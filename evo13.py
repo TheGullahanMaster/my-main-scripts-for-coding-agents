@@ -2864,9 +2864,9 @@ class CGPEquation:
             'tan': [(['sin', 'cos', 'tan', 'tanh', 'sigmoid'], 40.0), (['exp', '10^x', 'log', 'log10'], 40.0)],
             'tanh': [(['sin', 'cos', 'tan', 'tanh', 'sigmoid'], 40.0), (['exp', '10^x', 'log', 'log10'], 40.0)],
             'sigmoid': [(['sin', 'cos', 'tan', 'tanh', 'sigmoid'], 40.0), (['exp', '10^x', 'log', 'log10'], 40.0)],
-            'pow': [(['pow'], 40.0), (['exp'], 50.0)],
-            'square': [(['square', 'cube'], 20.0)],
-            'cube': [(['square', 'cube'], 20.0)],
+            'pow': [(['pow'], 10.0), (['exp'], 50.0)],
+            'square': [(['square', 'cube'], 5.0)],
+            'cube': [(['square', 'cube'], 5.0)],
             'log': [(['log', 'log10'], 30.0), (['exp', '10^x'], 20.0), (['sin', 'cos', 'tan', 'tanh', 'sigmoid'], 40.0)],
             'log10': [(['log', 'log10'], 30.0), (['exp', '10^x'], 20.0), (['sin', 'cos', 'tan', 'tanh', 'sigmoid'], 40.0)],
             '10^x': [(['10^x'], 50.0), (['sin', 'cos', 'tan', 'tanh', 'sigmoid'], 40.0)],
@@ -3203,7 +3203,7 @@ def random_cgp(n_features, max_nodes, feature_names):
                                     60.0, 3600.0, 0.01, 0.1,
                                     np.sqrt(2), np.log(2), np.log(10)])
         elif roll < 0.4:
-            return random.choice([-5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5,
+            return random.choice([-5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
                                     0.25, 0.33, 0.5, 0.67, 0.75, 1.5, 2.5, 3.5])
         else:
             mag = random.choice([0.1, 1.0, 10.0, 100.0, 1000.0])
@@ -3221,7 +3221,11 @@ def random_cgp(n_features, max_nodes, feature_names):
         # Fill all nodes with random junk first (for neutral drift)
         for i in range(max_nodes):
             max_connect = max(0, n_features + i - 1)
-            op = random.choice(CGPEquation.OPS_ALL)
+            core = [o for o in ['+', '-', '*', '/', 'const'] if o in CGPEquation.OPS_ALL]
+            if core and random.random() < 0.5:
+                op = random.choice(core)
+            else:
+                op = random.choice(CGPEquation.OPS_ALL)
             in1 = random.randint(0, max_connect)
             in2 = random.randint(0, max_connect)
             in3 = random.randint(0, max_connect)
@@ -3275,7 +3279,11 @@ def random_cgp(n_features, max_nodes, feature_names):
         # --- Traditional fully-random CGP ---
         for i in range(max_nodes):
             max_connect = max(0, n_features + i - 1)
-            op = random.choice(CGPEquation.OPS_ALL)
+            core = [o for o in ['+', '-', '*', '/', 'const'] if o in CGPEquation.OPS_ALL]
+            if core and random.random() < 0.5:
+                op = random.choice(core)
+            else:
+                op = random.choice(CGPEquation.OPS_ALL)
             in1 = random.randint(0, max_connect)
             in2 = random.randint(0, max_connect)
             in3 = random.randint(0, max_connect)
@@ -4034,7 +4042,7 @@ def generate_seeds_v5(n_features, feature_names):
     if n_features >= 2 and 'pow' in allowed and '*' in allowed and 'const' in allowed:
         cgp = _make_cgp_base(n_features, feature_names)
         f1, f2 = random.sample(range(n_features), 2)
-        p1 = random.choice([0.5, 1.5, 2.0, 3.0])
+        p1 = random.choice([0.5, 1.5, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0])
         p2 = random.choice([0.5, 1.0, 1.5])
         cgp.nodes[0] = CGPNode('const', 0, 0, p1)
         cgp.nodes[1] = CGPNode('const', 0, 0, p2)
@@ -4094,7 +4102,7 @@ def generate_seeds_v5(n_features, feature_names):
     if n_features >= 2 and 'pow' in allowed and '/' in allowed and 'const' in allowed:
         cgp = _make_cgp_base(n_features, feature_names)
         f1, f2 = random.sample(range(n_features), 2)
-        _exp = random.choice([0.5, 1.5, 2.0, 3.0, -1.0])
+        _exp = random.choice([0.5, 1.5, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, -1.0])
         cgp.nodes[0] = CGPNode('/', f1, f2)               # x1 / x2
         cgp.nodes[1] = CGPNode('const', 0, 0, _exp)
         cgp.nodes[2] = CGPNode('pow', n_features, n_features + 1)  # (x1/x2)^p
@@ -4427,9 +4435,9 @@ def generate_seeds_v5(n_features, feature_names):
     if n_features >= 3 and 'pow' in allowed and '*' in allowed and 'const' in allowed:
         cgp = _make_cgp_base(n_features, feature_names)
         fs = random.sample(range(n_features), min(3, n_features))
-        cgp.nodes[0] = CGPNode('const', 0, 0, random.choice([0.5, 1.0, 1.5, 2.0, -1.0]))
-        cgp.nodes[1] = CGPNode('const', 0, 0, random.choice([0.5, 1.0, 1.5, 2.0, -1.0]))
-        cgp.nodes[2] = CGPNode('const', 0, 0, random.choice([0.5, 1.0, 1.5, 2.0, -1.0]))
+        cgp.nodes[0] = CGPNode('const', 0, 0, random.choice([0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, -1.0]))
+        cgp.nodes[1] = CGPNode('const', 0, 0, random.choice([0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, -1.0]))
+        cgp.nodes[2] = CGPNode('const', 0, 0, random.choice([0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, -1.0]))
         cgp.nodes[3] = CGPNode('pow', fs[0], n_features)
         cgp.nodes[4] = CGPNode('pow', fs[1], n_features + 1)
         cgp.nodes[5] = CGPNode('pow', fs[2], n_features + 2)
@@ -5096,7 +5104,7 @@ def _build_random_mini_tree(child_eq, n_features, start_slot, max_depth=3,
         in2 = _pick_input() if op in CGPEquation.OPS_BINARY_SET else 0
         # For const nodes inject a useful constant value
         if op == 'const':
-            c_val = random.choice([0.5, 1.0, 2.0, 3.0, -1.0, np.pi,
+            c_val = random.choice([0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, -1.0, np.pi,
                                     0.1, 10.0, -0.5, np.e])
         else:
             c_val = random.gauss(0, 2.0)
@@ -5189,7 +5197,12 @@ def mutate(parent_eq, n_features, feature_names, mut_rate=None, temperature=0.0,
             if op_affinity:
                 target.op = affinity_biased_op_choice(op_affinity, CGPEquation.OPS_ALL)
             else:
-                target.op = random.choice(CGPEquation.OPS_ALL)
+                # Prefer arithmetic/core ops
+                core = [o for o in ['+', '-', '*', '/', 'const'] if o in CGPEquation.OPS_ALL]
+                if core and random.random() < 0.5:
+                    target.op = random.choice(core)
+                else:
+                    target.op = random.choice(CGPEquation.OPS_ALL)
         elif choice == 'rewire1':
             target.in1 = random.randint(0, max_connect)
         elif choice == 'rewire2':
@@ -5852,7 +5865,7 @@ def macro_graft_feature(cgp_eq, n_features, feature_names):
         if exp_candidates:
             exp_slot     = min(exp_candidates)
             exp_idx      = exp_slot - n_features
-            exp_val      = random.choice([0.5, 1.5, 2.0, 2.5, 3.0,
+            exp_val      = random.choice([0.5, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0,
                                           -0.5, -1.0, -2.0])
             child.nodes[exp_idx] = CGPNode('const', 0, 0, exp_val)
             # new_feat^const_exp
@@ -8135,7 +8148,7 @@ def macro_nest_compound(cgp_eq, n_features, feature_names, op_affinity=None):
 
     if strategy == 'unary_scaled':
         s1, s2, s3, s4 = free_slots[0], free_slots[1], free_slots[2], free_slots[3]
-        c_val = random.choice([0.5, 1.0, 1.5, 2.0, 3.0, np.pi, 0.1, -1.0, -0.5])
+        c_val = random.choice([0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, np.pi, 0.1, -1.0, -0.5])
         child.nodes[s1 - nf] = CGPNode('const', 0, 0, c_val)
         child.nodes[s2 - nf] = CGPNode('*', s1, feat)
         child.nodes[s3 - nf] = CGPNode(random.choice(unary_ops), s2, 0)
@@ -8147,7 +8160,7 @@ def macro_nest_compound(cgp_eq, n_features, feature_names, op_affinity=None):
 
     elif strategy == 'power_term':
         s1, s2, s3, s4 = free_slots[0], free_slots[1], free_slots[2], free_slots[3]
-        exp_val = random.choice([0.5, 1.5, 2.0, 2.5, 3.0, -0.5, -1.0, -2.0])
+        exp_val = random.choice([0.5, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, -0.5, -1.0, -2.0])
         child.nodes[s1 - nf] = CGPNode('const', 0, 0, exp_val)
         child.nodes[s2 - nf] = CGPNode('pow', feat, s1)
         child.nodes[s3 - nf] = CGPNode('const', 0, 0, random.uniform(0.1, 5.0))
@@ -10262,11 +10275,11 @@ def _boosting_line_search(residuals, preds_raw, affine_a, affine_b, base_lr,
     # Newton-step closed-form candidate:  γ* = <r, f> / (<f, f> + λ)
     rf = float(np.dot(residuals, scaled_preds))
     ff = float(np.dot(scaled_preds, scaled_preds)) + l2_reg * len(residuals)
-    newton_lr = np.clip(rf / (ff + 1e-30), 0.0, base_lr) if ff > 1e-12 else base_lr
+    newton_lr = np.clip(rf / (ff + 1e-30), 0.0, 1.0) if ff > 1e-12 else 1.0
 
     # Grid search candidates
     fracs = np.linspace(0.05, 1.0, 20)
-    candidates = np.concatenate([fracs * base_lr, [newton_lr]])
+    candidates = np.concatenate([fracs * base_lr, [1.0, newton_lr]])
 
     best_mse, best_lr = float('inf'), base_lr
     for c_lr in candidates:
@@ -10294,10 +10307,10 @@ def _boosting_cls_line_search(F_current, preds_scaled, y_binary, base_lr):
     newton_lr = np.clip(
         float(np.sum(r * preds_scaled)) /
         (float(np.sum(hessian_diag * preds_scaled ** 2)) + 1e-30),
-        0.0, base_lr)
+        0.0, 1.0)
 
     fracs = np.linspace(0.05, 1.0, 20)
-    candidates = np.concatenate([fracs * base_lr, [newton_lr]])
+    candidates = np.concatenate([fracs * base_lr, [1.0, newton_lr]])
 
     best_loss, best_lr = float('inf'), base_lr
     for c_lr in candidates:
