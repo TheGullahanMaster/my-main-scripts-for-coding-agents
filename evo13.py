@@ -1,0 +1,13381 @@
+import pandas as pd
+import numpy as np
+import random
+import copy
+import time
+import sys
+import pickle
+import base64
+import warnings
+import re
+from abc import ABC, abstractmethod
+from collections import Counter
+import networkx as nx
+from networkx.algorithms.community import greedy_modularity_communities
+from networkx.algorithms.community.quality import modularity
+
+try:
+    from scipy import special as scipy_special
+    HAS_SCIPY_SPECIAL = True
+except ImportError:
+    HAS_SCIPY_SPECIAL = False
+
+from sklearn.neighbors import NearestNeighbors
+
+def compute_target_gradients(X, y, k=None):
+    """
+    Unified Sobolev target-gradient estimator.
+
+    Dispatches to the appropriate method based on input dimensionality:
+      - 1-D: finite differences on the sorted (x, y) pairs — exact and fast.
+      - N-D (n_features >= 2): KNN local-linear regression, which estimates
+        the full Jacobian vector ∂y/∂x_j for every point simultaneously.
+
+    Returns
+    -------
+    grads : ndarray, shape (N, D)
+        Estimated partial derivatives dy/dx_j at each training point.
+        For 1-D output grads[:, 0] is the ordinary derivative.
+    """
+    if k is None:
+        k = SOBOLEV_KNN_K
+    N, D = X.shape
+    if D == 1:
+        # 1-D: sort by x, use np.gradient (central differences), then unsort.
+        order   = np.argsort(X[:, 0])
+        x_sorted = X[order, 0]
+        y_sorted = y[order]
+        dy_dx    = np.gradient(y_sorted, x_sorted)
+        grads    = np.empty((N, 1), dtype=np.float64)
+        grads[order, 0] = dy_dx
+        return np.clip(np.nan_to_num(grads, nan=0.0, posinf=1e5, neginf=-1e5), -1e5, 1e5)
+    else:
+        return compute_multivariate_target_gradients(X, y, k=k)
+
+
+def compute_multivariate_target_gradients(X, y, k=15):
+    """
+    Estimates dy/dx for unstructured multivariate data using local linear regression.
+    Works natively for 1D, 2D, and ND datasets.
+
+    Fully vectorised using batched normal equations with Tikhonov regularisation:
+        g_i = (X_local^T X_local + λI)^{-1} X_local^T y_local
+    for each point i, solved in a single batched np.linalg.solve call — O(N·D³)
+    instead of O(N) Python-level lstsq calls.  For D≤~15 and N≤50 000 this is
+    typically 10-50× faster than the loop version.
+    """
+    N, D = X.shape
+    k = min(k, N)
+
+    nbrs = NearestNeighbors(n_neighbors=k).fit(X)
+    _, indices = nbrs.kneighbors(X)
+
+    # Build centred neighbourhoods: (N, K, D) and (N, K)
+    X_local = X[indices] - X[:, np.newaxis, :]   # (N, K, D)
+    y_local = y[indices] - y[:, np.newaxis]       # (N, K)
+
+    # Normal equations: (N, D, D) @ g = (N, D)
+    XTX = np.einsum('nkd,nke->nde', X_local, X_local)   # (N, D, D)
+    XTy = np.einsum('nkd,nk->nd',  X_local, y_local)    # (N, D)
+
+    # Tikhonov regularisation: λ = 1e-6 × mean diagonal (scale-adaptive ridge)
+    diag_mean = XTX.reshape(N, -1)[:, ::D + 1].mean(axis=1).clip(min=1e-8)
+    lam = 1e-6 * diag_mean                               # (N,)
+    eye = np.eye(D, dtype=X.dtype)[np.newaxis]           # (1, D, D)
+    XTX += lam[:, np.newaxis, np.newaxis] * eye
+
+    try:
+        target_grads = np.linalg.solve(XTX, XTy[..., np.newaxis])[..., 0]   # (N, D)
+    except np.linalg.LinAlgError:
+        # Singular batches: fall back to per-point lstsq (rare, small N)
+        target_grads = np.zeros((N, D), dtype=np.float64)
+        for i in range(N):
+            g, _, _, _ = np.linalg.lstsq(X_local[i], y_local[i], rcond=None)
+            target_grads[i] = g
+
+    return np.clip(np.nan_to_num(target_grads, nan=0.0, posinf=1e5, neginf=-1e5), -1e5, 1e5)
+def evaluate_tree_gradients(tree, X, affine_a, eps=1e-5):
+    """
+    Computes the gradient of the CGP tree w.r.t each input feature using central differences.
+    """
+    N, D = X.shape
+    grads = np.zeros((N, D))
+    
+    for j in range(D):
+        X_plus = X.copy()
+        X_plus[:, j] += eps
+        y_plus = tree.evaluate(X_plus)
+        
+        X_minus = X.copy()
+        X_minus[:, j] -= eps
+        y_minus = tree.evaluate(X_minus)
+        
+        # Don't forget the affine scaling applies to the derivative too!
+        # d/dx (a * f(x) + b) = a * f'(x)
+        raw_grad = (y_plus - y_minus) / (2 * eps)
+        grads[:, j] = affine_a * raw_grad
+        
+    # Sanitize to prevent explosions from polluting the loss
+    return np.clip(np.nan_to_num(grads, nan=0.0, posinf=1e5, neginf=-1e5), -1e5, 1e5)
+
+# --- CONFIGURATION ---
+POPULATION_SIZE = 200
+TOURNAMENT_SIZE = 20
+MAX_COMPLEXITY = 2500
+HOF_SIZE = 10
+COST_CONST = .0
+COST_VAR = 0.
+COST_OP_SIMPLE = 2.0    
+COST_OP_COMPLEX = 4.0   
+COST_UNARY_RISK = 3.0   
+COST_UNARY_SAFE = 3.0   
+COST_UNARY_CHEAP = 1.0  
+COST_IF = 10.0
+COST_COMPARISON = 3.0   # gt, lt, gte, lte comparison operators
+
+# ---- IF/ELSE Branching ----
+# When enabled, adds comparison operators (gt, lt, gte, lte) and a ternary
+# if_else node to the CGP graph.  This creates a hybrid CGP + decision tree
+# where conditions can compare constants to variables, variables to variables,
+# or entire sub-expressions to each other.  Branches can output constants,
+# 0/1 booleans, or the result of arbitrary sub-expressions.
+IF_ELSE_ENABLED = False   # toggled interactively at startup
+
+# ---- Differentiable Branching ----
+# When enabled alongside IF/ELSE, the hard np.where(cond > 0.5, true, false)
+# is replaced by a smooth sigmoid blend:
+#   result = σ(k*(cond - 0.5)) * true + (1 - σ(k*(cond - 0.5))) * false
+# This makes the branch differentiable w.r.t. the condition, which helps
+# constant optimisation (Nelder-Mead / L-BFGS-B can smooth-gradient through
+# branches) and produces smoother ensemble predictions in gradient boosting.
+# The steepness k controls the transition sharpness:
+#   k=10  → fairly soft (≈95% hard at ±0.2 from threshold)
+#   k=20  → moderately sharp (default, good balance)
+#   k=50  → nearly hard (≈99.99% at ±0.1 from threshold)
+DIFFERENTIABLE_BRANCHING   = False  # toggled interactively at startup
+DIFF_BRANCH_STEEPNESS      = 20.0   # sigmoid steepness k
+
+# ---- Gradient Boosting ----
+# When enabled, runs multiple sequential CGP evolution stages.  After each
+# stage the best model's predictions are subtracted from the target (residuals),
+# and the next stage evolves on those residuals.  Final prediction is the sum
+# of all stage models, weighted by a learning rate.  Inspired by XGBoost /
+# gradient boosting machines.  Works with or without IF/ELSE nodes.
+# Now supports CLASSIFICATION (binary + multi-class) via logistic / softmax
+# pseudo-residuals, mirroring how XGBoost handles log-loss.
+GRADIENT_BOOSTING_ENABLED  = False   # toggled interactively at startup
+GRADIENT_BOOSTING_STAGES   = 5      # number of boosting rounds
+GRADIENT_BOOSTING_LR       = 0.3    # learning rate (shrinkage)
+GRADIENT_BOOSTING_GENS     = 2000   # generations per boosting stage
+GRADIENT_BOOSTING_SUBSAMPLE = 1.0   # fraction of rows sampled per stage (stochastic GB)
+GRADIENT_BOOSTING_LR_DECAY  = 1.0   # multiplicative LR decay per stage (1.0 = no decay)
+GRADIENT_BOOSTING_L2_LEAF   = 0.0   # L2 regularisation on stage predictions (0 = none)
+GRADIENT_BOOSTING_DART_DROP = 0.0   # DART: probability of dropping a previous stage (0 = off)
+GRADIENT_BOOSTING_PATIENCE  = 3     # early-stop patience (val R² / accuracy stalls)
+GRADIENT_BOOSTING_HESSIAN   = True  # 2nd-order (Hessian-weighted) fitness for boosting stages
+
+# Whitelist of allowed operations during evolution.
+# This is set interactively at runtime via select_allowed_ops().
+ALLOWED_OPS = ['+', '-', '*', '/', 'pow', 'exp', 'log', 'const']  # default fallback
+
+# Default CGP Settings
+CGP_NODES = 50
+CGP_MUT_RATE = 3
+
+# Self-adaptive sigma bounds and meta-learning rate
+SIGMA_TAU = 0.15     # meta-learning rate for self-adaptive mutation
+SIGMA_MIN = 0.5
+SIGMA_MAX = 20.0
+
+# Parsimony pressure coefficient: multiplied by complexity and added to fitness.
+# Higher values favour simpler (shorter) expressions more aggressively.
+# 0.0 = no parsimony; 0.01 = gentle; 0.05 = moderate; 0.2+ = strong.
+PARSIMONY_STRENGTH = 0.01
+
+# Maximum loss an individual may have to enter the Hall of Fame.
+# Expressions with billion-scale losses (abs(x)^feature blowups, etc.) would
+# otherwise occupy every high-complexity HoF slot and block genuinely good
+# medium-complexity expressions from entering the frontier.
+# Comfortably above "mean predictor" (regression loss ~1.0) but far below
+# catastrophic blow-up territory.
+HOF_LOSS_CEILING = 5.0
+
+# How often (in generations) to run the periodic algebraic simplification pass
+# across the entire population and Hall of Fame.
+SIMPLIFICATION_FREQ = 500
+
+# ---- PySR-style Simulated Annealing ----
+# SA acceptance: a newly generated child that is *worse* than the individual it
+# would replace is still accepted with probability exp(-Δfitness / T), where
+# T = SA_ALPHA * mean_population_loss.  This prevents premature convergence by
+# allowing occasional uphill moves — exactly as PySR's `annealing=True` does.
+# • SA_ALPHA=0.0  → pure greedy selection (SA disabled)
+# • SA_ALPHA=0.1  → PySR default, mild annealing
+# • SA_ALPHA=0.5  → strong annealing (noisier but harder to get stuck)
+SA_ALPHA   = 0.1
+SA_ENABLED = True
+
+# Temperature-scaled constant perturbation (PySR: perturbationFactor).
+# During constant Gaussian mutation the noise sigma is multiplied by
+# (SA_PERTURBATION_FACTOR * T + 1).  At high T (early, bad population) constants
+# explore widely; as T → 0 (good population) they are refined precisely.
+SA_PERTURBATION_FACTOR = 1.0
+
+# ---- Sobolev Training ----
+# Adds a gradient-matching penalty to the regression loss.
+# Target gradients dy/dX are estimated once from the training data before
+# evolution (KNN local-linear regression for any input dimensionality).
+# The Sobolev penalty penalises expressions whose partial derivatives diverge
+# from the empirically estimated target derivatives, guiding the search toward
+# symbolically interpretable structures that respect the data's local geometry.
+#
+# For n_features == 1: finite differences on the sorted (x, y) pairs.
+# For n_features >= 2: KNN local-linear regression (compute_multivariate_target_gradients).
+#
+# SOBOLEV_WEIGHT : relative weight of ‖∇f - ∇̂y‖² vs value loss.
+#   0.0  → disabled (pure value loss)
+#   0.1  → mild nudge (recommended default)
+#   0.3  → moderate (good balance)
+#   1.0  → equal weight to value loss (strong gradient enforcement)
+# SOBOLEV_KNN_K  : neighbourhood size for multivariate gradient estimation.
+SOBOLEV_ENABLED  = False  # toggled interactively at startup
+SOBOLEV_WEIGHT   = 0.3
+SOBOLEV_KNN_K    = 15
+
+# ---- Adaptive Complexity Frequency Parsimony (PySR: use_frequency) ----
+# Measure how often each complexity level appears in the population and add a
+# log-frequency penalty so over-crowded complexities are gently discouraged.
+# This naturally maintains a spread across the complexity axis without forcing
+# the user to hand-tune PARSIMONY_STRENGTH for each problem.
+# • 0.0 → disabled
+# • 0.03 → gentle (recommended default)
+# • 0.10 → strong (pushes hard for diversity across complexity levels)
+ADAPTIVE_PARSIMONY_WEIGHT  = 0.03
+ADAPTIVE_PARSIMONY_ENABLED = True
+
+# ---- Evolution model ----
+# "island"          = Island Model (default, multi-process)
+# "afpo"            = Age-Fitness Pareto Optimisation (single-process)
+# "island_afpo"     = Islanded AFPOs: N islands each running their own AFPO (parallel)
+# "age_group_islands" = Age Group Islands: tiered AFPO where best individuals
+#                      graduate from younger to older age-group island pools
+EVOLUTION_MODEL = "island"
+
+# Number of islands for Island and Islanded-AFPO models (set interactively)
+NUM_ISLANDS_GLOBAL = 4
+
+# Age Group Islands settings (set interactively)
+AGE_GROUP_N_GROUPS          = 3    # number of age tiers
+AGE_GROUP_ISLANDS_PER_GROUP = 2    # AFPO islands per tier
+AGE_GROUP_GRAD_FREQ         = 100  # every N generations, graduate best from each tier
+
+# ---- Down-Sampled Lexicase ----
+# Fraction of the training set used for DS-Lexicase each generation.
+# 0.0 = disabled (use fixed n_cases=20 as before).
+# 0.05–0.10 recommended when enabled.
+DS_LEXICASE_FRAC = 0.0
+
+# ---- Automatically Defined Functions (ADF) ----
+# Enabled via interactive prompt after operator selection.
+ADF_ENABLED            = False
+ADF_MODULARITY_THRESH  = 0.30   # minimum Q score to trigger extraction
+ADF_FITNESS_THRESH     = 0.50   # maximum normalised fitness percentile (lower = better)
+ADF_MAX_LIBRARY        = 8      # cap on how many ADFs can be accumulated
+ADF_EXTRACT_FREQ       = 500    # check for new ADFs every N generations
+ADF_RETIRE_PATIENCE    = 3      # consecutive zero-use cycles before an ADF is retired
+_ADF_REGISTRY          = []     # list of serialisable ADF dicts (shared state)
+_ADF_ZERO_USE_COUNT    = {}     # name → consecutive zero-usage extraction cycles
+
+# ---- Arithmetic Interval mode ----
+# Runs Unsafe ops but periodically evaluates every individual against the
+# FULL training input range.  Any individual whose expression yields NaN or
+# Inf on any training row is immediately penalised / discarded.
+# Unlike naive symbolic interval arithmetic this handles the actual data
+# distribution (including all interaction patterns between variables).
+INTERVAL_MODE       = False   # set interactively via select_ops_safety()
+INTERVAL_CHECK_FREQ = 100     # how often (in generations) to run stability scan
+
+# ---- Logit Saturation Penalty (Interval Mode) ----
+# When INTERVAL_MODE is enabled for classification outputs, penalise individuals
+# whose raw logit outputs are extremely saturated (|logit| >> threshold).
+# Saturated logits map to probabilities ≈ 0 or ≈ 1 through sigmoid/softmax,
+# causing:  (a) overconfident predictions that don't generalise,
+#           (b) vanishing gradients for boosting pseudo-residuals,
+#           (c) numerical issues in BCE/softmax CE computation.
+# The penalty is: WEIGHT * mean(max(0, |logit| - THRESHOLD)²)
+# This keeps logits in a numerically healthy range without restricting the
+# sign or rough magnitude of the output.
+# Also available for regression to discourage extreme prediction magnitudes.
+LOGIT_SATURATION_THRESHOLD  = 12.0   # |logit| above this is penalised
+LOGIT_SATURATION_WEIGHT     = 0.05   # penalty coefficient
+LOGIT_SATURATION_REG_ENABLE = False  # also apply to regression (extreme pred penalty)
+
+# ---- Bayesian CGP Settings ----
+# Bayesian optimisation uses a Gaussian Process surrogate to model the
+# fitness landscape over CGP genotype space, and Expected Improvement (EI)
+# to pick which candidate mutations to actually evaluate.  This is much
+# more sample-efficient than pure evolution but more expensive per iteration.
+BAYESIAN_INITIAL_SAMPLES = 100    # random individuals evaluated before BO starts
+BAYESIAN_BATCH_SIZE      = 20     # candidates evaluated per BO iteration
+BAYESIAN_N_CANDIDATES    = 200    # mutation candidates generated per iteration
+BAYESIAN_GP_REFIT_FREQ   = 5      # refit GP every N iterations
+BAYESIAN_EXPLORATION     = 0.01   # exploration–exploitation trade-off (xi for EI)
+BAYESIAN_MAX_GP_POINTS   = 500    # cap on GP training set (oldest evicted first)
+BAYESIAN_CONST_OPT_FREQ  = 10     # run light const-opt on HoF every N iterations
+
+
+# --- IMPORTS FOR SIMPLIFICATION ---
+try:
+    import sympy
+    from sympy.printing.numpy import NumPyPrinter
+except ImportError:
+    print("Warning: 'sympy' not found. Equations will not be simplified.")
+    sympy = None
+
+warnings.filterwarnings('ignore')
+np.seterr(all='ignore')
+
+# ==========================================
+# IMPROVEMENT 1: ACTIVE-GRAPH FITNESS CACHE
+# ==========================================
+# Caches fitness results keyed by the active-graph fingerprint so that
+# genotypically converging populations (where many individuals share the same
+# effective computation) skip redundant evaluate() calls entirely.
+# The fingerprint ignores inactive nodes (junk DNA), focusing on what the
+# expression actually computes.
+#
+# Thread / process safety: each worker process gets its own cache instance
+# (Python multiprocessing uses fork or spawn; the global is not shared).
+# Cache is cleared on extinction to prevent stale entries from poisoning
+# post-extinction diversity.
+
+class _FitnessCache:
+    """LRU-like cache keyed by active-graph fingerprint → Individual attributes."""
+
+    def __init__(self, maxsize: int = 8000):
+        self._cache: dict = {}
+        self._order: list = []     # insertion order for eviction
+        self._maxsize = maxsize
+        self.hits = 0
+        self.misses = 0
+
+    def _fingerprint(self, tree) -> tuple:
+        """
+        Canonical tuple representation of the *active* CGP graph.
+        Inactive nodes are ignored entirely.  Const values are rounded to
+        4 significant figures so near-identical constants collapse together.
+        """
+        tree.update_active_nodes()
+        parts = []
+        for idx in sorted(tree.active_nodes):
+            if idx < tree.n_features:
+                parts.append(('F', idx))
+            else:
+                node = tree.nodes[idx - tree.n_features]
+                if node.op == 'const':
+                    # round to 4 sig-figs to tolerate floating-point noise
+                    v = float(f"{node.const_val:.4g}")
+                    parts.append(('C', v))
+                elif node.op in CGPEquation.OPS_TERNARY_SET:
+                    parts.append((node.op, node.in1, node.in2, node.in3))
+                else:
+                    parts.append((node.op, node.in1, node.in2))
+        parts.append(('O', tree.out_idx))
+        return tuple(parts)
+
+    def get(self, tree, y_target) -> dict | None:
+        """Return cached result dict or None on miss."""
+        # Create a fast, unique signature for the target array
+        target_sig = (float(y_target[0]), float(y_target[-1]), len(y_target))
+        fp = (self._fingerprint(tree), target_sig)
+        
+        if fp in self._cache:
+            self.hits += 1
+            return self._cache[fp]
+        self.misses += 1
+        return None
+
+    def put(self, tree, y_target, result: dict):
+        """Store result dict for this tree's fingerprint AND target."""
+        target_sig = (float(y_target[0]), float(y_target[-1]), len(y_target))
+        fp = (self._fingerprint(tree), target_sig)
+        
+        if fp in self._cache:
+            self._cache[fp] = result
+            return
+        if len(self._cache) >= self._maxsize:
+            # Evict oldest 20%
+            evict_n = max(1, self._maxsize // 5)
+            for old_fp in self._order[:evict_n]:
+                self._cache.pop(old_fp, None)
+            self._order = self._order[evict_n:]
+        self._cache[fp] = result
+        self._order.append(fp)
+
+    def clear(self):
+        self._cache.clear()
+        self._order.clear()
+
+    def stats_str(self) -> str:
+        total = self.hits + self.misses
+        rate = self.hits / max(total, 1)
+        return f"cache hits={self.hits}/{total} ({rate:.1%}), size={len(self._cache)}"
+
+
+# Process-local singleton
+_FITNESS_CACHE = _FitnessCache(maxsize=8000)
+
+# Initialization-phase flag: when True, modularity is skipped and
+# evaluation can use a subsample.  Set True during population init,
+# cleared before evolution begins.  This makes large-dataset startup
+# dramatically faster.
+_INIT_PHASE = False
+_INIT_SUBSAMPLE_CAP = 5000   # max rows during init evaluation
+
+
+# ==========================================
+# IMPROVEMENT 2: ADAPTIVE REPRODUCTIVE OPERATOR WEIGHTS
+# ==========================================
+# Tracks which reproductive actions (mutate, crossover, grow, prune, …) most
+# frequently produce children that are accepted into the population (i.e. that
+# beat the death-tournament victim).  Uses an exponential moving average of
+# per-operator success rates (SHADE-inspired) to dynamically re-weight
+# operator selection each generation.
+#
+# Exploration is preserved via UCB-style mixing: w_i = base_i × (0.4 + 0.6 × sr_i)
+# so no operator can ever be fully suppressed (minimum 40% of its base weight).
+
+class AdaptiveMutationTracker:
+    """
+    Per-island tracker for reproductive operator success rates.
+
+    Usage:
+        tracker = AdaptiveMutationTracker(repro_ops, base_weights)
+        action  = tracker.choose()
+        ...
+        child_accepted = (delta_fit < 0)
+        tracker.record(action, child_accepted)
+        # Every ~50 generations:
+        adapted_weights = tracker.get_weights()
+    """
+
+    def __init__(self, ops: list, base_weights: list, alpha: float = 0.08):
+        assert len(ops) == len(base_weights)
+        self.ops          = ops
+        self.base_weights = list(base_weights)
+        self.alpha        = alpha                        # EMA decay
+        # Initialise all operators at neutral (50% success)
+        self.sr: dict     = {op: 0.5 for op in ops}
+        self.counts: dict = {op: 0   for op in ops}
+
+    def record(self, op: str, success: bool):
+        """Update EMA success rate for op."""
+        if op not in self.sr:
+            return
+        self.counts[op] += 1
+        self.sr[op] = (1.0 - self.alpha) * self.sr[op] + self.alpha * (1.0 if success else 0.0)
+
+    def choose(self) -> str:
+        """Sample an operator using current adapted weights."""
+        w = self.get_weights()
+        return random.choices(self.ops, weights=w, k=1)[0]
+
+    def get_weights(self) -> list:
+        """
+        Return weight list for random.choices().
+        w_i = base_i × (0.4 + 0.6 × sr_i)   — always ≥ 40% of base.
+        """
+        return [bw * (0.4 + 0.6 * self.sr[op])
+                for bw, op in zip(self.base_weights, self.ops)]
+
+    def summary(self) -> str:
+        lines = ["  Operator success rates:"]
+        for op in self.ops:
+            lines.append(f"    {op:<14} sr={self.sr[op]:.3f}  n={self.counts[op]}")
+        return "\n".join(lines)
+
+
+# ==========================================
+# IMPROVEMENT 3: OPERATOR AFFINITY SCORING
+# ==========================================
+# Tracks which primitive operators appear in HoF expressions and biases
+# OPS_ALL sampling toward operators with proven track records on THIS problem.
+# Called periodically from the main loop; results are passed into mutation.
+
+def compute_hof_operator_affinity(hofs, smoothing: float = 0.5) -> dict:
+    """
+    Count how often each operator appears in active nodes across all HoF
+    entries and return a normalised affinity dict: op → weight ∈ (0, 1].
+
+    Smoothing prevents any operator from being zeroed out.  All operators
+    not seen in HoF entries receive weight = smoothing / (smoothing + max_count).
+    """
+    counts: dict = {}
+    total_inds = 0
+    for hof in hofs:
+        for ind in hof.best_by_complexity.values():
+            if ind is None:
+                continue
+            total_inds += 1
+            ind.tree.update_active_nodes()
+            for idx in ind.tree.active_nodes:
+                if idx >= ind.tree.n_features:
+                    op = ind.tree.nodes[idx - ind.tree.n_features].op
+                    if op != 'const':
+                        counts[op] = counts.get(op, 0) + 1
+
+    if not counts:
+        return {}
+
+    max_c = max(counts.values())
+    affinity = {}
+    for op in CGPEquation.OPS_ALL:
+        c = counts.get(op, 0)
+        affinity[op] = (c + smoothing) / (max_c + smoothing)
+    return affinity
+
+
+def affinity_biased_op_choice(affinity: dict, ops: list | None = None) -> str:
+    """Sample from ops (default: OPS_ALL) weighted by HoF affinity."""
+    if ops is None:
+        ops = CGPEquation.OPS_ALL
+    if not affinity:
+        return random.choice(ops)
+    weights = [affinity.get(op, 0.3) for op in ops]
+    return random.choices(ops, weights=weights, k=1)[0]
+
+# ==========================================
+# MODULE-LEVEL OP DISPATCH TABLES
+# Centralizes all operation logic; evaluate(), __str__,
+# get_complexity(), and tree_to_sympy() all pull from here.
+# ==========================================
+
+# ==========================================
+# SAFE / UNSAFE OP IMPLEMENTATIONS
+# ==========================================
+#
+# SAFE MODE  — every operation is total: domain violations are deflected by
+#              input clamping, abs-wrapping, or epsilon guards so that no NaN
+#              or Inf can ever escape a node.  Evolution is stable but some
+#              operations are modified from their mathematical meaning
+#              (most notably: exp becomes exp(-|v|), a bounded decay curve).
+#
+# UNSAFE MODE — raw numpy semantics.  Domain violations (log of negative,
+#              sqrt of negative, div-by-zero, exp overflow …) produce NaN/Inf,
+#              which are caught by the nan_to_num call in CGPEquation.evaluate()
+#              and clamped to 0 / ±1e9.  Expressions are mathematically purer
+#              and exp is the real exponential, but evolution is noisier because
+#              large sub-trees can temporarily collapse to zero or ±1e9.
+#
+# Toggle with SAFE_OPS_MODE (set by select_ops_safety() in train_mode).
+# ==========================================
+
+SAFE_OPS_MODE = True  # default; changed interactively at startup
+
+# ---- Affine Scaling ----
+# When enabled (default), every regression individual gets an analytic
+# affine rescaling y = a*f(x) + b, fitted once on the full dataset.
+# This lets the evolutionary search focus on shape rather than scale.
+# Disabling forces the CGP to learn scale/offset from constants alone.
+AFFINE_SCALING_ENABLED = True
+
+# ---- helpers used by SAFE variants ----
+def _sinc_fn(v):
+    mask = np.abs(v) > 1e-8
+    return np.where(mask, np.sin(v) / np.where(mask, v, 1.0), 1.0)
+
+def _erf_fn(v):
+    if HAS_SCIPY_SPECIAL:
+        return scipy_special.erf(v)
+    return np.tanh(np.clip(1.2 * v, -20, 20))
+
+# ---- SAFE binary ----
+_BINARY_SAFE = {
+    '+':         lambda v1, v2: v1 + v2,
+    '-':         lambda v1, v2: v1 - v2,
+    '*':         lambda v1, v2: v1 * v2,
+    # Denominator nudged away from zero → never divides by zero
+    '/':         lambda v1, v2: v1 / np.where(np.abs(v2) > 1e-8, v2,
+                                               np.sign(v2 + 1e-18) * 1e-8),
+    'max':       np.maximum,
+    'min':       np.minimum,
+    # Base forced positive; exponent clamped to prevent ±∞
+    'pow':       lambda v1, v2: np.where(np.abs(np.round(v2) - v2) < 1e-4, np.where(np.abs(np.mod(np.round(v2), 2)) < 1e-8, np.power(np.abs(v1) + 1e-30, np.clip(v2, -250.0, 250.0)), np.copysign(np.power(np.abs(v1) + 1e-30, np.clip(v2, -250.0, 250.0)), v1)), np.power(np.abs(v1) + 1e-30, np.clip(v2, -250.0, 250.0))),
+    'hypot':     lambda v1, v2: np.sqrt(v1**2 + v2**2),
+    'atan2':     lambda v1, v2: np.arctan2(v1, v2),
+    # Denominator guard prevents 0/0 at v1=v2=0
+    'harmonic':  lambda v1, v2: 2.0 * v1 * v2 / (np.abs(v1 + v2) + 1e-8),
+    # Abs inside sqrt → always real
+    'geometric': lambda v1, v2: np.sqrt(np.abs(v1 * v2)),
+    # Divisor guard prevents mod-by-zero
+    'mod':       lambda v1, v2: np.mod(v1, np.where(np.abs(v2) > 1e-8,
+                                                     v2, 1.0)),
+    'copysign':  lambda v1, v2: np.abs(v1) * np.sign(v2),
+    # Integer division: floor(v1/v2), useful for time/unit conversions
+    'floordiv':  lambda v1, v2: np.floor(v1 / np.where(np.abs(v2) > 1e-8, v2,
+                                                         np.sign(v2 + 1e-18) * 1e-8)),
+    # Comparison operators — return 0.0 or 1.0 (used as conditions for if_else)
+    'gt':        lambda v1, v2: np.where(v1 > v2, 1.0, 0.0),
+    'lt':        lambda v1, v2: np.where(v1 < v2, 1.0, 0.0),
+    'gte':       lambda v1, v2: np.where(v1 >= v2, 1.0, 0.0),
+    'lte':       lambda v1, v2: np.where(v1 <= v2, 1.0, 0.0),
+}
+_BINARY_UNSAFE = {
+    '+':         lambda v1, v2: v1 + v2,
+    '-':         lambda v1, v2: v1 - v2,
+    '*':         lambda v1, v2: v1 * v2,
+    # Raw — NaN/Inf on zero denominator (caught by nan_to_num in evaluate)
+    '/':         lambda v1, v2: v1 / v2,
+    'max':       np.maximum,
+    'min':       np.minimum,
+    # Raw — NaN for negative base with fractional exponent
+    'pow':       lambda v1, v2: np.power(v1, v2),
+    'hypot':     lambda v1, v2: np.sqrt(v1**2 + v2**2),
+    'atan2':     lambda v1, v2: np.arctan2(v1, v2),
+    # Raw — NaN/Inf when v1+v2=0
+    'harmonic':  lambda v1, v2: 2.0 * v1 * v2 / (v1 + v2),
+    # NaN when product is negative
+    'geometric': lambda v1, v2: np.sqrt(v1 * v2),
+    # NaN/ZeroDivisionError when v2=0
+    'mod':       lambda v1, v2: np.mod(v1, v2),
+    'copysign':  lambda v1, v2: np.abs(v1) * np.sign(v2),
+    # Raw floor division — NaN/Inf on zero denominator
+    'floordiv':  lambda v1, v2: np.floor(v1 / v2),
+    # Comparison operators — same in safe and unsafe modes
+    'gt':        lambda v1, v2: np.where(v1 > v2, 1.0, 0.0),
+    'lt':        lambda v1, v2: np.where(v1 < v2, 1.0, 0.0),
+    'gte':       lambda v1, v2: np.where(v1 >= v2, 1.0, 0.0),
+    'lte':       lambda v1, v2: np.where(v1 <= v2, 1.0, 0.0),
+}
+_UNARY_SAFE = {
+    'sin':        np.sin,
+    'cos':        np.cos,
+    # tan with clamped output to avoid ±Inf near π/2
+    'tan':        lambda v: np.clip(np.where(np.abs(np.cos(v)) > 1e-8,
+                                              np.sin(v) / np.cos(v), 0.0),
+                                     -1e6, 1e6),
+    # NOTE: in safe mode exp is exp(-|v|) — a BOUNDED decay in [0,1].
+    # This prevents fitness-killing overflow at the cost of changing the
+    # function's meaning.  Use unsafe mode for the true exponential.
+    'exp':        lambda v: np.exp(np.clip(v, -700.0, 700.0)),
+    # Abs inside log → always real; log(0) avoided via abs (still -Inf at 0,
+    # but nan_to_num handles it)
+    'log':        lambda v: np.log(np.abs(v) + 1e-30),
+    'sqrt':       lambda v: np.sqrt(np.abs(v)),
+    'abs':        np.abs,
+    # x² as a cheap first-class unary — avoids needing mul(x,x) wiring
+    'square':     lambda v: v * v,
+    # Negation — extremely cheap, enables sign flips without 0 - x
+    'neg':        lambda v: -v,
+    # Fractional part: x - floor(x) ∈ [0,1). Useful for periodic/time data.
+    'frac':       lambda v: v - np.floor(v),
+    # Exponent clamped to avoid catastrophic overflow
+    '10^x':       lambda v: np.power(10.0, np.clip(v, -300.0, 300.0)),
+    'log10':      lambda v: np.log10(np.abs(v) + 1e-30),
+    # Exp argument clamped → sigmoid never overflows
+    'sigmoid':    lambda v: 1.0 / (1.0 + np.exp(-np.clip(v, -50.0, 50.0))),
+    'tanh':       np.tanh,
+    'relu':       lambda v: np.maximum(0.0, v),
+    'leaky_relu': lambda v: np.where(v >= 0, v, 0.01 * v),
+    'atan':       np.arctan,
+    # Exponent clamped
+    'gaussian':   lambda v: np.exp(-np.clip(v**2, 0, 500.0)),
+    # Clamp inner exp to avoid log1p overflow
+    'softplus':   lambda v: np.log1p(np.exp(np.clip(v, -500.0, 30.0))),
+    'sign':       np.sign,
+    'floor':      np.floor,
+    'ceil':       np.ceil,
+    'round':      lambda v: np.round(v),
+    'cube':       lambda v: v**3,
+    'sinc':       _sinc_fn,
+    # Epsilon inside log prevents log(0)
+    'xlogx':      lambda v: v * np.log(np.abs(v) + 1e-8),
+    'erf':        _erf_fn,
+    # Abs prevents reciprocal of negative; epsilon prevents 1/0
+    'inv':        lambda v: 1.0 / (np.abs(v) + 1e-30),
+}
+
+# ---- UNSAFE unary ----
+_UNARY_UNSAFE = {
+    'sin':        np.sin,
+    'cos':        np.cos,
+    # Raw tan — Inf near π/2 multiples (caught by nan_to_num)
+    'tan':        np.tan,
+    # TRUE exponential — can overflow to Inf for large positive v
+    'exp':        np.exp,
+    # NaN for v≤0; -Inf at v→0+
+    'log':        np.log,
+    # NaN for v<0
+    'sqrt':       np.sqrt,
+    'abs':        np.abs,
+    # x² — same in both modes (always safe)
+    'square':     lambda v: v * v,
+    # Negation — same in both modes
+    'neg':        lambda v: -v,
+    # Fractional part — same in both modes
+    'frac':       lambda v: v - np.floor(v),
+    # Inf for v>~308, underflow for v<~-308
+    '10^x':       lambda v: np.power(10.0, v),
+    # NaN for v≤0
+    'log10':      np.log10,
+    # Overflow for |v|>~710
+    'sigmoid':    lambda v: 1.0 / (1.0 + np.exp(-v)),
+    'tanh':       np.tanh,
+    'relu':       lambda v: np.maximum(0.0, v),
+    'leaky_relu': lambda v: np.where(v >= 0, v, 0.01 * v),
+    'atan':       np.arctan,
+    # Overflow for large v
+    'gaussian':   lambda v: np.exp(-(v**2)),
+    # Overflow for large v
+    'softplus':   lambda v: np.log1p(np.exp(v)),
+    'sign':       np.sign,
+    'floor':      np.floor,
+    'ceil':       np.ceil,
+    'round':      lambda v: np.round(v),
+    'cube':       lambda v: v**3,
+    'sinc':       _sinc_fn,
+    # NaN at v=0 (log(0)=-Inf, then 0*-Inf=NaN)
+    'xlogx':      lambda v: v * np.log(np.abs(v)),
+    'erf':        _erf_fn,
+    # NaN at v=0, negative for v<0
+    'inv':        lambda v: 1.0 / v,
+}
+
+# Active dispatch tables — updated in-place by set_ops_mode()
+BINARY_OPS_EVAL = dict(_BINARY_SAFE)
+UNARY_OPS_EVAL  = dict(_UNARY_SAFE)
+
+
+def set_ops_mode(safe: bool):
+    """
+    Switch the active BINARY_OPS_EVAL / UNARY_OPS_EVAL tables in-place
+    between SAFE and UNSAFE implementations.
+    Also updates SAFE_OPS_MODE so the rest of the code can query it.
+    """
+    global SAFE_OPS_MODE
+    SAFE_OPS_MODE = safe
+    src_bin = _BINARY_SAFE  if safe else _BINARY_UNSAFE
+    src_un  = _UNARY_SAFE   if safe else _UNARY_UNSAFE
+    BINARY_OPS_EVAL.clear()
+    BINARY_OPS_EVAL.update(src_bin)
+    UNARY_OPS_EVAL.clear()
+    UNARY_OPS_EVAL.update(src_un)
+
+
+def select_ops_safety():
+    """
+    Interactive prompt to choose Safe / Unsafe / Interval op mode.
+    Prints a per-op comparison table so the user knows exactly what changes.
+    """
+    global INTERVAL_MODE, INTERVAL_CHECK_FREQ
+
+    # Ops whose implementation actually differs between modes
+    DIFFERS = {
+        '/':         ("v1 / guard(v2,ε)  → 0 near zero",  "v1 / v2          → NaN/Inf at zero"),
+        'pow':       ("|v1|^clip(v2,−10,10) always real",  "v1^v2            → NaN for neg base + frac exp"),
+        'mod':       ("v1 mod guard(v2,ε) → no zero-div",  "v1 mod v2        → NaN/error at zero"),
+        'floordiv':  ("⌊v1/guard(v2,ε)⌋ → no zero-div",   "⌊v1/v2⌋          → NaN/error at zero"),
+        'harmonic':  ("2v1v2/(|v1+v2|+ε) → bounded",       "2v1v2/(v1+v2)   → NaN/Inf when v1=−v2"),
+        'geometric': ("sqrt(|v1·v2|)      → always real",   "sqrt(v1·v2)     → NaN for negative product"),
+        'tan':       ("sin/cos clamped to ±1e6",            "tan(v)          → Inf near π/2 multiples"),
+        'exp':       ("exp(clip(v, -700.0, 700.0)) → no overflow", "exp(v)          → TRUE exp, overflows for v≫0"),
+        'log':       ("log(|v|+ε)         → always finite",  "log(v)          → NaN for v≤0"),
+        'sqrt':      ("sqrt(|v|)          → always real",    "sqrt(v)         → NaN for v<0"),
+        '10^x':      ("10^clip(v,-300,300)  → no overflow",   "10^v            → Inf for v>~308"),
+        'log10':     ("log10(|v|+ε)       → always finite",  "log10(v)        → NaN for v≤0"),
+        'sigmoid':   ("σ(clip(v,−50,50))  → no overflow",    "σ(v)            → Inf for v<−710"),
+        'gaussian':  ("exp(−clip(v²,500)) → no underflow",   "exp(−v²)        → underflow for large v"),
+        'softplus':  ("log1p(exp(clip(v,30))) → safe",        "log1p(exp(v))   → Inf for v>~710"),
+        'xlogx':     ("v·log(|v|+ε)       → 0 at origin",    "v·log(|v|)     → NaN at v=0"),
+        'inv':       ("1/(|v|+ε)          → always positive", "1/v             → NaN at zero, neg for v<0"),
+    }
+
+    print("\n" + "═" * 78)
+    print("NUMERIC SAFETY MODE")
+    print("═" * 78)
+    print("Controls whether operations guard against domain errors.\n")
+    print("  [S] SAFE     — all ops are total functions; NaN/Inf can never escape")
+    print("                 a node.  Exponents are clipped to prevent Inf.")
+    print("                 Recommended for noisy data or when stability matters.\n")
+    print("  [U] UNSAFE   — raw numpy semantics; domain violations yield NaN/Inf")
+    print("                 clamped by nan_to_num in evaluate().  Mathematically")
+    print("                 purer (exp is the real exp), but noisier evolution.\n")
+    print("  [I] INTERVAL — Unsafe ops + empirical stability culling.")
+    print("                 Every", INTERVAL_CHECK_FREQ, "generations each individual is")
+    print("                 evaluated against ALL training rows.  Any individual that")
+    print("                 produces NaN or Inf on any row is immediately penalised.")
+    print("                 Unlike naive interval arithmetic this handles every actual")
+    print("                 input pattern in your data, not symbolic bounds.\n")
+    print(f"  {'Op':<12}  {'SAFE implementation':<44}  {'UNSAFE / INTERVAL'}")
+    print(f"  {'─'*12}  {'─'*44}  {'─'*34}")
+    for op, (sdesc, udesc) in DIFFERS.items():
+        print(f"  {op:<12}  {sdesc:<44}  {udesc}")
+    print()
+    print("  Note: ops not listed above (sin, cos, tanh, relu, abs, …) are")
+    print("  identical in all modes.")
+    print("═" * 78)
+
+    while True:
+        choice = input("Safety mode [S=safe / U=unsafe / I=interval, default S]: ").strip().lower()
+        if not choice or choice.startswith('s'):
+            set_ops_mode(True)
+            INTERVAL_MODE = False
+            print("  ✓  SAFE mode active — all ops are guarded against domain errors.")
+            break
+        elif choice.startswith('u'):
+            set_ops_mode(False)
+            INTERVAL_MODE = False
+            print("  ✓  UNSAFE mode active — raw numpy semantics, exp is the real exp.")
+            break
+        elif choice.startswith('i'):
+            set_ops_mode(False)   # Interval uses the unsafe dispatch tables
+            INTERVAL_MODE = True
+            freq_in = input(f"  Interval check every N generations [default {INTERVAL_CHECK_FREQ}]: ").strip()
+            if freq_in:
+                try:
+                    INTERVAL_CHECK_FREQ = max(1, int(freq_in))
+                except ValueError:
+                    pass
+            print(f"  ✓  INTERVAL mode active — unsafe ops + culling every "
+                  f"{INTERVAL_CHECK_FREQ} gens.")
+            break
+        else:
+            print("  Please enter S, U, or I.")
+
+# ----- COST TABLE -----
+OP_COSTS = {
+    # Binary
+    '+': COST_OP_SIMPLE, '-': COST_OP_SIMPLE,
+    '*': COST_OP_COMPLEX, '/': COST_OP_COMPLEX,
+    'max': COST_OP_COMPLEX, 'min': COST_OP_COMPLEX,
+    'pow': COST_OP_COMPLEX,
+    'hypot': COST_OP_COMPLEX, 'atan2': COST_UNARY_SAFE,
+    'harmonic': COST_OP_COMPLEX, 'geometric': COST_OP_COMPLEX,
+    'mod': COST_OP_COMPLEX, 'copysign': COST_OP_SIMPLE,
+    'floordiv': COST_OP_COMPLEX,
+    # Comparison operators (for if_else conditions)
+    'gt': COST_COMPARISON, 'lt': COST_COMPARISON,
+    'gte': COST_COMPARISON, 'lte': COST_COMPARISON,
+    # Ternary if_else
+    'if_else': COST_IF,
+    # Unary
+    'sin': COST_UNARY_SAFE, 'cos': COST_UNARY_SAFE,
+    'tan': COST_UNARY_SAFE,
+    'tanh': COST_UNARY_SAFE, 'sigmoid': COST_UNARY_SAFE,
+    'exp': COST_UNARY_RISK, 'log': COST_UNARY_RISK,
+    'sqrt': COST_UNARY_RISK, 'abs': COST_UNARY_CHEAP,
+    'square': COST_UNARY_CHEAP, 'neg': COST_UNARY_CHEAP,
+    'frac': COST_UNARY_CHEAP, 'round': COST_UNARY_CHEAP,
+    '10^x': COST_UNARY_RISK, 'log10': COST_UNARY_RISK,
+    'relu': COST_UNARY_CHEAP, 'leaky_relu': COST_UNARY_CHEAP,
+    'sign': COST_UNARY_CHEAP, 'floor': COST_UNARY_CHEAP,
+    'ceil': COST_UNARY_CHEAP,
+    'atan': COST_UNARY_SAFE, 'gaussian': COST_UNARY_RISK,
+    'softplus': COST_UNARY_RISK,
+    'cube': COST_OP_SIMPLE,
+    'sinc': COST_UNARY_SAFE,
+    'xlogx': COST_UNARY_RISK,
+    'erf': COST_UNARY_SAFE,
+    'inv': COST_UNARY_RISK,
+    # Other
+    'const': COST_CONST,
+}
+
+# ----- STRING REPR TABLE -----
+def _binary_str(op, s1, s2):
+    if op in ['+', '-', '*']:
+        return f"({s1} {op} {s2})"
+    elif op == '/':
+        return f"({s1} / {s2})"
+    elif op == 'floordiv':
+        return f"floor({s1} / {s2})"
+    elif op == 'pow':
+        if SAFE_OPS_MODE:
+            return f"(abs({s1})^{s2})"
+        else:
+            return f"({s1}^{s2})"
+    elif op == 'gt':
+        return f"({s1} > {s2})"
+    elif op == 'lt':
+        return f"({s1} < {s2})"
+    elif op == 'gte':
+        return f"({s1} >= {s2})"
+    elif op == 'lte':
+        return f"({s1} <= {s2})"
+    elif op.startswith('adf_'):
+        return f"{op}({s1}, {s2})"
+    else:
+        return f"{op}({s1}, {s2})"
+
+def _ternary_str(op, s1, s2, s3):
+    """String representation for ternary operators (if_else)."""
+    if op == 'if_else':
+        return f"IF({s1} THEN {s2} ELSE {s3})"
+    return f"{op}({s1}, {s2}, {s3})"
+
+def _unary_str(op, s1):
+    if op == '10^x':
+        return f"10^({s1})"
+    if op == 'square':
+        return f"({s1})²"
+    if op == 'neg':
+        return f"(-{s1})"
+    if op == 'frac':
+        return f"frac({s1})"
+    if op == 'round':
+        return f"round({s1})"
+    return f"{op}({s1})"
+
+
+# ==========================================
+# OP PRESETS & INTERACTIVE SELECTION
+# ==========================================
+
+# All ops with human-readable descriptions
+ALL_OP_DESCRIPTIONS = {
+    # Binary
+    '+':         "Addition             (x + y)  — linear combination building block",
+    '-':         "Subtraction          (x - y)  — difference, enables offsets",
+    '*':         "Multiplication       (x * y)  — product, enables interactions",
+    '/':         "Division             (x / y)  — ratio, protected against zero",
+    'max':       "Maximum              max(x,y) — piecewise max, threshold effect",
+    'min':       "Minimum              min(x,y) — piecewise min, lower-bound clip",
+    'pow':       "Power                |x|^y    — generalised polynomial",
+    'hypot':     "Hypotenuse           sqrt(x²+y²) — Euclidean distance",
+    'atan2':     "Atan2                atan2(x,y)  — angle in [-π, π]",
+    'harmonic':  "Harmonic mean        2xy/(|x+y|) — blending of two signals",
+    'geometric': "Geometric mean       sqrt(|xy|)  — multiplicative average",
+    'mod':       "Modulo               x mod y  — periodicity / remainder",
+    'copysign':  "Copysign             |x|·sign(y) — magnitude transfer",
+    'floordiv':  "Floor division       ⌊x/y⌋   — integer quotient (time/unit conv.)",
+    # Comparison operators (for if_else branching)
+    'gt':        "Greater than         (x > y)→0/1 — comparison for branching",
+    'lt':        "Less than            (x < y)→0/1 — comparison for branching",
+    'gte':       "Greater or equal     (x >= y)→0/1 — comparison for branching",
+    'lte':       "Less or equal        (x <= y)→0/1 — comparison for branching",
+    # Ternary operator
+    'if_else':   "If-Else branch       IF(cond THEN a ELSE b) — piecewise branching",
+    # Unary
+    'sin':       "Sine                 sin(x)   — oscillation, periodicity",
+    'cos':       "Cosine               cos(x)   — oscillation (phase-shifted)",
+    'tan':       "Tangent              tan(x)   — sin/cos ratio, singularities",
+    'exp':       "Exponential          exp(x)   — exponential growth/decay",
+    'log':       "Natural log          log(|x|) — compresses large values",
+    'sqrt':      "Square root          sqrt(|x|)— sublinear growth",
+    'abs':       "Absolute value       |x|      — removes sign, very cheap",
+    'square':    "Square               x²       — quadratic, very cheap",
+    'neg':       "Negation             -x       — sign flip, very cheap",
+    'frac':      "Fractional part      x-⌊x⌋   — periodic sawtooth [0,1)",
+    'round':     "Round                round(x) — nearest integer",
+    '10^x':      "Power of 10          10^x     — exponential scaling (base 10)",
+    'log10':     "Log base 10          log10|x| — order-of-magnitude scale",
+    'sigmoid':   "Sigmoid              1/(1+e⁻ˣ)— smooth 0-1 gate",
+    'tanh':      "Tanh                 tanh(x)  — smooth -1 to 1 squash",
+    'relu':      "ReLU                 max(0,x) — half-wave rectifier, cheap",
+    'leaky_relu':"Leaky ReLU  max(x,0.01x) — like ReLU but non-zero for x<0",
+    'atan':      "Arctangent           atan(x)  — bounded monotone, -π/2..π/2",
+    'gaussian':  "Gaussian             exp(-x²) — bell curve / radial basis",
+    'softplus':  "Softplus             log(1+eˣ)— smooth ReLU approximation",
+    'sign':      "Sign                 sign(x)  — +1/0/-1 indicator, cheap",
+    'floor':     "Floor                ⌊x⌋      — integer rounding down",
+    'ceil':      "Ceil                 ⌈x⌉      — integer rounding up",
+    'cube':      "Cube                 x³       — odd polynomial, cheap",
+    'sinc':      "Sinc                 sin(x)/x — decaying oscillation",
+    'xlogx':     "x·log(x)             x·log|x| — entropy-like term",
+    'erf':       "Error function       erf(x)   — S-curve from statistics",
+    'inv':       "Inverse              1/|x|    — reciprocal, singularity-safe",
+    'const':     "Constant             c        — learnable scalar constant",
+}
+
+OP_PRESETS = {
+    "1": {
+        "name": "Basic Arithmetic",
+        "desc": "Addition, subtraction, multiplication, division and constants. "
+                "Fastest search; finds linear/rational patterns.",
+        "ops": ['+', '-', '*', '/', 'const'],
+    },
+    "2": {
+        "name": "Polynomial",
+        "desc": "Arithmetic + power law. Good for polynomial / power-law regressions.",
+        "ops": ['+', '-', '*', '/', 'pow', 'const'],
+    },
+    "3": {
+        "name": "Scientific  (default)",
+        "desc": "Polynomial + exp/log. Suitable for most scientific datasets.",
+        "ops": ['+', '-', '*', '/', 'pow', 'exp', 'log', 'const'],
+    },
+    "4": {
+        "name": "Extended Scientific",
+        "desc": "Scientific + sqrt, abs, square, cube — adds sublinear / quadratic terms.",
+        "ops": ['+', '-', '*', '/', 'pow', 'exp', 'log', 'sqrt', 'abs', 'square', 'cube', 'const'],
+    },
+    "5": {
+        "name": "Trigonometric",
+        "desc": "Extended + sin/cos/tan/tanh/sigmoid. Best for periodic or bounded targets.",
+        "ops": ['+', '-', '*', '/', 'pow', 'exp', 'log', 'sqrt',
+                'sin', 'cos', 'tan', 'tanh', 'sigmoid', 'square', 'const'],
+    },
+    "6": {
+        "name": "Full  (all ops)",
+        "desc": "Every available operator. Widest search space; slowest convergence.",
+        "ops": list(ALL_OP_DESCRIPTIONS.keys()),
+    },
+    "7": {
+        "name": "Custom",
+        "desc": "Choose individual operations from the full list.",
+        "ops": None,  # filled interactively
+    },
+}
+
+
+def select_allowed_ops():
+    """Interactive prompt that returns a list of allowed ops."""
+    global ALLOWED_OPS
+
+    print("\n" + "=" * 70)
+    print("OPERATOR SELECTION")
+    print("Choose which mathematical operations the evolver may use.")
+    print("Fewer ops → faster convergence. More ops → richer expressions.")
+    print("=" * 70)
+    for key, preset in OP_PRESETS.items():
+        print(f"  [{key}] {preset['name']:<26}  {preset['desc']}")
+
+    while True:
+        choice = input("\nPreset number [default 3]: ").strip()
+        if not choice:
+            choice = "3"
+        if choice in OP_PRESETS:
+            break
+        print("  Please enter a number from 1–7.")
+
+    if choice == "7":
+        # Custom selection
+        print("\n--- Available operations (enter numbers separated by spaces or commas) ---")
+        op_list = list(ALL_OP_DESCRIPTIONS.keys())
+        for idx, op in enumerate(op_list, 1):
+            print(f"  [{idx:2d}] {ALL_OP_DESCRIPTIONS[op]}")
+        print()
+        while True:
+            raw = input("Select ops (e.g. '1 2 3 7' or '1,2,3,7'): ").strip()
+            tokens = re.split(r'[\s,]+', raw)
+            try:
+                indices = [int(t) - 1 for t in tokens if t]
+                if not indices:
+                    raise ValueError
+                chosen = [op_list[i] for i in indices if 0 <= i < len(op_list)]
+                if not chosen:
+                    raise ValueError
+                # Always warn if no const
+                if 'const' not in chosen:
+                    print("  Note: 'const' (learnable constants) not included. "
+                          "Equations will be constant-free.")
+                ALLOWED_OPS = chosen
+                break
+            except (ValueError, IndexError):
+                print("  Invalid selection. Try again.")
+    else:
+        ALLOWED_OPS = list(OP_PRESETS[choice]["ops"])
+
+    # Rebuild CGPEquation class-level op lists from new ALLOWED_OPS
+    CGPEquation.OPS_BINARY    = [op for op in BINARY_OPS_EVAL if op in ALLOWED_OPS]
+    CGPEquation.OPS_UNARY     = [op for op in UNARY_OPS_EVAL  if op in ALLOWED_OPS]
+    CGPEquation.OPS_TERNARY   = ['if_else'] if IF_ELSE_ENABLED else []
+    CGPEquation.OPS_ALL       = (CGPEquation.OPS_BINARY + CGPEquation.OPS_UNARY
+                                 + CGPEquation.OPS_TERNARY
+                                 + (['const'] if 'const' in ALLOWED_OPS else []))
+    CGPEquation.OPS_BINARY_SET  = set(CGPEquation.OPS_BINARY)
+    CGPEquation.OPS_UNARY_SET   = set(CGPEquation.OPS_UNARY)
+    CGPEquation.OPS_TERNARY_SET = set(CGPEquation.OPS_TERNARY)
+
+    print(f"\n  ✓  Using {len(ALLOWED_OPS)} ops: {ALLOWED_OPS}")
+
+    # ---- ADF (Automatically Defined Functions) ----
+    _select_adf_mode()
+
+    return ALLOWED_OPS
+
+
+def _select_adf_mode():
+    """
+    Ask the user whether to enable ADF sub-graph freezing.
+    When enabled, highly modular sub-graphs discovered during evolution are
+    extracted, frozen, and added back to ALLOWED_OPS as new single operators,
+    building a hierarchical domain-specific vocabulary automatically.
+    """
+    global ADF_ENABLED, ADF_MODULARITY_THRESH, ADF_MAX_LIBRARY, ADF_EXTRACT_FREQ
+    global ADF_RETIRE_PATIENCE
+
+    print("\n" + "─" * 70)
+    print("AUTOMATICALLY DEFINED FUNCTIONS (ADF) — Sub-graph Freezing")
+    print("─" * 70)
+    print("  When enabled, the system monitors Newman Modularity (Q) of each")
+    print("  individual's computational graph.  When a highly modular solution")
+    print("  is found, its most cohesive community (e.g. a sub-tree computing")
+    print("  x²+y²) is frozen and injected back into ALLOWED_OPS as a brand-new")
+    print("  single operator.  Future mutations can reuse this building block,")
+    print("  enabling hierarchical evolution without hitting MAX_COMPLEXITY.")
+    print()
+    print("  Admission filters prevent junk from entering the library:")
+    print("    • Constant-output bodies (variance ≈ 0 across inputs) → discarded")
+    print("    • Pure single-node wrappers around another ADF → discarded")
+    print("    • Exact body-string duplicates of existing ADFs → deduplicated")
+    print("    • Constant-folding simplification applied before admission")
+    print()
+    print("  Retirement: ADFs unused for N consecutive extraction cycles are")
+    print("  automatically removed from the operator library.")
+    print()
+    print("  Note: ADF extraction runs periodically (every N generations) in the")
+    print("  main process and is broadcast to all island workers.")
+    print("─" * 70)
+
+    choice = input("Enable ADF sub-graph freezing? [y/N]: ").strip().lower()
+    if not choice.startswith('y'):
+        ADF_ENABLED = False
+        print("  ADF disabled.")
+        return
+
+    ADF_ENABLED = True
+
+    thresh_in = input(f"  Modularity threshold to trigger extraction [default {ADF_MODULARITY_THRESH}]: ").strip()
+    if thresh_in:
+        try:
+            ADF_MODULARITY_THRESH = float(thresh_in)
+        except ValueError:
+            pass
+
+    max_in = input(f"  Maximum number of ADFs to accumulate [default {ADF_MAX_LIBRARY}]: ").strip()
+    if max_in:
+        try:
+            ADF_MAX_LIBRARY = int(max_in)
+        except ValueError:
+            pass
+
+    freq_in = input(f"  Extract ADFs every N generations [default {ADF_EXTRACT_FREQ}]: ").strip()
+    if freq_in:
+        try:
+            ADF_EXTRACT_FREQ = int(freq_in)
+        except ValueError:
+            pass
+
+    retire_in = input(f"  Retire unused ADFs after N zero-use cycles [default {ADF_RETIRE_PATIENCE}]: ").strip()
+    if retire_in:
+        try:
+            ADF_RETIRE_PATIENCE = max(1, int(retire_in))
+        except ValueError:
+            pass
+
+    print(f"  ✓  ADF enabled  (Q≥{ADF_MODULARITY_THRESH}, max {ADF_MAX_LIBRARY} ADFs, "
+          f"check every {ADF_EXTRACT_FREQ} gens, retire after {ADF_RETIRE_PATIENCE} idle cycles)")
+
+
+def _select_if_else_mode():
+    """
+    Ask the user whether to enable IF/ELSE branching.
+    Adds comparison operators and the ternary if_else node to the CGP graph,
+    creating a hybrid CGP + decision tree where conditions can compare any
+    sub-expressions and branches can return constants, 0/1, or equations.
+    """
+    global IF_ELSE_ENABLED
+
+    print("\n" + "─" * 70)
+    print("IF/ELSE BRANCHING — CGP + Decision Tree Hybrid")
+    print("─" * 70)
+    print("  When enabled, adds:")
+    print("    • Comparison ops: gt (>), lt (<), gte (>=), lte (<=)")
+    print("      These return 0.0 or 1.0 and can compare:")
+    print("        - constants to variables      (e.g. x > 3.5)")
+    print("        - variables to variables       (e.g. x > y)")
+    print("        - equations to constants       (e.g. sin(x) > 0)")
+    print("        - equations to equations       (e.g. x² > log(y))")
+    print()
+    print("    • if_else(condition, true_branch, false_branch)")
+    print("      A ternary node: when condition > 0.5, outputs true_branch,")
+    print("      otherwise outputs false_branch.  Branches can be:")
+    print("        - a constant  (e.g. IF x > 0 THEN 1.5 ELSE -1.5)")
+    print("        - 0/1 boolean (e.g. IF x > y THEN 1 ELSE 0)")
+    print("        - an equation (e.g. IF x > 0 THEN x² ELSE exp(x))")
+    print()
+    print("  This creates a hybrid between CGP and decision trees.  Useful for")
+    print("  piecewise functions, threshold effects, and classification-style splits.")
+    print("  The comparison + branch structure can nest arbitrarily deep.")
+    print()
+    print("  Cost: if_else = 10.0, comparisons = 3.0 each")
+    print("─" * 70)
+
+    choice = input("Enable IF/ELSE branching? [y/N]: ").strip().lower()
+    if choice.startswith('y'):
+        IF_ELSE_ENABLED = True
+        # Add comparison ops to ALLOWED_OPS if not already there
+        comparison_ops = ['gt', 'lt', 'gte', 'lte']
+        for op in comparison_ops:
+            if op not in ALLOWED_OPS:
+                ALLOWED_OPS.append(op)
+        # Rebuild CGPEquation op lists
+        CGPEquation.OPS_BINARY    = [op for op in BINARY_OPS_EVAL if op in ALLOWED_OPS]
+        CGPEquation.OPS_UNARY     = [op for op in UNARY_OPS_EVAL  if op in ALLOWED_OPS]
+        CGPEquation.OPS_TERNARY   = ['if_else']
+        CGPEquation.OPS_ALL       = (CGPEquation.OPS_BINARY + CGPEquation.OPS_UNARY
+                                     + CGPEquation.OPS_TERNARY
+                                     + (['const'] if 'const' in ALLOWED_OPS else []))
+        CGPEquation.OPS_BINARY_SET  = set(CGPEquation.OPS_BINARY)
+        CGPEquation.OPS_UNARY_SET   = set(CGPEquation.OPS_UNARY)
+        CGPEquation.OPS_TERNARY_SET = set(CGPEquation.OPS_TERNARY)
+        print(f"  ✓  IF/ELSE enabled  (comparison ops: {comparison_ops})")
+        print(f"      Total ops now: {len(CGPEquation.OPS_ALL)} "
+              f"({len(CGPEquation.OPS_BINARY)} binary + "
+              f"{len(CGPEquation.OPS_UNARY)} unary + "
+              f"{len(CGPEquation.OPS_TERNARY)} ternary + const)")
+
+        # ── Differentiable branching sub-option ──────────────────────────
+        global DIFFERENTIABLE_BRANCHING, DIFF_BRANCH_STEEPNESS
+        print()
+        print("  ── Differentiable Branching ──")
+        print("  Standard IF/ELSE uses a hard threshold: np.where(cond > 0.5, T, F)")
+        print("  Differentiable mode replaces this with a smooth sigmoid blend:")
+        print("    σ(k·(cond - 0.5))·T + (1 - σ(k·(cond - 0.5)))·F")
+        print("  Benefits: constant optimisation can gradient-smooth through branches,")
+        print("  and gradient boosting gets smoother ensemble predictions.")
+        print("  Trade-off: branch boundaries are slightly softer, which may reduce")
+        print("  interpretability of piecewise-constant expressions.")
+        diff_choice = input("  Enable differentiable branching? [y/N]: ").strip().lower()
+        if diff_choice.startswith('y'):
+            DIFFERENTIABLE_BRANCHING = True
+            steep_in = input(f"    Steepness k (10=soft, 20=default, 50=sharp) "
+                             f"[default {DIFF_BRANCH_STEEPNESS}]: ").strip()
+            if steep_in:
+                try:
+                    DIFF_BRANCH_STEEPNESS = max(1.0, float(steep_in))
+                except ValueError:
+                    pass
+            print(f"    ✓  Differentiable branching ON (k={DIFF_BRANCH_STEEPNESS})")
+        else:
+            DIFFERENTIABLE_BRANCHING = False
+            print("    Differentiable branching OFF (hard threshold).")
+    else:
+        IF_ELSE_ENABLED = False
+        CGPEquation.OPS_TERNARY     = []
+        CGPEquation.OPS_TERNARY_SET = set()
+        # Rebuild OPS_ALL without ternary
+        CGPEquation.OPS_ALL = (CGPEquation.OPS_BINARY + CGPEquation.OPS_UNARY
+                               + (['const'] if 'const' in ALLOWED_OPS else []))
+        print("  IF/ELSE disabled.")
+
+
+def _select_gradient_boosting():
+    """
+    Ask the user whether to enable gradient boosting mode.
+    When enabled, evolution runs in multiple stages on residuals.
+    Now supports classification (binary + multi-class) automatically.
+    """
+    global GRADIENT_BOOSTING_ENABLED, GRADIENT_BOOSTING_STAGES
+    global GRADIENT_BOOSTING_LR, GRADIENT_BOOSTING_GENS
+    global GRADIENT_BOOSTING_SUBSAMPLE, GRADIENT_BOOSTING_LR_DECAY
+    global GRADIENT_BOOSTING_L2_LEAF, GRADIENT_BOOSTING_DART_DROP
+    global GRADIENT_BOOSTING_PATIENCE, GRADIENT_BOOSTING_HESSIAN
+
+    print("\n" + "─" * 70)
+    print("GRADIENT BOOSTING MODE")
+    print("─" * 70)
+    print("  XGBoost-inspired: runs multiple sequential CGP evolution stages.")
+    print("  After each stage, the best model's predictions are subtracted")
+    print("  from the residuals and the next stage evolves on the remainder.")
+    print("  Final prediction = sum of (learning_rate × stage_model(x)) for all stages.")
+    print()
+    print("  Supports REGRESSION (L2 residuals) and CLASSIFICATION (logistic /")
+    print("  softmax pseudo-residuals).  Classification outputs are detected")
+    print("  automatically — no manual configuration needed.")
+    print()
+    print("  Works with any operator set — IF/ELSE branches make it especially")
+    print("  powerful since each boosting stage can focus on different data regions.")
+    print()
+    print("  Features: Newton+grid line search, stochastic row subsampling,")
+    print("  LR decay, DART dropout, L2 regularisation, snapshot early stopping.")
+    print("─" * 70)
+
+    choice = input("Enable Gradient Boosting? [y/N]: ").strip().lower()
+    if not choice.startswith('y'):
+        GRADIENT_BOOSTING_ENABLED = False
+        print("  Gradient Boosting disabled.")
+        return
+
+    GRADIENT_BOOSTING_ENABLED = True
+
+    stages_in = input(f"  Number of boosting stages [default {GRADIENT_BOOSTING_STAGES}]: ").strip()
+    if stages_in:
+        try:
+            GRADIENT_BOOSTING_STAGES = max(2, int(stages_in))
+        except ValueError:
+            pass
+
+    lr_in = input(f"  Learning rate (shrinkage) [default {GRADIENT_BOOSTING_LR}]: ").strip()
+    if lr_in:
+        try:
+            GRADIENT_BOOSTING_LR = max(0.01, min(1.0, float(lr_in)))
+        except ValueError:
+            pass
+
+    gens_in = input(f"  Generations per stage [default {GRADIENT_BOOSTING_GENS}]: ").strip()
+    if gens_in:
+        try:
+            GRADIENT_BOOSTING_GENS = max(100, int(gens_in))
+        except ValueError:
+            pass
+
+    sub_in = input(f"  Row subsample fraction (stochastic GB) [default {GRADIENT_BOOSTING_SUBSAMPLE}]: ").strip()
+    if sub_in:
+        try:
+            GRADIENT_BOOSTING_SUBSAMPLE = max(0.1, min(1.0, float(sub_in)))
+        except ValueError:
+            pass
+
+    decay_in = input(f"  LR decay per stage (1.0=none, 0.95=gradual) [default {GRADIENT_BOOSTING_LR_DECAY}]: ").strip()
+    if decay_in:
+        try:
+            GRADIENT_BOOSTING_LR_DECAY = max(0.5, min(1.0, float(decay_in)))
+        except ValueError:
+            pass
+
+    dart_in = input(f"  DART dropout probability (0=off) [default {GRADIENT_BOOSTING_DART_DROP}]: ").strip()
+    if dart_in:
+        try:
+            GRADIENT_BOOSTING_DART_DROP = max(0.0, min(0.5, float(dart_in)))
+        except ValueError:
+            pass
+
+    l2_in = input(f"  L2 regularisation on stage predictions (0=off) [default {GRADIENT_BOOSTING_L2_LEAF}]: ").strip()
+    if l2_in:
+        try:
+            GRADIENT_BOOSTING_L2_LEAF = max(0.0, float(l2_in))
+        except ValueError:
+            pass
+
+    hess_in = input(f"  2nd-order (Hessian) fitness for classification? [Y/n, default Y]: ").strip().lower()
+    if hess_in.startswith('n'):
+        GRADIENT_BOOSTING_HESSIAN = False
+    else:
+        GRADIENT_BOOSTING_HESSIAN = True
+
+    print(f"  ✓  Gradient Boosting enabled  "
+          f"(stages={GRADIENT_BOOSTING_STAGES}, lr={GRADIENT_BOOSTING_LR}, "
+          f"gens/stage={GRADIENT_BOOSTING_GENS})")
+    extras = []
+    if GRADIENT_BOOSTING_HESSIAN:
+        extras.append("2nd-order Hessian=ON")
+    if GRADIENT_BOOSTING_SUBSAMPLE < 1.0:
+        extras.append(f"subsample={GRADIENT_BOOSTING_SUBSAMPLE:.0%}")
+    if GRADIENT_BOOSTING_LR_DECAY < 1.0:
+        extras.append(f"decay={GRADIENT_BOOSTING_LR_DECAY}")
+    if GRADIENT_BOOSTING_DART_DROP > 0:
+        extras.append(f"DART={GRADIENT_BOOSTING_DART_DROP:.0%}")
+    if GRADIENT_BOOSTING_L2_LEAF > 0:
+        extras.append(f"L2={GRADIENT_BOOSTING_L2_LEAF}")
+    if extras:
+        print(f"     {', '.join(extras)}")
+
+
+# ==========================================
+# ALGEBRAIC SIMPLIFICATION
+# ==========================================
+
+def advanced_simplify_expr(sympy_expr):
+    """
+    Try multiple sympy simplification strategies and return the shortest result.
+    Strategies tried: simplify, expand, factor, cancel, radsimp, trigsimp,
+    powsimp, and nsimplify. This is much more thorough than a plain simplify().
+    """
+    if sympy is None or sympy_expr is None:
+        return sympy_expr
+    strategies = [
+        ("simplify",  lambda e: sympy.simplify(e)),
+        ("expand",    lambda e: sympy.expand(e)),
+        ("factor",    lambda e: sympy.factor(e)),
+        ("cancel",    lambda e: sympy.cancel(e)),
+        ("radsimp",   lambda e: sympy.radsimp(e)),
+        ("trigsimp",  lambda e: sympy.trigsimp(e)),
+        ("powsimp",   lambda e: sympy.powsimp(e, force=True)),
+    ]
+    best = sympy_expr
+    best_len = len(str(sympy_expr))
+    for name, strat in strategies:
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                result = strat(sympy_expr)
+            rlen = len(str(result))
+            if rlen < best_len:
+                best = result
+                best_len = rlen
+        except Exception:
+            pass
+    return best
+
+
+def _topological_sort_eq(eq):
+    eq.update_active_nodes()
+    
+    # Standard Kahn's algorithm or iterative DFS for post-order
+    visited = set()
+    topo = []
+    stack = [(eq.out_idx, False)] # (index, processed_children)
+
+    while stack:
+        idx, processed = stack.pop()
+        if idx in visited or idx < eq.n_features:
+            if idx >= eq.n_features and not processed:
+                # We still need to add features/already visited to topo if they are leaves
+                pass 
+            if idx < eq.n_features and idx not in visited:
+                # Features are always leaves, but we don't re-index them
+                visited.add(idx)
+            continue
+
+        if processed:
+            visited.add(idx)
+            topo.append(idx)
+        else:
+            # Push self back with processed=True
+            stack.append((idx, True))
+            node = eq.nodes[idx - eq.n_features]
+            if node.op != 'const':
+                # Push inputs to be processed first
+                if node.op in eq.OPS_TERNARY_SET:
+                    stack.append((node.in3, False))
+                    stack.append((node.in2, False))
+                elif node.op in eq.OPS_BINARY_SET:
+                    stack.append((node.in2, False))
+                stack.append((node.in1, False))
+
+    # Build old_idx → new_idx mapping (feature slots stay unchanged)
+    old_to_new = {i: i for i in range(eq.n_features)}
+    for new_local, old_idx in enumerate(topo):
+        old_to_new[old_idx] = eq.n_features + new_local
+
+    # ... (the rest of the mapping logic remains the same)
+    # Rebuild node list in topological order, remapping all in1/in2 refs
+    new_nodes = []
+    for old_idx in topo:
+        node = eq.nodes[old_idx - eq.n_features]
+        new_nodes.append(CGPNode(
+            node.op,
+            old_to_new.get(node.in1, node.in1),
+            old_to_new.get(node.in2, node.in2),
+            node.const_val,
+            in3=old_to_new.get(node.in3, node.in3),
+        ))
+
+    # Pad to at least the original max_nodes with dead const nodes
+    while len(new_nodes) < eq.max_nodes:
+        new_nodes.append(CGPNode('const', 0, 0, 0.0))
+
+    eq.nodes    = new_nodes
+    eq.max_nodes = len(new_nodes)
+    eq.out_idx  = old_to_new.get(eq.out_idx, eq.out_idx)
+    eq.update_active_nodes()
+    return eq
+
+
+def _inline_adf_in_eq(eq):
+    """
+    Expand every ADF node in a CGP equation into its constituent primitive
+    nodes, making the full computation visible to the algebraic simplifier.
+
+    Strategy (single forward pass — topological order is preserved because
+    active_nodes are sorted and newly appended nodes have higher indices):
+
+      For each active ADF node:
+        1. Map the ADF's abstract input slots to the actual CGP indices that
+           feed the ADF node (in1 for unary, in1+in2 for binary).
+        2. Append one new CGPNode per entry in adf_dict['node_data'].
+        3. Rewire every downstream node (and the graph output) that referenced
+           the ADF node's slot to point to the new output node.
+        4. Mark the original ADF node as a dead 'const' so it is pruned from
+           active_nodes on the next update_active_nodes() call.
+
+    After all inlining, _topological_sort_eq() is called to restore the
+    CGP index-ordering invariant (all deps at lower indices than consumers),
+    which is required by both evaluate() and simplify_cgp_tree().
+
+    Returns True if anything was inlined, False otherwise.
+    """
+    eq.update_active_nodes()
+    inlined_any = False
+
+    # Snapshot the active set — we must not iterate while modifying
+    for idx in sorted(list(eq.active_nodes)):
+        if idx < eq.n_features:
+            continue
+        node_local = idx - eq.n_features
+        node       = eq.nodes[node_local]
+
+        if not node.op.startswith('adf_'):
+            continue
+        adf_d = next((d for d in _ADF_REGISTRY if d['name'] == node.op), None)
+        if adf_d is None:
+            continue
+
+        n_in      = adf_d['n_inputs']
+        node_data = adf_d['node_data']
+        out_slot  = adf_d['output_slot']
+
+        # Map abstract ADF input slots → real CGP indices
+        slot_to_cgp = {0: node.in1}
+        if n_in >= 2:
+            slot_to_cgp[1] = node.in2
+
+        # Append one new CGPNode per ADF internal node
+        for j, (op, in1s, in2s, cval) in enumerate(node_data):
+            abs_slot = n_in + j
+            in1_cgp  = slot_to_cgp.get(in1s, 0)
+            in2_cgp  = slot_to_cgp.get(in2s, 0)
+            eq.nodes.append(CGPNode(op, in1_cgp, in2_cgp, cval))
+            new_cgp_idx = eq.n_features + len(eq.nodes) - 1
+            slot_to_cgp[abs_slot] = new_cgp_idx
+
+        eq.max_nodes  = len(eq.nodes)
+        adf_out_cgp   = slot_to_cgp[out_slot]
+
+        # Rewire: everything pointing to the old ADF slot → new output node
+        for n2 in eq.nodes:
+            if n2.in1 == idx:
+                n2.in1 = adf_out_cgp
+            if n2.in2 == idx:
+                n2.in2 = adf_out_cgp
+            if n2.in3 == idx:
+                n2.in3 = adf_out_cgp
+        if eq.out_idx == idx:
+            eq.out_idx = adf_out_cgp
+
+        # Kill the original ADF node (dead after rewiring)
+        node.op        = 'const'
+        node.const_val = 0.0
+
+        inlined_any = True
+
+    if inlined_any:
+        # Restore the CGP index-ordering invariant so that
+        # sorted(active_nodes) == correct evaluation order.
+        _topological_sort_eq(eq)
+
+    return inlined_any
+
+
+def simplify_cgp_tree(cgp_eq):
+    """
+    Algebraic simplification directly on a CGP tree (no sympy needed).
+
+    Pass 1  (Constant folding) — subtrees whose every active input is a
+              constant are collapsed into a single 'const' node.
+              ADF operators registered in UNARY_OPS_EVAL / BINARY_OPS_EVAL
+              are callable, so adf_X(const) → const is handled automatically
+              by the same dispatch tables used during evaluation — no special
+              treatment required.
+
+    Pass 2  (Identity reduction) — x*1→x, x+0→x, x-0→x, x/1→x, x^1→x,
+              x*0→0, x^0→1, 0/x→0  (redirect output pointers).
+
+    NOTE: ADF nodes with variable inputs are intentionally left intact.
+    Inlining them back to primitives would (a) increase complexity, worsening
+    fitness under parsimony pressure and (b) destroy the compact hierarchical
+    vocabulary that ADF extraction is trying to build up.  The original Pass 0
+    inline expansion is therefore NOT performed here.
+
+    Passes 1 and 2 repeat up to MAX_PASSES times until no more changes occur.
+    Returns a simplified deep-copy.  Updates active_nodes afterwards.
+    """
+    eq = copy.deepcopy(cgp_eq)
+
+    def _redirect(idx, redirect_to):
+        """Rewrite every reference to *idx* → *redirect_to* in the graph.
+        Returns True if any pointer was changed."""
+        did = False
+        for n2 in eq.nodes:
+            if n2.in1 == idx:
+                n2.in1 = redirect_to
+                did = True
+            if n2.in2 == idx:
+                n2.in2 = redirect_to
+                did = True
+            if n2.in3 == idx:
+                n2.in3 = redirect_to
+                did = True
+        if eq.out_idx == idx:
+            eq.out_idx = redirect_to
+            did = True
+        return did
+
+    MAX_PASSES = 8
+    for _ in range(MAX_PASSES):
+        eq.update_active_nodes()
+        changed = False
+
+        for idx in sorted(eq.active_nodes):
+            if idx < eq.n_features:
+                continue
+            node_idx = idx - eq.n_features
+            node = eq.nodes[node_idx]
+            if node.op == 'const':
+                continue
+
+            def _is_const(i):
+                return (i >= eq.n_features
+                        and eq.nodes[i - eq.n_features].op == 'const')
+
+            def _cval(i):
+                return eq.nodes[i - eq.n_features].const_val
+
+            # ---- CONSTANT FOLDING ----
+            # Works for ADF unary ops too: UNARY_OPS_EVAL['adf_N'] is the
+            # callable ADFOperator, so the dispatch below naturally folds it.
+            if node.op in eq.OPS_UNARY_SET and _is_const(node.in1):
+                try:
+                    v = UNARY_OPS_EVAL[node.op](np.array([_cval(node.in1)]))[0]
+                    if np.isfinite(v):
+                        node.op = 'const'
+                        node.const_val = float(v)
+                        changed = True
+                        continue
+                except Exception:
+                    pass
+
+            if node.op in eq.OPS_BINARY_SET:
+                c1, c2 = _is_const(node.in1), _is_const(node.in2)
+                if c1 and c2:
+                    try:
+                        v = BINARY_OPS_EVAL[node.op](
+                            np.array([_cval(node.in1)]),
+                            np.array([_cval(node.in2)]))[0]
+                        if np.isfinite(v):
+                            node.op = 'const'
+                            node.const_val = float(v)
+                            changed = True
+                            continue
+                    except Exception:
+                        pass
+
+                # ---- IDENTITY REDUCTION (fold-to-zero / fold-to-one) ----
+                # x * 0 = 0 and 0 * x = 0
+                if node.op == '*':
+                    if (c1 and abs(_cval(node.in1)) < 1e-9) or \
+                       (c2 and abs(_cval(node.in2)) < 1e-9):
+                        node.op = 'const'
+                        node.const_val = 0.0
+                        changed = True
+                        continue
+                # 0 / x = 0
+                if node.op == '/' and c1 and abs(_cval(node.in1)) < 1e-9:
+                    node.op = 'const'
+                    node.const_val = 0.0
+                    changed = True
+                    continue
+                # x ^ 0 = 1
+                if node.op == 'pow' and c2 and abs(_cval(node.in2)) < 1e-9:
+                    node.op = 'const'
+                    node.const_val = 1.0
+                    changed = True
+                    continue
+
+                # ---- IDENTITY REDUCTION (redirect pointers) ----
+                # These replace references to this node with a direct pointer
+                # to one of its inputs (effectively removing the node).
+                redirect_to = None
+                if node.op in ('+', '-') and c2 and abs(_cval(node.in2)) < 1e-9:
+                    redirect_to = node.in1   # x ± 0 → x
+                if node.op == '+' and c1 and abs(_cval(node.in1)) < 1e-9:
+                    redirect_to = node.in2   # 0 + x → x
+                if node.op == '*' and c2 and abs(_cval(node.in2) - 1.0) < 1e-9:
+                    redirect_to = node.in1   # x * 1 → x
+                if node.op == '*' and c1 and abs(_cval(node.in1) - 1.0) < 1e-9:
+                    redirect_to = node.in2   # 1 * x → x
+                if node.op == '/' and c2 and abs(_cval(node.in2) - 1.0) < 1e-9:
+                    redirect_to = node.in1   # x / 1 → x
+                if node.op == 'pow' and c2 and abs(_cval(node.in2) - 1.0) < 1e-9:
+                    redirect_to = node.in1   # x ^ 1 → x
+
+                if redirect_to is not None:
+                    changed |= _redirect(idx, redirect_to)
+
+            # ---- IF_ELSE CONSTANT FOLDING ----
+            if node.op in eq.OPS_TERNARY_SET and node.op == 'if_else':
+                c1 = _is_const(node.in1)
+                c2 = _is_const(node.in2)
+                c3 = _is_const(node.in3)
+                # If condition is a known constant, redirect to the chosen branch
+                if c1:
+                    cond_val = _cval(node.in1)
+                    redirect_to = node.in2 if cond_val > 0.5 else node.in3
+                    changed |= _redirect(idx, redirect_to)
+                    continue
+                # If both branches are the same node, result is always that node
+                if node.in2 == node.in3:
+                    changed |= _redirect(idx, node.in2)
+                    continue
+                # If both branches are constants, fold to a single constant
+                # (only when condition is also constant — handled above — so
+                # this folds if_else(var, c1, c1) when c1==c2)
+                if c2 and c3 and abs(_cval(node.in2) - _cval(node.in3)) < 1e-12:
+                    node.op = 'const'
+                    node.const_val = _cval(node.in2)
+                    changed = True
+                    continue
+
+        if not changed:
+            break
+
+    eq.update_active_nodes()
+    return eq
+
+
+def apply_simplification_pass(islands_pop, hofs, X, Y, out_types, target_grads_list=None):
+    """
+    Apply simplify_cgp_tree() to every individual in every island and every
+    Hall-of-Fame entry.  Recalculates fitness after simplification so that
+    reduced-complexity individuals are correctly scored.
+    Prints a short summary of how many nodes were pruned overall.
+    """
+    if target_grads_list is None:
+        target_grads_list = [None] * len(hofs)
+    n_outputs = len(hofs)
+    total_before = 0
+    total_after  = 0
+    count = 0
+
+    # ---- Islands ----
+    for island_pops in islands_pop:           # list of lists [island][output]
+        for o_idx, pop in enumerate(island_pops):
+            for ind in pop:
+                old_c = ind.complexity
+                ind.tree = simplify_cgp_tree(ind.tree)
+                ind.tree.update_active_nodes()
+                ind.calculate_fitness(X, Y[:, o_idx], out_types[o_idx],
+                                      update_affine=False,
+                                      target_grads=(target_grads_list[o_idx]
+                                                    if target_grads_list else None))
+                total_before += old_c
+                total_after  += ind.complexity
+                count += 1
+
+    # ---- Hall of Fame ----
+    for o_idx, hof in enumerate(hofs):
+        for c_key in list(hof.best_by_complexity.keys()):
+            ind = hof.best_by_complexity[c_key]
+            old_c = ind.complexity
+            ind.tree = simplify_cgp_tree(ind.tree)
+            ind.tree.update_active_nodes()
+            ind.calculate_fitness(X, Y[:, o_idx], out_types[o_idx],
+                                  update_affine=False,
+                                  target_grads=(target_grads_list[o_idx]
+                                                if target_grads_list else None))
+            total_before += old_c
+            total_after  += ind.complexity
+            count += 1
+        # Rebuild HoF keyed by new (possibly lower) complexity
+        new_dict = {}
+        for ind in hof.best_by_complexity.values():
+            nc = ind.complexity
+            if nc not in new_dict or ind.loss < new_dict[nc].loss:
+                new_dict[nc] = ind
+        hof.best_by_complexity = new_dict
+        # Purge zombies exposed by new complexities / losses after simplification
+        hof.sanitize()
+
+    saved = total_before - total_after
+    pct   = 100.0 * saved / (total_before + 1e-8)
+    print(f"  [Simplify] {count} individuals | "
+          f"complexity {total_before:.0f} → {total_after:.0f}  "
+          f"(−{saved:.0f}, {pct:.1f}% reduction)")
+
+
+
+# ==========================================
+# AUTOMATICALLY DEFINED FUNCTIONS (ADF)
+# Sub-graph Freezing & Hierarchical Evolution
+# ==========================================
+
+class ADFOperator:
+    """
+    A frozen sub-graph extracted from a high-modularity individual.
+    Serialisable (no lambdas): stores raw node_data tuples so it survives
+    pickle round-trips into ProcessPoolExecutor workers.
+    """
+    __slots__ = ('name', 'n_inputs', '_node_data',
+                 '_total_slots', '_output_slot', '_n_adf_inputs')
+
+    def __init__(self, name, n_inputs, node_data, total_slots, output_slot):
+        self.name          = name
+        self.n_inputs      = n_inputs          # 1 = unary ADF, 2 = binary ADF
+        self._node_data    = node_data         # list of (op, in1_slot, in2_slot, const_val)
+        self._total_slots  = total_slots
+        self._output_slot  = output_slot
+        self._n_adf_inputs = n_inputs
+
+    # ---- make it callable like a numpy ufunc ----
+    def __call__(self, *args):
+        """Evaluate the frozen sub-graph.  args = (v1,) or (v1, v2)."""
+        v0 = np.asarray(args[0], dtype=float)
+        scalar = v0.ndim == 0
+        if scalar:
+            v0 = v0.reshape(1)
+        batch = v0.shape[0]
+
+        buf = np.zeros((batch, self._total_slots))
+        for i, v in enumerate(args):
+            buf[:, i] = np.asarray(v, dtype=float).reshape(-1) if not scalar else np.asarray(v).ravel()
+
+        for j, (op, in1, in2, cval) in enumerate(self._node_data):
+            slot = self._n_adf_inputs + j
+            v1 = buf[:, in1]
+            if op == 'const':
+                buf[:, slot] = cval
+            elif op in BINARY_OPS_EVAL:
+                v2 = buf[:, in2]
+                r = BINARY_OPS_EVAL[op](v1, v2)
+                buf[:, slot] = np.nan_to_num(r, nan=0.0, posinf=1e9, neginf=-1e9)
+            elif op in UNARY_OPS_EVAL:
+                r = UNARY_OPS_EVAL[op](v1)
+                buf[:, slot] = np.nan_to_num(r, nan=0.0, posinf=1e9, neginf=-1e9)
+            else:
+                buf[:, slot] = 0.0
+
+        result = buf[:, self._output_slot]
+        return result[0] if scalar else result
+
+    def to_dict(self):
+        """Serialise to a plain dict for passing to subprocesses."""
+        return {
+            'name':        self.name,
+            'n_inputs':    self.n_inputs,
+            'node_data':   self._node_data,
+            'total_slots': self._total_slots,
+            'output_slot': self._output_slot,
+        }
+
+    @classmethod
+    def from_dict(cls, d):
+        return cls(d['name'], d['n_inputs'],
+                   d['node_data'], d['total_slots'], d['output_slot'])
+
+
+def _extract_community_adf(cgp_eq, community_nodes):
+    """
+    Try to extract one community from a CGP graph as an ADFOperator.
+    Returns (ADFOperator, n_inputs) or None on failure.
+
+    community_nodes : iterable of global node indices (feature slots + compute slots).
+
+    Key insight: ``const`` nodes inside the community whose values differ across
+    individuals represent *variable* parameters, not truly frozen constants.
+    We therefore treat them as additional input slots rather than baking their
+    current value in.  Concretely:
+
+      • Internal const nodes that are referenced by >= 1 other node inside the
+        community are considered a "boundary const" and promoted to an input
+        slot.  This lets e.g. the motif abs(C)^(abs(x)^k) be extracted as a
+        BINARY adf(C, x) rather than a unary adf(x) with one frozen constant,
+        making the ADF far more reusable across individuals with different C.
+
+      • The promotion is capped: if the total inputs (external feature refs +
+        promoted consts) would exceed 2, we skip promotion for the least-used
+        consts until we are back at ≤ 2 inputs.
+    """
+    community_set  = set(community_nodes)
+    compute_nodes  = sorted(idx for idx in community_set if idx >= cgp_eq.n_features)
+    if len(compute_nodes) < 2:
+        return None
+
+    # ── Step 1: find genuine external feature/variable inputs ────────────────
+    # External = anything referenced by a compute node that is NOT itself a
+    # compute node inside the community.  This includes:
+    #   (a) nodes outside the community entirely (other compute nodes), AND
+    #   (b) feature slots (idx < n_features) that happen to BE in community_set
+    #       — these are global graph inputs, not internal computations; the ADF
+    #       must receive them as arguments.
+    external_inputs = set()
+    for idx in compute_nodes:
+        node = cgp_eq.nodes[idx - cgp_eq.n_features]
+        if node.op == 'const':
+            continue
+        refs = [node.in1]
+        if node.op in cgp_eq.OPS_BINARY_SET:
+            refs.append(node.in2)
+        elif node.op in cgp_eq.OPS_TERNARY_SET:
+            refs.append(node.in2)
+            refs.append(node.in3)
+        for ref in refs:
+            # Feature slot → always an input (even if inside community_set)
+            if ref < cgp_eq.n_features:
+                external_inputs.add(ref)
+            # Compute node outside community → also an input
+            elif ref not in community_set:
+                external_inputs.add(ref)
+            # Const node inside community → handled in step 2
+
+
+    # ── Step 2: find boundary const nodes inside the community ───────────────
+    # Count how many non-const community nodes reference each internal const.
+    const_ref_count = Counter()
+    for idx in compute_nodes:
+        node = cgp_eq.nodes[idx - cgp_eq.n_features]
+        if node.op == 'const':
+            continue
+        refs = [node.in1]
+        if node.op in cgp_eq.OPS_BINARY_SET:
+            refs.append(node.in2)
+        elif node.op in cgp_eq.OPS_TERNARY_SET:
+            refs.append(node.in2)
+            refs.append(node.in3)
+        for ref in refs:
+            if (ref in community_set
+                    and ref >= cgp_eq.n_features
+                    and cgp_eq.nodes[ref - cgp_eq.n_features].op == 'const'):
+                const_ref_count[ref] += 1
+
+    # Promote the most-referenced internal consts to inputs, up to the budget.
+    budget          = 2
+    remaining       = budget - len(external_inputs)
+    promoted_consts = set()
+    if remaining > 0:
+        for const_idx, _ in const_ref_count.most_common():
+            if remaining <= 0:
+                break
+            promoted_consts.add(const_idx)
+            remaining -= 1
+
+    all_inputs = sorted(external_inputs) + sorted(promoted_consts)
+    n_ext      = len(all_inputs)
+
+    if n_ext == 0 or n_ext > 2:
+        return None
+
+    # ── Step 3: find the community's output node ─────────────────────────────
+    output_candidates = []
+    for idx in compute_nodes:
+        if idx == cgp_eq.out_idx:
+            output_candidates.append(idx)
+            continue
+        for other in cgp_eq.active_nodes:
+            if other in community_set or other < cgp_eq.n_features:
+                continue
+            n = cgp_eq.nodes[other - cgp_eq.n_features]
+            if n.in1 == idx or (n.op in cgp_eq.OPS_BINARY_SET and n.in2 == idx):
+                output_candidates.append(idx)
+                break
+    if not output_candidates:
+        output_candidates = [max(compute_nodes)]
+
+    output_node = output_candidates[0]
+
+    # ── Step 4: build slot mapping ───────────────────────────────────────────
+    slot = {}
+    for i, orig_idx in enumerate(all_inputs):
+        slot[orig_idx] = i
+
+    # Promoted const nodes no longer appear as internal compute nodes
+    internal_compute = [idx for idx in compute_nodes if idx not in promoted_consts]
+    if len(internal_compute) < 1:
+        return None
+
+    internal_base = n_ext
+    for j, idx in enumerate(internal_compute):
+        slot[idx] = internal_base + j
+
+    total_slots = n_ext + len(internal_compute)
+    output_slot = slot.get(output_node)
+    if output_slot is None:
+        return None
+
+    # ── Step 5: build node_data (skip promoted const nodes) ──────────────────
+    node_data = []
+    for idx in internal_compute:
+        node = cgp_eq.nodes[idx - cgp_eq.n_features]
+        in1s = slot.get(node.in1, 0)
+        in2s = slot.get(node.in2, 0)
+        node_data.append((node.op, in1s, in2s, node.const_val))
+
+    if not node_data:
+        return None
+
+    try:
+        adf = ADFOperator(
+            name        = "",
+            n_inputs    = n_ext,
+            node_data   = node_data,
+            total_slots = total_slots,
+            output_slot = output_slot,
+        )
+        return adf, n_ext
+    except Exception:
+        return None
+
+
+def _adf_signature(node_data):
+    """A hashable fingerprint for deduplication."""
+    return tuple((op, in1, in2, round(cv, 4)) for (op, in1, in2, cv) in node_data)
+
+
+def _register_adf_in_tables(adf_op):
+    """
+    Register an ADFOperator into the module-level dispatch tables and
+    CGPEquation class-level op lists.  Safe to call multiple times
+    (checks for duplicates by name).
+    """
+    name = adf_op.name
+    if name in BINARY_OPS_EVAL or name in UNARY_OPS_EVAL:
+        return   # already registered
+
+    if adf_op.n_inputs == 1:
+        UNARY_OPS_EVAL[name]  = adf_op
+        CGPEquation.OPS_UNARY.append(name)
+        CGPEquation.OPS_UNARY_SET.add(name)
+    else:
+        BINARY_OPS_EVAL[name] = adf_op
+        CGPEquation.OPS_BINARY.append(name)
+        CGPEquation.OPS_BINARY_SET.add(name)
+
+    CGPEquation.OPS_ALL.append(name)
+    ALLOWED_OPS.append(name)
+    OP_COSTS[name] = COST_OP_COMPLEX * 1.5    # moderate cost for ADF nodes
+
+
+def _register_adf_from_dict(d):
+    """Register an ADF from a serialised dict (used in subprocesses)."""
+    adf_op = ADFOperator.from_dict(d)
+    _register_adf_in_tables(adf_op)
+
+
+def _adf_internal_complexity(adf_dict):
+    """
+    Compute the approximate complexity of an ADF's internal nodes using the
+    same OP_COSTS table as the main complexity metric.  This is used to set
+    a proportional (not flat) complexity cost for each extracted ADF.
+    """
+    cost = 0.0
+    for (op, in1, in2, cval) in adf_dict['node_data']:
+        cost += OP_COSTS.get(op, COST_OP_COMPLEX)
+    return cost
+
+
+def _adf_summary_line(adf_dict):
+    """
+    Return a one-line human-readable description of an ADF by expanding its
+    node_data into an infix expression string using abstract variable names.
+    e.g.  adf_3 [binary] : (abs(v0)^v1)
+    """
+    nodes    = adf_dict['node_data']
+    n_in     = adf_dict['n_inputs']
+    out_slot = adf_dict['output_slot']
+    name     = adf_dict['name']
+    kind     = 'unary' if n_in == 1 else 'binary'
+
+    buf = {i: f"v{i}" for i in range(n_in)}
+    for j, (op, in1, in2, cval) in enumerate(nodes):
+        slot = n_in + j
+        s1   = buf.get(in1, '?')
+        s2   = buf.get(in2, '?')
+        if op == 'const':
+            buf[slot] = f"{cval:.4g}"
+        elif op in ('+', '-', '*'):
+            buf[slot] = f"({s1} {op} {s2})"
+        elif op == '/':
+            buf[slot] = f"({s1}/{s2})"
+        elif op == 'pow':
+            buf[slot] = f"(abs({s1})^{s2})"
+        elif op in BINARY_OPS_EVAL:
+            buf[slot] = f"{op}({s1},{s2})"
+        elif op in UNARY_OPS_EVAL:
+            buf[slot] = f"{op}({s1})"
+        else:
+            buf[slot] = f"{op}({s1})"
+    body = buf.get(out_slot, '?')
+    internal_cost = _adf_internal_complexity(adf_dict)
+    return f"  {name:<10} [{kind}]  internal_cost={internal_cost:.1f}  body: {body}"
+
+
+def print_adf_library():
+    """
+    Print the full contents of every ADF in the registry.
+    Called alongside each periodic Pareto-frontier display so the user can
+    see exactly what computation each frozen sub-graph performs.
+    """
+    if not _ADF_REGISTRY:
+        return
+    print("\n" + "─" * 70)
+    print(f"ADF LIBRARY  ({len(_ADF_REGISTRY)} operator(s) extracted so far)")
+    print("─" * 70)
+    for d in _ADF_REGISTRY:
+        print(_adf_summary_line(d))
+    print("─" * 70)
+
+
+def _is_adf_vacuous(node_data, n_inputs):
+    """
+    Return True if the ADF body is too trivial to deserve a library slot:
+      • Single-node body that just delegates to another ADF (pure wrapper)
+      • Single-node body that duplicates a primitive already in ALLOWED_OPS
+      • Body that algebraically simplifies to a linear function of one input
+        (e.g. (v1-v0)+(v0+(v1-v0)) = 2*v1-v0 — expressible with primitives)
+    """
+    if len(node_data) == 1:
+        op = node_data[0][0]
+        if op.startswith('adf_'):
+            return True
+        # Check against the ACTIVE dispatch tables (not just the safe-mode
+        # static dicts) so that unsafe mode and ADF-registered ops are also
+        # caught.  A single-node ADF that just wraps an existing op is pure
+        # indirection — it adds complexity cost without adding expressiveness.
+        if op in ALLOWED_OPS and (op in BINARY_OPS_EVAL or op in UNARY_OPS_EVAL):
+            return True
+
+    # ── Algebraic triviality check via sympy ─────────────────────────────
+    # Catches bodies that look complex but simplify to a*v0 + b*v1 + c,
+    # i.e. a linear combination expressible with existing primitives.
+    if sympy is not None:
+        try:
+            sym_inputs = [sympy.Symbol(f'v{i}') for i in range(n_inputs)]
+            adf_op = ADFOperator("_vac_probe", n_inputs, node_data,
+                                 n_inputs + len(node_data),
+                                 n_inputs + len(node_data) - 1)
+            # Build a sympy expression by evaluating symbolically
+            # Use the body string and parse it
+            body_str = _adf_body_string(node_data, n_inputs)
+            # Replace v0, v1 with sympy symbols and try to expand
+            sym_expr = sympy.sympify(
+                body_str.replace('v0', 'v0_').replace('v1', 'v1_'),
+                locals={f'v{i}_': sym_inputs[i] for i in range(n_inputs)}
+            )
+            expanded = sympy.expand(sym_expr)
+            # Vacuous if it's a polynomial of degree ≤ 1 in all variables
+            is_linear = all(
+                sympy.degree(expanded, sym_inputs[i]) <= 1
+                for i in range(n_inputs)
+            )
+            if is_linear:
+                return True
+        except Exception:
+            pass  # sympy parse failed — don't reject, let it through
+
+    return False
+
+
+def _adf_body_string(node_data, n_inputs):
+    """
+    Canonical infix body string for semantic deduplication.
+    Two ADFs with the same body string are guaranteed to be equivalent.
+    """
+    buf = {i: f"v{i}" for i in range(n_inputs)}
+    for j, (op, in1, in2, cval) in enumerate(node_data):
+        slot = n_inputs + j
+        s1 = buf.get(in1, '?')
+        s2 = buf.get(in2, '?')
+        if op == 'const':
+            buf[slot] = f"{cval:.6g}"
+        elif op in ('+', '-', '*'):
+            buf[slot] = f"({s1}{op}{s2})"
+        elif op == '/':
+            buf[slot] = f"({s1}/{s2})"
+        elif op == 'pow':
+            buf[slot] = f"(|{s1}|^{s2})"
+        elif op in BINARY_OPS_EVAL:
+            buf[slot] = f"{op}({s1},{s2})"
+        elif op in UNARY_OPS_EVAL:
+            buf[slot] = f"{op}({s1})"
+        else:
+            buf[slot] = f"{op}({s1})"
+    return buf.get(n_inputs + len(node_data) - 1, '?')
+
+
+def _adf_output_variance(node_data, n_inputs, total_slots, output_slot, n_samples=64):
+    """
+    Evaluate the ADF on n_samples random input vectors drawn from N(0,1).
+    Returns the variance of the outputs; near-zero means the ADF is
+    effectively a constant regardless of inputs → vacuous.
+    """
+    try:
+        rng = np.random.default_rng(0)
+        inputs = rng.normal(0.0, 1.0, (n_samples, n_inputs))
+        adf = ADFOperator("_probe", n_inputs, node_data, total_slots, output_slot)
+        if n_inputs == 1:
+            out = adf(inputs[:, 0])
+        else:
+            out = adf(inputs[:, 0], inputs[:, 1])
+        out = np.nan_to_num(np.asarray(out, dtype=float),
+                            nan=0.0, posinf=0.0, neginf=0.0)
+        return float(np.var(out))
+    except Exception:
+        return 0.0
+
+
+def _simplify_adf_node_data(node_data, n_inputs, output_slot):
+    """
+    Constant-fold the node_data list of an ADF in a single forward pass.
+
+    Slots whose values can be determined statically are collapsed; surviving
+    non-constant slots are compacted into a shorter list.  The new output
+    slot is always the last entry of the returned list.
+
+    Returns (simplified_nodes, new_output_slot), or (None, -1) if the
+    entire body folded down to a constant (useless ADF).
+    """
+    # slot → float for any slot proven to be a constant
+    folded_val  = {}   # old slot index → float
+    # old slot index → new slot index (None if it was folded away)
+    slot_map    = {i: i for i in range(n_inputs)}
+    new_nodes   = []   # list of (op, new_in1, new_in2, cval)
+
+    def _resolve(s):
+        """Return the new slot index for old slot s, emitting a const node if needed."""
+        if s in slot_map and slot_map[s] is not None:
+            return slot_map[s]
+        if s in folded_val:
+            # Emit an explicit const node for this folded value
+            ns = n_inputs + len(new_nodes)
+            new_nodes.append(('const', 0, 0, folded_val[s]))
+            slot_map[s] = ns
+            return ns
+        return s  # fallback (shouldn't happen in a well-formed ADF)
+
+    for j, (op, in1, in2, cval) in enumerate(node_data):
+        old_slot = n_inputs + j
+        c1 = folded_val.get(in1)
+        c2 = folded_val.get(in2)
+
+        if op == 'const':
+            folded_val[old_slot] = cval
+            slot_map[old_slot] = None
+            continue
+
+        # ── Unary constant folding ───────────────────────────────────────────
+        if op in UNARY_OPS_EVAL and c1 is not None:
+            try:
+                v = float(UNARY_OPS_EVAL[op](np.array([c1]))[0])
+                if np.isfinite(v):
+                    folded_val[old_slot] = v
+                    slot_map[old_slot] = None
+                    continue
+            except Exception:
+                pass
+
+        # ── Binary constant folding ──────────────────────────────────────────
+        if op in BINARY_OPS_EVAL and c1 is not None and c2 is not None:
+            try:
+                v = float(BINARY_OPS_EVAL[op](np.array([c1]), np.array([c2]))[0])
+                if np.isfinite(v):
+                    folded_val[old_slot] = v
+                    slot_map[old_slot] = None
+                    continue
+            except Exception:
+                pass
+
+        # ── Surviving node: compact into new_nodes ───────────────────────────
+        r_in1 = _resolve(in1)
+        r_in2 = _resolve(in2)
+        new_slot = n_inputs + len(new_nodes)
+        slot_map[old_slot] = new_slot
+        new_nodes.append((op, r_in1, r_in2, cval))
+
+    # Find the new slot for the original output
+    new_out = slot_map.get(output_slot)
+
+    if not new_nodes or new_out is None:
+        # Entire body folded away → trivial constant ADF
+        return None, -1
+
+    # The output node must be the last entry (trim any dead nodes appended
+    # after the output slot during const-emit of downstream consumers).
+    # Because we process in forward order and const-emits happen in _resolve,
+    # new_out is always the last *real* computation node we added.
+    return new_nodes, new_out
+
+
+def _retire_unused_adfs(all_pops_flat):
+    """
+    Scan all_pops_flat (list of Individual lists) to count ADF usage.
+    ADFs that have been unused for ADF_RETIRE_PATIENCE consecutive extraction
+    cycles are removed from the operator library and all dispatch tables.
+
+    Returns list of retired ADF names.
+    """
+    global _ADF_REGISTRY, _ADF_ZERO_USE_COUNT
+
+    # Count how many individuals across all populations use each ADF op
+    usage = {}
+    for pop in all_pops_flat:
+        for ind in pop:
+            ind.tree.update_active_nodes()
+            for idx in ind.tree.active_nodes:
+                if idx >= ind.tree.n_features:
+                    op = ind.tree.nodes[idx - ind.tree.n_features].op
+                    if op.startswith('adf_'):
+                        usage[op] = usage.get(op, 0) + 1
+
+    retired = []
+    for d in list(_ADF_REGISTRY):
+        name = d['name']
+        if usage.get(name, 0) == 0:
+            _ADF_ZERO_USE_COUNT[name] = _ADF_ZERO_USE_COUNT.get(name, 0) + 1
+        else:
+            _ADF_ZERO_USE_COUNT[name] = 0  # reset on any usage
+
+        if _ADF_ZERO_USE_COUNT.get(name, 0) >= ADF_RETIRE_PATIENCE:
+            # ── Purge from every table ───────────────────────────────────────
+            _ADF_REGISTRY.remove(d)
+            BINARY_OPS_EVAL.pop(name, None)
+            UNARY_OPS_EVAL.pop(name, None)
+            if name in CGPEquation.OPS_BINARY:
+                CGPEquation.OPS_BINARY.remove(name)
+            CGPEquation.OPS_BINARY_SET.discard(name)
+            if name in CGPEquation.OPS_UNARY:
+                CGPEquation.OPS_UNARY.remove(name)
+            CGPEquation.OPS_UNARY_SET.discard(name)
+            if name in CGPEquation.OPS_ALL:
+                CGPEquation.OPS_ALL.remove(name)
+            if name in ALLOWED_OPS:
+                ALLOWED_OPS.remove(name)
+            OP_COSTS.pop(name, None)
+            _ADF_ZERO_USE_COUNT.pop(name, None)
+            retired.append(name)
+
+    return retired
+
+
+def try_extract_adfs_from_population(population, X, y_target, type_code):
+    """
+    Scan a population for modular individuals and attempt to extract
+    new ADF operators from their community structure.
+
+    Candidate selection: sort the ENTIRE population by modularity score
+    (descending) and scan the top 25%.  This deliberately avoids selecting
+    only the fittest individuals — the fittest may have already converged on
+    good primitive solutions and their sub-graphs are not necessarily modular.
+    Individuals with high Q but moderate fitness are the richest source of
+    genuinely reusable sub-computations.
+
+    Returns a list of new ADF dicts (serialisable) ready to be appended to
+    _ADF_REGISTRY and broadcast to workers.
+    """
+    global _ADF_REGISTRY, ADF_MAX_LIBRARY
+
+    if not ADF_ENABLED or len(_ADF_REGISTRY) >= ADF_MAX_LIBRARY:
+        return []
+
+    # ── Candidate selection ──────────────────────────────────────────────────
+    # We want individuals that are BOTH fitting well AND have reusable structure.
+    # Strategy: filter to the top 50% by fitness (so we're working with models
+    # that are actually learning something useful), then rank by modularity Q
+    # within that set.  This avoids the failure mode of selecting high-Q but
+    # terrible-fitting individuals (bloated junk tends to have very high Q).
+    ranked_fit = sorted(population, key=lambda x: x.fitness)
+    top_half   = ranked_fit[:max(2, len(ranked_fit) // 2)]
+    candidates = sorted(top_half, key=lambda x: x.modularity, reverse=True)
+    candidates = candidates[:max(1, len(candidates) // 2)]   # top half of top half
+
+    known_sigs = {_adf_signature(d['node_data']) for d in _ADF_REGISTRY}
+    known_sigs |= {_adf_body_string(d['node_data'], d['n_inputs']) for d in _ADF_REGISTRY}
+    new_adfs   = []
+
+    for ind in candidates:
+        if ind.modularity < ADF_MODULARITY_THRESH:
+            break           # sorted descending — no point continuing
+        if len(_ADF_REGISTRY) + len(new_adfs) >= ADF_MAX_LIBRARY:
+            break
+
+        # Re-run community detection to get actual community sets
+        cgp = ind.tree
+        cgp.update_active_nodes()
+        if len(cgp.active_nodes) < 4:
+            continue
+
+        G = nx.Graph()
+        for idx in cgp.active_nodes:
+            if idx >= cgp.n_features:
+                node = cgp.nodes[idx - cgp.n_features]
+                if node.op != 'const':
+                    G.add_edge(node.in1, idx)
+                    if node.op in cgp.OPS_BINARY_SET:
+                        G.add_edge(node.in2, idx)
+        if len(G.edges) < 2:
+            continue
+
+        try:
+            communities = list(greedy_modularity_communities(G))
+        except Exception:
+            continue
+
+        for comm in sorted(communities, key=len, reverse=True):
+            if len(_ADF_REGISTRY) + len(new_adfs) >= ADF_MAX_LIBRARY:
+                break
+            result = _extract_community_adf(cgp, comm)
+            if result is None:
+                continue
+            adf_op, n_inputs = result
+
+            # ════════════════════════════════════════════════════════════════
+            # PRE-ADMISSION FILTERING — reject garbage before it enters the
+            # library and wastes complexity budget on future individuals.
+            # ════════════════════════════════════════════════════════════════
+
+            # 1. Simplify via constant folding before any other checks
+            simplified_nodes, new_out_slot = _simplify_adf_node_data(
+                adf_op._node_data, n_inputs, adf_op._output_slot)
+            if simplified_nodes is None:
+                continue   # entire body collapsed to a constant → useless
+            if simplified_nodes != list(adf_op._node_data):
+                # Rebuild ADFOperator with compacted node_data
+                new_n = len(simplified_nodes)
+                adf_op = ADFOperator(
+                    name        = "",
+                    n_inputs    = n_inputs,
+                    node_data   = simplified_nodes,
+                    total_slots = n_inputs + new_n,
+                    output_slot = new_out_slot,
+                )
+
+            # 2. Exact-signature deduplication (post-simplification)
+            sig = _adf_signature(adf_op._node_data)
+            if sig in known_sigs:
+                continue
+
+            # 2b. Circular reference check — reject any ADF whose body
+            # references another ADF that (directly or transitively) references
+            # something not yet in the registry.  The OOM kill was caused by:
+            #   adf_4 body refs adf_5; old adf_5 body refs adf_4 (not in
+            #   registry yet) → infinite mutual recursion at eval time.
+            # Strategy: collect all ADF names reachable from this candidate
+            # (including transitively through the existing registry).  If any
+            # referenced ADF's body contains a name that is NOT in the current
+            # registry, that unknown name could be this very candidate → cycle.
+            # Also reject if the transitive closure contains any name that
+            # is itself referenced by the candidate (direct mutual dep).
+            def _all_adf_names_in_nd(nd):
+                return {op for (op, _, _, _) in nd if op.startswith('adf_')}
+
+            def _transitive_adf_names(root_nd, combined_reg, _seen=None):
+                """BFS over all reachable ADF names from a node_data list."""
+                if _seen is None:
+                    _seen = set()
+                for name in _all_adf_names_in_nd(root_nd):
+                    if name in _seen:
+                        continue
+                    _seen.add(name)
+                    entry = next((d for d in combined_reg if d['name'] == name), None)
+                    if entry:
+                        _transitive_adf_names(entry['node_data'], combined_reg, _seen)
+                return _seen
+
+            _combined = _ADF_REGISTRY + new_adfs
+            _known_names = {d['name'] for d in _combined}
+            _candidate_direct = _all_adf_names_in_nd(adf_op._node_data)
+            _reachable = _transitive_adf_names(adf_op._node_data, _combined)
+
+            _circular = False
+            # Case A: any referenced ADF mentions a name not in registry
+            # (that unknown name may be this pending candidate once named)
+            for ref_name in _reachable:
+                entry = next((d for d in _combined if d['name'] == ref_name), None)
+                if entry:
+                    unknown = _all_adf_names_in_nd(entry['node_data']) - _known_names
+                    if unknown:
+                        _circular = True
+                        break
+            # Case B: direct mutual dependency —  candidate refs X and X refs back
+            # to any name that is in candidate's own direct refs
+            if not _circular:
+                for ref_name in _candidate_direct:
+                    entry = next((d for d in _combined if d['name'] == ref_name), None)
+                    if entry:
+                        if _all_adf_names_in_nd(entry['node_data']) & _candidate_direct:
+                            _circular = True
+                            break
+            if _circular:
+                continue
+
+            # 3. Vacuous single-node ADF-wrapper check
+            if _is_adf_vacuous(adf_op._node_data, n_inputs):
+                continue
+
+            # 4. Constant-output check: variance ≈ 0 over random inputs
+            total_s = n_inputs + len(adf_op._node_data)
+            variance = _adf_output_variance(
+                adf_op._node_data, n_inputs, total_s, adf_op._output_slot)
+            if variance < 1e-6:
+                continue  # output doesn't depend on inputs at all
+
+            # 5. Body-string semantic deduplication
+            body_str = _adf_body_string(adf_op._node_data, n_inputs)
+            existing_bodies = {
+                _adf_body_string(d['node_data'], d['n_inputs'])
+                for d in _ADF_REGISTRY + new_adfs
+            }
+            if body_str in existing_bodies:
+                continue
+            # ════════════════════════════════════════════════════════════════
+
+            adf_name = f"adf_{len(_ADF_REGISTRY) + len(new_adfs)}"
+            adf_op.name = adf_name
+            d = adf_op.to_dict()
+
+            # ---- Proportional complexity pricing ----
+            # Charge the ADF a cost proportional to its internal complexity
+            # with a compression factor, so larger ADFs give bigger savings.
+            # Floor of COST_OP_SIMPLE ensures trivial ADFs are never free.
+            internal_cost = _adf_internal_complexity(d)
+            adf_cost = max(COST_OP_SIMPLE, internal_cost * 0.4)
+            OP_COSTS[adf_name] = adf_cost
+
+            # Register locally (main process)
+            _register_adf_in_tables(adf_op)
+            # Patch the cost that _register_adf_in_tables set with the flat default
+            OP_COSTS[adf_name] = adf_cost
+
+            known_sigs.add(sig)
+            known_sigs.add(body_str)   # prevent semantic dups across future loop iterations
+            new_adfs.append(d)
+            _ADF_REGISTRY.append(d)
+
+            kind = "unary" if n_inputs == 1 else "binary"
+            print(f"  [ADF] Extracted {kind} '{adf_name}'  "
+                  f"internal_cost={internal_cost:.1f} → stored_cost={adf_cost:.1f}  "
+                  f"Q={ind.modularity:.3f}  body: {_adf_summary_line(d).split('body:')[1].strip()}")
+
+    return new_adfs
+
+
+
+class DataProcessor:
+    def __init__(self, scale=False):
+        self.scale = scale
+        self.col_configs = []
+        self.stats = {}
+        self.input_map = []
+        self.output_map = []
+        self.output_slices = {}
+
+    def set_configs(self, configs): self.col_configs = configs
+
+    def fit_transform(self, df):
+        X_parts, Y_parts = [], []
+        self.input_map, self.output_map = [], []
+        self.output_slices = {}
+        y_cursor = 0
+
+        for col_name, type_code in self.col_configs:
+            col_data = df[col_name].values
+            if type_code == 0: continue
+
+            elif type_code == 1:  # Num In
+                vals = pd.to_numeric(col_data, errors='coerce')
+                vals = np.nan_to_num(vals)
+                if self.scale:
+                    mean, std = np.mean(vals), np.std(vals) + 1e-8
+                    self.stats[col_name] = {'mean': mean, 'std': std, 'type': 1}
+                    vals = (vals - mean) / std
+                else:
+                    self.stats[col_name] = {'type': 1}
+                X_parts.append(vals.reshape(-1, 1))
+                self.input_map.append(col_name)
+
+            elif type_code == 2:  # Cat In (One Hot)
+                uniques = sorted(list(set(col_data)))
+                self.stats[col_name] = {'classes': uniques, 'type': 2}
+                one_hot = np.zeros((len(col_data), len(uniques)))
+                for k, cls in enumerate(uniques):
+                    one_hot[:, k] = (col_data == cls).astype(float)
+                    self.input_map.append(f"{col_name}_{cls}")
+                X_parts.append(one_hot)
+
+            elif type_code == 3:  # Char In
+                str_data = col_data.astype(str)
+                max_len = max(len(s) for s in str_data)
+                chars = sorted(list(set("".join(str_data))))
+                char_map = {c: i + 1 for i, c in enumerate(chars)}
+                self.stats[col_name] = {'char_map': char_map, 'max_len': max_len, 'type': 3}
+                feature_block = np.zeros((len(str_data), max_len * len(chars)))
+                for i, s in enumerate(str_data):
+                    for j, char in enumerate(s):
+                        if j >= max_len: break
+                        if char in char_map:
+                            char_idx = char_map[char] - 1
+                            feature_block[i, j * len(chars) + char_idx] = 1.0
+                X_parts.append(feature_block)
+                for j in range(max_len):
+                    for c in chars:
+                        self.input_map.append(f"{col_name}_pos{j}_{c}")
+
+            elif type_code == 5:  # Num Out
+                vals = pd.to_numeric(col_data, errors='coerce')
+                vals = np.nan_to_num(vals)
+                if self.scale:
+                    mean, std = np.mean(vals), np.std(vals) + 1e-8
+                    self.stats[col_name] = {'mean': mean, 'std': std, 'type': 5}
+                    vals = (vals - mean) / std
+                else:
+                    self.stats[col_name] = {'type': 5}
+                Y_parts.append(vals.reshape(-1, 1))
+                self.output_map.append(col_name)
+                self.output_slices[col_name] = (y_cursor, y_cursor + 1)
+                y_cursor += 1
+
+            elif type_code == 6:  # Cat Out
+                uniques = sorted(list(set(col_data)))
+                self.stats[col_name] = {'classes': uniques, 'type': 6}
+                one_hot = np.zeros((len(col_data), len(uniques)))
+                for k, cls in enumerate(uniques):
+                    one_hot[:, k] = (col_data == cls).astype(float)
+                    self.output_map.append(f"{col_name}_{cls}")
+                Y_parts.append(one_hot)
+                self.output_slices[col_name] = (y_cursor, y_cursor + len(uniques))
+                y_cursor += len(uniques)
+
+        X = np.hstack(X_parts) if X_parts else np.array([])
+        Y = np.hstack(Y_parts) if Y_parts else np.array([])
+        return X, Y
+
+    def transform(self, df):
+        """
+        Apply already-fitted stats/encodings to a new dataframe (e.g. a
+        validation or test set).  Must be called after fit_transform().
+        """
+        X_parts, Y_parts = [], []
+        for col_name, type_code in self.col_configs:
+            if type_code == 0:
+                continue
+            col_data = df[col_name].values if col_name in df.columns else \
+                       np.zeros(len(df))
+            stat = self.stats.get(col_name, {})
+
+            if type_code == 1:
+                vals = pd.to_numeric(col_data, errors='coerce')
+                vals = np.nan_to_num(vals)
+                if self.scale:
+                    vals = (vals - stat['mean']) / stat['std']
+                X_parts.append(vals.reshape(-1, 1))
+            elif type_code == 2:
+                uniques = stat.get('classes', [])
+                one_hot = np.zeros((len(col_data), len(uniques)))
+                for k, cls in enumerate(uniques):
+                    one_hot[:, k] = (col_data == cls).astype(float)
+                X_parts.append(one_hot)
+            elif type_code == 3:
+                char_map = stat.get('char_map', {})
+                max_len  = stat.get('max_len', 1)
+                chars    = sorted(char_map.keys())
+                str_data = col_data.astype(str)
+                feature_block = np.zeros((len(str_data), max_len * len(chars)))
+                for i, s in enumerate(str_data):
+                    for j, char in enumerate(s):
+                        if j >= max_len: break
+                        if char in char_map:
+                            char_idx = char_map[char] - 1
+                            feature_block[i, j * len(chars) + char_idx] = 1.0
+                X_parts.append(feature_block)
+            elif type_code == 5:
+                vals = pd.to_numeric(col_data, errors='coerce')
+                vals = np.nan_to_num(vals)
+                if self.scale:
+                    vals = (vals - stat['mean']) / stat['std']
+                Y_parts.append(vals.reshape(-1, 1))
+            elif type_code == 6:
+                uniques = stat.get('classes', [])
+                one_hot = np.zeros((len(col_data), len(uniques)))
+                for k, cls in enumerate(uniques):
+                    one_hot[:, k] = (col_data == cls).astype(float)
+                Y_parts.append(one_hot)
+
+        X = np.hstack(X_parts) if X_parts else np.array([])
+        Y = np.hstack(Y_parts) if Y_parts else np.array([])
+        return X, Y
+
+    def transform_input_sample(self, input_dict):
+        vec_parts = []
+        for col_name, type_code in self.col_configs:
+            if type_code in [0, 5, 6, 7]: continue
+            val = input_dict.get(col_name)
+            stat = self.stats.get(col_name, {})
+            if type_code == 1:
+                # SAFE FALLBACK: If an unused variable is missing, default to 0.0
+                val = float(val) if val is not None and val != '' else 0.0
+                if self.scale: val = (val - stat['mean']) / stat['std']
+                vec_parts.append([val])
+            elif type_code == 2:
+                classes = stat['classes']
+                one_hot = [0.0] * len(classes)
+                if val in classes: one_hot[classes.index(val)] = 1.0
+                vec_parts.append(one_hot)
+        return np.concatenate(vec_parts)
+
+    def inverse_transform_output(self, y_pred_vec):
+        res = {}
+        for col_name, type_code in self.col_configs:
+            if type_code not in [5, 6, 7]: continue
+            start, end = self.output_slices[col_name]
+            col_preds = y_pred_vec[start:end]
+            stat = self.stats[col_name]
+            if type_code == 5:
+                val = col_preds[0]
+                if self.scale: val = (val * stat['std']) + stat['mean']
+                res[col_name] = val
+            elif type_code == 6:
+                best_idx = np.argmax(col_preds)
+                res[col_name] = stat['classes'][best_idx]
+        return res
+
+    def get_output_types_flat(self):
+        types_list = []
+        for col_name, type_code in self.col_configs:
+            if type_code < 5: continue
+            if type_code == 5: types_list.append(5)
+            elif type_code == 6: types_list.extend([6] * len(self.stats[col_name]['classes']))
+        return types_list
+
+
+# ==========================================
+# PART 2: CARTESIAN GENETIC PROGRAMMING (CGP)
+# ==========================================
+
+class CGPNode:
+    __slots__ = ('op', 'in1', 'in2', 'in3', 'const_val')
+
+    def __init__(self, op, in1, in2, const_val=0.0, in3=0):
+        self.op = op
+        self.in1 = in1
+        self.in2 = in2
+        self.in3 = in3          # third input, used only by ternary ops (if_else)
+        self.const_val = const_val
+
+
+class CGPEquation:
+    # Dynamically filter operations based on the ALLOWED_OPS whitelist
+    OPS_BINARY = [op for op in BINARY_OPS_EVAL.keys() if op in ALLOWED_OPS]
+    OPS_UNARY  = [op for op in UNARY_OPS_EVAL.keys() if op in ALLOWED_OPS]
+    OPS_TERNARY = ['if_else'] if IF_ELSE_ENABLED else []
+    OPS_ALL    = OPS_BINARY + OPS_UNARY + OPS_TERNARY + (['const'] if 'const' in ALLOWED_OPS else [])
+
+    OPS_BINARY_SET  = set(OPS_BINARY)
+    OPS_UNARY_SET   = set(OPS_UNARY)
+    OPS_TERNARY_SET = set(OPS_TERNARY)
+
+    def __init__(self, n_features, max_nodes, feature_names=None):
+        self.n_features = n_features
+        self.max_nodes = max_nodes
+        self.feature_names = feature_names if feature_names else [f"X_{i}" for i in range(n_features)]
+        self.nodes = []
+        self.out_idx = 0
+        self.active_nodes = set()
+
+    def evaluate(self, X):
+        """Evaluate the CGP expression on input X using dispatch tables."""
+        batch_size = X.shape[0]
+        buffer = np.zeros((batch_size, self.n_features + self.max_nodes))
+        buffer[:, :self.n_features] = X
+        
+        # Track if the FINAL OUTPUT has numerical issues.
+        # IMPORTANT: we intentionally do NOT flag intermediate-node explosions.
+        # Patterns like const^variable (e.g. 3^x) produce huge intermediate
+        # values that the affine rescaling a*f(x)+b handles perfectly.
+        # Only flag when the output itself is NaN/Inf-dominated.
+        self.last_eval_clipped = False
+
+        for i in sorted(self.active_nodes):
+            if i < self.n_features:
+                continue
+            node_idx = i - self.n_features
+            node = self.nodes[node_idx]
+            v1 = buffer[:, node.in1]
+
+            if node.op in self.OPS_BINARY_SET:
+                v2 = buffer[:, node.in2]
+                result = BINARY_OPS_EVAL[node.op](v1, v2)
+            elif node.op in self.OPS_TERNARY_SET:
+                # if_else(condition, true_val, false_val)
+                # condition = in1, true_branch = in2, false_branch = in3
+                v2 = buffer[:, node.in2]
+                v3 = buffer[:, node.in3]
+                if DIFFERENTIABLE_BRANCHING:
+                    # Smooth sigmoid blend: σ(k*(c-0.5))*T + (1-σ(k*(c-0.5)))*F
+                    # Differentiable w.r.t. condition → helps const-opt & boosting
+                    k = DIFF_BRANCH_STEEPNESS
+                    gate = 1.0 / (1.0 + np.exp(-np.clip(k * (v1 - 0.5), -50, 50)))
+                    result = gate * v2 + (1.0 - gate) * v3
+                else:
+                    result = np.where(v1 > 0.5, v2, v3)
+            elif node.op in self.OPS_UNARY_SET:
+                result = UNARY_OPS_EVAL[node.op](v1)
+            elif node.op == 'const':
+                buffer[:, i] = node.const_val
+                continue
+            else:
+                result = np.zeros(batch_size)
+
+            # Sanitize per-node to prevent NaN/Inf cascade
+            buffer[:, i] = np.nan_to_num(result, nan=0.0, posinf=1e9, neginf=-1e9)
+
+        # Check the FINAL OUTPUT only — intermediate blowups are fine as long
+        # as the output is well-behaved (affine rescaling handles magnitude).
+        out = buffer[:, self.out_idx]
+        nan_frac = np.mean(np.isnan(out) | np.isinf(out))
+        clamp_frac = np.mean((out >= 1e9) | (out <= -1e9))
+        if nan_frac > 0.1 or clamp_frac > 0.5:
+            self.last_eval_clipped = True
+
+        return out
+
+
+    def update_active_nodes(self):
+        self.active_nodes = set()
+        if self.out_idx is None: return
+        
+        stack = [self.out_idx]
+        while stack:
+            idx = stack.pop()
+            if idx in self.active_nodes:
+                continue
+            
+            self.active_nodes.add(idx)
+            
+            # If it's a compute node (not a raw feature), trace its inputs
+            if idx >= self.n_features:
+                node = self.nodes[idx - self.n_features]
+                if node.op != 'const':
+                    stack.append(node.in1)
+                    if node.op in self.OPS_BINARY_SET:
+                        stack.append(node.in2)
+                    elif node.op in self.OPS_TERNARY_SET:
+                        stack.append(node.in2)
+                        stack.append(node.in3)
+
+    def get_complexity(self):
+        self.update_active_nodes()
+        cost = 0.0
+        unique_features_used = set()
+
+        # Define nested constraints with graduated penalties instead of a
+        # hard 1000-point wall.  Each entry maps outer_op → list of
+        # (forbidden_inner_ops, penalty) pairs.  The penalty scales with how
+        # numerically dangerous the nesting is:
+        #   • Severe (exp∘exp, pow∘exp) → 50   — can overflow to Inf quickly
+        #   • Moderate (trig∘trig, log∘log) → 30 — hard to interpret, rarely useful
+        #   • Mild (square∘square, log∘exp cancel) → 20 — occasionally useful
+        # This replaces the old 1000-point cliff, allowing evolution to explore
+        # nested structures if they substantially reduce loss, while still
+        # preferring simpler alternatives at similar accuracy.
+        nested_constraints = {
+            'exp': [(['exp'], 50.0), (['sin', 'cos', 'tan', 'tanh', 'sigmoid'], 40.0)],
+            'sin': [(['sin', 'cos', 'tan', 'tanh', 'sigmoid'], 40.0), (['exp', '10^x', 'log', 'log10'], 40.0)],
+            'cos': [(['sin', 'cos', 'tan', 'tanh', 'sigmoid'], 40.0), (['exp', '10^x', 'log', 'log10'], 40.0)],
+            'tan': [(['sin', 'cos', 'tan', 'tanh', 'sigmoid'], 40.0), (['exp', '10^x', 'log', 'log10'], 40.0)],
+            'tanh': [(['sin', 'cos', 'tan', 'tanh', 'sigmoid'], 40.0), (['exp', '10^x', 'log', 'log10'], 40.0)],
+            'sigmoid': [(['sin', 'cos', 'tan', 'tanh', 'sigmoid'], 40.0), (['exp', '10^x', 'log', 'log10'], 40.0)],
+            'pow': [(['pow'], 40.0), (['exp'], 50.0)],
+            'square': [(['square', 'cube'], 20.0)],
+            'cube': [(['square', 'cube'], 20.0)],
+            'log': [(['log', 'log10'], 30.0), (['exp', '10^x'], 20.0), (['sin', 'cos', 'tan', 'tanh', 'sigmoid'], 40.0)],
+            'log10': [(['log', 'log10'], 30.0), (['exp', '10^x'], 20.0), (['sin', 'cos', 'tan', 'tanh', 'sigmoid'], 40.0)],
+            '10^x': [(['10^x'], 50.0), (['sin', 'cos', 'tan', 'tanh', 'sigmoid'], 40.0)],
+        }
+
+        for idx in self.active_nodes:
+            if idx >= self.n_features:
+                node = self.nodes[idx - self.n_features]
+                cost += OP_COSTS.get(node.op, COST_OP_COMPLEX)
+
+                # Check nested constraints — graduated penalties
+                if node.op in nested_constraints:
+                    for forbidden_inners, penalty in nested_constraints[node.op]:
+                        # Check in1
+                        if (node.in1 >= self.n_features
+                                and node.in1 - self.n_features < len(self.nodes)
+                                and self.nodes[node.in1 - self.n_features].op in forbidden_inners):
+                            cost += penalty
+                        # Check in2 (for binary ops)
+                        if node.op in self.OPS_BINARY_SET and node.in2 >= self.n_features:
+                            if (node.in2 - self.n_features < len(self.nodes)
+                                    and self.nodes[node.in2 - self.n_features].op in forbidden_inners):
+                                cost += penalty
+            else:
+                unique_features_used.add(idx)
+
+        return cost
+
+    def __str__(self):
+        if not self.active_nodes:
+            self.update_active_nodes()
+        buf = {i: str(self.feature_names[i]) for i in range(self.n_features)}
+
+        for idx in sorted(self.active_nodes):
+            if idx < self.n_features: continue
+            node = self.nodes[idx - self.n_features]
+            if node.op == 'const':
+                buf[idx] = f"{node.const_val:.4f}"
+                continue
+            s1 = buf.get(node.in1, "0")
+            if node.op in self.OPS_BINARY_SET:
+                s2 = buf.get(node.in2, "0")
+                buf[idx] = _binary_str(node.op, s1, s2)
+            elif node.op in self.OPS_TERNARY_SET:
+                s2 = buf.get(node.in2, "0")
+                s3 = buf.get(node.in3, "0")
+                buf[idx] = _ternary_str(node.op, s1, s2, s3)
+            elif node.op in self.OPS_UNARY_SET:
+                buf[idx] = _unary_str(node.op, s1)
+
+        return buf.get(self.out_idx, "0")
+
+    def get_graph_modularity(self):
+        """Newman's Modularity (Q) for the active computational graph."""
+        # Skip expensive community detection during population initialization
+        if _INIT_PHASE:
+            return 0.0
+        self.update_active_nodes()
+        if len(self.active_nodes) < 3:
+            return 0.0
+        G = nx.Graph()
+        for idx in self.active_nodes:
+            if idx >= self.n_features:
+                node = self.nodes[idx - self.n_features]
+                if node.op != 'const':
+                    G.add_edge(node.in1, idx)
+                    if node.op in self.OPS_BINARY_SET:
+                        G.add_edge(node.in2, idx)
+                    elif node.op in self.OPS_TERNARY_SET:
+                        G.add_edge(node.in2, idx)
+                        G.add_edge(node.in3, idx)
+        if len(G.edges) == 0:
+            return 0.0
+        try:
+            communities = greedy_modularity_communities(G)
+            q_score = modularity(G, communities)
+            return max(0.0, q_score)
+        except Exception:
+            return 0.0
+
+
+# ==========================================
+# PART 3: HALL OF FAME
+# ==========================================
+
+class HallOfFame:
+    def __init__(self):
+        self.best_by_complexity = {}
+
+    def update(self, individual):
+        c = individual.complexity
+        if c > MAX_COMPLEXITY: return False
+        # Reject catastrophically bad individuals — billion-scale losses from
+        # abs(x)^feature blowups would otherwise occupy every high-complexity
+        # slot and permanently block good expressions from those positions.
+        if individual.loss > HOF_LOSS_CEILING: return False
+        if c not in self.best_by_complexity:
+            self.best_by_complexity[c] = copy.deepcopy(individual)
+            self._evict_dominated_by(c)
+            return True
+        elif individual.loss < self.best_by_complexity[c].loss:
+            self.best_by_complexity[c] = copy.deepcopy(individual)
+            self._evict_dominated_by(c)
+            return True
+        return False
+
+    def _evict_dominated_by(self, ref_complexity):
+        """
+        After a slot at ref_complexity is updated, evict any OTHER slots that
+        are now cross-complexity Pareto-dominated.
+
+        A slot at complexity C2 is dominated if there EXISTS a slot at C1 where:
+            C1 < C2  AND  loss(C1) <= loss(C2)   (strictly simpler AND at least as good)
+         OR C1 <= C2 AND  loss(C1) <  loss(C2)   (at most as complex AND strictly better)
+
+        Using strict inequality on at least one axis prevents wiping entries
+        that tie on loss but differ in complexity — those represent distinct
+        Pareto-front points that evolution may build on later.
+        """
+        ref_loss = self.best_by_complexity[ref_complexity].loss
+        to_remove = []
+        for c, ind in self.best_by_complexity.items():
+            if c == ref_complexity:
+                continue
+            # Can ref evict c?  Require strictly better on at least one axis.
+            if ref_complexity < c and ref_loss <= ind.loss:
+                to_remove.append(c)
+            elif ref_complexity <= c and ref_loss < ind.loss:
+                to_remove.append(c)
+            # Can c evict ref? (c is simpler and strictly better)
+            elif c < ref_complexity and ind.loss < ref_loss:
+                # ref is dominated — but we just put it there, so don't remove ref.
+                # Instead, note it won't survive but keep it since it was just placed.
+                pass
+        for c in to_remove:
+            del self.best_by_complexity[c]
+
+    def sanitize(self):
+        """
+        Full HoF cleanup pass.  Should be called periodically (e.g. after
+        deep constant optimization) to evict entries that have become stale:
+
+        1. Loss ceiling violations — entries whose loss exceeds HOF_LOSS_CEILING.
+           These can arise when constants drift post-optimization or when the
+           ceiling was lowered after entries were admitted.
+
+        2. Cross-complexity Pareto domination — a slot at (C2, L2) is evicted
+           if any slot at (C1, L1) satisfies C1 <= C2 AND L1 <= L2.
+           This removes the 'staircase gaps' where a mediocre high-complexity
+           entry occupies a slot that a simpler entry already dominates.
+
+        Returns the number of entries removed.
+        """
+        before = len(self.best_by_complexity)
+
+        # Pass 1: ceiling violations
+        self.best_by_complexity = {
+            c: ind for c, ind in self.best_by_complexity.items()
+            if ind.loss <= HOF_LOSS_CEILING
+        }
+
+        # Pass 2: build a clean Pareto front (simpler-is-better on complexity,
+        # lower-is-better on loss).  Walk complexity in ascending order;
+        # track the running minimum loss seen so far.  Any entry whose loss
+        # is strictly greater than that minimum is dominated and gets dropped.
+        # Entries with EQUAL loss at higher complexity are kept — they represent
+        # structurally different solutions that may improve independently later.
+        sorted_entries = sorted(self.best_by_complexity.items())   # by complexity asc
+        clean = {}
+        best_loss_seen = float('inf')
+        for c, ind in sorted_entries:
+            if ind.loss <= best_loss_seen:
+                clean[c] = ind
+                best_loss_seen = ind.loss
+            # else: this slot is strictly dominated — skip it
+
+        self.best_by_complexity = clean
+        removed = before - len(self.best_by_complexity)
+        return removed
+    def compute_pysr_scores(self):
+        """Calculate PySR's -d(log(loss)) / d(complexity) score for the Pareto front."""
+        sorted_complexities = sorted(self.best_by_complexity.keys())
+        scores = {}
+        
+        for i, c in enumerate(sorted_complexities):
+            if i == 0:
+                scores[c] = 0.0
+            else:
+                prev_c = sorted_complexities[i - 1]
+                ind = self.best_by_complexity[c]
+                prev_ind = self.best_by_complexity[prev_c]
+                
+                delta_c = ind.complexity - prev_ind.complexity
+                
+                if delta_c > 0 and ind.loss < prev_ind.loss:
+                    # Clamp the loss to a tiny epsilon to prevent log(0) 
+                    # but still grant a massive score for perfect fits
+                    safe_loss = max(ind.loss, 1e-15)
+                    safe_prev = max(prev_ind.loss, 1e-15)
+                    score = -np.log(safe_loss / safe_prev) / delta_c
+                else:
+                    score = 0.0
+                scores[c] = score
+        return scores
+    def get_best_overall(self):
+        if not self.best_by_complexity: return None
+
+        # 1. THE ABSOLUTE OVERRIDE
+        # If any model has functionally zero loss, it is a perfect solution.
+        # Ignore PySR derivatives and just return the simplest perfect model.
+        perfect_models = [ind for ind in self.best_by_complexity.values() if ind.loss < 1e-5]
+        if perfect_models:
+            return min(perfect_models, key=lambda x: x.complexity)
+
+        # 2. Normal PySR scoring for typical (non-perfect) frontiers
+        scores = self.compute_pysr_scores()
+        if not scores:
+            return min(self.best_by_complexity.values(), key=lambda x: x.loss)
+
+        best_c = max(scores, key=scores.get)
+
+        # Fallback to absolute lowest loss if no meaningful scores exist
+        if scores[best_c] == 0.0:
+             return min(self.best_by_complexity.values(), key=lambda x: x.loss)
+
+        score_pick = self.best_by_complexity[best_c]
+
+        # 3. R²-AWARE OVERRIDE
+        # The PySR score rewards *marginal* loss improvement per complexity unit.
+        # This can pick a simple but poorly-fitting model (e.g. R²=0.25) over a
+        # much better model (e.g. R²=0.96) just because the score derivative was
+        # higher at the simpler end.  Fix: if the best-R² model on the frontier
+        # has a substantially higher R² than the score-picked model, prefer it —
+        # but only when the R² gap is large enough to clearly indicate a better
+        # model, not just a marginal gain from over-fitting extra complexity.
+        all_inds = list(self.best_by_complexity.values())
+        # Use R² for regression; for classification this attribute is 0.0 so
+        # the override won't trigger (classification uses accuracy instead).
+        score_r2 = getattr(score_pick, 'r2', 0.0)
+
+        # Find the model with the best R² on the frontier
+        best_r2_ind = max(all_inds, key=lambda x: getattr(x, 'r2', 0.0))
+        best_r2 = getattr(best_r2_ind, 'r2', 0.0)
+
+        if best_r2 > score_r2:
+            r2_gap = best_r2 - score_r2
+            # Adaptive threshold: the required R² gap shrinks as overall R²
+            # increases (near-perfect models need smaller gaps to matter).
+            # At R²~0.0 the threshold is 0.15; at R²~1.0 it's 0.02.
+            threshold = max(0.02, 0.15 * (1.0 - best_r2))
+
+            if r2_gap > threshold:
+                # Among all models with R² close to the best (within 0.01),
+                # prefer the simplest one — Occam's razor still applies.
+                near_best = [ind for ind in all_inds
+                             if getattr(ind, 'r2', 0.0) >= best_r2 - 0.01]
+                return min(near_best, key=lambda x: x.complexity)
+
+        return score_pick
+
+
+    def print_frontier(self, out_type=5, label=""):
+        is_cls = (out_type == 6)
+        metric_name = "Acc    " if is_cls else "R²     "
+        # ADDED SCORE COLUMN
+        header = f"{'Comp':<6} | {'Score':<8} | {'Mod (Q)':<8} | {'Loss':<12} | {metric_name:<8} | Equation"
+        title = f"Pareto Frontier{' — ' + label if label else ''}"
+        print("\n" + "=" * 100)
+        print(title)
+        print(header)
+        print("-" * 100)
+        
+        scores = self.compute_pysr_scores()
+        
+        for c in sorted(self.best_by_complexity.keys()):
+            ind = self.best_by_complexity[c]
+            score = scores.get(c, 0.0)
+            metric_val = getattr(ind, 'accuracy', 0.0) if is_cls else getattr(ind, 'r2', 0.0)
+            
+            # --- NEW: Format with outer affine scale ---
+            if is_cls:
+                eq_str = str(ind.tree)
+            else:
+                a, b = getattr(ind, 'affine_a', 1.0), getattr(ind, 'affine_b', 0.0)
+                sign = "+" if b >= 0 else "-"
+                eq_str = f"({a:.4g} * ({ind.tree}) {sign} {abs(b):.4g})"
+                
+            print(f"{c:<6.1f} | {score:<8.4f} | {ind.modularity:<8.3f} | {ind.loss:<12.5f} | {metric_val:<8.4f} | {eq_str}")
+            
+        best = self.get_best_overall()
+        if best:
+            metric_val = getattr(best, 'accuracy', 0.0) if is_cls else getattr(best, 'r2', 0.0)
+            metric_label = "Accuracy" if is_cls else "R²"
+            best_score = scores.get(best.complexity, 0.0)
+            
+            if is_cls:
+                best_eq_str = str(best.tree)
+            else:
+                a, b = getattr(best, 'affine_a', 1.0), getattr(best, 'affine_b', 0.0)
+                sign = "+" if b >= 0 else "-"
+                best_eq_str = f"({a:.4g} * ({best.tree}) {sign} {abs(b):.4g})"
+
+            print("-" * 100)
+            print("🏆 BEST OVERALL MODEL (Score + R² Balanced) 🏆")
+            print(f"  Complexity: {best.complexity:.1f}  |  Score: {best_score:.4f}  |  Loss: {best.loss:.5f}  |  {metric_label}: {metric_val:.4f}")
+            print(f"  Expression: {best_eq_str}")
+        print("=" * 100 + "\n")
+        if ADF_ENABLED and _ADF_REGISTRY:
+            print_adf_library()
+
+
+# ==========================================
+# PART 4: CGP SEEDING, MUTATION & CROSSOVER
+# ==========================================
+
+def random_cgp(n_features, max_nodes, feature_names):
+    """Generate a random CGP individual.
+
+    50% of the time uses "structured random" generation that builds a coherent
+    expression tree from the bottom up (ensuring meaningful active graphs),
+    and 50% uses the traditional fully-random approach (preserving diversity).
+
+    The structured approach solves the problem where random CGP individuals
+    have tiny or degenerate active graphs that contribute nothing useful to
+    the population.
+    """
+    eq = CGPEquation(n_features, max_nodes, feature_names)
+
+    def _random_const():
+        roll = random.random()
+        if roll < 0.15:
+            return random.choice([0.0, 1.0, -1.0, 2.0, -2.0, 0.5, -0.5,
+                                    np.pi, 2*np.pi, np.e, 10.0, 100.0,
+                                    60.0, 3600.0, 0.01, 0.1,
+                                    np.sqrt(2), np.log(2), np.log(10)])
+        elif roll < 0.4:
+            return random.choice([-5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5,
+                                    0.25, 0.33, 0.5, 0.67, 0.75, 1.5, 2.5, 3.5])
+        else:
+            mag = random.choice([0.1, 1.0, 10.0, 100.0, 1000.0])
+            return random.gauss(0, 2.0) * mag
+
+    use_structured = random.random() < 0.50
+
+    if use_structured:
+        # --- Structured random: build a tree bottom-up ---
+        # Target depth 2-5 nodes of active computation, ensuring every node
+        # contributes to the output.  This produces individuals with meaningful
+        # active graphs instead of the typical 1-2 node junk.
+        target_depth = random.randint(2, min(6, max_nodes // 2))
+
+        # Fill all nodes with random junk first (for neutral drift)
+        for i in range(max_nodes):
+            max_connect = max(0, n_features + i - 1)
+            op = random.choice(CGPEquation.OPS_ALL)
+            in1 = random.randint(0, max_connect)
+            in2 = random.randint(0, max_connect)
+            in3 = random.randint(0, max_connect)
+            eq.nodes.append(CGPNode(op, in1, in2, _random_const(), in3=in3))
+
+        # Now build a coherent chain in the first `target_depth` slots.
+        # Layer 0: operate on raw features
+        # Layer k: operate on layer k-1 outputs + features
+        layer_outputs = list(range(n_features))  # start with raw features
+
+        for layer in range(target_depth):
+            slot = layer
+            if slot >= max_nodes:
+                break
+            max_connect = max(0, n_features + slot - 1)
+
+            # Decide: unary (wrap previous) vs binary (combine two things)
+            unary_ops  = CGPEquation.OPS_UNARY or []
+            binary_ops = CGPEquation.OPS_BINARY or []
+
+            # Bias toward operations that reference previous layer outputs
+            if binary_ops and (len(layer_outputs) >= 2 or random.random() < 0.4):
+                op = random.choice(binary_ops)
+                in1 = random.choice(layer_outputs)
+                # For binary: sometimes pick a feature, sometimes a layer output
+                if random.random() < 0.5 and n_features > 0:
+                    in2 = random.randint(0, n_features - 1)
+                else:
+                    in2 = random.choice(layer_outputs)
+                # Clamp to valid range
+                in1 = min(in1, max_connect)
+                in2 = min(in2, max_connect)
+                eq.nodes[slot] = CGPNode(op, in1, in2, _random_const())
+            elif unary_ops:
+                op = random.choice(unary_ops)
+                in1 = random.choice(layer_outputs)
+                in1 = min(in1, max_connect)
+                eq.nodes[slot] = CGPNode(op, in1, 0, _random_const())
+            else:
+                # Only const available
+                eq.nodes[slot] = CGPNode('const', 0, 0, _random_const())
+
+            layer_outputs.append(n_features + slot)
+            # Keep the pool bounded to avoid always referencing distant nodes
+            if len(layer_outputs) > 6:
+                layer_outputs = layer_outputs[-4:] + list(range(min(n_features, 3)))
+
+        # Point output at the last structured node
+        eq.out_idx = n_features + min(target_depth - 1, max_nodes - 1)
+    else:
+        # --- Traditional fully-random CGP ---
+        for i in range(max_nodes):
+            max_connect = max(0, n_features + i - 1)
+            op = random.choice(CGPEquation.OPS_ALL)
+            in1 = random.randint(0, max_connect)
+            in2 = random.randint(0, max_connect)
+            in3 = random.randint(0, max_connect)
+            eq.nodes.append(CGPNode(op, in1, in2, _random_const(), in3=in3))
+        eq.out_idx = random.randint(0, n_features + max_nodes - 1)
+
+    eq.update_active_nodes()
+    return eq
+
+
+def _make_cgp_base(n_features, feature_names, max_nodes=None):
+    return random_cgp(n_features, max_nodes or CGP_NODES, feature_names)
+
+
+def _build_seed(n_features, feature_names, node_specs, out_offset=None):
+    """Build a seed Individual from a compact node specification list.
+
+    *node_specs* is a list of (op, in1, in2[, const_val[, in3]]) tuples,
+    one per CGP node slot to fill (starting at slot 0).
+
+    *out_offset* is the local node offset for the output index.  If ``None``
+    it defaults to ``len(node_specs) - 1`` (last specified node).
+
+    Returns a fully initialised ``Individual``.
+    """
+    cgp = _make_cgp_base(n_features, feature_names)
+    for i, spec in enumerate(node_specs):
+        op, in1, in2 = spec[0], spec[1], spec[2]
+        cval = spec[3] if len(spec) > 3 else 0.0
+        in3  = spec[4] if len(spec) > 4 else 0
+        cgp.nodes[i] = CGPNode(op, in1, in2, cval, in3=in3)
+    if out_offset is None:
+        out_offset = len(node_specs) - 1
+    cgp.out_idx = n_features + out_offset
+    cgp.update_active_nodes()
+    return Individual(cgp)
+
+
+# ==========================================
+# FEATURE IMPORTANCE PRE-SCREENING
+# ==========================================
+# Quick correlation/mutual-information scan to identify the most
+# promising features and feature pairs.  Used to bias seed generation
+# and feature-grafting toward features that actually correlate with the target.
+
+def compute_feature_importance(X, y):
+    """
+    Rank features by absolute Pearson correlation with y.
+    Returns a dict: feature_index → importance ∈ [0, 1].
+    Also returns top pairwise product/ratio importance.
+    """
+    n_features = X.shape[1]
+    importance = {}
+    for i in range(n_features):
+        xi = X[:, i]
+        if np.std(xi) < 1e-10:
+            importance[i] = 0.0
+            continue
+        r = abs(float(np.corrcoef(xi, y)[0, 1]))
+        importance[i] = 0.0 if np.isnan(r) else r
+
+    # Also compute importance for x^2, sqrt, log, 1/x transforms
+    transform_importance = {}
+    for i in range(n_features):
+        xi = X[:, i]
+        if np.std(xi) < 1e-10:
+            continue
+        for name, fn in [('sq', lambda v: v**2),
+                         ('sqrt', lambda v: np.sqrt(np.abs(v))),
+                         ('log', lambda v: np.log(np.abs(v) + 1e-30)),
+                         ('inv', lambda v: 1.0/(np.abs(v)+1e-8)),
+                         ('sin', lambda v: np.sin(v)),
+                         ('cos', lambda v: np.cos(v))]:
+            try:
+                xform = fn(xi)
+                xform = np.nan_to_num(xform, nan=0.0, posinf=0.0, neginf=0.0)
+                if np.std(xform) < 1e-10:
+                    continue
+                r = abs(float(np.corrcoef(xform, y)[0, 1]))
+                if not np.isnan(r) and r > importance.get(i, 0.0):
+                    transform_importance[(i, name)] = r
+            except Exception:
+                pass
+
+    # Pairwise product and ratio importance (only top pairs)
+    pair_importance = {}
+    if n_features <= 20:
+        for i in range(n_features):
+            for j in range(i+1, n_features):
+                xi, xj = X[:, i], X[:, j]
+                if np.std(xi) < 1e-10 or np.std(xj) < 1e-10:
+                    continue
+                # Product
+                try:
+                    prod = xi * xj
+                    prod = np.nan_to_num(prod, nan=0.0, posinf=0.0, neginf=0.0)
+                    if np.std(prod) > 1e-10:
+                        r = abs(float(np.corrcoef(prod, y)[0, 1]))
+                        if not np.isnan(r):
+                            pair_importance[(i, j, '*')] = r
+                except Exception:
+                    pass
+                # Ratio
+                try:
+                    ratio = xi / (np.abs(xj) + 1e-8)
+                    ratio = np.nan_to_num(ratio, nan=0.0, posinf=0.0, neginf=0.0)
+                    if np.std(ratio) > 1e-10:
+                        r = abs(float(np.corrcoef(ratio, y)[0, 1]))
+                        if not np.isnan(r):
+                            pair_importance[(i, j, '/')] = r
+                except Exception:
+                    pass
+                # Trig product: sin(xi)*cos(xj) and sin(xi)*sin(xj)
+                for trig_pair_name, trig_fn in [
+                    ('sin*cos', lambda a, b: np.sin(a) * np.cos(b)),
+                    ('sin*sin', lambda a, b: np.sin(a) * np.sin(b)),
+                    ('cos*cos', lambda a, b: np.cos(a) * np.cos(b)),
+                ]:
+                    try:
+                        trig_val = trig_fn(xi, xj)
+                        trig_val = np.nan_to_num(trig_val, nan=0.0, posinf=0.0, neginf=0.0)
+                        if np.std(trig_val) > 1e-10:
+                            r = abs(float(np.corrcoef(trig_val, y)[0, 1]))
+                            if not np.isnan(r):
+                                pair_importance[(i, j, trig_pair_name)] = r
+                    except Exception:
+                        pass
+
+    return importance, transform_importance, pair_importance
+
+
+def compute_data_constants(X, y):
+    """
+    Compute useful constants from data statistics.
+    These are seeded into initial constant values to give evolution a head start.
+    Returns a list of promising constant values.
+    """
+    consts = []
+    # Target statistics
+    consts.extend([float(np.mean(y)), float(np.std(y)),
+                   float(np.min(y)), float(np.max(y)),
+                   float(np.median(y))])
+
+    # Feature-target ratios (useful scaling constants)
+    for i in range(X.shape[1]):
+        xi = X[:, i]
+        x_mean = float(np.mean(xi))
+        x_std = float(np.std(xi))
+        if abs(x_std) > 1e-8 and abs(float(np.std(y))) > 1e-8:
+            consts.append(float(np.std(y)) / x_std)  # scale ratio
+        if abs(x_mean) > 1e-8:
+            consts.append(float(np.mean(y)) / x_mean)  # mean ratio
+
+    # Common mathematical/physical constants
+    consts.extend([np.pi, 2*np.pi, np.e, 0.5, 2.0, 10.0, 100.0,
+                   60.0, 3600.0, 24.0, 365.25,  # time constants
+                   9.81, 273.15,  # physics constants
+                   ])
+
+    # Deduplicate and filter
+    seen = set()
+    unique = []
+    for c in consts:
+        if np.isfinite(c) and abs(c) < 1e8:
+            key = round(c, 4)
+            if key not in seen:
+                seen.add(key)
+                unique.append(float(c))
+    return unique
+
+
+def generate_importance_biased_seeds(n_features, feature_names, X, y):
+    """
+    Generate seeds biased by feature importance analysis.
+    Creates targeted expressions for the most promising features and pairs.
+    """
+    seeds = []
+    allowed = set(CGPEquation.OPS_ALL)
+    if n_features < 1:
+        return seeds
+
+    importance, transform_imp, pair_imp = compute_feature_importance(X, y)
+    data_consts = compute_data_constants(X, y)
+
+    # Sort features by importance
+    ranked = sorted(importance.items(), key=lambda x: -x[1])
+
+    # For the top-3 most important features, seed with their best transform
+    for feat_idx, imp in ranked[:3]:
+        if imp < 0.1:
+            continue
+        # Check which transform is best for this feature
+        best_xform = None
+        best_xform_imp = imp
+        for (fi, xname), ximp in transform_imp.items():
+            if fi == feat_idx and ximp > best_xform_imp:
+                best_xform = xname
+                best_xform_imp = ximp
+
+        if best_xform == 'sq' and 'square' in allowed:
+            cgp = _make_cgp_base(n_features, feature_names)
+            cgp.nodes[0] = CGPNode('square', feat_idx, 0)
+            cgp.out_idx = n_features; cgp.update_active_nodes()
+            seeds.append(Individual(cgp))
+        elif best_xform == 'sqrt' and 'sqrt' in allowed:
+            cgp = _make_cgp_base(n_features, feature_names)
+            cgp.nodes[0] = CGPNode('sqrt', feat_idx, 0)
+            cgp.out_idx = n_features; cgp.update_active_nodes()
+            seeds.append(Individual(cgp))
+        elif best_xform == 'log' and 'log' in allowed:
+            cgp = _make_cgp_base(n_features, feature_names)
+            cgp.nodes[0] = CGPNode('log', feat_idx, 0)
+            cgp.out_idx = n_features; cgp.update_active_nodes()
+            seeds.append(Individual(cgp))
+        elif best_xform == 'inv' and 'inv' in allowed:
+            cgp = _make_cgp_base(n_features, feature_names)
+            cgp.nodes[0] = CGPNode('inv', feat_idx, 0)
+            cgp.out_idx = n_features; cgp.update_active_nodes()
+            seeds.append(Individual(cgp))
+        elif best_xform == 'sin' and 'sin' in allowed:
+            cgp = _make_cgp_base(n_features, feature_names)
+            cgp.nodes[0] = CGPNode('sin', feat_idx, 0)
+            cgp.out_idx = n_features; cgp.update_active_nodes()
+            seeds.append(Individual(cgp))
+        elif best_xform == 'cos' and 'cos' in allowed:
+            cgp = _make_cgp_base(n_features, feature_names)
+            cgp.nodes[0] = CGPNode('cos', feat_idx, 0)
+            cgp.out_idx = n_features; cgp.update_active_nodes()
+            seeds.append(Individual(cgp))
+
+    # For the top-5 most promising feature pairs, seed x_i OP x_j
+    top_pairs = sorted(pair_imp.items(), key=lambda x: -x[1])[:8]
+    for (fi, fj, op), pimp in top_pairs:
+        if pimp < 0.2:
+            continue
+        # Handle trig pairs specially
+        if op == 'sin*cos' and 'sin' in allowed and 'cos' in allowed and '*' in allowed:
+            cgp = _make_cgp_base(n_features, feature_names)
+            cgp.nodes[0] = CGPNode('sin', fi, 0)
+            cgp.nodes[1] = CGPNode('cos', fj, 0)
+            cgp.nodes[2] = CGPNode('*', n_features, n_features + 1)
+            cgp.out_idx = n_features + 2; cgp.update_active_nodes()
+            seeds.append(Individual(cgp))
+            # Also seed the reverse: sin(xj)*cos(xi)
+            cgp2 = _make_cgp_base(n_features, feature_names)
+            cgp2.nodes[0] = CGPNode('sin', fj, 0)
+            cgp2.nodes[1] = CGPNode('cos', fi, 0)
+            cgp2.nodes[2] = CGPNode('*', n_features, n_features + 1)
+            cgp2.out_idx = n_features + 2; cgp2.update_active_nodes()
+            seeds.append(Individual(cgp2))
+            continue
+        if op == 'sin*sin' and 'sin' in allowed and '*' in allowed:
+            cgp = _make_cgp_base(n_features, feature_names)
+            cgp.nodes[0] = CGPNode('sin', fi, 0)
+            cgp.nodes[1] = CGPNode('sin', fj, 0)
+            cgp.nodes[2] = CGPNode('*', n_features, n_features + 1)
+            cgp.out_idx = n_features + 2; cgp.update_active_nodes()
+            seeds.append(Individual(cgp))
+            continue
+        if op == 'cos*cos' and 'cos' in allowed and '*' in allowed:
+            cgp = _make_cgp_base(n_features, feature_names)
+            cgp.nodes[0] = CGPNode('cos', fi, 0)
+            cgp.nodes[1] = CGPNode('cos', fj, 0)
+            cgp.nodes[2] = CGPNode('*', n_features, n_features + 1)
+            cgp.out_idx = n_features + 2; cgp.update_active_nodes()
+            seeds.append(Individual(cgp))
+            continue
+        if op not in allowed:
+            continue
+        cgp = _make_cgp_base(n_features, feature_names)
+        cgp.nodes[0] = CGPNode(op, fi, fj)
+        cgp.out_idx = n_features; cgp.update_active_nodes()
+        seeds.append(Individual(cgp))
+
+    # Seed data-aware constants into linear models with the top feature
+    if ranked and ranked[0][1] > 0.1 and '*' in allowed and '+' in allowed and 'const' in allowed:
+        top_feat = ranked[0][0]
+        for dc in data_consts[:5]:
+            cgp = _make_cgp_base(n_features, feature_names)
+            cgp.nodes[0] = CGPNode('const', 0, 0, dc)
+            cgp.nodes[1] = CGPNode('*', n_features, top_feat)
+            cgp.out_idx = n_features + 1; cgp.update_active_nodes()
+            seeds.append(Individual(cgp))
+
+    # ── Damped / amplitude-modulated oscillation seeds ──────────────────────
+    # Detect and seed patterns like  exp(a*x) * sin(b*x)  which are extremely
+    # hard for vanilla CGP because they require discovering the product of two
+    # independent sub-expressions (an envelope and an oscillation) simultaneously.
+    # Strategy: for each feature, check if the residuals after removing a simple
+    # exp fit still correlate with sin/cos.  If so, seed the product template.
+    if (n_features >= 1 and 'sin' in allowed and '*' in allowed
+            and ('exp' in allowed or 'neg' in allowed)):
+        for feat_idx in range(min(n_features, 5)):
+            xi = X[:, feat_idx]
+            if np.std(xi) < 1e-10 or np.std(y) < 1e-10:
+                continue
+            try:
+                # Fit a simple exponential decay/growth envelope:  y ≈ A * exp(c * x)
+                # Take log of |y| and fit a linear model to get c
+                y_abs = np.abs(y) + 1e-30
+                log_y = np.log(y_abs)
+                # Remove outliers for robust fitting
+                mask = np.isfinite(log_y) & (np.abs(log_y) < 50)
+                if mask.sum() < 10:
+                    continue
+                xi_m, log_y_m = xi[mask], log_y[mask]
+                # Simple OLS: log|y| = c * x + d
+                cov = np.mean((xi_m - np.mean(xi_m)) * (log_y_m - np.mean(log_y_m)))
+                var_x = np.var(xi_m) + 1e-30
+                c_est = cov / var_x
+                if abs(c_est) < 0.01:
+                    continue  # not exponential enough
+                # Compute envelope-removed residuals
+                envelope = np.exp(c_est * xi)
+                envelope = np.clip(envelope, 1e-30, 1e30)
+                residual = y / np.where(np.abs(envelope) > 1e-10, envelope, 1.0)
+                residual = np.nan_to_num(residual, nan=0.0, posinf=0.0, neginf=0.0)
+                if np.std(residual) < 1e-10:
+                    continue
+                # Check if residual correlates with sin or cos of various frequencies
+                for freq_mult in [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 5.0]:
+                    sin_sig = np.sin(freq_mult * xi)
+                    cos_sig = np.cos(freq_mult * xi)
+                    r_sin = abs(float(np.corrcoef(residual, sin_sig)[0, 1]))
+                    r_cos = abs(float(np.corrcoef(residual, cos_sig)[0, 1]))
+                    if np.isnan(r_sin): r_sin = 0.0
+                    if np.isnan(r_cos): r_cos = 0.0
+
+                    if max(r_sin, r_cos) > 0.3:
+                        # Seed: exp(c * x) * sin(freq * x)  or  exp(c * x) * cos(freq * x)
+                        trig_op = 'sin' if r_sin >= r_cos else 'cos'
+                        if trig_op not in allowed:
+                            continue
+
+                        # Template: const_c * feat  →  exp(*)  →  const_f * feat  →  trig(*)  →  product
+                        cgp = _make_cgp_base(n_features, feature_names)
+                        nf = n_features
+                        # node[0]: const c_est (decay rate)
+                        cgp.nodes[0] = CGPNode('const', 0, 0, c_est)
+                        # node[1]: c * x
+                        cgp.nodes[1] = CGPNode('*', nf, feat_idx)
+                        # node[2]: exp(c * x)
+                        if 'exp' in allowed and not SAFE_OPS_MODE:
+                            cgp.nodes[2] = CGPNode('exp', nf + 1, 0)
+                        else:
+                            # In safe mode, exp is exp(-|v|), so use pow with e base
+                            cgp.nodes[2] = CGPNode('exp', nf + 1, 0)
+                        # node[3]: const freq
+                        cgp.nodes[3] = CGPNode('const', 0, 0, freq_mult)
+                        # node[4]: freq * x
+                        cgp.nodes[4] = CGPNode('*', nf + 3, feat_idx)
+                        # node[5]: sin/cos(freq * x)
+                        cgp.nodes[5] = CGPNode(trig_op, nf + 4, 0)
+                        # node[6]: exp(c*x) * sin(freq*x)
+                        cgp.nodes[6] = CGPNode('*', nf + 2, nf + 5)
+                        cgp.out_idx = nf + 6
+                        cgp.update_active_nodes()
+                        seeds.append(Individual(cgp))
+
+                        # Also seed with an additive constant: A * exp(c*x) * trig(f*x) + B
+                        if '+' in allowed and 'const' in allowed:
+                            cgp2 = _make_cgp_base(n_features, feature_names)
+                            cgp2.nodes[0] = CGPNode('const', 0, 0, c_est)
+                            cgp2.nodes[1] = CGPNode('*', nf, feat_idx)
+                            cgp2.nodes[2] = CGPNode('exp', nf + 1, 0)
+                            cgp2.nodes[3] = CGPNode('const', 0, 0, freq_mult)
+                            cgp2.nodes[4] = CGPNode('*', nf + 3, feat_idx)
+                            cgp2.nodes[5] = CGPNode(trig_op, nf + 4, 0)
+                            cgp2.nodes[6] = CGPNode('*', nf + 2, nf + 5)
+                            cgp2.nodes[7] = CGPNode('const', 0, 0, float(np.mean(y)))
+                            cgp2.nodes[8] = CGPNode('+', nf + 6, nf + 7)
+                            cgp2.out_idx = nf + 8
+                            cgp2.update_active_nodes()
+                            seeds.append(Individual(cgp2))
+
+                        break  # one frequency seed per feature is enough
+            except Exception:
+                continue
+
+    # ── Simple product-of-functions seeds (variable amplitude) ──────────────
+    # For 1D data: seed exp(x)*x, exp(-x)*x, x*sin(x) templates
+    if n_features >= 1 and '*' in allowed:
+        for feat_idx in range(min(n_features, 3)):
+            # x * sin(x) — polynomial × oscillation
+            if 'sin' in allowed:
+                cgp = _make_cgp_base(n_features, feature_names)
+                cgp.nodes[0] = CGPNode('sin', feat_idx, 0)
+                cgp.nodes[1] = CGPNode('*', feat_idx, n_features)
+                cgp.out_idx = n_features + 1; cgp.update_active_nodes()
+                seeds.append(Individual(cgp))
+            # x² * sin(x) — quadratic envelope
+            if 'sin' in allowed and 'square' in allowed:
+                cgp = _make_cgp_base(n_features, feature_names)
+                cgp.nodes[0] = CGPNode('square', feat_idx, 0)
+                cgp.nodes[1] = CGPNode('sin', feat_idx, 0)
+                cgp.nodes[2] = CGPNode('*', n_features, n_features + 1)
+                cgp.out_idx = n_features + 2; cgp.update_active_nodes()
+                seeds.append(Individual(cgp))
+            # exp(x) * sin(x) — exponential × oscillation
+            if 'sin' in allowed and 'exp' in allowed:
+                cgp = _make_cgp_base(n_features, feature_names)
+                cgp.nodes[0] = CGPNode('exp', feat_idx, 0)
+                cgp.nodes[1] = CGPNode('sin', feat_idx, 0)
+                cgp.nodes[2] = CGPNode('*', n_features, n_features + 1)
+                cgp.out_idx = n_features + 2; cgp.update_active_nodes()
+                seeds.append(Individual(cgp))
+
+    return seeds
+
+
+def generate_residual_aware_seeds(n_features, feature_names, X, y_target,
+                                   hof_best, max_seeds=10):
+    """
+    Generate seeds targeted at regions where the current HoF best is failing.
+
+    Strategy:
+      1. Evaluate the HoF best to get residuals.
+      2. Find the samples with the largest absolute residuals (error hotspots).
+      3. Analyze which features are most correlated with those residual patterns.
+      4. Generate seeds that specifically target those features and patterns.
+      5. Also generate seeds for the residuals themselves (treating residuals
+         as a new regression target), biased toward features correlated with
+         the error pattern.
+
+    This breaks the "seed basin trap" where the population converges to seed
+    templates and can't discover the correction terms needed for regions those
+    seeds don't cover.
+    """
+    seeds = []
+    allowed = set(CGPEquation.OPS_ALL)
+    if hof_best is None or n_features < 1:
+        return seeds
+
+    try:
+        # Compute residuals from the HoF best
+        preds = hof_best.tree.evaluate(X)
+        preds = np.clip(np.nan_to_num(preds, nan=0.0, posinf=1e9, neginf=-1e9),
+                        -1e9, 1e9)
+        preds = hof_best.affine_a * preds + hof_best.affine_b
+        # Apply boost corrections if any
+        for corr_tree, ca, cb, lr in getattr(hof_best, 'boost_stages', []):
+            corr = corr_tree.evaluate(X)
+            corr = np.clip(np.nan_to_num(corr, nan=0.0, posinf=1e9,
+                           neginf=-1e9), -1e9, 1e9)
+            preds += lr * (ca * corr + cb)
+
+        residuals = y_target - preds
+        res_std = float(np.std(residuals))
+        if res_std < 1e-10:
+            return seeds  # HoF is near-perfect
+
+        # ── Step 1: Feature-residual correlation analysis ──────────────────
+        # Find which features explain the remaining error pattern
+        res_importance = {}
+        for i in range(n_features):
+            xi = X[:, i]
+            if np.std(xi) < 1e-10:
+                continue
+            r = abs(float(np.corrcoef(xi, residuals)[0, 1]))
+            res_importance[i] = 0.0 if np.isnan(r) else r
+
+        # Also check nonlinear transforms of features against residuals
+        res_transform_imp = {}
+        for i in range(min(n_features, 10)):
+            xi = X[:, i]
+            if np.std(xi) < 1e-10:
+                continue
+            for name, fn in [('sq', lambda v: v**2),
+                             ('sqrt', lambda v: np.sqrt(np.abs(v))),
+                             ('sin', lambda v: np.sin(v)),
+                             ('cos', lambda v: np.cos(v)),
+                             ('log', lambda v: np.log(np.abs(v) + 1e-30)),
+                             ('inv', lambda v: 1.0 / (np.abs(v) + 1e-8))]:
+                try:
+                    xform = fn(xi)
+                    xform = np.nan_to_num(xform, nan=0.0, posinf=0.0, neginf=0.0)
+                    if np.std(xform) < 1e-10:
+                        continue
+                    r = abs(float(np.corrcoef(xform, residuals)[0, 1]))
+                    if not np.isnan(r) and r > res_importance.get(i, 0.0):
+                        res_transform_imp[(i, name)] = r
+                except Exception:
+                    pass
+
+        # ── Step 2: Generate seeds for top residual-correlated features ────
+        ranked = sorted(res_importance.items(), key=lambda x: -x[1])
+
+        for feat_idx, imp in ranked[:4]:
+            if imp < 0.05:
+                continue
+
+            # Simple linear seed on this feature (targets residual directly)
+            if 'const' in allowed and '*' in allowed:
+                cgp = _make_cgp_base(n_features, feature_names)
+                nf = n_features
+                # Estimate slope from residuals
+                xi = X[:, feat_idx]
+                xi_std = float(np.std(xi))
+                if xi_std > 1e-10:
+                    slope = float(np.cov(xi, residuals)[0, 1] / (xi_std**2))
+                else:
+                    slope = 1.0
+                cgp.nodes[0] = CGPNode('const', 0, 0, slope)
+                cgp.nodes[1] = CGPNode('*', nf, feat_idx)
+                cgp.out_idx = nf + 1
+                cgp.update_active_nodes()
+                seeds.append(Individual(cgp))
+
+            # Check best nonlinear transform
+            best_xform = None
+            best_r = imp
+            for (fi, xname), ximp in res_transform_imp.items():
+                if fi == feat_idx and ximp > best_r:
+                    best_xform = xname
+                    best_r = ximp
+
+            op_map = {'sq': 'square', 'sqrt': 'sqrt', 'sin': 'sin',
+                      'cos': 'cos', 'log': 'log', 'inv': 'inv'}
+            if best_xform and op_map.get(best_xform) in allowed:
+                cgp = _make_cgp_base(n_features, feature_names)
+                cgp.nodes[0] = CGPNode(op_map[best_xform], feat_idx, 0)
+                cgp.out_idx = n_features
+                cgp.update_active_nodes()
+                seeds.append(Individual(cgp))
+
+        # ── Step 3: Pairwise interaction seeds for residuals ───────────────
+        # Check if products/ratios of features explain the residual
+        top2 = [f for f, _ in ranked[:5] if res_importance.get(f, 0) > 0.05]
+        for i in range(len(top2)):
+            for j in range(i + 1, len(top2)):
+                fi, fj = top2[i], top2[j]
+                if '*' in allowed:
+                    xi_xj = X[:, fi] * X[:, fj]
+                    xi_xj = np.nan_to_num(xi_xj, nan=0.0, posinf=0.0, neginf=0.0)
+                    if np.std(xi_xj) > 1e-10:
+                        r = abs(float(np.corrcoef(xi_xj, residuals)[0, 1]))
+                        if not np.isnan(r) and r > 0.15:
+                            cgp = _make_cgp_base(n_features, feature_names)
+                            cgp.nodes[0] = CGPNode('*', fi, fj)
+                            cgp.out_idx = n_features
+                            cgp.update_active_nodes()
+                            seeds.append(Individual(cgp))
+
+        # ── Step 4: Error-hotspot focused seeds ────────────────────────────
+        # Find the top-20% highest-error samples and generate seeds biased
+        # toward the feature subspace of those samples
+        abs_res = np.abs(residuals)
+        threshold = np.percentile(abs_res, 80)
+        hotspot_mask = abs_res >= threshold
+        n_hotspot = int(np.sum(hotspot_mask))
+
+        if n_hotspot >= 5 and n_hotspot < len(residuals):
+            X_hot = X[hotspot_mask]
+            res_hot = residuals[hotspot_mask]
+
+            # Re-run importance on the hotspot subset
+            for feat_idx in range(min(n_features, 8)):
+                xi = X_hot[:, feat_idx]
+                if np.std(xi) < 1e-10 or np.std(res_hot) < 1e-10:
+                    continue
+                r = abs(float(np.corrcoef(xi, res_hot)[0, 1]))
+                if np.isnan(r) or r < 0.2:
+                    continue
+
+                # Seed with a const*feature targeting the hotspot pattern
+                if 'const' in allowed and '*' in allowed:
+                    xi_std = float(np.std(xi))
+                    if xi_std > 1e-10:
+                        slope = float(np.cov(xi, res_hot)[0, 1] / (xi_std**2))
+                    else:
+                        slope = 1.0
+                    cgp = _make_cgp_base(n_features, feature_names)
+                    nf = n_features
+                    cgp.nodes[0] = CGPNode('const', 0, 0, slope)
+                    cgp.nodes[1] = CGPNode('*', nf, feat_idx)
+                    cgp.out_idx = nf + 1
+                    cgp.update_active_nodes()
+                    seeds.append(Individual(cgp))
+
+        # ── Step 5: Mutated variants of HoF best targeting residuals ───────
+        # Create mutations of the HoF best that might capture missing patterns
+        for rate_mult in [2, 4, 8]:
+            tree = mutate(hof_best.tree, n_features, feature_names,
+                          mut_rate=max(1, CGP_MUT_RATE * rate_mult))
+            seeds.append(Individual(tree))
+
+    except Exception:
+        pass  # never let seed generation crash the main loop
+
+    return seeds[:max_seeds]
+
+
+def generate_seeds_v5(n_features, feature_names):
+    """Generate a diverse population of hand-crafted seed individuals."""
+    seeds = []
+    feat = lambda: random.randint(0, n_features - 1)
+    
+    # Pre-calculate for fast O(1) lookups
+    allowed = set(CGPEquation.OPS_ALL)
+
+    # 1. Linear: c * x
+    if '*' in allowed and 'const' in allowed:
+        f = feat()
+        seeds.append(_build_seed(n_features, feature_names, [
+            ('const', 0, 0, random.uniform(0.1, 5.0)),
+            ('*', n_features, f),
+        ]))
+
+    # 2. Linear offset: x + c
+    if '+' in allowed and 'const' in allowed:
+        f = feat()
+        seeds.append(_build_seed(n_features, feature_names, [
+            ('const', 0, 0, random.uniform(-5.0, 5.0)),
+            ('+', n_features, f),
+        ]))
+
+    # 3. Inverse: 1 / x
+    if '/' in allowed and 'const' in allowed:
+        f = feat()
+        seeds.append(_build_seed(n_features, feature_names, [
+            ('const', 0, 0, 1.0),
+            ('/', n_features, f),
+        ]))
+
+    # 4. Square: x^2
+    if '*' in allowed:
+        f = feat()
+        seeds.append(_build_seed(n_features, feature_names, [
+            ('*', f, f),
+        ]))
+
+    # 5. Square root: sqrt(x)
+    if 'sqrt' in allowed:
+        f = feat()
+        seeds.append(_build_seed(n_features, feature_names, [
+            ('sqrt', f, 0),
+        ]))
+
+    # 6. Exponential decay: exp(-x)
+    if 'exp' in allowed and '-' in allowed and 'const' in allowed:
+        f = feat()
+        seeds.append(_build_seed(n_features, feature_names, [
+            ('const', 0, 0, 0.0),
+            ('-', n_features, f),
+            ('exp', n_features + 1, 0),
+        ]))
+
+    # 7. Logarithm: log(|x|)
+    if 'log' in allowed:
+        f = feat()
+        seeds.append(_build_seed(n_features, feature_names, [
+            ('log', f, 0),
+        ]))
+
+    # 8. Sigmoid/logistic: sigmoid(c*x + b)
+    if 'sigmoid' in allowed and '*' in allowed and '+' in allowed and 'const' in allowed:
+        f = feat()
+        seeds.append(_build_seed(n_features, feature_names, [
+            ('const', 0, 0, random.uniform(0.5, 3.0)),
+            ('*', n_features, f),
+            ('const', 0, 0, random.uniform(-2.0, 2.0)),
+            ('+', n_features + 1, n_features + 2),
+            ('sigmoid', n_features + 3, 0),
+        ]))
+
+    # 9. Gaussian bell: exp(-x^2)
+    if 'gaussian' in allowed:
+        f = feat()
+        seeds.append(_build_seed(n_features, feature_names, [
+            ('gaussian', f, 0),
+        ]))
+
+    # 10. Cubic: x^3
+    if 'cube' in allowed:
+        f = feat()
+        seeds.append(_build_seed(n_features, feature_names, [
+            ('cube', f, 0),
+        ]))
+
+    # 11. Two-feature product: x1 * x2
+    if n_features >= 2 and '*' in allowed:
+        f1, f2 = random.sample(range(n_features), 2)
+        seeds.append(_build_seed(n_features, feature_names, [
+            ('*', f1, f2),
+        ]))
+
+    # 12. Two-feature linear sum: c1*x1 + c2*x2
+    if n_features >= 2 and '*' in allowed and '+' in allowed and 'const' in allowed:
+        f1, f2 = random.sample(range(n_features), 2)
+        seeds.append(_build_seed(n_features, feature_names, [
+            ('const', 0, 0, random.uniform(0.1, 3.0)),
+            ('const', 0, 0, random.uniform(0.1, 3.0)),
+            ('*', n_features, f1),
+            ('*', n_features + 1, f2),
+            ('+', n_features + 2, n_features + 3),
+        ]))
+
+    # 13. ReLU linear: relu(c*x + b)
+    if 'relu' in allowed and '*' in allowed and 'const' in allowed:
+        f = feat()
+        seeds.append(_build_seed(n_features, feature_names, [
+            ('const', 0, 0, random.uniform(0.5, 2.0)),
+            ('*', n_features, f),
+            ('relu', n_features + 1, 0),
+        ]))
+
+    # 14. Tanh: tanh(c*x)
+    if 'tanh' in allowed and '*' in allowed and 'const' in allowed:
+        f = feat()
+        seeds.append(_build_seed(n_features, feature_names, [
+            ('const', 0, 0, random.uniform(0.5, 2.0)),
+            ('*', n_features, f),
+            ('tanh', n_features + 1, 0),
+        ]))
+
+    # 15. Rational: x / (1 + |x|)
+    if '/' in allowed and '+' in allowed and 'abs' in allowed and 'const' in allowed:
+        f = feat()
+        seeds.append(_build_seed(n_features, feature_names, [
+            ('abs', f, 0),
+            ('const', 0, 0, 1.0),
+            ('+', n_features, n_features + 1),
+            ('/', f, n_features + 2),
+        ]))
+
+    # 16. Power law: c * x^p  (covers x^1.5, x^2.5, x^0.5 etc.)
+    # This is the key building block for Kepler-type and other physical laws.
+    # Without it the population can get stuck in a linear basin because every
+    # mutation toward x^p temporarily worsens fitness relative to c*x+b.
+    if 'pow' in allowed and '*' in allowed and 'const' in allowed:
+        for _exp in [0.5, 1.5, 2.0, 2.5, 3.0]:
+            cgp = _make_cgp_base(n_features, feature_names)
+            f = feat()
+            cgp.nodes[0] = CGPNode('const', 0, 0, _exp)           # exponent
+            cgp.nodes[1] = CGPNode('pow', f, n_features)           # x^p
+            cgp.nodes[2] = CGPNode('const', 0, 0, random.uniform(0.5, 10.0))  # scale
+            cgp.nodes[3] = CGPNode('*', n_features + 1, n_features + 2)       # c * x^p
+            cgp.out_idx = n_features + 3; cgp.update_active_nodes()
+            seeds.append(Individual(cgp))
+
+    # 17. Scaled power law with offset: c1 * x^p + c2
+    if 'pow' in allowed and '*' in allowed and '+' in allowed and 'const' in allowed:
+        for _exp in [1.5, 2.5]:
+            cgp = _make_cgp_base(n_features, feature_names)
+            f = feat()
+            cgp.nodes[0] = CGPNode('const', 0, 0, _exp)
+            cgp.nodes[1] = CGPNode('pow', f, n_features)
+            cgp.nodes[2] = CGPNode('const', 0, 0, random.uniform(0.5, 10.0))
+            cgp.nodes[3] = CGPNode('*', n_features + 1, n_features + 2)
+            cgp.nodes[4] = CGPNode('const', 0, 0, random.uniform(-10.0, 10.0))
+            cgp.nodes[5] = CGPNode('+', n_features + 3, n_features + 4)
+            cgp.out_idx = n_features + 5; cgp.update_active_nodes()
+            seeds.append(Individual(cgp))
+
+    # 18. Two-feature power interaction: x1^p * x2^q
+    if n_features >= 2 and 'pow' in allowed and '*' in allowed and 'const' in allowed:
+        cgp = _make_cgp_base(n_features, feature_names)
+        f1, f2 = random.sample(range(n_features), 2)
+        p1 = random.choice([0.5, 1.5, 2.0, 3.0])
+        p2 = random.choice([0.5, 1.0, 1.5])
+        cgp.nodes[0] = CGPNode('const', 0, 0, p1)
+        cgp.nodes[1] = CGPNode('const', 0, 0, p2)
+        cgp.nodes[2] = CGPNode('pow', f1, n_features)
+        cgp.nodes[3] = CGPNode('pow', f2, n_features + 1)
+        cgp.nodes[4] = CGPNode('*', n_features + 2, n_features + 3)
+        cgp.out_idx = n_features + 4; cgp.update_active_nodes()
+        seeds.append(Individual(cgp))
+
+    # 19. Three-feature weighted sum: c1*x1 + c2*x2 + c3*x3
+    if n_features >= 3 and '*' in allowed and '+' in allowed and 'const' in allowed:
+        cgp = _make_cgp_base(n_features, feature_names)
+        f1, f2, f3 = random.sample(range(n_features), 3)
+        cgp.nodes[0] = CGPNode('const', 0, 0, random.uniform(0.1, 3.0))
+        cgp.nodes[1] = CGPNode('const', 0, 0, random.uniform(0.1, 3.0))
+        cgp.nodes[2] = CGPNode('const', 0, 0, random.uniform(0.1, 3.0))
+        cgp.nodes[3] = CGPNode('*', n_features, f1)      # c1*x1
+        cgp.nodes[4] = CGPNode('*', n_features + 1, f2)  # c2*x2
+        cgp.nodes[5] = CGPNode('*', n_features + 2, f3)  # c3*x3
+        cgp.nodes[6] = CGPNode('+', n_features + 3, n_features + 4)
+        cgp.nodes[7] = CGPNode('+', n_features + 6, n_features + 5)
+        cgp.out_idx = n_features + 7; cgp.update_active_nodes()
+        seeds.append(Individual(cgp))
+
+    # 20. Exponential decay modulated by second feature: exp(-a*x1) * x2
+    if n_features >= 2 and 'exp' in allowed and '*' in allowed and 'const' in allowed:
+        cgp = _make_cgp_base(n_features, feature_names)
+        f1, f2 = random.sample(range(n_features), 2)
+        cgp.nodes[0] = CGPNode('const', 0, 0, random.uniform(0.1, 2.0))   # rate a
+        cgp.nodes[1] = CGPNode('*', n_features, f1)      # a*x1
+        # Safe: use negated argument for decay (0 - a*x1)
+        cgp.nodes[2] = CGPNode('const', 0, 0, 0.0)
+        cgp.nodes[3] = CGPNode('-', n_features + 2, n_features + 1)        # -a*x1
+        cgp.nodes[4] = CGPNode('exp', n_features + 3, 0)                   # exp(-a*x1)
+        cgp.nodes[5] = CGPNode('*', n_features + 4, f2)                    # exp(-a*x1)*x2
+        cgp.out_idx = n_features + 5; cgp.update_active_nodes()
+        seeds.append(Individual(cgp))
+
+    # 21. Multi-feature sum of power laws: c1*x1^p + c2*x2^q
+    if n_features >= 2 and 'pow' in allowed and '*' in allowed and '+' in allowed and 'const' in allowed:
+        for _p, _q in [(2.0, 1.0), (1.5, 0.5), (3.0, 2.0)]:
+            cgp = _make_cgp_base(n_features, feature_names)
+            f1, f2 = random.sample(range(n_features), 2)
+            cgp.nodes[0] = CGPNode('const', 0, 0, _p)
+            cgp.nodes[1] = CGPNode('const', 0, 0, _q)
+            cgp.nodes[2] = CGPNode('const', 0, 0, random.uniform(0.5, 5.0))
+            cgp.nodes[3] = CGPNode('const', 0, 0, random.uniform(0.5, 5.0))
+            cgp.nodes[4] = CGPNode('pow', f1, n_features)        # x1^p
+            cgp.nodes[5] = CGPNode('pow', f2, n_features + 1)    # x2^q
+            cgp.nodes[6] = CGPNode('*', n_features + 2, n_features + 4)  # c1*x1^p
+            cgp.nodes[7] = CGPNode('*', n_features + 3, n_features + 5)  # c2*x2^q
+            cgp.nodes[8] = CGPNode('+', n_features + 6, n_features + 7)
+            cgp.out_idx = n_features + 8; cgp.update_active_nodes()
+            seeds.append(Individual(cgp))
+
+    # 22. Feature ratio power: (x1 / x2)^p  — common in physics / dimensional analysis
+    if n_features >= 2 and 'pow' in allowed and '/' in allowed and 'const' in allowed:
+        cgp = _make_cgp_base(n_features, feature_names)
+        f1, f2 = random.sample(range(n_features), 2)
+        _exp = random.choice([0.5, 1.5, 2.0, 3.0, -1.0])
+        cgp.nodes[0] = CGPNode('/', f1, f2)               # x1 / x2
+        cgp.nodes[1] = CGPNode('const', 0, 0, _exp)
+        cgp.nodes[2] = CGPNode('pow', n_features, n_features + 1)  # (x1/x2)^p
+        cgp.nodes[3] = CGPNode('const', 0, 0, random.uniform(0.5, 5.0))
+        cgp.nodes[4] = CGPNode('*', n_features + 3, n_features + 2)
+        cgp.out_idx = n_features + 4; cgp.update_active_nodes()
+        seeds.append(Individual(cgp))
+
+    # 23. Mixed log-linear: log(x1) * x2  — entropy/information-type interactions
+    if n_features >= 2 and 'log' in allowed and '*' in allowed:
+        cgp = _make_cgp_base(n_features, feature_names)
+        f1, f2 = random.sample(range(n_features), 2)
+        cgp.nodes[0] = CGPNode('log', f1, 0)
+        cgp.nodes[1] = CGPNode('*', n_features, f2)
+        cgp.out_idx = n_features + 1; cgp.update_active_nodes()
+        seeds.append(Individual(cgp))
+
+    # 24. Sum of logs: log(x1) + log(x2)  — equivalent to log(x1*x2)
+    if n_features >= 2 and 'log' in allowed and '+' in allowed:
+        cgp = _make_cgp_base(n_features, feature_names)
+        f1, f2 = random.sample(range(n_features), 2)
+        cgp.nodes[0] = CGPNode('log', f1, 0)
+        cgp.nodes[1] = CGPNode('log', f2, 0)
+        cgp.nodes[2] = CGPNode('+', n_features, n_features + 1)
+        cgp.out_idx = n_features + 2; cgp.update_active_nodes()
+        seeds.append(Individual(cgp))
+
+    # 25. Additive model with nonlinear transforms: f(x1) + g(x2)
+    _additive_unary_pairs = [
+        ('sqrt', 'log'), ('log', 'sqrt'), ('exp', 'log'),
+        ('tanh', 'relu'), ('sigmoid', 'tanh'),
+        ('sin', 'cos'), ('sin', 'sin'), ('cos', 'cos'),
+    ]
+    for u1, u2 in _additive_unary_pairs:
+        if n_features >= 2 and u1 in allowed and u2 in allowed and '+' in allowed:
+            cgp = _make_cgp_base(n_features, feature_names)
+            f1, f2 = random.sample(range(n_features), 2)
+            cgp.nodes[0] = CGPNode(u1, f1, 0)
+            cgp.nodes[1] = CGPNode(u2, f2, 0)
+            cgp.nodes[2] = CGPNode('+', n_features, n_features + 1)
+            cgp.out_idx = n_features + 2; cgp.update_active_nodes()
+            seeds.append(Individual(cgp))
+
+    # 26. Power-law decay × second variable: c * x1^(-p) * x2
+    #     (inverse power modulated by another variable — common in physics)
+    if n_features >= 2 and 'pow' in allowed and '*' in allowed and 'const' in allowed:
+        cgp = _make_cgp_base(n_features, feature_names)
+        f1, f2 = random.sample(range(n_features), 2)
+        _neg_exp = random.choice([-0.5, -1.0, -1.5, -2.0])
+        cgp.nodes[0] = CGPNode('const', 0, 0, _neg_exp)
+        cgp.nodes[1] = CGPNode('pow', f1, n_features)         # x1^(-p)
+        cgp.nodes[2] = CGPNode('const', 0, 0, random.uniform(0.5, 5.0))
+        cgp.nodes[3] = CGPNode('*', n_features + 2, n_features + 1)  # c * x1^(-p)
+        cgp.nodes[4] = CGPNode('*', n_features + 3, f2)              # * x2
+        cgp.out_idx = n_features + 4; cgp.update_active_nodes()
+        seeds.append(Individual(cgp))
+
+    # 27. Squared multi-feature interaction: (c1*x1 + c2*x2)^2
+    if n_features >= 2 and '*' in allowed and '+' in allowed and 'const' in allowed:
+        cgp = _make_cgp_base(n_features, feature_names)
+        f1, f2 = random.sample(range(n_features), 2)
+        cgp.nodes[0] = CGPNode('const', 0, 0, random.uniform(0.5, 3.0))
+        cgp.nodes[1] = CGPNode('const', 0, 0, random.uniform(0.5, 3.0))
+        cgp.nodes[2] = CGPNode('*', n_features, f1)            # c1*x1
+        cgp.nodes[3] = CGPNode('*', n_features + 1, f2)        # c2*x2
+        cgp.nodes[4] = CGPNode('+', n_features + 2, n_features + 3)   # sum
+        cgp.nodes[5] = CGPNode('*', n_features + 4, n_features + 4)   # sum^2
+        cgp.out_idx = n_features + 5; cgp.update_active_nodes()
+        seeds.append(Individual(cgp))
+
+    # 28. Generalised multi-var exponential: c * exp(a*x1 + b*x2)
+    if n_features >= 2 and 'exp' in allowed and '*' in allowed and '+' in allowed and 'const' in allowed:
+        cgp = _make_cgp_base(n_features, feature_names)
+        f1, f2 = random.sample(range(n_features), 2)
+        cgp.nodes[0] = CGPNode('const', 0, 0, random.gauss(0, 0.5))   # a
+        cgp.nodes[1] = CGPNode('const', 0, 0, random.gauss(0, 0.5))   # b
+        cgp.nodes[2] = CGPNode('*', n_features, f1)                    # a*x1
+        cgp.nodes[3] = CGPNode('*', n_features + 1, f2)                # b*x2
+        cgp.nodes[4] = CGPNode('+', n_features + 2, n_features + 3)   # a*x1+b*x2
+        cgp.nodes[5] = CGPNode('exp', n_features + 4, 0)               # exp(...)
+        cgp.nodes[6] = CGPNode('const', 0, 0, random.uniform(0.5, 5.0))
+        cgp.nodes[7] = CGPNode('*', n_features + 6, n_features + 5)   # c*exp(...)
+        cgp.out_idx = n_features + 7; cgp.update_active_nodes()
+        seeds.append(Individual(cgp))
+
+    # ================================================================
+    # 29–33. CONST^VARIABLE seeds (exponential growth patterns)
+    # ================================================================
+    # These are the CRITICAL missing patterns.  All existing pow seeds use
+    # pow(variable, const) = x^c (power laws).  But pow(const, variable) = c^x
+    # (exponential growth/decay) is equally important in science:
+    #   • Radioactive decay: N = N₀ · (1/2)^(t/τ)
+    #   • Compound interest: A = P · (1+r)^t
+    #   • Bacterial growth:  N = N₀ · 2^(t/τ)
+    #   • General:           y = a · b^(c·x)
+    # Without explicit seeds, evolution almost never discovers this pattern
+    # because the search space is too vast for random mutation to stumble into
+    # the specific (const_node→in1, feature→in2) wiring of a pow node.
+
+    # 29. Simple exponential: c^x  (various bases)
+    if 'pow' in allowed and 'const' in allowed:
+        for _base in [2.0, np.e, 5.0, 10.0, 0.5]:
+            cgp = _make_cgp_base(n_features, feature_names)
+            f = feat()
+            # NOTE: const is IN1 (base), feature is IN2 (exponent)!
+            cgp.nodes[0] = CGPNode('const', 0, 0, _base)
+            cgp.nodes[1] = CGPNode('pow', n_features, f)  # const^x
+            cgp.out_idx = n_features + 1; cgp.update_active_nodes()
+            seeds.append(Individual(cgp))
+
+    # 30. Scaled exponential: a * b^(c*x)
+    if 'pow' in allowed and '*' in allowed and 'const' in allowed:
+        for _base in [2.0, np.e, 10.0]:
+            cgp = _make_cgp_base(n_features, feature_names)
+            f = feat()
+            cgp.nodes[0] = CGPNode('const', 0, 0, random.uniform(0.1, 1.0))  # rate c
+            cgp.nodes[1] = CGPNode('*', n_features, f)                        # c*x
+            cgp.nodes[2] = CGPNode('const', 0, 0, _base)                      # base b
+            cgp.nodes[3] = CGPNode('pow', n_features + 2, n_features + 1)     # b^(c*x)
+            cgp.nodes[4] = CGPNode('const', 0, 0, random.uniform(0.5, 5.0))  # scale a
+            cgp.nodes[5] = CGPNode('*', n_features + 4, n_features + 3)       # a * b^(c*x)
+            cgp.out_idx = n_features + 5; cgp.update_active_nodes()
+            seeds.append(Individual(cgp))
+
+    # 31. Exponential with offset: a * b^x + c
+    if 'pow' in allowed and '*' in allowed and '+' in allowed and 'const' in allowed:
+        cgp = _make_cgp_base(n_features, feature_names)
+        f = feat()
+        cgp.nodes[0] = CGPNode('const', 0, 0, random.choice([2.0, np.e, 10.0]))  # base
+        cgp.nodes[1] = CGPNode('pow', n_features, f)                               # base^x
+        cgp.nodes[2] = CGPNode('const', 0, 0, random.uniform(0.5, 5.0))           # scale
+        cgp.nodes[3] = CGPNode('*', n_features + 2, n_features + 1)                # a*b^x
+        cgp.nodes[4] = CGPNode('const', 0, 0, random.uniform(-5.0, 5.0))          # offset
+        cgp.nodes[5] = CGPNode('+', n_features + 3, n_features + 4)                # a*b^x + c
+        cgp.out_idx = n_features + 5; cgp.update_active_nodes()
+        seeds.append(Individual(cgp))
+
+    # 32. Two-feature exponential interaction: b^x1 * x2
+    if n_features >= 2 and 'pow' in allowed and '*' in allowed and 'const' in allowed:
+        cgp = _make_cgp_base(n_features, feature_names)
+        f1, f2 = random.sample(range(n_features), 2)
+        cgp.nodes[0] = CGPNode('const', 0, 0, random.choice([2.0, np.e, 10.0]))
+        cgp.nodes[1] = CGPNode('pow', n_features, f1)          # base^x1
+        cgp.nodes[2] = CGPNode('*', n_features + 1, f2)        # base^x1 * x2
+        cgp.out_idx = n_features + 2; cgp.update_active_nodes()
+        seeds.append(Individual(cgp))
+
+    # 33. Exponential decay: a * b^(-c*x) = a / b^(c*x)
+    if 'pow' in allowed and '*' in allowed and '-' in allowed and 'const' in allowed:
+        cgp = _make_cgp_base(n_features, feature_names)
+        f = feat()
+        cgp.nodes[0] = CGPNode('const', 0, 0, random.uniform(0.1, 1.0))   # rate c
+        cgp.nodes[1] = CGPNode('*', n_features, f)                         # c*x
+        cgp.nodes[2] = CGPNode('const', 0, 0, 0.0)
+        cgp.nodes[3] = CGPNode('-', n_features + 2, n_features + 1)        # -c*x
+        cgp.nodes[4] = CGPNode('const', 0, 0, random.choice([2.0, np.e, 10.0]))
+        cgp.nodes[5] = CGPNode('pow', n_features + 4, n_features + 3)     # base^(-c*x)
+        cgp.nodes[6] = CGPNode('const', 0, 0, random.uniform(0.5, 5.0))
+        cgp.nodes[7] = CGPNode('*', n_features + 6, n_features + 5)       # a * base^(-c*x)
+        cgp.out_idx = n_features + 7; cgp.update_active_nodes()
+        seeds.append(Individual(cgp))
+
+    # ================================================================
+    # 34–39. TRIGONOMETRIC IDENTITY SEEDS
+    # ================================================================
+    # These directly seed the compositions that are hard to discover:
+    # sin(x)*cos(x), sin²(x), tan(x), and trig with scaling.
+
+    # 34. tan(x)  — direct tangent (if tan op available)
+    if 'tan' in allowed:
+        cgp = _make_cgp_base(n_features, feature_names)
+        f = feat()
+        cgp.nodes[0] = CGPNode('tan', f, 0)
+        cgp.out_idx = n_features; cgp.update_active_nodes()
+        seeds.append(Individual(cgp))
+
+    # 34b. sin(x)/cos(x) = tan(x)  — compositional route
+    if 'sin' in allowed and 'cos' in allowed and '/' in allowed:
+        cgp = _make_cgp_base(n_features, feature_names)
+        f = feat()
+        cgp.nodes[0] = CGPNode('sin', f, 0)
+        cgp.nodes[1] = CGPNode('cos', f, 0)
+        cgp.nodes[2] = CGPNode('/', n_features, n_features + 1)
+        cgp.out_idx = n_features + 2; cgp.update_active_nodes()
+        seeds.append(Individual(cgp))
+
+    # 35. sin(x) * cos(x) = sin(2x)/2
+    if 'sin' in allowed and 'cos' in allowed and '*' in allowed:
+        cgp = _make_cgp_base(n_features, feature_names)
+        f = feat()
+        cgp.nodes[0] = CGPNode('sin', f, 0)
+        cgp.nodes[1] = CGPNode('cos', f, 0)
+        cgp.nodes[2] = CGPNode('*', n_features, n_features + 1)
+        cgp.out_idx = n_features + 2; cgp.update_active_nodes()
+        seeds.append(Individual(cgp))
+
+    # 36. sin²(x) — common in physics (wave energy, etc.)
+    if 'sin' in allowed and ('square' in allowed or '*' in allowed):
+        cgp = _make_cgp_base(n_features, feature_names)
+        f = feat()
+        cgp.nodes[0] = CGPNode('sin', f, 0)
+        if 'square' in allowed:
+            cgp.nodes[1] = CGPNode('square', n_features, 0)
+            cgp.out_idx = n_features + 1
+        else:
+            cgp.nodes[1] = CGPNode('*', n_features, n_features)
+            cgp.out_idx = n_features + 1
+        cgp.update_active_nodes()
+        seeds.append(Individual(cgp))
+
+    # 37. c * sin(a*x + b) — phase-shifted sinusoidal
+    if 'sin' in allowed and '*' in allowed and '+' in allowed and 'const' in allowed:
+        cgp = _make_cgp_base(n_features, feature_names)
+        f = feat()
+        cgp.nodes[0] = CGPNode('const', 0, 0, random.uniform(0.5, 6.0))  # frequency
+        cgp.nodes[1] = CGPNode('*', n_features, f)                        # a*x
+        cgp.nodes[2] = CGPNode('const', 0, 0, random.uniform(-3.14, 3.14))  # phase
+        cgp.nodes[3] = CGPNode('+', n_features + 1, n_features + 2)        # a*x+b
+        cgp.nodes[4] = CGPNode('sin', n_features + 3, 0)                   # sin(a*x+b)
+        cgp.nodes[5] = CGPNode('const', 0, 0, random.uniform(0.5, 5.0))   # amplitude
+        cgp.nodes[6] = CGPNode('*', n_features + 5, n_features + 4)        # c*sin(a*x+b)
+        cgp.out_idx = n_features + 6; cgp.update_active_nodes()
+        seeds.append(Individual(cgp))
+
+    # 38. sin(x1) * cos(x2) — two-feature trig interaction
+    if n_features >= 2 and 'sin' in allowed and 'cos' in allowed and '*' in allowed:
+        cgp = _make_cgp_base(n_features, feature_names)
+        f1, f2 = random.sample(range(n_features), 2)
+        cgp.nodes[0] = CGPNode('sin', f1, 0)
+        cgp.nodes[1] = CGPNode('cos', f2, 0)
+        cgp.nodes[2] = CGPNode('*', n_features, n_features + 1)
+        cgp.out_idx = n_features + 2; cgp.update_active_nodes()
+        seeds.append(Individual(cgp))
+
+    # 39. c * sin(a*x1 + b*x2) — wave with 2 features
+    if n_features >= 2 and 'sin' in allowed and '*' in allowed and '+' in allowed and 'const' in allowed:
+        cgp = _make_cgp_base(n_features, feature_names)
+        f1, f2 = random.sample(range(n_features), 2)
+        cgp.nodes[0] = CGPNode('const', 0, 0, random.uniform(0.5, 5.0))
+        cgp.nodes[1] = CGPNode('const', 0, 0, random.uniform(0.5, 5.0))
+        cgp.nodes[2] = CGPNode('*', n_features, f1)
+        cgp.nodes[3] = CGPNode('*', n_features + 1, f2)
+        cgp.nodes[4] = CGPNode('+', n_features + 2, n_features + 3)
+        cgp.nodes[5] = CGPNode('sin', n_features + 4, 0)
+        cgp.out_idx = n_features + 5; cgp.update_active_nodes()
+        seeds.append(Individual(cgp))
+
+    # ================================================================
+    # 40–44. INTEGER / TIME ARITHMETIC SEEDS
+    # ================================================================
+    # For problems like converting between time units, dates, etc.
+
+    # 40. floor(x / c) — integer quotient (hours from total seconds, etc.)
+    if ('floordiv' in allowed or ('/' in allowed and 'floor' in allowed)) and 'const' in allowed:
+        for _div in [60.0, 3600.0, 24.0, 100.0]:
+            cgp = _make_cgp_base(n_features, feature_names)
+            f = feat()
+            cgp.nodes[0] = CGPNode('const', 0, 0, _div)
+            if 'floordiv' in allowed:
+                cgp.nodes[1] = CGPNode('floordiv', f, n_features)
+            else:
+                cgp.nodes[1] = CGPNode('/', f, n_features)
+                cgp.nodes[2] = CGPNode('floor', n_features + 1, 0)
+                cgp.out_idx = n_features + 2; cgp.update_active_nodes()
+                seeds.append(Individual(cgp))
+                continue
+            cgp.out_idx = n_features + 1; cgp.update_active_nodes()
+            seeds.append(Individual(cgp))
+
+    # 41. mod(x, c) — remainder (minutes from total seconds, etc.)
+    if 'mod' in allowed and 'const' in allowed:
+        for _mod in [60.0, 3600.0, 24.0, 100.0]:
+            cgp = _make_cgp_base(n_features, feature_names)
+            f = feat()
+            cgp.nodes[0] = CGPNode('const', 0, 0, _mod)
+            cgp.nodes[1] = CGPNode('mod', f, n_features)
+            cgp.out_idx = n_features + 1; cgp.update_active_nodes()
+            seeds.append(Individual(cgp))
+
+    # 42. x1 - floor(x1/c)*c  (= mod but via subtraction, more discoverable)
+    if 'floor' in allowed and '/' in allowed and '*' in allowed and '-' in allowed and 'const' in allowed:
+        cgp = _make_cgp_base(n_features, feature_names)
+        f = feat()
+        cgp.nodes[0] = CGPNode('const', 0, 0, 60.0)
+        cgp.nodes[1] = CGPNode('/', f, n_features)                        # x/c
+        cgp.nodes[2] = CGPNode('floor', n_features + 1, 0)                # floor(x/c)
+        cgp.nodes[3] = CGPNode('*', n_features + 2, n_features)           # floor(x/c)*c
+        cgp.nodes[4] = CGPNode('-', f, n_features + 3)                    # x - floor(x/c)*c
+        cgp.out_idx = n_features + 4; cgp.update_active_nodes()
+        seeds.append(Individual(cgp))
+
+    # 43. Multi-feature time conversion: floor(x1/c1)*c2 + mod(x2, c3)
+    if n_features >= 2 and 'mod' in allowed and 'floor' in allowed and '*' in allowed and '+' in allowed and 'const' in allowed:
+        cgp = _make_cgp_base(n_features, feature_names)
+        f1, f2 = random.sample(range(n_features), 2)
+        cgp.nodes[0] = CGPNode('const', 0, 0, 60.0)
+        cgp.nodes[1] = CGPNode('/', f1, n_features)
+        cgp.nodes[2] = CGPNode('floor', n_features + 1, 0)
+        cgp.nodes[3] = CGPNode('const', 0, 0, 1.0)
+        cgp.nodes[4] = CGPNode('*', n_features + 2, n_features + 3)
+        cgp.nodes[5] = CGPNode('const', 0, 0, 60.0)
+        cgp.nodes[6] = CGPNode('mod', f2, n_features + 5)
+        cgp.nodes[7] = CGPNode('+', n_features + 4, n_features + 6)
+        cgp.out_idx = n_features + 7; cgp.update_active_nodes()
+        seeds.append(Individual(cgp))
+
+    # ================================================================
+    # 44–48. COMPLEX PHYSICAL LAW SEEDS
+    # ================================================================
+    # For NASA airfoil, concrete dataset, and similar multi-feature problems.
+
+    # 44. Ratio of sums: (c1*x1 + c2*x2) / (c3*x3 + c4)
+    if n_features >= 3 and '/' in allowed and '+' in allowed and '*' in allowed and 'const' in allowed:
+        cgp = _make_cgp_base(n_features, feature_names)
+        fs = random.sample(range(n_features), min(3, n_features))
+        cgp.nodes[0] = CGPNode('const', 0, 0, random.uniform(0.5, 3.0))
+        cgp.nodes[1] = CGPNode('const', 0, 0, random.uniform(0.5, 3.0))
+        cgp.nodes[2] = CGPNode('const', 0, 0, random.uniform(0.5, 3.0))
+        cgp.nodes[3] = CGPNode('const', 0, 0, random.uniform(0.1, 2.0))
+        cgp.nodes[4] = CGPNode('*', n_features, fs[0])
+        cgp.nodes[5] = CGPNode('*', n_features + 1, fs[1])
+        cgp.nodes[6] = CGPNode('+', n_features + 4, n_features + 5)       # c1*x1 + c2*x2
+        cgp.nodes[7] = CGPNode('*', n_features + 2, fs[2])
+        cgp.nodes[8] = CGPNode('+', n_features + 7, n_features + 3)       # c3*x3 + c4
+        cgp.nodes[9] = CGPNode('/', n_features + 6, n_features + 8)
+        cgp.out_idx = n_features + 9; cgp.update_active_nodes()
+        seeds.append(Individual(cgp))
+
+    # 45. Product-of-powers: c * x1^a * x2^b * x3^d — generalised Buckingham Π
+    if n_features >= 3 and 'pow' in allowed and '*' in allowed and 'const' in allowed:
+        cgp = _make_cgp_base(n_features, feature_names)
+        fs = random.sample(range(n_features), min(3, n_features))
+        cgp.nodes[0] = CGPNode('const', 0, 0, random.choice([0.5, 1.0, 1.5, 2.0, -1.0]))
+        cgp.nodes[1] = CGPNode('const', 0, 0, random.choice([0.5, 1.0, 1.5, 2.0, -1.0]))
+        cgp.nodes[2] = CGPNode('const', 0, 0, random.choice([0.5, 1.0, 1.5, 2.0, -1.0]))
+        cgp.nodes[3] = CGPNode('pow', fs[0], n_features)
+        cgp.nodes[4] = CGPNode('pow', fs[1], n_features + 1)
+        cgp.nodes[5] = CGPNode('pow', fs[2], n_features + 2)
+        cgp.nodes[6] = CGPNode('*', n_features + 3, n_features + 4)
+        cgp.nodes[7] = CGPNode('*', n_features + 6, n_features + 5)
+        cgp.nodes[8] = CGPNode('const', 0, 0, random.uniform(0.5, 10.0))
+        cgp.nodes[9] = CGPNode('*', n_features + 8, n_features + 7)
+        cgp.out_idx = n_features + 9; cgp.update_active_nodes()
+        seeds.append(Individual(cgp))
+
+    # 46. Polynomial interaction: c0 + c1*x1 + c2*x2 + c3*x1*x2
+    if n_features >= 2 and '*' in allowed and '+' in allowed and 'const' in allowed:
+        cgp = _make_cgp_base(n_features, feature_names)
+        f1, f2 = random.sample(range(n_features), 2)
+        cgp.nodes[0] = CGPNode('const', 0, 0, random.gauss(0, 2.0))
+        cgp.nodes[1] = CGPNode('const', 0, 0, random.gauss(0, 2.0))
+        cgp.nodes[2] = CGPNode('const', 0, 0, random.gauss(0, 2.0))
+        cgp.nodes[3] = CGPNode('*', n_features + 1, f1)
+        cgp.nodes[4] = CGPNode('*', n_features + 2, f2)
+        cgp.nodes[5] = CGPNode('*', f1, f2)                               # x1*x2
+        cgp.nodes[6] = CGPNode('+', n_features, n_features + 3)
+        cgp.nodes[7] = CGPNode('+', n_features + 6, n_features + 4)
+        cgp.nodes[8] = CGPNode('+', n_features + 7, n_features + 5)
+        cgp.out_idx = n_features + 8; cgp.update_active_nodes()
+        seeds.append(Individual(cgp))
+
+    # 47. Log-product: c * log(x1 * x2 * x3) = c * (log(x1)+log(x2)+log(x3))
+    if n_features >= 3 and 'log' in allowed and '+' in allowed and 'const' in allowed:
+        cgp = _make_cgp_base(n_features, feature_names)
+        fs = random.sample(range(n_features), min(3, n_features))
+        cgp.nodes[0] = CGPNode('log', fs[0], 0)
+        cgp.nodes[1] = CGPNode('log', fs[1], 0)
+        cgp.nodes[2] = CGPNode('log', fs[2], 0)
+        cgp.nodes[3] = CGPNode('+', n_features, n_features + 1)
+        cgp.nodes[4] = CGPNode('+', n_features + 3, n_features + 2)
+        cgp.nodes[5] = CGPNode('const', 0, 0, random.uniform(0.5, 5.0))
+        cgp.nodes[6] = CGPNode('*', n_features + 5, n_features + 4)
+        cgp.out_idx = n_features + 6; cgp.update_active_nodes()
+        seeds.append(Individual(cgp))
+
+    # 48. Exhaustive pairwise products (for small n_features ≤ 5)
+    if n_features >= 2 and n_features <= 5 and '*' in allowed and '+' in allowed:
+        for i in range(n_features):
+            for j in range(i+1, n_features):
+                cgp = _make_cgp_base(n_features, feature_names)
+                cgp.nodes[0] = CGPNode('*', i, j)
+                cgp.out_idx = n_features; cgp.update_active_nodes()
+                seeds.append(Individual(cgp))
+
+    # 49. Exhaustive pairwise ratios (for small n_features ≤ 5)
+    if n_features >= 2 and n_features <= 5 and '/' in allowed:
+        for i in range(n_features):
+            for j in range(n_features):
+                if i == j:
+                    continue
+                cgp = _make_cgp_base(n_features, feature_names)
+                cgp.nodes[0] = CGPNode('/', i, j)
+                cgp.out_idx = n_features; cgp.update_active_nodes()
+                seeds.append(Individual(cgp))
+
+    # ================================================================
+    # 50–62. TRIGONOMETRIC SEEDS
+    # ================================================================
+    # sin(x)*cos(y) and similar separable trig products are extremely hard
+    # to discover incrementally because each mutation step (adding sin to one
+    # feature, adding cos to another, multiplying them) doesn't improve
+    # fitness until the full structure is in place.  Explicit seeds are the
+    # only reliable way to put this template into the population.
+
+    # 50. Single-feature sin(x_i) — for every feature when n_features ≤ 5
+    if 'sin' in allowed:
+        for fi in range(min(n_features, 5)):
+            cgp = _make_cgp_base(n_features, feature_names)
+            cgp.nodes[0] = CGPNode('sin', fi, 0)
+            cgp.out_idx = n_features; cgp.update_active_nodes()
+            seeds.append(Individual(cgp))
+
+    # 51. Single-feature cos(x_i)
+    if 'cos' in allowed:
+        for fi in range(min(n_features, 5)):
+            cgp = _make_cgp_base(n_features, feature_names)
+            cgp.nodes[0] = CGPNode('cos', fi, 0)
+            cgp.out_idx = n_features; cgp.update_active_nodes()
+            seeds.append(Individual(cgp))
+
+    # 52. Scaled trig: c * sin(c * x + c)  — amplitude, frequency, and phase
+    if 'sin' in allowed and '*' in allowed and '+' in allowed and 'const' in allowed:
+        for fi in range(min(n_features, 3)):
+            cgp = _make_cgp_base(n_features, feature_names)
+            cgp.nodes[0] = CGPNode('const', 0, 0, random.uniform(0.5, 6.28))   # freq
+            cgp.nodes[1] = CGPNode('*', n_features, fi)                          # freq*x
+            cgp.nodes[2] = CGPNode('const', 0, 0, random.uniform(-3.14, 3.14))  # phase
+            cgp.nodes[3] = CGPNode('+', n_features + 1, n_features + 2)          # freq*x+phase
+            cgp.nodes[4] = CGPNode('sin', n_features + 3, 0)                     # sin(...)
+            cgp.nodes[5] = CGPNode('const', 0, 0, random.uniform(0.5, 5.0))     # amplitude
+            cgp.nodes[6] = CGPNode('*', n_features + 5, n_features + 4)          # amp*sin(...)
+            cgp.out_idx = n_features + 6; cgp.update_active_nodes()
+            seeds.append(Individual(cgp))
+
+    # 53. Separable trig product: sin(x_i) * cos(x_j)  — THE KEY MISSING PATTERN
+    if n_features >= 2 and 'sin' in allowed and 'cos' in allowed and '*' in allowed:
+        for fi in range(min(n_features, 5)):
+            for fj in range(min(n_features, 5)):
+                if fi == fj:
+                    continue
+                cgp = _make_cgp_base(n_features, feature_names)
+                cgp.nodes[0] = CGPNode('sin', fi, 0)
+                cgp.nodes[1] = CGPNode('cos', fj, 0)
+                cgp.nodes[2] = CGPNode('*', n_features, n_features + 1)
+                cgp.out_idx = n_features + 2; cgp.update_active_nodes()
+                seeds.append(Individual(cgp))
+
+    # 54. Separable trig product: sin(x_i) * sin(x_j)
+    if n_features >= 2 and 'sin' in allowed and '*' in allowed:
+        for fi in range(min(n_features, 5)):
+            for fj in range(fi + 1, min(n_features, 5)):
+                cgp = _make_cgp_base(n_features, feature_names)
+                cgp.nodes[0] = CGPNode('sin', fi, 0)
+                cgp.nodes[1] = CGPNode('sin', fj, 0)
+                cgp.nodes[2] = CGPNode('*', n_features, n_features + 1)
+                cgp.out_idx = n_features + 2; cgp.update_active_nodes()
+                seeds.append(Individual(cgp))
+
+    # 55. Separable trig product: cos(x_i) * cos(x_j)
+    if n_features >= 2 and 'cos' in allowed and '*' in allowed:
+        for fi in range(min(n_features, 5)):
+            for fj in range(fi + 1, min(n_features, 5)):
+                cgp = _make_cgp_base(n_features, feature_names)
+                cgp.nodes[0] = CGPNode('cos', fi, 0)
+                cgp.nodes[1] = CGPNode('cos', fj, 0)
+                cgp.nodes[2] = CGPNode('*', n_features, n_features + 1)
+                cgp.out_idx = n_features + 2; cgp.update_active_nodes()
+                seeds.append(Individual(cgp))
+
+    # 56. Scaled separable trig: c * sin(c*x) * cos(c*y) — with learnable freq/amp
+    if n_features >= 2 and 'sin' in allowed and 'cos' in allowed and '*' in allowed and 'const' in allowed:
+        for _ in range(min(n_features, 3)):
+            fi, fj = random.sample(range(n_features), 2)
+            cgp = _make_cgp_base(n_features, feature_names)
+            cgp.nodes[0] = CGPNode('const', 0, 0, random.uniform(0.5, 6.28))   # freq1
+            cgp.nodes[1] = CGPNode('*', n_features, fi)                          # freq1*x
+            cgp.nodes[2] = CGPNode('sin', n_features + 1, 0)                     # sin(freq1*x)
+            cgp.nodes[3] = CGPNode('const', 0, 0, random.uniform(0.5, 6.28))   # freq2
+            cgp.nodes[4] = CGPNode('*', n_features + 3, fj)                      # freq2*y
+            cgp.nodes[5] = CGPNode('cos', n_features + 4, 0)                     # cos(freq2*y)
+            cgp.nodes[6] = CGPNode('*', n_features + 2, n_features + 5)          # sin*cos
+            cgp.nodes[7] = CGPNode('const', 0, 0, random.uniform(0.5, 5.0))     # amplitude
+            cgp.nodes[8] = CGPNode('*', n_features + 7, n_features + 6)          # amp*sin*cos
+            cgp.out_idx = n_features + 8; cgp.update_active_nodes()
+            seeds.append(Individual(cgp))
+
+    # 57. Trig sum: sin(x) + cos(y)
+    if n_features >= 2 and 'sin' in allowed and 'cos' in allowed and '+' in allowed:
+        for _ in range(min(n_features, 3)):
+            fi, fj = random.sample(range(n_features), 2)
+            cgp = _make_cgp_base(n_features, feature_names)
+            cgp.nodes[0] = CGPNode('sin', fi, 0)
+            cgp.nodes[1] = CGPNode('cos', fj, 0)
+            cgp.nodes[2] = CGPNode('+', n_features, n_features + 1)
+            cgp.out_idx = n_features + 2; cgp.update_active_nodes()
+            seeds.append(Individual(cgp))
+
+    # 58. Trig * linear: sin(x) * y — trig modulated by another variable
+    if n_features >= 2 and 'sin' in allowed and '*' in allowed:
+        for _ in range(min(n_features, 3)):
+            fi, fj = random.sample(range(n_features), 2)
+            cgp = _make_cgp_base(n_features, feature_names)
+            cgp.nodes[0] = CGPNode('sin', fi, 0)
+            cgp.nodes[1] = CGPNode('*', n_features, fj)
+            cgp.out_idx = n_features + 1; cgp.update_active_nodes()
+            seeds.append(Individual(cgp))
+
+    # 59. cos(x) * y — same but with cos
+    if n_features >= 2 and 'cos' in allowed and '*' in allowed:
+        for _ in range(min(n_features, 3)):
+            fi, fj = random.sample(range(n_features), 2)
+            cgp = _make_cgp_base(n_features, feature_names)
+            cgp.nodes[0] = CGPNode('cos', fi, 0)
+            cgp.nodes[1] = CGPNode('*', n_features, fj)
+            cgp.out_idx = n_features + 1; cgp.update_active_nodes()
+            seeds.append(Individual(cgp))
+
+    # 60. sin(x + y) — trig of feature sum (not separable, but a stepping stone)
+    if n_features >= 2 and 'sin' in allowed and '+' in allowed:
+        fi, fj = random.sample(range(n_features), 2)
+        cgp = _make_cgp_base(n_features, feature_names)
+        cgp.nodes[0] = CGPNode('+', fi, fj)
+        cgp.nodes[1] = CGPNode('sin', n_features, 0)
+        cgp.out_idx = n_features + 1; cgp.update_active_nodes()
+        seeds.append(Individual(cgp))
+
+    # 61. sin(x * y) — trig of feature product
+    if n_features >= 2 and 'sin' in allowed and '*' in allowed:
+        fi, fj = random.sample(range(n_features), 2)
+        cgp = _make_cgp_base(n_features, feature_names)
+        cgp.nodes[0] = CGPNode('*', fi, fj)
+        cgp.nodes[1] = CGPNode('sin', n_features, 0)
+        cgp.out_idx = n_features + 1; cgp.update_active_nodes()
+        seeds.append(Individual(cgp))
+
+    # 62. sin²(x) + cos²(y) — sum of squared trig terms
+    if n_features >= 2 and 'sin' in allowed and 'cos' in allowed and '+' in allowed:
+        fi, fj = random.sample(range(n_features), 2)
+        cgp = _make_cgp_base(n_features, feature_names)
+        cgp.nodes[0] = CGPNode('sin', fi, 0)
+        cgp.nodes[1] = CGPNode('*', n_features, n_features)           # sin²(x)
+        cgp.nodes[2] = CGPNode('cos', fj, 0)
+        cgp.nodes[3] = CGPNode('*', n_features + 2, n_features + 2)   # cos²(y)
+        cgp.nodes[4] = CGPNode('+', n_features + 1, n_features + 3)
+        cgp.out_idx = n_features + 4; cgp.update_active_nodes()
+        seeds.append(Individual(cgp))
+
+    # ================================================================
+    # 63–79. PHYSICS / MATH DISCOVERY SEEDS
+    # ================================================================
+    # Common patterns from physics and applied math that are extremely
+    # hard to discover by mutation alone because they require specific
+    # multi-node structures to be assembled simultaneously.
+
+    # 63. Coulomb / gravitational: c / r²  (inverse square law)
+    if '/' in allowed and 'const' in allowed:
+        for fi in range(min(n_features, 3)):
+            cgp = _make_cgp_base(n_features, feature_names)
+            nf = n_features
+            cgp.nodes[0] = CGPNode('const', 0, 0, random.uniform(0.5, 10.0))
+            cgp.nodes[1] = CGPNode('*', fi, fi)                              # r²
+            cgp.nodes[2] = CGPNode('/', nf, nf + 1)                          # c / r²
+            cgp.out_idx = nf + 2; cgp.update_active_nodes()
+            seeds.append(Individual(cgp))
+
+    # 64. Inverse-distance: c / sqrt(x1² + x2²)  (2D Coulomb)
+    if n_features >= 2 and '/' in allowed and 'const' in allowed:
+        cgp = _make_cgp_base(n_features, feature_names)
+        fi, fj = random.sample(range(n_features), 2)
+        nf = n_features
+        cgp.nodes[0] = CGPNode('*', fi, fi)                                  # x1²
+        cgp.nodes[1] = CGPNode('*', fj, fj)                                  # x2²
+        cgp.nodes[2] = CGPNode('+', nf, nf + 1)                              # x1² + x2²
+        cgp.nodes[3] = CGPNode('sqrt', nf + 2, 0) if 'sqrt' in allowed else CGPNode('pow', nf + 2, nf + 4)
+        cgp.nodes[4] = CGPNode('const', 0, 0, 0.5 if 'sqrt' not in allowed else 1.0)
+        cgp.nodes[5] = CGPNode('const', 0, 0, random.uniform(0.5, 10.0))
+        out_node = nf + 3 if 'sqrt' in allowed else nf + 3
+        cgp.nodes[6] = CGPNode('/', nf + 5, out_node)                        # c / sqrt(x1²+x2²)
+        cgp.out_idx = nf + 6; cgp.update_active_nodes()
+        seeds.append(Individual(cgp))
+
+    # 65. Hooke's law / spring: c * (x - x0)²  (harmonic potential)
+    if '*' in allowed and '-' in allowed and 'const' in allowed:
+        for fi in range(min(n_features, 3)):
+            cgp = _make_cgp_base(n_features, feature_names)
+            nf = n_features
+            cgp.nodes[0] = CGPNode('const', 0, 0, random.uniform(-3.0, 3.0))  # equilibrium x0
+            cgp.nodes[1] = CGPNode('-', fi, nf)                                # x - x0
+            cgp.nodes[2] = CGPNode('*', nf + 1, nf + 1)                       # (x - x0)²
+            cgp.nodes[3] = CGPNode('const', 0, 0, random.uniform(0.1, 5.0))   # spring constant k
+            cgp.nodes[4] = CGPNode('*', nf + 3, nf + 2)                       # k * (x - x0)²
+            cgp.out_idx = nf + 4; cgp.update_active_nodes()
+            seeds.append(Individual(cgp))
+
+    # 66. Wave equation: A * sin(k*x - ω*t)  (travelling wave, 2 features)
+    if (n_features >= 2 and 'sin' in allowed and '*' in allowed
+            and '-' in allowed and 'const' in allowed):
+        cgp = _make_cgp_base(n_features, feature_names)
+        fi, fj = random.sample(range(n_features), 2)
+        nf = n_features
+        cgp.nodes[0] = CGPNode('const', 0, 0, random.uniform(0.5, 5.0))    # wavenumber k
+        cgp.nodes[1] = CGPNode('*', nf, fi)                                  # k*x
+        cgp.nodes[2] = CGPNode('const', 0, 0, random.uniform(0.5, 5.0))    # frequency ω
+        cgp.nodes[3] = CGPNode('*', nf + 2, fj)                              # ω*t
+        cgp.nodes[4] = CGPNode('-', nf + 1, nf + 3)                          # k*x - ω*t
+        cgp.nodes[5] = CGPNode('sin', nf + 4, 0)                             # sin(k*x - ω*t)
+        cgp.nodes[6] = CGPNode('const', 0, 0, random.uniform(0.5, 5.0))    # amplitude A
+        cgp.nodes[7] = CGPNode('*', nf + 6, nf + 5)                          # A * sin(...)
+        cgp.out_idx = nf + 7; cgp.update_active_nodes()
+        seeds.append(Individual(cgp))
+
+    # 67. Gaussian / normal distribution: c * exp(-((x - μ)/σ)²)
+    if 'gaussian' in allowed and '-' in allowed and '*' in allowed and 'const' in allowed:
+        for fi in range(min(n_features, 3)):
+            cgp = _make_cgp_base(n_features, feature_names)
+            nf = n_features
+            cgp.nodes[0] = CGPNode('const', 0, 0, random.uniform(-3.0, 3.0))  # mean μ
+            cgp.nodes[1] = CGPNode('-', fi, nf)                                 # x - μ
+            cgp.nodes[2] = CGPNode('const', 0, 0, random.uniform(0.3, 3.0))   # 1/σ
+            cgp.nodes[3] = CGPNode('*', nf + 2, nf + 1)                        # (x-μ)/σ
+            cgp.nodes[4] = CGPNode('gaussian', nf + 3, 0)                      # exp(-((x-μ)/σ)²)
+            cgp.nodes[5] = CGPNode('const', 0, 0, random.uniform(0.5, 5.0))   # amplitude
+            cgp.nodes[6] = CGPNode('*', nf + 5, nf + 4)
+            cgp.out_idx = nf + 6; cgp.update_active_nodes()
+            seeds.append(Individual(cgp))
+
+    # 68. Logistic growth: L / (1 + exp(-k*(x - x0)))
+    if 'sigmoid' in allowed and '*' in allowed and '-' in allowed and 'const' in allowed:
+        for fi in range(min(n_features, 2)):
+            cgp = _make_cgp_base(n_features, feature_names)
+            nf = n_features
+            cgp.nodes[0] = CGPNode('const', 0, 0, random.uniform(-3.0, 3.0))  # midpoint x0
+            cgp.nodes[1] = CGPNode('-', fi, nf)                                 # x - x0
+            cgp.nodes[2] = CGPNode('const', 0, 0, random.uniform(0.5, 5.0))   # steepness k
+            cgp.nodes[3] = CGPNode('*', nf + 2, nf + 1)                        # k*(x-x0)
+            cgp.nodes[4] = CGPNode('sigmoid', nf + 3, 0)                       # σ(k*(x-x0))
+            cgp.nodes[5] = CGPNode('const', 0, 0, random.uniform(1.0, 10.0))  # carrying cap L
+            cgp.nodes[6] = CGPNode('*', nf + 5, nf + 4)
+            cgp.out_idx = nf + 6; cgp.update_active_nodes()
+            seeds.append(Individual(cgp))
+
+    # 69. Lennard-Jones potential: c1/r^12 - c2/r^6  (simplified: c1/r^a - c2/r^b)
+    if 'pow' in allowed and '-' in allowed and '*' in allowed and 'const' in allowed:
+        for fi in range(min(n_features, 2)):
+            cgp = _make_cgp_base(n_features, feature_names)
+            nf = n_features
+            cgp.nodes[0] = CGPNode('const', 0, 0, -6.0)                       # exponent a
+            cgp.nodes[1] = CGPNode('pow', fi, nf)                              # r^(-6)
+            cgp.nodes[2] = CGPNode('const', 0, 0, random.uniform(0.1, 5.0))  # c2
+            cgp.nodes[3] = CGPNode('*', nf + 2, nf + 1)                       # c2 * r^(-6)
+            cgp.nodes[4] = CGPNode('const', 0, 0, -3.0)                       # exponent b (half of a)
+            cgp.nodes[5] = CGPNode('pow', fi, nf + 4)                          # r^(-3)
+            cgp.nodes[6] = CGPNode('const', 0, 0, random.uniform(0.1, 5.0))  # c1
+            cgp.nodes[7] = CGPNode('*', nf + 6, nf + 5)                       # c1 * r^(-3)
+            cgp.nodes[8] = CGPNode('-', nf + 3, nf + 7)                       # c2*r^-6 - c1*r^-3
+            cgp.out_idx = nf + 8; cgp.update_active_nodes()
+            seeds.append(Individual(cgp))
+
+    # 70. Damped oscillation: exp(-a*x) * sin(b*x + c)  — already covered by
+    #     importance-biased seeds but seeding with explicit phase is critical
+    if ('exp' in allowed and 'sin' in allowed and '*' in allowed
+            and '-' in allowed and '+' in allowed and 'const' in allowed):
+        for fi in range(min(n_features, 2)):
+            cgp = _make_cgp_base(n_features, feature_names)
+            nf = n_features
+            cgp.nodes[0]  = CGPNode('const', 0, 0, random.uniform(0.1, 1.0))  # decay a
+            cgp.nodes[1]  = CGPNode('*', nf, fi)                               # a*x
+            cgp.nodes[2]  = CGPNode('neg', nf + 1, 0) if 'neg' in allowed else CGPNode('const', 0, 0, 0.0)
+            if 'neg' in allowed:
+                cgp.nodes[3]  = CGPNode('exp', nf + 2, 0)                      # exp(-a*x)
+            else:
+                cgp.nodes[2] = CGPNode('const', 0, 0, 0.0)
+                cgp.nodes[3] = CGPNode('-', nf + 2, nf + 1)
+                cgp.nodes[3] = CGPNode('exp', nf + 2, 0)  # approximate
+            cgp.nodes[4]  = CGPNode('const', 0, 0, random.uniform(1.0, 6.0))  # freq b
+            cgp.nodes[5]  = CGPNode('*', nf + 4, fi)                           # b*x
+            cgp.nodes[6]  = CGPNode('const', 0, 0, random.uniform(-3.14, 3.14))  # phase c
+            cgp.nodes[7]  = CGPNode('+', nf + 5, nf + 6)                       # b*x + c
+            cgp.nodes[8]  = CGPNode('sin', nf + 7, 0)                          # sin(b*x+c)
+            cgp.nodes[9]  = CGPNode('*', nf + 3, nf + 8)                       # exp(-a*x)*sin(b*x+c)
+            cgp.out_idx = nf + 9; cgp.update_active_nodes()
+            seeds.append(Individual(cgp))
+
+    # 71. Dimensional product: c * x1^a * x2^b  (Buckingham Pi for 2 variables)
+    if n_features >= 2 and 'pow' in allowed and '*' in allowed and 'const' in allowed:
+        for _a, _b in [(2.0, -1.0), (1.0, -2.0), (0.5, 1.5), (-1.0, -1.0),
+                        (1.5, -0.5), (3.0, -1.0), (2.0, 1.0)]:
+            cgp = _make_cgp_base(n_features, feature_names)
+            fi, fj = random.sample(range(n_features), 2)
+            nf = n_features
+            cgp.nodes[0] = CGPNode('const', 0, 0, _a)
+            cgp.nodes[1] = CGPNode('const', 0, 0, _b)
+            cgp.nodes[2] = CGPNode('pow', fi, nf)                              # x1^a
+            cgp.nodes[3] = CGPNode('pow', fj, nf + 1)                          # x2^b
+            cgp.nodes[4] = CGPNode('*', nf + 2, nf + 3)                        # x1^a * x2^b
+            cgp.nodes[5] = CGPNode('const', 0, 0, random.uniform(0.1, 10.0))  # overall scale
+            cgp.nodes[6] = CGPNode('*', nf + 5, nf + 4)
+            cgp.out_idx = nf + 6; cgp.update_active_nodes()
+            seeds.append(Individual(cgp))
+
+    # 72. Sum of inverse squares: c1/x1² + c2/x2²
+    if n_features >= 2 and '/' in allowed and '+' in allowed and 'const' in allowed:
+        cgp = _make_cgp_base(n_features, feature_names)
+        fi, fj = random.sample(range(n_features), 2)
+        nf = n_features
+        cgp.nodes[0] = CGPNode('*', fi, fi)                                    # x1²
+        cgp.nodes[1] = CGPNode('const', 0, 0, random.uniform(0.1, 5.0))
+        cgp.nodes[2] = CGPNode('/', nf + 1, nf)                                # c1/x1²
+        cgp.nodes[3] = CGPNode('*', fj, fj)                                    # x2²
+        cgp.nodes[4] = CGPNode('const', 0, 0, random.uniform(0.1, 5.0))
+        cgp.nodes[5] = CGPNode('/', nf + 4, nf + 3)                            # c2/x2²
+        cgp.nodes[6] = CGPNode('+', nf + 2, nf + 5)
+        cgp.out_idx = nf + 6; cgp.update_active_nodes()
+        seeds.append(Individual(cgp))
+
+    # 73. Stefan-Boltzmann / blackbody: c * x^4
+    if 'pow' in allowed and '*' in allowed and 'const' in allowed:
+        for fi in range(min(n_features, 3)):
+            cgp = _make_cgp_base(n_features, feature_names)
+            nf = n_features
+            cgp.nodes[0] = CGPNode('const', 0, 0, 4.0)
+            cgp.nodes[1] = CGPNode('pow', fi, nf)                              # x^4
+            cgp.nodes[2] = CGPNode('const', 0, 0, random.uniform(0.01, 5.0))
+            cgp.nodes[3] = CGPNode('*', nf + 2, nf + 1)
+            cgp.out_idx = nf + 3; cgp.update_active_nodes()
+            seeds.append(Individual(cgp))
+
+    # 74. Square-root sum (Pythagorean): sqrt(x1² + x2² + x3²)
+    if n_features >= 2 and 'sqrt' in allowed and '+' in allowed:
+        cgp = _make_cgp_base(n_features, feature_names)
+        nf = n_features
+        fs = random.sample(range(n_features), min(n_features, 3))
+        cgp.nodes[0] = CGPNode('*', fs[0], fs[0])
+        if len(fs) >= 2:
+            cgp.nodes[1] = CGPNode('*', fs[1], fs[1])
+            cgp.nodes[2] = CGPNode('+', nf, nf + 1)
+        else:
+            cgp.nodes[1] = CGPNode('const', 0, 0, 0.0)
+            cgp.nodes[2] = CGPNode('+', nf, nf + 1)
+        if len(fs) >= 3:
+            cgp.nodes[3] = CGPNode('*', fs[2], fs[2])
+            cgp.nodes[4] = CGPNode('+', nf + 2, nf + 3)
+            cgp.nodes[5] = CGPNode('sqrt', nf + 4, 0)
+            cgp.out_idx = nf + 5
+        else:
+            cgp.nodes[3] = CGPNode('sqrt', nf + 2, 0)
+            cgp.out_idx = nf + 3
+        cgp.update_active_nodes()
+        seeds.append(Individual(cgp))
+
+    # 75. Reciprocal sum (parallel resistors): 1 / (1/x1 + 1/x2)
+    if n_features >= 2 and '/' in allowed and '+' in allowed and 'const' in allowed:
+        cgp = _make_cgp_base(n_features, feature_names)
+        fi, fj = random.sample(range(n_features), 2)
+        nf = n_features
+        cgp.nodes[0] = CGPNode('const', 0, 0, 1.0)
+        cgp.nodes[1] = CGPNode('/', nf, fi)                                    # 1/x1
+        cgp.nodes[2] = CGPNode('/', nf, fj)                                    # 1/x2
+        cgp.nodes[3] = CGPNode('+', nf + 1, nf + 2)                            # 1/x1 + 1/x2
+        cgp.nodes[4] = CGPNode('/', nf, nf + 3)                                # 1/(1/x1+1/x2)
+        cgp.out_idx = nf + 4; cgp.update_active_nodes()
+        seeds.append(Individual(cgp))
+
+    # 76. Logarithmic ratio: log(x1/x2) = log(x1) - log(x2)  (entropy, information gain)
+    if n_features >= 2 and 'log' in allowed and '-' in allowed:
+        cgp = _make_cgp_base(n_features, feature_names)
+        fi, fj = random.sample(range(n_features), 2)
+        nf = n_features
+        cgp.nodes[0] = CGPNode('log', fi, 0)
+        cgp.nodes[1] = CGPNode('log', fj, 0)
+        cgp.nodes[2] = CGPNode('-', nf, nf + 1)                                # log(x1) - log(x2)
+        cgp.out_idx = nf + 2; cgp.update_active_nodes()
+        seeds.append(Individual(cgp))
+
+    # 77. Polynomial with cross terms: c1*x1² + c2*x1*x2 + c3*x2²  (quadratic form)
+    if n_features >= 2 and '*' in allowed and '+' in allowed and 'const' in allowed:
+        cgp = _make_cgp_base(n_features, feature_names)
+        fi, fj = random.sample(range(n_features), 2)
+        nf = n_features
+        cgp.nodes[0]  = CGPNode('*', fi, fi)                                   # x1²
+        cgp.nodes[1]  = CGPNode('*', fj, fj)                                   # x2²
+        cgp.nodes[2]  = CGPNode('*', fi, fj)                                   # x1*x2
+        cgp.nodes[3]  = CGPNode('const', 0, 0, random.uniform(0.1, 3.0))
+        cgp.nodes[4]  = CGPNode('const', 0, 0, random.uniform(0.1, 3.0))
+        cgp.nodes[5]  = CGPNode('const', 0, 0, random.uniform(0.1, 3.0))
+        cgp.nodes[6]  = CGPNode('*', nf + 3, nf)                               # c1*x1²
+        cgp.nodes[7]  = CGPNode('*', nf + 4, nf + 2)                           # c2*x1*x2
+        cgp.nodes[8]  = CGPNode('*', nf + 5, nf + 1)                           # c3*x2²
+        cgp.nodes[9]  = CGPNode('+', nf + 6, nf + 7)
+        cgp.nodes[10] = CGPNode('+', nf + 9, nf + 8)
+        cgp.out_idx = nf + 10; cgp.update_active_nodes()
+        seeds.append(Individual(cgp))
+
+    # 78. Power law with exp cutoff: c * x^a * exp(-b*x)  (gamma distribution shape)
+    if ('pow' in allowed and 'exp' in allowed and '*' in allowed
+            and 'const' in allowed):
+        for fi in range(min(n_features, 2)):
+            cgp = _make_cgp_base(n_features, feature_names)
+            nf = n_features
+            cgp.nodes[0] = CGPNode('const', 0, 0, random.uniform(0.5, 3.0))   # exponent a
+            cgp.nodes[1] = CGPNode('pow', fi, nf)                              # x^a
+            cgp.nodes[2] = CGPNode('const', 0, 0, random.uniform(0.1, 2.0))   # rate b
+            cgp.nodes[3] = CGPNode('*', nf + 2, fi)                            # b*x
+            cgp.nodes[4] = CGPNode('neg', nf + 3, 0) if 'neg' in allowed else CGPNode('const', 0, 0, 0.0)
+            if 'neg' not in allowed:
+                cgp.nodes[4] = CGPNode('const', 0, 0, 0.0)
+                cgp.nodes[5] = CGPNode('-', nf + 4, nf + 3)                    # -b*x
+                cgp.nodes[6] = CGPNode('exp', nf + 5, 0)                       # exp(-b*x)
+            else:
+                cgp.nodes[5] = CGPNode('exp', nf + 4, 0)                       # exp(-b*x)
+                cgp.nodes[6] = CGPNode('const', 0, 0, 0.0)                     # placeholder
+            exp_node = nf + 6 if 'neg' not in allowed else nf + 5
+            cgp.nodes[7] = CGPNode('*', nf + 1, exp_node)                      # x^a * exp(-b*x)
+            cgp.nodes[8] = CGPNode('const', 0, 0, random.uniform(0.5, 5.0))
+            cgp.nodes[9] = CGPNode('*', nf + 8, nf + 7)                        # c * ...
+            cgp.out_idx = nf + 9; cgp.update_active_nodes()
+            seeds.append(Individual(cgp))
+
+    # 79. Kepler's 3rd law style: x1^a / x2^b  (period-radius relation)
+    if n_features >= 2 and 'pow' in allowed and '/' in allowed and 'const' in allowed:
+        for _a, _b in [(1.5, 1.0), (2.0, 3.0), (3.0, 2.0), (0.5, 1.0)]:
+            cgp = _make_cgp_base(n_features, feature_names)
+            fi, fj = random.sample(range(n_features), 2)
+            nf = n_features
+            cgp.nodes[0] = CGPNode('const', 0, 0, _a)
+            cgp.nodes[1] = CGPNode('pow', fi, nf)                              # x1^a
+            cgp.nodes[2] = CGPNode('const', 0, 0, _b)
+            cgp.nodes[3] = CGPNode('pow', fj, nf + 2)                          # x2^b
+            cgp.nodes[4] = CGPNode('/', nf + 1, nf + 3)                        # x1^a / x2^b
+            cgp.nodes[5] = CGPNode('const', 0, 0, random.uniform(0.1, 10.0))
+            cgp.nodes[6] = CGPNode('*', nf + 5, nf + 4)
+            cgp.out_idx = nf + 6; cgp.update_active_nodes()
+            seeds.append(Individual(cgp))
+
+    # ── IF/ELSE seed templates ─────────────────────────────────────────────
+    if 'if_else' in allowed:
+        nf = n_features
+        # 80. Step function: IF(x > c) THEN 1 ELSE 0
+        if 'gt' in allowed and 'const' in allowed:
+            cgp = _make_cgp_base(n_features, feature_names)
+            f = feat()
+            cgp.nodes[0] = CGPNode('const', 0, 0, 0.0)
+            cgp.nodes[1] = CGPNode('gt', f, nf)
+            cgp.nodes[2] = CGPNode('const', 0, 0, 1.0)
+            cgp.nodes[3] = CGPNode('const', 0, 0, 0.0)
+            cgp.nodes[4] = CGPNode('if_else', nf+1, nf+2, 0.0, in3=nf+3)
+            cgp.out_idx = nf + 4; cgp.update_active_nodes()
+            seeds.append(Individual(cgp))
+
+        # 64. Piecewise linear: IF(x > 0) THEN c1*x ELSE c2*x
+        if 'gt' in allowed and '*' in allowed and 'const' in allowed:
+            cgp = _make_cgp_base(n_features, feature_names)
+            f = feat()
+            cgp.nodes[0] = CGPNode('const', 0, 0, 0.0)              # threshold
+            cgp.nodes[1] = CGPNode('gt', f, nf)                     # condition
+            cgp.nodes[2] = CGPNode('const', 0, 0, random.uniform(0.5, 3.0))
+            cgp.nodes[3] = CGPNode('*', nf+2, f)                    # c1*x
+            cgp.nodes[4] = CGPNode('const', 0, 0, random.uniform(-1.0, -0.1))
+            cgp.nodes[5] = CGPNode('*', nf+4, f)                    # c2*x
+            cgp.nodes[6] = CGPNode('if_else', nf+1, nf+3, 0.0, in3=nf+5)
+            cgp.out_idx = nf + 6; cgp.update_active_nodes()
+            seeds.append(Individual(cgp))
+
+        # 65. Piecewise with different equations: IF(x > c) THEN x² ELSE sqrt(x)
+        if 'gt' in allowed and 'const' in allowed and 'square' in allowed and 'sqrt' in allowed:
+            cgp = _make_cgp_base(n_features, feature_names)
+            f = feat()
+            cgp.nodes[0] = CGPNode('const', 0, 0, random.uniform(-2.0, 2.0))
+            cgp.nodes[1] = CGPNode('gt', f, nf)
+            cgp.nodes[2] = CGPNode('square', f, 0)
+            cgp.nodes[3] = CGPNode('sqrt', f, 0)
+            cgp.nodes[4] = CGPNode('if_else', nf+1, nf+2, 0.0, in3=nf+3)
+            cgp.out_idx = nf + 4; cgp.update_active_nodes()
+            seeds.append(Individual(cgp))
+
+        # 66. Two-feature split: IF(x1 > x2) THEN x1 ELSE x2  (equivalent to max)
+        if n_features >= 2 and 'gt' in allowed:
+            fi, fj = random.sample(range(n_features), 2)
+            cgp = _make_cgp_base(n_features, feature_names)
+            cgp.nodes[0] = CGPNode('gt', fi, fj)
+            cgp.nodes[1] = CGPNode('if_else', nf, fi, 0.0, in3=fj)
+            cgp.out_idx = nf + 1; cgp.update_active_nodes()
+            seeds.append(Individual(cgp))
+
+        # 83. Clamp / clip: IF(x > c_hi) THEN c_hi ELSE IF(x < c_lo) THEN c_lo ELSE x
+        if 'gt' in allowed and 'lt' in allowed and 'const' in allowed:
+            f = feat()
+            cgp = _make_cgp_base(n_features, feature_names)
+            cgp.nodes[0] = CGPNode('const', 0, 0, random.uniform(1.0, 5.0))  # c_hi
+            cgp.nodes[1] = CGPNode('gt', f, nf)                               # x > c_hi?
+            cgp.nodes[2] = CGPNode('const', 0, 0, random.uniform(-5.0, -1.0)) # c_lo
+            cgp.nodes[3] = CGPNode('lt', f, nf + 2)                           # x < c_lo?
+            cgp.nodes[4] = CGPNode('if_else', nf + 3, nf + 2, 0.0, in3=f)    # inner: lo or x
+            cgp.nodes[5] = CGPNode('if_else', nf + 1, nf, 0.0, in3=nf + 4)   # outer: hi or inner
+            cgp.out_idx = nf + 5; cgp.update_active_nodes()
+            seeds.append(Individual(cgp))
+
+        # 84. Absolute value via if-else: IF(x > 0) THEN x ELSE -x
+        if 'gt' in allowed and 'const' in allowed and ('neg' in allowed or '-' in allowed):
+            f = feat()
+            cgp = _make_cgp_base(n_features, feature_names)
+            cgp.nodes[0] = CGPNode('const', 0, 0, 0.0)
+            cgp.nodes[1] = CGPNode('gt', f, nf)                               # x > 0?
+            if 'neg' in allowed:
+                cgp.nodes[2] = CGPNode('neg', f, 0)                           # -x
+            else:
+                cgp.nodes[2] = CGPNode('-', nf, f)                             # 0 - x
+            cgp.nodes[3] = CGPNode('if_else', nf + 1, f, 0.0, in3=nf + 2)
+            cgp.out_idx = nf + 3; cgp.update_active_nodes()
+            seeds.append(Individual(cgp))
+
+        # 85. Piecewise constant: IF(x > c1) THEN a ELSE IF(x > c2) THEN b ELSE c
+        if 'gt' in allowed and 'const' in allowed:
+            f = feat()
+            cgp = _make_cgp_base(n_features, feature_names)
+            cgp.nodes[0] = CGPNode('const', 0, 0, random.uniform(-2.0, 0.0))  # c2 (lower threshold)
+            cgp.nodes[1] = CGPNode('gt', f, nf)                                # x > c2?
+            cgp.nodes[2] = CGPNode('const', 0, 0, random.uniform(-1.0, 1.0))  # b (middle value)
+            cgp.nodes[3] = CGPNode('const', 0, 0, random.uniform(-3.0, -1.0)) # c (low value)
+            cgp.nodes[4] = CGPNode('if_else', nf + 1, nf + 2, 0.0, in3=nf + 3)  # inner
+            cgp.nodes[5] = CGPNode('const', 0, 0, random.uniform(0.0, 2.0))   # c1 (upper threshold)
+            cgp.nodes[6] = CGPNode('gt', f, nf + 5)                            # x > c1?
+            cgp.nodes[7] = CGPNode('const', 0, 0, random.uniform(1.0, 3.0))   # a (high value)
+            cgp.nodes[8] = CGPNode('if_else', nf + 6, nf + 7, 0.0, in3=nf + 4)
+            cgp.out_idx = nf + 8; cgp.update_active_nodes()
+            seeds.append(Individual(cgp))
+
+        # 86. Piecewise polynomial: IF(x > c) THEN c1*x + c2 ELSE c3*x² + c4
+        if 'gt' in allowed and '*' in allowed and '+' in allowed and 'const' in allowed:
+            f = feat()
+            cgp = _make_cgp_base(n_features, feature_names)
+            cgp.nodes[0]  = CGPNode('const', 0, 0, random.uniform(-1.0, 1.0))  # threshold
+            cgp.nodes[1]  = CGPNode('gt', f, nf)
+            cgp.nodes[2]  = CGPNode('const', 0, 0, random.uniform(0.5, 3.0))   # c1
+            cgp.nodes[3]  = CGPNode('*', nf + 2, f)                             # c1*x
+            cgp.nodes[4]  = CGPNode('const', 0, 0, random.uniform(-2.0, 2.0))  # c2
+            cgp.nodes[5]  = CGPNode('+', nf + 3, nf + 4)                        # c1*x + c2
+            cgp.nodes[6]  = CGPNode('*', f, f)                                  # x²
+            cgp.nodes[7]  = CGPNode('const', 0, 0, random.uniform(0.1, 2.0))   # c3
+            cgp.nodes[8]  = CGPNode('*', nf + 7, nf + 6)                        # c3*x²
+            cgp.nodes[9]  = CGPNode('const', 0, 0, random.uniform(-2.0, 2.0))  # c4
+            cgp.nodes[10] = CGPNode('+', nf + 8, nf + 9)                        # c3*x² + c4
+            cgp.nodes[11] = CGPNode('if_else', nf + 1, nf + 5, 0.0, in3=nf + 10)
+            cgp.out_idx = nf + 11; cgp.update_active_nodes()
+            seeds.append(Individual(cgp))
+
+        # 87. Two-feature conditional: IF(x1 > c) THEN f(x2) ELSE g(x2)
+        if n_features >= 2 and 'gt' in allowed and 'const' in allowed and '*' in allowed:
+            fi, fj = random.sample(range(n_features), 2)
+            cgp = _make_cgp_base(n_features, feature_names)
+            cgp.nodes[0] = CGPNode('const', 0, 0, random.uniform(-2.0, 2.0))
+            cgp.nodes[1] = CGPNode('gt', fi, nf)                               # x1 > c?
+            cgp.nodes[2] = CGPNode('const', 0, 0, random.uniform(0.5, 3.0))
+            cgp.nodes[3] = CGPNode('*', nf + 2, fj)                            # c1*x2
+            cgp.nodes[4] = CGPNode('const', 0, 0, random.uniform(-3.0, -0.5))
+            cgp.nodes[5] = CGPNode('*', nf + 4, fj)                            # c2*x2
+            cgp.nodes[6] = CGPNode('if_else', nf + 1, nf + 3, 0.0, in3=nf + 5)
+            cgp.out_idx = nf + 6; cgp.update_active_nodes()
+            seeds.append(Individual(cgp))
+
+    return seeds
+
+
+
+
+def _build_random_mini_tree(child_eq, n_features, start_slot, max_depth=3,
+                            available_inputs=None):
+    """Build a small coherent random expression tree in consecutive CGP slots.
+
+    Returns the slot index of the root node, or None if no space.
+    *available_inputs* are the slot indices that can be referenced (features +
+    any active compute nodes below start_slot).
+    """
+    if available_inputs is None:
+        available_inputs = list(range(n_features))
+
+    unary_ops  = CGPEquation.OPS_UNARY  or []
+    binary_ops = CGPEquation.OPS_BINARY or []
+    all_ops    = unary_ops + binary_ops
+    if not all_ops:
+        return None
+
+    max_slot = n_features + child_eq.max_nodes
+    slots_used = []
+    cur = start_slot
+
+    def _pick_input():
+        pool = list(available_inputs) + [n_features + s for s in slots_used]
+        return random.choice(pool) if pool else random.randint(0, n_features - 1)
+
+    for depth in range(max_depth):
+        if n_features + cur >= max_slot:
+            break
+        # Leaf vs internal decision: deeper = more likely to stop
+        if depth > 0 and random.random() < 0.35:
+            break
+        op = random.choice(all_ops)
+        in1 = _pick_input()
+        in2 = _pick_input() if op in CGPEquation.OPS_BINARY_SET else 0
+        # For const nodes inject a useful constant value
+        if op == 'const':
+            c_val = random.choice([0.5, 1.0, 2.0, 3.0, -1.0, np.pi,
+                                    0.1, 10.0, -0.5, np.e])
+        else:
+            c_val = random.gauss(0, 2.0)
+        child_eq.nodes[cur] = CGPNode(op, in1, in2, c_val)
+        slots_used.append(cur)
+        cur += 1
+
+    return (n_features + slots_used[-1]) if slots_used else None
+
+
+def mutate(parent_eq, n_features, feature_names, mut_rate=None, temperature=0.0,
+           op_affinity: dict | None = None):
+    """
+    Point-mutation of a CGP equation.
+
+    Includes structural mutations (compose, decompose, inject_subtree) alongside
+    traditional constant-tuning and rewiring, giving the search the ability to
+    discover novel expression structures — not just optimize constants.
+
+    op_affinity : optional dict mapping op_name → float weight (0,1].
+                  When provided, operator selection inside 'operator' mutations
+                  is biased toward operators that appear more in HoF expressions
+                  (computed by compute_hof_operator_affinity).  Absent keys
+                  default to 0.3 (mild discouragement vs default uniform).
+    """
+    if mut_rate is None:
+        mut_rate = CGP_MUT_RATE
+    child_eq = copy.deepcopy(parent_eq)
+
+    perturb_scale = SA_PERTURBATION_FACTOR * temperature + 1.0
+
+    active_compute   = [i - n_features for i in child_eq.active_nodes if i >= n_features]
+    all_compute      = set(range(child_eq.max_nodes))
+    inactive_compute = list(all_compute - set(active_compute))
+
+    # --- Mutation type weights ---
+    # Balanced between constant tuning and structural exploration.
+    # The old 10:1 constant:operator ratio meant >60% of mutations just tweaked
+    # numbers — great for polishing but terrible for structural discovery.
+    weightMutateOperator = 2.0     # was 1.0 — doubled for more structural change
+    weightRewireIn1      = 1.5     # was 1.0 — rewiring IS structural change
+    weightRewireIn2      = 1.5     # was 1.0
+    weightRewireIn3      = 0.5 if CGPEquation.OPS_TERNARY else 0.0
+    weightMutateConstant = 7.0     # was 10.0 — still dominant but less so
+    weightScaleConstant  = 1.0     # was 1.5
+    weightResetConstant  = 0.5
+    weightSwapOperands   = 0.5
+    weightSwapPow        = 0.3
+    # NEW structural mutation types
+    weightCompose        = 1.5     # wrap active subexpr in a new unary op
+    weightDecompose      = 1.0     # split output into sum/product with new term
+    weightInjectSubtree  = 1.2     # replace inactive region with coherent mini-tree
+
+    mut_types = ['operator', 'rewire1', 'rewire2', 'rewire3',
+                 'perturb_const', 'scale_const', 'reset_const',
+                 'swap_ops', 'swap_pow',
+                 'compose', 'decompose', 'inject_subtree']
+    mut_weights = [
+        weightMutateOperator, weightRewireIn1, weightRewireIn2, weightRewireIn3,
+        weightMutateConstant, weightScaleConstant, weightResetConstant,
+        weightSwapOperands, weightSwapPow,
+        weightCompose, weightDecompose, weightInjectSubtree
+    ]
+
+    for _ in range(mut_rate):
+        # 10% chance: shift output pointer
+        if random.random() < 0.10:
+            child_eq.out_idx = random.randint(0, n_features + child_eq.max_nodes - 1)
+            child_eq.update_active_nodes()
+            active_compute   = [i - n_features for i in child_eq.active_nodes if i >= n_features]
+            inactive_compute = list(all_compute - set(active_compute))
+            continue
+
+        # --- Improved active/inactive balance ---
+        # Old: 80% inactive. New: 50% inactive.
+        # Mutating only junk nodes is neutral drift — useful for CGP but
+        # crippling when you need to actually change the expression structure.
+        if inactive_compute and random.random() < 0.50:
+            node_idx = random.choice(inactive_compute)
+        else:
+            node_idx = (random.choice(active_compute) if active_compute else random.randint(0, child_eq.max_nodes - 1))
+
+        target = child_eq.nodes[node_idx]
+        max_connect = max(0, n_features + node_idx - 1)
+
+        # Sample the mutation type using weights
+        choice = random.choices(mut_types, weights=mut_weights, k=1)[0]
+
+        if choice == 'operator':
+            if op_affinity:
+                target.op = affinity_biased_op_choice(op_affinity, CGPEquation.OPS_ALL)
+            else:
+                target.op = random.choice(CGPEquation.OPS_ALL)
+        elif choice == 'rewire1':
+            target.in1 = random.randint(0, max_connect)
+        elif choice == 'rewire2':
+            target.in2 = random.randint(0, max_connect)
+        elif choice == 'rewire3':
+            target.in3 = random.randint(0, max_connect)
+        elif choice == 'perturb_const':
+            noise_sigma = (abs(target.const_val) * 0.3 + 1.0) * perturb_scale
+            target.const_val += random.gauss(0, noise_sigma)
+        elif choice == 'scale_const':
+            target.const_val *= random.uniform(0.2, 5.0)
+        elif choice == 'reset_const':
+            mag = random.choice([1, 10, 100, 0.1, 0.01])
+            target.const_val = random.gauss(0, 3.0) * mag
+        elif choice == 'swap_ops':
+            if target.op in child_eq.OPS_BINARY_SET:
+                target.in1, target.in2 = target.in2, target.in1
+        elif choice == 'swap_pow':
+            pow_nodes = [i - n_features for i in child_eq.active_nodes
+                         if i >= n_features
+                         and child_eq.nodes[i - n_features].op == 'pow']
+            if pow_nodes:
+                pi = random.choice(pow_nodes)
+                pn = child_eq.nodes[pi]
+                pn.in1, pn.in2 = pn.in2, pn.in1
+            else:
+                if target.op in child_eq.OPS_BINARY_SET:
+                    target.in1, target.in2 = target.in2, target.in1
+
+        elif choice == 'compose':
+            # COMPOSE: wrap a random active node in a new unary operator.
+            # e.g. node_A → sin(node_A), exp(node_A), log(node_A)
+            # This is the key mutation for discovering nested function composition
+            # like sin(x²) or log(x+y) that point-mutation can't reach in one step.
+            unary_ops = CGPEquation.OPS_UNARY or []
+            if active_compute and unary_ops:
+                wrap_target_local = random.choice(active_compute)
+                wrap_target_global = n_features + wrap_target_local
+                # Find a free slot after the wrap target
+                free_after = [s for s in range(wrap_target_local + 1, child_eq.max_nodes)
+                              if s not in set(active_compute)]
+                if free_after:
+                    dst = free_after[0]
+                    new_op = random.choice(unary_ops)
+                    child_eq.nodes[dst] = CGPNode(new_op, wrap_target_global, 0,
+                                                   random.gauss(0, 1.0))
+                    # Rewire anything that referenced wrap_target to use the new node
+                    new_global = n_features + dst
+                    for ac in active_compute:
+                        if ac == dst:
+                            continue
+                        nd = child_eq.nodes[ac]
+                        if nd.in1 == wrap_target_global and ac > dst:
+                            nd.in1 = new_global
+                        if nd.in2 == wrap_target_global and ac > dst:
+                            nd.in2 = new_global
+                    if child_eq.out_idx == wrap_target_global:
+                        child_eq.out_idx = new_global
+                    child_eq.update_active_nodes()
+                    active_compute   = [i - n_features for i in child_eq.active_nodes if i >= n_features]
+                    inactive_compute = list(all_compute - set(active_compute))
+
+        elif choice == 'decompose':
+            # DECOMPOSE: add a new term to the output via + or *.
+            # Turns expr → expr + f(x_i) or expr * f(x_i).
+            # This is critical for discovering additive/multiplicative corrections
+            # that seeds miss, e.g. going from "x²" to "x² + sin(y)".
+            active_set = set(active_compute)
+            free_slots = [s for s in range(child_eq.max_nodes) if s not in active_set]
+            binary_ops_avail = CGPEquation.OPS_BINARY or []
+            if len(free_slots) >= 3 and binary_ops_avail:
+                # Build a small new term in free slots
+                s1, s2, s3 = free_slots[0], free_slots[1], free_slots[2]
+                # Pick a feature (prefer unused ones)
+                used_feats = set()
+                for idx in child_eq.active_nodes:
+                    if idx < n_features:
+                        used_feats.add(idx)
+                unused = [f for f in range(n_features) if f not in used_feats]
+                new_feat = random.choice(unused) if unused else random.randint(0, n_features - 1)
+                # Build: unary(feature) or const*feature
+                unary_ops = CGPEquation.OPS_UNARY or []
+                if unary_ops and random.random() < 0.6:
+                    new_op = random.choice(unary_ops)
+                    child_eq.nodes[s1] = CGPNode(new_op, new_feat, 0, random.gauss(0, 2.0))
+                    new_term = n_features + s1
+                    combine_slot = s2
+                else:
+                    c_val = random.choice([0.5, 1.0, 2.0, -1.0, np.pi, 0.1])
+                    child_eq.nodes[s1] = CGPNode('const', 0, 0, c_val)
+                    child_eq.nodes[s2] = CGPNode('*', n_features + s1, new_feat, 0.0)
+                    new_term = n_features + s2
+                    combine_slot = s3
+                # Combine with current output
+                combine_op = random.choices(['+', '*', '-'],
+                                            weights=[5, 3, 2], k=1)[0]
+                if combine_op in set(binary_ops_avail):
+                    child_eq.nodes[combine_slot] = CGPNode(
+                        combine_op, child_eq.out_idx, new_term, 0.0)
+                    child_eq.out_idx = n_features + combine_slot
+                    child_eq.update_active_nodes()
+                    active_compute   = [i - n_features for i in child_eq.active_nodes if i >= n_features]
+                    inactive_compute = list(all_compute - set(active_compute))
+
+        elif choice == 'inject_subtree':
+            # INJECT SUBTREE: replace a chunk of inactive nodes with a coherent
+            # random mini-expression and wire it into the active graph.
+            # Unlike random node-by-node mutation, this creates *meaningful*
+            # sub-expressions that the crossover can later combine.
+            if len(inactive_compute) >= 2:
+                # Pick a contiguous region of inactive slots
+                inactive_sorted = sorted(inactive_compute)
+                start = random.choice(inactive_sorted[:max(1, len(inactive_sorted) - 2)])
+                avail_inputs = list(range(n_features))
+                # Also allow referencing existing active nodes below start
+                for ac in active_compute:
+                    if ac < start:
+                        avail_inputs.append(n_features + ac)
+                root = _build_random_mini_tree(
+                    child_eq, n_features, start, max_depth=3,
+                    available_inputs=avail_inputs)
+                if root is not None:
+                    # 40% chance: wire it into the output to make it active
+                    if random.random() < 0.40:
+                        active_set = set(active_compute)
+                        free_after_root = [s for s in range(root - n_features + 1, child_eq.max_nodes)
+                                           if s not in active_set]
+                        if free_after_root:
+                            cs = free_after_root[0]
+                            combine_op = random.choice(['+', '*'])
+                            if combine_op in set(CGPEquation.OPS_BINARY or []):
+                                child_eq.nodes[cs] = CGPNode(
+                                    combine_op, child_eq.out_idx, root, 0.0)
+                                child_eq.out_idx = n_features + cs
+                    child_eq.update_active_nodes()
+                    active_compute   = [i - n_features for i in child_eq.active_nodes if i >= n_features]
+                    inactive_compute = list(all_compute - set(active_compute))
+
+        target.const_val = max(-1e6, min(1e6, target.const_val))
+
+    child_eq.update_active_nodes()
+    return child_eq
+
+
+def _subtree_crossover(p1, p2):
+    """
+    Contiguous-block crossover: copy a randomly-sized slice of p2's node array
+    into p1, then optionally inherit p2's output pointer.
+
+    This is more disruptive than active-biased swap — it transplants a whole
+    region of computation, including any wiring that reaches into or out of
+    the block.  Safe because CGP's forward-only references mean the block can
+    always be evaluated once it's wired in.
+    """
+    if len(p1.nodes) != len(p2.nodes):
+        return copy.deepcopy(p1)
+    n     = len(p1.nodes)
+    child = copy.deepcopy(p1)
+    # Block size: 10–33% of the graph
+    width = random.randint(max(1, n // 10), max(1, n // 3))
+    start = random.randint(0, n - width)
+    for i in range(start, start + width):
+        child.nodes[i] = copy.deepcopy(p2.nodes[i])
+    if random.random() < 0.35:
+        child.out_idx = p2.out_idx
+    child.update_active_nodes()
+    return child
+
+
+def crossover(parent1_eq, parent2_eq):
+    """
+    Active-biased uniform crossover for CGP (default) with a 30% fallback to
+    contiguous-block (subtree) crossover.
+
+    Problem with naive uniform swap at 40%: ~70% of nodes in a typical evolved
+    CGP are inactive junk.  Swapping junk for junk produces a child whose active
+    graph is nearly identical to parent-1 — the crossover does nothing useful.
+
+    Active-biased swap fixes this by using two different swap probabilities:
+      • Nodes active in *either* parent: 55% swap probability
+      • Nodes inactive in both parents:   5% swap probability
+    This preserves working building blocks while still allowing recombination.
+
+    The output pointer is inherited from parent-2 with 35% probability.
+    """
+    if len(parent1_eq.nodes) != len(parent2_eq.nodes):
+        return copy.deepcopy(parent1_eq)
+
+    # 30% chance: use contiguous-block crossover for more disruptive recombination
+    if random.random() < 0.30:
+        return _subtree_crossover(parent1_eq, parent2_eq)
+
+    child_eq  = copy.deepcopy(parent1_eq)
+    p2_active = parent2_eq.active_nodes
+    p1_active = parent1_eq.active_nodes
+
+    for i in range(len(child_eq.nodes)):
+        slot      = parent1_eq.n_features + i
+        is_active = (slot in p1_active) or (slot in p2_active)
+        if random.random() < (0.55 if is_active else 0.05):
+            child_eq.nodes[i] = copy.deepcopy(parent2_eq.nodes[i])
+
+    if random.random() < 0.35:
+        child_eq.out_idx = parent2_eq.out_idx
+
+    child_eq.update_active_nodes()
+    return child_eq
+
+
+def _semantic_crossover(parent1_eq, parent2_eq, X, y_residuals, n_probe=64):
+    """
+    Semantic-ish crossover: combine two parents by evaluating which parent's
+    sub-expressions better fit different regions of the residual landscape.
+
+    Strategy:
+      1. Evaluate both parents on a probe set to get output vectors.
+      2. For each sample, compute which parent has smaller absolute residual.
+      3. Build a child that inherits active nodes from the parent that performs
+         better on the majority of samples, but splices in the *other* parent's
+         active sub-graph when it covers a different behavioral niche.
+      4. If the parents produce outputs that are complementary (low correlation
+         of their residuals), create a child that adds their outputs via a new
+         node: child = a*parent1 + b*parent2 (residual boosting crossover).
+
+    This is "semantic-ish" because it uses output behavior to guide structural
+    recombination, not just random node swapping.
+    """
+    if len(parent1_eq.nodes) != len(parent2_eq.nodes):
+        return copy.deepcopy(parent1_eq)
+
+    n = X.shape[0]
+    probe_n = min(n_probe, n)
+    idx = np.random.choice(n, probe_n, replace=False)
+    Xp = X[idx]
+    rp = y_residuals[idx] if y_residuals is not None else None
+
+    try:
+        out1 = parent1_eq.evaluate(Xp)
+        out1 = np.nan_to_num(out1, nan=0.0, posinf=0.0, neginf=0.0)
+        out2 = parent2_eq.evaluate(Xp)
+        out2 = np.nan_to_num(out2, nan=0.0, posinf=0.0, neginf=0.0)
+    except Exception:
+        return crossover(parent1_eq, parent2_eq)
+
+    # Check if outputs are complementary (residuals from each are anti-correlated
+    # or uncorrelated — meaning they explain different parts of the variance).
+    if rp is not None:
+        res1 = rp - out1
+        res2 = rp - out2
+        std1, std2 = np.std(res1), np.std(res2)
+        if std1 > 1e-8 and std2 > 1e-8:
+            corr_residuals = float(np.corrcoef(res1, res2)[0, 1])
+            if np.isnan(corr_residuals):
+                corr_residuals = 1.0
+        else:
+            corr_residuals = 1.0
+
+        # If residuals are weakly correlated (< 0.5), parents explain different
+        # parts of the data — combine them additively (gradient boosting crossover).
+        # Build: out = parent1_output + parent2_output via a '+' node.
+        if corr_residuals < 0.5 and '+' in ALLOWED_OPS:
+            child_eq = copy.deepcopy(parent1_eq)
+            nf = child_eq.n_features
+
+            # Find a free slot after both parents' active regions
+            max_active = max(
+                (i for i in child_eq.active_nodes if i >= nf),
+                default=nf)
+            # We need: one slot for parent2's output copy, one for the add node
+            all_slots = range(nf, nf + child_eq.max_nodes)
+            free_slots = sorted(s for s in all_slots
+                                if s not in child_eq.active_nodes
+                                and s > max_active)
+
+            if len(free_slots) >= 1:
+                # Copy parent2's active structure into child's inactive region
+                # Strategy: copy parent2 nodes into child, remap output
+                p2 = copy.deepcopy(parent2_eq)
+
+                # Simple approach: place a '+' node that references both outputs
+                add_slot = free_slots[0]
+                add_idx = add_slot - nf
+                child_eq.nodes[add_idx] = CGPNode(
+                    '+', child_eq.out_idx, p2.out_idx)
+
+                # Copy parent2's active nodes into child
+                for i in sorted(p2.active_nodes):
+                    if i >= nf:
+                        ni = i - nf
+                        if ni < len(child_eq.nodes):
+                            # Only copy if the slot isn't active in child
+                            slot = nf + ni
+                            if slot not in child_eq.active_nodes:
+                                child_eq.nodes[ni] = copy.deepcopy(p2.nodes[ni])
+
+                child_eq.out_idx = add_slot
+                child_eq.update_active_nodes()
+                return child_eq
+
+    # Fallback: behavior-biased node swap.
+    # Determine which parent's output is closer to the residual target on
+    # more probe points, and bias the swap probability accordingly.
+    if rp is not None:
+        err1 = np.mean(np.abs(rp - out1))
+        err2 = np.mean(np.abs(rp - out2))
+        # p2_bias: probability of taking from parent2 (higher if p2 is better)
+        total_err = err1 + err2 + 1e-30
+        p2_bias = float(err1 / total_err)  # higher p1 error → more p2 nodes
+        p2_bias = np.clip(p2_bias, 0.2, 0.8)  # keep it reasonable
+    else:
+        p2_bias = 0.5
+
+    child_eq = copy.deepcopy(parent1_eq)
+    p2_active = parent2_eq.active_nodes
+    p1_active = parent1_eq.active_nodes
+
+    for i in range(len(child_eq.nodes)):
+        slot = parent1_eq.n_features + i
+        is_active = (slot in p1_active) or (slot in p2_active)
+        swap_prob = p2_bias if is_active else 0.05
+        if random.random() < swap_prob:
+            child_eq.nodes[i] = copy.deepcopy(parent2_eq.nodes[i])
+
+    if random.random() < p2_bias:
+        child_eq.out_idx = parent2_eq.out_idx
+
+    child_eq.update_active_nodes()
+    return child_eq
+
+
+# ==========================================
+# PART 4d: MACRO-MUTATIONS & EVOLUTION HELPERS
+# ==========================================
+
+def macro_grow(cgp_eq, n_features, feature_names, op_affinity=None):
+    """
+    Grow macro-mutation: increase active complexity by exactly one node.
+
+    Two strategies selected randomly:
+      A (60%): wrap the current output in a new unary operation.
+               Output becomes: new_op( old_output ).
+      B (40%): fuse two random active nodes with a new binary operation,
+               making the result the new output.
+               Output becomes: new_op( active_a, active_b ).
+
+    The new node is placed in the lowest available inactive slot that lies
+    *after* all currently active slots (so the forward-reference constraint
+    is never violated).
+
+    If *op_affinity* is provided, operator selection is biased toward ops
+    that appear in HoF expressions (same system used by mutate()).
+    """
+    child  = copy.deepcopy(cgp_eq)
+    active = sorted(i for i in child.active_nodes if i >= n_features)
+    if not active:
+        return child
+
+    # Find unused slots that can legally reference active nodes
+    max_active = max(active)
+    all_slots  = range(n_features, n_features + child.max_nodes)
+    # A valid wrapper slot must be > max_active (so it can reference it)
+    valid = [s for s in all_slots
+             if s not in child.active_nodes and s > max_active]
+    if not valid:
+        # Fall back: any inactive slot after the current output
+        valid = [s for s in all_slots
+                 if s not in child.active_nodes and s > child.out_idx]
+    if not valid:
+        return child  # graph is completely full
+
+    dst     = min(valid)            # use the nearest available slot
+    dst_idx = dst - n_features
+
+    unary_ops  = [op for op in CGPEquation.OPS_UNARY  if op in ALLOWED_OPS]
+    binary_ops = [op for op in CGPEquation.OPS_BINARY if op in ALLOWED_OPS]
+
+    if len(active) < 2 and not unary_ops:
+        return child
+
+    def _affinity_choice(ops):
+        """Pick op from *ops* weighted by affinity if available, else uniform."""
+        if op_affinity and len(ops) > 1:
+            weights = [op_affinity.get(o, 1.0) for o in ops]
+            return random.choices(ops, weights=weights, k=1)[0]
+        return random.choice(ops)
+
+    if (random.random() < 0.60 or len(active) < 2 or not binary_ops) and unary_ops:
+        # Strategy A: wrap current output with a unary op
+        op = _affinity_choice(unary_ops)
+        child.nodes[dst_idx] = CGPNode(op, child.out_idx, child.out_idx,
+                                       random.gauss(0, 1.0))
+        child.out_idx = dst
+
+    elif binary_ops:
+        # Strategy B: fuse two active nodes with a binary op.
+        # Cross-feature bias: prefer fusing nodes that trace back to DIFFERENT
+        # raw input features — this drives multi-variable interaction discovery.
+        def _root_features(eq, start_idx, n_feat):
+            """Return set of raw feature indices reachable from idx (Iterative)."""
+            result = set()
+            stack = [start_idx]
+            visited = set()
+            
+            while stack:
+                idx = stack.pop()
+                
+                # Skip if we've already traced this node
+                if idx in visited:
+                    continue
+                visited.add(idx)
+                
+                # If it's a raw feature, add it to our results
+                if idx < n_feat:
+                    result.add(idx)
+                else:
+                    # Otherwise, push its inputs onto the stack to trace them
+                    node = eq.nodes[idx - n_feat]
+                    if node.op != 'const':
+                        stack.append(node.in1)
+                        if node.op in eq.OPS_BINARY_SET:
+                            stack.append(node.in2)
+                        elif node.op in eq.OPS_TERNARY_SET:
+                            stack.append(node.in2)
+                            stack.append(node.in3)
+                            
+            return result
+
+
+        # Try to find a diverse pair (from different feature lineages)
+        best_s1, best_s2, best_overlap = None, None, 1.0
+        for _attempt in range(6):
+            s1, s2 = random.sample(active, 2)
+            feats1 = _root_features(child, s1, n_features)
+            feats2 = _root_features(child, s2, n_features)
+            union  = feats1 | feats2
+            inter  = feats1 & feats2
+            overlap = len(inter) / max(len(union), 1)
+            if best_s1 is None or overlap < best_overlap:
+                best_s1, best_s2, best_overlap = s1, s2, overlap
+                if overlap == 0:
+                    break  # perfect: completely different feature lineages
+
+        s1, s2 = best_s1, best_s2
+        op = _affinity_choice(binary_ops)
+        child.nodes[dst_idx] = CGPNode(op, s1, s2, random.gauss(0, 1.0))
+        child.out_idx = dst
+
+    child.update_active_nodes()
+    return child
+
+
+def macro_prune(cgp_eq, n_features):
+    """
+    Prune macro-mutation: decrease active complexity by exactly one node.
+
+    Selects a random active compute node (not the output root), bypasses it
+    by redirecting all references to it toward one of its own inputs, then
+    removes it from the active graph.
+
+    Node selection is biased by operator cost so that expensive nodes (pow,
+    exp, …) are pruned first — this gives the biggest complexity reduction
+    per step.
+
+    The replacement input is chosen as the input with the higher complexity
+    sub-graph (preserving more information), or randomly for unary nodes.
+    """
+    child   = copy.deepcopy(cgp_eq)
+    active_c = [i for i in child.active_nodes if i >= n_features]
+    if len(active_c) <= 1:
+        return child
+
+    # Candidates: active nodes that are NOT the output root
+    candidates = [i for i in active_c if i != child.out_idx]
+    if not candidates:
+        return child
+
+    # Bias selection toward high-cost nodes
+    costs  = [OP_COSTS.get(child.nodes[i - n_features].op, COST_OP_COMPLEX)
+              for i in candidates]
+    total  = sum(costs)
+    if total < 1e-10:
+        target = random.choice(candidates)
+    else:
+        target = random.choices(candidates, weights=costs, k=1)[0]
+
+    target_node = child.nodes[target - n_features]
+
+    # Replacement: prefer the input that leads to a richer sub-graph
+    if target_node.op in child.OPS_BINARY_SET:
+        # Count active descendants of each input as a proxy for richness
+        def _descendant_count(eq, root):
+            seen, stack = 0, [root]
+            visited = set()
+            while stack:
+                n = stack.pop()
+                if n in visited or n < n_features: continue
+                visited.add(n); seen += 1
+                if n - n_features >= len(eq.nodes):
+                    continue
+                node = eq.nodes[n - n_features]
+                if node.op != 'const':
+                    stack.append(node.in1)
+                    if node.op in eq.OPS_BINARY_SET:
+                        stack.append(node.in2)
+                    elif node.op in eq.OPS_TERNARY_SET:
+                        stack.append(node.in2)
+                        stack.append(node.in3)
+            return seen
+        d1 = _descendant_count(child, target_node.in1)
+        d2 = _descendant_count(child, target_node.in2)
+        if target_node.op in child.OPS_TERNARY_SET:
+            # For ternary (if_else): prefer the true or false branch (in2/in3)
+            # over the condition (in1), as branches carry more semantic content
+            d3 = _descendant_count(child, target_node.in3)
+            candidates = [(d2, target_node.in2), (d3, target_node.in3), (d1, target_node.in1)]
+            replacement = max(candidates, key=lambda x: x[0])[1]
+        else:
+            replacement = target_node.in1 if d1 >= d2 else target_node.in2
+    else:
+        replacement = target_node.in1
+
+    # Rewire: replace every reference to `target` with `replacement`
+    for i in list(child.active_nodes):
+        if i < n_features:
+            continue
+        nd = child.nodes[i - n_features]
+        new_in1 = replacement if nd.in1 == target else nd.in1
+        new_in2 = replacement if nd.in2 == target else nd.in2
+        new_in3 = replacement if nd.in3 == target else nd.in3
+        child.nodes[i - n_features] = CGPNode(nd.op, new_in1, new_in2, nd.const_val, in3=new_in3)
+
+    if child.out_idx == target:
+        child.out_idx = replacement
+
+    child.update_active_nodes()
+    return child
+
+
+def _active_feature_set(cgp_eq, n_features):
+    """Return the set of raw feature indices (0..n_features-1) used in the active graph."""
+    used = set()
+    for idx in cgp_eq.active_nodes:
+        if idx < n_features:
+            used.add(idx)
+    return used
+
+def macro_ablate_feature(cgp_eq, n_features):
+    """
+    Selects a currently active feature and replaces all references to it 
+    with a single learnable constant node.
+    """
+    child = copy.deepcopy(cgp_eq)
+    active_feats = list(_active_feature_set(child, n_features))
+    
+    if not active_feats:
+        return child
+        
+    # Pick a random active feature to kill
+    target_feat = random.choice(active_feats)
+    
+    # Find a free slot for the new constant node (must be before out_idx)
+    all_slots = range(n_features, n_features + child.max_nodes)
+    valid_slots = [s for s in all_slots if s not in child.active_nodes]
+    
+    if not valid_slots:
+        return macro_prune(child, n_features) # Fallback if graph is totally full
+        
+    const_slot = min(valid_slots)
+    const_idx = const_slot - n_features
+    
+    # Initialize the constant at 0.0 (or 1.0 if you want to be safe with multiplication)
+    child.nodes[const_idx] = CGPNode('const', 0, 0, random.gauss(0, 1.0))
+    
+    # Rewire all active nodes that pointed to the target feature to point to the new constant
+    for i in child.active_nodes:
+        if i >= n_features:
+            node = child.nodes[i - n_features]
+            new_in1 = const_slot if node.in1 == target_feat else node.in1
+            new_in2 = const_slot if node.in2 == target_feat else node.in2
+            new_in3 = const_slot if node.in3 == target_feat else node.in3
+            child.nodes[i - n_features] = CGPNode(node.op, new_in1, new_in2, node.const_val, in3=new_in3)
+            
+    if child.out_idx == target_feat:
+        child.out_idx = const_slot
+        
+    child.update_active_nodes()
+    return child
+def macro_graft_feature(cgp_eq, n_features, feature_names):
+    """
+    Feature-grafting macro-mutation: wire an UNUSED input feature into the
+    active expression via a new binary node.
+
+    This directly accelerates multi-variable expression discovery.  Pure point-
+    mutation must blindly stumble onto a rewire that happens to pick a new
+    feature AND an operator that improves fitness — this can take hundreds of
+    generations.  Grafting explicitly finds features absent from the active
+    computation and fuses them in, so the evolver always has multi-variable
+    candidates to evaluate.
+
+    Algorithm:
+      1. Collect raw feature indices not referenced anywhere in active_nodes.
+      2. If all features are already used, fall back to macro_grow (not a no-op).
+      3. Find a valid inactive slot beyond the current output.
+      4. Fuse the chosen feature with the current output via a binary operator
+         sampled from a distribution biased toward the most useful combiners:
+           40% *   — multiplicative interaction (most powerful for new variables)
+           25% +   — additive interaction (simplest extension)
+           15% pow — power-law relationship (x^new_feat or new_feat^x)
+           10% /   — ratio
+           10% any remaining binary op (if available)
+      5. If the fused op is 'pow', also inject a learnable constant exponent so
+         the constant optimizer can immediately tune the power.
+    """
+    child = copy.deepcopy(cgp_eq)
+    child.update_active_nodes()
+
+    # 1. Find unused features
+    used_feats = _active_feature_set(child, n_features)
+    unused     = [f for f in range(n_features) if f not in used_feats]
+    if not unused:
+        # All features already present — grow complexity instead
+        return macro_grow(cgp_eq, n_features, feature_names)
+
+    new_feat = random.choice(unused)
+
+    # 2. Find a valid inactive slot after the current output
+    active    = sorted(i for i in child.active_nodes if i >= n_features)
+    max_active = max(active) if active else (n_features - 1)
+    all_slots  = range(n_features, n_features + child.max_nodes)
+    valid      = [s for s in all_slots if s not in child.active_nodes and s > max_active]
+    if not valid:
+        valid  = [s for s in all_slots if s not in child.active_nodes and s > child.out_idx]
+    if not valid:
+        return macro_grow(cgp_eq, n_features, feature_names)
+
+    dst     = min(valid)
+    dst_idx = dst - n_features
+
+    # 3. Build weighted binary-op pool from available ops
+    binary_ops = [op for op in CGPEquation.OPS_BINARY if op in ALLOWED_OPS]
+    if not binary_ops:
+        return macro_grow(cgp_eq, n_features, feature_names)
+
+    # Preference weights for cross-feature combination
+    _GRAFT_WEIGHTS = {'*': 40, '+': 25, 'pow': 15, '/': 10, '-': 5}
+    weighted_pool  = []
+    weight_vals    = []
+    for op in binary_ops:
+        weighted_pool.append(op)
+        weight_vals.append(_GRAFT_WEIGHTS.get(op, 4))
+
+    op = random.choices(weighted_pool, weights=weight_vals, k=1)[0]
+
+    # 4. For pow, optionally insert a learnable const exponent node first
+    #    so the constant optimizer can freely tune the power relationship.
+    if op == 'pow' and 'const' in ALLOWED_OPS and random.random() < 0.6:
+        # Insert: child.out ^ const_exp  where const_exp is tunable
+        exp_candidates = [s for s in all_slots
+                          if s not in child.active_nodes and s > max_active and s != dst]
+        if exp_candidates:
+            exp_slot     = min(exp_candidates)
+            exp_idx      = exp_slot - n_features
+            exp_val      = random.choice([0.5, 1.5, 2.0, 2.5, 3.0,
+                                          -0.5, -1.0, -2.0])
+            child.nodes[exp_idx] = CGPNode('const', 0, 0, exp_val)
+            # new_feat^const_exp
+            child.nodes[dst_idx] = CGPNode('pow', new_feat, exp_slot,
+                                           random.gauss(0, 1.0))
+        else:
+            child.nodes[dst_idx] = CGPNode(op, child.out_idx, new_feat,
+                                           random.gauss(0, 1.0))
+    else:
+        # Standard fuse: current_output  OP  new_feature
+        # Randomly order operands (matters for -, /, pow)
+        if random.random() < 0.5:
+            child.nodes[dst_idx] = CGPNode(op, child.out_idx, new_feat,
+                                           random.gauss(0, 1.0))
+        else:
+            child.nodes[dst_idx] = CGPNode(op, new_feat, child.out_idx,
+                                           random.gauss(0, 1.0))
+
+    child.out_idx = dst
+    child.update_active_nodes()
+    return child
+
+
+def _is_semantically_novel(child_tree, parent1_tree, parent2_tree, X, probe_n=32):
+    """
+    Quick semantic novelty check for crossover offspring.
+
+    Evaluates the child and both parents on a small random probe set and
+    computes Pearson correlation.  Returns False (not novel) only if the
+    child is almost perfectly correlated (r > 0.99) with *both* parents,
+    meaning crossover produced a functionally identical copy — a wasted slot.
+
+    Errors (NaN, empty X, single-point X) always return True so the check
+    never becomes a blocker.
+    """
+    n = X.shape[0]
+    if n < 4:
+        return True
+    idx = np.random.choice(n, min(probe_n, n), replace=False)
+    Xp  = X[idx]
+    try:
+        def _safe_eval(tree):
+            out = tree.evaluate(Xp)
+            return np.nan_to_num(out.astype(float), nan=0.0, posinf=0.0, neginf=0.0)
+
+        def _corr(a, b):
+            sa, sb = np.std(a), np.std(b)
+            if sa < 1e-8 or sb < 1e-8:
+                return 1.0 if np.allclose(a, b, atol=1e-4) else 0.0
+            return float(np.corrcoef(a, b)[0, 1])
+
+        c_out  = _safe_eval(child_tree)
+        p1_out = _safe_eval(parent1_tree)
+        p2_out = _safe_eval(parent2_tree)
+        r1, r2 = _corr(c_out, p1_out), _corr(c_out, p2_out)
+        # Novel if it differs meaningfully from at least one parent
+        return not (r1 > 0.99 and r2 > 0.99)
+    except Exception:
+        return True
+
+
+def _crowding_death_select(sample, X_probe: np.ndarray | None = None):
+    """
+    NSGA-II crowding-distance death selection extended with semantic uniqueness.
+
+    Among the candidate sample, returns the individual that should be
+    *removed* — the one with the smallest crowding distance in the
+    2-objective space (fitness, complexity).
+
+    Extension: if X_probe is supplied (a small random row subset of X),
+    individuals whose output vector is unique in the candidate set receive
+    a semantic uniqueness bonus that inflates their crowding distance by 1.5×,
+    protecting behaviorally novel individuals even when their raw fitness lags.
+    This prevents the population from collapsing to a single behavioral attractor
+    while still removing the most redundant (crowded) individuals.
+
+    Falls back to worst-fitness on degenerate inputs.
+    """
+    n = len(sample)
+    if n <= 2:
+        return max(sample, key=lambda x: x.fitness)
+
+    distances = [0.0] * n
+
+    for attr in ('fitness', 'complexity'):
+        vals   = [getattr(ind, attr) for ind in sample]
+        lo, hi = min(vals), max(vals)
+        span   = hi - lo + 1e-10
+
+        order = sorted(range(n), key=lambda i: vals[i])
+        distances[order[0]]  = float('inf')   # boundary → protect
+        distances[order[-1]] = float('inf')
+
+        for k in range(1, n - 1):
+            distances[order[k]] += (vals[order[k + 1]] - vals[order[k - 1]]) / span
+
+    # ── Semantic uniqueness bonus ─────────────────────────────────────────
+    # Evaluate all candidates on a tiny probe set and group by output hash.
+    # Individuals in behaviorally unique clusters get crowding distance × 1.5
+    # so they are protected from death relative to their crowded twins.
+    if X_probe is not None and X_probe.shape[0] >= 2:
+        try:
+            # Compute quantised output fingerprint for each individual
+            def _qfp(ind):
+                out = ind.tree.evaluate(X_probe)
+                out = np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+                # Quantise to 3 sig-figs to collapse near-identical vectors
+                return tuple(float(f"{v:.3g}") for v in out)
+
+            fps = [_qfp(ind) for ind in sample]
+            fp_counts = {}
+            for fp in fps:
+                fp_counts[fp] = fp_counts.get(fp, 0) + 1
+            for i, fp in enumerate(fps):
+                if fp_counts[fp] == 1 and distances[i] != float('inf'):
+                    # Unique behavior — inflate distance to protect from death
+                    distances[i] *= 1.5
+        except Exception:
+            pass  # probe evaluation failed; fall through to standard crowding
+
+    # Kill the most crowded (smallest distance); break ties by worst fitness
+    min_d   = min(d for d in distances if d != float('inf'))  if any(d != float('inf') for d in distances) else float('inf')
+    crowded = [sample[i] for i, d in enumerate(distances)
+               if d != float('inf') and abs(d - min_d) < 1e-10]
+    if not crowded:
+        # All candidates are boundary-protected — fall back to worst fitness
+        crowded = sample
+    return max(crowded, key=lambda x: x.fitness + x.age * 0.01)
+
+
+def compute_complexity_frequency_adjustment(population):
+    """
+    PySR-style adaptive parsimony via complexity frequency histogram.
+
+    Measures how often each (discretized integer) complexity level appears in
+    the current population, then returns a per-complexity penalty/bonus dict so
+    that over-represented complexities receive a positive parsimony increment
+    (discouraging more individuals at that size) while under-represented
+    complexities receive a negative increment (actively encouraging them).
+
+    The adjustment for complexity c is:
+        adj(c) = ADAPTIVE_PARSIMONY_WEIGHT × log( f(c) × n_unique )
+
+    where f(c) = freq(c) / total is the fraction of the population at that
+    complexity and n_unique is the number of distinct complexity levels observed.
+    When all complexities are equally represented adj(c) = 0 for every c.
+    When c is over-represented adj(c) > 0, adding to the effective parsimony.
+    When c is under-represented adj(c) < 0, reducing the effective parsimony.
+
+    Returns {} when ADAPTIVE_PARSIMONY_ENABLED is False or the population is
+    too small to be meaningful.
+
+    Usage in fitness calculation:
+        adj = freq_adj.get(int(round(ind.complexity)), 0.0)
+        effective_parsimony = PARSIMONY_STRENGTH + adj
+    """
+    if not ADAPTIVE_PARSIMONY_ENABLED or len(population) < 5:
+        return {}
+
+    counts = {}
+    for ind in population:
+        c = int(round(ind.complexity))
+        counts[c] = counts.get(c, 0) + 1
+
+    total    = len(population)
+    n_unique = max(len(counts), 1)
+
+    adjustments = {}
+    for c, cnt in counts.items():
+        freq = cnt / total
+        # log(freq * n_unique): 0 when uniform, positive when over-crowded
+        adjustments[c] = ADAPTIVE_PARSIMONY_WEIGHT * float(
+            np.log(freq * n_unique + 1e-10))
+    return adjustments
+
+
+# ==========================================
+# PART 4b: CONSTANTS HELPERS
+# ==========================================
+
+def get_constants_shared(cgp_eq):
+    return [cgp_eq.nodes[i - cgp_eq.n_features].const_val
+            for i in cgp_eq.active_nodes
+            if i >= cgp_eq.n_features and cgp_eq.nodes[i - cgp_eq.n_features].op == 'const']
+
+
+def set_constants_shared(cgp_eq, vals, cursor=0):
+    for i in cgp_eq.active_nodes:
+        if i >= cgp_eq.n_features and cgp_eq.nodes[i - cgp_eq.n_features].op == 'const':
+            cgp_eq.nodes[i - cgp_eq.n_features].const_val = vals[cursor]
+            cursor += 1
+    return cursor
+
+
+# ==========================================
+# PART 4c: INDIVIDUAL
+# ==========================================
+
+class Individual:
+    def __init__(self, cgp_eq):
+        self.tree = cgp_eq
+        if self.tree:
+            self.tree.update_active_nodes()
+            self.complexity = self.tree.get_complexity()
+        else:
+            self.complexity = 0.0
+        self.loss      = 1e10
+        self.fitness   = 1e10
+        self.r2        = 0.0
+        self.accuracy  = 0.0
+        self.modularity = 0.0
+        self.age       = 0
+        # Self-adaptive mutation strength (Evolution Strategy style).
+        # Each individual carries its own sigma; it evolves alongside the tree.
+        self.sigma       = float(CGP_MUT_RATE)
+        self.affine_a    = 1.0
+        self.affine_b    = 0.0
+        # Locked after the first full-data evaluation; prevents minibatch noise
+        # and constant-optimisation from silently re-fitting the affine rescaling.
+        self.affine_fitted = False
+        # ── Intra-individual gradient boosting stages ──────────────────
+        # Each individual can accumulate small correction terms that fit the
+        # residuals left after the main tree's prediction.  This is "gradient
+        # boosting within a single equation" — the main tree provides the base
+        # prediction, and boost_stages stores (correction_tree, affine_a, affine_b, lr)
+        # tuples that additively correct the output.
+        self.boost_stages = []     # list of (CGPEquation, a, b, lr)
+        self.boost_max_stages = 3  # cap to prevent over-fitting
+
+    def _predict_with_boosts(self, X):
+        """Evaluate main tree + all boost correction stages."""
+        preds = self.tree.evaluate(X)
+        preds = np.clip(np.nan_to_num(preds, nan=0.0, posinf=1e9, neginf=-1e9),
+                        -1e9, 1e9)
+        preds = self.affine_a * preds + self.affine_b
+        for corr_tree, ca, cb, lr in self.boost_stages:
+            corr = corr_tree.evaluate(X)
+            corr = np.clip(np.nan_to_num(corr, nan=0.0, posinf=1e9, neginf=-1e9),
+                           -1e9, 1e9)
+            preds += lr * (ca * corr + cb)
+        return preds
+
+    def boost_on_residuals(self, X, y_target, type_code, n_features, feat_names,
+                           max_boost_gens=80, boost_lr=0.3):
+        """
+        Intra-individual gradient boosting: evolve a small correction tree on the
+        residuals left by the current prediction (main tree + existing boosts).
+
+        This helps individuals that have a good structural form but miss specific
+        data patterns — the correction term patches those gaps without changing
+        the main tree's structure.
+
+        Improvements over the original version:
+          - Larger mini-population (25) with residual-aware seeding
+          - Crossover between correction candidates (not just mutation)
+          - Adaptive learning rate via line search on the full residual
+          - Lower R² acceptance threshold (0.005) — even tiny corrections
+            compound across multiple boost stages
+          - Weighted sampling: harder residual regions get more attention
+          - Multiple const-opt restarts on the best correction
+        """
+        if type_code == 6:
+            return  # skip for classification
+        if len(self.boost_stages) >= self.boost_max_stages:
+            return
+        if not self.affine_fitted:
+            return  # need fitted affine first
+
+        # Compute current residuals
+        preds = self._predict_with_boosts(X)
+        residuals = y_target - preds
+        res_var = float(np.var(residuals))
+        if res_var < 1e-10:
+            return  # already near-perfect
+
+        # Mini-evolution: moderate population, targeting residuals
+        MINI_POP = 25
+        MINI_NODES = max(12, CGP_NODES // 3)  # smaller graphs for corrections
+
+        mini_pop = []
+
+        # Seed with residual-aware seeds: analyze which features correlate
+        # with the residual pattern and create targeted initial individuals
+        try:
+            for fi in range(min(n_features, 5)):
+                xi = X[:, fi]
+                if np.std(xi) < 1e-10:
+                    continue
+                r = abs(float(np.corrcoef(xi, residuals)[0, 1]))
+                if np.isnan(r) or r < 0.1:
+                    continue
+                # Linear seed on correlated feature
+                cgp = _make_cgp_base(n_features, feat_names, max_nodes=MINI_NODES)
+                nf = n_features
+                slope = float(np.cov(xi, residuals)[0, 1] / (np.var(xi) + 1e-30))
+                cgp.nodes[0] = CGPNode('const', 0, 0, slope)
+                cgp.nodes[1] = CGPNode('*', nf, fi)
+                cgp.out_idx = nf + 1; cgp.update_active_nodes()
+                ind = Individual(cgp)
+                ind.boost_stages = []; ind.boost_max_stages = 0
+                mini_pop.append(ind)
+                # Nonlinear seed: try x² of this feature
+                if 'square' in ALLOWED_OPS:
+                    cgp2 = _make_cgp_base(n_features, feat_names, max_nodes=MINI_NODES)
+                    cgp2.nodes[0] = CGPNode('square', fi, 0)
+                    cgp2.out_idx = nf; cgp2.update_active_nodes()
+                    ind2 = Individual(cgp2)
+                    ind2.boost_stages = []; ind2.boost_max_stages = 0
+                    mini_pop.append(ind2)
+        except Exception:
+            pass
+
+        # Fill remaining slots with random individuals
+        while len(mini_pop) < MINI_POP:
+            cgp = random_cgp(n_features, MINI_NODES, feat_names)
+            ind = Individual(cgp)
+            ind.boost_stages = []
+            ind.boost_max_stages = 0
+            mini_pop.append(ind)
+
+        # Compute per-sample weights proportional to |residual| — focus on
+        # high-error regions (important for gradient boosting convergence)
+        abs_res = np.abs(residuals)
+        sample_weights = abs_res / (np.mean(abs_res) + 1e-30)
+        sample_weights = np.clip(sample_weights, 0.1, 10.0)
+
+        # Evaluate on residuals
+        for ind in mini_pop:
+            ind.calculate_fitness(X, residuals, 5, sample_weights=sample_weights)
+
+        best = min(mini_pop, key=lambda x: x.loss)
+
+        # Evolutionary loop with crossover support
+        stagnation = 0
+        prev_best_loss = best.loss
+        for gen_i in range(max_boost_gens):
+            # Tournament selection
+            parent = min(random.sample(mini_pop, min(4, len(mini_pop))),
+                         key=lambda x: x.fitness)
+
+            # 20% crossover, 80% mutation
+            if random.random() < 0.20 and len(mini_pop) >= 2:
+                parent2 = min(random.sample(mini_pop, min(3, len(mini_pop))),
+                              key=lambda x: x.fitness)
+                child_tree = crossover(parent.tree, parent2.tree)
+                child_tree = mutate(child_tree, n_features, feat_names,
+                                    mut_rate=max(1, CGP_MUT_RATE // 2))
+            else:
+                # Increase mutation rate when stagnating
+                rate = max(1, CGP_MUT_RATE * (2 if stagnation > 15 else 1))
+                child_tree = mutate(parent.tree, n_features, feat_names,
+                                    mut_rate=rate)
+
+            child = Individual(child_tree)
+            child.boost_stages = []
+            child.boost_max_stages = 0
+            child.calculate_fitness(X, residuals, 5, sample_weights=sample_weights)
+
+            if child.loss < best.loss:
+                best = child
+                stagnation = 0
+            else:
+                stagnation += 1
+
+            # Replace worst
+            worst = max(mini_pop, key=lambda x: x.fitness)
+            if child.fitness < worst.fitness:
+                mini_pop.remove(worst)
+                mini_pop.append(child)
+
+            # If stagnating badly, inject fresh blood
+            if stagnation > 25 and gen_i < max_boost_gens - 10:
+                fresh = Individual(random_cgp(n_features, MINI_NODES, feat_names))
+                fresh.boost_stages = []; fresh.boost_max_stages = 0
+                fresh.calculate_fitness(X, residuals, 5, sample_weights=sample_weights)
+                worst = max(mini_pop, key=lambda x: x.fitness)
+                mini_pop.remove(worst); mini_pop.append(fresh)
+                stagnation = 0
+
+        # Check if the correction actually helps (lower threshold than before)
+        if best.loss >= 1e9 or best.r2 < 0.005:
+            return  # correction is useless
+
+        # More thorough const-opt on the correction
+        if get_constants_shared(best.tree):
+            best.optimize_constants(X, residuals, 5,
+                                    max_rows=min(800, X.shape[0]),
+                                    n_restarts=2, max_iter=50)
+
+        # Line-search for optimal learning rate instead of fixed boost_lr
+        corr_preds = best.tree.evaluate(X)
+        corr_preds = np.clip(np.nan_to_num(corr_preds, nan=0.0, posinf=1e9,
+                                            neginf=-1e9), -1e9, 1e9)
+        corr_scaled_unit = best.affine_a * corr_preds + best.affine_b
+
+        # Grid search for optimal lr
+        best_lr = boost_lr
+        best_mse = float('inf')
+        old_mse = float(np.mean(residuals ** 2))
+        for candidate_lr in [0.05, 0.1, 0.15, 0.2, 0.3, 0.5, 0.7, 1.0]:
+            trial_preds = preds + candidate_lr * corr_scaled_unit
+            trial_mse = float(np.mean((y_target - trial_preds) ** 2))
+            if trial_mse < best_mse:
+                best_mse = trial_mse
+                best_lr = candidate_lr
+
+        # Also try Newton step: lr* = <residuals, h> / <h, h>
+        h = corr_scaled_unit
+        h_dot_h = float(np.dot(h, h))
+        if h_dot_h > 1e-10:
+            newton_lr = float(np.dot(residuals, h)) / h_dot_h
+            newton_lr = np.clip(newton_lr, 0.01, 2.0)
+            trial_preds = preds + newton_lr * corr_scaled_unit
+            trial_mse = float(np.mean((y_target - trial_preds) ** 2))
+            if trial_mse < best_mse:
+                best_mse = trial_mse
+                best_lr = newton_lr
+
+        if best_mse < old_mse * 0.98:  # at least 2% improvement (was 5%)
+            self.boost_stages.append((
+                copy.deepcopy(best.tree),
+                best.affine_a,
+                best.affine_b,
+                best_lr
+            ))
+            # Update complexity to account for the correction
+            self.complexity += best.tree.get_complexity() * 0.5  # discounted
+
+    def calculate_fitness(self, X, y_target, type_code, batch_indices=None,
+                          bg_logits=None, class_idx_in_group=None, Y_group=None,
+                          freq_parsimony_adj=0.0, update_affine=True,
+                          target_grads=None, use_cache=True,
+                          sample_weights=None):
+        """
+        Calculate fitness for this individual.
+
+        When bg_logits / class_idx_in_group / Y_group are supplied, the output
+        belongs to a multi-class one-hot group and joint softmax cross-entropy is
+        used instead of binary BCE.  This couples all class logits together so that
+        constant-negative trivial solutions are penalised correctly.
+
+        bg_logits           : (N, n_classes) float array — precomputed logits for
+                              ALL classes in the group from current HoF best models.
+                              Column class_idx_in_group is overwritten by this
+                              individual's predictions before softmax is applied.
+        class_idx_in_group  : int — which column of bg_logits this individual fills.
+        Y_group             : (N, n_classes) float array — one-hot labels for the
+                              full group (all classes), used for softmax CE and
+                              argmax accuracy.
+
+        use_cache           : bool — if True, check/populate the process-local
+                              FitnessCache before evaluating.  Set to False for
+                              constant-optimisation sub-calls that mutate consts
+                              in-place (cache entry would be stale).
+
+        sample_weights      : (N,) float array or None — per-sample weights for
+                              loss computation (used by 2nd-order Hessian boosting).
+                              When provided, the regression loss is a weighted MSE.
+                              Weights are normalised internally so they sum to N.
+        """
+        # ── Cache lookup (full-dataset, no batch, no bg_logits) ─────────────────
+        # Only cache simple regression/classification calls on the full dataset.
+        # Batched calls, multi-class group calls, and const-opt sub-calls are
+        # excluded because they either have extra context or mutate in-place.
+        _cacheable = (use_cache and batch_indices is None and bg_logits is None
+                      and sample_weights is None)
+
+        if _cacheable:
+            cached = _FITNESS_CACHE.get(self.tree, y_target)
+            if cached is not None:
+                self.loss       = cached['loss']
+                self.r2         = cached['r2']
+                self.accuracy   = cached['accuracy']
+                self.modularity = cached['modularity']
+                self.complexity = cached['complexity']
+                self.affine_a   = cached['affine_a']
+                self.affine_b   = cached['affine_b']
+                self.affine_fitted = True
+                dynamic_parsimony = PARSIMONY_STRENGTH * min(1.0, self.loss / 0.5)
+                self.fitness = (self.loss
+                                + (dynamic_parsimony + freq_parsimony_adj) * self.complexity
+                                - 0.5 * self.modularity)
+                return self.fitness
+        try:
+            X_eval = X[batch_indices] if batch_indices is not None else X
+            y_eval = y_target[batch_indices] if batch_indices is not None else y_target
+
+            preds = self.tree.evaluate(X_eval)
+            preds = np.clip(np.nan_to_num(preds, nan=0.0, posinf=1e9, neginf=-1e9), -1e9, 1e9)
+
+            if bg_logits is not None:
+                # ── Joint softmax cross-entropy (multi-class group mode) ──────
+                bg   = bg_logits[batch_indices] if batch_indices is not None else bg_logits
+                yg   = Y_group[batch_indices]   if batch_indices is not None else Y_group
+                logits = bg.copy()
+                logits[:, class_idx_in_group] = preds
+
+                # Numerically stable log-softmax: subtract row-wise max first
+                row_max  = logits.max(axis=1, keepdims=True)
+                exp_l    = np.exp(np.clip(logits - row_max, -500, 0))
+                log_sm   = (logits - row_max) - np.log(exp_l.sum(axis=1, keepdims=True) + 1e-30)
+
+                self.loss     = float(-np.mean((yg * log_sm).sum(axis=1)))
+                self.r2       = 0.0
+                pred_cls      = np.argmax(logits, axis=1)
+                true_cls      = np.argmax(yg,     axis=1)
+                self.accuracy = float(np.mean(pred_cls == true_cls))
+
+                # ── Flat-prediction penalty (multiclass) ─────────────────────
+                # A constant logit is the mathematically optimal solution to
+                # softmax CE when all discriminative information is absent — it
+                # simply encodes the class prior.  Without this penalty, every
+                # output in a multiclass group converges to its prior constant
+                # and evolution never discovers feature-based discriminators.
+                # Penalty magnitude 0.5 is enough to prefer any expression that
+                # achieves ~0.3 loss improvement via feature use, while staying
+                # below HOF_LOSS_CEILING so penalised constants still enter HoF
+                # and serve as fallback when no features discriminate the class.
+                if np.std(preds) < 1e-4:
+                    self.loss += 0.5
+
+                # ── Logit saturation penalty (Interval mode, multiclass) ─────
+                if INTERVAL_MODE:
+                    excess = np.maximum(0.0, np.abs(preds) - LOGIT_SATURATION_THRESHOLD)
+                    sat_pen = float(np.mean(excess ** 2))
+                    if sat_pen > 0:
+                        self.loss += LOGIT_SATURATION_WEIGHT * sat_pen
+
+            elif type_code == 6:  # Classification — Binary Cross Entropy + Accuracy
+                bce = (np.maximum(preds, 0)
+                       - preds * y_eval
+                       + np.log(1 + np.exp(-np.abs(preds))))
+                self.loss = np.mean(bce)
+                # Accuracy: sigmoid threshold at 0.5
+                pred_class = (1.0 / (1.0 + np.exp(-preds))) >= 0.5
+                self.r2       = 0.0   # not meaningful for classification
+                self.accuracy = float(np.mean(pred_class == (y_eval >= 0.5)))
+
+                # ── Flat-prediction penalty (binary) ─────────────────────────
+                # Mirror of the regression flat-prediction penalty: if this
+                # output produces the same value for every sample it is a
+                # disguised constant and should be pushed out of local optima.
+                if np.std(preds) < 1e-4:
+                    self.loss += 0.5
+
+                # ── Logit saturation penalty (Interval mode, binary cls) ─────
+                if INTERVAL_MODE:
+                    excess = np.maximum(0.0, np.abs(preds) - LOGIT_SATURATION_THRESHOLD)
+                    sat_pen = float(np.mean(excess ** 2))
+                    if sat_pen > 0:
+                        self.loss += LOGIT_SATURATION_WEIGHT * sat_pen
+            else:               # Regression — Normalized MSE + Analytic Scaling
+
+                # ── Affine precompute-and-lock ────────────────────────────────
+                # Compute affine_a, affine_b on the FULL X the FIRST time this
+                # individual is evaluated (update_affine=True, not yet fitted).
+                # After that the parameters are frozen: minibatch re-evaluations
+                # and constant-optimisation steps all use the locked values.
+                # This prevents the affine from drifting across different batches
+                # and ensures constant optimisation cannot "cheat" by implicitly
+                # rescaling via the affine as a free parameter.
+                # When AFFINE_SCALING_ENABLED is False, keep identity (a=1, b=0)
+                # and lock immediately so the CGP must learn scale from constants.
+                if not AFFINE_SCALING_ENABLED and not self.affine_fitted:
+                    self.affine_a = 1.0
+                    self.affine_b = 0.0
+                    self.affine_fitted = True
+                if update_affine and not self.affine_fitted:
+                    # Reuse existing preds when evaluating on the full dataset
+                    # (batch_indices is None) — avoids a redundant evaluate() call,
+                    # which is a huge speedup during population initialisation on
+                    # large datasets.
+                    if batch_indices is None:
+                        preds_full = preds  # already evaluated on full X above
+                    else:
+                        preds_full = self.tree.evaluate(X)
+                        preds_full = np.clip(
+                            np.nan_to_num(preds_full, nan=0.0, posinf=1e9, neginf=-1e9),
+                            -1e9, 1e9)
+                    p_mean      = float(np.mean(preds_full))
+                    y_mean_full = float(np.mean(y_target))
+                    p_var       = float(np.var(preds_full))
+                    if p_var > 1e-10:
+                        cov           = float(np.mean((preds_full - p_mean) * (y_target - y_mean_full)))
+                        self.affine_a = float(cov / p_var)
+                        self.affine_b = float(y_mean_full - self.affine_a * p_mean)
+                        self.affine_fitted = True
+                    else:
+                        # Tree output is near-constant: use identity affine (a=1, b=0)
+                        # but do NOT lock — after mutation changes the tree to produce
+                        # variable output, the affine should be re-fitted on the next
+                        # full-data evaluation.  Locking (0, mean_y) here would
+                        # permanently kill the individual even after structural mutation.
+                        self.affine_a = 1.0
+                        self.affine_b = 0.0
+
+                # Apply the locked affine to the (possibly batched) predictions
+                preds  = self.affine_a * preds + self.affine_b
+
+                # ── Apply intra-individual boost corrections ───────────────
+                if self.boost_stages:
+                    for corr_tree, ca, cb, lr in self.boost_stages:
+                        corr = corr_tree.evaluate(X_eval)
+                        corr = np.clip(np.nan_to_num(corr, nan=0.0,
+                                       posinf=1e9, neginf=-1e9), -1e9, 1e9)
+                        preds += lr * (ca * corr + cb)
+
+                y_mean = float(np.mean(y_eval))
+                diff   = preds - y_eval
+
+                y_var = float(np.var(y_eval)) + 1e-8
+
+                # ── 2nd-order Hessian-weighted loss for boosting ─────────────
+                # When sample_weights are provided (from Hessian boosting),
+                # use weighted MSE/MAE.  Weights are normalised to sum to N
+                # so the loss scale stays consistent with unweighted mode.
+                w_eval = (sample_weights[batch_indices]
+                          if sample_weights is not None and batch_indices is not None
+                          else sample_weights)
+                if w_eval is not None:
+                    w_norm = w_eval * (len(w_eval) / (np.sum(w_eval) + 1e-30))
+                    mse = float(np.mean(w_norm * diff ** 2))
+                    mae = float(np.mean(w_norm * np.abs(diff)))
+                else:
+                    mse   = float(np.mean(diff ** 2))
+                    mae   = float(np.mean(np.abs(diff)))
+
+                # Combine MSE and MAE: MSE handles large residuals early,
+                # MAE forces convergence to exact fit late.
+                self.loss = (mse / y_var) + (mae / np.sqrt(y_var))
+
+                # ── Sobolev gradient-matching penalty ────────────────────────
+                # Penalise expressions whose partial derivatives ∂f/∂x_j diverge
+                # from the empirically estimated target derivatives.
+                # For n_features == 1: targets computed via finite differences.
+                # For n_features >= 2: KNN local-linear regression Jacobian.
+                # The penalty is normalised by the variance of the target grads
+                # so each feature dimension contributes equally regardless of scale.
+                if target_grads is not None and SOBOLEV_ENABLED:
+                    tree_grads = evaluate_tree_gradients(self.tree, X_eval, self.affine_a)
+                    tg = (target_grads[batch_indices]
+                          if batch_indices is not None else target_grads)
+                    grad_var  = np.var(target_grads, axis=0) + 1e-8
+                    grad_mse  = float(np.mean((tree_grads - tg) ** 2 / grad_var))
+                    self.loss += SOBOLEV_WEIGHT * grad_mse
+
+                ss_res = float(np.sum(diff ** 2))
+                ss_tot = float(np.sum((y_eval - y_mean) ** 2))
+                self.r2       = 1.0 - ss_res / (ss_tot + 1e-8)
+                self.accuracy = float(self.r2)
+
+                if np.std(y_eval) > 1e-6 and np.std(preds) < 1e-6:
+                    self.loss += 10.0
+
+                # ── Logit saturation penalty (Interval mode, regression) ─────
+                # Optional: penalise extreme prediction magnitudes even for
+                # regression.  Helps prevent expressions that produce 1e8-scale
+                # outputs which are technically finite but not meaningful.
+                if INTERVAL_MODE and LOGIT_SATURATION_REG_ENABLE:
+                    y_range = float(np.ptp(y_eval)) + 1e-8
+                    # Threshold scaled to the target range: allow ≈3× the range
+                    reg_thresh = max(LOGIT_SATURATION_THRESHOLD, 3.0 * y_range)
+                    excess = np.maximum(0.0, np.abs(preds) - reg_thresh)
+                    sat_pen = float(np.mean(excess ** 2)) / (y_range ** 2 + 1e-8)
+                    if sat_pen > 0:
+                        self.loss += LOGIT_SATURATION_WEIGHT * sat_pen
+
+            self.complexity = self.tree.get_complexity()
+            self.modularity = self.tree.get_graph_modularity()
+            if getattr(self.tree, 'last_eval_clipped', False):
+                self.loss += 10.0
+
+            # ── Constant magnitude penalty ────────────────────────────────────
+            # Astronomically large constants (e.g. 6e16) are exploited by pow()
+            # to create disguised exponentials: C^(x+k) = e^((x+k)·ln C).
+            # These achieve near-perfect fit with no scientific meaning and block
+            # the HoF from discovering the actual formula.  Penalise log-linearly
+            # above 1e4 so legitimate large constants (e.g. pressures in Pa) are
+            # unaffected while true outliers are strongly penalised.
+            _CONST_THRESHOLD = 1e4
+            _CONST_PENALTY   = 0.05   # loss units per decade above threshold
+            active_const_vals = [
+                self.tree.nodes[i - self.tree.n_features].const_val
+                for i in self.tree.active_nodes
+                if i >= self.tree.n_features
+                and self.tree.nodes[i - self.tree.n_features].op == 'const'
+            ]
+            if active_const_vals:
+                max_abs = max(abs(c) for c in active_const_vals)
+                if max_abs > _CONST_THRESHOLD:
+                    self.loss += _CONST_PENALTY * np.log10(max_abs / _CONST_THRESHOLD)
+
+            # ── Hard loss ceiling ────────────────────────────────────────────
+            # Clamp loss so catastrophically bad individuals (abs(x)^feature
+            # explosions, etc.) don't appear as extreme outliers on the fitness
+            # axis and thereby survive crowding-distance death selection longer
+            # than mediocre-but-harmless individuals.  HOF_LOSS_CEILING + 1
+            # ensures they still score strictly worse than the ceiling itself.
+            self.loss = min(self.loss, HOF_LOSS_CEILING + 1.0)
+
+            MODULARITY_REWARD = 0.5
+            # Parsimony shrinks as loss shrinks, allowing late-stage structural fine-tuning
+            dynamic_parsimony = PARSIMONY_STRENGTH * min(1.0, self.loss / 0.5) 
+            self.fitness = self.loss + (dynamic_parsimony + freq_parsimony_adj) * self.complexity - MODULARITY_REWARD * self.modularity
+
+            # ── Populate fitness cache ───────────────────────────────────────
+            if _cacheable and batch_indices is None and bg_logits is None:
+                _FITNESS_CACHE.put(self.tree, y_target, {
+                    'loss':       self.loss,
+                    'r2':         self.r2,
+                    'accuracy':   self.accuracy,
+                    'modularity': self.modularity,
+                    'complexity': self.complexity,
+                    'affine_a':   self.affine_a,
+                    'affine_b':   self.affine_b,
+                })
+
+        except Exception:
+            self.fitness  = 1e10
+            self.r2       = -1e10
+            self.accuracy = 0.0
+            self.modularity = 0.0
+
+        return self.fitness
+
+    def optimize_constants(self, X, y_target, type_code,
+                           max_rows=None, n_restarts=5, max_iter=200,
+                           bg_logits=None, class_idx_in_group=None, Y_group=None,
+                           freq_parsimony_adj=0.0, target_grads=None):
+        """
+        Two-stage constant optimisation.
+
+        The affine (affine_a, affine_b) is KEPT FIXED throughout — constant
+        optimisation must improve the symbolic structure's fit, not silently
+        re-absorb fitting error through the affine.
+
+        If SOBOLEV_ENABLED and target_grads is provided, the objective also
+        includes the Sobolev gradient-matching penalty so constant optimisation
+        pushes toward correct derivative behaviour as well as correct values.
+        """
+        initial_consts = get_constants_shared(self.tree)
+        if not initial_consts:
+            return
+
+        from scipy.optimize import minimize, differential_evolution
+
+        N = X.shape[0]
+        if max_rows is not None and N > max_rows:
+            idx = np.random.choice(N, max_rows, replace=False)
+            X_opt, y_opt = X[idx], y_target[idx]
+            bg_opt = bg_logits[idx] if bg_logits is not None else None
+            yg_opt = Y_group[idx]   if Y_group  is not None else None
+            tg_opt = target_grads[idx] if target_grads is not None else None
+        else:
+            X_opt, y_opt = X, y_target
+            bg_opt, yg_opt = bg_logits, Y_group
+            tg_opt = target_grads
+
+        n = len(initial_consts)
+        best_params = list(initial_consts)
+        best_loss = 1e10
+
+        def objective(params):
+            set_constants_shared(self.tree, list(params))
+            p = self.tree.evaluate(X_opt)
+            p = np.clip(np.nan_to_num(p, nan=0.0, posinf=1e9, neginf=-1e9), -1e9, 1e9)
+
+            if bg_opt is not None:
+                # Joint softmax CE mode
+                logits = bg_opt.copy()
+                logits[:, class_idx_in_group] = p
+                row_max = logits.max(axis=1, keepdims=True)
+                exp_l   = np.exp(np.clip(logits - row_max, -500, 0))
+                log_sm  = (logits - row_max) - np.log(exp_l.sum(axis=1, keepdims=True) + 1e-30)
+                return float(-np.mean((yg_opt * log_sm).sum(axis=1)))
+            elif type_code == 6:
+                bce = (np.maximum(p, 0) - p * y_opt
+                       + np.log(1 + np.exp(-np.abs(p))))
+                return float(np.mean(bce))
+            else:
+                # Use LOCKED affine — do not refit during constant optimisation
+                p = self.affine_a * p + self.affine_b
+                diff  = p - y_opt
+                y_var = float(np.var(y_opt)) + 1e-8
+                loss  = float(np.mean(diff**2) / y_var
+                              + np.mean(np.abs(diff)) / np.sqrt(y_var))
+                if tg_opt is not None and SOBOLEV_ENABLED:
+                    tree_grads = evaluate_tree_gradients(self.tree, X_opt, self.affine_a)
+                    grad_var   = np.var(target_grads, axis=0) + 1e-8
+                    loss      += SOBOLEV_WEIGHT * float(
+                        np.mean((tree_grads - tg_opt) ** 2 / grad_var))
+                return loss
+        # ------------------------------------------------------------------ #
+        # Stage 1: Differential Evolution (global search)
+        # Skip DE if max_iter is small (used for fast in-loop local nudges)
+        # ------------------------------------------------------------------ #
+        USE_DE = (n <= 12) and (max_iter >= 50) 
+        if USE_DE:
+            _span = np.maximum(np.abs(initial_consts), 1.0) * 10.0
+            bounds = [(-s, s) for s in _span]
+            try:
+                de_result = differential_evolution(
+                    objective, bounds, seed=42,
+                    maxiter=max(30, max_iter // 4),
+                    popsize=8, tol=1e-6, mutation=(0.5, 1.5),
+                    recombination=0.9, polish=False, init='sobol'
+                )
+                if de_result.fun < best_loss:
+                    best_loss = de_result.fun
+                    best_params = list(de_result.x)
+            except Exception:
+                pass 
+
+        # ------------------------------------------------------------------ #
+        # Stage 2: L-BFGS-B (fast local polish)
+        # ------------------------------------------------------------------ #
+        polish_starts = [best_params]
+        if not USE_DE:
+            scale = max(np.std(initial_consts), 1.0) if initial_consts else 1.0
+            for _ in range(n_restarts - 1):
+                polish_starts.append(
+                    (np.array(best_params) + np.random.randn(n) * scale).tolist()
+                )
+
+        for x0 in polish_starts:
+            try:
+                # Increased eps from 1e-5 to 1e-3 to handle unscaled raw feature gradients
+                res = minimize(objective, np.array(x0), method='L-BFGS-B',
+                               options={'maxiter': max_iter,
+                                        'ftol': 1e-15, 'gtol': 1e-8,
+                                        'eps': 1e-8}) 
+                if res.fun < best_loss:
+                    best_loss = res.fun
+                    best_params = list(res.x)
+            except Exception:
+                try:
+                    res = minimize(objective, np.array(x0), method='Nelder-Mead',
+                                   options={'maxiter': max_iter,
+                                            'xatol': 1e-5, 'fatol': 1e-6})
+                    if res.fun < best_loss:
+                        best_loss = res.fun
+                        best_params = list(res.x)
+                except Exception:
+                    pass
+
+        set_constants_shared(self.tree, best_params)
+        self.calculate_fitness(X, y_target, type_code,
+                               bg_logits=bg_logits,
+                               class_idx_in_group=class_idx_in_group,
+                               Y_group=Y_group,
+                               freq_parsimony_adj=freq_parsimony_adj,
+                               update_affine=False,   # keep the locked affine
+                               target_grads=target_grads)
+
+
+    def get_case_errors(self, X, y_target, type_code, indices,
+                        bg_logits=None, class_idx_in_group=None, Y_group=None):
+        preds = self.tree.evaluate(X[indices])
+        preds = np.clip(np.nan_to_num(preds, nan=0.0, posinf=1e9, neginf=-1e9), -1e9, 1e9)
+
+        if bg_logits is not None:
+            yg     = Y_group[indices]
+            logits = bg_logits[indices].copy()
+            logits[:, class_idx_in_group] = preds
+            row_max = logits.max(axis=1, keepdims=True)
+            exp_l   = np.exp(np.clip(logits - row_max, -500, 0))
+            log_sm  = (logits - row_max) - np.log(exp_l.sum(axis=1, keepdims=True) + 1e-30)
+            return -(yg * log_sm).sum(axis=1)   
+        elif type_code == 6:
+            return (np.maximum(preds, 0)
+                    - preds * y_target[indices]
+                    + np.log(1 + np.exp(-np.abs(preds))))
+        else:
+            # --- Apply locked affine scaling + boost corrections ---
+            a = getattr(self, 'affine_a', 1.0)
+            b = getattr(self, 'affine_b', 0.0)
+            preds = a * preds + b
+            for corr_tree, ca, cb, lr in getattr(self, 'boost_stages', []):
+                corr = corr_tree.evaluate(X[indices])
+                corr = np.clip(np.nan_to_num(corr, nan=0.0, posinf=1e9,
+                               neginf=-1e9), -1e9, 1e9)
+                preds += lr * (ca * corr + cb)
+            # ----------------------------------------
+            diff = preds - y_target[indices]
+            return np.where(np.abs(diff) > 100, np.abs(diff) - 0.6931, np.log(np.cosh(diff)))
+
+    def full_expr_string(self):
+        """String representation including boost correction stages."""
+        base = f"{self.affine_a:.4g} * ({str(self.tree)}) + {self.affine_b:.4g}"
+        if not getattr(self, 'boost_stages', []):
+            return base
+        parts = [base]
+        for i, (corr_tree, ca, cb, lr) in enumerate(self.boost_stages):
+            parts.append(f" + {lr:.3g} * ({ca:.4g} * ({str(corr_tree)}) + {cb:.4g})")
+        return "".join(parts)
+
+
+# ==========================================
+# PART 5: EXPORT TO SYMPY & SCRIPT
+# ==========================================
+
+def clean_var_name(name):
+    clean = re.sub(r'[^a-zA-Z0-9_]', '_', name)
+    if clean[0].isdigit(): clean = "var_" + clean
+    return re.sub(r'_+', '_', clean).strip('_')
+
+
+def _adf_to_sympy(adf_dict, input_exprs, safe=True):
+    """
+    Recursively expand an ADF sub-graph into a SymPy expression.
+
+    adf_dict   : the ADF registry dict (name, n_inputs, node_data, …).
+    input_exprs: list of SymPy expressions feeding the ADF's abstract input slots.
+    safe       : mirrors the SAFE_OPS_MODE flag for safe/unsafe op variants.
+
+    Returns a SymPy expression that is the full algebraic expansion of the
+    frozen sub-graph, using the provided input expressions as leaves.
+    This lets the final display show e.g. ``initial_temp**2 + ambient_temp``
+    rather than the opaque stub ``adf_0(initial_temp, ambient_temp)``.
+    """
+    if sympy is None:
+        return sympy.Float(0)
+
+    nodes     = adf_dict['node_data']   # list of (op, in1_slot, in2_slot, cval)
+    n_in      = adf_dict['n_inputs']
+    out_slot  = adf_dict['output_slot']
+
+    # Slot buffer: slots 0..n_in-1 are the abstract input expressions
+    sbuf = {i: input_exprs[i] for i in range(n_in)}
+
+    for j, (op, in1, in2, cval) in enumerate(nodes):
+        slot = n_in + j
+        v1   = sbuf.get(in1, sympy.Float(0))
+        v2   = sbuf.get(in2, sympy.Float(0))
+
+        if op == 'const':
+            sbuf[slot] = sympy.Float(cval)
+        elif op == '+':
+            sbuf[slot] = v1 + v2
+        elif op == '-':
+            sbuf[slot] = v1 - v2
+        elif op == '*':
+            sbuf[slot] = v1 * v2
+        elif op == '/':
+            if safe:
+                sbuf[slot] = v1 / (sympy.Abs(v2) + sympy.Float(1e-8))
+            else:
+                sbuf[slot] = v1 / v2
+        elif op == 'pow':
+            if safe:
+                v2c = sympy.Min(sympy.Max(v2, -250.0), 250.0)
+                try:
+                    v2_float = float(v2c)
+                    if abs(round(v2_float) - v2_float) < 1e-4:
+                        if abs(round(v2_float) % 2) == 1:
+                            sbuf[slot] = sympy.sign(v1) * (sympy.Abs(v1) + sympy.Float(1e-30)) ** v2c
+                        else:
+                            sbuf[slot] = (sympy.Abs(v1) + sympy.Float(1e-30)) ** v2c
+                    else:
+                        sbuf[slot] = (sympy.Abs(v1) + sympy.Float(1e-30)) ** v2c
+                except Exception:
+                    sbuf[slot] = (sympy.Abs(v1) + sympy.Float(1e-30)) ** v2c
+            else:
+                sbuf[slot] = v1 ** v2
+        elif op == 'sin':
+            sbuf[slot] = sympy.sin(v1)
+        elif op == 'cos':
+            sbuf[slot] = sympy.cos(v1)
+        elif op == 'tan':
+            sbuf[slot] = sympy.tan(v1)
+        elif op == 'square':
+            sbuf[slot] = v1**2
+        elif op == 'neg':
+            sbuf[slot] = -v1
+        elif op == 'frac':
+            sbuf[slot] = v1 - sympy.floor(v1)
+        elif op == 'round':
+            sbuf[slot] = sympy.floor(v1 + sympy.Rational(1, 2))
+        elif op == 'floordiv':
+            if safe:
+                sbuf[slot] = sympy.floor(v1 / (sympy.Abs(v2) + sympy.Float(1e-8)))
+            else:
+                sbuf[slot] = sympy.floor(v1 / v2)
+        elif op == 'exp':
+            sbuf[slot] = sympy.exp(sympy.Min(sympy.Max(v1, -700.0), 700.0)) if safe else sympy.exp(v1)
+        elif op == 'log':
+            sbuf[slot] = sympy.log(sympy.Abs(v1) + sympy.Float(1e-30)) if safe else sympy.log(v1)
+        elif op == 'sqrt':
+            sbuf[slot] = sympy.sqrt(sympy.Abs(v1)) if safe else sympy.sqrt(v1)
+        elif op == 'abs':
+            sbuf[slot] = sympy.Abs(v1)
+        elif op == 'tanh':
+            sbuf[slot] = sympy.tanh(v1)
+        elif op == 'sigmoid':
+            sbuf[slot] = 1 / (1 + sympy.exp(-v1))
+        elif op == 'relu':
+            sbuf[slot] = sympy.Piecewise((v1, v1 > 0), (sympy.Integer(0), True))
+        elif op == 'cube':
+            sbuf[slot] = v1 ** 3
+        elif op == 'inv':
+            sbuf[slot] = (1 / (sympy.Abs(v1) + sympy.Float(1e-30)) if safe
+                          else 1 / v1)
+        elif op == 'gaussian':
+            sbuf[slot] = sympy.exp(-(v1 ** 2))
+        elif op == 'log10':
+            sbuf[slot] = sympy.log(sympy.Abs(v1) + sympy.Float(1e-30), 10) if safe else sympy.log(v1, 10)
+        elif op == 'atan':
+            sbuf[slot] = sympy.atan(v1)
+        elif op == 'sign':
+            sbuf[slot] = sympy.sign(v1)
+        elif op == 'erf':
+            sbuf[slot] = sympy.erf(v1)
+        elif op == 'hypot':
+            sbuf[slot] = sympy.sqrt(v1**2 + v2**2)
+        elif op == 'max':
+            sbuf[slot] = sympy.Max(v1, v2)
+        elif op == 'min':
+            sbuf[slot] = sympy.Min(v1, v2)
+        elif op.startswith('adf_'):
+            # Nested ADF: look up and expand recursively
+            nested = next((d for d in _ADF_REGISTRY if d['name'] == op), None)
+            if nested:
+                sbuf[slot] = _adf_to_sympy(nested, [v1, v2][:nested['n_inputs']], safe)
+            else:
+                sbuf[slot] = sympy.Function(op)(v1, v2)
+        else:
+            sbuf[slot] = sympy.Float(0)
+
+    return sbuf.get(out_slot, sympy.Float(0))
+
+
+def tree_to_sympy(cgp_eq, feature_vars, safe=None):
+    """
+    Convert a CGP expression tree to a SymPy expression.
+
+    safe=True   → mirrors SAFE op implementations (abs-wrapping, epsilon guards,
+                  exp becomes exp(clip(v, -700.0, 700.0))).
+    safe=False  → mirrors UNSAFE op implementations (raw math, no guards).
+    safe=None   → uses the current global SAFE_OPS_MODE setting.
+
+    The two sets are kept in sync with _BINARY_SAFE/_UNARY_SAFE and
+    _BINARY_UNSAFE/_UNARY_UNSAFE so the symbolic form always matches what
+    the evaluator actually computed.
+    """
+    if sympy is None:
+        return "Sympy not installed."
+
+    if safe is None:
+        safe = SAFE_OPS_MODE
+
+    buf = {i: feature_vars[i] for i in range(cgp_eq.n_features)}
+
+    for idx in sorted(cgp_eq.active_nodes):
+        if idx < cgp_eq.n_features:
+            continue
+        node = cgp_eq.nodes[idx - cgp_eq.n_features]
+
+        if node.op == 'const':
+            buf[idx] = sympy.Float(node.const_val)
+            continue
+
+        v1 = buf.get(node.in1, sympy.Float(0))
+
+        # ------------------------------------------------------------------ #
+        #  BINARY OPS
+        # ------------------------------------------------------------------ #
+        if node.op in cgp_eq.OPS_BINARY_SET:
+            v2 = buf.get(node.in2, sympy.Float(0))
+
+            if node.op == '+':
+                buf[idx] = v1 + v2
+            elif node.op == '-':
+                buf[idx] = v1 - v2
+            elif node.op == '*':
+                buf[idx] = v1 * v2
+
+            elif node.op == '/':
+                if safe:
+                    # guard: denominator nudged away from zero
+                    buf[idx] = v1 / (v2 + sympy.Piecewise(
+                        (sympy.Float(1e-8),  sympy.Abs(v2) <= 1e-8),
+                        (sympy.Float(0),     True)))
+                else:
+                    buf[idx] = v1 / v2
+
+            elif node.op == 'max':
+                buf[idx] = sympy.Max(v1, v2)
+            elif node.op == 'min':
+                buf[idx] = sympy.Min(v1, v2)
+
+            elif node.op == 'pow':
+                if safe:
+                    # Real pow with sign preservation where possible
+                    v2c = sympy.Min(sympy.Max(v2, sympy.Float(-250.0)), sympy.Float(250.0))
+                    # Check if v2c is a constant integer to preserve sign
+                    try:
+                        v2_float = float(v2c)
+                        if abs(round(v2_float) - v2_float) < 1e-4:
+                            if abs(round(v2_float) % 2) == 1:
+                                buf[idx] = sympy.sign(v1) * sympy.Pow(sympy.Abs(v1) + sympy.Float(1e-30), v2c)
+                            else:
+                                buf[idx] = sympy.Pow(sympy.Abs(v1) + sympy.Float(1e-30), v2c)
+                        else:
+                            buf[idx] = sympy.Pow(sympy.Abs(v1) + sympy.Float(1e-30), v2c)
+                    except Exception:
+                        buf[idx] = sympy.Pow(sympy.Abs(v1) + sympy.Float(1e-30), v2c)
+                else:
+                    buf[idx] = sympy.Pow(v1, v2)
+
+            elif node.op == 'hypot':
+                buf[idx] = sympy.sqrt(v1**2 + v2**2)
+            elif node.op == 'atan2':
+                buf[idx] = sympy.atan2(v1, v2)
+
+            elif node.op == 'harmonic':
+                if safe:
+                    buf[idx] = 2 * v1 * v2 / (sympy.Abs(v1 + v2) + sympy.Float(1e-8))
+                else:
+                    buf[idx] = 2 * v1 * v2 / (v1 + v2)
+
+            elif node.op == 'geometric':
+                if safe:
+                    buf[idx] = sympy.sqrt(sympy.Abs(v1 * v2))
+                else:
+                    buf[idx] = sympy.sqrt(v1 * v2)
+
+            elif node.op == 'mod':
+                if safe:
+                    buf[idx] = sympy.Mod(v1, sympy.Abs(v2) + sympy.Float(1e-8))
+                else:
+                    buf[idx] = sympy.Mod(v1, v2)
+
+            elif node.op == 'copysign':
+                buf[idx] = sympy.Abs(v1) * sympy.sign(v2)
+            elif node.op == 'floordiv':
+                if safe:
+                    buf[idx] = sympy.floor(v1 / (v2 + sympy.Piecewise(
+                        (sympy.Float(1e-8),  sympy.Abs(v2) <= 1e-8),
+                        (sympy.Float(0),     True))))
+                else:
+                    buf[idx] = sympy.floor(v1 / v2)
+            # Comparison operators → Piecewise(1, cond, 0)
+            elif node.op == 'gt':
+                buf[idx] = sympy.Piecewise((sympy.Float(1), v1 > v2), (sympy.Float(0), True))
+            elif node.op == 'lt':
+                buf[idx] = sympy.Piecewise((sympy.Float(1), v1 < v2), (sympy.Float(0), True))
+            elif node.op == 'gte':
+                buf[idx] = sympy.Piecewise((sympy.Float(1), v1 >= v2), (sympy.Float(0), True))
+            elif node.op == 'lte':
+                buf[idx] = sympy.Piecewise((sympy.Float(1), v1 <= v2), (sympy.Float(0), True))
+            elif node.op.startswith('adf_'):
+                # ADF binary operator — expand sub-graph inline into SymPy.
+                adf_d = next((d for d in _ADF_REGISTRY if d['name'] == node.op), None)
+                if adf_d:
+                    buf[idx] = _adf_to_sympy(adf_d, [v1, v2], safe)
+                else:
+                    buf[idx] = sympy.Function(node.op)(v1, v2)
+            else:
+                buf[idx] = sympy.Float(0)
+
+        # ------------------------------------------------------------------ #
+        #  TERNARY OPS (if_else)
+        # ------------------------------------------------------------------ #
+        elif node.op in cgp_eq.OPS_TERNARY_SET:
+            v2 = buf.get(node.in2, sympy.Float(0))
+            v3 = buf.get(node.in3, sympy.Float(0))
+            if node.op == 'if_else':
+                # if_else(condition, true_val, false_val)
+                # condition > 0.5 → true_val, else false_val
+                buf[idx] = sympy.Piecewise((v2, v1 > 0.5), (v3, True))
+            else:
+                buf[idx] = sympy.Float(0)
+
+        # ------------------------------------------------------------------ #
+        #  UNARY OPS
+        # ------------------------------------------------------------------ #
+        elif node.op in cgp_eq.OPS_UNARY_SET:
+
+            if node.op == 'sin':
+                buf[idx] = sympy.sin(v1)
+            elif node.op == 'cos':
+                buf[idx] = sympy.cos(v1)
+            elif node.op == 'tan':
+                buf[idx] = sympy.tan(v1)
+
+            elif node.op == 'exp':
+                if safe:
+                    buf[idx] = sympy.exp(sympy.Min(sympy.Max(v1, sympy.Float(-700.0)), sympy.Float(700.0)))
+                else:
+                    buf[idx] = sympy.exp(v1)
+
+            elif node.op == 'log':
+                if safe:
+                    buf[idx] = sympy.log(sympy.Abs(v1) + sympy.Float(1e-30))
+                else:
+                    buf[idx] = sympy.log(v1)
+
+            elif node.op == 'sqrt':
+                if safe:
+                    buf[idx] = sympy.sqrt(sympy.Abs(v1))
+                else:
+                    buf[idx] = sympy.sqrt(v1)
+
+            elif node.op == 'abs':
+                buf[idx] = sympy.Abs(v1)
+
+            elif node.op == 'square':
+                buf[idx] = v1**2
+            elif node.op == 'neg':
+                buf[idx] = -v1
+            elif node.op == 'frac':
+                buf[idx] = v1 - sympy.floor(v1)
+            elif node.op == 'round':
+                buf[idx] = sympy.floor(v1 + sympy.Rational(1, 2))
+
+            elif node.op == '10^x':
+                if safe:
+                    v1c = sympy.Min(sympy.Max(v1, sympy.Float(-300.0)), sympy.Float(300.0))
+                    buf[idx] = sympy.Pow(10, v1c)
+                else:
+                    buf[idx] = sympy.Pow(10, v1)
+
+            elif node.op == 'log10':
+                if safe:
+                    buf[idx] = sympy.log(sympy.Abs(v1) + sympy.Float(1e-30), 10)
+                else:
+                    buf[idx] = sympy.log(v1, 10)
+
+            elif node.op == 'sigmoid':
+                if safe:
+                    v1c = sympy.Min(sympy.Max(v1, sympy.Float(-50)), sympy.Float(50))
+                    buf[idx] = 1 / (1 + sympy.exp(-v1c))
+                else:
+                    buf[idx] = 1 / (1 + sympy.exp(-v1))
+
+            elif node.op == 'tanh':
+                buf[idx] = sympy.tanh(v1)
+            elif node.op == 'relu':
+                buf[idx] = sympy.Piecewise((v1, v1 > 0), (sympy.Integer(0), True))
+            elif node.op == 'leaky_relu':
+                buf[idx] = sympy.Piecewise((v1, v1 >= 0), (v1 / 100, True))
+            elif node.op == 'atan':
+                buf[idx] = sympy.atan(v1)
+
+            elif node.op == 'gaussian':
+                if safe:
+                    buf[idx] = sympy.exp(-sympy.Min(v1**2, sympy.Float(500)))
+                else:
+                    buf[idx] = sympy.exp(-v1**2)
+
+            elif node.op == 'softplus':
+                if safe:
+                    v1c = sympy.Min(v1, sympy.Float(30))
+                    buf[idx] = sympy.log(1 + sympy.exp(v1c))
+                else:
+                    buf[idx] = sympy.log(1 + sympy.exp(v1))
+
+            elif node.op == 'sign':
+                buf[idx] = sympy.sign(v1)
+            elif node.op == 'floor':
+                buf[idx] = sympy.floor(v1)
+            elif node.op == 'ceil':
+                buf[idx] = sympy.ceiling(v1)
+            elif node.op == 'cube':
+                buf[idx] = v1**3
+            elif node.op == 'sinc':
+                buf[idx] = sympy.sinc(v1 / sympy.pi)
+
+            elif node.op == 'xlogx':
+                if safe:
+                    buf[idx] = v1 * sympy.log(sympy.Abs(v1) + sympy.Float(1e-8))
+                else:
+                    buf[idx] = v1 * sympy.log(sympy.Abs(v1))
+
+            elif node.op == 'erf':
+                buf[idx] = sympy.erf(v1)
+
+            elif node.op == 'inv':
+                if safe:
+                    buf[idx] = 1 / (sympy.Abs(v1) + sympy.Float(1e-30))
+                else:
+                    buf[idx] = 1 / v1
+
+            elif node.op.startswith('adf_'):
+                # ADF unary operator — expand sub-graph inline into SymPy.
+                adf_d = next((d for d in _ADF_REGISTRY if d['name'] == node.op), None)
+                if adf_d:
+                    buf[idx] = _adf_to_sympy(adf_d, [v1], safe)
+                else:
+                    buf[idx] = sympy.Function(node.op)(v1)
+
+            else:
+                buf[idx] = sympy.Float(0)
+
+    return buf.get(cgp_eq.out_idx, sympy.Float(0))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PERFECT OUTPUT EARLY STOPPING
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Thresholds for "perfect" performance
+_PERFECT_R2_THRESHOLD = 1.0 - 1e-9       # R² >= this is considered perfect
+_PERFECT_MSE_THRESHOLD = 1e-10            # MSE <= this is considered near-zero
+_PERFECT_ACCURACY_THRESHOLD = 1.0 - 1e-9  # accuracy >= this for classification
+
+
+def _check_output_perfect(hof, X, Y_col, out_type):
+    """Check if the best model for this output has effectively perfect performance.
+
+    Returns (is_perfect, best_ind) where is_perfect is True if R²≈1 and MSE≈0
+    (regression) or accuracy≈1 (classification).
+    """
+    best = hof.get_best_overall()
+    if best is None:
+        return False, None
+
+    is_cls = (out_type == 6)
+    if is_cls:
+        acc = getattr(best, 'accuracy', 0.0)
+        return acc >= _PERFECT_ACCURACY_THRESHOLD, best
+
+    # Regression: check R² and MSE
+    r2 = getattr(best, 'r2', 0.0)
+    if r2 < _PERFECT_R2_THRESHOLD:
+        return False, best
+
+    # Double-check with actual MSE on full data
+    pred = best.tree.evaluate(X)
+    pred = np.nan_to_num(pred, nan=0.0, posinf=1e9, neginf=-1e9)
+    a = getattr(best, 'affine_a', 1.0)
+    b = getattr(best, 'affine_b', 0.0)
+    pred = a * pred + b
+    mse = float(np.mean((Y_col - pred) ** 2))
+    return mse <= _PERFECT_MSE_THRESHOLD, best
+
+
+def _save_backup_model(models, dp, output_idx, X_data=None):
+    """Save a backup model script for a single perfect output."""
+    out_label = dp.output_map[output_idx] if output_idx < len(dp.output_map) else f"Out{output_idx}"
+    safe_label = re.sub(r'[^a-zA-Z0-9_]', '_', out_label)
+    filename = f"backup_perfect_{safe_label}.py"
+    generate_script(models, dp, filename=filename, X_data=X_data)
+    print(f"  [Perfect] Backup model saved to: {filename}")
+
+
+def _simplify_perfect_output(hof, X, Y_col, out_type, target_grads=None):
+    """Run aggressive simplification on a perfect output's HoF,
+    trying to reduce complexity while keeping perfect performance."""
+    if sympy is None:
+        return
+
+    improved = False
+    for complexity, ind in list(hof.best_by_complexity.items()):
+        try:
+            # Try sympy simplification on the tree
+            clean_names = [clean_var_name(n) for n in ind.tree.feature_names]
+            sym_vars = [sympy.Symbol(n) for n in clean_names]
+            raw_sym = tree_to_sympy(ind.tree, sym_vars, safe=SAFE_OPS_MODE)
+            simplified = advanced_simplify_expr(raw_sym)
+
+            # If simplification actually reduced expression size, rebuild
+            if str(simplified) != str(raw_sym):
+                # Re-evaluate to make sure performance is maintained
+                ind_copy = copy.deepcopy(ind)
+                ind_copy.calculate_fitness(X, Y_col, out_type, target_grads=target_grads)
+                if ind_copy.loss < 1e-5:
+                    hof.update(ind_copy)
+                    improved = True
+        except Exception:
+            continue
+    return improved
+
+
+def generate_script(models, dp, filename="best_model.py", X_data=None):
+    import inspect
+
+    out_types = dp.get_output_types_flat()
+
+    # ------------------------------------------------------------------ #
+    # 0. Find used inputs by tracing active nodes
+    # ------------------------------------------------------------------ #
+    used_feature_indices = set()
+    for ind in models:
+        if ind is None: continue
+        ind.tree.update_active_nodes()
+        for idx in ind.tree.active_nodes:
+            if idx < ind.tree.n_features:
+                used_feature_indices.add(idx)
+                
+    used_input_map_names = set(dp.input_map[idx] for idx in used_feature_indices)
+    
+    used_cols = []
+    for col, type_c in dp.col_configs:
+        if type_c in [0, 5, 6, 7]: continue
+        if type_c == 1:
+            if col in used_input_map_names:
+                used_cols.append(col)
+        elif type_c == 2:
+            stat = dp.stats.get(col, {})
+            for cls in stat.get('classes', []):
+                if f"{col}_{cls}" in used_input_map_names:
+                    used_cols.append(col)
+                    break
+        elif type_c == 3:
+            stat = dp.stats.get(col, {})
+            chars = stat.get('char_map', {}).keys()
+            max_len = stat.get('max_len', 1)
+            found = False
+            for j in range(max_len):
+                for c in chars:
+                    if f"{col}_pos{j}_{c}" in used_input_map_names:
+                        used_cols.append(col)
+                        found = True
+                        break
+                if found: break
+
+
+    # 1. Resolve clean variable names (deduplicated)
+    clean_names = [clean_var_name(n) for n in dp.input_map]
+    seen = {}
+    final_vars = []
+    for name in clean_names:
+        if name in seen:
+            seen[name] += 1
+            final_vars.append(f"{name}_{seen[name]}")
+        else:
+            seen[name] = 0
+            final_vars.append(name)
+
+    # ------------------------------------------------------------------ #
+    # 2. Build numpy expression code for each output.
+    # ------------------------------------------------------------------ #
+    sym_vars = [sympy.Symbol(n) for n in final_vars] if sympy else []
+    eq_code = ""
+
+    adf_helper_code = ""
+    emitted_adfs = set()
+
+    def _adf_node_data_to_numpy(d):
+        """Render an ADF's node_data list as a self-contained numpy lambda string."""
+        n_in   = d['n_inputs']
+        nodes  = d['node_data']
+        n_slots = d['total_slots']
+        out_s   = d['output_slot']
+
+        arg_names = [f"_a{i}" for i in range(n_in)]
+        lines = ["    import numpy as _np"]
+        lines.append(f"    _buf = _np.zeros(({n_slots}, len(_a0) if hasattr(_a0,'__len__') else 1))")
+        for i, a in enumerate(arg_names):
+            lines.append(f"    _buf[{i}] = {a}")
+        for j, (op, in1, in2, cval) in enumerate(nodes):
+            slot = n_in + j
+            v1 = f"_buf[{in1}]"
+            v2 = f"_buf[{in2}]"
+            cval_r = repr(float(cval))
+            if op == 'const':
+                lines.append(f"    _buf[{slot}] = {cval_r}")
+            elif op == '+':
+                lines.append(f"    _buf[{slot}] = {v1} + {v2}")
+            elif op == '-':
+                lines.append(f"    _buf[{slot}] = {v1} - {v2}")
+            elif op == '*':
+                lines.append(f"    _buf[{slot}] = {v1} * {v2}")
+            elif op == '/':
+                lines.append(f"    _buf[{slot}] = _np.where(_np.abs({v2})>1e-8, {v1}/{v2}, 0.0)")
+            elif op == 'pow':
+                lines.append(f"    _buf[{slot}] = _np.where(_np.abs(_np.round({v2}) - {v2}) < 1e-4, _np.where(_np.abs(_np.mod(_np.round({v2}), 2)) < 1e-8, _np.power(_np.abs({v1}) + 1e-30, _np.clip({v2}, -250.0, 250.0)), _np.copysign(_np.power(_np.abs({v1}) + 1e-30, _np.clip({v2}, -250.0, 250.0)), {v1})), _np.power(_np.abs({v1}) + 1e-30, _np.clip({v2}, -250.0, 250.0)))")
+            elif op in ('sin','cos','tan','tanh','abs','sign','floor','ceil'):
+                lines.append(f"    _buf[{slot}] = _np.{op}({v1})")
+            elif op == 'exp':
+                lines.append(f"    _buf[{slot}] = _np.exp(_np.clip({v1}, -700.0, 700.0))")
+            elif op == 'log':
+                lines.append(f"    _buf[{slot}] = _np.log(_np.abs({v1})+1e-30)")
+            elif op == 'sqrt':
+                lines.append(f"    _buf[{slot}] = _np.sqrt(_np.abs({v1}))")
+            elif op == 'square':
+                lines.append(f"    _buf[{slot}] = {v1}*{v1}")
+            elif op == 'neg':
+                lines.append(f"    _buf[{slot}] = -{v1}")
+            elif op == 'frac':
+                lines.append(f"    _buf[{slot}] = {v1} - _np.floor({v1})")
+            elif op == 'round':
+                lines.append(f"    _buf[{slot}] = _np.round({v1})")
+            elif op == 'floordiv':
+                lines.append(f"    _buf[{slot}] = _np.floor({v1} / _np.where(_np.abs({v2})>1e-8, {v2}, 1e-8))")
+            elif op == 'relu':
+                lines.append(f"    _buf[{slot}] = _np.maximum(0.0, {v1})")
+            elif op == 'sigmoid':
+                lines.append(f"    _buf[{slot}] = 1.0/(1.0+_np.exp(-_np.clip({v1},-50,50)))")
+            elif op == 'cube':
+                lines.append(f"    _buf[{slot}] = {v1}**3")
+            elif op == 'inv':
+                lines.append(f"    _buf[{slot}] = 1.0/(_np.abs({v1})+1e-30)")
+            elif op == 'gaussian':
+                lines.append(f"    _buf[{slot}] = _np.exp(-_np.clip({v1}**2,0,500))")
+            elif op.startswith('adf_'):
+                lines.append(f"    _buf[{slot}] = {op}({v1}, {v2})")
+            else:
+                lines.append(f"    _buf[{slot}] = 0.0  # unknown op: {op}")
+            lines.append(f"    _buf[{slot}] = _np.nan_to_num(_buf[{slot}], nan=0., posinf=1e9, neginf=-1e9)")
+        lines.append(f"    return _buf[{out_s}].squeeze() if hasattr(_a0,'__len__') else float(_buf[{out_s}][0])")
+        args_sig = ", ".join(arg_names)
+        body = "\n".join(lines)
+        return args_sig, body
+
+    for ind in models:
+        if ind is None:
+            continue
+        ind.tree.update_active_nodes()
+        for nidx in ind.tree.active_nodes:
+            if nidx < ind.tree.n_features:
+                continue
+            op = ind.tree.nodes[nidx - ind.tree.n_features].op
+            if op.startswith('adf_') and op not in emitted_adfs:
+                adf_dict = next((d for d in _ADF_REGISTRY if d['name'] == op), None)
+                if adf_dict:
+                    args_sig, body = _adf_node_data_to_numpy(adf_dict)
+                    adf_helper_code += f"\ndef {op}({args_sig}):\n{body}\n"
+                    emitted_adfs.add(op)
+
+    for i, ind in enumerate(models):
+        out_name = dp.output_map[i]
+        if sympy:
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    raw_sym    = tree_to_sympy(ind.tree, sym_vars, safe=SAFE_OPS_MODE)
+                    simplified = advanced_simplify_expr(raw_sym)
+                py_expr = NumPyPrinter().doprint(simplified)
+                py_expr = py_expr.replace('numpy.', 'np.')
+            except Exception:
+                py_expr = str(ind.tree)
+        else:
+            py_expr = str(ind.tree)
+            
+        if out_types[i] == 5: 
+            a = getattr(ind, 'affine_a', 1.0)
+            b = getattr(ind, 'affine_b', 0.0)
+            py_expr = f"({a} * ({py_expr}) + {b})"
+
+        eq_code += f"    # Output {i} ({out_name})\n"
+        eq_code += f"    y_pred[:, {i}] = {py_expr}\n\n"
+
+    unpack_code = "".join(
+        f"    {name} = _X_mat[:, {idx}]\n" for idx, name in enumerate(final_vars)
+    )
+
+    # ------------------------------------------------------------------ #
+    # 2b. Compute feature ranges for plotting
+    # ------------------------------------------------------------------ #
+    feature_ranges = {}  # idx -> (min, max, mean)
+    if X_data is not None:
+        for idx in range(len(final_vars)):
+            col = X_data[:, idx]
+            feature_ranges[idx] = (float(np.nanmin(col)), float(np.nanmax(col)), float(np.nanmean(col)))
+
+    # ------------------------------------------------------------------ #
+    # 3. Embed DataProcessor source so pickle can find the class.
+    # ------------------------------------------------------------------ #
+    try:
+        dp_class_src = inspect.getsource(DataProcessor)
+    except Exception:
+        dp_class_src = "# DataProcessor source unavailable"
+
+    dp_bytes = pickle.dumps(dp)
+    dp_b64   = base64.b64encode(dp_bytes).decode('utf-8')
+
+    dp_class_src = "\n".join(
+        line for line in dp_class_src.splitlines()
+    )
+
+    output_names_list = [dp.output_map[i] if i < len(dp.output_map) else f"Out{i}" for i in range(len(models))]
+
+    script_content = f'''import numpy as np
+import pandas as pd
+import pickle
+import base64
+import math
+import sys
+import warnings
+import functools
+np.seterr(all="ignore")
+warnings.filterwarnings("ignore")
+
+# ── Vectorised helper: erf (math.erf is scalar-only) ─────────────────────────
+def _erf_vec(x):
+    """Vectorised error function — wraps scipy if available, else math.erf."""
+    x = np.asarray(x, dtype=float)
+    try:
+        from scipy.special import erf as _sp_erf
+        return _sp_erf(x)
+    except ImportError:
+        return np.vectorize(math.erf)(x)
+# Monkey-patch so that SymPy-generated math.erf(…) calls work on arrays
+math.erf = _erf_vec
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── DataProcessor class (embedded so pickle can resolve it) ──────────────────
+{dp_class_src}
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── ADF (Automatically Defined Functions) — frozen sub-graph operators ────────
+{adf_helper_code if adf_helper_code else "# (no ADF operators used in this model)"}
+# ─────────────────────────────────────────────────────────────────────────────
+
+USED_COLS = {repr(used_cols)}
+FEATURE_NAMES = {repr(final_vars)}
+FEATURE_RANGES = {repr(feature_ranges)}
+OUTPUT_NAMES = {repr(output_names_list)}
+N_FEATURES = {len(final_vars)}
+N_OUTPUTS = {len(models)}
+
+DP_B64 = "{dp_b64}"
+dp = pickle.loads(base64.b64decode(DP_B64))
+
+
+def predict_raw(X):
+    """Predict from a raw numpy array of shape (N, n_features).
+    Skips DataProcessor preprocessing — use when data is already transformed.
+    """
+    _X_mat = np.asarray(X, dtype=float)
+    if _X_mat.ndim == 1:
+        _X_mat = _X_mat.reshape(1, -1)
+    N = _X_mat.shape[0]
+
+{unpack_code}
+
+    n_outputs = N_OUTPUTS
+    y_pred = np.zeros((N, n_outputs))
+
+{eq_code}
+
+    return y_pred
+
+
+def predict(input_dict):
+    try:
+        X_vec = dp.transform_input_sample(input_dict)
+    except Exception as e:
+        print(f"Error: {{e}}")
+        return None
+    _X_mat = X_vec.reshape(1, -1)
+
+{unpack_code}
+
+    n_outputs = N_OUTPUTS
+    y_pred = np.zeros((1, n_outputs))
+
+{eq_code}
+
+    return dp.inverse_transform_output(y_pred[0])
+
+
+def _sanitize_filename(name):
+    """Replace characters that are unsafe for filenames with safe variants."""
+    import re as _re
+    # Replace common unsafe chars with descriptive alternatives
+    replacements = {{'/': '_div_', '\\\\': '_bslash_', ':': '_', '*': '_star_',
+                    '?': '_', '"': '_', '<': '_lt_', '>': '_gt_', '|': '_pipe_',
+                    ' ': '_'}}
+    for ch, repl in replacements.items():
+        name = name.replace(ch, repl)
+    # Remove any remaining non-alphanumeric chars (except - _ .)
+    name = _re.sub(r'[^\\w.\\-]', '_', name)
+    # Collapse multiple underscores
+    name = _re.sub(r'_+', '_', name).strip('_')
+    return name if name else 'unnamed'
+
+
+def plot_model():
+    """Generate plots of model outputs vs inputs (1D and 2D) and save to evo_plots/."""
+    import os
+    import shutil
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+    except Exception:
+        pass
+    try:
+        import matplotlib.pyplot as plt
+        from matplotlib import cm
+    except ImportError:
+        print("matplotlib is required for plotting. Install with: pip install matplotlib")
+        return
+
+    if not FEATURE_RANGES:
+        print("No feature range data available (model was saved without training data).")
+        return
+
+    n_feat = N_FEATURES
+    n_out = N_OUTPUTS
+    resolution = 200
+
+    # Build defaults
+    feat_defaults = {{}}
+    feat_mins = {{}}
+    feat_maxs = {{}}
+    for idx_str, (fmin, fmax, fmean) in FEATURE_RANGES.items():
+        idx = int(idx_str) if isinstance(idx_str, str) else idx_str
+        feat_defaults[idx] = fmean
+        feat_mins[idx] = fmin
+        feat_maxs[idx] = fmax
+
+    # Prepare output directory
+    plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "evo_plots")
+    if os.path.exists(plot_dir):
+        shutil.rmtree(plot_dir)
+    os.makedirs(plot_dir)
+
+    # Create per-output subdirectories
+    out_dirs = {{}}
+    for out_idx in range(n_out):
+        safe_name = _sanitize_filename(OUTPUT_NAMES[out_idx])
+        out_path = os.path.join(plot_dir, safe_name)
+        os.makedirs(out_path, exist_ok=True)
+        out_dirs[out_idx] = out_path
+
+    print("\\n--- MODEL PLOTTING ---")
+    print(f"Features ({{n_feat}}): {{', '.join(FEATURE_NAMES)}}")
+    print(f"Outputs  ({{n_out}}): {{', '.join(OUTPUT_NAMES)}}")
+    print(f"Saving plots to: {{plot_dir}}")
+
+    # Ask user for custom frozen values
+    print("\\nFrozen input defaults (mean of training data):")
+    for idx in range(n_feat):
+        print(f"  {{FEATURE_NAMES[idx]}}: {{feat_defaults.get(idx, 0.0):.4g}}"
+              f"  (range: {{feat_mins.get(idx, 0.0):.4g}} to {{feat_maxs.get(idx, 0.0):.4g}})")
+    custom = input("\\nCustomize frozen values? [y/N]: ").strip().lower()
+    if custom == 'y':
+        for idx in range(n_feat):
+            val = input(f"  {{FEATURE_NAMES[idx]}} [{{feat_defaults.get(idx, 0.0):.4g}}]: ").strip()
+            if val:
+                try:
+                    feat_defaults[idx] = float(val)
+                except ValueError:
+                    pass
+
+    plot_count = 0
+
+    # 1D plots: each feature vs each output
+    print("\\nGenerating 1D plots (each input vs each output)...")
+    for feat_idx in range(n_feat):
+        fmin = feat_mins.get(feat_idx, 0.0)
+        fmax = feat_maxs.get(feat_idx, 1.0)
+        if abs(fmax - fmin) < 1e-12:
+            continue  # skip constant features
+        x_range = np.linspace(fmin, fmax, resolution)
+        X_grid = np.tile([feat_defaults.get(i, 0.0) for i in range(n_feat)], (resolution, 1))
+        X_grid[:, feat_idx] = x_range
+        y_pred = predict_raw(X_grid)
+
+        for out_idx in range(n_out):
+            fig, ax = plt.subplots(figsize=(8, 5))
+            ax.plot(x_range, y_pred[:, out_idx], linewidth=2)
+            frozen_str = ", ".join(
+                f"{{FEATURE_NAMES[i]}}={{feat_defaults.get(i, 0.0):.3g}}"
+                for i in range(n_feat) if i != feat_idx)
+            ax.set_xlabel(FEATURE_NAMES[feat_idx])
+            ax.set_ylabel(OUTPUT_NAMES[out_idx])
+            ax.set_title(f"{{OUTPUT_NAMES[out_idx]}} vs {{FEATURE_NAMES[feat_idx]}}")
+            if frozen_str:
+                ax.text(0.02, 0.98, f"Frozen: {{frozen_str}}", transform=ax.transAxes,
+                        fontsize=7, verticalalignment='top',
+                        bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+            ax.grid(True, alpha=0.3)
+            plt.tight_layout()
+            fname = f"{{_sanitize_filename(OUTPUT_NAMES[out_idx])}}_vs_{{_sanitize_filename(FEATURE_NAMES[feat_idx])}}.png"
+            fig.savefig(os.path.join(out_dirs[out_idx], fname), dpi=150)
+            plt.close(fig)
+            plot_count += 1
+
+    # 2D plots: each pair of features vs each output
+    if n_feat >= 2:
+        print("Generating 2D plots (each input pair vs each output)...")
+        res2d = 80
+        for i in range(n_feat):
+            for j in range(i + 1, n_feat):
+                fmin_i, fmax_i = feat_mins.get(i, 0.0), feat_maxs.get(i, 1.0)
+                fmin_j, fmax_j = feat_mins.get(j, 0.0), feat_maxs.get(j, 1.0)
+                if abs(fmax_i - fmin_i) < 1e-12 or abs(fmax_j - fmin_j) < 1e-12:
+                    continue
+                xi = np.linspace(fmin_i, fmax_i, res2d)
+                xj = np.linspace(fmin_j, fmax_j, res2d)
+                Xi, Xj = np.meshgrid(xi, xj)
+                X_grid = np.tile([feat_defaults.get(k, 0.0) for k in range(n_feat)],
+                                 (res2d * res2d, 1))
+                X_grid[:, i] = Xi.ravel()
+                X_grid[:, j] = Xj.ravel()
+                y_pred = predict_raw(X_grid)
+
+                for out_idx in range(n_out):
+                    Z = y_pred[:, out_idx].reshape(res2d, res2d)
+                    fig, ax = plt.subplots(figsize=(8, 6))
+                    cf = ax.contourf(Xi, Xj, Z, levels=30, cmap='viridis')
+                    plt.colorbar(cf, ax=ax, label=OUTPUT_NAMES[out_idx])
+                    ax.set_xlabel(FEATURE_NAMES[i])
+                    ax.set_ylabel(FEATURE_NAMES[j])
+                    frozen_str = ", ".join(
+                        f"{{FEATURE_NAMES[k]}}={{feat_defaults.get(k, 0.0):.3g}}"
+                        for k in range(n_feat) if k != i and k != j)
+                    title = f"{{OUTPUT_NAMES[out_idx]}} vs {{FEATURE_NAMES[i]}}, {{FEATURE_NAMES[j]}}"
+                    ax.set_title(title)
+                    if frozen_str:
+                        ax.text(0.02, 0.98, f"Frozen: {{frozen_str}}", transform=ax.transAxes,
+                                fontsize=7, verticalalignment='top',
+                                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+                    plt.tight_layout()
+                    fname = f"{{_sanitize_filename(OUTPUT_NAMES[out_idx])}}_vs_{{_sanitize_filename(FEATURE_NAMES[i])}}_and_{{_sanitize_filename(FEATURE_NAMES[j])}}.png"
+                    fig.savefig(os.path.join(out_dirs[out_idx], fname), dpi=150)
+                    plt.close(fig)
+                    plot_count += 1
+
+    print(f"Saved {{plot_count}} plots to {{plot_dir}}")
+
+
+def main():
+    print("--- MODEL INTERFACE ---")
+    print("Required Inputs (unused features omitted):")
+    for col in USED_COLS:
+        print(f" - {{col}}")
+
+    # Ask if user wants to plot
+    try:
+        do_plot = input("\\nWould you like to plot the model? [y/N]: ").strip().lower()
+        if do_plot == 'y':
+            plot_model()
+    except (KeyboardInterrupt, EOFError):
+        pass
+
+    print("\\nEnter values (Ctrl+C to exit):")
+    try:
+        while True:
+            inp = {{}}
+            for col in USED_COLS:
+                val = input(f"{{col}}: ")
+                inp[col] = val
+            result = predict(inp)
+            print(result)
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()
+'''
+    with open(filename, "w") as f:
+        f.write(script_content)
+    print(f"\nSaved to {filename}")
+
+
+
+# ==========================================
+# PART 6: MAIN LOOP — SELECTION & EVOLUTION
+# ==========================================
+
+def get_configs(df):
+    """
+    Interactively assign a role to every column in the dataframe.
+
+    Types:
+      0 = Ignore      — column is completely excluded from training.
+      1 = Numeric In  — continuous numeric feature (input).
+      2 = Categoric In— categorical/string feature; one-hot encoded automatically.
+      5 = Numeric Out — continuous regression target.
+      6 = Categoric Out — categorical classification target; one-hot encoded.
+
+    Shortcut syntax  'T*N'  applies type T to the next N consecutive columns,
+    e.g. '1*10' marks the next 10 columns as numeric inputs.
+    """
+    configs = []
+    i = 0
+    print("\n" + "=" * 65)
+    print("COLUMN CONFIGURATION")
+    print("=" * 65)
+    print("  0  Ignore         — skip this column entirely")
+    print("  1  Numeric  Input — continuous number used as a feature")
+    print("  2  Categoric Input— text/category, auto one-hot encoded as input")
+    print("  5  Numeric  Output— continuous regression target")
+    print("  6  Categoric Output—classification target (BCE loss, Accuracy metric)")
+    print()
+    print("  Shortcut: 'T*N'  applies type T to the next N columns (e.g. 1*20)")
+    print("=" * 65)
+
+    while i < len(df.columns):
+        col = df.columns[i]
+        unique_count = df[col].nunique()
+        sample_val = df[col].sample(1).values[0]
+        dtype = df[col].dtype
+        print(f"\n--> [{i+1}/{len(df.columns)}] COLUMN: {col}")
+        print(f"    Dtype: {dtype} | Unique values: {unique_count} | Sample: '{sample_val}'")
+        valid = False
+        while not valid:
+            u = input("    Set Type [0/1/2/5/6 or T*N]: ").strip()
+            if not u:
+                continue
+            try:
+                if '*' in u:
+                    t, c = map(int, u.split('*'))
+                else:
+                    t, c = int(u), 1
+                for _ in range(c):
+                    if i < len(df.columns):
+                        current_col = df.columns[i]
+                        configs.append((current_col, t))
+                        status = "OK" if t != 0 else "SKIP"
+                        print(f"    ({status}) {current_col} -> {t}")
+                        i += 1
+                valid = True
+            except Exception:
+                print("    Invalid input. Use 'Type' or 'Type*Count'.")
+    return configs
+
+
+def tournament_select(population, k=3):
+    """Simple fitness-based tournament selection."""
+    candidates = random.sample(population, min(len(population), k))
+    return min(candidates, key=lambda x: x.fitness)
+
+
+def epsilon_lexicase_selection(population, X, y_target, type_code, n_cases=20,
+                               bg_logits=None, class_idx_in_group=None, Y_group=None):
+    """
+    Down-Sampled epsilon-lexicase selection with MAD-based adaptive epsilon.
+
+    Uses the Median Absolute Deviation (MAD) of per-case errors across the
+    population to set epsilon, following Helmuth et al.'s recommendation for
+    automatic epsilon scaling.  This adapts to the population's actual error
+    distribution rather than using a fixed 5% relative threshold:
+      - Early evolution (large error spread): epsilon is large → more diversity
+      - Late evolution (tight error spread): epsilon is small → sharper selection
+
+    If DS_LEXICASE_FRAC > 0, each call randomly sub-samples that fraction of
+    the dataset (minimum 20 cases) as the case pool for this generation.
+
+    bg_logits / class_idx_in_group / Y_group are forwarded to get_case_errors
+    for joint softmax mode.
+    """
+    pool = list(population)
+
+    N = X.shape[0]
+    if DS_LEXICASE_FRAC > 0.0:
+        n_subsample = max(20, int(DS_LEXICASE_FRAC * N))
+        subsample_idx = np.random.choice(N, min(N, n_subsample), replace=False)
+    else:
+        subsample_idx = np.random.choice(N, min(N, n_cases), replace=False)
+
+    # Shuffle case order (standard lexicase randomises the case sequence)
+    case_order = subsample_idx[np.random.permutation(len(subsample_idx))]
+
+    for case_idx in case_order:
+        errors = [ind.get_case_errors(X, y_target, type_code, [case_idx],
+                                      bg_logits=bg_logits,
+                                      class_idx_in_group=class_idx_in_group,
+                                      Y_group=Y_group)[0]
+                  for ind in pool]
+        best_err = min(errors)
+        # MAD-based adaptive epsilon: median absolute deviation of errors
+        # across the population for this case.  Falls back to 5% relative
+        # if the MAD is degenerate (all individuals have the same error).
+        err_arr = np.array(errors)
+        mad = float(np.median(np.abs(err_arr - np.median(err_arr))))
+        if mad > 1e-10:
+            epsilon = best_err + mad
+        else:
+            # Degenerate: all errors are nearly identical, use small relative
+            epsilon = best_err + abs(best_err) * 0.05 + 1e-6
+        pool = [ind for ind, err in zip(pool, errors) if err <= epsilon]
+        if len(pool) == 1:
+            break
+
+    return min(pool, key=lambda x: x.complexity)
+
+
+import concurrent.futures
+
+def macro_rational_grow(cgp_eq, n_features):
+    """
+    Specifically targets division nodes to grow the denominator.
+    Turns A / B  into A / (B + C) or A / (B * C).
+    """
+    child = copy.deepcopy(cgp_eq)
+    active_divs = [i for i in child.active_nodes if i >= n_features and child.nodes[i-n_features].op == '/']
+    
+    if not active_divs:
+        return child
+        
+    target_idx = random.choice(active_divs)
+    node = child.nodes[target_idx - n_features]
+    
+    # Find a free slot
+    all_slots = range(n_features, n_features + child.max_nodes)
+    free = [s for s in all_slots if s not in child.active_nodes and s < target_idx]
+    
+    if len(free) < 2: return child
+    
+    new_const_slot = free[0]
+    new_op_slot = free[1]
+    
+    # Inject a new constant and a + or * node into the denominator path
+    child.nodes[new_const_slot - n_features] = CGPNode('const', 0, 0, random.gauss(0, 1.0))
+    child.nodes[new_op_slot - n_features] = CGPNode(random.choice(['+', '*']), node.in2, new_const_slot)
+    
+    # Rewire the division to use the new compound denominator
+    node.in2 = new_op_slot
+    child.update_active_nodes()
+    return child
+
+
+def macro_trig_identity(cgp_eq, n_features):
+    """
+    Trig-identity macro-mutation: detects and applies trigonometric rewrites,
+    AND can construct separable trig products on different features.
+
+    Patterns detected and transformed:
+      • sin(A)/cos(A) → tan(A)      (eliminates a division + cos node)
+      • sin(A)*cos(A) → sin(A)*cos(A) [annotated for ADF extraction]
+
+    New in this version:
+      • Strategy 2 (50%): Separable trig construction — independently wraps
+        two DIFFERENT features in sin/cos and multiplies them.  This is the
+        critical mutation for discovering sin(x)*cos(y) patterns that are
+        impossible to reach incrementally via point mutation.
+      • Strategy 3 (fallback): Wraps the current output in trig (original).
+    """
+    child = copy.deepcopy(cgp_eq)
+    child.update_active_nodes()
+
+    # Strategy 1: Try to find sin(A)/cos(A) → tan(A)
+    if 'tan' in CGPEquation.OPS_UNARY_SET:
+        for idx in sorted(child.active_nodes):
+            if idx < n_features:
+                continue
+            node = child.nodes[idx - n_features]
+            if node.op != '/':
+                continue
+            # Check if in1 is sin(X) and in2 is cos(X) with SAME X
+            if node.in1 >= n_features and node.in2 >= n_features:
+                n1 = child.nodes[node.in1 - n_features]
+                n2 = child.nodes[node.in2 - n_features]
+                if n1.op == 'sin' and n2.op == 'cos' and n1.in1 == n2.in1:
+                    # Replace the / node with tan(X)
+                    node.op = 'tan'
+                    node.in1 = n1.in1
+                    node.in2 = 0
+                    child.update_active_nodes()
+                    return child
+
+    # Decide between separable trig (strategy 2) vs output-wrapping (strategy 3)
+    trig_ops = [op for op in ['sin', 'cos'] if op in CGPEquation.OPS_UNARY_SET]
+    if not trig_ops:
+        trig_ops = [op for op in ['tan'] if op in CGPEquation.OPS_UNARY_SET]
+    if not trig_ops:
+        return child
+
+    # Strategy 2 (50%): Separable trig — sin(x_i) OP cos(x_j) for different features
+    if n_features >= 2 and random.random() < 0.50 and '*' in ALLOWED_OPS:
+        active = sorted(i for i in child.active_nodes if i >= n_features)
+        max_active = max(active) if active else (n_features - 1)
+        all_slots = range(n_features, n_features + child.max_nodes)
+        free_slots = [s for s in all_slots
+                      if s not in child.active_nodes and s > max_active]
+
+        # Need at least 3 free slots: trig1, trig2, combiner
+        if len(free_slots) >= 3:
+            # Pick two different features (prefer ones NOT already in active graph)
+            used_feats = _active_feature_set(child, n_features)
+            unused = [f for f in range(n_features) if f not in used_feats]
+            all_feats = list(range(n_features))
+
+            if len(unused) >= 2:
+                fi, fj = random.sample(unused, 2)
+            elif len(unused) == 1:
+                fi = unused[0]
+                fj = random.choice([f for f in all_feats if f != fi])
+            else:
+                fi, fj = random.sample(all_feats, 2)
+
+            s1, s2, s3 = free_slots[0], free_slots[1], free_slots[2]
+            trig1 = random.choice(trig_ops)
+            trig2 = random.choice(trig_ops)
+
+            # Optionally add frequency scaling if enough free slots are available
+            if len(free_slots) >= 7 and 'const' in ALLOWED_OPS and random.random() < 0.5:
+                sa, sb, sc, sd, se, sf, sg = free_slots[:7]
+                child.nodes[sa - n_features] = CGPNode('const', 0, 0,
+                                                         random.uniform(0.5, 6.28))
+                child.nodes[sb - n_features] = CGPNode('*', sa, fi)
+                child.nodes[sc - n_features] = CGPNode(trig1, sb, 0)
+                child.nodes[sd - n_features] = CGPNode('const', 0, 0,
+                                                         random.uniform(0.5, 6.28))
+                child.nodes[se - n_features] = CGPNode('*', sd, fj)
+                child.nodes[sf - n_features] = CGPNode(trig2, se, 0)
+                child.nodes[sg - n_features] = CGPNode('*', sc, sf)
+                child.out_idx = sg
+                child.update_active_nodes()
+                return child
+
+            # Simple version: trig1(x_i) * trig2(x_j)
+            child.nodes[s1 - n_features] = CGPNode(trig1, fi, 0)
+            child.nodes[s2 - n_features] = CGPNode(trig2, fj, 0)
+            child.nodes[s3 - n_features] = CGPNode('*', s1, s2)
+            child.out_idx = s3
+            child.update_active_nodes()
+            return child
+
+    # Strategy 3 (fallback): Wrap current output in trig (original behaviour)
+    active = sorted(i for i in child.active_nodes if i >= n_features)
+    if not active:
+        return child
+
+    max_active = max(active)
+    all_slots = range(n_features, n_features + child.max_nodes)
+    valid = [s for s in all_slots if s not in child.active_nodes and s > max_active]
+    if not valid:
+        return child
+
+    dst = min(valid)
+    dst_idx = dst - n_features
+
+    trig_op = random.choice(trig_ops + [op for op in ['tan'] if op in CGPEquation.OPS_UNARY_SET])
+
+    # Wrap the current output in: trig(c * output + phase)
+    const_slots = [s for s in all_slots if s not in child.active_nodes
+                   and s > max_active and s != dst]
+    if len(const_slots) >= 2 and 'const' in ALLOWED_OPS and '*' in ALLOWED_OPS:
+        cs1 = const_slots[0]
+        cs2 = const_slots[1]
+        child.nodes[cs1 - n_features] = CGPNode('const', 0, 0,
+                                                  random.uniform(0.5, 6.0))
+        child.nodes[cs2 - n_features] = CGPNode('*', cs1, child.out_idx)
+        child.nodes[dst_idx] = CGPNode(trig_op, cs2, 0)
+    else:
+        child.nodes[dst_idx] = CGPNode(trig_op, child.out_idx, 0)
+
+    child.out_idx = dst
+    child.update_active_nodes()
+    return child
+
+
+def macro_piecewise(cgp_eq, n_features, feature_names):
+    """
+    Piecewise / if-else macro-mutation: wraps the current output in a
+    conditional split, creating a piecewise expression.
+
+    Strategies (chosen randomly):
+      1. Threshold split: IF(x_i > c) THEN current_output ELSE c2
+         — Creates a region where the expression "turns off" below a threshold.
+      2. Feature gate: IF(x_i > c) THEN current_output ELSE alternative_expr
+         — Replaces the output with a different feature/const in one region.
+      3. Blend: IF(x_i > x_j) THEN current_output ELSE x_j
+         — Switches between the evolved expression and a raw feature.
+
+    Only active when IF_ELSE_ENABLED is True and if_else is in the op set.
+    """
+    if not IF_ELSE_ENABLED or 'if_else' not in CGPEquation.OPS_TERNARY_SET:
+        return copy.deepcopy(cgp_eq)
+
+    child = copy.deepcopy(cgp_eq)
+    child.update_active_nodes()
+
+    active = sorted(i for i in child.active_nodes if i >= n_features)
+    max_active = max(active) if active else (n_features - 1)
+    all_slots = range(n_features, n_features + child.max_nodes)
+    free_slots = [s for s in all_slots
+                  if s not in child.active_nodes and s > max_active]
+
+    # Need at least 3 free slots: comparison/const, condition, if_else node
+    if len(free_slots) < 3:
+        return child
+
+    comp_ops = [op for op in ['gt', 'lt'] if op in CGPEquation.OPS_BINARY_SET]
+    if not comp_ops:
+        return child
+
+    strategy = random.random()
+    cur_out = child.out_idx
+    feat_idx = random.randint(0, n_features - 1)
+
+    if strategy < 0.4 and 'const' in ALLOWED_OPS:
+        # Strategy 1: Threshold split — IF(x > c) THEN expr ELSE const
+        s1, s2, s3 = free_slots[0], free_slots[1], free_slots[2]
+        child.nodes[s1 - n_features] = CGPNode('const', 0, 0, random.gauss(0, 2.0))
+        child.nodes[s2 - n_features] = CGPNode(random.choice(comp_ops), feat_idx, s1)
+        # False branch: a learnable constant
+        if len(free_slots) >= 4:
+            s4 = free_slots[3]
+            child.nodes[s4 - n_features] = CGPNode('const', 0, 0, random.gauss(0, 1.0))
+            child.nodes[s3 - n_features] = CGPNode('if_else', s2, cur_out, 0.0, in3=s4)
+        else:
+            child.nodes[s3 - n_features] = CGPNode('if_else', s2, cur_out, 0.0, in3=s1)
+        child.out_idx = s3
+    elif strategy < 0.7 and n_features >= 2:
+        # Strategy 2: Feature gate — IF(x_i > x_j) THEN expr ELSE x_j
+        s1, s2 = free_slots[0], free_slots[1]
+        feat2 = random.choice([f for f in range(n_features) if f != feat_idx])
+        child.nodes[s1 - n_features] = CGPNode(random.choice(comp_ops), feat_idx, feat2)
+        child.nodes[s2 - n_features] = CGPNode('if_else', s1, cur_out, 0.0, in3=feat2)
+        child.out_idx = s2
+    else:
+        # Strategy 3: Region blend with constant threshold
+        if 'const' in ALLOWED_OPS and len(free_slots) >= 4:
+            s1, s2, s3, s4 = free_slots[0], free_slots[1], free_slots[2], free_slots[3]
+            child.nodes[s1 - n_features] = CGPNode('const', 0, 0, random.gauss(0, 2.0))
+            child.nodes[s2 - n_features] = CGPNode(random.choice(comp_ops), feat_idx, s1)
+            # False branch: use a different feature or feature * const
+            alt_feat = random.randint(0, n_features - 1)
+            child.nodes[s3 - n_features] = CGPNode('const', 0, 0, random.uniform(0.5, 3.0))
+            child.nodes[s4 - n_features] = CGPNode('if_else', s2, cur_out, 0.0, in3=alt_feat)
+            child.out_idx = s4
+        else:
+            return child
+
+    child.update_active_nodes()
+    return child
+
+
+def macro_nest_compound(cgp_eq, n_features, feature_names, op_affinity=None):
+    """
+    Compound nesting macro-mutation: builds a multi-node sub-expression on a
+    NEW feature and combines it with the current output.
+
+    Unlike macro_grow (which adds one node) or macro_graft (which adds a raw
+    feature), this builds a 2-4 node expression on a randomly chosen feature
+    and then merges it with the existing output via +, *, or /.
+
+    This is the key mutation for discovering compound corrections like:
+      expr + c*sin(x2)
+      expr * exp(-c*x3)
+      expr / (1 + x4²)
+
+    These require multiple coordinated nodes that point-mutation almost never
+    produces simultaneously.
+    """
+    child = copy.deepcopy(cgp_eq)
+    child.update_active_nodes()
+
+    active = sorted(i for i in child.active_nodes if i >= n_features)
+    max_active = max(active) if active else (n_features - 1)
+    all_slots = range(n_features, n_features + child.max_nodes)
+    free_slots = [s for s in all_slots
+                  if s not in child.active_nodes and s > max_active]
+
+    # Need at least 4 free slots for a meaningful compound expression
+    if len(free_slots) < 4:
+        return child
+
+    # Pick a feature — prefer unused ones
+    used_feats = _active_feature_set(child, n_features)
+    unused = [f for f in range(n_features) if f not in used_feats]
+    feat = random.choice(unused) if unused else random.randint(0, n_features - 1)
+
+    unary_ops  = [op for op in CGPEquation.OPS_UNARY  if op in ALLOWED_OPS]
+    binary_ops = [op for op in CGPEquation.OPS_BINARY if op in ALLOWED_OPS]
+    cur_out = child.out_idx
+
+    # Strategy selection based on available ops
+    strategies = []
+    # Strategy 1: unary(c * feature)  — e.g. sin(2*x), exp(-0.5*x), log(3*x)
+    if unary_ops and '*' in ALLOWED_OPS and 'const' in ALLOWED_OPS:
+        strategies.append('unary_scaled')
+    # Strategy 2: feature^c  — power-law new term
+    if 'pow' in ALLOWED_OPS and 'const' in ALLOWED_OPS:
+        strategies.append('power_term')
+    # Strategy 3: c1 * unary1(feat) + c2 * unary2(feat)  — e.g. sin+cos combo
+    if len(unary_ops) >= 2 and '*' in ALLOWED_OPS and '+' in ALLOWED_OPS and 'const' in ALLOWED_OPS and len(free_slots) >= 7:
+        strategies.append('dual_unary')
+    # Strategy 4: feature * other_active_node  — interaction term
+    if '*' in ALLOWED_OPS and active:
+        strategies.append('interaction')
+    # Strategy 5: raw unary(feature) — simplest compound
+    if unary_ops:
+        strategies.append('simple_unary')
+
+    if not strategies:
+        return child
+
+    strategy = random.choice(strategies)
+    nf = n_features  # shorthand
+
+    if strategy == 'unary_scaled':
+        s1, s2, s3, s4 = free_slots[0], free_slots[1], free_slots[2], free_slots[3]
+        c_val = random.choice([0.5, 1.0, 1.5, 2.0, 3.0, np.pi, 0.1, -1.0, -0.5])
+        child.nodes[s1 - nf] = CGPNode('const', 0, 0, c_val)
+        child.nodes[s2 - nf] = CGPNode('*', s1, feat)
+        child.nodes[s3 - nf] = CGPNode(random.choice(unary_ops), s2, 0)
+        combine_op = random.choices(['+', '*', '-'], weights=[5, 3, 2], k=1)[0]
+        if combine_op not in set(binary_ops):
+            combine_op = '+' if '+' in set(binary_ops) else binary_ops[0]
+        child.nodes[s4 - nf] = CGPNode(combine_op, cur_out, s3)
+        child.out_idx = s4
+
+    elif strategy == 'power_term':
+        s1, s2, s3, s4 = free_slots[0], free_slots[1], free_slots[2], free_slots[3]
+        exp_val = random.choice([0.5, 1.5, 2.0, 2.5, 3.0, -0.5, -1.0, -2.0])
+        child.nodes[s1 - nf] = CGPNode('const', 0, 0, exp_val)
+        child.nodes[s2 - nf] = CGPNode('pow', feat, s1)
+        child.nodes[s3 - nf] = CGPNode('const', 0, 0, random.uniform(0.1, 5.0))
+        child.nodes[s4 - nf] = CGPNode('+' if '+' in set(binary_ops) else binary_ops[0],
+                                         cur_out,
+                                         s2 if random.random() < 0.5 else s3)
+        # Actually: expr + c * feat^p
+        if '*' in set(binary_ops) and len(free_slots) >= 5:
+            s5 = free_slots[4]
+            child.nodes[s4 - nf] = CGPNode('*', s3, s2)  # c * feat^p
+            child.nodes[s5 - nf] = CGPNode('+' if '+' in set(binary_ops) else binary_ops[0],
+                                             cur_out, s4)
+            child.out_idx = s5
+        else:
+            child.out_idx = s4
+
+    elif strategy == 'dual_unary':
+        s1, s2, s3, s4, s5, s6, s7 = free_slots[:7]
+        u1, u2 = random.sample(unary_ops, 2)
+        c1 = random.uniform(0.5, 3.0)
+        c2 = random.uniform(0.5, 3.0)
+        child.nodes[s1 - nf] = CGPNode(u1, feat, 0)
+        child.nodes[s2 - nf] = CGPNode('const', 0, 0, c1)
+        child.nodes[s3 - nf] = CGPNode('*', s2, s1)          # c1 * u1(feat)
+        child.nodes[s4 - nf] = CGPNode(u2, feat, 0)
+        child.nodes[s5 - nf] = CGPNode('const', 0, 0, c2)
+        child.nodes[s6 - nf] = CGPNode('*', s5, s4)          # c2 * u2(feat)
+        combine_inner = '+' if '+' in set(binary_ops) else binary_ops[0]
+        child.nodes[s7 - nf] = CGPNode(combine_inner, cur_out, s3)
+        child.out_idx = s7
+
+    elif strategy == 'interaction':
+        s1, s2 = free_slots[0], free_slots[1]
+        # Pick a random active node to interact with
+        partner = random.choice(active)
+        child.nodes[s1 - nf] = CGPNode('*', feat, partner)
+        combine_op = '+' if '+' in set(binary_ops) else binary_ops[0]
+        child.nodes[s2 - nf] = CGPNode(combine_op, cur_out, s1)
+        child.out_idx = s2
+
+    elif strategy == 'simple_unary':
+        s1, s2 = free_slots[0], free_slots[1]
+        child.nodes[s1 - nf] = CGPNode(random.choice(unary_ops), feat, 0)
+        combine_op = random.choices(['+', '*'], weights=[3, 2], k=1)[0]
+        if combine_op not in set(binary_ops):
+            combine_op = binary_ops[0] if binary_ops else '+'
+        child.nodes[s2 - nf] = CGPNode(combine_op, cur_out, s1)
+        child.out_idx = s2
+
+    child.update_active_nodes()
+    return child
+
+
+def macro_inject_subtree(cgp_eq, n_features, feature_names):
+    """
+    Inject a coherent random sub-expression into the CGP graph as a new
+    independent branch, then wire it into the output.
+
+    Unlike point-mutation (which changes one node at a time) or macro_grow
+    (which adds one node), this builds a complete 2-4 node sub-expression
+    from scratch and adds it to the output.  The sub-expression is built
+    top-down as a tree, guaranteeing it computes something meaningful.
+
+    Templates (randomly selected):
+      1. f(x_i op x_j)   — binary combo wrapped in unary
+      2. f(x_i) op g(x_j) — product/sum of independent transforms
+      3. c * f(c2 * x_i)  — scaled transform with frequency
+      4. (x_i op c) op x_j — nested binary with constant
+
+    This mutation is the primary mechanism for discovering novel functional
+    forms that weren't covered by seeds.
+    """
+    child = copy.deepcopy(cgp_eq)
+    child.update_active_nodes()
+
+    active = sorted(i for i in child.active_nodes if i >= n_features)
+    max_active = max(active) if active else (n_features - 1)
+    all_slots = range(n_features, n_features + child.max_nodes)
+    free_slots = [s for s in all_slots
+                  if s not in child.active_nodes and s > max_active]
+
+    if len(free_slots) < 5:
+        return child
+
+    unary_ops  = [op for op in CGPEquation.OPS_UNARY  if op in ALLOWED_OPS]
+    binary_ops = [op for op in CGPEquation.OPS_BINARY if op in ALLOWED_OPS]
+
+    if not binary_ops:
+        return child
+
+    nf = n_features
+    cur_out = child.out_idx
+
+    # Pick features — prefer diverse ones
+    used_feats = _active_feature_set(child, n_features)
+    all_feats = list(range(n_features))
+    unused = [f for f in all_feats if f not in used_feats]
+
+    def _pick_feat(prefer_unused=True):
+        if prefer_unused and unused:
+            return random.choice(unused)
+        return random.choice(all_feats)
+
+    template = random.choices(
+        ['unary_binary', 'product_transforms', 'scaled_transform',
+         'nested_binary', 'triple_interaction'],
+        weights=[3, 3, 2, 2, 1 if n_features >= 3 else 0],
+        k=1)[0]
+
+    if template == 'unary_binary' and unary_ops and len(free_slots) >= 4:
+        # f(x_i op x_j) — e.g. sin(x1 * x2), exp(x1 + x2)
+        s1, s2, s3, s4 = free_slots[:4]
+        fi, fj = _pick_feat(), _pick_feat(prefer_unused=False)
+        inner_op = random.choice(binary_ops)
+        outer_op = random.choice(unary_ops)
+        child.nodes[s1 - nf] = CGPNode(inner_op, fi, fj, random.gauss(0, 1.0))
+        child.nodes[s2 - nf] = CGPNode(outer_op, s1, 0, random.gauss(0, 1.0))
+        combine = random.choices(['+', '*', '-'], weights=[4, 3, 2], k=1)[0]
+        if combine not in set(binary_ops):
+            combine = binary_ops[0]
+        child.nodes[s3 - nf] = CGPNode('const', 0, 0, random.uniform(0.1, 3.0))
+        child.nodes[s4 - nf] = CGPNode(combine, cur_out, s2)
+        child.out_idx = s4
+
+    elif template == 'product_transforms' and len(unary_ops) >= 2 and len(free_slots) >= 5:
+        # f(x_i) * g(x_j) — e.g. sin(x1) * exp(x2)
+        s1, s2, s3, s4, s5 = free_slots[:5]
+        fi, fj = _pick_feat(), _pick_feat(prefer_unused=False)
+        u1 = random.choice(unary_ops)
+        u2 = random.choice(unary_ops)
+        child.nodes[s1 - nf] = CGPNode(u1, fi, 0, random.gauss(0, 1.0))
+        child.nodes[s2 - nf] = CGPNode(u2, fj, 0, random.gauss(0, 1.0))
+        child.nodes[s3 - nf] = CGPNode('*' if '*' in set(binary_ops) else binary_ops[0],
+                                         s1, s2)
+        combine = random.choices(['+', '*'], weights=[3, 2], k=1)[0]
+        if combine not in set(binary_ops):
+            combine = binary_ops[0]
+        child.nodes[s4 - nf] = CGPNode('const', 0, 0, random.uniform(0.1, 5.0))
+        child.nodes[s5 - nf] = CGPNode(combine, cur_out, s3)
+        child.out_idx = s5
+
+    elif template == 'scaled_transform' and unary_ops and 'const' in ALLOWED_OPS and len(free_slots) >= 5:
+        # c1 * f(c2 * x_i) — e.g. 3.0 * sin(2.5 * x)
+        s1, s2, s3, s4, s5 = free_slots[:5]
+        fi = _pick_feat()
+        child.nodes[s1 - nf] = CGPNode('const', 0, 0,
+                                         random.choice([0.5, 1.0, 1.5, 2.0, 3.0,
+                                                         np.pi, 2*np.pi, 0.1]))
+        child.nodes[s2 - nf] = CGPNode('*' if '*' in set(binary_ops) else binary_ops[0],
+                                         s1, fi)
+        child.nodes[s3 - nf] = CGPNode(random.choice(unary_ops), s2, 0)
+        child.nodes[s4 - nf] = CGPNode('const', 0, 0, random.uniform(0.1, 5.0))
+        combine = '+' if '+' in set(binary_ops) else binary_ops[0]
+        child.nodes[s5 - nf] = CGPNode(combine, cur_out, s3)
+        child.out_idx = s5
+
+    elif template == 'nested_binary' and len(free_slots) >= 4:
+        # (x_i op c) op2 x_j — e.g. (x1 + 3) * x2, (x1 / 2) + x2
+        s1, s2, s3, s4 = free_slots[:4]
+        fi, fj = _pick_feat(), _pick_feat(prefer_unused=False)
+        op1 = random.choice(binary_ops)
+        op2 = random.choice(binary_ops)
+        child.nodes[s1 - nf] = CGPNode('const', 0, 0, random.gauss(0, 3.0))
+        child.nodes[s2 - nf] = CGPNode(op1, fi, s1)
+        child.nodes[s3 - nf] = CGPNode(op2, s2, fj)
+        combine = '+' if '+' in set(binary_ops) else binary_ops[0]
+        child.nodes[s4 - nf] = CGPNode(combine, cur_out, s3)
+        child.out_idx = s4
+
+    elif template == 'triple_interaction' and n_features >= 3 and len(free_slots) >= 4:
+        # x_i * x_j * x_k — three-way product
+        s1, s2, s3, s4 = free_slots[:4]
+        feats = random.sample(all_feats, min(3, n_features))
+        mul_op = '*' if '*' in set(binary_ops) else binary_ops[0]
+        child.nodes[s1 - nf] = CGPNode(mul_op, feats[0], feats[1])
+        child.nodes[s2 - nf] = CGPNode(mul_op, s1, feats[2] if len(feats) > 2 else feats[0])
+        combine = '+' if '+' in set(binary_ops) else binary_ops[0]
+        child.nodes[s3 - nf] = CGPNode('const', 0, 0, random.uniform(0.01, 5.0))
+        child.nodes[s4 - nf] = CGPNode(combine, cur_out, s2)
+        child.out_idx = s4
+
+    else:
+        # Fallback: simple feature addition
+        if len(free_slots) >= 2:
+            s1, s2 = free_slots[0], free_slots[1]
+            fi = _pick_feat()
+            child.nodes[s1 - nf] = CGPNode('const', 0, 0, random.uniform(0.1, 5.0))
+            combine = '+' if '+' in set(binary_ops) else binary_ops[0]
+            child.nodes[s2 - nf] = CGPNode(combine, cur_out, fi)
+            child.out_idx = s2
+
+    child.update_active_nodes()
+    return child
+
+
+def _create_offspring(action, parent, population, n_features, feat_names,
+                      eff_rate, sa_temp, parent_sigma, X,
+                      op_affinity=None, y_residuals=None):
+    """Shared offspring creation logic for both island evolution and AFPO.
+
+    Returns (child_tree, child_sigma) after applying the chosen reproductive
+    action to *parent*.
+
+    y_residuals : optional (N,) array — current target residuals, used by
+                  semantic crossover to guide recombination toward residual-
+                  reducing combinations.
+    """
+    child_sigma = float(np.clip(
+        parent_sigma * np.exp(random.gauss(0, SIGMA_TAU)),
+        SIGMA_MIN, SIGMA_MAX))
+
+    if action == 'crossover' and len(population) >= 2:
+        parent2    = tournament_select(population, k=3)
+        child_tree = crossover(parent.tree, parent2.tree)
+        if not _is_semantically_novel(child_tree, parent.tree, parent2.tree, X):
+            child_tree = mutate(child_tree, n_features, feat_names,
+                                mut_rate=max(2, eff_rate), temperature=sa_temp)
+        else:
+            child_tree = mutate(child_tree, n_features, feat_names,
+                                mut_rate=max(1, eff_rate // 2), temperature=sa_temp)
+        p2_sigma    = getattr(parent2, 'sigma', float(CGP_MUT_RATE))
+        child_sigma = float(np.clip(
+            (parent_sigma + p2_sigma) / 2.0 * np.exp(random.gauss(0, SIGMA_TAU * 0.5)),
+            SIGMA_MIN, SIGMA_MAX))
+    elif action == 'semantic_xover' and len(population) >= 2:
+        # Semantic-ish crossover: combine parents based on residual behavior
+        parent2 = tournament_select(population, k=3)
+        child_tree = _semantic_crossover(parent.tree, parent2.tree, X,
+                                          y_residuals)
+        # Light mutation to explore around the semantic combination
+        child_tree = mutate(child_tree, n_features, feat_names,
+                            mut_rate=max(1, eff_rate // 2), temperature=sa_temp)
+        p2_sigma = getattr(parent2, 'sigma', float(CGP_MUT_RATE))
+        child_sigma = float(np.clip(
+            (parent_sigma + p2_sigma) / 2.0 * np.exp(random.gauss(0, SIGMA_TAU * 0.5)),
+            SIGMA_MIN, SIGMA_MAX))
+    elif action == 'grow':
+        child_tree = macro_grow(parent.tree, n_features, feat_names,
+                                op_affinity=op_affinity)
+    elif action == 'prune':
+        child_tree = macro_prune(parent.tree, n_features)
+    elif action == 'graft':
+        child_tree = macro_graft_feature(parent.tree, n_features, feat_names)
+    elif action in ('optimize', 'do_nothing', 'boost'):
+        child_tree = copy.deepcopy(parent.tree)
+    elif action == 'div':
+        child_tree = macro_rational_grow(parent.tree, n_features)
+    elif action == 'trig':
+        child_tree = macro_trig_identity(parent.tree, n_features)
+    elif action == 'ablate':
+        child_tree = macro_ablate_feature(parent.tree, n_features)
+    elif action == 'piecewise':
+        child_tree = macro_piecewise(parent.tree, n_features, feat_names)
+    elif action == 'nest':
+        child_tree = macro_nest_compound(parent.tree, n_features, feat_names,
+                                          op_affinity=op_affinity)
+    elif action == 'inject':
+        child_tree = macro_inject_subtree(parent.tree, n_features, feat_names)
+    else:  # mutate
+        child_tree = mutate(parent.tree, n_features, feat_names,
+                            mut_rate=eff_rate, temperature=sa_temp,
+                            op_affinity=op_affinity)
+    return child_tree, child_sigma
+
+
+def evolve_island_chunk(args):
+    """
+    Island worker — runs on a single subprocess.
+
+    New in this version:
+      • Self-adaptive sigma  — each individual carries its own mutation
+        strength that evolves alongside the tree (Evolution Strategy style).
+      • Macro-mutations      — 5% grow, 5% prune, replacing a regular
+        mutation step; allow deliberate complexity navigation.
+      • Crossover semantic check — if the crossover child is functionally
+        identical to both parents, extra mutation is applied to push it away.
+      • Crowding-distance death — NSGA-II crowding distance on (fitness,
+        complexity) replaces the hand-tuned `age + fitness*10 + complexity`
+        formula; removes the most *redundant* individual each step.
+      • Directed extinction  — 20% of new blood comes from heavily-mutated
+        HoF elites rather than purely random individuals.
+      • PySR Simulated Annealing — worse children are accepted with
+        probability exp(-Δfitness / T) where T = SA_ALPHA × mean_loss.
+        At high T (early, poor population) the search is explorative; as
+        T → 0 (good population) it becomes purely greedy.  Prevents
+        premature convergence exactly as PySR's annealing=True does.
+      • PySR Adaptive Frequency Parsimony — over-represented complexities
+        receive a positive parsimony increment; under-represented ones receive
+        a negative increment.  This naturally maintains a spread across the
+        complexity axis without manual tuning (PySR: use_frequency=True).
+      • PySR Temperature-scaled constant perturbation — Gaussian noise for
+        constant mutations is multiplied by (SA_PERTURBATION_FACTOR × T + 1),
+        enabling broad constant exploration early and precise refinement late.
+      • Higher constant mutation ratio — constant mutations raised from 25 %
+        to 45 % of point-mutations, reflecting PySR's weightMutateConstant=10
+        philosophy: constants are cheap to tune and critical for fit quality.
+    """
+    (island_pop, X, y_target, type_code,
+     n_features, feat_names, generations,
+     island_idx, out_idx, ext_patience, current_stag,
+     adf_registry,
+     bg_logits, class_idx_in_group, Y_group,
+     target_grads) = args
+    # bg_logits / class_idx_in_group / Y_group: non-None for class groups using
+    # joint softmax CE.  bg_logits is (N, n_classes) with all sibling class logits
+    # pre-filled from the main process HoF; column class_idx_in_group is overwritten
+    # by each individual's predictions during fitness evaluation.
+
+    for d in adf_registry:
+        _register_adf_from_dict(d)
+
+    local_hof  = HallOfFame()
+    local_stag = current_stag
+
+    # ── Meta-learning rate for self-adaptive sigma ────────────────────────
+    # τ = 1 / sqrt(2·sqrt(n_active)) is the canonical ES recommendation.
+    # We use a fixed approximation tuned for typical CGP active sizes.
+    MACRO_P_GROW  = 0.07    # probability of grow macro-mutation per step (was 0.05)
+    MACRO_P_PRUNE = 0.04    # probability of prune macro-mutation per step (was 0.05)
+    MACRO_P_GRAFT = 0.06    # probability of feature-graft macro-mutation per step
+
+    # ── IMPROVEMENT: Adaptive reproductive operator tracker ────────────────
+    # Tracks which operators produce accepted children; adapts weights over time.
+    _repro_ops_base = ['mutate', 'crossover', 'semantic_xover', 'grow', 'prune', 'graft', 'optimize', 'boost', 'do_nothing', 'div', 'trig', 'ablate', 'piecewise', 'nest', 'inject']
+    _repro_weights_base = [3.5, 1.0, 0.8, 0.7, 0.5, 0.7, 1.5, 0.6, 0.3, 0.5, 0.8, 0.3, 0.6 if IF_ELSE_ENABLED else 0.0, 1.2, 1.0]
+    #                      ^^^                  ^^^       ^^^                 ^^^                                               ^^^  ^^^
+    #                  mutate↓  grow↑  graft↑  do_nothing↓                                                               nest  inject
+    # Net effect: ~25% of actions are now structural exploration (grow+graft+nest+inject+trig+div)
+    # vs ~10% before.  mutate still dominates but its internal weights are rebalanced too.
+    _mut_tracker = AdaptiveMutationTracker(_repro_ops_base, _repro_weights_base, alpha=0.07)
+
+    # ── IMPROVEMENT: Operator affinity (updated every 200 gens) ───────────
+    _op_affinity: dict = {}
+    _AFFINITY_UPDATE_FREQ = 200
+
+    # ── IMPROVEMENT: Scheduled light const-opt (every N gens, top-10%) ───
+    _LIGHT_CONST_OPT_FREQ  = 75   # run every 75 generations
+    _LIGHT_CONST_OPT_TOP_N = max(1, len(island_pop) // 10)
+
+    for gen in range(generations):
+        for ind in island_pop:
+            ind.age += 1
+
+        # ── PySR-style SA temperature with cosine annealing ─────────────────
+        # Base temperature: T_base = SA_ALPHA × mean_population_loss.
+        # Cosine schedule multiplier decays from 1.0 → 0.1 over the run,
+        # ensuring broad exploration early and precise exploitation late
+        # even when the mean loss plateaus (which would keep T_base flat).
+        valid_losses = [ind.loss for ind in island_pop
+                        if np.isfinite(ind.loss) and ind.loss < 1e9]
+        mean_loss    = float(np.mean(valid_losses)) if valid_losses else 1.0
+        gen_frac     = gen / max(1, generations - 1)
+        cosine_decay = 0.1 + 0.9 * 0.5 * (1.0 + np.cos(np.pi * gen_frac))
+        sa_temp      = SA_ALPHA * mean_loss * cosine_decay if SA_ENABLED else 0.0
+
+        # ── PySR adaptive complexity frequency parsimony ──────────────────────
+        # Penalise over-crowded complexities; reward under-represented ones.
+        freq_adj = compute_complexity_frequency_adjustment(island_pop)
+
+        # ── Adaptive stagnation multiplier ───────────────────────────────
+        # Smooth sigmoid stagnation multiplier: ramps continuously from 1× to 4×
+        # as stagnation progresses, avoiding the abrupt jumps of discrete levels.
+        stag_frac = local_stag / max(ext_patience, 1)
+        stag_mul = 1.0 + 3.0 / (1.0 + np.exp(-10.0 * (stag_frac - 0.5)))
+
+        # ── IMPROVEMENT: Periodic light constant optimisation ─────────────────
+        # Every _LIGHT_CONST_OPT_FREQ generations, run a quick L-BFGS-B polish
+        # on the top-10% of the population (by loss).  This is much cheaper than
+        # the full HoF deep-opt (every 1000 gens) but far more frequent, keeping
+        # constants near their optimum throughout evolution rather than only at
+        # the end.  Disabled during early generations to avoid prematurely
+        # locking in poor structural choices before the population matures.
+        if gen > 0 and gen % _LIGHT_CONST_OPT_FREQ == 0:
+            top_inds = sorted(island_pop, key=lambda x: x.loss)[:_LIGHT_CONST_OPT_TOP_N]
+            for _ind in top_inds:
+                if get_constants_shared(_ind.tree):   # has at least one const node
+                    _old_loss = _ind.loss
+                    _ind.optimize_constants(
+                        X, y_target, type_code,
+                        max_rows=min(300, X.shape[0]),
+                        n_restarts=1, max_iter=20,
+                        bg_logits=bg_logits,
+                        class_idx_in_group=class_idx_in_group,
+                        Y_group=Y_group,
+                        target_grads=target_grads)
+                    # If const-opt improved the individual, clear its cache entry
+                    # (the tree's constants changed, so the cached result is stale).
+                    if _ind.loss < _old_loss - 1e-8:
+                        _FITNESS_CACHE.put(_ind.tree, y_target, {
+                            'loss':       _ind.loss,
+                            'r2':         _ind.r2,
+                            'accuracy':   _ind.accuracy,
+                            'modularity': _ind.modularity,
+                            'complexity': _ind.complexity,
+                            'affine_a':   _ind.affine_a,
+                            'affine_b':   _ind.affine_b,
+                        })
+
+        # ── IMPROVEMENT: Periodic intra-individual boosting ──────────────────
+        # Every 150 gens, try boosting the top-3 individuals' residuals.
+        # This is the core "gradient boosting within each equation" mechanism.
+        _BOOST_FREQ = 150
+        if (gen > 0 and gen % _BOOST_FREQ == 0
+                and type_code != 6 and bg_logits is None):
+            top_boost = sorted(island_pop, key=lambda x: x.loss)[:3]
+            for _ind in top_boost:
+                if _ind.affine_fitted and len(getattr(_ind, 'boost_stages', [])) < getattr(_ind, 'boost_max_stages', 3):
+                    _old_loss = _ind.loss
+                    _ind.boost_on_residuals(X, y_target, type_code,
+                                            n_features, feat_names,
+                                            max_boost_gens=30, boost_lr=0.3)
+                    if len(_ind.boost_stages) > 0 and _ind.boost_stages != getattr(_ind, '_prev_boost_stages', None):
+                        # Re-evaluate with the new boost correction
+                        _ind.calculate_fitness(X, y_target, type_code,
+                                               update_affine=False,
+                                               target_grads=target_grads)
+                        if _ind.loss < _old_loss - 1e-8:
+                            local_hof.update(_ind)
+
+        # ── IMPROVEMENT: Periodic operator affinity update ────────────────────
+        if gen % _AFFINITY_UPDATE_FREQ == 0 and local_hof.best_by_complexity:
+            _op_affinity = compute_hof_operator_affinity([local_hof])
+
+        # 1. Parent selection
+        parent = epsilon_lexicase_selection(island_pop, X, y_target, type_code,
+                                            bg_logits=bg_logits,
+                                            class_idx_in_group=class_idx_in_group,
+                                            Y_group=Y_group)
+
+        parent_sigma = getattr(parent, 'sigma', float(CGP_MUT_RATE))
+        child_sigma  = float(np.clip(
+            parent_sigma * np.exp(random.gauss(0, SIGMA_TAU)),
+            SIGMA_MIN, SIGMA_MAX))
+        eff_rate = max(1, round(np.random.poisson(max(0.1, child_sigma * stag_mul))))
+
+        # ------------------------------------------------------------------ #
+        # 2. PySR-Style Top-Level Operator Action Selection (adaptive weights)
+        #    with stagnation-aware structural exploration boost
+        # ------------------------------------------------------------------ #
+        repro_ops = _repro_ops_base
+        repro_weights = list(_mut_tracker.get_weights())
+
+        # Stagnation boost: when stuck, shift weight toward structural mutations
+        # (nest, inject, grow, graft, trig, div) at the expense of mutate/optimize.
+        # This prevents the search from endlessly polishing constants when it
+        # needs a structural breakthrough.
+        if stag_frac > 0.3:
+            structural_boost = 1.0 + 2.0 * min(1.0, (stag_frac - 0.3) / 0.5)
+            _structural_ops = {'grow', 'graft', 'nest', 'inject', 'trig', 'div', 'crossover', 'semantic_xover'}
+            _exploitation_ops = {'mutate', 'optimize', 'do_nothing'}
+            for k, op_name in enumerate(repro_ops):
+                if op_name in _structural_ops:
+                    repro_weights[k] *= structural_boost
+                elif op_name in _exploitation_ops:
+                    repro_weights[k] *= max(0.3, 1.0 / structural_boost)
+
+        action = random.choices(repro_ops, weights=repro_weights, k=1)[0]
+
+        child_tree, child_sigma = _create_offspring(
+            action, parent, island_pop, n_features, feat_names,
+            eff_rate, sa_temp, parent_sigma, X,
+            op_affinity=_op_affinity if _op_affinity else None,
+            y_residuals=y_target)
+
+        child       = Individual(child_tree)
+        child.sigma = child_sigma
+        child.age   = int(parent.age * 0.5)
+        # Inherit boost stages from parent if action preserves structure
+        if action in ('optimize', 'boost', 'do_nothing') and hasattr(parent, 'boost_stages'):
+            child.boost_stages = copy.deepcopy(parent.boost_stages)
+
+        # ------------------------------------------------------------------ #
+        # 3. Fitness Calculation & Fast Optimization Action
+        # ------------------------------------------------------------------ #
+        child_freq_adj = freq_adj.get(int(round(child.tree.get_complexity())), 0.0)
+
+        if action == 'optimize':
+            # PySR runs a fast optimization cycle here: no DE, just a quick
+            # 15-iteration L-BFGS-B nudge into the local gradient basin.
+            child.optimize_constants(X, y_target, type_code,
+                                     max_rows=None, n_restarts=1, max_iter=15,
+                                     bg_logits=bg_logits,
+                                     class_idx_in_group=class_idx_in_group,
+                                     Y_group=Y_group,
+                                     freq_parsimony_adj=child_freq_adj,
+                                     target_grads=target_grads)
+        elif action == 'boost':
+            # Intra-individual gradient boosting: evolve a correction on residuals
+            child.calculate_fitness(X, y_target, type_code,
+                                    bg_logits=bg_logits,
+                                    class_idx_in_group=class_idx_in_group,
+                                    Y_group=Y_group,
+                                    freq_parsimony_adj=child_freq_adj,
+                                    target_grads=target_grads)
+            if type_code != 6 and bg_logits is None:
+                child.boost_on_residuals(X, y_target, type_code,
+                                         n_features, feat_names)
+                # Re-evaluate with boost correction applied
+                child.calculate_fitness(X, y_target, type_code,
+                                        freq_parsimony_adj=child_freq_adj,
+                                        update_affine=False,
+                                        target_grads=target_grads)
+        else:
+            child.calculate_fitness(X, y_target, type_code,
+                                    bg_logits=bg_logits,
+                                    class_idx_in_group=class_idx_in_group,
+                                    Y_group=Y_group,
+                                    freq_parsimony_adj=child_freq_adj,
+                                    target_grads=target_grads)
+
+        # 5. Death tournament — crowding-distance selection with semantic probe
+        # (Behaviorally unique individuals get crowding-distance bonus protection)
+        death_sample = random.sample(island_pop,
+                                     min(len(island_pop), TOURNAMENT_SIZE * 2))
+        # Build a tiny probe set (8 random rows) for semantic uniqueness check
+        _probe_idx = np.random.choice(X.shape[0], min(8, X.shape[0]), replace=False)
+        _X_probe   = X[_probe_idx]
+        victim = _crowding_death_select(death_sample, X_probe=_X_probe)
+
+        # ── PySR Simulated Annealing acceptance ──────────────────────────
+        # Accept child even if it is worse than the victim with probability
+        # exp(-Δfitness / T), where T = SA_ALPHA × mean_loss.
+        # This prevents premature convergence by allowing occasional uphill
+        # moves, exactly as PySR's annealing=True does.
+        delta_fit = child.fitness - victim.fitness
+        if delta_fit < 0:
+            # Child is strictly better — always accept
+            island_pop.remove(victim)
+            island_pop.append(child)
+            _mut_tracker.record(action, success=True)
+        elif SA_ENABLED and sa_temp > 1e-10:
+            import math as _math
+            if random.random() < _math.exp(-delta_fit / sa_temp):
+                island_pop.remove(victim)
+                island_pop.append(child)
+                _mut_tracker.record(action, success=True)
+            else:
+                _mut_tracker.record(action, success=False)
+            # else: child rejected, victim stays (population unchanged)
+        else:
+            # SA disabled or temperature is negligible — strict greedy acceptance
+            if delta_fit <= 0:
+                island_pop.remove(victim)
+                island_pop.append(child)
+                _mut_tracker.record(action, success=True)
+            else:
+                _mut_tracker.record(action, success=False)
+
+        # 6. HoF update & stagnation tracking
+        child_freq_adj = freq_adj.get(int(round(child.complexity)), 0.0)
+        child.calculate_fitness(X, y_target, type_code,
+                                bg_logits=bg_logits,
+                                class_idx_in_group=class_idx_in_group,
+                                Y_group=Y_group,
+                                freq_parsimony_adj=child_freq_adj,
+                                update_affine=False,
+                                target_grads=target_grads)
+        if local_hof.update(child):
+            local_stag = 0
+        else:
+            local_stag += 1
+
+        # 7. Extinction — directed restart with HoF elites
+        if local_stag > ext_patience:
+            island_pop.sort(key=lambda x: x.fitness)
+            keep_n    = max(1, int(len(island_pop) * 0.10))
+            survivors = island_pop[:keep_n]
+            new_blood = list(generate_seeds_v5(n_features, feat_names))
+
+            # Clear fitness cache on extinction: post-extinction diversity means
+            # most cache entries will be stale misses anyway.
+            _FITNESS_CACHE.clear()
+
+            # ── Residual-aware seed injection ──────────────────────────────
+            # Generate seeds that specifically target the HoF best's error
+            # patterns — breaks the "seed basin trap" where the population
+            # converges to seed templates and can't discover correction terms.
+            hof_best  = local_hof.get_best_overall()
+            if hof_best is not None:
+                try:
+                    res_seeds = generate_residual_aware_seeds(
+                        n_features, feat_names, X, y_target, hof_best,
+                        max_seeds=max(5, int(len(island_pop) * 0.15)))
+                    new_blood.extend(res_seeds)
+                except Exception:
+                    pass
+
+                n_directed = max(3, int(len(island_pop) * 0.20))
+                for k in range(n_directed):
+                    # Cycle through light / medium / heavy perturbation
+                    rate = [max(1, CGP_MUT_RATE),
+                            max(2, CGP_MUT_RATE * 2),
+                            max(3, CGP_MUT_RATE * 4)][k % 3]
+                    tree = mutate(hof_best.tree, n_features, feat_names,
+                                  mut_rate=int(rate))
+                    ni   = Individual(tree)
+                    ni.sigma = float(np.clip(
+                        hof_best.sigma * random.uniform(0.5, 2.0),
+                        SIGMA_MIN, SIGMA_MAX))
+                    new_blood.append(ni)
+
+                # Feature-graft variants of the HoF best — add unused features
+                # to the champion expression so extinction explores multi-variable
+                # territory immediately rather than waiting for random mutations.
+                n_grafts = max(2, int(len(island_pop) * 0.10))
+                for _ in range(n_grafts):
+                    tree = macro_graft_feature(hof_best.tree, n_features, feat_names)
+                    # One extra point-mutation so grafted variants are diverse
+                    tree = mutate(tree, n_features, feat_names,
+                                  mut_rate=max(1, CGP_MUT_RATE))
+                    ni   = Individual(tree)
+                    ni.sigma = float(np.clip(
+                        hof_best.sigma * random.uniform(0.8, 1.5),
+                        SIGMA_MIN, SIGMA_MAX))
+                    new_blood.append(ni)
+
+                # ── Elite crossover: combine structural motifs from different
+                # HoF complexity levels.  This lets extinction inject individuals
+                # that inherit useful sub-expressions from both simple and complex
+                # models, bridging the gap between them on the Pareto frontier.
+                hof_inds = list(local_hof.best_by_complexity.values())
+                if len(hof_inds) >= 2:
+                    n_elite_xover = max(2, int(len(island_pop) * 0.08))
+                    for _ in range(n_elite_xover):
+                        p1, p2 = random.sample(hof_inds, 2)
+                        child_tree = crossover(p1.tree, p2.tree)
+                        child_tree = mutate(child_tree, n_features, feat_names,
+                                            mut_rate=max(1, CGP_MUT_RATE))
+                        ni = Individual(child_tree)
+                        ni.sigma = float(np.clip(
+                            (p1.sigma + p2.sigma) / 2.0 * random.uniform(0.7, 1.5),
+                            SIGMA_MIN, SIGMA_MAX))
+                        new_blood.append(ni)
+
+            while len(survivors) + len(new_blood) < len(island_pop):
+                new_blood.append(Individual(
+                    random_cgp(n_features, CGP_NODES, feat_names)))
+            for ind in new_blood:
+                ind.calculate_fitness(X, y_target, type_code,
+                                      bg_logits=bg_logits,
+                                      class_idx_in_group=class_idx_in_group,
+                                      Y_group=Y_group,
+                                      target_grads=target_grads)
+            island_pop = survivors + new_blood
+            local_stag = 0
+
+    return island_pop, local_hof, local_stag, island_idx, out_idx
+
+
+# ==========================================
+# AGE-FITNESS PARETO OPTIMISATION (AFPO)
+# ==========================================
+
+def _pareto_dominates(a, b):
+    """
+    Return True if individual `a` Pareto-dominates `b` on
+    (age, fitness) — both minimised.
+    """
+    return (a.age <= b.age and a.fitness <= b.fitness and
+            (a.age < b.age or a.fitness < b.fitness))
+
+
+def _pareto_dominates_3obj(a, b):
+    """
+    Return True if individual `a` Pareto-dominates `b` on
+    (age, fitness, complexity) — all three minimised.
+
+    The extra complexity axis preserves structurally diverse solutions that
+    would otherwise be trimmed by 2-objective AFPO: a young, mediocre-loss
+    but very compact expression now survives alongside a same-age, lower-loss
+    but bloated one.  This naturally maintains the Pareto frontier across
+    interpretability (complexity) as well as performance.
+    """
+    return (a.age <= b.age and a.fitness <= b.fitness
+            and a.complexity <= b.complexity
+            and (a.age < b.age or a.fitness < b.fitness
+                 or a.complexity < b.complexity))
+
+
+def _trim_to_pareto_front_3obj(population, target_size):
+    """
+    Remove Pareto-dominated individuals using 3-objective dominance
+    (age, fitness, complexity).  If the front is still too large, remove
+    the individuals with the worst crowding distance (NSGA-II style)
+    over the same three axes.
+
+    The champion (lowest loss) is always protected.
+    """
+    if not population:
+        return population
+
+    champion = min(population, key=lambda x: x.loss)
+
+    # Remove 3-obj dominated individuals
+    survivors = []
+    for i, ind in enumerate(population):
+        if ind is champion:
+            survivors.append(ind)
+            continue
+        dominated = any(_pareto_dominates_3obj(other, ind)
+                        for j, other in enumerate(population) if j != i)
+        if not dominated:
+            survivors.append(ind)
+
+    # Crowding-distance trim if still too large
+    if len(survivors) > target_size:
+        # Compute crowding distance on (age, fitness, complexity)
+        cd = np.zeros(len(survivors))
+        for dim_fn in [lambda x: x.age, lambda x: x.fitness, lambda x: x.complexity]:
+            vals = np.array([dim_fn(ind) for ind in survivors], dtype=np.float64)
+            order = np.argsort(vals)
+            cd[order[0]]  = float('inf')
+            cd[order[-1]] = float('inf')
+            span = vals[order[-1]] - vals[order[0]] + 1e-30
+            for k in range(1, len(order) - 1):
+                cd[order[k]] += (vals[order[k+1]] - vals[order[k-1]]) / span
+
+        # Sort by crowding distance descending, keep top target_size
+        ranked = sorted(range(len(survivors)), key=lambda i: cd[i], reverse=True)
+        keep_indices = set(ranked[:target_size])
+        # Ensure champion is always kept
+        champ_idx = next(i for i, ind in enumerate(survivors) if ind is champion)
+        keep_indices.add(champ_idx)
+        survivors = [survivors[i] for i in sorted(keep_indices)][:target_size]
+
+    return survivors
+
+
+def _select_diverse_migrants(population, n_migrants=3, X_probe=None):
+    """
+    Select a diverse set of migrants from a population for inter-island
+    migration.  Instead of always sending the single best, selects:
+      1. The best-loss individual (exploitation)
+      2. The lowest-complexity viable individual (parsimony explorer)
+      3. A phenotypically unique individual (novelty — most different
+         prediction pattern on a probe set from the best)
+
+    Falls back to best-only when the population is too small.
+    Returns a list of Individuals (deep copies with age reset to 0).
+    """
+    if not population or n_migrants < 1:
+        return []
+
+    migrants = []
+
+    # 1. Best loss (exploitation migrant)
+    best = min(population, key=lambda x: x.loss)
+    migrants.append(best)
+
+    if n_migrants >= 2 and len(population) >= 3:
+        # 2. Lowest complexity among the top 50% by loss
+        sorted_by_loss = sorted(population, key=lambda x: x.loss)
+        top_half = sorted_by_loss[:max(2, len(sorted_by_loss) // 2)]
+        simplest = min(top_half, key=lambda x: x.complexity)
+        if simplest is not best:
+            migrants.append(simplest)
+        else:
+            # Fall back to 2nd-best loss
+            if len(sorted_by_loss) >= 2:
+                migrants.append(sorted_by_loss[1])
+
+    if n_migrants >= 3 and len(population) >= 4 and X_probe is not None:
+        # 3. Most phenotypically unique (max distance from best's predictions)
+        try:
+            best_preds = np.nan_to_num(best.tree.evaluate(X_probe),
+                                        nan=0.0, posinf=0.0, neginf=0.0)
+            max_dist, novel_ind = -1.0, None
+            already_selected = set(id(m) for m in migrants)
+            for ind in population:
+                if id(ind) in already_selected:
+                    continue
+                try:
+                    ind_preds = np.nan_to_num(ind.tree.evaluate(X_probe),
+                                              nan=0.0, posinf=0.0, neginf=0.0)
+                    dist = float(np.mean((ind_preds - best_preds) ** 2))
+                    if dist > max_dist and ind.loss < 1e9:
+                        max_dist = dist
+                        novel_ind = ind
+                except Exception:
+                    pass
+            if novel_ind is not None:
+                migrants.append(novel_ind)
+        except Exception:
+            pass
+
+    # Deep copy with age reset
+    result = []
+    for m in migrants[:n_migrants]:
+        mc = copy.deepcopy(m)
+        mc.age = 0
+        result.append(mc)
+    return result
+
+
+def _compute_island_diversity(population, X_probe):
+    """
+    Compute a diversity score for an island's population using the mean
+    pairwise prediction distance on a small probe set.
+
+    Returns a float in [0, ∞) — 0 means total semantic collapse,
+    higher values indicate more diversity.
+    """
+    if not population or X_probe is None or len(population) < 3:
+        return 0.0
+    try:
+        # Sample up to 15 individuals to keep computation fast
+        sample = random.sample(population, min(15, len(population)))
+        preds = []
+        for ind in sample:
+            try:
+                p = np.nan_to_num(ind.tree.evaluate(X_probe),
+                                  nan=0.0, posinf=0.0, neginf=0.0)
+                preds.append(p)
+            except Exception:
+                pass
+        if len(preds) < 2:
+            return 0.0
+        preds = np.array(preds)
+        # Mean pairwise L2 distance
+        dists = []
+        for i in range(len(preds)):
+            for j in range(i + 1, len(preds)):
+                dists.append(float(np.mean((preds[i] - preds[j]) ** 2)))
+        return float(np.mean(dists)) if dists else 0.0
+    except Exception:
+        return 0.0
+
+
+def _trim_to_pareto_front(population, target_size):
+    """
+    Remove Pareto-dominated individuals.  If the Pareto front is still larger
+    than `target_size`, remove the individuals with the worst fitness until the
+    population fits.
+
+    The all-time best individual (lowest loss) is always protected regardless
+    of age.  Without this, AFPO's age accumulation will eventually Pareto-
+    dominate even the champion once any age=0 child has slightly better
+    fitness, causing the best-ever solution to be silently evicted.
+    """
+    if not population:
+        return population
+
+    # Identify the champion — must survive regardless of age
+    champion = min(population, key=lambda x: x.loss)
+
+    # Remove dominated individuals (champion excluded from domination check)
+    survivors = []
+    for i, ind in enumerate(population):
+        if ind is champion:
+            survivors.append(ind)
+            continue
+        dominated = any(_pareto_dominates(other, ind)
+                        for j, other in enumerate(population) if j != i)
+        if not dominated:
+            survivors.append(ind)
+
+    # If Pareto front still too large, trim by worst fitness (never the champion)
+    if len(survivors) > target_size:
+        survivors.sort(key=lambda x: x.fitness)
+        # Ensure champion is not trimmed
+        if champion not in survivors[:target_size]:
+            survivors = survivors[:target_size - 1] + [champion]
+        else:
+            survivors = survivors[:target_size]
+
+    return survivors
+
+
+def evolve_afpo(population, X, y_target, type_code,
+                n_features, feat_names, target_size,
+                n_generations, hof, stag_counter, ext_patience,
+                bg_logits=None, class_idx_in_group=None, Y_group=None,
+                target_grads=None):
+    """
+    Age-Fitness Pareto Optimisation (AFPO) — single-process evolution loop.
+
+    Inherits all improvements from evolve_island_chunk:
+      self-adaptive sigma, macro-mutations, active-biased crossover,
+      semantic novelty check, crowding-distance death, directed extinction.
+
+    Additional AFPO-specific behaviour:
+      • Every child starts at age 0 (the AFPO invariant).
+      • Population is Pareto-trimmed on (age, fitness) after each birth.
+
+    bg_logits / class_idx_in_group / Y_group: forwarded to all fitness calls
+    for joint softmax CE when this output belongs to a multi-class group.
+    """
+    MACRO_P_GROW  = 0.07    # was 0.05
+    MACRO_P_PRUNE = 0.04    # was 0.05
+    MACRO_P_GRAFT = 0.06    # feature-graft macro-mutation
+
+    # ── Adaptive reproductive operator tracker (same as island model) ─────
+    _repro_ops_base = ['mutate', 'crossover', 'semantic_xover', 'grow', 'prune', 'graft',
+                       'optimize', 'boost', 'do_nothing', 'div', 'trig', 'ablate', 'piecewise', 'nest', 'inject']
+    _repro_weights_base = [3.5, 1.0, 0.8, 0.7, 0.5, 0.7, 1.5, 0.6, 0.3, 0.5, 0.8, 0.3, 0.6 if IF_ELSE_ENABLED else 0.0, 1.2, 1.0]
+    _mut_tracker = AdaptiveMutationTracker(_repro_ops_base, _repro_weights_base, alpha=0.07)
+
+    local_stag = stag_counter
+    # Track the best individual seen inside this chunk for champion protection
+    _chunk_champion = min(population, key=lambda x: x.loss) if population else None
+
+    for gen in range(n_generations):
+        for ind in population:
+            ind.age += 1
+
+        # ── Mid-chunk champion re-injection ──────────────────────────────────
+        # The Pareto trim now protects the current champion, but if a better
+        # child dethrones it mid-chunk the old champion may age out before the
+        # new one is established.  Every 10 gens, refresh the champion pointer
+        # and ensure it's alive at age=0 if it's been evicted.
+        if gen % 10 == 0:
+            current_best = min(population, key=lambda x: x.loss)
+            if _chunk_champion is None or current_best.loss < _chunk_champion.loss:
+                _chunk_champion = current_best
+            # If the all-time chunk champion is no longer in the population,
+            # re-inject it (the trim may have removed it in a crowded step).
+            if _chunk_champion not in population:
+                worst = max(population, key=lambda x: x.fitness)
+                population.remove(worst)
+                rescued = copy.deepcopy(_chunk_champion)
+                rescued.age = 0
+                population.append(rescued)
+
+        # ── PySR-style SA temperature ─────────────────────────────────────────
+        valid_losses = [ind.loss for ind in population
+                        if np.isfinite(ind.loss) and ind.loss < 1e9]
+        mean_loss    = float(np.mean(valid_losses)) if valid_losses else 1.0
+        sa_temp      = SA_ALPHA * mean_loss if SA_ENABLED else 0.0
+
+        # ── PySR adaptive complexity frequency parsimony ──────────────────────
+        freq_adj = compute_complexity_frequency_adjustment(population)
+
+        # Smooth sigmoid stagnation multiplier: ramps continuously from 1× to 4×
+        # as stagnation progresses, avoiding the abrupt jumps of discrete levels.
+        stag_frac = local_stag / max(ext_patience, 1)
+        stag_mul = 1.0 + 3.0 / (1.0 + np.exp(-10.0 * (stag_frac - 0.5)))
+
+        parent       = epsilon_lexicase_selection(population, X, y_target, type_code,
+                                                  bg_logits=bg_logits,
+                                                  class_idx_in_group=class_idx_in_group,
+                                                  Y_group=Y_group)
+        parent_sigma = getattr(parent, 'sigma', float(CGP_MUT_RATE))
+        child_sigma  = float(np.clip(
+            parent_sigma * np.exp(random.gauss(0, SIGMA_TAU)),
+            SIGMA_MIN, SIGMA_MAX))
+        eff_rate = max(1, round(np.random.poisson(max(0.1, child_sigma * stag_mul))))
+
+        # ------------------------------------------------------------------ #
+        # PySR-Style Top-Level Operator Action Selection (adaptive weights)
+        #   with stagnation-aware structural exploration boost
+        # ------------------------------------------------------------------ #
+        repro_weights = list(_mut_tracker.get_weights())
+        if stag_frac > 0.3:
+            structural_boost = 1.0 + 2.0 * min(1.0, (stag_frac - 0.3) / 0.5)
+            _structural_ops = {'grow', 'graft', 'nest', 'inject', 'trig', 'div', 'crossover', 'semantic_xover'}
+            _exploitation_ops = {'mutate', 'optimize', 'do_nothing'}
+            for k, op_name in enumerate(_repro_ops_base):
+                if op_name in _structural_ops:
+                    repro_weights[k] *= structural_boost
+                elif op_name in _exploitation_ops:
+                    repro_weights[k] *= max(0.3, 1.0 / structural_boost)
+        action = random.choices(_repro_ops_base, weights=repro_weights, k=1)[0]
+
+        child_tree, child_sigma = _create_offspring(
+            action, parent, population, n_features, feat_names,
+            eff_rate, sa_temp, parent_sigma, X,
+            y_residuals=y_target)
+
+        child       = Individual(child_tree)
+        child.sigma = child_sigma
+        child.age   = 0    # AFPO invariant
+        # Inherit boost stages from parent if action preserves structure
+        if action in ('optimize', 'boost', 'do_nothing') and hasattr(parent, 'boost_stages'):
+            child.boost_stages = copy.deepcopy(parent.boost_stages)
+
+        # ------------------------------------------------------------------ #
+        # Fitness Calculation & Fast Optimization Action
+        # ------------------------------------------------------------------ #
+        child_freq_adj = freq_adj.get(int(round(child.tree.get_complexity())), 0.0)
+
+        if action == 'optimize':
+            child.optimize_constants(X, y_target, type_code,
+                                     max_rows=None, n_restarts=1, max_iter=15,
+                                     bg_logits=bg_logits,
+                                     class_idx_in_group=class_idx_in_group,
+                                     Y_group=Y_group,
+                                     freq_parsimony_adj=child_freq_adj,
+                                     target_grads=target_grads)
+        elif action == 'boost':
+            # Intra-individual gradient boosting: evolve a correction on residuals
+            child.calculate_fitness(X, y_target, type_code,
+                                    bg_logits=bg_logits,
+                                    class_idx_in_group=class_idx_in_group,
+                                    Y_group=Y_group,
+                                    freq_parsimony_adj=child_freq_adj,
+                                    target_grads=target_grads)
+            if type_code != 6 and bg_logits is None:
+                child.boost_on_residuals(X, y_target, type_code,
+                                         n_features, feat_names)
+                # Re-evaluate with boost correction applied
+                child.calculate_fitness(X, y_target, type_code,
+                                        freq_parsimony_adj=child_freq_adj,
+                                        update_affine=False,
+                                        target_grads=target_grads)
+        else:
+            child.calculate_fitness(X, y_target, type_code,
+                                    bg_logits=bg_logits,
+                                    class_idx_in_group=class_idx_in_group,
+                                    Y_group=Y_group,
+                                    freq_parsimony_adj=child_freq_adj,
+                                    target_grads=target_grads)
+
+        population.append(child)
+        population = _trim_to_pareto_front_3obj(population, target_size)
+        # Track whether the child survived the Pareto trim
+        _mut_tracker.record(action, success=(child in population))
+
+        # ── Complexity budget cap ─────────────────────────────────────────────
+        # Prevent unbounded memory growth: if total active-node count across
+        # the population exceeds ~200× the max single-individual budget, cull
+        # the most complex individuals until we're back under budget.
+        # This fires rarely under normal conditions but acts as a hard ceiling
+        # that prevents OOM kills during long runs.
+        _COMPLEXITY_BUDGET = target_size * MAX_COMPLEXITY * 0.5
+        total_complexity = sum(ind.complexity for ind in population)
+        if total_complexity > _COMPLEXITY_BUDGET:
+            population.sort(key=lambda x: x.complexity, reverse=True)
+            while (len(population) > max(2, target_size // 2)
+                   and sum(ind.complexity for ind in population) > _COMPLEXITY_BUDGET):
+                population.pop(0)  # remove most complex
+
+        # HoF update uses .loss (not .fitness), so no need to re-evaluate
+        # with freq_parsimony_adj — the loss is already correct from above.
+        if hof.update(child):
+            local_stag = 0
+        else:
+            local_stag += 1
+
+        # Directed extinction
+        if local_stag > ext_patience:
+            population.sort(key=lambda x: x.fitness)
+            keep_n    = max(1, int(target_size * 0.10))
+            survivors = population[:keep_n]
+            new_blood = list(generate_seeds_v5(n_features, feat_names))
+
+            # ── Semantic diversity check ──────────────────────────────────────
+            # If the population has collapsed semantically (all individuals
+            # predict very similar values), injecting more mutants of the HoF
+            # best only creates more of the same.  Detect collapse by measuring
+            # the mean pairwise Pearson correlation of predictions on a probe
+            # set; if it exceeds the threshold, skip the HoF injection and
+            # rely on the fresh seeds (which include power-law forms, etc.)
+            # to escape the basin.
+            _SEMANTIC_COLLAPSE_THRESH = 0.92
+            _semantic_collapsed = False
+            if X.shape[0] >= 8:
+                try:
+                    probe_idx = np.random.choice(X.shape[0],
+                                                 min(32, X.shape[0]), replace=False)
+                    pred_matrix = np.array([
+                        np.nan_to_num(ind.tree.evaluate(X[probe_idx]),
+                                      nan=0.0, posinf=0.0, neginf=0.0)
+                        for ind in survivors + new_blood[:5]
+                        if ind.tree is not None
+                    ])
+                    if len(pred_matrix) >= 2:
+                        # Normalise each row so correlation = dot product
+                        norms = np.std(pred_matrix, axis=1, keepdims=True) + 1e-8
+                        normed = (pred_matrix - pred_matrix.mean(axis=1, keepdims=True)) / norms
+                        corr_matrix = normed @ normed.T / pred_matrix.shape[1]
+                        # Mean off-diagonal correlation
+                        n_p = len(corr_matrix)
+                        off_diag = (corr_matrix.sum() - np.trace(corr_matrix)) / max(1, n_p * (n_p - 1))
+                        _semantic_collapsed = float(off_diag) > _SEMANTIC_COLLAPSE_THRESH
+                except Exception:
+                    pass
+
+            hof_best = hof.get_best_overall()
+            if hof_best is not None and not _semantic_collapsed:
+                # ── Residual-aware seed injection ──────────────────────────
+                # Generate seeds targeting the HoF best's error patterns
+                try:
+                    res_seeds = generate_residual_aware_seeds(
+                        n_features, feat_names, X, y_target, hof_best,
+                        max_seeds=max(5, int(target_size * 0.15)))
+                    for rs in res_seeds:
+                        rs.age = 0
+                    new_blood.extend(res_seeds)
+                except Exception:
+                    pass
+
+                # Normal case: inject diversity cloud around the best solution
+                n_directed = max(3, int(target_size * 0.20))
+                for k in range(n_directed):
+                    rate = [max(1, CGP_MUT_RATE),
+                            max(2, CGP_MUT_RATE * 2),
+                            max(3, CGP_MUT_RATE * 4)][k % 3]
+                    tree = mutate(hof_best.tree, n_features, feat_names,
+                                  mut_rate=int(rate))
+                    ni       = Individual(tree)
+                    ni.age   = 0
+                    ni.sigma = float(np.clip(
+                        hof_best.sigma * random.uniform(0.5, 2.0),
+                        SIGMA_MIN, SIGMA_MAX))
+                    new_blood.append(ni)
+
+                # Feature-graft variants: wire unused features into the champion
+                n_grafts = max(2, int(target_size * 0.10))
+                for _ in range(n_grafts):
+                    tree = macro_graft_feature(hof_best.tree, n_features, feat_names)
+                    tree = mutate(tree, n_features, feat_names,
+                                  mut_rate=max(1, CGP_MUT_RATE))
+                    ni       = Individual(tree)
+                    ni.age   = 0
+                    ni.sigma = float(np.clip(
+                        hof_best.sigma * random.uniform(0.8, 1.5),
+                        SIGMA_MIN, SIGMA_MAX))
+                    new_blood.append(ni)
+            elif _semantic_collapsed:
+                # Semantic collapse: the HoF best dominates so completely that
+                # mutations of it all land in the same basin.  Skip HoF injection
+                # and add extra random+seed diversity to force structural exploration.
+                # Also inject residual-aware seeds to escape the basin.
+                hof_best = hof.get_best_overall()
+                if hof_best is not None:
+                    try:
+                        res_seeds = generate_residual_aware_seeds(
+                            n_features, feat_names, X, y_target, hof_best,
+                            max_seeds=max(5, int(target_size * 0.15)))
+                        for rs in res_seeds:
+                            rs.age = 0
+                        new_blood.extend(res_seeds)
+                    except Exception:
+                        pass
+                extra = max(3, int(target_size * 0.15))
+                for _ in range(extra):
+                    new_blood.append(Individual(
+                        random_cgp(n_features, CGP_NODES, feat_names)))
+
+            while len(survivors) + len(new_blood) < target_size:
+                new_blood.append(Individual(
+                    random_cgp(n_features, CGP_NODES, feat_names)))
+            for ind in new_blood:
+                ind.age = 0   # AFPO invariant
+                ind.calculate_fitness(X, y_target, type_code,
+                                      bg_logits=bg_logits,
+                                      class_idx_in_group=class_idx_in_group,
+                                      Y_group=Y_group,
+                                      target_grads=target_grads)
+            population = survivors + new_blood
+            local_stag = 0
+
+    return population, local_stag
+
+
+def evolve_afpo_island_chunk(args):
+    """
+    Thin wrapper around evolve_afpo suitable for ProcessPoolExecutor.
+
+    Accepts a single packed-args tuple (so it can be passed as one argument to
+    executor.submit), syncs the ADF registry, runs evolve_afpo for one chunk,
+    and returns the updated population together with enough metadata for the
+    caller to merge results back into the master state.
+
+    Returns
+    -------
+    (population, local_stag, island_idx, out_idx, local_hof)
+    """
+    (population, X, y_target, type_code,
+     n_features, feat_names,
+     target_size, n_generations,
+     stag_counter, ext_patience,
+     island_idx, out_idx,
+     adf_registry,
+     bg_logits, class_idx_in_group, Y_group,
+     target_grads) = args
+
+    # Sync ADF registry into this worker process
+    global _ADF_REGISTRY
+    _ADF_REGISTRY = list(adf_registry)
+
+    local_hof = HallOfFame()
+    population, local_stag = evolve_afpo(
+        population, X, y_target, type_code,
+        n_features, feat_names, target_size,
+        n_generations, local_hof, stag_counter, ext_patience,
+        bg_logits=bg_logits,
+        class_idx_in_group=class_idx_in_group,
+        Y_group=Y_group,
+        target_grads=target_grads,
+    )
+    return population, local_stag, island_idx, out_idx, local_hof
+
+
+def _deep_optimize_hofs(hofs, X, Y, out_types,
+                        max_rows=1000, top_k=5,
+                        n_restarts=3, max_iter=150):
+    """
+    Bounded deep constant optimisation for all Hall-of-Fame entries.
+
+    Caps three sources of expense:
+      max_rows   — subsample the dataset to at most this many rows for each
+                   Nelder-Mead objective call.  Full-dataset fitness is
+                   recalculated once after optimisation finishes.
+      top_k      — only optimise the top-k HoF entries ranked by current
+                   loss.  Entries outside the top-k are skipped; they are
+                   usually dominated anyway.
+      n_restarts — fewer restarts than the in-loop 10% chance pass.
+      max_iter   — tighter iteration budget per restart.
+
+    Prints a one-line summary per output instead of per-individual chatter.
+    """
+    N = X.shape[0]
+    cap = min(max_rows, N)
+    print(f"\n[Deep-Opt] Optimizing top-{top_k} HoF entries "
+          f"(dataset cap={cap}/{N} rows, {n_restarts} restarts × {max_iter} iters)…")
+
+    for out_idx, h in enumerate(hofs):
+        if not h.best_by_complexity:
+            continue
+
+        # Rank entries by loss, take top-k
+        ranked = sorted(h.best_by_complexity.values(), key=lambda x: x.loss)
+        targets = ranked[:top_k]
+
+        improved = 0
+        for ind in targets:
+            loss_before = ind.loss
+            ind.optimize_constants(X, Y[:, out_idx], out_types[out_idx],
+                                   max_rows=cap,
+                                   n_restarts=n_restarts,
+                                   max_iter=max_iter)
+            if ind.loss < loss_before - 1e-8:
+                improved += 1
+
+        # Rebuild HoF keyed by (possibly unchanged) complexity
+        new_dict = {}
+        for ind in h.best_by_complexity.values():
+            c = ind.complexity
+            if c not in new_dict or ind.loss < new_dict[c].loss:
+                new_dict[c] = ind
+        h.best_by_complexity = new_dict
+
+        # Purge zombie entries: ceiling violations + cross-complexity dominated slots
+        n_removed = h.sanitize()
+
+        best = h.get_best_overall()
+        if best:
+            print(f"  Out {out_idx}: {len(targets)} optimized, "
+                  f"{improved} improved | best loss={best.loss:.5f}"
+                  + (f" | evicted {n_removed} zombie(s)" if n_removed else ""))
+
+
+def _print_validation_metrics(hofs, X_val, Y_val, out_types, dp):
+    """
+    Evaluate each output's current best HoF model on the validation set
+    and print a compact comparison table (val vs train).
+    """
+    print("\n── VALIDATION ──────────────────────────────────────────────────────────")
+    for o_idx, hof in enumerate(hofs):
+        best = hof.get_best_overall()
+        if best is None:
+            continue
+        out_label = dp.output_map[o_idx] if o_idx < len(dp.output_map) else f"Out{o_idx}"
+        is_cls    = (out_types[o_idx] == 6)
+        try:
+            preds = best.tree.evaluate(X_val)
+            preds = np.clip(np.nan_to_num(preds, nan=0.0, posinf=1e9, neginf=-1e9),
+                            -1e9, 1e9)
+            
+            # --- NEW: Apply analytic scaling before metric calculation ---
+            if not is_cls:
+                a = getattr(best, 'affine_a', 1.0)
+                b = getattr(best, 'affine_b', 0.0)
+                preds = a * preds + b
+            # -----------------------------------------------------------
+            
+            y_v = Y_val[:, o_idx]
+
+            # We need the 'if is_cls:' here to match the 'else:' below
+            if is_cls:
+                bce = (np.maximum(preds, 0) - preds * y_v
+                       + np.log(1 + np.exp(-np.abs(preds))))
+                val_loss = float(np.mean(bce))
+                val_acc  = float(np.mean(
+                    ((1.0 / (1.0 + np.exp(-preds))) >= 0.5) == (y_v >= 0.5)))
+                print(f"  Out {o_idx} ({out_label}): "
+                      f"val_loss={val_loss:.5f}  val_acc={val_acc:.4f}  "
+                      f"| train_loss={best.loss:.5f}  train_acc={best.accuracy:.4f}")
+            else:
+                diff  = preds - y_v
+                smape = float(np.mean(2*np.abs(diff)/(np.abs(preds)+np.abs(y_v)+1e-8)))
+                nrmse = float(np.sqrt(np.mean(diff**2)) / (np.ptp(y_v) + 1e-8))
+                val_loss = 0.5 * smape + 0.5 * nrmse
+                ss_res   = float(np.sum((y_v - preds)**2))
+                ss_tot   = float(np.sum((y_v - np.mean(y_v))**2))
+                val_r2   = 1.0 - ss_res / (ss_tot + 1e-8)
+                gap      = val_loss - best.loss
+                gap_str  = f"+{gap:.4f}" if gap >= 0 else f"{gap:.4f}"
+                print(f"  Out {o_idx} ({out_label}): "
+                      f"val_loss={val_loss:.5f}  val_R²={val_r2:.4f}  "
+                      f"| train_loss={best.loss:.5f}  train_R²={best.r2:.4f}  "
+                      f"gap={gap_str}")
+        except Exception as exc:
+            print(f"  Out {o_idx} ({out_label}): validation error — {exc}")
+    print("────────────────────────────────────────────────────────────────────────")
+
+
+def _interval_cull_population(islands_pop, X_full, out_types=None):
+    """
+    Empirical interval stability check for Interval mode.
+
+    Evaluate every individual against the full training set X_full.
+    Any individual whose expression produces NaN or Inf on any row has
+    its fitness/loss set to 1e10 so it will be replaced by the next
+    death tournament.  Does NOT change island sizes.
+
+    When out_types is provided, also applies logit saturation penalties
+    to classification individuals whose raw logits are extremely large
+    (|logit| >> LOGIT_SATURATION_THRESHOLD), which causes overconfident
+    predictions and vanishing gradients.
+
+    Returns the count of individuals penalised.
+    """
+    penalised = 0
+    for island_idx, island_pops in enumerate(islands_pop):
+        for out_idx, pop in enumerate(island_pops):
+            is_cls = (out_types is not None and out_idx < len(out_types)
+                      and out_types[out_idx] == 6)
+            for ind in pop:
+                try:
+                    preds = ind.tree.evaluate(X_full)
+                    if not np.all(np.isfinite(preds)):
+                        ind.loss    = 1e10
+                        ind.fitness = 1e10
+                        penalised  += 1
+                    elif is_cls:
+                        # Logit saturation check for classification
+                        excess = np.maximum(0.0, np.abs(preds) - LOGIT_SATURATION_THRESHOLD)
+                        sat_pen = float(np.mean(excess ** 2))
+                        if sat_pen > 0.5:  # only penalise severely saturated
+                            ind.loss   += LOGIT_SATURATION_WEIGHT * sat_pen
+                            ind.fitness = ind.loss + PARSIMONY_STRENGTH * ind.complexity
+                            penalised  += 1
+                except Exception:
+                    ind.loss    = 1e10
+                    ind.fitness = 1e10
+                    penalised  += 1
+    return penalised
+
+
+
+# ==========================================
+# MULTI-CLASS GROUP HELPERS
+# ==========================================
+
+def detect_class_groups(dp, out_types):
+    """
+    Detect which output indices belong to the same one-hot categorical column.
+
+    Returns a dict: { col_name: [out_idx_0, out_idx_1, ...] }
+    Only columns with >= 2 class outputs (type_code 6) are included.
+    Single-class binary outputs (which should use BCE as-is) are excluded.
+    """
+    groups = {}
+    for col_name, (start, end) in dp.output_slices.items():
+        stat = dp.stats.get(col_name, {})
+        if stat.get('type') != 6:
+            continue
+        n_classes = end - start
+        if n_classes < 2:
+            continue
+        # Verify all outputs in the slice are type 6
+        if all(out_types[i] == 6 for i in range(start, end)):
+            groups[col_name] = list(range(start, end))
+    return groups
+
+
+def build_bg_logits(hofs, group_indices, X):
+    """
+    Build a background logits matrix (N, n_classes) for a class group.
+
+    For each class in group_indices, evaluate the current HoF best model on X
+    and use its raw predictions as the logit for that class.  If no HoF entry
+    exists yet for a class, that column is initialised to 0.0 (neutral logit —
+    equivalent to predicting equal probability for that class).
+
+    Returns: numpy array shape (N, n_classes), dtype float64.
+    """
+    N        = X.shape[0]
+    n_cls    = len(group_indices)
+    bg       = np.zeros((N, n_cls), dtype=np.float64)
+
+    for local_k, global_k in enumerate(group_indices):
+        best = hofs[global_k].get_best_overall()
+        if best is not None:
+            try:
+                preds = best.tree.evaluate(X)
+                preds = np.clip(
+                    np.nan_to_num(preds, nan=0.0, posinf=1e9, neginf=-1e9),
+                    -1e9, 1e9)
+                # ── Constant-equilibrium guard ────────────────────────────
+                # If the HoF best for this class outputs the same value for
+                # every row (i.e. it is a pure constant / prior-encoding
+                # logit), treat it as neutral (0.0) in the background matrix.
+                #
+                # Why: a constant logit bg[:,k] = c is already the implicit
+                # "null hypothesis" that softmax CE minimises against.  Using
+                # the actual constant value c in the background shifts it away
+                # from neutral for ALL other classes, making *their* constants
+                # the optimal solution too.  This creates a stable Nash
+                # equilibrium where every output converges to a class-prior
+                # constant and feature-based discriminators are never found.
+                #
+                # Keeping constant entries at 0 (neutral) means every class
+                # must always compete as if it is the marginal discoverer,
+                # maintaining selection pressure toward feature use.
+                if np.std(preds) > 1e-4:
+                    bg[:, local_k] = preds
+                # else: leave column as 0.0 (neutral — same as "not found yet")
+            except Exception:
+                pass  # leave column as 0.0
+
+    return bg
+
+
+
+# ==========================================
+# BAYESIAN CGP — Surrogate-Assisted Optimisation
+# ==========================================
+# Instead of evolving a population via tournament selection, Bayesian CGP
+# uses a Gaussian Process (GP) surrogate to model the mapping from CGP
+# genotype encodings to fitness values.  Expected Improvement (EI)
+# identifies the most promising candidate mutations to evaluate,
+# dramatically improving sample efficiency compared to pure evolution.
+#
+# Workflow per iteration:
+#   1. Generate N candidate CGP individuals by mutating the current best.
+#   2. Encode each candidate as a fixed-length vector.
+#   3. Score each candidate with EI from the GP surrogate.
+#   4. Evaluate only the top-B candidates by EI (expensive step).
+#   5. Add evaluated (vector, fitness) pairs to the GP training set.
+#   6. Periodically refit the GP surrogate.
+#
+# The GP is fitted on negative-log-fitness (log-transformed for better
+# Gaussian approximation) with a Matérn-5/2 kernel + WhiteKernel noise.
+
+try:
+    from sklearn.gaussian_process import GaussianProcessRegressor
+    from sklearn.gaussian_process.kernels import Matern, WhiteKernel, ConstantKernel
+    HAS_SKLEARN_GP = True
+except ImportError:
+    HAS_SKLEARN_GP = False
+
+
+def cgp_to_vector(cgp_eq, max_nodes, X_probe=None):
+    """
+    Encode a CGPEquation as a fixed-length numeric vector suitable for GP
+    surrogate modelling.
+
+    Encoding per node (5 values):
+      [op_index_normalised, in1_normalised, in2_normalised, in3_normalised, const_val_norm]
+
+    Plus:
+      - one trailing element for out_idx_normalised.
+      - phenotypic probe outputs (if X_probe is provided).
+
+    Inactive nodes are masked (all features set to -1.0) to reduce genotype noise.
+    Constants are squashed using tanh to handle wide ranges gracefully.
+    """
+    n_feat = cgp_eq.n_features
+    total_slots = n_feat + max_nodes
+    ops_list = CGPEquation.OPS_ALL
+    n_ops = len(ops_list)
+    op_to_idx = {op: i for i, op in enumerate(ops_list)}
+
+    cgp_eq.update_active_nodes()
+    active = cgp_eq.active_nodes
+
+    vec_parts = []
+
+    # 1. Genotype encoding
+    genotype_vec = np.full(max_nodes * 5, -1.0, dtype=np.float64)
+    for i, node in enumerate(cgp_eq.nodes[:max_nodes]):
+        idx = n_feat + i
+        if idx not in active:
+            continue
+
+        base = i * 5
+        # Normalised op index in [0, 1]
+        genotype_vec[base + 0] = op_to_idx.get(node.op, 0) / max(n_ops - 1, 1)
+        # Normalised input indices in [0, 1]
+        genotype_vec[base + 1] = node.in1 / max(total_slots - 1, 1)
+        genotype_vec[base + 2] = node.in2 / max(total_slots - 1, 1)
+        genotype_vec[base + 3] = node.in3 / max(total_slots - 1, 1)
+        # Squashed constant value in [-1, 1]
+        genotype_vec[base + 4] = np.tanh(node.const_val / 10.0)
+
+    vec_parts.append(genotype_vec)
+
+    # 2. Output pointer
+    vec_parts.append(np.array([cgp_eq.out_idx / max(total_slots - 1, 1)]))
+
+    # 3. Phenotypic encoding (Probe outputs)
+    if X_probe is not None:
+        try:
+            preds = cgp_eq.evaluate(X_probe)
+            # Normalise/clamp probe outputs to prevent scale issues in GP
+            preds = np.tanh(np.nan_to_num(preds, nan=0.0) / 10.0)
+            vec_parts.append(preds)
+        except Exception:
+            vec_parts.append(np.zeros(X_probe.shape[0]))
+
+    return np.concatenate(vec_parts)
+
+
+def _expected_improvement(mu, sigma, best_f, xi=0.01):
+    """
+    Expected Improvement acquisition function.
+
+    mu, sigma : arrays of predicted mean and std from the GP surrogate
+                (on the NEGATED log-loss scale, so HIGHER is better).
+    best_f    : best observed value so far (higher = better).
+    xi        : exploration-exploitation trade-off parameter.
+
+    Returns EI values (higher = more promising).
+    """
+    sigma = np.maximum(sigma, 1e-9)
+    z = (mu - best_f - xi) / sigma
+    from scipy.stats import norm
+    ei = sigma * (z * norm.cdf(z) + norm.pdf(z))
+    return ei
+
+
+class BayesianCGPOptimizer:
+    """
+    Surrogate-assisted Bayesian optimisation for CGP symbolic regression.
+
+    Maintains a GP surrogate over (genotype_vector → transformed_fitness)
+    and uses Expected Improvement to select which candidates to evaluate.
+    """
+
+    def __init__(self, n_features, max_nodes, feat_names, X_probe=None,
+                 max_points=500, xi=0.01):
+        self.n_features = n_features
+        self.max_nodes  = max_nodes
+        self.feat_names = feat_names
+        self.X_probe    = X_probe
+        probe_size      = X_probe.shape[0] if X_probe is not None else 0
+        self.vec_dim    = max_nodes * 5 + 1 + probe_size
+        self.xi         = xi
+        self.max_points = max_points
+
+        # Observed data
+        self.X_observed = []   # list of vectors
+        self.y_observed = []   # transformed fitness (neg log loss)
+        self.individuals = []  # matching Individual objects
+
+        # GP surrogate — Matérn 5/2 + WhiteKernel for noise
+        kernel = (ConstantKernel(1.0, (1e-3, 1e3))
+                  * Matern(length_scale=1.0, length_scale_bounds=(1e-2, 1e2),
+                           nu=2.5)
+                  + WhiteKernel(noise_level=0.1, noise_level_bounds=(1e-5, 1e1)))
+        self.gp = GaussianProcessRegressor(
+            kernel=kernel, alpha=1e-6, normalize_y=True,
+            n_restarts_optimizer=2)
+        self.gp_fitted = False
+
+    def _transform_fitness(self, loss):
+        """Transform loss to a GP-friendly target: -log(loss + eps).
+        Higher = better, roughly Gaussian for well-behaved losses."""
+        return -np.log(np.clip(loss, 1e-15, 1e10))
+
+    def add_observation(self, individual, cgp_eq):
+        """Record an evaluated individual."""
+        vec = cgp_to_vector(cgp_eq, self.max_nodes, X_probe=self.X_probe)
+        y   = self._transform_fitness(individual.loss)
+        self.X_observed.append(vec)
+        self.y_observed.append(y)
+        self.individuals.append(individual)
+
+        # Cap the training set size (FIFO eviction of oldest)
+        if len(self.X_observed) > self.max_points:
+            self.X_observed = self.X_observed[-self.max_points:]
+            self.y_observed = self.y_observed[-self.max_points:]
+            self.individuals = self.individuals[-self.max_points:]
+
+    def fit_surrogate(self):
+        """(Re)fit the GP surrogate on current observations."""
+        if len(self.X_observed) < 10:
+            self.gp_fitted = False
+            return
+        X = np.array(self.X_observed)
+        y = np.array(self.y_observed)
+        try:
+            self.gp.fit(X, y)
+            self.gp_fitted = True
+        except Exception as e:
+            print(f"  [BO] GP fitting failed: {e}")
+            self.gp_fitted = False
+
+    def score_candidates(self, candidate_trees):
+        """
+        Score a list of CGPEquation trees using Expected Improvement.
+        Returns EI values (higher = more promising) or random scores if
+        GP is not fitted.
+        """
+        if not self.gp_fitted or len(self.X_observed) < 10:
+            return np.random.rand(len(candidate_trees))
+
+        vecs = np.array([cgp_to_vector(t, self.max_nodes, X_probe=self.X_probe)
+                         for t in candidate_trees])
+        try:
+            mu, sigma = self.gp.predict(vecs, return_std=True)
+        except Exception:
+            return np.random.rand(len(candidate_trees))
+
+        best_f = max(self.y_observed)
+        return _expected_improvement(mu, sigma, best_f, self.xi)
+
+    def get_best_individuals(self, n=5):
+        """Return the top-n individuals by loss (lowest loss first)."""
+        if not self.individuals:
+            return []
+        sorted_inds = sorted(self.individuals, key=lambda x: x.loss)
+        return sorted_inds[:n]
+
+    def summary_str(self):
+        n = len(self.X_observed)
+        best_loss = min(ind.loss for ind in self.individuals) if self.individuals else float('inf')
+        return (f"observations={n}, best_loss={best_loss:.5f}, "
+                f"GP_fitted={self.gp_fitted}")
+
+
+def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
+                     hofs, target_grads_list, dp,
+                     X_val=None, Y_val=None, BATCH_SIZE=0):
+    """
+    Main Bayesian CGP optimisation loop.
+
+    This is a single-process, single-output-at-a-time optimiser that uses
+    a GP surrogate to guide the search.  Multi-output problems are handled
+    by running independent BO instances per output (serially within each
+    iteration to share wall-clock time fairly).
+    """
+    global _INIT_PHASE
+
+    print("\n" + "═" * 70)
+    print("BAYESIAN CGP — Surrogate-Assisted Symbolic Regression")
+    print("═" * 70)
+    print(f"  Initial random samples : {BAYESIAN_INITIAL_SAMPLES}")
+    print(f"  Batch size per iter    : {BAYESIAN_BATCH_SIZE}")
+    print(f"  Candidates per iter    : {BAYESIAN_N_CANDIDATES}")
+    print(f"  GP refit frequency     : every {BAYESIAN_GP_REFIT_FREQ} iterations")
+    print(f"  GP max training points : {BAYESIAN_MAX_GP_POINTS}")
+    print(f"  Exploration (xi)       : {BAYESIAN_EXPLORATION}")
+    print("═" * 70 + "\n")
+
+    # Select phenotypic probe set: 20 points sampled from training data
+    _probe_n = min(20, X.shape[0])
+    _probe_idx = np.random.choice(X.shape[0], _probe_n, replace=False)
+    X_probe = X[_probe_idx]
+
+    # One BO optimizer per output
+    optimizers = [
+        BayesianCGPOptimizer(n_features, CGP_NODES, feat_names,
+                             X_probe=X_probe,
+                             max_points=BAYESIAN_MAX_GP_POINTS,
+                             xi=BAYESIAN_EXPLORATION)
+        for _ in range(n_outputs)
+    ]
+
+    # ── Phase 1: Initial random sampling ────────────────────────────────
+    print(f"Phase 1: Evaluating {BAYESIAN_INITIAL_SAMPLES} random individuals…")
+    _INIT_PHASE = True
+    N_train = X.shape[0]
+    if N_train > _INIT_SUBSAMPLE_CAP:
+        init_idx = np.random.choice(N_train, _INIT_SUBSAMPLE_CAP, replace=False)
+        X_init, Y_init = X[init_idx], Y[init_idx]
+        print(f"  (using {_INIT_SUBSAMPLE_CAP}/{N_train} row subsample for fast init)")
+    else:
+        X_init, Y_init = X, Y
+
+    for o_idx in range(n_outputs):
+        # Use seeded individuals + random ones
+        seeds = generate_seeds_v5(n_features, feat_names)
+        try:
+            imp_seeds = generate_importance_biased_seeds(
+                n_features, feat_names, X_init, Y_init[:, o_idx])
+            seeds.extend(imp_seeds)
+        except Exception:
+            pass
+        while len(seeds) < BAYESIAN_INITIAL_SAMPLES:
+            seeds.append(Individual(random_cgp(n_features, CGP_NODES, feat_names)))
+
+        seeds = seeds[:BAYESIAN_INITIAL_SAMPLES]
+        for ind in seeds:
+            ind.calculate_fitness(X_init, Y_init[:, o_idx], out_types[o_idx],
+                                  target_grads=target_grads_list[o_idx])
+            hofs[o_idx].update(ind)
+            optimizers[o_idx].add_observation(ind, ind.tree)
+
+        print(f"  Output {o_idx}: {len(seeds)} initial samples evaluated, "
+              f"best loss = {min(ind.loss for ind in seeds):.5f}")
+
+    # Re-evaluate HoF on full data if we sub-sampled
+    if N_train > _INIT_SUBSAMPLE_CAP:
+        print("  Re-scoring Hall of Fame on full dataset…")
+        for o_idx in range(n_outputs):
+            for ind in hofs[o_idx].best_by_complexity.values():
+                ind.affine_fitted = False
+                ind.calculate_fitness(X, Y[:, o_idx], out_types[o_idx],
+                                      target_grads=target_grads_list[o_idx])
+    _INIT_PHASE = False
+
+    # Fit initial surrogates
+    print("\nFitting initial GP surrogates…")
+    for opt in optimizers:
+        opt.fit_surrogate()
+        print(f"  {opt.summary_str()}")
+
+    # ── Phase 2: Bayesian optimisation loop ─────────────────────────────
+    print("\nPhase 2: Bayesian optimisation. Ctrl+C to stop.\n")
+    iteration = 0
+    total_evals = BAYESIAN_INITIAL_SAMPLES * n_outputs
+    perfect_outputs = set()
+    # Adaptive exploration: start at 5× the configured xi for broad
+    # exploration, then decay toward the configured value over iterations.
+    # This avoids premature exploitation when the GP model is uncertain.
+    _bo_xi_start = max(BAYESIAN_EXPLORATION * 5.0, 0.05)
+    _bo_xi_end   = BAYESIAN_EXPLORATION
+
+    try:
+        while True:
+            iteration += 1
+            batch_idx = (np.random.choice(X.shape[0], BATCH_SIZE, replace=False)
+                         if BATCH_SIZE > 0 else None)
+            X_b = X[batch_idx] if batch_idx is not None else X
+            Y_b = Y[batch_idx] if batch_idx is not None else Y
+
+            # ── Adaptive exploration decay ────────────────────────────────
+            # Exponential decay from _bo_xi_start toward _bo_xi_end over
+            # ~200 iterations (half-life ~50 iterations).
+            decay = np.exp(-0.014 * iteration)  # ~50 iteration half-life
+            current_xi = _bo_xi_end + (_bo_xi_start - _bo_xi_end) * decay
+            for opt in optimizers:
+                opt.xi = current_xi
+
+            for o_idx in range(n_outputs):
+                if o_idx in perfect_outputs:
+                    continue
+                opt = optimizers[o_idx]
+
+                # ── Generate candidates by mutating top individuals ────────
+                top_inds = opt.get_best_individuals(n=10)
+                if not top_inds:
+                    top_inds = [Individual(random_cgp(n_features, CGP_NODES, feat_names))]
+
+                candidate_trees = []
+                # 60% from mutating top individuals (exploitation)
+                n_exploit = int(BAYESIAN_N_CANDIDATES * 0.6)
+                for _ in range(n_exploit):
+                    parent = random.choice(top_inds)
+                    # Vary mutation rate: mostly light, occasionally heavy
+                    rate = random.choice([1, 1, 2, 2, 3, 5])
+                    child_tree = mutate(parent.tree, n_features, feat_names,
+                                        mut_rate=rate, temperature=0.0)
+                    candidate_trees.append(child_tree)
+
+                # 15% from crossover of top individuals
+                n_cross = int(BAYESIAN_N_CANDIDATES * 0.15)
+                for _ in range(n_cross):
+                    if len(top_inds) >= 2:
+                        p1, p2 = random.sample(top_inds, 2)
+                        child_tree = crossover(p1.tree, p2.tree)
+                        child_tree = mutate(child_tree, n_features, feat_names,
+                                            mut_rate=1)
+                    else:
+                        child_tree = random_cgp(n_features, CGP_NODES, feat_names)
+                    candidate_trees.append(child_tree)
+
+                # 10% from macro-mutations (structural exploration)
+                n_macro = int(BAYESIAN_N_CANDIDATES * 0.10)
+                for _ in range(n_macro):
+                    parent = random.choice(top_inds)
+                    _macro_choices = ['grow', 'prune', 'graft', 'rational', 'trig']
+                    if IF_ELSE_ENABLED:
+                        _macro_choices.append('piecewise')
+                    macro_choice = random.choice(_macro_choices)
+                    if macro_choice == 'grow':
+                        ct = macro_grow(parent.tree, n_features, feat_names)
+                    elif macro_choice == 'prune':
+                        ct = macro_prune(parent.tree, n_features)
+                    elif macro_choice == 'graft':
+                        ct = macro_graft_feature(parent.tree, n_features, feat_names)
+                    elif macro_choice == 'rational':
+                        ct = macro_rational_grow(parent.tree, n_features)
+                    elif macro_choice == 'piecewise':
+                        ct = macro_piecewise(parent.tree, n_features, feat_names)
+                    else:
+                        ct = macro_trig_identity(parent.tree, n_features)
+                    candidate_trees.append(ct)
+
+                # 10% from HoF elite crossover — recombine structural motifs
+                # from different complexity levels of the Hall of Fame.
+                n_hof_cross = int(BAYESIAN_N_CANDIDATES * 0.10)
+                hof_inds_bo = list(hofs[o_idx].best_by_complexity.values())
+                if len(hof_inds_bo) >= 2:
+                    for _ in range(n_hof_cross):
+                        p1, p2 = random.sample(hof_inds_bo, 2)
+                        child_tree = crossover(p1.tree, p2.tree)
+                        child_tree = mutate(child_tree, n_features, feat_names,
+                                            mut_rate=random.choice([1, 2]))
+                        candidate_trees.append(child_tree)
+                else:
+                    # Not enough HoF entries; fill with random
+                    for _ in range(n_hof_cross):
+                        candidate_trees.append(
+                            random_cgp(n_features, CGP_NODES, feat_names))
+
+                # 5% purely random (diversity injection)
+                n_random = BAYESIAN_N_CANDIDATES - n_exploit - n_cross - n_macro - n_hof_cross
+                for _ in range(max(0, n_random)):
+                    candidate_trees.append(
+                        random_cgp(n_features, CGP_NODES, feat_names))
+
+                # ── Score candidates with Expected Improvement ──────────────
+                ei_scores = opt.score_candidates(candidate_trees)
+
+                # ── Multi-fidelity evaluation ─────────────────────────────
+                # Stage 1: evaluate top 2×B candidates on a cheap subset
+                # Stage 2: re-evaluate the best B on full data
+                # This halves the cost of full evaluations per iteration.
+                n_screen = min(BAYESIAN_BATCH_SIZE * 2, len(candidate_trees))
+                screen_indices = np.argsort(ei_scores)[-n_screen:]
+
+                _N = X_b.shape[0]
+                _screen_rows = min(max(50, _N // 4), _N)
+                if _screen_rows < _N:
+                    _screen_idx = np.random.choice(_N, _screen_rows, replace=False)
+                    X_screen = X_b[_screen_idx]
+                    Y_screen = Y_b[_screen_idx]
+                else:
+                    X_screen, Y_screen = X_b, Y_b
+
+                # Stage 1: cheap screening
+                screen_results = []
+                for ci in screen_indices:
+                    child = Individual(candidate_trees[ci])
+                    child.calculate_fitness(
+                        X_screen, Y_screen[:, o_idx], out_types[o_idx],
+                        target_grads=target_grads_list[o_idx])
+                    screen_results.append((ci, child))
+                    # Even screening evaluations are useful data for the GP surrogate
+                    opt.add_observation(child, child.tree)
+
+                # Stage 2: pick best B from screening, evaluate on full data
+                screen_results.sort(key=lambda x: x[1].loss)
+                top_indices = [ci for ci, _ in screen_results[:BAYESIAN_BATCH_SIZE]]
+
+                n_improved = 0
+                for ci in top_indices:
+                    child = Individual(candidate_trees[ci])
+                    child.calculate_fitness(
+                        X_b, Y_b[:, o_idx], out_types[o_idx],
+                        target_grads=target_grads_list[o_idx])
+                    total_evals += 1
+
+                    if hofs[o_idx].update(child):
+                        n_improved += 1
+                        is_cls = (out_types[o_idx] == 6)
+                        metric = (f"Acc={getattr(child,'accuracy',0):.4f}"
+                                  if is_cls
+                                  else f"R²={getattr(child,'r2',0):.4f}")
+                        print(f"  [BO iter {iteration} | Out {o_idx}] "
+                              f"New HoF (Comp {child.complexity:.0f}): "
+                              f"loss={child.loss:.5f}  {metric}")
+
+                    # Update GP with full-fidelity evaluation
+                    opt.add_observation(child, child.tree)
+
+                # ── Refit GP surrogate periodically ─────────────────────────
+                if iteration % BAYESIAN_GP_REFIT_FREQ == 0:
+                    opt.fit_surrogate()
+
+                # ── Light constant optimisation on HoF ──────────────────────
+                if iteration % BAYESIAN_CONST_OPT_FREQ == 0:
+                    for ind in hofs[o_idx].best_by_complexity.values():
+                        if get_constants_shared(ind.tree):
+                            old_loss = ind.loss
+                            ind.optimize_constants(
+                                X, Y[:, o_idx], out_types[o_idx],
+                                max_rows=min(500, X.shape[0]),
+                                n_restarts=2, max_iter=30,
+                                target_grads=target_grads_list[o_idx])
+                            if ind.loss < old_loss - 1e-8:
+                                opt.add_observation(ind, ind.tree)
+
+            # ── Periodic status ─────────────────────────────────────────
+            print(f"--- BO Iteration {iteration}  "
+                  f"(total evals: {total_evals}) ---")
+
+            if iteration % 5 == 0:
+                for o_idx in range(n_outputs):
+                    if o_idx not in perfect_outputs:
+                        print(f"  [Out {o_idx}] GP: {optimizers[o_idx].summary_str()}")
+
+            # ── Perfect output detection ────────────────────────────────
+            for o_idx in range(n_outputs):
+                if o_idx in perfect_outputs:
+                    continue
+                is_perf, best_ind = _check_output_perfect(
+                    hofs[o_idx], X, Y[:, o_idx], out_types[o_idx])
+                if is_perf:
+                    out_label = dp.output_map[o_idx] if o_idx < len(dp.output_map) else f"Out{o_idx}"
+                    print(f"\n  ★ Output {o_idx} ({out_label}) reached PERFECT performance!")
+                    _simplify_perfect_output(
+                        hofs[o_idx], X, Y[:, o_idx], out_types[o_idx],
+                        target_grads=target_grads_list[o_idx])
+                    perfect_outputs.add(o_idx)
+
+            if len(perfect_outputs) == n_outputs:
+                print("\n  ★★★ ALL outputs reached perfect performance! Stopping Bayesian CGP.")
+                break
+
+            # ── Periodic frontier display ────────────────────────────────
+            if iteration % 25 == 0:
+                for o_idx, hof in enumerate(hofs):
+                    out_label = (dp.output_map[o_idx]
+                                 if o_idx < len(dp.output_map) else f"Out{o_idx}")
+                    pf_tag = " [PERFECT]" if o_idx in perfect_outputs else ""
+                    hof.print_frontier(
+                        out_type=out_types[o_idx],
+                        label=f"Output {o_idx} ({out_label}){pf_tag}")
+                if X_val is not None and Y_val is not None:
+                    _print_validation_metrics(hofs, X_val, Y_val, out_types, dp)
+
+            # ── Periodic simplification ──────────────────────────────────
+            if (SIMPLIFICATION_FREQ > 0
+                    and iteration % max(1, SIMPLIFICATION_FREQ // 50) == 0):
+                print(f"\n[BO iter {iteration}] Running algebraic "
+                      f"simplification on HoF…")
+                # Simplify HoF entries only (no island populations)
+                for o_idx, hof in enumerate(hofs):
+                    for c_key in list(hof.best_by_complexity.keys()):
+                        ind = hof.best_by_complexity[c_key]
+                        ind.tree = simplify_cgp_tree(ind.tree)
+                        ind.tree.update_active_nodes()
+                        ind.calculate_fitness(
+                            X, Y[:, o_idx], out_types[o_idx],
+                            update_affine=False,
+                            target_grads=target_grads_list[o_idx])
+                    # Rebuild HoF keyed by new complexity
+                    new_dict = {}
+                    for ind in hof.best_by_complexity.values():
+                        nc = ind.complexity
+                        if nc not in new_dict or ind.loss < new_dict[nc].loss:
+                            new_dict[nc] = ind
+                    hof.best_by_complexity = new_dict
+                    hof.sanitize()
+
+            # ── Deep constant optimisation ────────────────────────────────
+            if iteration > 0 and iteration % 50 == 0:
+                _deep_optimize_hofs(hofs, X, Y, out_types)
+
+    except KeyboardInterrupt:
+        print("\nStopping Bayesian CGP…")
+
+
+# ════════════════════════════════════════════════════════════════
+# GRADIENT BOOSTING WRAPPER
+# ════════════════════════════════════════════════════════════════
+
+def _sigmoid(x):
+    """Numerically stable sigmoid."""
+    return np.where(x >= 0,
+                    1.0 / (1.0 + np.exp(-np.clip(x, -500, 500))),
+                    np.exp(np.clip(x, -500, 500)) / (1.0 + np.exp(np.clip(x, -500, 500))))
+
+
+def _softmax(logits):
+    """Numerically stable softmax along axis=1.  logits: (N, K)."""
+    row_max = logits.max(axis=1, keepdims=True)
+    exp_l = np.exp(np.clip(logits - row_max, -500, 0))
+    return exp_l / (exp_l.sum(axis=1, keepdims=True) + 1e-30)
+
+
+class GradientBoostedModel:
+    """
+    Stores the sequence of (model, learning_rate) pairs from each boosting stage,
+    plus the initial intercept.
+
+    Supports three modes:
+      - 'regression':        intercept + Σ lr_i * (a_i * f_i(x) + b_i)
+      - 'binary_cls':        σ(intercept + Σ lr_i * (a_i * f_i(x) + b_i))
+      - 'multiclass':        softmax over K parallel chains of boosted models.
+                              Each chain k: intercept_k + Σ lr_{k,j} * (a * f(x) + b)
+
+    For multiclass, this is a *container* that wraps K separate
+    GradientBoostedModel objects (one per class), each in 'regression' mode
+    internally, with a final softmax applied across the K chains.
+    """
+    def __init__(self, intercept=0.0, task='regression', n_classes=0,
+                 class_names=None):
+        self.intercept = intercept
+        self.stages = []          # list of (Individual, lr) tuples
+        self.task = task          # 'regression' | 'binary_cls' | 'multiclass'
+        self.n_classes = n_classes
+        self.class_names = class_names or []
+        # For multiclass: list of K GradientBoostedModel (regression sub-chains)
+        self.class_chains = []
+        # Snapshot of the best model state (for early stopping revert)
+        self._best_snapshot_stages = None
+        self._best_snapshot_metric = -float('inf')
+
+    def add_stage(self, individual, lr):
+        self.stages.append((copy.deepcopy(individual), lr))
+
+    def _predict_raw(self, X):
+        """Raw prediction in log-odds / logit space (before sigmoid/softmax)."""
+        y_pred = np.full(X.shape[0], self.intercept)
+        for ind, lr in self.stages:
+            raw = ind.tree.evaluate(X)
+            raw = np.clip(np.nan_to_num(raw, nan=0.0, posinf=1e9, neginf=-1e9),
+                          -1e9, 1e9)
+            y_pred += lr * (ind.affine_a * raw + ind.affine_b)
+        return y_pred
+
+    def predict(self, X):
+        """Final prediction.  Returns class probabilities for classification."""
+        if self.task == 'multiclass':
+            N = X.shape[0]
+            K = self.n_classes
+            logits = np.zeros((N, K))
+            for k, chain in enumerate(self.class_chains):
+                logits[:, k] = chain._predict_raw(X)
+            return _softmax(logits)
+        elif self.task == 'binary_cls':
+            return _sigmoid(self._predict_raw(X))
+        else:
+            return self._predict_raw(X)
+
+    def predict_class(self, X):
+        """Returns integer class labels."""
+        if self.task == 'multiclass':
+            proba = self.predict(X)
+            return np.argmax(proba, axis=1)
+        elif self.task == 'binary_cls':
+            return (self.predict(X) >= 0.5).astype(int)
+        else:
+            return self.predict(X)
+
+    def snapshot(self, metric):
+        """Save current stages if metric improved."""
+        if metric > self._best_snapshot_metric:
+            self._best_snapshot_metric = metric
+            if self.task == 'multiclass':
+                self._best_snapshot_stages = [
+                    [(copy.deepcopy(ind), lr) for ind, lr in c.stages]
+                    for c in self.class_chains
+                ]
+            else:
+                self._best_snapshot_stages = [
+                    (copy.deepcopy(ind), lr) for ind, lr in self.stages
+                ]
+            return True
+        return False
+
+    def revert_to_snapshot(self):
+        """Revert to the best-seen snapshot."""
+        if self._best_snapshot_stages is None:
+            return
+        if self.task == 'multiclass':
+            for k, chain in enumerate(self.class_chains):
+                chain.stages = self._best_snapshot_stages[k]
+        else:
+            self.stages = self._best_snapshot_stages
+
+    def summary(self):
+        if self.task == 'multiclass':
+            lines = [f"GradientBoostedModel (multiclass, {self.n_classes} classes)"]
+            for k, chain in enumerate(self.class_chains):
+                name = self.class_names[k] if k < len(self.class_names) else f"class_{k}"
+                lines.append(f"  Class '{name}': {len(chain.stages)} stages, "
+                             f"intercept={chain.intercept:.4g}")
+                for i, (ind, lr) in enumerate(chain.stages):
+                    lines.append(f"    Stage {i}: lr={lr:.3f}  loss={ind.loss:.5f}  "
+                                 f"expr={str(ind.tree)}")
+            return "\n".join(lines)
+        else:
+            task_label = "binary classification" if self.task == 'binary_cls' else "regression"
+            lines = [f"GradientBoostedModel ({task_label}): {len(self.stages)} stages, "
+                     f"intercept={self.intercept:.4g}"]
+            for i, (ind, lr) in enumerate(self.stages):
+                lines.append(f"  Stage {i}: lr={lr:.3f}  loss={ind.loss:.5f}  "
+                             f"expr={str(ind.tree)}")
+            return "\n".join(lines)
+
+
+def _boosting_line_search(residuals, preds_raw, affine_a, affine_b, base_lr,
+                          l2_reg=0.0):
+    """
+    Line-search for the optimal shrinkage factor for this boosting stage.
+
+    Improved over original:
+      - Finer 20-point grid (0.05 … 1.0) × base_lr
+      - Optional L2 regularisation on the stage contribution
+      - Newton-step closed-form check as a candidate alongside the grid
+    """
+    scaled_preds = affine_a * preds_raw + affine_b
+
+    # Newton-step closed-form candidate:  γ* = <r, f> / (<f, f> + λ)
+    rf = float(np.dot(residuals, scaled_preds))
+    ff = float(np.dot(scaled_preds, scaled_preds)) + l2_reg * len(residuals)
+    newton_lr = np.clip(rf / (ff + 1e-30), 0.0, base_lr) if ff > 1e-12 else base_lr
+
+    # Grid search candidates
+    fracs = np.linspace(0.05, 1.0, 20)
+    candidates = np.concatenate([fracs * base_lr, [newton_lr]])
+
+    best_mse, best_lr = float('inf'), base_lr
+    for c_lr in candidates:
+        trial_res = residuals - c_lr * scaled_preds
+        mse = float(np.mean(trial_res ** 2))
+        if l2_reg > 0:
+            mse += l2_reg * float(np.mean(scaled_preds ** 2)) * c_lr ** 2
+        if mse < best_mse:
+            best_mse = mse
+            best_lr  = float(c_lr)
+    return best_lr
+
+
+def _boosting_cls_line_search(F_current, preds_scaled, y_binary, base_lr):
+    """
+    Line-search for classification boosting (binary logistic loss).
+
+    Finds γ that minimises: -Σ[y·log(σ(F+γ·h)) + (1-y)·log(1-σ(F+γ·h))]
+    Uses a 20-point grid + Newton's-method closed-form candidate.
+    """
+    # Newton step for logistic:  γ = Σ(r) / Σ(p*(1-p))
+    p = _sigmoid(F_current)
+    r = y_binary - p
+    hessian_diag = p * (1.0 - p) + 1e-8
+    newton_lr = np.clip(
+        float(np.sum(r * preds_scaled)) /
+        (float(np.sum(hessian_diag * preds_scaled ** 2)) + 1e-30),
+        0.0, base_lr)
+
+    fracs = np.linspace(0.05, 1.0, 20)
+    candidates = np.concatenate([fracs * base_lr, [newton_lr]])
+
+    best_loss, best_lr = float('inf'), base_lr
+    for c_lr in candidates:
+        F_trial = F_current + c_lr * preds_scaled
+        # Stable log-loss
+        loss = float(np.mean(
+            np.maximum(F_trial, 0) - F_trial * y_binary +
+            np.log1p(np.exp(-np.abs(F_trial)))))
+        if loss < best_loss:
+            best_loss = loss
+            best_lr = float(c_lr)
+    return best_lr
+
+
+def _run_boosting_stage_evolution(X, residuals, n_features, feat_names,
+                                  stage_hof, gens_per_stage,
+                                  prev_stage_best, BATCH_SIZE,
+                                  subsample_idx=None,
+                                  sample_weights=None):
+    """
+    Run a single boosting stage's CGP evolution on given residuals.
+
+    Factored out to share between regression and classification boosting.
+    Returns the stage HoF (caller picks best model from it).
+
+    When sample_weights is provided (2nd-order Hessian boosting), uses
+    weighted MSE where wi = hessian_i, targeting Newton-step residuals.
+    """
+    from concurrent.futures import ProcessPoolExecutor
+    import concurrent.futures
+
+    POP_SIZE = 50
+    NUM_ISLANDS_STAGE = max(2, NUM_ISLANDS_GLOBAL)
+
+    # If subsample_idx provided, train on that subset
+    X_stage = X[subsample_idx] if subsample_idx is not None else X
+    res_stage = residuals[subsample_idx] if subsample_idx is not None else residuals
+    sw_stage = (sample_weights[subsample_idx] if sample_weights is not None
+                and subsample_idx is not None else sample_weights)
+
+    # Recompute target gradients for residuals if Sobolev is enabled
+    stage_target_grads = None
+    if SOBOLEV_ENABLED:
+        try:
+            stage_target_grads = compute_target_gradients(X_stage, res_stage)
+        except Exception:
+            pass
+
+    # Initialize populations
+    islands_pop = [[] for _ in range(NUM_ISLANDS_STAGE)]
+    stagnation_counters = [[0] for _ in range(NUM_ISLANDS_STAGE)]
+
+    global _INIT_PHASE
+    _INIT_PHASE = True
+    for isl in range(NUM_ISLANDS_STAGE):
+        pop = generate_seeds_v5(n_features, feat_names)
+        try:
+            imp_seeds = generate_importance_biased_seeds(
+                n_features, feat_names, X_stage, res_stage)
+            pop.extend(imp_seeds)
+        except Exception:
+            pass
+
+        # Residual-correlated seeds: for each feature that correlates with
+        # the residuals, inject a targeted linear seed.  This dramatically
+        # accelerates boosting convergence on structured residual patterns.
+        try:
+            for fi in range(min(n_features, 8)):
+                xi = X_stage[:, fi]
+                if np.std(xi) < 1e-10:
+                    continue
+                r_corr = abs(float(np.corrcoef(xi, res_stage)[0, 1]))
+                if np.isnan(r_corr) or r_corr < 0.1:
+                    continue
+                # Linear seed: slope * feature
+                xi_var = float(np.var(xi))
+                if xi_var > 1e-10:
+                    slope = float(np.cov(xi, res_stage)[0, 1] / xi_var)
+                else:
+                    slope = 1.0
+                cgp = _make_cgp_base(n_features, feat_names)
+                nf = n_features
+                cgp.nodes[0] = CGPNode('const', 0, 0, slope)
+                cgp.nodes[1] = CGPNode('*', nf, fi)
+                cgp.out_idx = nf + 1; cgp.update_active_nodes()
+                pop.append(Individual(cgp))
+        except Exception:
+            pass
+
+        # Warm-start: inject mutations of the previous stage's best
+        if prev_stage_best is not None:
+            n_warm = min(5, max(1, POP_SIZE // 10))
+            for _ in range(n_warm):
+                warm_tree = mutate(prev_stage_best.tree, n_features,
+                                   feat_names, mut_rate=CGP_MUT_RATE * 2)
+                pop.append(Individual(warm_tree))
+
+        while len(pop) < POP_SIZE:
+            pop.append(Individual(random_cgp(n_features, CGP_NODES, feat_names)))
+        for ind in pop:
+            ind.calculate_fitness(X_stage, res_stage, 5,  # type 5 = regression
+                                  target_grads=stage_target_grads,
+                                  sample_weights=sw_stage)
+            stage_hof.update(ind)
+        islands_pop[isl].append(pop)
+    _INIT_PHASE = False
+
+    # Run evolution for gens_per_stage generations
+    MIGRATION_FREQ = 50
+    gen = 0
+    try:
+        with ProcessPoolExecutor(max_workers=NUM_ISLANDS_STAGE) as executor:
+            while gen < gens_per_stage:
+                batch_idx = (np.random.choice(X_stage.shape[0], BATCH_SIZE, replace=False)
+                             if BATCH_SIZE > 0 else None)
+                X_b = X_stage[batch_idx] if batch_idx is not None else X_stage
+                res_b = res_stage[batch_idx] if batch_idx is not None else res_stage
+
+                # Elitist HoF injection
+                hof_best = stage_hof.get_best_overall()
+                if hof_best is not None:
+                    for isl in range(NUM_ISLANDS_STAGE):
+                        pop = islands_pop[isl][0]
+                        if pop:
+                            pop_best = min(ind.loss for ind in pop)
+                            if hof_best.loss < pop_best - 1e-9:
+                                worst = max(pop, key=lambda x: x.fitness)
+                                pop.remove(worst)
+                                pop.append(copy.deepcopy(hof_best))
+
+                futures = []
+                for isl in range(NUM_ISLANDS_STAGE):
+                    args = (
+                        islands_pop[isl][0],
+                        X_b, res_b, 5,  # regression on residuals
+                        n_features, feat_names,
+                        MIGRATION_FREQ, isl, 0,
+                        150,  # extinction patience
+                        stagnation_counters[isl][0],
+                        list(_ADF_REGISTRY),
+                        None, None, None,   # no softmax group
+                        stage_target_grads,  # Sobolev
+                    )
+                    futures.append(executor.submit(evolve_island_chunk, args))
+
+                for future in concurrent.futures.as_completed(futures):
+                    ret_pop, local_hof, stag, isl_idx, _ = future.result()
+                    islands_pop[isl_idx][0] = ret_pop
+                    stagnation_counters[isl_idx][0] = stag
+                    for c, ind in local_hof.best_by_complexity.items():
+                        stage_hof.update(ind)
+
+                gen += MIGRATION_FREQ
+
+                # Migration
+                for isl in range(NUM_ISLANDS_STAGE):
+                    next_isl = (isl + 1) % NUM_ISLANDS_STAGE
+                    migrant = min(islands_pop[isl][0], key=lambda x: x.fitness)
+                    mc = copy.deepcopy(migrant); mc.age = 0
+                    tp = islands_pop[next_isl][0]
+                    tp.remove(random.choice(tp)); tp.append(mc)
+
+    except KeyboardInterrupt:
+        print("    (interrupted)")
+
+    return stage_hof
+
+
+def run_gradient_boosted_evolution(X, Y, n_features, n_outputs, feat_names,
+                                   out_types, dp, target_grads_list,
+                                   X_val=None, Y_val=None, BATCH_SIZE=0):
+    """
+    Run gradient-boosted CGP evolution.
+
+    Supports three modes:
+      • Regression:        classical L2 boosting (residuals = y - F(x))
+      • Binary classification:  logistic boosting (pseudo-residuals = y - σ(F))
+      • Multi-class classification: K-chain softmax boosting
+        (pseudo-residuals_k = y_k - softmax_k(F))
+
+    Improvements over vanilla GB:
+      - Per-stage Newton-step + grid line search for optimal learning rate
+      - Validation-based early stopping with snapshot/revert
+      - Stochastic boosting (row subsampling per stage)
+      - Learning rate decay across stages
+      - DART-style random stage dropping for regularisation
+      - L2 regularisation on stage contributions
+      - Warm-starting later stages with mutations of previous best
+      - Cumulative metric tracking at every stage
+    """
+    n_stages = GRADIENT_BOOSTING_STAGES
+    base_lr = GRADIENT_BOOSTING_LR
+    gens_per_stage = GRADIENT_BOOSTING_GENS
+    subsample_frac = GRADIENT_BOOSTING_SUBSAMPLE
+    lr_decay = GRADIENT_BOOSTING_LR_DECAY
+    l2_reg = GRADIENT_BOOSTING_L2_LEAF
+    dart_drop = GRADIENT_BOOSTING_DART_DROP
+    patience_limit = GRADIENT_BOOSTING_PATIENCE
+
+    # Detect classification groups
+    class_groups = detect_class_groups(dp, out_types)
+    # Build a set of all output indices that belong to a multiclass group
+    multiclass_outs = set()
+    for grp_indices in class_groups.values():
+        multiclass_outs.update(grp_indices)
+
+    print("\n" + "═" * 70)
+    print(f"GRADIENT BOOSTED EVOLUTION")
+    print(f"  Stages: {n_stages}  |  Base LR: {base_lr}  |  Gens/stage: {gens_per_stage}")
+    print(f"  Subsample: {subsample_frac:.0%}  |  LR decay: {lr_decay}  |  "
+          f"L2 reg: {l2_reg}")
+    if dart_drop > 0:
+        print(f"  DART dropout: {dart_drop:.0%}")
+    if GRADIENT_BOOSTING_HESSIAN:
+        print(f"  2nd-order Hessian fitness: ON (Newton-step targets for classification)")
+    print(f"  Line search: Newton + grid  |  Validation early-stop: "
+          f"{'ON (patience=' + str(patience_limit) + ')' if X_val is not None else 'OFF (no val set)'}")
+    has_cls = any(out_types[i] == 6 for i in range(n_outputs))
+    if has_cls:
+        print(f"  Classification outputs detected — using logistic/softmax boosting")
+        if class_groups:
+            for gname, gidx in class_groups.items():
+                print(f"    Multi-class group '{gname}': outputs {gidx}")
+    print("═" * 70)
+
+    boosted_models = [None] * n_outputs
+    N = X.shape[0]
+
+    # ─── Handle multiclass groups ────────────────────────────────────────
+    for grp_name, grp_indices in class_groups.items():
+        K = len(grp_indices)
+        y_onehot = Y[:, grp_indices]  # (N, K)
+        class_names = []
+        for gi in grp_indices:
+            class_names.append(dp.output_map[gi] if gi < len(dp.output_map) else f"cls{gi}")
+
+        print(f"\n  [Multiclass '{grp_name}'] {K} classes: {class_names}")
+
+        # Initialise: F_k = log(prior_k + eps)
+        priors = y_onehot.mean(axis=0).clip(1e-6, 1 - 1e-6)  # (K,)
+        log_priors = np.log(priors)
+        # Centre log-priors so they sum to ~0 (numerically cleaner softmax)
+        log_priors -= log_priors.mean()
+
+        mc_model = GradientBoostedModel(task='multiclass', n_classes=K,
+                                         class_names=class_names)
+        # Create K sub-chains
+        for k in range(K):
+            chain = GradientBoostedModel(intercept=float(log_priors[k]),
+                                          task='regression')
+            mc_model.class_chains.append(chain)
+
+        # Cumulative logits matrix
+        F = np.zeros((N, K))
+        for k in range(K):
+            F[:, k] = log_priors[k]
+
+        # Validation state
+        best_val_acc = -1.0
+        val_patience = 0
+
+        prev_bests = [None] * K  # warm-start per class
+
+        for stage in range(n_stages):
+            current_lr = base_lr * (lr_decay ** stage)
+
+            # Softmax probabilities from current ensemble
+            P = _softmax(F)  # (N, K)
+
+            print(f"\n    ── Stage {stage+1}/{n_stages} (lr={current_lr:.4f}) ──")
+
+            # Stochastic subsampling
+            if subsample_frac < 1.0:
+                n_sub = max(10, int(N * subsample_frac))
+                sub_idx = np.random.choice(N, n_sub, replace=False)
+            else:
+                sub_idx = None
+
+            for k in range(K):
+                # Pseudo-residuals: r_ik = y_ik - P_ik
+                pseudo_res = y_onehot[:, k] - P[:, k]
+
+                # 2nd-order (Hessian): Newton targets for softmax
+                # For softmax, h_ik = P_ik * (1 - P_ik) (diagonal of Hessian)
+                mc_hessian_weights = None
+                stage_residuals = pseudo_res
+                if GRADIENT_BOOSTING_HESSIAN:
+                    h_k = P[:, k] * (1.0 - P[:, k])
+                    h_k = np.clip(h_k, 1e-6, None)
+                    newton_t = pseudo_res / h_k
+                    newton_t = np.clip(newton_t, -50.0, 50.0)
+                    mc_hessian_weights = h_k
+                    stage_residuals = newton_t
+
+                # Evolve a CGP model on the (Newton) residuals
+                stage_hof = HallOfFame()
+                stage_hof = _run_boosting_stage_evolution(
+                    X, stage_residuals, n_features, feat_names,
+                    stage_hof, gens_per_stage, prev_bests[k], BATCH_SIZE,
+                    subsample_idx=sub_idx,
+                    sample_weights=mc_hessian_weights)
+
+                best_stage = stage_hof.get_best_overall()
+                if best_stage is None:
+                    print(f"      Class {k} ({class_names[k]}): no valid model, skipping")
+                    continue
+
+                prev_bests[k] = best_stage
+
+                # Line-search for this class (regression on pseudo-residuals)
+                preds_raw = best_stage.tree.evaluate(X)
+                preds_raw = np.clip(np.nan_to_num(preds_raw, nan=0.0,
+                                                   posinf=1e9, neginf=-1e9),
+                                    -1e9, 1e9)
+                stage_lr = _boosting_line_search(
+                    pseudo_res, preds_raw,
+                    getattr(best_stage, 'affine_a', 1.0),
+                    getattr(best_stage, 'affine_b', 0.0),
+                    current_lr, l2_reg=l2_reg)
+
+                # Update logits
+                scaled = stage_lr * (best_stage.affine_a * preds_raw
+                                     + best_stage.affine_b)
+                F[:, k] += scaled
+                mc_model.class_chains[k].add_stage(best_stage, stage_lr)
+
+                print(f"      Class {k} ({class_names[k]}): lr={stage_lr:.4f}  "
+                      f"expr={str(best_stage.tree)}")
+
+            # Cumulative train accuracy
+            train_pred_cls = np.argmax(F, axis=1)
+            train_true_cls = np.argmax(y_onehot, axis=1)
+            train_acc = float(np.mean(train_pred_cls == train_true_cls))
+            # Log-loss
+            P_new = _softmax(F)
+            train_logloss = float(-np.mean(np.sum(
+                y_onehot * np.log(P_new.clip(1e-15, 1.0)), axis=1)))
+            print(f"    Cumulative train accuracy: {train_acc:.4f}  "
+                  f"log-loss: {train_logloss:.5f}")
+
+            # Validation early stopping
+            if X_val is not None and Y_val is not None:
+                val_proba = mc_model.predict(X_val)
+                val_pred_cls = np.argmax(val_proba, axis=1)
+                val_true_cls = np.argmax(Y_val[:, grp_indices], axis=1)
+                val_acc = float(np.mean(val_pred_cls == val_true_cls))
+                improved = mc_model.snapshot(val_acc)
+                print(f"    Cumulative val   accuracy: {val_acc:.4f}", end="")
+                if improved:
+                    val_patience = 0
+                    print("  ✓ (new best)")
+                else:
+                    val_patience += 1
+                    print(f"  (patience {val_patience}/{patience_limit})")
+                    if val_patience >= patience_limit:
+                        print(f"    Early stopping: val accuracy stalled.")
+                        mc_model.revert_to_snapshot()
+                        break
+
+        # Assign to all outputs in the group
+        for gi in grp_indices:
+            boosted_models[gi] = mc_model
+
+    # ─── Handle binary classification + regression outputs ───────────────
+    for o_idx in range(n_outputs):
+        if o_idx in multiclass_outs:
+            continue  # already handled above
+
+        out_label = dp.output_map[o_idx] if o_idx < len(dp.output_map) else f"Out{o_idx}"
+        y_target = Y[:, o_idx]
+        is_binary_cls = (out_types[o_idx] == 6)
+
+        if is_binary_cls:
+            # ── Binary logistic boosting ──────────────────────────────
+            y_binary = y_target.clip(0, 1)
+            p_mean = float(np.mean(y_binary)).clip(1e-6, 1 - 1e-6)
+            F0 = np.log(p_mean / (1 - p_mean))  # log-odds intercept
+
+            boosted = GradientBoostedModel(intercept=F0, task='binary_cls')
+            F = np.full(N, F0)
+            metric_name = "Accuracy"
+            print(f"\n  [Output {o_idx} ({out_label})] Binary classification boosting…")
+            print(f"    Prior: {p_mean:.4f}  →  log-odds intercept: {F0:.4f}")
+
+        else:
+            # ── Regression boosting ───────────────────────────────────
+            y_mean = float(np.mean(y_target))
+            boosted = GradientBoostedModel(intercept=y_mean, task='regression')
+            F = np.full(N, y_mean)
+            metric_name = "R²"
+            ss_tot = float(np.sum((y_target - y_mean) ** 2)) + 1e-8
+            print(f"\n  [Output {o_idx} ({out_label})] Regression boosting…")
+            print(f"    Initial residual variance: {np.var(y_target - y_mean):.6f}")
+
+        best_val_metric = -float('inf')
+        val_patience = 0
+        prev_stage_best = None
+
+        for stage in range(n_stages):
+            current_lr = base_lr * (lr_decay ** stage)
+
+            # ── Compute residuals / Newton targets ─────────────────────────
+            hessian_weights = None   # sample weights for 2nd-order mode
+            if is_binary_cls:
+                p = _sigmoid(F)
+                # 1st-order pseudo-residuals
+                residuals = y_binary - p
+
+                # 2nd-order (Hessian): Newton step targets + weights
+                if GRADIENT_BOOSTING_HESSIAN:
+                    h = p * (1.0 - p)
+                    h = np.clip(h, 1e-6, None)  # prevent division instabilities
+                    # Newton targets: r_i / h_i = (y - p) / (p*(1-p))
+                    # The evolved model should approximate this for optimal step
+                    newton_targets = residuals / h
+                    # Clip extreme Newton targets (near-certain predictions cause
+                    # huge targets like (1-1e-6)/1e-6 ≈ 1e6)
+                    newton_targets = np.clip(newton_targets, -50.0, 50.0)
+                    hessian_weights = h
+                    residuals = newton_targets
+            else:
+                residuals = y_target - F
+
+            res_var = float(np.var(residuals))
+            if res_var < 1e-12:
+                print(f"    Stage {stage+1}: residuals ≈ 0, stopping early.")
+                break
+
+            print(f"\n    ── Stage {stage+1}/{n_stages}  "
+                  f"(residual var={res_var:.6f}, lr={current_lr:.4f}) ──")
+
+            # DART: randomly drop previous stages for regularisation
+            dropped_stages = []
+            if dart_drop > 0 and len(boosted.stages) > 0:
+                n_drop = 0
+                for s_idx in range(len(boosted.stages)):
+                    if random.random() < dart_drop:
+                        n_drop += 1
+                        dropped_stages.append(s_idx)
+                if dropped_stages:
+                    # Recompute F without the dropped stages
+                    F_nodrop = np.full(N, boosted.intercept)
+                    for s_idx, (ind, lr) in enumerate(boosted.stages):
+                        if s_idx not in dropped_stages:
+                            raw = ind.tree.evaluate(X)
+                            raw = np.clip(np.nan_to_num(raw, nan=0.0,
+                                          posinf=1e9, neginf=-1e9), -1e9, 1e9)
+                            F_nodrop += lr * (ind.affine_a * raw + ind.affine_b)
+                    if is_binary_cls:
+                        p_drop = _sigmoid(F_nodrop)
+                        residuals = y_binary - p_drop
+                        if GRADIENT_BOOSTING_HESSIAN:
+                            h_drop = np.clip(p_drop * (1.0 - p_drop), 1e-6, None)
+                            residuals = np.clip(residuals / h_drop, -50.0, 50.0)
+                            hessian_weights = h_drop
+                    else:
+                        residuals = y_target - F_nodrop
+                    print(f"      DART: dropped {len(dropped_stages)} stage(s)")
+
+            # Stochastic subsampling
+            if subsample_frac < 1.0:
+                n_sub = max(10, int(N * subsample_frac))
+                sub_idx = np.random.choice(N, n_sub, replace=False)
+            else:
+                sub_idx = None
+
+            # Evolve CGP on residuals
+            stage_hof = HallOfFame()
+            stage_hof = _run_boosting_stage_evolution(
+                X, residuals, n_features, feat_names,
+                stage_hof, gens_per_stage, prev_stage_best, BATCH_SIZE,
+                subsample_idx=sub_idx,
+                sample_weights=hessian_weights)
+
+            best_stage = stage_hof.get_best_overall()
+            if best_stage is None:
+                print(f"    Stage {stage+1}: no valid model found, stopping.")
+                break
+
+            prev_stage_best = best_stage
+
+            # Line-search
+            preds_raw = best_stage.tree.evaluate(X)
+            preds_raw = np.clip(np.nan_to_num(preds_raw, nan=0.0,
+                                              posinf=1e9, neginf=-1e9),
+                                -1e9, 1e9)
+
+            if is_binary_cls:
+                scaled_preds = (best_stage.affine_a * preds_raw
+                                + best_stage.affine_b)
+                stage_lr = _boosting_cls_line_search(
+                    F, scaled_preds, y_binary, current_lr)
+            else:
+                stage_lr = _boosting_line_search(
+                    residuals, preds_raw,
+                    getattr(best_stage, 'affine_a', 1.0),
+                    getattr(best_stage, 'affine_b', 0.0),
+                    current_lr, l2_reg=l2_reg)
+
+            # Update ensemble
+            stage_contrib = stage_lr * (best_stage.affine_a * preds_raw
+                                        + best_stage.affine_b)
+
+            # If DART dropped stages, rescale new stage to compensate
+            if dropped_stages:
+                n_active = len(boosted.stages) - len(dropped_stages) + 1
+                dart_scale = (len(boosted.stages) + 1) / (n_active + 1e-30)
+                stage_contrib *= dart_scale
+
+            F = F + stage_contrib
+            boosted.add_stage(best_stage, stage_lr)
+
+            lr_note = f"  (line-search: {stage_lr:.4f})" if abs(stage_lr - current_lr) > 1e-6 else ""
+
+            # Cumulative metrics
+            if is_binary_cls:
+                cum_proba = _sigmoid(F)
+                cum_pred_cls = (cum_proba >= 0.5).astype(int)
+                cum_acc = float(np.mean(cum_pred_cls == y_binary.astype(int)))
+                cum_logloss = float(np.mean(
+                    np.maximum(F, 0) - F * y_binary +
+                    np.log1p(np.exp(-np.abs(F)))))
+                cum_metric = cum_acc
+                print(f"    Stage {stage+1} done: loss={best_stage.loss:.5f}  "
+                      f"expr={str(best_stage.tree)}")
+                new_res_var = float(np.var(y_binary - _sigmoid(F)))
+                print(f"    Residual var: {res_var:.6f} → {new_res_var:.6f}{lr_note}")
+                print(f"    Cumulative train accuracy: {cum_acc:.4f}  "
+                      f"log-loss: {cum_logloss:.5f}")
+            else:
+                cum_ss_res = float(np.sum((y_target - F) ** 2))
+                cum_r2 = 1.0 - cum_ss_res / ss_tot
+                cum_metric = cum_r2
+                new_res_var = float(np.var(y_target - F))
+                improvement = 1.0 - new_res_var / (res_var + 1e-30)
+                print(f"    Stage {stage+1} done: loss={best_stage.loss:.5f}  "
+                      f"stage R²={best_stage.r2:.4f}  expr={str(best_stage.tree)}")
+                print(f"    Residual var: {res_var:.6f} → {new_res_var:.6f}  "
+                      f"({improvement*100:.1f}% reduction){lr_note}")
+                print(f"    Cumulative train R²: {cum_r2:.6f}")
+
+            # Validation early stopping
+            if X_val is not None and Y_val is not None:
+                y_val_target = Y_val[:, o_idx]
+                if is_binary_cls:
+                    val_proba = boosted.predict(X_val)
+                    val_pred_cls = (val_proba >= 0.5).astype(int)
+                    val_metric = float(np.mean(
+                        val_pred_cls == y_val_target.clip(0, 1).astype(int)))
+                    metric_label = "accuracy"
+                else:
+                    val_pred = boosted.predict(X_val)
+                    ss_res_v = float(np.sum((y_val_target - val_pred) ** 2))
+                    ss_tot_v = float(np.sum(
+                        (y_val_target - np.mean(y_val_target)) ** 2)) + 1e-8
+                    val_metric = 1.0 - ss_res_v / ss_tot_v
+                    metric_label = "R²"
+
+                improved = boosted.snapshot(val_metric)
+                print(f"    Cumulative val {metric_label}: {val_metric:.6f}", end="")
+                if improved:
+                    val_patience = 0
+                    print("  ✓ (new best)")
+                else:
+                    val_patience += 1
+                    print(f"  (patience {val_patience}/{patience_limit})")
+                    if val_patience >= patience_limit:
+                        print(f"    Early stopping: val {metric_label} stalled for "
+                              f"{patience_limit} stages.")
+                        boosted.revert_to_snapshot()
+                        break
+
+        boosted_models[o_idx] = boosted
+
+        # Final metrics
+        if is_binary_cls:
+            final_proba = boosted.predict(X)
+            final_pred = (final_proba >= 0.5).astype(int)
+            final_acc = float(np.mean(final_pred == y_binary.astype(int)))
+            final_ll = float(np.mean(
+                np.maximum(boosted._predict_raw(X), 0)
+                - boosted._predict_raw(X) * y_binary
+                + np.log1p(np.exp(-np.abs(boosted._predict_raw(X))))))
+            print(f"\n    Final boosted accuracy for output {o_idx}: {final_acc:.4f}")
+            print(f"    Final boosted log-loss : {final_ll:.5f}")
+        else:
+            y_pred = boosted.predict(X)
+            ss_res = float(np.sum((y_target - y_pred) ** 2))
+            boosted_r2 = 1.0 - ss_res / ss_tot
+            print(f"\n    Final boosted R² for output {o_idx}: {boosted_r2:.6f}")
+
+        print(f"    Total stages used: {len(boosted.stages)}")
+
+        if X_val is not None and Y_val is not None:
+            y_val_target = Y_val[:, o_idx]
+            if is_binary_cls:
+                val_proba = boosted.predict(X_val)
+                val_pred = (val_proba >= 0.5).astype(int)
+                val_acc = float(np.mean(
+                    val_pred == y_val_target.clip(0, 1).astype(int)))
+                print(f"    Final Validation Accuracy: {val_acc:.4f}")
+            else:
+                y_val_pred = boosted.predict(X_val)
+                ss_res_v = float(np.sum((y_val_target - y_val_pred) ** 2))
+                ss_tot_v = float(np.sum(
+                    (y_val_target - np.mean(y_val_target)) ** 2)) + 1e-8
+                val_r2 = 1.0 - ss_res_v / ss_tot_v
+                print(f"    Final Validation R²: {val_r2:.6f}")
+
+        # Check if this boosted output reached perfect performance
+        _perf = False
+        if is_binary_cls:
+            _final_proba = boosted.predict(X)
+            _final_pred = (_final_proba >= 0.5).astype(int)
+            _final_acc = float(np.mean(_final_pred == y_target.clip(0, 1).astype(int)))
+            _perf = _final_acc >= _PERFECT_ACCURACY_THRESHOLD
+        else:
+            _y_pred_perf = boosted.predict(X)
+            _mse_perf = float(np.mean((y_target - _y_pred_perf) ** 2))
+            _ss_res_perf = float(np.sum((y_target - _y_pred_perf) ** 2))
+            _ss_tot_perf = float(np.sum((y_target - np.mean(y_target)) ** 2)) + 1e-8
+            _r2_perf = 1.0 - _ss_res_perf / _ss_tot_perf
+            _perf = _r2_perf >= _PERFECT_R2_THRESHOLD and _mse_perf <= _PERFECT_MSE_THRESHOLD
+
+        if _perf:
+            print(f"\n    ★ Output {o_idx} ({out_label}) reached PERFECT boosted performance!")
+            print(f"      Saving backup boosted model...")
+            _generate_boosted_script(boosted_models, dp, X_data=X)
+            out_safe = re.sub(r'[^a-zA-Z0-9_]', '_', out_label)
+            # Also save a dedicated backup
+            try:
+                import shutil
+                shutil.copy("best_boosted_model.py", f"backup_perfect_boosted_{out_safe}.py")
+                print(f"      Backup saved to: backup_perfect_boosted_{out_safe}.py")
+            except Exception:
+                pass
+
+    return boosted_models
+
+
+def _generate_boosted_script(boosted_models, dp, X_data=None):
+    """Generate a standalone Python script for gradient-boosted models.
+
+    Mirrors the full generate_script() output: embeds the DataProcessor class,
+    pickles dp for transform_input_sample/inverse_transform_output, tracks
+    USED_COLS, emits ADF helpers, and provides an interactive main() prompt.
+    """
+    import inspect
+
+    out_types = dp.get_output_types_flat()
+
+    # ------------------------------------------------------------------ #
+    # 0. Find used inputs by tracing active nodes across all stage models
+    # ------------------------------------------------------------------ #
+    used_feature_indices = set()
+    all_stage_inds = []
+    seen_bm_ids = set()
+    for bm in boosted_models:
+        if bm is None or id(bm) in seen_bm_ids:
+            continue
+        seen_bm_ids.add(id(bm))
+        # Collect stages from either flat stages or multiclass class_chains
+        stages_to_scan = []
+        if bm.task == 'multiclass':
+            for chain in bm.class_chains:
+                stages_to_scan.extend(chain.stages)
+        else:
+            stages_to_scan = bm.stages
+        for ind, _lr in stages_to_scan:
+            all_stage_inds.append(ind)
+            ind.tree.update_active_nodes()
+            for idx in ind.tree.active_nodes:
+                if idx < ind.tree.n_features:
+                    used_feature_indices.add(idx)
+
+    used_input_map_names = set(dp.input_map[idx] for idx in used_feature_indices)
+
+    used_cols = []
+    for col, type_c in dp.col_configs:
+        if type_c in [0, 5, 6, 7]:
+            continue
+        if type_c == 1:
+            if col in used_input_map_names:
+                used_cols.append(col)
+        elif type_c == 2:
+            stat = dp.stats.get(col, {})
+            for cls in stat.get('classes', []):
+                if f"{col}_{cls}" in used_input_map_names:
+                    used_cols.append(col)
+                    break
+        elif type_c == 3:
+            stat = dp.stats.get(col, {})
+            chars = stat.get('char_map', {}).keys()
+            max_len = stat.get('max_len', 1)
+            found = False
+            for j in range(max_len):
+                for c in chars:
+                    if f"{col}_pos{j}_{c}" in used_input_map_names:
+                        used_cols.append(col)
+                        found = True
+                        break
+                if found:
+                    break
+
+    # 1. Resolve clean variable names (deduplicated)
+    clean_names = [clean_var_name(n) for n in dp.input_map]
+    seen = {}
+    final_vars = []
+    for name in clean_names:
+        if name in seen:
+            seen[name] += 1
+            final_vars.append(f"{name}_{seen[name]}")
+        else:
+            seen[name] = 0
+            final_vars.append(name)
+
+    # 2. Build numpy expression code for each output
+    sym_vars = [sympy.Symbol(n) for n in final_vars] if sympy else []
+
+    # ---- ADF helper code ----
+    adf_helper_code = ""
+    emitted_adfs = set()
+
+    def _adf_node_data_to_numpy(d):
+        """Render an ADF's node_data list as a self-contained numpy lambda string."""
+        n_in   = d['n_inputs']
+        nodes  = d['node_data']
+        n_slots = d['total_slots']
+        out_s   = d['output_slot']
+
+        arg_names = [f"_a{i}" for i in range(n_in)]
+        lines = ["    import numpy as _np"]
+        lines.append(f"    _buf = _np.zeros(({n_slots}, len(_a0) if hasattr(_a0,'__len__') else 1))")
+        for i_a, a in enumerate(arg_names):
+            lines.append(f"    _buf[{i_a}] = {a}")
+        for j, (op, in1, in2, cval) in enumerate(nodes):
+            slot = n_in + j
+            v1 = f"_buf[{in1}]"
+            v2 = f"_buf[{in2}]"
+            cval_r = repr(float(cval))
+            if op == 'const':
+                lines.append(f"    _buf[{slot}] = {cval_r}")
+            elif op == '+':
+                lines.append(f"    _buf[{slot}] = {v1} + {v2}")
+            elif op == '-':
+                lines.append(f"    _buf[{slot}] = {v1} - {v2}")
+            elif op == '*':
+                lines.append(f"    _buf[{slot}] = {v1} * {v2}")
+            elif op == '/':
+                lines.append(f"    _buf[{slot}] = _np.where(_np.abs({v2})>1e-8, {v1}/{v2}, 0.0)")
+            elif op == 'pow':
+                lines.append(f"    _buf[{slot}] = _np.where(_np.abs(_np.round({v2}) - {v2}) < 1e-4, _np.where(_np.abs(_np.mod(_np.round({v2}), 2)) < 1e-8, _np.power(_np.abs({v1}) + 1e-30, _np.clip({v2}, -250.0, 250.0)), _np.copysign(_np.power(_np.abs({v1}) + 1e-30, _np.clip({v2}, -250.0, 250.0)), {v1})), _np.power(_np.abs({v1}) + 1e-30, _np.clip({v2}, -250.0, 250.0)))")
+            elif op in ('sin','cos','tan','tanh','abs','sign','floor','ceil'):
+                lines.append(f"    _buf[{slot}] = _np.{op}({v1})")
+            elif op == 'exp':
+                lines.append(f"    _buf[{slot}] = _np.exp(_np.clip({v1}, -700.0, 700.0))")
+            elif op == 'log':
+                lines.append(f"    _buf[{slot}] = _np.log(_np.abs({v1})+1e-30)")
+            elif op == 'sqrt':
+                lines.append(f"    _buf[{slot}] = _np.sqrt(_np.abs({v1}))")
+            elif op == 'square':
+                lines.append(f"    _buf[{slot}] = {v1}*{v1}")
+            elif op == 'neg':
+                lines.append(f"    _buf[{slot}] = -{v1}")
+            elif op == 'frac':
+                lines.append(f"    _buf[{slot}] = {v1} - _np.floor({v1})")
+            elif op == 'round':
+                lines.append(f"    _buf[{slot}] = _np.round({v1})")
+            elif op == 'floordiv':
+                lines.append(f"    _buf[{slot}] = _np.floor({v1} / _np.where(_np.abs({v2})>1e-8, {v2}, 1e-8))")
+            elif op == 'relu':
+                lines.append(f"    _buf[{slot}] = _np.maximum(0.0, {v1})")
+            elif op == 'sigmoid':
+                lines.append(f"    _buf[{slot}] = 1.0/(1.0+_np.exp(-_np.clip({v1},-50,50)))")
+            elif op == 'cube':
+                lines.append(f"    _buf[{slot}] = {v1}**3")
+            elif op == 'inv':
+                lines.append(f"    _buf[{slot}] = 1.0/(_np.abs({v1})+1e-30)")
+            elif op == 'gaussian':
+                lines.append(f"    _buf[{slot}] = _np.exp(-_np.clip({v1}**2,0,500))")
+            elif op.startswith('adf_'):
+                lines.append(f"    _buf[{slot}] = {op}({v1}, {v2})")
+            else:
+                lines.append(f"    _buf[{slot}] = 0.0  # unknown op: {op}")
+            lines.append(f"    _buf[{slot}] = _np.nan_to_num(_buf[{slot}], nan=0., posinf=1e9, neginf=-1e9)")
+        lines.append(f"    return _buf[{out_s}].squeeze() if hasattr(_a0,'__len__') else float(_buf[{out_s}][0])")
+        args_sig = ", ".join(arg_names)
+        body = "\n".join(lines)
+        return args_sig, body
+
+    for ind in all_stage_inds:
+        ind.tree.update_active_nodes()
+        for nidx in ind.tree.active_nodes:
+            if nidx < ind.tree.n_features:
+                continue
+            op = ind.tree.nodes[nidx - ind.tree.n_features].op
+            if op.startswith('adf_') and op not in emitted_adfs:
+                adf_dict = next((d for d in _ADF_REGISTRY if d['name'] == op), None)
+                if adf_dict:
+                    args_sig, body = _adf_node_data_to_numpy(adf_dict)
+                    adf_helper_code += f"\ndef {op}({args_sig}):\n{body}\n"
+                    emitted_adfs.add(op)
+
+    # ---- Build expression code per stage per output ----
+    eq_code = ""
+    # Helper to emit sympy-simplified numpy expression for a stage individual
+    def _ind_to_numpy_expr(ind):
+        a = getattr(ind, 'affine_a', 1.0)
+        b = getattr(ind, 'affine_b', 0.0)
+        if sympy is not None:
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    raw_sym = tree_to_sympy(ind.tree, sym_vars, safe=SAFE_OPS_MODE)
+                    simplified = advanced_simplify_expr(raw_sym)
+                py_expr = NumPyPrinter().doprint(simplified)
+                py_expr = py_expr.replace('numpy.', 'np.')
+            except Exception:
+                py_expr = str(ind.tree)
+        else:
+            py_expr = str(ind.tree)
+        return py_expr, a, b
+
+    seen_mc_ids = set()
+    for i, bm in enumerate(boosted_models):
+        out_name = dp.output_map[i] if i < len(dp.output_map) else f"Out{i}"
+        if bm is None:
+            eq_code += f"    # Output {i} ({out_name}): no boosted model\n"
+            eq_code += f"    y_pred[:, {i}] = 0.0\n\n"
+            continue
+
+        if bm.task == 'multiclass':
+            bm_id = id(bm)
+            if bm_id in seen_mc_ids:
+                continue  # already emitted for this group
+            seen_mc_ids.add(bm_id)
+
+            # Find all output indices for this multiclass group
+            grp_indices = [j for j in range(len(boosted_models))
+                           if boosted_models[j] is bm]
+            K = bm.n_classes
+            eq_code += f"    # Multiclass group: outputs {grp_indices} ({K} classes)\n"
+            eq_code += f"    _mc_logits = np.zeros((N, {K}))\n"
+            for k, chain in enumerate(bm.class_chains):
+                eq_code += f"    _mc_logits[:, {k}] = {chain.intercept}\n"
+                for s, (ind, stage_lr) in enumerate(chain.stages):
+                    py_expr, a, b = _ind_to_numpy_expr(ind)
+                    eq_code += f"    _mc_s{k}_{s} = {py_expr}\n"
+                    eq_code += f"    _mc_s{k}_{s} = np.clip(np.nan_to_num(_mc_s{k}_{s}, nan=0.0, posinf=1e9, neginf=-1e9), -1e9, 1e9)\n"
+                    eq_code += f"    _mc_logits[:, {k}] += {stage_lr} * ({a} * _mc_s{k}_{s} + {b})\n"
+            eq_code += f"    # Softmax\n"
+            eq_code += f"    _mc_max = _mc_logits.max(axis=1, keepdims=True)\n"
+            eq_code += f"    _mc_exp = np.exp(np.clip(_mc_logits - _mc_max, -500, 0))\n"
+            eq_code += f"    _mc_proba = _mc_exp / (_mc_exp.sum(axis=1, keepdims=True) + 1e-30)\n"
+            for local_k, gi in enumerate(grp_indices):
+                eq_code += f"    y_pred[:, {gi}] = _mc_proba[:, {local_k}]\n"
+            eq_code += "\n"
+
+        elif bm.task == 'binary_cls':
+            n_stg = len(bm.stages)
+            eq_code += f"    # Output {i} ({out_name}): binary classification ({n_stg} stages)\n"
+            eq_code += f"    _logit = np.full(N, {bm.intercept})\n"
+            for s, (ind, stage_lr) in enumerate(bm.stages):
+                py_expr, a, b = _ind_to_numpy_expr(ind)
+                eq_code += f"    _bstg{s} = {py_expr}\n"
+                eq_code += f"    _bstg{s} = np.clip(np.nan_to_num(_bstg{s}, nan=0.0, posinf=1e9, neginf=-1e9), -1e9, 1e9)\n"
+                eq_code += f"    _logit += {stage_lr} * ({a} * _bstg{s} + {b})\n"
+            eq_code += f"    y_pred[:, {i}] = 1.0 / (1.0 + np.exp(-np.clip(_logit, -500, 500)))\n\n"
+
+        else:  # regression
+            eq_code += f"    # Output {i} ({out_name}): boosted model ({len(bm.stages)} stages)\n"
+            eq_code += f"    _acc = np.full(N, {bm.intercept})\n"
+            for s, (ind, stage_lr) in enumerate(bm.stages):
+                py_expr, a, b = _ind_to_numpy_expr(ind)
+                eq_code += f"    _stage{s} = {py_expr}\n"
+                eq_code += f"    _stage{s} = np.clip(np.nan_to_num(_stage{s}, nan=0.0, posinf=1e9, neginf=-1e9), -1e9, 1e9)\n"
+                eq_code += f"    _acc += {stage_lr} * ({a} * _stage{s} + {b})\n"
+            eq_code += f"    y_pred[:, {i}] = _acc\n\n"
+
+    unpack_code = "".join(
+        f"    {name} = _X_mat[:, {idx}]\n" for idx, name in enumerate(final_vars)
+    )
+
+    # ------------------------------------------------------------------ #
+    # 2b. Compute feature ranges for plotting
+    # ------------------------------------------------------------------ #
+    feature_ranges = {}
+    if X_data is not None:
+        for idx in range(len(final_vars)):
+            col = X_data[:, idx]
+            feature_ranges[idx] = (float(np.nanmin(col)), float(np.nanmax(col)), float(np.nanmean(col)))
+
+    # ------------------------------------------------------------------ #
+    # 3. Embed DataProcessor source so pickle can find the class.
+    # ------------------------------------------------------------------ #
+    try:
+        dp_class_src = inspect.getsource(DataProcessor)
+    except Exception:
+        dp_class_src = "# DataProcessor source unavailable"
+
+    dp_bytes = pickle.dumps(dp)
+    dp_b64   = base64.b64encode(dp_bytes).decode('utf-8')
+
+    dp_class_src = "\n".join(
+        line for line in dp_class_src.splitlines()
+    )
+
+    output_names_list = [dp.output_map[i] if i < len(dp.output_map) else f"Out{i}" for i in range(len(boosted_models))]
+
+    script_content = f'''import numpy as np
+import pandas as pd
+import pickle
+import base64
+import math
+import sys
+import warnings
+import functools
+np.seterr(all="ignore")
+warnings.filterwarnings("ignore")
+
+# ── Vectorised helper: erf (math.erf is scalar-only) ─────────────────────────
+def _erf_vec(x):
+    """Vectorised error function — wraps scipy if available, else math.erf."""
+    x = np.asarray(x, dtype=float)
+    try:
+        from scipy.special import erf as _sp_erf
+        return _sp_erf(x)
+    except ImportError:
+        return np.vectorize(math.erf)(x)
+# Monkey-patch so that SymPy-generated math.erf(…) calls work on arrays
+math.erf = _erf_vec
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── DataProcessor class (embedded so pickle can resolve it) ──────────────────
+{dp_class_src}
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── ADF (Automatically Defined Functions) — frozen sub-graph operators ────────
+{adf_helper_code if adf_helper_code else "# (no ADF operators used in this model)"}
+# ─────────────────────────────────────────────────────────────────────────────
+
+USED_COLS = {repr(used_cols)}
+FEATURE_NAMES = {repr(final_vars)}
+FEATURE_RANGES = {repr(feature_ranges)}
+OUTPUT_NAMES = {repr(output_names_list)}
+N_FEATURES = {len(final_vars)}
+N_OUTPUTS = {len(boosted_models)}
+
+DP_B64 = "{dp_b64}"
+dp = pickle.loads(base64.b64decode(DP_B64))
+
+
+def predict(input_dict):
+    """Predict from a dict of column_name → value (handles preprocessing)."""
+    try:
+        X_vec = dp.transform_input_sample(input_dict)
+    except Exception as e:
+        print(f"Error: {{e}}")
+        return None
+    _X_mat = X_vec.reshape(1, -1)
+    N = 1
+
+{unpack_code}
+
+    n_outputs = N_OUTPUTS
+    y_pred = np.zeros((N, n_outputs))
+
+{eq_code}
+
+    return dp.inverse_transform_output(y_pred[0])
+
+
+def predict_raw(X):
+    """Predict from a raw numpy array of shape (N, {len(final_vars)}).
+    Skips DataProcessor preprocessing — use when data is already transformed.
+    """
+    _X_mat = np.asarray(X, dtype=float)
+    if _X_mat.ndim == 1:
+        _X_mat = _X_mat.reshape(1, -1)
+    N = _X_mat.shape[0]
+
+{unpack_code}
+
+    n_outputs = N_OUTPUTS
+    y_pred = np.zeros((N, n_outputs))
+
+{eq_code}
+
+    return y_pred
+
+
+def _sanitize_filename(name):
+    """Replace characters that are unsafe for filenames with safe variants."""
+    import re as _re
+    # Replace common unsafe chars with descriptive alternatives
+    replacements = {{'/': '_div_', '\\\\': '_bslash_', ':': '_', '*': '_star_',
+                    '?': '_', '"': '_', '<': '_lt_', '>': '_gt_', '|': '_pipe_',
+                    ' ': '_'}}
+    for ch, repl in replacements.items():
+        name = name.replace(ch, repl)
+    # Remove any remaining non-alphanumeric chars (except - _ .)
+    name = _re.sub(r'[^\\w.\\-]', '_', name)
+    # Collapse multiple underscores
+    name = _re.sub(r'_+', '_', name).strip('_')
+    return name if name else 'unnamed'
+
+
+def plot_model():
+    """Generate plots of model outputs vs inputs (1D and 2D) and save to evo_plots/."""
+    import os
+    import shutil
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+    except Exception:
+        pass
+    try:
+        import matplotlib.pyplot as plt
+        from matplotlib import cm
+    except ImportError:
+        print("matplotlib is required for plotting. Install with: pip install matplotlib")
+        return
+
+    if not FEATURE_RANGES:
+        print("No feature range data available (model was saved without training data).")
+        return
+
+    n_feat = N_FEATURES
+    n_out = N_OUTPUTS
+    resolution = 200
+
+    # Build defaults
+    feat_defaults = {{}}
+    feat_mins = {{}}
+    feat_maxs = {{}}
+    for idx_str, (fmin, fmax, fmean) in FEATURE_RANGES.items():
+        idx = int(idx_str) if isinstance(idx_str, str) else idx_str
+        feat_defaults[idx] = fmean
+        feat_mins[idx] = fmin
+        feat_maxs[idx] = fmax
+
+    # Prepare output directory
+    plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "evo_plots")
+    if os.path.exists(plot_dir):
+        shutil.rmtree(plot_dir)
+    os.makedirs(plot_dir)
+
+    # Create per-output subdirectories
+    out_dirs = {{}}
+    for out_idx in range(n_out):
+        safe_name = _sanitize_filename(OUTPUT_NAMES[out_idx])
+        out_path = os.path.join(plot_dir, safe_name)
+        os.makedirs(out_path, exist_ok=True)
+        out_dirs[out_idx] = out_path
+
+    print("\\n--- MODEL PLOTTING ---")
+    print(f"Features ({{n_feat}}): {{', '.join(FEATURE_NAMES)}}")
+    print(f"Outputs  ({{n_out}}): {{', '.join(OUTPUT_NAMES)}}")
+    print(f"Saving plots to: {{plot_dir}}")
+
+    # Ask user for custom frozen values
+    print("\\nFrozen input defaults (mean of training data):")
+    for idx in range(n_feat):
+        print(f"  {{FEATURE_NAMES[idx]}}: {{feat_defaults.get(idx, 0.0):.4g}}"
+              f"  (range: {{feat_mins.get(idx, 0.0):.4g}} to {{feat_maxs.get(idx, 0.0):.4g}})")
+    custom = input("\\nCustomize frozen values? [y/N]: ").strip().lower()
+    if custom == 'y':
+        for idx in range(n_feat):
+            val = input(f"  {{FEATURE_NAMES[idx]}} [{{feat_defaults.get(idx, 0.0):.4g}}]: ").strip()
+            if val:
+                try:
+                    feat_defaults[idx] = float(val)
+                except ValueError:
+                    pass
+
+    plot_count = 0
+
+    # 1D plots: each feature vs each output
+    print("\\nGenerating 1D plots (each input vs each output)...")
+    for feat_idx in range(n_feat):
+        fmin = feat_mins.get(feat_idx, 0.0)
+        fmax = feat_maxs.get(feat_idx, 1.0)
+        if abs(fmax - fmin) < 1e-12:
+            continue
+        x_range = np.linspace(fmin, fmax, resolution)
+        X_grid = np.tile([feat_defaults.get(i, 0.0) for i in range(n_feat)], (resolution, 1))
+        X_grid[:, feat_idx] = x_range
+        y_pred = predict_raw(X_grid)
+
+        for out_idx in range(n_out):
+            fig, ax = plt.subplots(figsize=(8, 5))
+            ax.plot(x_range, y_pred[:, out_idx], linewidth=2)
+            frozen_str = ", ".join(
+                f"{{FEATURE_NAMES[i]}}={{feat_defaults.get(i, 0.0):.3g}}"
+                for i in range(n_feat) if i != feat_idx)
+            ax.set_xlabel(FEATURE_NAMES[feat_idx])
+            ax.set_ylabel(OUTPUT_NAMES[out_idx])
+            ax.set_title(f"{{OUTPUT_NAMES[out_idx]}} vs {{FEATURE_NAMES[feat_idx]}}")
+            if frozen_str:
+                ax.text(0.02, 0.98, f"Frozen: {{frozen_str}}", transform=ax.transAxes,
+                        fontsize=7, verticalalignment='top',
+                        bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+            ax.grid(True, alpha=0.3)
+            plt.tight_layout()
+            fname = f"{{_sanitize_filename(OUTPUT_NAMES[out_idx])}}_vs_{{_sanitize_filename(FEATURE_NAMES[feat_idx])}}.png"
+            fig.savefig(os.path.join(out_dirs[out_idx], fname), dpi=150)
+            plt.close(fig)
+            plot_count += 1
+
+    # 2D plots: each pair of features vs each output
+    if n_feat >= 2:
+        print("Generating 2D plots (each input pair vs each output)...")
+        res2d = 80
+        for i in range(n_feat):
+            for j in range(i + 1, n_feat):
+                fmin_i, fmax_i = feat_mins.get(i, 0.0), feat_maxs.get(i, 1.0)
+                fmin_j, fmax_j = feat_mins.get(j, 0.0), feat_maxs.get(j, 1.0)
+                if abs(fmax_i - fmin_i) < 1e-12 or abs(fmax_j - fmin_j) < 1e-12:
+                    continue
+                xi = np.linspace(fmin_i, fmax_i, res2d)
+                xj = np.linspace(fmin_j, fmax_j, res2d)
+                Xi, Xj = np.meshgrid(xi, xj)
+                X_grid = np.tile([feat_defaults.get(k, 0.0) for k in range(n_feat)],
+                                 (res2d * res2d, 1))
+                X_grid[:, i] = Xi.ravel()
+                X_grid[:, j] = Xj.ravel()
+                y_pred = predict_raw(X_grid)
+
+                for out_idx in range(n_out):
+                    Z = y_pred[:, out_idx].reshape(res2d, res2d)
+                    fig, ax = plt.subplots(figsize=(8, 6))
+                    cf = ax.contourf(Xi, Xj, Z, levels=30, cmap='viridis')
+                    plt.colorbar(cf, ax=ax, label=OUTPUT_NAMES[out_idx])
+                    ax.set_xlabel(FEATURE_NAMES[i])
+                    ax.set_ylabel(FEATURE_NAMES[j])
+                    frozen_str = ", ".join(
+                        f"{{FEATURE_NAMES[k]}}={{feat_defaults.get(k, 0.0):.3g}}"
+                        for k in range(n_feat) if k != i and k != j)
+                    title = f"{{OUTPUT_NAMES[out_idx]}} vs {{FEATURE_NAMES[i]}}, {{FEATURE_NAMES[j]}}"
+                    ax.set_title(title)
+                    if frozen_str:
+                        ax.text(0.02, 0.98, f"Frozen: {{frozen_str}}", transform=ax.transAxes,
+                                fontsize=7, verticalalignment='top',
+                                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+                    plt.tight_layout()
+                    fname = f"{{_sanitize_filename(OUTPUT_NAMES[out_idx])}}_vs_{{_sanitize_filename(FEATURE_NAMES[i])}}_and_{{_sanitize_filename(FEATURE_NAMES[j])}}.png"
+                    fig.savefig(os.path.join(out_dirs[out_idx], fname), dpi=150)
+                    plt.close(fig)
+                    plot_count += 1
+
+    print(f"Saved {{plot_count}} plots to {{plot_dir}}")
+
+
+def main():
+    print("--- GRADIENT-BOOSTED MODEL INTERFACE ---")
+    print("Required Inputs (unused features omitted):")
+    for col in USED_COLS:
+        print(f" - {{col}}")
+
+    # Ask if user wants to plot
+    try:
+        do_plot = input("\\nWould you like to plot the model? [y/N]: ").strip().lower()
+        if do_plot == 'y':
+            plot_model()
+    except (KeyboardInterrupt, EOFError):
+        pass
+
+    print("\\nEnter values (Ctrl+C to exit):")
+    try:
+        while True:
+            inp = {{}}
+            for col in USED_COLS:
+                val = input(f"{{col}}: ")
+                inp[col] = val
+            result = predict(inp)
+            print(result)
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()
+'''
+    filename = "best_boosted_model.py"
+    with open(filename, 'w') as f:
+        f.write(script_content)
+    print(f"\n  Boosted prediction script saved to: {filename}")
+
+
+
+def train_mode():
+    global CGP_NODES, CGP_MUT_RATE, PARSIMONY_STRENGTH, SIMPLIFICATION_FREQ
+    global EVOLUTION_MODEL, DS_LEXICASE_FRAC
+    global NUM_ISLANDS_GLOBAL
+    global AGE_GROUP_N_GROUPS, AGE_GROUP_ISLANDS_PER_GROUP, AGE_GROUP_GRAD_FREQ
+    global BAYESIAN_INITIAL_SAMPLES, BAYESIAN_BATCH_SIZE, BAYESIAN_N_CANDIDATES
+    global BAYESIAN_EXPLORATION, BAYESIAN_GP_REFIT_FREQ, BAYESIAN_MAX_GP_POINTS
+    global BAYESIAN_CONST_OPT_FREQ
+    global _INIT_PHASE
+
+    # ---- Load CSV ----
+    try:
+        path = input("CSV Path: ").strip()
+
+        # ---- Delimiter selection ----
+        print("\nCSV Delimiter:")
+        print("  [0] Comma        ,   (default)")
+        print("  [1] Semicolon    ;")
+        print("  [2] Tab          \\t")
+        print("  [3] Custom")
+        delim_choice = input("Delimiter [0]: ").strip()
+        _DELIM_MAP = {'0': ',', '1': ';', '2': '\t', '': ','}
+        if delim_choice == '3':
+            csv_sep = input("Enter custom delimiter: ")
+            if not csv_sep:
+                csv_sep = ','
+        else:
+            csv_sep = _DELIM_MAP.get(delim_choice, ',')
+        print(f"  → Using delimiter: {repr(csv_sep)}")
+
+        df = pd.read_csv(path, sep=csv_sep)
+        print("\n" + "=" * 60)
+        print(f"DATASET: {path}  |  {df.shape[0]} rows × {df.shape[1]} cols")
+        print("=" * 60)
+        print(df.head(5))
+        print("=" * 60 + "\n")
+    except Exception as e:
+        print(f"Error loading file: {e}")
+        return
+
+    # ---- Batch size ----
+    print("─" * 60)
+    print("BATCH SIZE")
+    print("  Use a random mini-batch of this many rows each generation.")
+    print("  Smaller = faster per generation but noisier fitness estimates.")
+    print("  Leave blank to use the full dataset every generation.")
+    batch_input = input("Batch Size [Enter = full dataset]: ").strip()
+    try:
+        BATCH_SIZE = int(batch_input) if batch_input else 0
+    except ValueError:
+        BATCH_SIZE = 0
+
+    # ---- Operator selection ----
+    select_allowed_ops()
+
+    # ---- IF/ELSE branching (separate from operator selection) ----
+    _select_if_else_mode()
+
+    # ---- Gradient boosting mode ----
+    _select_gradient_boosting()
+
+    # ---- Safe vs Unsafe ops ----
+    select_ops_safety()
+
+    # ---- Affine scaling toggle ----
+    global AFFINE_SCALING_ENABLED
+    print("\n" + "─" * 60)
+    print("AFFINE SCALING")
+    print("  When enabled (default), each regression expression is auto-scaled:")
+    print("    y = a * f(x) + b    (a, b fitted analytically once)")
+    print("  This lets evolution focus on the shape of f(x) rather than its")
+    print("  magnitude, dramatically speeding up convergence for most problems.")
+    print()
+    print("  When disabled, the CGP must learn scale/offset from its own")
+    print("  constants.  Use this if you need the raw symbolic expression")
+    print("  without an outer affine wrapper.")
+    print("─" * 60)
+    aff_choice = input("Enable affine scaling? [Y/n]: ").strip().lower()
+    if aff_choice.startswith('n'):
+        AFFINE_SCALING_ENABLED = False
+        print("  ✓  Affine scaling DISABLED — CGP must learn scale from constants.")
+    else:
+        AFFINE_SCALING_ENABLED = True
+        print("  ✓  Affine scaling ENABLED (default).")
+
+    # ---- CGP node count ----
+    print("\n─" * 30)
+    print("CGP NODE COUNT")
+    print(f"  The CGP graph has this many internal computation nodes.")
+    print(f"  More nodes → richer expressions but larger search space.")
+    print(f"  Typical range: 20 (fast/simple) – 200 (complex).")
+    cgp_nodes_in = input(f"Max CGP Nodes [default {CGP_NODES}]: ").strip()
+    if cgp_nodes_in:
+        CGP_NODES = int(cgp_nodes_in)
+
+    # ---- Mutation rate ----
+    print("\nBASE MUTATION RATE")
+    print(f"  Number of gene changes per mutation event.")
+    print(f"  Higher = more exploration, slower convergence.")
+    print(f"  Under stagnation the rate is automatically ramped up 2×–4×.")
+    print(f"  Typical range: 1 (fine-tuning) – 5 (exploration).")
+    cgp_mut_in = input(f"Base Mutation Rate [default {CGP_MUT_RATE}]: ").strip()
+    if cgp_mut_in:
+        CGP_MUT_RATE = int(cgp_mut_in)
+
+    # ---- Parsimony strength ----
+    print("\nPARSIMONY STRENGTH")
+    print(f"  Controls how heavily expression complexity is penalised in fitness.")
+    print(f"  formula:  fitness = loss + PARSIMONY * complexity - modularity_bonus")
+    print(f"  0.00 = no penalty (fastest, but expressions bloat).")
+    print(f"  0.01 = very gentle — only prunes runaway bloat.")
+    print(f"  0.05 = moderate  (default) — balanced size/accuracy.")
+    print(f"  0.20 = strong — prefers very compact expressions.")
+    pars_in = input(f"Parsimony Strength [default {PARSIMONY_STRENGTH}]: ").strip()
+    if pars_in:
+        try:
+            PARSIMONY_STRENGTH = float(pars_in)
+        except ValueError:
+            print("  Invalid value; keeping default.")
+
+    # ---- Simplification frequency ----
+    print("\nSIMPLIFICATION FREQUENCY")
+    print(f"  Every N generations an algebraic simplification pass is run on")
+    print(f"  ALL individuals in every island and the Hall of Fame.")
+    print(f"  This performs constant folding and identity reduction (x+0, x*1 …)")
+    print(f"  directly on the CGP graph, which reduces complexity and fights bloat.")
+    print(f"  Lower N = more aggressive (but slower per cycle).")
+    print(f"  0 = disable periodic simplification entirely.")
+    simp_in = input(f"Simplification frequency (gens) [default {SIMPLIFICATION_FREQ}]: ").strip()
+    if simp_in:
+        try:
+            SIMPLIFICATION_FREQ = int(simp_in)
+        except ValueError:
+            print("  Invalid value; keeping default.")
+
+    # ---- Evolution model ----
+    print("\n" + "═" * 70)
+    print("EVOLUTION MODEL")
+    print("═" * 70)
+    print("  [1] Island Model  (default)")
+    print("      N isolated sub-populations evolve in parallel (multi-process).")
+    print("      Best individuals migrate between islands periodically.")
+    print("      Fastest wall-clock time on multi-core machines.")
+    print()
+    print("  [2] Age-Fitness Pareto Optimisation (AFPO)")
+    print("      Single population.  Each individual has an 'age' counter.")
+    print("      After every birth the population is trimmed to its Pareto")
+    print("      front on (age, fitness) — both minimised.  Younger fitter")
+    print("      individuals always survive; old unfit ones are pruned.")
+    print("      ADF operators take effect immediately (no subprocess boundary).")
+    print("      Slower per generation but often finds simpler solutions.")
+    print()
+    print("  [3] Islanded AFPOs")
+    print("      N islands, each running its own independent AFPO population")
+    print("      (parallel, multi-process).  Ring migration after every chunk.")
+    print("      Combines AFPO's age-fitness Pareto pressure with island diversity.")
+    print()
+    print("  [4] Age Group Islands")
+    print("      G age-group tiers, each tier with N AFPO islands.")
+    print("      Every GRAD_FREQ gens the best individuals from a younger tier")
+    print("      graduate into the next tier's island pool, creating a curriculum")
+    print("      where survivors of age-fitness pressure compete in increasingly")
+    print("      veteran arenas.  Within-tier ring migration keeps islands diverse.")
+    print()
+    print("  [5] Bayesian CGP  (surrogate-assisted)")
+    print("      Uses a Gaussian Process surrogate to model the fitness landscape")
+    print("      over CGP genotype space.  Expected Improvement selects which")
+    print("      candidate mutations to evaluate, dramatically reducing the number")
+    print("      of expensive fitness evaluations.  Single-process, best for small")
+    print("      datasets where each evaluation is fast but the search space is large.")
+    print("      Requires scikit-learn.")
+    print("═" * 70)
+    while True:
+        em_in = input("Evolution model [1/2/3/4/5, default 1]: ").strip()
+        if not em_in or em_in == '1':
+            EVOLUTION_MODEL = "island"
+            # Ask for island count
+            n_isl_in = input("  Number of islands [default 4]: ").strip()
+            try:
+                NUM_ISLANDS_GLOBAL = int(n_isl_in) if n_isl_in else 4
+                NUM_ISLANDS_GLOBAL = max(1, NUM_ISLANDS_GLOBAL)
+            except ValueError:
+                NUM_ISLANDS_GLOBAL = 4
+            print(f"  ✓  Island Model selected  ({NUM_ISLANDS_GLOBAL} islands).")
+            break
+        elif em_in == '2':
+            EVOLUTION_MODEL = "afpo"
+            NUM_ISLANDS_GLOBAL = 1   # not used, but keep consistent
+            print("  ✓  AFPO selected.")
+            break
+        elif em_in == '3':
+            EVOLUTION_MODEL = "island_afpo"
+            n_isl_in = input("  Number of AFPO islands [default 4]: ").strip()
+            try:
+                NUM_ISLANDS_GLOBAL = int(n_isl_in) if n_isl_in else 4
+                NUM_ISLANDS_GLOBAL = max(1, NUM_ISLANDS_GLOBAL)
+            except ValueError:
+                NUM_ISLANDS_GLOBAL = 4
+            print(f"  ✓  Islanded AFPOs selected  ({NUM_ISLANDS_GLOBAL} islands).")
+            break
+        elif em_in == '4':
+            EVOLUTION_MODEL = "age_group_islands"
+            n_grp_in = input(f"  Number of age-group tiers [default {AGE_GROUP_N_GROUPS}]: ").strip()
+            try:
+                AGE_GROUP_N_GROUPS = int(n_grp_in) if n_grp_in else 3
+                AGE_GROUP_N_GROUPS = max(2, AGE_GROUP_N_GROUPS)
+            except ValueError:
+                AGE_GROUP_N_GROUPS = 3
+            n_isl_in = input(f"  AFPO islands per tier [default {AGE_GROUP_ISLANDS_PER_GROUP}]: ").strip()
+            try:
+                AGE_GROUP_ISLANDS_PER_GROUP = int(n_isl_in) if n_isl_in else 2
+                AGE_GROUP_ISLANDS_PER_GROUP = max(1, AGE_GROUP_ISLANDS_PER_GROUP)
+            except ValueError:
+                AGE_GROUP_ISLANDS_PER_GROUP = 2
+            grad_in = input(f"  Graduation frequency (gens) [default {AGE_GROUP_GRAD_FREQ}]: ").strip()
+            try:
+                AGE_GROUP_GRAD_FREQ = int(grad_in) if grad_in else 100
+                AGE_GROUP_GRAD_FREQ = max(50, AGE_GROUP_GRAD_FREQ)  # 50 = default MIGRATION_FREQ
+            except ValueError:
+                AGE_GROUP_GRAD_FREQ = 100
+            NUM_ISLANDS_GLOBAL = AGE_GROUP_ISLANDS_PER_GROUP  # for reference
+            print(f"  ✓  Age Group Islands selected  "
+                  f"({AGE_GROUP_N_GROUPS} tiers × {AGE_GROUP_ISLANDS_PER_GROUP} islands, "
+                  f"graduation every {AGE_GROUP_GRAD_FREQ} gens).")
+            break
+        elif em_in == '5':
+            if not HAS_SKLEARN_GP:
+                print("  ERROR: scikit-learn GaussianProcessRegressor not available.")
+                print("  Install with: pip install scikit-learn")
+                print("  Falling back to Island Model.")
+                EVOLUTION_MODEL = "island"
+                NUM_ISLANDS_GLOBAL = 4
+                break
+            EVOLUTION_MODEL = "bayesian_cgp"
+            NUM_ISLANDS_GLOBAL = 1
+            # Bayesian CGP hyperparameters
+            init_in = input(f"  Initial random samples [default {BAYESIAN_INITIAL_SAMPLES}]: ").strip()
+            if init_in:
+                try:
+                    BAYESIAN_INITIAL_SAMPLES = max(20, int(init_in))
+                except ValueError:
+                    pass
+            batch_in = input(f"  Batch size per BO iteration [default {BAYESIAN_BATCH_SIZE}]: ").strip()
+            if batch_in:
+                try:
+                    BAYESIAN_BATCH_SIZE = max(5, int(batch_in))
+                except ValueError:
+                    pass
+            cand_in = input(f"  Candidates per iteration [default {BAYESIAN_N_CANDIDATES}]: ").strip()
+            if cand_in:
+                try:
+                    BAYESIAN_N_CANDIDATES = max(50, int(cand_in))
+                except ValueError:
+                    pass
+            xi_in = input(f"  Exploration parameter xi [default {BAYESIAN_EXPLORATION}]: ").strip()
+            if xi_in:
+                try:
+                    BAYESIAN_EXPLORATION = max(0.0, float(xi_in))
+                except ValueError:
+                    pass
+            print(f"  ✓  Bayesian CGP selected  "
+                  f"(init={BAYESIAN_INITIAL_SAMPLES}, batch={BAYESIAN_BATCH_SIZE}, "
+                  f"candidates={BAYESIAN_N_CANDIDATES}, xi={BAYESIAN_EXPLORATION}).")
+            break
+        else:
+            print("  Please enter 1, 2, 3, 4, or 5.")
+
+    # ---- DS-Lexicase fraction ----
+    print("\n" + "─" * 70)
+    print("DOWN-SAMPLED LEXICASE (DS-Lexicase)")
+    print("─" * 70)
+    print("  Standard epsilon-lexicase evaluates candidates against random cases")
+    print("  from the full dataset, which is expensive for large datasets.")
+    print("  DS-Lexicase randomly sub-samples a small fraction of the training")
+    print("  data each generation (e.g. 5%–10%).  The sub-sample changes every")
+    print("  generation, preserving diversity benefits without the full compute")
+    print("  cost.  Highly beneficial for datasets with dominant edge cases.")
+    print()
+    print("  0.00 = disabled (original behaviour, ~20 random cases)")
+    print("  0.05 = 5% sub-sample  (recommended for large datasets ≥1000 rows)")
+    print("  0.10 = 10% sub-sample (default when enabled)")
+    print("─" * 70)
+    ds_in = input(f"DS-Lexicase fraction [default 0.00 = off]: ").strip()
+    if ds_in:
+        try:
+            DS_LEXICASE_FRAC = float(ds_in)
+            DS_LEXICASE_FRAC = max(0.0, min(1.0, DS_LEXICASE_FRAC))
+            if DS_LEXICASE_FRAC > 0:
+                print(f"  ✓  DS-Lexicase enabled at {DS_LEXICASE_FRAC*100:.1f}% sub-sample.")
+            else:
+                print("  DS-Lexicase disabled.")
+        except ValueError:
+            print("  Invalid value; keeping default (off).")
+
+
+    # ---- Column config ----
+    configs = get_configs(df)
+    dp = DataProcessor(scale=False)
+    dp.set_configs(configs)
+
+    print("Preprocessing...")
+    X, Y = dp.fit_transform(df)
+    n_features, n_outputs = X.shape[1], Y.shape[1]
+    feat_names, out_types = dp.input_map, dp.get_output_types_flat()
+
+    # ── Validation set setup ─────────────────────────────────────────────────
+    X_val, Y_val = None, None
+    print("\n" + "─" * 60)
+    print("VALIDATION")
+    print("─" * 60)
+    print("  Provide a held-out set to monitor generalisation during evolution.")
+    print("  Validation metrics are printed alongside each periodic Pareto display.")
+    val_path_in = input("  Validation CSV path [Enter to use fraction or skip]: ").strip()
+    if val_path_in:
+        try:
+            val_df   = pd.read_csv(val_path_in)
+            X_val, Y_val = dp.transform(val_df)
+            print(f"  ✓  Validation set loaded from file: {X_val.shape[0]} rows.")
+        except Exception as e:
+            print(f"  Could not load validation file: {e}  — falling back to fraction split.")
+            val_path_in = ""
+
+    if not val_path_in:
+        val_frac_in = input("  Validation fraction [e.g. 0.2 | Enter = skip]: ").strip()
+        val_frac = 0.0
+        try:
+            val_frac = float(val_frac_in) if val_frac_in else 0.0
+        except ValueError:
+            pass
+        if 0.0 < val_frac < 1.0:
+            n_val = int(len(X) * val_frac)
+            if n_val > 0:
+                perm   = np.random.permutation(len(X))
+                X, Y   = X[perm], Y[perm]
+                X_val  = X[:n_val];  Y_val  = Y[:n_val]
+                X      = X[n_val:];  Y      = Y[n_val:]
+                print(f"  ✓  {n_val} rows held out for validation  "
+                      f"({len(X)} rows remain for training).")
+        else:
+            print("  Validation skipped.")
+    # ─────────────────────────────────────────────────────────────────────────
+
+    if BATCH_SIZE > 0:
+        print(f"Using random mini-batches of size {BATCH_SIZE}.")
+
+    # ════════════════════════════════════════════════════════════════
+    # DISCOVERY MACHINE: Feature importance pre-analysis
+    # ════════════════════════════════════════════════════════════════
+    # Quick correlation + nonlinear mutual information scan to give the
+    # user (and the system) an early read on which features matter most.
+    # Also detects data characteristics that inform search strategy.
+    print("\n" + "─" * 70)
+    print("FEATURE IMPORTANCE PRE-ANALYSIS")
+    print("─" * 70)
+    try:
+        _cap = min(X.shape[0], 5000)
+        _X_sample = X[:_cap]
+        for o_idx in range(n_outputs):
+            _y = Y[:_cap, o_idx]
+            out_label = dp.output_map[o_idx] if o_idx < len(dp.output_map) else f"Out{o_idx}"
+            is_cls = (out_types[o_idx] == 6)
+
+            if is_cls:
+                # For classification, use point-biserial correlation
+                _cors = []
+                for j in range(n_features):
+                    _c = abs(float(np.corrcoef(_X_sample[:, j], _y)[0, 1]))
+                    _cors.append((_c if np.isfinite(_c) else 0.0, feat_names[j]))
+            else:
+                # For regression, use Pearson + Spearman + nonlinear detection
+                try:
+                    from scipy.stats import spearmanr as _spearmanr_fn
+                except ImportError:
+                    _spearmanr_fn = None
+                _cors = []
+                for j in range(n_features):
+                    _pearson = abs(float(np.corrcoef(_X_sample[:, j], _y)[0, 1]))
+                    if _spearmanr_fn is not None:
+                        _spearman = abs(float(_spearmanr_fn(_X_sample[:, j], _y).statistic))
+                    else:
+                        _spearman = _pearson
+                    # If Spearman >> Pearson, there's a nonlinear monotonic relationship
+                    _nonlin_flag = " ⚡NL" if (_spearman - _pearson) > 0.15 else ""
+                    _score = max(_pearson if np.isfinite(_pearson) else 0.0,
+                                 _spearman if np.isfinite(_spearman) else 0.0)
+                    _cors.append((_score, feat_names[j], _nonlin_flag))
+
+            _cors.sort(reverse=True)
+            print(f"\n  Output: {out_label}  ({'classification' if is_cls else 'regression'})")
+            for rank, item in enumerate(_cors[:min(15, n_features)], 1):
+                if is_cls:
+                    _score, _name = item
+                    bar = "█" * int(_score * 20) + "░" * (20 - int(_score * 20))
+                    print(f"    {rank:2d}. {_name:<25} |{bar}| {_score:.3f}")
+                else:
+                    _score, _name, _flag = item
+                    bar = "█" * int(_score * 20) + "░" * (20 - int(_score * 20))
+                    print(f"    {rank:2d}. {_name:<25} |{bar}| {_score:.3f}{_flag}")
+
+            # Data shape hints
+            _y_range = float(np.ptp(_y))
+            _y_std = float(np.std(_y))
+            _y_skew = float(np.mean(((_y - np.mean(_y)) / (_y_std + 1e-8))**3))
+            if not is_cls:
+                hints = []
+                if abs(_y_skew) > 2.0:
+                    hints.append(f"high skew ({_y_skew:.1f}) → consider log/sqrt transforms")
+                if _y_range > 1e4:
+                    hints.append(f"wide range ({_y_range:.0f}) → exponential patterns likely")
+                if all(item[0] < 0.1 for item in _cors[:3]) if _cors else False:
+                    hints.append("weak linear correlations → look for nonlinear/interaction terms")
+                if hints:
+                    print(f"    💡 Hints: {'; '.join(hints)}")
+
+    except Exception as e:
+        print(f"  (pre-analysis skipped: {e})")
+    print("─" * 70)
+
+    # ════════════════════════════════════════════════════════════════
+    # SOBOLEV TRAINING — precompute target gradients
+    # ════════════════════════════════════════════════════════════════
+    global SOBOLEV_ENABLED, SOBOLEV_WEIGHT, SOBOLEV_KNN_K
+    n_regression_outputs = sum(1 for t in out_types if t != 6)
+    if n_regression_outputs > 0:
+        print("\n" + "─" * 70)
+        print("SOBOLEV TRAINING")
+        print("─" * 70)
+        print("  Augments the regression loss with a gradient-matching penalty.")
+        print("  Expressions must approximate not just the target values but also")
+        print("  their partial derivatives ∂y/∂x, estimated from the data via KNN.")
+        print("  This steers evolution toward symbolically correct local behaviour,")
+        print("  reducing the chance of functions that fit values but have wrong shape.")
+        print()
+        print("  1D input : finite differences on sorted (x, y) — exact & fast.")
+        print("  ND input  : KNN local-linear regression Jacobian.")
+        print()
+        print("  Recommended: weight 0.1–0.3 (start low; increase if solutions")
+        print("               look structurally wrong despite good loss).")
+        print("─" * 70)
+        sob_en = input("Enable Sobolev gradient matching? [y/N]: ").strip().lower()
+        if sob_en.startswith('y'):
+            SOBOLEV_ENABLED = True
+            w_in = input(f"  Sobolev weight [default {SOBOLEV_WEIGHT}]: ").strip()
+            if w_in:
+                try:
+                    SOBOLEV_WEIGHT = float(w_in)
+                except ValueError:
+                    pass
+            if n_features >= 2:
+                k_in = input(f"  KNN neighbours for gradient estimation [default {SOBOLEV_KNN_K}]: ").strip()
+                if k_in:
+                    try:
+                        SOBOLEV_KNN_K = int(k_in)
+                    except ValueError:
+                        pass
+            print(f"  ✓  Sobolev enabled  weight={SOBOLEV_WEIGHT}"
+                  + (f"  k={SOBOLEV_KNN_K}" if n_features >= 2 else "  (1D finite-diff)"))
+        else:
+            SOBOLEV_ENABLED = False
+            print("  Sobolev disabled.")
+
+    # Precompute target gradients once (None for classification outputs)
+    target_grads_list = [None] * n_outputs
+    if SOBOLEV_ENABLED:
+        print("\nPrecomputing Sobolev target gradients…")
+        for i in range(n_outputs):
+            if out_types[i] != 6:  # regression only
+                try:
+                    target_grads_list[i] = compute_target_gradients(X, Y[:, i])
+                    dim_desc = f"{n_features}D KNN" if n_features >= 2 else "1D finite-diff"
+                    print(f"  Output {i}: ∇y estimated ({dim_desc}, {X.shape[0]} points)")
+                except Exception as e:
+                    print(f"  Output {i}: gradient estimation failed ({e}) — Sobolev disabled for this output.")
+                    target_grads_list[i] = None
+        print("  Done.\n")
+
+    # ---- Shared population config ----
+    POP_SIZE            = 50
+    MIGRATION_FREQ      = 50
+    EXTINCTION_PATIENCE = 150
+    feature_weights = np.ones(n_features)
+
+    # ════════════════════════════════════════════════════════════════
+    # GRADIENT BOOSTING MODE (runs instead of standard evolution)
+    # ════════════════════════════════════════════════════════════════
+    if GRADIENT_BOOSTING_ENABLED:
+        boosted_models = run_gradient_boosted_evolution(
+            X, Y, n_features, n_outputs, feat_names, out_types, dp,
+            target_grads_list, X_val=X_val, Y_val=Y_val, BATCH_SIZE=BATCH_SIZE)
+
+        print("\n" + "=" * 80)
+        print("GRADIENT BOOSTED FINAL RESULTS")
+        print("=" * 80)
+
+        # Track which multiclass models we've already printed
+        printed_mc = set()
+
+        for i, bm in enumerate(boosted_models):
+            out_label = dp.output_map[i] if i < len(dp.output_map) else f"Out{i}"
+            if bm is None:
+                print(f"\nOutput {i} ({out_label}): No boosted model (failed)")
+                continue
+
+            # ── Multiclass model: print once for the whole group ──────
+            if bm.task == 'multiclass':
+                bm_id = id(bm)
+                if bm_id in printed_mc:
+                    continue
+                printed_mc.add(bm_id)
+
+                # Find all output indices sharing this model
+                grp_indices = [j for j in range(n_outputs)
+                               if boosted_models[j] is bm]
+                grp_labels = [dp.output_map[j] if j < len(dp.output_map)
+                              else f"Out{j}" for j in grp_indices]
+
+                y_onehot = Y[:, grp_indices]
+                proba = bm.predict(X)
+                pred_cls = np.argmax(proba, axis=1)
+                true_cls = np.argmax(y_onehot, axis=1)
+                acc = float(np.mean(pred_cls == true_cls))
+                logloss = float(-np.mean(np.sum(
+                    y_onehot * np.log(proba.clip(1e-15, 1.0)), axis=1)))
+
+                print(f"\nMulticlass group: outputs {grp_indices}  "
+                      f"({', '.join(grp_labels)})")
+                print(f"  Boosted Accuracy : {acc:.4f}")
+                print(f"  Boosted Log-Loss : {logloss:.5f}")
+                for k, chain in enumerate(bm.class_chains):
+                    name = bm.class_names[k] if k < len(bm.class_names) else f"cls{k}"
+                    print(f"  Class '{name}': {len(chain.stages)} stages, "
+                          f"intercept={chain.intercept:.4g}")
+                    for s, (ind, lr) in enumerate(chain.stages):
+                        a = getattr(ind, 'affine_a', 1.0)
+                        b = getattr(ind, 'affine_b', 0.0)
+                        expr_str = str(ind.tree)
+                        if sympy is not None:
+                            try:
+                                clean_names = [clean_var_name(n) for n in dp.input_map]
+                                sym_vars = [sympy.Symbol(n) for n in clean_names]
+                                raw_sym = tree_to_sympy(ind.tree, sym_vars,
+                                                        safe=SAFE_OPS_MODE)
+                                raw_sym = a * raw_sym + b
+                                simplified = advanced_simplify_expr(raw_sym)
+                                expr_str = str(simplified)
+                            except Exception:
+                                expr_str = f"{a:.4g} * ({expr_str}) + {b:.4g}"
+                        print(f"    Stage {s}: lr={lr:.3f}  → {expr_str}")
+
+                if X_val is not None and Y_val is not None:
+                    val_proba = bm.predict(X_val)
+                    val_pred = np.argmax(val_proba, axis=1)
+                    val_true = np.argmax(Y_val[:, grp_indices], axis=1)
+                    val_acc = float(np.mean(val_pred == val_true))
+                    print(f"  Validation Accuracy: {val_acc:.4f}")
+                continue
+
+            # ── Binary classification ─────────────────────────────────
+            if bm.task == 'binary_cls':
+                y_binary = Y[:, i].clip(0, 1)
+                proba = bm.predict(X)
+                pred_cls = (proba >= 0.5).astype(int)
+                acc = float(np.mean(pred_cls == y_binary.astype(int)))
+                F_raw = bm._predict_raw(X)
+                logloss = float(np.mean(
+                    np.maximum(F_raw, 0) - F_raw * y_binary +
+                    np.log1p(np.exp(-np.abs(F_raw)))))
+
+                print(f"\nOutput {i} ({out_label})  [Binary Classification, "
+                      f"{len(bm.stages)} stages]")
+                print(f"  Boosted Accuracy : {acc:.4f}")
+                print(f"  Boosted Log-Loss : {logloss:.5f}")
+                print(f"  Intercept (log-odds): {bm.intercept:.4g}")
+                for s, (ind, lr) in enumerate(bm.stages):
+                    a = getattr(ind, 'affine_a', 1.0)
+                    b = getattr(ind, 'affine_b', 0.0)
+                    expr_str = str(ind.tree)
+                    if sympy is not None:
+                        try:
+                            clean_names = [clean_var_name(n) for n in dp.input_map]
+                            sym_vars = [sympy.Symbol(n) for n in clean_names]
+                            raw_sym = tree_to_sympy(ind.tree, sym_vars,
+                                                    safe=SAFE_OPS_MODE)
+                            raw_sym = a * raw_sym + b
+                            simplified = advanced_simplify_expr(raw_sym)
+                            expr_str = str(simplified)
+                        except Exception:
+                            expr_str = f"{a:.4g} * ({expr_str}) + {b:.4g}"
+                    print(f"  Stage {s}: lr={lr:.3f}  → {expr_str}")
+
+                if X_val is not None and Y_val is not None:
+                    val_proba = bm.predict(X_val)
+                    val_pred = (val_proba >= 0.5).astype(int)
+                    val_true = Y_val[:, i].clip(0, 1).astype(int)
+                    val_acc = float(np.mean(val_pred == val_true))
+                    print(f"  Validation Accuracy: {val_acc:.4f}")
+                continue
+
+            # ── Regression ────────────────────────────────────────────
+            y_pred = bm.predict(X)
+            y_target = Y[:, i]
+            ss_res = float(np.sum((y_target - y_pred) ** 2))
+            ss_tot = float(np.sum((y_target - np.mean(y_target)) ** 2)) + 1e-8
+            r2 = 1.0 - ss_res / ss_tot
+            mse = float(np.mean((y_target - y_pred) ** 2))
+            print(f"\nOutput {i} ({out_label})  [Regression, {len(bm.stages)} stages]")
+            print(f"  Boosted R² : {r2:.6f}")
+            print(f"  Boosted MSE: {mse:.6f}")
+            print(f"  Intercept  : {bm.intercept:.4g}")
+            for s, (ind, lr) in enumerate(bm.stages):
+                a = getattr(ind, 'affine_a', 1.0)
+                b = getattr(ind, 'affine_b', 0.0)
+                expr_str = str(ind.tree)
+                if sympy is not None:
+                    try:
+                        clean_names = [clean_var_name(n) for n in dp.input_map]
+                        sym_vars    = [sympy.Symbol(n) for n in clean_names]
+                        raw_sym     = tree_to_sympy(ind.tree, sym_vars, safe=SAFE_OPS_MODE)
+                        raw_sym     = a * raw_sym + b
+                        simplified  = advanced_simplify_expr(raw_sym)
+                        expr_str    = str(simplified)
+                    except Exception:
+                        expr_str = f"{a:.4g} * ({expr_str}) + {b:.4g}"
+                print(f"  Stage {s}: lr={lr:.3f}  → {expr_str}")
+
+            if X_val is not None and Y_val is not None:
+                y_val_pred = bm.predict(X_val)
+                y_val_target = Y_val[:, i]
+                ss_res_v = float(np.sum((y_val_target - y_val_pred) ** 2))
+                ss_tot_v = float(np.sum(
+                    (y_val_target - np.mean(y_val_target)) ** 2)) + 1e-8
+                val_r2 = 1.0 - ss_res_v / ss_tot_v
+                print(f"  Validation R²: {val_r2:.6f}")
+
+        # Generate boosted prediction script
+        _generate_boosted_script(boosted_models, dp, X_data=X)
+        return
+
+    # ════════════════════════════════════════════════════════════════
+    # ISLAND MODEL
+    # ════════════════════════════════════════════════════════════════
+    if EVOLUTION_MODEL == "island":
+        NUM_ISLANDS = NUM_ISLANDS_GLOBAL
+        ISLAND_SIZE = POP_SIZE
+
+        islands_pop         = [[] for _ in range(NUM_ISLANDS)]
+        hofs                = [HallOfFame() for _ in range(n_outputs)]
+        stagnation_counters = [[0] * n_outputs for _ in range(NUM_ISLANDS)]
+
+        print(f"\nInitializing {NUM_ISLANDS} islands × {ISLAND_SIZE} individuals "
+              f"× {n_outputs} output(s)…")
+
+        # ── Fast initialization: subsample + skip modularity ─────────────
+        global _INIT_PHASE
+        _INIT_PHASE = True
+        N_train = X.shape[0]
+        if N_train > _INIT_SUBSAMPLE_CAP:
+            init_idx = np.random.choice(N_train, _INIT_SUBSAMPLE_CAP, replace=False)
+            X_init, Y_init = X[init_idx], Y[init_idx]
+            print(f"  (using {_INIT_SUBSAMPLE_CAP}/{N_train} row subsample for fast init)")
+        else:
+            X_init, Y_init = X, Y
+
+        for island_idx in range(NUM_ISLANDS):
+            for i in range(n_outputs):
+                pop = generate_seeds_v5(n_features, feat_names)
+                # Add feature-importance-biased seeds for every island (not
+                # just island 0) so all islands benefit from data-driven
+                # initialization rather than relying solely on generic templates.
+                try:
+                    imp_seeds = generate_importance_biased_seeds(
+                        n_features, feat_names, X_init, Y_init[:, i])
+                    pop.extend(imp_seeds)
+                    if imp_seeds and island_idx == 0:
+                        print(f"    [Importance] {len(imp_seeds)} data-driven seeds "
+                              f"for output {i}")
+                except Exception:
+                    pass
+                while len(pop) < ISLAND_SIZE:
+                    pop.append(Individual(random_cgp(n_features, CGP_NODES, feat_names)))
+                for ind in pop:
+                    ind.calculate_fitness(X_init, Y_init[:, i], out_types[i],
+                                          target_grads=target_grads_list[i])
+                    hofs[i].update(ind)
+                islands_pop[island_idx].append(pop)
+            print(f"  Island {island_idx+1}/{NUM_ISLANDS} initialized.")
+
+        # Re-evaluate HoF on full data for accurate scoring
+        if N_train > _INIT_SUBSAMPLE_CAP:
+            print("  Re-scoring Hall of Fame on full dataset…")
+            for i in range(n_outputs):
+                for ind in hofs[i].best_by_complexity.values():
+                    ind.affine_fitted = False   # allow re-fitting on full data
+                    ind.calculate_fitness(X, Y[:, i], out_types[i],
+                                          target_grads=target_grads_list[i])
+        _INIT_PHASE = False
+
+        # ── Detect multi-class groups for joint softmax CE ──────────────────
+        class_groups  = detect_class_groups(dp, out_types)
+        # Map each output index → (group_indices_list, local_class_index)
+        # For outputs not in any group, value is (None, None)
+        out_group_info = {}
+        for col_name, group_idxs in class_groups.items():
+            for local_k, global_k in enumerate(group_idxs):
+                out_group_info[global_k] = (group_idxs, local_k)
+        if class_groups:
+            print(f"  [Joint Softmax] Detected {len(class_groups)} class group(s): "
+                  + ", ".join(f"{k}({len(v)} classes)" for k, v in class_groups.items()))
+
+        ds_label = (f"DS-Lexicase {DS_LEXICASE_FRAC*100:.0f}%"
+                    if DS_LEXICASE_FRAC > 0 else "standard epsilon-Lexicase")
+        adf_label = "ADF enabled" if ADF_ENABLED else "ADF disabled"
+        print(f"Island Evolution started  [{ds_label} | {adf_label}]. Ctrl+C to stop.\n")
+
+        gen = 0
+        perfect_outputs = set()   # outputs that reached perfect performance
+        try:
+            with concurrent.futures.ProcessPoolExecutor(max_workers=NUM_ISLANDS) as executor:
+                while True:
+                    batch_idx = (np.random.choice(X.shape[0], BATCH_SIZE, replace=False)
+                                 if BATCH_SIZE > 0 else None)
+                    X_b = X[batch_idx] if batch_idx is not None else X
+                    Y_b = Y[batch_idx] if batch_idx is not None else Y
+
+                    # ── Build background logits for class groups ──────────
+                    # Build once per generation cycle (after last HoF updates).
+                    bg_logits_cache = {}    # col_name → (N_b, n_cls) array
+                    for col_name, group_idxs in class_groups.items():
+                        bg_logits_cache[col_name] = build_bg_logits(hofs, group_idxs, X_b)
+
+                    # ── Elitist HoF injection ────────────────────────────────────
+                    # The global HoF best can be stranded — discovered on one
+                    # island, stored globally, then crowded out of every population
+                    # by drift/death.  Once no island carries it, extinction only
+                    # reinjects the (already-degenerate) local_hof best, so quality
+                    # collapses permanently.
+                    #
+                    # Fix: before each batch, ensure EVERY island has a live copy
+                    # of the global HoF best.  Replace only the worst individual
+                    # so the injection costs at most one slot per island per cycle,
+                    # and only fires when the HoF best is genuinely better than
+                    # anything currently alive in the population.
+                    for i in range(n_outputs):
+                        hof_best_i = hofs[i].get_best_overall()
+                        if hof_best_i is None:
+                            continue
+                        for island_idx in range(NUM_ISLANDS):
+                            pop = islands_pop[island_idx][i]
+                            if not pop:
+                                continue
+                            pop_best_loss = min(ind.loss for ind in pop)
+                            if hof_best_i.loss < pop_best_loss - 1e-9:
+                                worst = max(pop, key=lambda x: x.fitness)
+                                pop.remove(worst)
+                                elite = copy.deepcopy(hof_best_i)
+                                elite.age = 0   # reset age so AFPO doesn't kill it
+                                pop.append(elite)
+
+                    futures = []
+                    for i in range(n_outputs):
+                        if i in perfect_outputs:
+                            continue  # skip evolution on perfect outputs
+
+                        # Determine if this output is part of a class group
+                        g_info = out_group_info.get(i)
+                        if g_info is not None:
+                            group_idxs, local_k = g_info
+                            # Find which col_name owns this group
+                            col_bg = next(
+                                bg_logits_cache[cn]
+                                for cn, idxs in class_groups.items()
+                                if group_idxs == idxs)
+                            Y_group_i = Y_b[:, group_idxs[0]:group_idxs[-1]+1]
+                        else:
+                            col_bg, local_k, Y_group_i = None, None, None
+
+                        for island_idx in range(NUM_ISLANDS):
+                            args = (
+                                islands_pop[island_idx][i],
+                                X_b, Y_b[:, i], out_types[i],
+                                n_features, feat_names,
+                                MIGRATION_FREQ, island_idx, i,
+                                EXTINCTION_PATIENCE,
+                                stagnation_counters[island_idx][i],
+                                list(_ADF_REGISTRY),   # ← ADF broadcast
+                                col_bg, local_k, Y_group_i,  # ← softmax group
+                                target_grads_list[i],  # ← Sobolev
+                            )
+                            futures.append(executor.submit(evolve_island_chunk, args))
+
+                    for future in concurrent.futures.as_completed(futures):
+                        ret_pop, local_hof, stag, isl_idx, o_idx = future.result()
+                        islands_pop[isl_idx][o_idx] = ret_pop
+                        stagnation_counters[isl_idx][o_idx] = stag
+                        for c, ind in local_hof.best_by_complexity.items():
+                            if hofs[o_idx].update(ind):
+                                is_cls = (out_types[o_idx] == 6)
+                                metric = (f"Acc={getattr(ind,'accuracy',0):.4f}"
+                                          if is_cls else f"R²={getattr(ind,'r2',0):.4f}")
+                                print(f"[Out {o_idx} | Isl {isl_idx}] "
+                                      f"New Best (Comp {ind.complexity:.0f}): "
+                                      f"loss={ind.loss:.4f}  {metric}")
+
+                    gen += MIGRATION_FREQ
+
+                    # ---- Island migration (diverse ring topology) ----
+                    # Select up to 2 diverse migrants per island (best-loss +
+                    # most phenotypically unique) instead of single-best, for
+                    # better cross-island diversity transfer.
+                    _mig_probe_idx = np.random.choice(
+                        X.shape[0], min(16, X.shape[0]), replace=False)
+                    _X_mig_probe = X[_mig_probe_idx]
+                    for i in range(n_outputs):
+                        for island_idx in range(NUM_ISLANDS):
+                            next_island = (island_idx + 1) % NUM_ISLANDS
+                            src_pop = islands_pop[island_idx][i]
+                            n_mig = min(2, max(1, len(src_pop) // 25))
+                            migrants = _select_diverse_migrants(
+                                src_pop, n_migrants=n_mig, X_probe=_X_mig_probe)
+                            target_pop = islands_pop[next_island][i]
+                            for mig in migrants:
+                                mig_copy = copy.deepcopy(mig)
+                                mig_copy.age = 0
+                                # Replace worst individual in target
+                                worst = max(target_pop, key=lambda x: x.fitness)
+                                target_pop.remove(worst)
+                                target_pop.append(mig_copy)
+
+                    print(f"--- Generation {gen} ---")
+
+                    # ---- Perfect output detection & early stopping ----
+                    if gen % MIGRATION_FREQ == 0:
+                        for o_idx in range(n_outputs):
+                            if o_idx in perfect_outputs:
+                                continue
+                            is_perf, best_ind = _check_output_perfect(
+                                hofs[o_idx], X, Y[:, o_idx], out_types[o_idx])
+                            if is_perf:
+                                out_label = dp.output_map[o_idx] if o_idx < len(dp.output_map) else f"Out{o_idx}"
+                                print(f"\n  ★ Output {o_idx} ({out_label}) reached PERFECT performance!")
+                                print(f"    Running simplification pass on perfect output...")
+                                _simplify_perfect_output(
+                                    hofs[o_idx], X, Y[:, o_idx], out_types[o_idx],
+                                    target_grads=target_grads_list[o_idx])
+                                perfect_outputs.add(o_idx)
+                                # Save backup model
+                                best_models_snapshot = [h.get_best_overall() for h in hofs]
+                                _save_backup_model(best_models_snapshot, dp, o_idx, X_data=X)
+
+                        if len(perfect_outputs) == n_outputs:
+                            print("\n  ★★★ ALL outputs reached perfect performance! Stopping evolution.")
+                            break
+
+                    # ---- Periodic frontier display ----
+                    if gen % 500 == 0:
+                        for o_idx, hof in enumerate(hofs):
+                            out_label = dp.output_map[o_idx] if o_idx < len(dp.output_map) else f"Out{o_idx}"
+                            pf_tag = " [PERFECT]" if o_idx in perfect_outputs else ""
+                            hof.print_frontier(out_type=out_types[o_idx],
+                                               label=f"Output {o_idx} ({out_label}){pf_tag}")
+                        if X_val is not None and Y_val is not None:
+                            _print_validation_metrics(hofs, X_val, Y_val, out_types, dp)
+
+                    # ---- Interval stability culling (Interval mode only) ----
+                    if INTERVAL_MODE and gen % INTERVAL_CHECK_FREQ == 0:
+                        n_pen = _interval_cull_population(islands_pop, X, out_types)
+                        if n_pen:
+                            print(f"  [Interval] {n_pen} numerically unstable "
+                                  f"individual(s) penalised.")
+
+                    # ---- ADF extraction pass ----
+                    if ADF_ENABLED and gen % ADF_EXTRACT_FREQ == 0:
+                        print(f"\n[Gen {gen}] ADF extraction scan…")
+                        for o_idx in range(n_outputs):
+                            # gather all individuals across all islands for this output
+                            all_inds = [ind for isl in islands_pop for ind in isl[o_idx]]
+                            new_adfs = try_extract_adfs_from_population(
+                                all_inds, X, Y[:, o_idx], out_types[o_idx])
+                            if new_adfs:
+                                print(f"  [ADF] {len(new_adfs)} new operator(s) added to library "
+                                      f"({len(_ADF_REGISTRY)} total).  "
+                                      f"Will broadcast to workers next cycle.")
+                        # ---- ADF retirement ----
+                        all_pops_flat = [islands_pop[i][j]
+                                         for i in range(NUM_ISLANDS)
+                                         for j in range(n_outputs)]
+                        retired = _retire_unused_adfs(all_pops_flat)
+                        if retired:
+                            print(f"  [ADF] Retired {len(retired)} idle operator(s): "
+                                  f"{retired}")
+
+                    # ---- Periodic simplification pass ----
+                    if SIMPLIFICATION_FREQ > 0 and gen % SIMPLIFICATION_FREQ == 0:
+                        print(f"\n[Gen {gen}] Running algebraic simplification pass…")
+                        apply_simplification_pass(islands_pop, hofs, X, Y, out_types)
+
+                    # ---- Extra simplification for perfect outputs ----
+                    if perfect_outputs and gen % max(100, SIMPLIFICATION_FREQ if SIMPLIFICATION_FREQ > 0 else 100) == 0:
+                        for o_idx in perfect_outputs:
+                            _simplify_perfect_output(
+                                hofs[o_idx], X, Y[:, o_idx], out_types[o_idx],
+                                target_grads=target_grads_list[o_idx])
+
+                    # ---- Periodic HoF re-scoring on full data (batch mode) ----
+                    # When BATCH_SIZE > 0, island workers fit affine on batch data
+                    # (they see X_b as their "full" dataset).  Periodically re-score
+                    # all HoF entries on the true full dataset so affine parameters
+                    # are accurate and entries are correctly ranked.
+                    if BATCH_SIZE > 0 and gen > 0 and gen % 200 == 0:
+                        for o_idx, hof in enumerate(hofs):
+                            for ind in hof.best_by_complexity.values():
+                                ind.affine_fitted = False
+                                ind.calculate_fitness(
+                                    X, Y[:, o_idx], out_types[o_idx],
+                                    update_affine=True,
+                                    target_grads=target_grads_list[o_idx])
+
+                    # ---- Deep constant optimisation ----
+                    if gen > 0 and gen % 1000 == 0:
+                        _deep_optimize_hofs(hofs, X, Y, out_types)
+
+        except KeyboardInterrupt:
+            print("\nStopping Evolution…")
+
+    # ════════════════════════════════════════════════════════════════
+    # AFPO MODEL
+    # ════════════════════════════════════════════════════════════════
+    elif EVOLUTION_MODEL == "afpo":
+        AFPO_POP_SIZE = POP_SIZE * 2   # AFPO typically runs a larger pool
+
+        afpo_pops = []
+        hofs      = [HallOfFame() for _ in range(n_outputs)]
+        stag_cntrs = [0] * n_outputs
+
+        print(f"\nInitializing AFPO population ({AFPO_POP_SIZE} individuals "
+              f"× {n_outputs} output(s))…")
+
+        # ── Fast initialization: subsample + skip modularity ─────────────
+        _INIT_PHASE = True
+        N_train = X.shape[0]
+        if N_train > _INIT_SUBSAMPLE_CAP:
+            init_idx = np.random.choice(N_train, _INIT_SUBSAMPLE_CAP, replace=False)
+            X_init, Y_init = X[init_idx], Y[init_idx]
+            print(f"  (using {_INIT_SUBSAMPLE_CAP}/{N_train} row subsample for fast init)")
+        else:
+            X_init, Y_init = X, Y
+
+        for i in range(n_outputs):
+            pop = generate_seeds_v5(n_features, feat_names)
+            while len(pop) < AFPO_POP_SIZE:
+                pop.append(Individual(random_cgp(n_features, CGP_NODES, feat_names)))
+            for ind in pop:
+                ind.calculate_fitness(X_init, Y_init[:, i], out_types[i],
+                                      target_grads=target_grads_list[i])
+                hofs[i].update(ind)
+            afpo_pops.append(pop)
+
+        if N_train > _INIT_SUBSAMPLE_CAP:
+            print("  Re-scoring Hall of Fame on full dataset…")
+            for i in range(n_outputs):
+                for ind in hofs[i].best_by_complexity.values():
+                    ind.affine_fitted = False
+                    ind.calculate_fitness(X, Y[:, i], out_types[i],
+                                          target_grads=target_grads_list[i])
+        _INIT_PHASE = False
+
+        # ── Detect multi-class groups for joint softmax CE ──────────────────
+        class_groups_a  = detect_class_groups(dp, out_types)
+        out_group_info_a = {}
+        for col_name, group_idxs in class_groups_a.items():
+            for local_k, global_k in enumerate(group_idxs):
+                out_group_info_a[global_k] = (group_idxs, local_k)
+        if class_groups_a:
+            print(f"  [Joint Softmax] Detected {len(class_groups_a)} class group(s): "
+                  + ", ".join(f"{k}({len(v)} classes)" for k, v in class_groups_a.items()))
+
+        ds_label  = (f"DS-Lexicase {DS_LEXICASE_FRAC*100:.0f}%"
+                     if DS_LEXICASE_FRAC > 0 else "standard epsilon-Lexicase")
+        adf_label = "ADF enabled" if ADF_ENABLED else "ADF disabled"
+        print(f"AFPO Evolution started  [{ds_label} | {adf_label}]. Ctrl+C to stop.\n")
+
+        gen = 0
+        perfect_outputs = set()
+        try:
+            while True:
+                batch_idx = (np.random.choice(X.shape[0], BATCH_SIZE, replace=False)
+                             if BATCH_SIZE > 0 else None)
+                X_b = X[batch_idx] if batch_idx is not None else X
+                Y_b = Y[batch_idx] if batch_idx is not None else Y
+
+                # ── Build background logits for class groups ────────────────
+                bg_logits_cache_a = {}
+                for col_name, group_idxs in class_groups_a.items():
+                    bg_logits_cache_a[col_name] = build_bg_logits(hofs, group_idxs, X_b)
+
+                for i in range(n_outputs):
+                    if i in perfect_outputs:
+                        continue  # skip training on perfect outputs
+
+                    g_info_a = out_group_info_a.get(i)
+                    if g_info_a is not None:
+                        group_idxs_a, local_k_a = g_info_a
+                        col_bg_a = next(
+                            bg_logits_cache_a[cn]
+                            for cn, idxs in class_groups_a.items()
+                            if group_idxs_a == idxs)
+                        Y_group_a = Y_b[:, group_idxs_a[0]:group_idxs_a[-1]+1]
+                    else:
+                        col_bg_a, local_k_a, Y_group_a = None, None, None
+
+                    # ── Elitist HoF injection ─────────────────────────────────
+                    # AFPO's age mechanism is lethal to good solutions: every
+                    # generation ind.age += 1, so even the best individual
+                    # eventually gets Pareto-dominated by any age=0 child with
+                    # slightly better fitness and gets trimmed from the population.
+                    # Fix: before each evolve call, guarantee the global HoF best
+                    # is present at age=0, replacing only the population's worst.
+                    hof_best_i = hofs[i].get_best_overall()
+                    if hof_best_i is not None and afpo_pops[i]:
+                        pop_best_loss = min(ind.loss for ind in afpo_pops[i])
+                        if hof_best_i.loss < pop_best_loss - 1e-9:
+                            worst = max(afpo_pops[i], key=lambda x: x.fitness)
+                            afpo_pops[i].remove(worst)
+                            elite = copy.deepcopy(hof_best_i)
+                            elite.age = 0   # reset so AFPO Pareto trim won't kill it immediately
+                            afpo_pops[i].append(elite)
+
+                    afpo_pops[i], stag_cntrs[i] = evolve_afpo(
+                        afpo_pops[i], X_b, Y_b[:, i], out_types[i],
+                        n_features, feat_names, AFPO_POP_SIZE,
+                        MIGRATION_FREQ,          # generations per chunk
+                        hofs[i], stag_cntrs[i], EXTINCTION_PATIENCE,
+                        bg_logits=col_bg_a, class_idx_in_group=local_k_a, Y_group=Y_group_a,
+                        target_grads=target_grads_list[i],
+                    )
+                    # Update global HoF with any new discoveries
+                    for ind in afpo_pops[i]:
+                        if hofs[i].update(ind):
+                            is_cls = (out_types[i] == 6)
+                            metric = (f"Acc={getattr(ind,'accuracy',0):.4f}"
+                                      if is_cls else f"R²={getattr(ind,'r2',0):.4f}")
+                            print(f"[Out {i} | AFPO] "
+                                  f"New Best (Comp {ind.complexity:.0f}): "
+                                  f"loss={ind.loss:.4f}  {metric}")
+
+                gen += MIGRATION_FREQ
+                print(f"--- Generation {gen} ---")
+
+                # ---- Perfect output detection & early stopping ----
+                for o_idx in range(n_outputs):
+                    if o_idx in perfect_outputs:
+                        continue
+                    is_perf, best_ind = _check_output_perfect(
+                        hofs[o_idx], X, Y[:, o_idx], out_types[o_idx])
+                    if is_perf:
+                        out_label = dp.output_map[o_idx] if o_idx < len(dp.output_map) else f"Out{o_idx}"
+                        print(f"\n  ★ Output {o_idx} ({out_label}) reached PERFECT performance!")
+                        print(f"    Running simplification pass on perfect output...")
+                        _simplify_perfect_output(
+                            hofs[o_idx], X, Y[:, o_idx], out_types[o_idx],
+                            target_grads=target_grads_list[o_idx])
+                        perfect_outputs.add(o_idx)
+                        best_models_snapshot = [h.get_best_overall() for h in hofs]
+                        _save_backup_model(best_models_snapshot, dp, o_idx, X_data=X)
+
+                if len(perfect_outputs) == n_outputs:
+                    print("\n  ★★★ ALL outputs reached perfect performance! Stopping evolution.")
+                    break
+
+                # ---- Periodic frontier display ----
+                if gen % 500 == 0:
+                    for o_idx, hof in enumerate(hofs):
+                        out_label = dp.output_map[o_idx] if o_idx < len(dp.output_map) else f"Out{o_idx}"
+                        pf_tag = " [PERFECT]" if o_idx in perfect_outputs else ""
+                        hof.print_frontier(out_type=out_types[o_idx],
+                                           label=f"Output {o_idx} ({out_label}){pf_tag}")
+                    if X_val is not None and Y_val is not None:
+                        _print_validation_metrics(hofs, X_val, Y_val, out_types, dp)
+
+                    # ── Fitness cache stats ──────────────────────────────────
+                    if _FITNESS_CACHE.hits + _FITNESS_CACHE.misses > 0:
+                        print(f"  [Cache] {_FITNESS_CACHE.stats_str()}")
+
+                # ---- Interval stability culling (Interval mode only) ----
+                if INTERVAL_MODE and gen % INTERVAL_CHECK_FREQ == 0:
+                    n_pen = 0
+                    for i in range(n_outputs):
+                        for ind in afpo_pops[i]:
+                            try:
+                                preds = ind.tree.evaluate(X)
+                                if not np.all(np.isfinite(preds)):
+                                    ind.loss = 1e10; ind.fitness = 1e10; n_pen += 1
+                            except Exception:
+                                ind.loss = 1e10; ind.fitness = 1e10; n_pen += 1
+                    if n_pen:
+                        print(f"  [Interval] {n_pen} numerically unstable "
+                              f"individual(s) penalised.")
+
+                # ---- ADF extraction (immediate, single-process) ----
+                if ADF_ENABLED and gen % ADF_EXTRACT_FREQ == 0:
+                    print(f"\n[Gen {gen}] ADF extraction scan…")
+                    for i in range(n_outputs):
+                        new_adfs = try_extract_adfs_from_population(
+                            afpo_pops[i], X, Y[:, i], out_types[i])
+                        if new_adfs:
+                            print(f"  [ADF] {len(new_adfs)} new operator(s) added "
+                                  f"({len(_ADF_REGISTRY)} total).  "
+                                  f"Active immediately for all future mutations.")
+                    # ---- ADF retirement ----
+                    retired = _retire_unused_adfs(afpo_pops)
+                    if retired:
+                        print(f"  [ADF] Retired {len(retired)} idle operator(s): "
+                              f"{retired}")
+
+                # ---- Periodic simplification pass ----
+                if SIMPLIFICATION_FREQ > 0 and gen % SIMPLIFICATION_FREQ == 0:
+                    print(f"\n[Gen {gen}] Running algebraic simplification pass…")
+                    # Wrap afpo_pops as if they were islands (list of [pop])
+                    pseudo_islands = [[pop] for pop in afpo_pops]
+                    apply_simplification_pass(pseudo_islands, hofs, X, Y, out_types)
+                    # Unwrap back
+                    for i in range(n_outputs):
+                        afpo_pops[i] = pseudo_islands[i][0]
+
+                # ---- Extra simplification for perfect outputs ----
+                if perfect_outputs and gen % max(100, SIMPLIFICATION_FREQ if SIMPLIFICATION_FREQ > 0 else 100) == 0:
+                    for o_idx in perfect_outputs:
+                        _simplify_perfect_output(
+                            hofs[o_idx], X, Y[:, o_idx], out_types[o_idx],
+                            target_grads=target_grads_list[o_idx])
+
+                # ---- Periodic HoF re-scoring on full data (batch mode) ----
+                if BATCH_SIZE > 0 and gen > 0 and gen % 200 == 0:
+                    for o_idx, hof in enumerate(hofs):
+                        for ind in hof.best_by_complexity.values():
+                            ind.affine_fitted = False
+                            ind.calculate_fitness(
+                                X, Y[:, o_idx], out_types[o_idx],
+                                update_affine=True,
+                                target_grads=target_grads_list[o_idx])
+
+                # ---- Deep constant optimisation ----
+                if gen > 0 and gen % 1000 == 0:
+                    _deep_optimize_hofs(hofs, X, Y, out_types)
+
+        except KeyboardInterrupt:
+            print("\nStopping Evolution…")
+
+    # ════════════════════════════════════════════════════════════════
+    # ISLANDED AFPOs MODEL
+    # Each island runs its own AFPO population in a separate worker
+    # process.  Ring migration of the best individual after every chunk.
+    # ════════════════════════════════════════════════════════════════
+    elif EVOLUTION_MODEL == "island_afpo":
+        NUM_ISLANDS  = NUM_ISLANDS_GLOBAL
+        AFPO_POP_SIZE = POP_SIZE * 2
+
+        # islands_pop[island_idx][out_idx] = list of Individuals
+        islands_pop         = [[] for _ in range(NUM_ISLANDS)]
+        hofs                = [HallOfFame() for _ in range(n_outputs)]
+        stagnation_counters = [[0] * n_outputs for _ in range(NUM_ISLANDS)]
+
+        # ── Detect multi-class groups ────────────────────────────────────────
+        class_groups_ia  = detect_class_groups(dp, out_types)
+        out_group_info_ia = {}
+        for col_name, group_idxs in class_groups_ia.items():
+            for local_k, global_k in enumerate(group_idxs):
+                out_group_info_ia[global_k] = (group_idxs, local_k)
+        if class_groups_ia:
+            print(f"  [Joint Softmax] Detected {len(class_groups_ia)} class group(s): "
+                  + ", ".join(f"{k}({len(v)} classes)" for k, v in class_groups_ia.items()))
+
+        print(f"\nInitializing {NUM_ISLANDS} AFPO islands × {AFPO_POP_SIZE} individuals "
+              f"× {n_outputs} output(s)…")
+
+        # ── Fast initialization ──────────────────────────────────────────
+        _INIT_PHASE = True
+        N_train = X.shape[0]
+        if N_train > _INIT_SUBSAMPLE_CAP:
+            init_idx = np.random.choice(N_train, _INIT_SUBSAMPLE_CAP, replace=False)
+            X_init, Y_init = X[init_idx], Y[init_idx]
+            print(f"  (using {_INIT_SUBSAMPLE_CAP}/{N_train} row subsample for fast init)")
+        else:
+            X_init, Y_init = X, Y
+
+        for island_idx in range(NUM_ISLANDS):
+            for i in range(n_outputs):
+                pop = generate_seeds_v5(n_features, feat_names)
+                try:
+                    imp_seeds = generate_importance_biased_seeds(
+                        n_features, feat_names, X_init, Y_init[:, i])
+                    pop.extend(imp_seeds)
+                except Exception:
+                    pass
+                while len(pop) < AFPO_POP_SIZE:
+                    pop.append(Individual(random_cgp(n_features, CGP_NODES, feat_names)))
+                for ind in pop:
+                    ind.age = 0
+                    ind.calculate_fitness(X_init, Y_init[:, i], out_types[i],
+                                          target_grads=target_grads_list[i])
+                    hofs[i].update(ind)
+                islands_pop[island_idx].append(pop)
+            print(f"  Island {island_idx+1}/{NUM_ISLANDS} initialized.")
+
+        if N_train > _INIT_SUBSAMPLE_CAP:
+            print("  Re-scoring Hall of Fame on full dataset…")
+            for i in range(n_outputs):
+                for ind in hofs[i].best_by_complexity.values():
+                    ind.affine_fitted = False
+                    ind.calculate_fitness(X, Y[:, i], out_types[i],
+                                          target_grads=target_grads_list[i])
+        _INIT_PHASE = False
+
+        ds_label  = (f"DS-Lexicase {DS_LEXICASE_FRAC*100:.0f}%"
+                     if DS_LEXICASE_FRAC > 0 else "standard epsilon-Lexicase")
+        adf_label = "ADF enabled" if ADF_ENABLED else "ADF disabled"
+        print(f"Islanded AFPOs started  [{ds_label} | {adf_label}]. Ctrl+C to stop.\n")
+
+        gen = 0
+        perfect_outputs = set()
+        try:
+            with concurrent.futures.ProcessPoolExecutor(max_workers=NUM_ISLANDS) as executor:
+                while True:
+                    batch_idx = (np.random.choice(X.shape[0], BATCH_SIZE, replace=False)
+                                 if BATCH_SIZE > 0 else None)
+                    X_b = X[batch_idx] if batch_idx is not None else X
+                    Y_b = Y[batch_idx] if batch_idx is not None else Y
+
+                    # ── Background logits ─────────────────────────────────────
+                    bg_logits_cache_ia = {}
+                    for col_name, group_idxs in class_groups_ia.items():
+                        bg_logits_cache_ia[col_name] = build_bg_logits(hofs, group_idxs, X_b)
+
+                    # ── Elitist HoF injection ─────────────────────────────────
+                    for i in range(n_outputs):
+                        hof_best_i = hofs[i].get_best_overall()
+                        if hof_best_i is None:
+                            continue
+                        for island_idx in range(NUM_ISLANDS):
+                            pop = islands_pop[island_idx][i]
+                            if not pop:
+                                continue
+                            pop_best_loss = min(ind.loss for ind in pop)
+                            if hof_best_i.loss < pop_best_loss - 1e-9:
+                                worst = max(pop, key=lambda x: x.fitness)
+                                pop.remove(worst)
+                                elite = copy.deepcopy(hof_best_i)
+                                elite.age = 0
+                                pop.append(elite)
+
+                    # ── Submit AFPO chunks ────────────────────────────────────
+                    futures = []
+                    for i in range(n_outputs):
+                        g_info = out_group_info_ia.get(i)
+                        if g_info is not None:
+                            group_idxs, local_k = g_info
+                            col_bg = next(
+                                bg_logits_cache_ia[cn]
+                                for cn, idxs in class_groups_ia.items()
+                                if group_idxs == idxs)
+                            Y_group_i = Y_b[:, group_idxs[0]:group_idxs[-1]+1]
+                        else:
+                            col_bg, local_k, Y_group_i = None, None, None
+
+                        for island_idx in range(NUM_ISLANDS):
+                            args_ia = (
+                                islands_pop[island_idx][i],
+                                X_b, Y_b[:, i], out_types[i],
+                                n_features, feat_names,
+                                AFPO_POP_SIZE, MIGRATION_FREQ,
+                                stagnation_counters[island_idx][i],
+                                EXTINCTION_PATIENCE,
+                                island_idx, i,
+                                list(_ADF_REGISTRY),
+                                col_bg, local_k, Y_group_i,
+                                target_grads_list[i],  # ← Sobolev
+                            )
+                            futures.append(
+                                executor.submit(evolve_afpo_island_chunk, args_ia))
+
+                    for future in concurrent.futures.as_completed(futures):
+                        ret_pop, stag, isl_idx, o_idx, local_hof = future.result()
+                        islands_pop[isl_idx][o_idx] = ret_pop
+                        stagnation_counters[isl_idx][o_idx] = stag
+                        for c, ind in local_hof.best_by_complexity.items():
+                            if hofs[o_idx].update(ind):
+                                is_cls = (out_types[o_idx] == 6)
+                                metric = (f"Acc={getattr(ind,'accuracy',0):.4f}"
+                                          if is_cls else f"R²={getattr(ind,'r2',0):.4f}")
+                                print(f"[Out {o_idx} | AFPO-Isl {isl_idx}] "
+                                      f"New Best (Comp {ind.complexity:.0f}): "
+                                      f"loss={ind.loss:.4f}  {metric}")
+
+                    gen += MIGRATION_FREQ
+
+                    # ── Diverse ring migration between AFPO islands ──────────
+                    # Instead of migrating only the best, send a diverse pool:
+                    # best-loss + lowest-complexity + most-novel individual.
+                    # This prevents inter-island convergence (all islands
+                    # collapsing onto the same expression) while still
+                    # sharing high-quality solutions.
+                    _probe_idx_mig = np.random.choice(
+                        X.shape[0], min(16, X.shape[0]), replace=False)
+                    _X_probe_mig = X[_probe_idx_mig]
+
+                    for i in range(n_outputs):
+                        for island_idx in range(NUM_ISLANDS):
+                            next_island = (island_idx + 1) % NUM_ISLANDS
+                            n_mig = min(3, max(1, AFPO_POP_SIZE // 50))
+                            migrants = _select_diverse_migrants(
+                                islands_pop[island_idx][i],
+                                n_migrants=n_mig,
+                                X_probe=_X_probe_mig)
+                            target_pop = islands_pop[next_island][i]
+                            for mc in migrants:
+                                if target_pop:
+                                    worst = max(target_pop, key=lambda x: x.fitness)
+                                    target_pop.remove(worst)
+                                target_pop.append(mc)
+
+                    # ── Per-island stagnation monitoring & adaptive reset ─────
+                    # If a single island has stagnated severely while others
+                    # are still progressing, reset just that island with a mix
+                    # of HoF mutations and fresh random individuals.
+                    _ISL_RESET_THRESH = EXTINCTION_PATIENCE * 2
+                    for i in range(n_outputs):
+                        # Check if any island is severely stagnated
+                        max_stag_isl = -1
+                        max_stag_val = 0
+                        min_stag_val = float('inf')
+                        for island_idx in range(NUM_ISLANDS):
+                            s = stagnation_counters[island_idx][i]
+                            if s > max_stag_val:
+                                max_stag_val = s
+                                max_stag_isl = island_idx
+                            min_stag_val = min(min_stag_val, s)
+
+                        # Only reset if: (a) one island is severely stagnated,
+                        # (b) at least one other island is still progressing,
+                        # (c) threshold exceeded
+                        if (max_stag_val > _ISL_RESET_THRESH
+                                and min_stag_val < max_stag_val * 0.5
+                                and max_stag_isl >= 0):
+                            pop = islands_pop[max_stag_isl][i]
+                            # Keep top 10% as survivors
+                            pop.sort(key=lambda x: x.loss)
+                            keep_n = max(2, len(pop) // 10)
+                            survivors = pop[:keep_n]
+                            new_blood = list(generate_seeds_v5(n_features, feat_names))
+
+                            # Inject HoF mutations for warm-restart
+                            hof_best_i = hofs[i].get_best_overall()
+                            if hof_best_i is not None:
+                                for _ in range(max(3, AFPO_POP_SIZE // 10)):
+                                    rate = random.choice([CGP_MUT_RATE,
+                                                          CGP_MUT_RATE * 2,
+                                                          CGP_MUT_RATE * 4])
+                                    tree = mutate(hof_best_i.tree, n_features,
+                                                  feat_names, mut_rate=int(rate))
+                                    ni = Individual(tree)
+                                    ni.age = 0
+                                    new_blood.append(ni)
+
+                            while len(survivors) + len(new_blood) < AFPO_POP_SIZE:
+                                new_blood.append(Individual(
+                                    random_cgp(n_features, CGP_NODES, feat_names)))
+                            for ind in new_blood:
+                                ind.age = 0
+                                ind.calculate_fitness(
+                                    X_b, Y_b[:, i], out_types[i],
+                                    target_grads=target_grads_list[i])
+                            islands_pop[max_stag_isl][i] = survivors + new_blood
+                            stagnation_counters[max_stag_isl][i] = 0
+                            print(f"  [Island Reset] Island {max_stag_isl} / "
+                                  f"Output {i}: stagnation={max_stag_val}, "
+                                  f"reset with {keep_n} survivors + "
+                                  f"{len(new_blood)} new")
+
+                    # ── Periodic diversity report ─────────────────────────────
+                    if gen % 500 == 0 and NUM_ISLANDS >= 2:
+                        for i in range(n_outputs):
+                            divs = []
+                            for isl in range(NUM_ISLANDS):
+                                d = _compute_island_diversity(
+                                    islands_pop[isl][i], _X_probe_mig)
+                                divs.append(d)
+                            print(f"  [Diversity] Out {i}: " +
+                                  "  ".join(f"Isl{j}={d:.4f}"
+                                            for j, d in enumerate(divs)))
+
+                    print(f"--- Generation {gen} ---")
+
+                    # ---- Perfect output detection & early stopping ----
+                    for o_idx in range(n_outputs):
+                        if o_idx in perfect_outputs:
+                            continue
+                        is_perf, best_ind = _check_output_perfect(
+                            hofs[o_idx], X, Y[:, o_idx], out_types[o_idx])
+                        if is_perf:
+                            out_label = dp.output_map[o_idx] if o_idx < len(dp.output_map) else f"Out{o_idx}"
+                            print(f"\n  ★ Output {o_idx} ({out_label}) reached PERFECT performance!")
+                            print(f"    Running simplification pass on perfect output...")
+                            _simplify_perfect_output(
+                                hofs[o_idx], X, Y[:, o_idx], out_types[o_idx],
+                                target_grads=target_grads_list[o_idx])
+                            perfect_outputs.add(o_idx)
+                            best_models_snapshot = [h.get_best_overall() for h in hofs]
+                            _save_backup_model(best_models_snapshot, dp, o_idx, X_data=X)
+
+                    if len(perfect_outputs) == n_outputs:
+                        print("\n  ★★★ ALL outputs reached perfect performance! Stopping evolution.")
+                        break
+
+                    # ---- Periodic frontier display ----
+                    if gen % 500 == 0:
+                        for o_idx, hof in enumerate(hofs):
+                            out_label = dp.output_map[o_idx] if o_idx < len(dp.output_map) else f"Out{o_idx}"
+                            pf_tag = " [PERFECT]" if o_idx in perfect_outputs else ""
+                            hof.print_frontier(out_type=out_types[o_idx],
+                                               label=f"Output {o_idx} ({out_label}){pf_tag}")
+                        if X_val is not None and Y_val is not None:
+                            _print_validation_metrics(hofs, X_val, Y_val, out_types, dp)
+
+                    # ---- Interval stability culling ----
+                    if INTERVAL_MODE and gen % INTERVAL_CHECK_FREQ == 0:
+                        n_pen = _interval_cull_population(islands_pop, X, out_types)
+                        if n_pen:
+                            print(f"  [Interval] {n_pen} numerically unstable "
+                                  f"individual(s) penalised.")
+
+                    # ---- ADF extraction ----
+                    if ADF_ENABLED and gen % ADF_EXTRACT_FREQ == 0:
+                        print(f"\n[Gen {gen}] ADF extraction scan…")
+                        for o_idx in range(n_outputs):
+                            all_inds = [ind for isl in islands_pop for ind in isl[o_idx]]
+                            new_adfs = try_extract_adfs_from_population(
+                                all_inds, X, Y[:, o_idx], out_types[o_idx])
+                            if new_adfs:
+                                print(f"  [ADF] {len(new_adfs)} new operator(s) added "
+                                      f"({len(_ADF_REGISTRY)} total).")
+                        all_pops_flat = [islands_pop[i][j]
+                                         for i in range(NUM_ISLANDS)
+                                         for j in range(n_outputs)]
+                        retired = _retire_unused_adfs(all_pops_flat)
+                        if retired:
+                            print(f"  [ADF] Retired {len(retired)} idle operator(s): "
+                                  f"{retired}")
+
+                    # ---- Periodic simplification ----
+                    if SIMPLIFICATION_FREQ > 0 and gen % SIMPLIFICATION_FREQ == 0:
+                        print(f"\n[Gen {gen}] Running algebraic simplification pass…")
+                        apply_simplification_pass(islands_pop, hofs, X, Y, out_types)
+
+                    # ---- Extra simplification for perfect outputs ----
+                    if perfect_outputs and gen % max(100, SIMPLIFICATION_FREQ if SIMPLIFICATION_FREQ > 0 else 100) == 0:
+                        for o_idx in perfect_outputs:
+                            _simplify_perfect_output(
+                                hofs[o_idx], X, Y[:, o_idx], out_types[o_idx],
+                                target_grads=target_grads_list[o_idx])
+
+                    # ---- Periodic HoF re-scoring on full data (batch mode) ----
+                    if BATCH_SIZE > 0 and gen > 0 and gen % 200 == 0:
+                        for o_idx, hof in enumerate(hofs):
+                            for ind in hof.best_by_complexity.values():
+                                ind.affine_fitted = False
+                                ind.calculate_fitness(
+                                    X, Y[:, o_idx], out_types[o_idx],
+                                    update_affine=True,
+                                    target_grads=target_grads_list[o_idx])
+
+                    # ---- Deep constant optimisation ----
+                    if gen > 0 and gen % 1000 == 0:
+                        _deep_optimize_hofs(hofs, X, Y, out_types)
+
+        except KeyboardInterrupt:
+            print("\nStopping Evolution…")
+
+    # ════════════════════════════════════════════════════════════════
+    # AGE GROUP ISLANDS MODEL
+    #
+    # G tiers × N_ISLANDS AFPO islands each.  A "tier" represents a
+    # seniority level.  New individuals always start in Tier 0 at age=0.
+    # Every AGE_GROUP_GRAD_FREQ generations, the best-fitness individuals
+    # from each island in Tier g are graduated (injected as age=0) into a
+    # randomly chosen island in Tier g+1, driving competition upward.
+    # Within each tier, ring migration keeps the islands diverse.
+    # Global HoF aggregates discoveries from every tier and island.
+    # ════════════════════════════════════════════════════════════════
+    elif EVOLUTION_MODEL == "age_group_islands":
+        N_GROUPS    = AGE_GROUP_N_GROUPS
+        N_ISL_PER_G = AGE_GROUP_ISLANDS_PER_GROUP
+        GRAD_FREQ   = AGE_GROUP_GRAD_FREQ
+        AFPO_POP_SIZE = max(POP_SIZE, POP_SIZE * 2 // N_GROUPS)
+
+        # tier_islands[tier][island_idx][out_idx] = list of Individuals
+        tier_islands = [[[] for _ in range(N_ISL_PER_G)] for _ in range(N_GROUPS)]
+        hofs         = [HallOfFame() for _ in range(n_outputs)]
+        # stag_counters[tier][island_idx][out_idx]
+        stag_counters = [[[0] * n_outputs for _ in range(N_ISL_PER_G)]
+                         for _ in range(N_GROUPS)]
+
+        # ── Detect multi-class groups ────────────────────────────────────────
+        class_groups_ag  = detect_class_groups(dp, out_types)
+        out_group_info_ag = {}
+        for col_name, group_idxs in class_groups_ag.items():
+            for local_k, global_k in enumerate(group_idxs):
+                out_group_info_ag[global_k] = (group_idxs, local_k)
+        if class_groups_ag:
+            print(f"  [Joint Softmax] Detected {len(class_groups_ag)} class group(s): "
+                  + ", ".join(f"{k}({len(v)} classes)" for k, v in class_groups_ag.items()))
+
+        total_islands = N_GROUPS * N_ISL_PER_G
+        print(f"\nInitializing Age Group Islands: {N_GROUPS} tiers × {N_ISL_PER_G} islands "
+              f"= {total_islands} total AFPO populations, {AFPO_POP_SIZE} individuals each "
+              f"× {n_outputs} output(s)…")
+
+        # ── Fast initialization ──────────────────────────────────────────
+        _INIT_PHASE = True
+        N_train = X.shape[0]
+        if N_train > _INIT_SUBSAMPLE_CAP:
+            init_idx = np.random.choice(N_train, _INIT_SUBSAMPLE_CAP, replace=False)
+            X_init, Y_init = X[init_idx], Y[init_idx]
+            print(f"  (using {_INIT_SUBSAMPLE_CAP}/{N_train} row subsample for fast init)")
+        else:
+            X_init, Y_init = X, Y
+
+        for tier in range(N_GROUPS):
+            for isl in range(N_ISL_PER_G):
+                for i in range(n_outputs):
+                    pop = generate_seeds_v5(n_features, feat_names)
+                    try:
+                        imp_seeds = generate_importance_biased_seeds(
+                            n_features, feat_names, X_init, Y_init[:, i])
+                        pop.extend(imp_seeds)
+                    except Exception:
+                        pass
+                    while len(pop) < AFPO_POP_SIZE:
+                        pop.append(Individual(random_cgp(n_features, CGP_NODES, feat_names)))
+                    for ind in pop:
+                        ind.age = 0
+                        ind.calculate_fitness(X_init, Y_init[:, i], out_types[i],
+                                              target_grads=target_grads_list[i])
+                        hofs[i].update(ind)
+                    tier_islands[tier][isl].append(pop)
+            print(f"  Tier {tier+1}/{N_GROUPS} initialized.")
+
+        if N_train > _INIT_SUBSAMPLE_CAP:
+            print("  Re-scoring Hall of Fame on full dataset…")
+            for i in range(n_outputs):
+                for ind in hofs[i].best_by_complexity.values():
+                    ind.affine_fitted = False
+                    ind.calculate_fitness(X, Y[:, i], out_types[i],
+                                          target_grads=target_grads_list[i])
+        _INIT_PHASE = False
+
+        ds_label  = (f"DS-Lexicase {DS_LEXICASE_FRAC*100:.0f}%"
+                     if DS_LEXICASE_FRAC > 0 else "standard epsilon-Lexicase")
+        adf_label = "ADF enabled" if ADF_ENABLED else "ADF disabled"
+        print(f"Age Group Islands started  [{ds_label} | {adf_label}]. Ctrl+C to stop.")
+        print(f"  Graduation every {GRAD_FREQ} gens: best of Tier g → Tier g+1.\n")
+
+        gen = 0
+        perfect_outputs = set()
+        try:
+            # Flatten all (tier, island) pairs for the executor
+            all_pairs = [(tier, isl)
+                         for tier in range(N_GROUPS)
+                         for isl in range(N_ISL_PER_G)]
+            # We encode the island identity as a single flat index:
+            # flat_idx = tier * N_ISL_PER_G + isl
+            FLAT_COUNT = total_islands
+
+            with concurrent.futures.ProcessPoolExecutor(
+                    max_workers=min(FLAT_COUNT, 8)) as executor:
+                while True:
+                    batch_idx = (np.random.choice(X.shape[0], BATCH_SIZE, replace=False)
+                                 if BATCH_SIZE > 0 else None)
+                    X_b = X[batch_idx] if batch_idx is not None else X
+                    Y_b = Y[batch_idx] if batch_idx is not None else Y
+
+                    # ── Background logits ─────────────────────────────────────
+                    bg_logits_cache_ag = {}
+                    for col_name, group_idxs in class_groups_ag.items():
+                        bg_logits_cache_ag[col_name] = build_bg_logits(
+                            hofs, group_idxs, X_b)
+
+                    # ── Elitist HoF injection across all islands ──────────────
+                    for i in range(n_outputs):
+                        hof_best_i = hofs[i].get_best_overall()
+                        if hof_best_i is None:
+                            continue
+                        for tier in range(N_GROUPS):
+                            for isl in range(N_ISL_PER_G):
+                                pop = tier_islands[tier][isl][i]
+                                if not pop:
+                                    continue
+                                pop_best = min(ind.loss for ind in pop)
+                                if hof_best_i.loss < pop_best - 1e-9:
+                                    worst = max(pop, key=lambda x: x.fitness)
+                                    pop.remove(worst)
+                                    elite = copy.deepcopy(hof_best_i)
+                                    elite.age = 0
+                                    pop.append(elite)
+
+                    # ── Submit AFPO chunks for every (tier, island) ───────────
+                    futures_ag = []
+                    for tier, isl in all_pairs:
+                        flat_idx = tier * N_ISL_PER_G + isl
+                        for i in range(n_outputs):
+                            g_info = out_group_info_ag.get(i)
+                            if g_info is not None:
+                                group_idxs, local_k = g_info
+                                col_bg = next(
+                                    bg_logits_cache_ag[cn]
+                                    for cn, idxs in class_groups_ag.items()
+                                    if group_idxs == idxs)
+                                Y_group_i = Y_b[:, group_idxs[0]:group_idxs[-1]+1]
+                            else:
+                                col_bg, local_k, Y_group_i = None, None, None
+
+                            args_ag = (
+                                tier_islands[tier][isl][i],
+                                X_b, Y_b[:, i], out_types[i],
+                                n_features, feat_names,
+                                AFPO_POP_SIZE, MIGRATION_FREQ,
+                                stag_counters[tier][isl][i],
+                                EXTINCTION_PATIENCE,
+                                flat_idx, i,
+                                list(_ADF_REGISTRY),
+                                col_bg, local_k, Y_group_i,
+                                target_grads_list[i],  # ← Sobolev
+                            )
+                            futures_ag.append(
+                                executor.submit(evolve_afpo_island_chunk, args_ag))
+
+                    for future in concurrent.futures.as_completed(futures_ag):
+                        ret_pop, stag, flat_idx, o_idx, local_hof = future.result()
+                        tier_r = flat_idx // N_ISL_PER_G
+                        isl_r  = flat_idx  % N_ISL_PER_G
+                        tier_islands[tier_r][isl_r][o_idx] = ret_pop
+                        stag_counters[tier_r][isl_r][o_idx] = stag
+                        for c, ind in local_hof.best_by_complexity.items():
+                            if hofs[o_idx].update(ind):
+                                is_cls = (out_types[o_idx] == 6)
+                                metric = (f"Acc={getattr(ind,'accuracy',0):.4f}"
+                                          if is_cls else f"R²={getattr(ind,'r2',0):.4f}")
+                                print(f"[Out {o_idx} | Tier {tier_r} Isl {isl_r}] "
+                                      f"New Best (Comp {ind.complexity:.0f}): "
+                                      f"loss={ind.loss:.4f}  {metric}")
+
+                    gen += MIGRATION_FREQ
+
+                    # ── Within-tier ring migration ────────────────────────────
+                    # Best individual from island k → island (k+1) % N_ISL_PER_G,
+                    # within the same tier.
+                    for tier in range(N_GROUPS):
+                        for i in range(n_outputs):
+                            for isl in range(N_ISL_PER_G):
+                                next_isl = (isl + 1) % N_ISL_PER_G
+                                src_pop  = tier_islands[tier][isl][i]
+                                dst_pop  = tier_islands[tier][next_isl][i]
+                                if not src_pop or not dst_pop:
+                                    continue
+                                migrant = copy.deepcopy(
+                                    min(src_pop, key=lambda x: x.fitness))
+                                migrant.age = 0   # AFPO invariant on arrival
+                                worst = max(dst_pop, key=lambda x: x.fitness)
+                                dst_pop.remove(worst)
+                                dst_pop.append(migrant)
+
+                    # ── Graduation: best of Tier g → Tier g+1 ────────────────
+                    # Runs every GRAD_FREQ gens.  For each output, for each
+                    # island in Tier g, the single best-fitness individual
+                    # graduates into a random island in Tier g+1 as age=0.
+                    # The graduating slot in Tier g is replenished with a fresh
+                    # age=0 individual cloned from the global HoF best (or random).
+                    if gen % GRAD_FREQ == 0:
+                        for tier in range(N_GROUPS - 1):
+                            next_tier = tier + 1
+                            for i in range(n_outputs):
+                                for isl in range(N_ISL_PER_G):
+                                    src_pop = tier_islands[tier][isl][i]
+                                    if not src_pop:
+                                        continue
+                                    # Pick the champion of this island
+                                    champion = min(src_pop, key=lambda x: x.fitness)
+                                    # Graduate it to a random island in next tier
+                                    dst_isl = random.randrange(N_ISL_PER_G)
+                                    dst_pop = tier_islands[next_tier][dst_isl][i]
+                                    if dst_pop:
+                                        worst = max(dst_pop, key=lambda x: x.fitness)
+                                        dst_pop.remove(worst)
+                                    graduate = copy.deepcopy(champion)
+                                    graduate.age = 0   # fresh competitor in new arena
+                                    dst_pop.append(graduate)
+                                    # Replenish Tier g: HoF mutation or fresh random
+                                    hof_best = hofs[i].get_best_overall()
+                                    if hof_best is not None:
+                                        tree = mutate(hof_best.tree, n_features,
+                                                      feat_names, mut_rate=CGP_MUT_RATE)
+                                        new_ind = Individual(tree)
+                                    else:
+                                        new_ind = Individual(
+                                            random_cgp(n_features, CGP_NODES, feat_names))
+                                    new_ind.age = 0
+                                    new_ind.calculate_fitness(
+                                        X_b, Y_b[:, i], out_types[i],
+                                        target_grads=target_grads_list[i])
+                                    # Replace a weak individual in source island
+                                    if src_pop:
+                                        weak = max(src_pop, key=lambda x: x.fitness)
+                                        src_pop.remove(weak)
+                                    src_pop.append(new_ind)
+                        print(f"  [Gen {gen}] Graduation cycle complete.")
+
+                    print(f"--- Generation {gen} ---")
+
+                    # ---- Perfect output detection & early stopping ----
+                    for o_idx in range(n_outputs):
+                        if o_idx in perfect_outputs:
+                            continue
+                        is_perf, best_ind = _check_output_perfect(
+                            hofs[o_idx], X, Y[:, o_idx], out_types[o_idx])
+                        if is_perf:
+                            out_label = dp.output_map[o_idx] if o_idx < len(dp.output_map) else f"Out{o_idx}"
+                            print(f"\n  ★ Output {o_idx} ({out_label}) reached PERFECT performance!")
+                            print(f"    Running simplification pass on perfect output...")
+                            _simplify_perfect_output(
+                                hofs[o_idx], X, Y[:, o_idx], out_types[o_idx],
+                                target_grads=target_grads_list[o_idx])
+                            perfect_outputs.add(o_idx)
+                            best_models_snapshot = [h.get_best_overall() for h in hofs]
+                            _save_backup_model(best_models_snapshot, dp, o_idx, X_data=X)
+
+                    if len(perfect_outputs) == n_outputs:
+                        print("\n  ★★★ ALL outputs reached perfect performance! Stopping evolution.")
+                        break
+
+                    # ---- Periodic frontier display ----
+                    if gen % 500 == 0:
+                        for o_idx, hof in enumerate(hofs):
+                            out_label = dp.output_map[o_idx] if o_idx < len(dp.output_map) else f"Out{o_idx}"
+                            pf_tag = " [PERFECT]" if o_idx in perfect_outputs else ""
+                            hof.print_frontier(out_type=out_types[o_idx],
+                                               label=f"Output {o_idx} ({out_label}){pf_tag}")
+                        if X_val is not None and Y_val is not None:
+                            _print_validation_metrics(hofs, X_val, Y_val, out_types, dp)
+
+                    # ---- Interval stability culling ----
+                    if INTERVAL_MODE and gen % INTERVAL_CHECK_FREQ == 0:
+                        # Build flat islands_pop-like structure for the cull helper
+                        flat_islands = [
+                            [tier_islands[tier][isl][j]
+                             for j in range(n_outputs)]
+                            for tier in range(N_GROUPS)
+                            for isl in range(N_ISL_PER_G)
+                        ]
+                        n_pen = _interval_cull_population(flat_islands, X, out_types)
+                        if n_pen:
+                            print(f"  [Interval] {n_pen} numerically unstable "
+                                  f"individual(s) penalised.")
+
+                    # ---- ADF extraction ----
+                    if ADF_ENABLED and gen % ADF_EXTRACT_FREQ == 0:
+                        print(f"\n[Gen {gen}] ADF extraction scan…")
+                        all_inds_by_out = [[] for _ in range(n_outputs)]
+                        for tier in range(N_GROUPS):
+                            for isl in range(N_ISL_PER_G):
+                                for j in range(n_outputs):
+                                    all_inds_by_out[j].extend(
+                                        tier_islands[tier][isl][j])
+                        for o_idx in range(n_outputs):
+                            new_adfs = try_extract_adfs_from_population(
+                                all_inds_by_out[o_idx], X, Y[:, o_idx],
+                                out_types[o_idx])
+                            if new_adfs:
+                                print(f"  [ADF] {len(new_adfs)} new operator(s) "
+                                      f"({len(_ADF_REGISTRY)} total).")
+                        all_pops_flat = [tier_islands[t][isl][j]
+                                         for t in range(N_GROUPS)
+                                         for isl in range(N_ISL_PER_G)
+                                         for j in range(n_outputs)]
+                        retired = _retire_unused_adfs(all_pops_flat)
+                        if retired:
+                            print(f"  [ADF] Retired {len(retired)}: {retired}")
+
+                    # ---- Periodic simplification ----
+                    if SIMPLIFICATION_FREQ > 0 and gen % SIMPLIFICATION_FREQ == 0:
+                        print(f"\n[Gen {gen}] Running algebraic simplification pass…")
+                        for tier in range(N_GROUPS):
+                            flat_isl = [[tier_islands[tier][isl][j]
+                                         for j in range(n_outputs)]
+                                        for isl in range(N_ISL_PER_G)]
+                            apply_simplification_pass(flat_isl, hofs, X, Y, out_types)
+                            for isl in range(N_ISL_PER_G):
+                                for j in range(n_outputs):
+                                    tier_islands[tier][isl][j] = flat_isl[isl][j]
+
+                    # ---- Extra simplification for perfect outputs ----
+                    if perfect_outputs and gen % max(100, SIMPLIFICATION_FREQ if SIMPLIFICATION_FREQ > 0 else 100) == 0:
+                        for o_idx in perfect_outputs:
+                            _simplify_perfect_output(
+                                hofs[o_idx], X, Y[:, o_idx], out_types[o_idx],
+                                target_grads=target_grads_list[o_idx])
+
+                    # ---- Periodic HoF re-scoring on full data (batch mode) ----
+                    if BATCH_SIZE > 0 and gen > 0 and gen % 200 == 0:
+                        for o_idx, hof in enumerate(hofs):
+                            for ind in hof.best_by_complexity.values():
+                                ind.affine_fitted = False
+                                ind.calculate_fitness(
+                                    X, Y[:, o_idx], out_types[o_idx],
+                                    update_affine=True,
+                                    target_grads=target_grads_list[o_idx])
+
+                    # ---- Deep constant optimisation ----
+                    if gen > 0 and gen % 1000 == 0:
+                        _deep_optimize_hofs(hofs, X, Y, out_types)
+
+        except KeyboardInterrupt:
+            print("\nStopping Evolution…")
+
+    # ════════════════════════════════════════════════════════════════
+    # BAYESIAN CGP
+    # ════════════════════════════════════════════════════════════════
+    elif EVOLUTION_MODEL == "bayesian_cgp":
+        hofs = [HallOfFame() for _ in range(n_outputs)]
+
+        run_bayesian_cgp(
+            X, Y, n_features, n_outputs, feat_names, out_types,
+            hofs, target_grads_list, dp,
+            X_val=X_val, Y_val=Y_val, BATCH_SIZE=BATCH_SIZE)
+
+    best_models = [h.get_best_overall() for h in hofs]
+
+    print("\n" + "=" * 80)
+    print("FINAL BEST MODELS PER OUTPUT")
+    print("=" * 80)
+    for i, best in enumerate(best_models):
+        out_label = dp.output_map[i] if i < len(dp.output_map) else f"Unknown"
+        if best:
+            is_cls = (out_types[i] == 6)
+            if is_cls:
+                metric_label = "Accuracy"
+                metric_val   = getattr(best, 'accuracy', 0.0)
+            else:
+                metric_label = "R²"
+                metric_val   = getattr(best, 'r2', 0.0)
+
+            # --- 1. Format the raw expression string ---
+            raw_expr_str = str(best.tree)
+            if not is_cls:
+                a = getattr(best, 'affine_a', 1.0)
+                b = getattr(best, 'affine_b', 0.0)
+                sign = "+" if b >= 0 else "-"
+                raw_expr_str = f"({a:.4g} * ({raw_expr_str}) {sign} {abs(b):.4g})"
+
+            # --- 2. Format the SymPy simplified string ---
+            simplified_expr = raw_expr_str
+            if sympy is not None:
+                try:
+                    clean_names = [clean_var_name(n) for n in dp.input_map]
+                    sym_vars    = [sympy.Symbol(n) for n in clean_names]
+                    raw_sym     = tree_to_sympy(best.tree, sym_vars, safe=SAFE_OPS_MODE)
+                    
+                    # Inject the affine transform into the SymPy object before simplifying
+                    if not is_cls:
+                        a = getattr(best, 'affine_a', 1.0)
+                        b = getattr(best, 'affine_b', 0.0)
+                        raw_sym = a * raw_sym + b
+                        
+                    simplified_sym = advanced_simplify_expr(raw_sym)
+                    simplified_expr = str(simplified_sym)
+                except Exception:
+                    pass
+
+            print(f"Output {i} ({out_label})  [{'Classification' if is_cls else 'Regression'}]")
+            print(f"  Complexity   : {best.complexity:.1f}")
+            print(f"  Loss         : {best.loss:.5f}")
+            print(f"  {metric_label:<13}: {metric_val:.4f}")
+            print(f"  Expression   : {raw_expr_str}")
+            print(f"  Simplified   : {simplified_expr}\n")
+        else:
+            print(f"Output {i} ({out_label}): No valid models found.\n")
+
+
+    generate_script(best_models, dp, X_data=X)
+
+
+if __name__ == "__main__":
+    train_mode()
