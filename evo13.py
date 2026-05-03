@@ -7168,8 +7168,9 @@ def tree_to_sympy(cgp_eq, feature_vars, safe=None):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # Thresholds for "perfect" performance
-_PERFECT_R2_THRESHOLD = 1.0 - 1e-9       # R² >= this is considered perfect
-_PERFECT_MSE_THRESHOLD = 1e-10            # MSE <= this is considered near-zero
+# Disabled for regression to force evolutionary search to find true structures (like ELU/GELU)
+_PERFECT_R2_THRESHOLD = 2.0               # R² >= this is considered perfect (impossible)
+_PERFECT_MSE_THRESHOLD = -1.0             # MSE <= this is considered near-zero (impossible)
 _PERFECT_ACCURACY_THRESHOLD = 1.0 - 1e-9  # accuracy >= this for classification
 
 
