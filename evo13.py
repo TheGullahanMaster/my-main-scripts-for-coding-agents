@@ -3520,6 +3520,283 @@ def compute_data_constants(X, y):
     return unique
 
 
+def _build_ols_seed(n_features, feature_names, basis, w, kept_indices):
+    """
+    Transcribe an OLS-fitted weighted sum  Σ_k w_k · b_k(x)  into a CGP
+    individual.  Each basis term `b_k` is a (kind, params) tuple:
+
+        ('const1', None)        -> the constant 1                — folded into the weight
+        ('feat',    (i,))       -> raw feature x_i               — no node needed
+        ('square',  (i,))       -> x_i²                           — one mult node
+        ('product', (i, j))     -> x_i · x_j                      — one mult node
+
+    Layout strategy keeps the build forward-only so every CGP wiring
+    constraint (in1, in2 < n_features + slot) is satisfied:
+        1. Allocate basis-value slots first (squares / products).
+        2. Allocate const + multiply nodes for each kept term.
+        3. Chain '+' across all weighted terms.
+
+    Returns ``None`` if the seed would not fit in the CGP node budget.
+    """
+    cgp = _make_cgp_base(n_features, feature_names)
+    nf = n_features
+    cur = 0
+    max_slots = cgp.max_nodes
+    allowed = set(CGPEquation.OPS_ALL)
+
+    def _alloc():
+        nonlocal cur
+        if cur >= max_slots:
+            return None
+        s = cur
+        cur += 1
+        return s
+
+    # ── Pass 1: build basis-value slots for non-trivial terms ───────────
+    term_slot = {}   # kept-index → global-slot of basis value (None for const1)
+    for ki in kept_indices:
+        kind, params, _ = basis[ki]
+        if kind == 'const1':
+            term_slot[ki] = None
+        elif kind == 'feat':
+            term_slot[ki] = params[0]                       # raw feature slot
+        elif kind == 'square':
+            ls = _alloc()
+            if ls is None:
+                return None
+            if 'square' in allowed:
+                cgp.nodes[ls] = CGPNode('square', params[0], 0)
+            else:
+                cgp.nodes[ls] = CGPNode('*', params[0], params[0])
+            term_slot[ki] = nf + ls
+        elif kind == 'product':
+            ls = _alloc()
+            if ls is None:
+                return None
+            cgp.nodes[ls] = CGPNode('*', params[0], params[1])
+            term_slot[ki] = nf + ls
+        else:
+            return None
+
+    # ── Pass 2: emit weighted terms (const  +  mult) ────────────────────
+    weighted_slots = []
+    for ki in kept_indices:
+        weight = float(w[ki])
+        if not np.isfinite(weight) or abs(weight) > 1e6:
+            continue                                        # skip pathological weights
+        bs = term_slot[ki]
+        if bs is None:
+            # Pure constant term: just a const node
+            ls = _alloc()
+            if ls is None:
+                return None
+            cgp.nodes[ls] = CGPNode('const', 0, 0, weight)
+            weighted_slots.append(nf + ls)
+        else:
+            ls_c = _alloc()
+            if ls_c is None:
+                return None
+            cgp.nodes[ls_c] = CGPNode('const', 0, 0, weight)
+            ls_m = _alloc()
+            if ls_m is None:
+                return None
+            cgp.nodes[ls_m] = CGPNode('*', nf + ls_c, bs)
+            weighted_slots.append(nf + ls_m)
+
+    if not weighted_slots:
+        return None
+
+    # ── Pass 3: chain '+' across all weighted terms ─────────────────────
+    if len(weighted_slots) == 1:
+        cgp.out_idx = weighted_slots[0]
+    else:
+        acc = weighted_slots[0]
+        for nxt in weighted_slots[1:]:
+            ls = _alloc()
+            if ls is None:
+                return None
+            cgp.nodes[ls] = CGPNode('+', acc, nxt)
+            acc = nf + ls
+        cgp.out_idx = acc
+
+    cgp.update_active_nodes()
+    return Individual(cgp)
+
+
+def generate_ols_basis_seeds(n_features, feature_names, X, y, max_terms=12):
+    """
+    Solve OLS over a polynomial feature basis and seed the population with
+    the resulting expression.  The killer move for tasks like:
+
+        y = c₀ + c₁x₁ + c₂x₂ + …                       (system of linear equations)
+        y = c₀ + c₁x  + c₂x²                            (single-feature quadratic)
+        y = c₀ + Σ aᵢxᵢ + Σ bᵢxᵢ² + Σ cᵢⱼxᵢxⱼ           (multivariate quadratic form)
+
+    Why this matters
+    ----------------
+    • Correlation-based feature importance MISSES joint linear relationships
+      when no individual feature correlates strongly with y.
+    • Random / data-stat constant init plus local L-BFGS-B / DE optimisation
+      MISSES the right magnitudes when many coefficients must coordinate
+      simultaneously.
+    OLS solves both problems in one closed-form O(N·P²) step; we transcribe
+    the solution into a CGP graph and let evolution refine it from there.
+
+    Returns up to two seed individuals — a quadratic-basis solution (when
+    quadratic terms are informative) and a linear-only fallback (smaller,
+    often preferred for true linear systems).
+    """
+    seeds = []
+    allowed = set(CGPEquation.OPS_ALL)
+    if n_features < 1 or len(y) < 5 or X.size == 0:
+        return seeds
+    # We need at minimum '+', '*', 'const' to encode a weighted sum
+    if not ({'+', '*', 'const'} <= allowed):
+        return seeds
+
+    X_clean = np.nan_to_num(X.astype(np.float64),
+                            nan=0.0, posinf=0.0, neginf=0.0)
+    y_clean = np.nan_to_num(np.asarray(y, dtype=np.float64),
+                            nan=0.0, posinf=0.0, neginf=0.0)
+    if np.std(y_clean) < 1e-12:
+        return seeds
+
+    N = len(y_clean)
+
+    # ── Build polynomial basis ──────────────────────────────────────────
+    # Each entry: (kind, params, vector)
+    basis = [('const1', None, np.ones(N))]
+    for i in range(n_features):
+        basis.append(('feat', (i,), X_clean[:, i].copy()))
+
+    # Quadratic terms: cap when n_features is large to keep basis tractable.
+    # P scales as O(n²), CGP_NODES bounds the seed size, and very large
+    # bases make OLS itself expensive.
+    QUAD_FEATURE_CAP = 12
+    if n_features <= QUAD_FEATURE_CAP:
+        for i in range(n_features):
+            basis.append(('square', (i,), X_clean[:, i] ** 2))
+        for i in range(n_features):
+            for j in range(i + 1, n_features):
+                basis.append(('product', (i, j), X_clean[:, i] * X_clean[:, j]))
+
+    # ── Solve OLS (column-scaled, ridge-regularised for stability) ─────
+    P = len(basis)
+    B = np.empty((N, P), dtype=np.float64)
+    for k, (_, _, v) in enumerate(basis):
+        B[:, k] = np.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0)
+
+    try:
+        col_std = np.std(B, axis=0)
+        col_std = np.where(col_std > 1e-12, col_std, 1.0)
+        B_s = B / col_std
+        # Ridge λ chosen tiny relative to mean column scale: stabilises
+        # near-singular Gram matrices without measurably biasing coefficients.
+        lam = 1e-6 * float(np.mean(col_std ** 2))
+        XTX = B_s.T @ B_s + lam * np.eye(P)
+        XTy = B_s.T @ y_clean
+        w_s = np.linalg.solve(XTX, XTy)
+        w = w_s / col_std
+    except Exception:
+        return seeds
+
+    if not np.all(np.isfinite(w)):
+        return seeds
+
+    # ── Score each term by its prediction-magnitude contribution ───────
+    # Contribution = |w_k| · std(B[:, k]); compare to std(y) to get the
+    # term's relative explanatory power.  Drops near-zero / numerical-junk
+    # terms that the ridge would otherwise leave at 1e-15 magnitudes.
+    contrib = np.abs(w) * col_std
+    rel = contrib / (float(np.std(y_clean)) + 1e-12)
+    order = np.argsort(-rel)
+
+    # ── Budget-aware term selection ─────────────────────────────────────
+    # Each term costs a different number of CGP nodes:
+    #   const1  → 1  (just a const node carrying the weight)
+    #   feat    → 2  (const + multiply against a raw feature)
+    #   square  → 3  (square + const + multiply)
+    #   product → 3  (multiply + const + multiply)
+    # Plus 1 '+' node per term beyond the first.  Greedy budget walk
+    # adds terms in importance order until the remaining slots can't
+    # hold another, so we use as much of CGP_NODES as is informative.
+    _TERM_COST = {'const1': 1, 'feat': 2, 'square': 3, 'product': 3}
+    REL_FLOOR  = 0.005                                # 0.5 % of std(y) — below this is noise
+    BUDGET     = max(8, int(CGP_NODES) - 2)           # small safety margin
+    HARD_CAP   = max(max_terms, 16)                   # absolute upper bound on # terms
+
+    quad_keep   = []
+    used_nodes  = 0
+    for idx in order:
+        idx = int(idx)
+        if rel[idx] < REL_FLOOR and len(quad_keep) >= 3:
+            break
+        cost = _TERM_COST.get(basis[idx][0], 3) + (1 if quad_keep else 0)
+        if used_nodes + cost > BUDGET:
+            continue                                   # can't afford this term — try smaller ones
+        quad_keep.append(idx)
+        used_nodes += cost
+        if len(quad_keep) >= HARD_CAP:
+            break
+    if not quad_keep:
+        return seeds
+
+    # ── Quadratic seed (full polynomial basis) ──────────────────────────
+    quad_seed = _build_ols_seed(n_features, feature_names, basis, w, quad_keep)
+    if quad_seed is not None:
+        seeds.append(quad_seed)
+
+    # ── Linear-only seed: re-solve OLS on the linear-only sub-basis ────
+    # The full-basis weights for linear terms are biased by colinearity
+    # with the quadratic columns, so a clean re-fit produces a more
+    # accurate linear-only model and dodges constants that look extreme
+    # in the joint solution.
+    lin_indices = [k for k in range(P) if basis[k][0] in ('const1', 'feat')]
+    if len(lin_indices) >= 2 and len(lin_indices) < P:
+        try:
+            B_lin = B[:, lin_indices]
+            col_std_lin = np.std(B_lin, axis=0)
+            col_std_lin = np.where(col_std_lin > 1e-12, col_std_lin, 1.0)
+            B_lin_s = B_lin / col_std_lin
+            lam_lin = 1e-6 * float(np.mean(col_std_lin ** 2))
+            XTX_l = B_lin_s.T @ B_lin_s + lam_lin * np.eye(len(lin_indices))
+            XTy_l = B_lin_s.T @ y_clean
+            w_lin_s = np.linalg.solve(XTX_l, XTy_l)
+            w_lin = w_lin_s / col_std_lin
+            if np.all(np.isfinite(w_lin)):
+                # Map the linear-fit weights back into a full-length array
+                # indexed by the original basis so _build_ols_seed can use it.
+                w_full = np.zeros(P, dtype=np.float64)
+                for local_k, global_k in enumerate(lin_indices):
+                    w_full[global_k] = w_lin[local_k]
+                contrib_lin = np.abs(w_full[lin_indices]) * col_std_lin
+                rel_lin = contrib_lin / (float(np.std(y_clean)) + 1e-12)
+                lin_order = np.argsort(-rel_lin)
+                lin_keep = []
+                used_lin = 0
+                for li in lin_order:
+                    li = int(li)
+                    gi = lin_indices[li]
+                    if rel_lin[li] < REL_FLOOR and len(lin_keep) >= 2:
+                        break
+                    cost = _TERM_COST.get(basis[gi][0], 2) + (1 if lin_keep else 0)
+                    if used_lin + cost > BUDGET:
+                        continue
+                    lin_keep.append(gi)
+                    used_lin += cost
+                    if len(lin_keep) >= HARD_CAP:
+                        break
+                if lin_keep:
+                    lin_seed = _build_ols_seed(
+                        n_features, feature_names, basis, w_full, lin_keep)
+                    if lin_seed is not None:
+                        seeds.append(lin_seed)
+        except Exception:
+            pass
+
+    return seeds
+
+
 def generate_importance_biased_seeds(n_features, feature_names, X, y):
     """
     Generate seeds biased by feature importance analysis.
@@ -3529,6 +3806,18 @@ def generate_importance_biased_seeds(n_features, feature_names, X, y):
     allowed = set(CGPEquation.OPS_ALL)
     if n_features < 1:
         return seeds
+
+    # ── Analytical OLS over polynomial basis ────────────────────────────
+    # Solves systems of linear equations and quadratic forms in closed form,
+    # then transcribes the result directly into the population.  This is the
+    # decisive move for problems where many coefficients must coordinate;
+    # without it, evolution must rediscover them by gradient descent through
+    # a rugged loss landscape, which routinely fails on > 3-feature systems.
+    try:
+        ols_seeds = generate_ols_basis_seeds(n_features, feature_names, X, y)
+        seeds.extend(ols_seeds)
+    except Exception:
+        pass
 
     importance, transform_imp, pair_imp = compute_feature_importance(X, y)
     data_consts = compute_data_constants(X, y)
