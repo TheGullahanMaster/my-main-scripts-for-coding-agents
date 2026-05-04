@@ -3202,7 +3202,15 @@ def random_cgp(n_features, max_nodes, feature_names):
                                     np.pi, 2*np.pi, np.e, 10.0, 100.0,
                                     60.0, 3600.0, 0.01, 0.1,
                                     np.sqrt(2), np.log(2), np.log(10)])
-        elif roll < 0.4:
+        elif roll < 0.30:
+            # Power-of-2 ladder — needed for binary↔decimal, hex, and any
+            # bit-arithmetic problem.  Without this the search rarely
+            # discovers the precise integer multipliers (128, 256, 512 …).
+            return random.choice([1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0,
+                                  128.0, 256.0, 512.0, 1024.0, 2048.0,
+                                  4096.0, 8192.0, 16384.0, 32768.0,
+                                  0.5, 0.25, 0.125, 0.0625, 0.03125])
+        elif roll < 0.5:
             return random.choice([-5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
                                     0.25, 0.33, 0.5, 0.67, 0.75, 1.5, 2.5, 3.5])
         else:
@@ -3415,6 +3423,37 @@ def compute_feature_importance(X, y):
     return importance, transform_importance, pair_importance
 
 
+def detect_binary_features(X, tol=1e-6):
+    """
+    Identify columns of X whose values are (almost) all in {0, 1}.
+    Returns a list of column indices for which >=99% of rows are within `tol`
+    of either 0 or 1.  Used to detect bit-vector inputs (binary→decimal tasks)
+    so the search can be primed with the power-of-2 weight ladder.
+    """
+    binary_idx = []
+    for i in range(X.shape[1]):
+        xi = X[:, i]
+        if np.std(xi) < 1e-10:
+            continue
+        near_bit = (np.abs(xi) < tol) | (np.abs(xi - 1.0) < tol)
+        if float(np.mean(near_bit)) >= 0.99:
+            binary_idx.append(i)
+    return binary_idx
+
+
+def detect_integer_target(y, tol=1e-6, min_range=2.0):
+    """
+    Return True if the target values look like integers spanning a non-trivial
+    range — a strong signal of a decimal→binary or counting task where a
+    power-of-2 / power-of-10 / floor / mod constant ladder should be primed.
+    """
+    if len(y) == 0:
+        return False
+    rounded = np.round(y)
+    near_int = float(np.mean(np.abs(y - rounded) < tol))
+    return near_int >= 0.99 and (float(np.max(y)) - float(np.min(y))) >= min_range
+
+
 def compute_data_constants(X, y):
     """
     Compute useful constants from data statistics.
@@ -3442,6 +3481,32 @@ def compute_data_constants(X, y):
                    60.0, 3600.0, 24.0, 365.25,  # time constants
                    9.81, 273.15,  # physics constants
                    ])
+
+    # Power-of-2 ladder (essential for binary↔decimal, hex, byte arithmetic).
+    # Always included; cheap and never hurts non-bit problems because the
+    # constant optimizer can re-tune unhelpful seeds.
+    consts.extend([1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0,
+                   256.0, 512.0, 1024.0, 2048.0, 4096.0, 8192.0,
+                   16384.0, 32768.0, 65536.0])
+    # Inverse power-of-2 ladder (for floor(x / 2^k) bit-extraction).
+    consts.extend([0.5, 0.25, 0.125, 0.0625, 0.03125, 0.015625,
+                   0.0078125, 0.00390625])
+
+    # ── Adaptive bit-aware constants ──────────────────────────────────────
+    # When the target spans a large integer range (e.g. 0..255) include the
+    # exact 2^k that brackets the range — that's the high-bit weight needed
+    # to start fitting decimal-from-bits patterns.
+    try:
+        if detect_integer_target(y):
+            y_max = float(np.max(np.abs(y)))
+            if y_max > 1.0:
+                k_top = int(np.ceil(np.log2(y_max + 1.0)))
+                for k in range(0, min(k_top + 2, 32)):
+                    consts.append(float(1 << k))     # 2^k
+                # Also include y_max + 1 itself — useful as a modulus
+                consts.append(float(round(y_max + 1.0)))
+    except Exception:
+        pass
 
     # Deduplicate and filter
     seen = set()
@@ -3689,6 +3754,179 @@ def generate_importance_biased_seeds(n_features, feature_names, X, y):
                 cgp.nodes[1] = CGPNode('sin', feat_idx, 0)
                 cgp.nodes[2] = CGPNode('*', n_features, n_features + 1)
                 cgp.out_idx = n_features + 2; cgp.update_active_nodes()
+                seeds.append(Individual(cgp))
+
+    # ════════════════════════════════════════════════════════════════
+    # BIT-ARITHMETIC SEEDS  (binary↔decimal, hex, byte tasks)
+    # ════════════════════════════════════════════════════════════════
+    # The standard seed templates miss a class of problems where the target
+    # is built from / decomposed into integer powers-of-2:
+    #     decimal = b0·1 + b1·2 + b2·4 + … + b_k·2^k          (bits→number)
+    #     b_k     = floor(N / 2^k) mod 2                       (number→bits)
+    # Without explicit templates evolution almost never finds these because
+    # they need many specific constants AND many specific wirings to land
+    # simultaneously.  Detect the data shape and seed accordingly.
+    seeds.extend(_generate_bit_arithmetic_seeds(n_features, feature_names, X, y))
+
+    return seeds
+
+
+def _generate_bit_arithmetic_seeds(n_features, feature_names, X, y):
+    """
+    Detect bit-arithmetic structure in (X, y) and emit seed individuals that
+    encode it directly:
+
+      * If features look binary (in {0,1}) → seed Σ 2^i · x_i (one per bit
+        ordering, plus the simple sum-of-features as a stepping stone).
+      * If the target is integer-valued and spans an integer range → seed
+        floor(N/2^k) mod 2 for each k that fits the range — one seed per
+        bit position.  Also seed mod(N, 2^k), floor(N/c), round(x/c), and
+        N - 2*floor(N/2)  (lowest-bit shortcut).
+    """
+    seeds = []
+    allowed = set(CGPEquation.OPS_ALL)
+    if n_features < 1:
+        return seeds
+
+    try:
+        bin_feats = detect_binary_features(X)
+    except Exception:
+        bin_feats = []
+
+    # ── Pattern A: bits → decimal  (sum c_i · x_i with c_i = 2^i)  ────────
+    # Triggered whenever ≥3 features look binary and we have enough nodes.
+    if (len(bin_feats) >= 3 and '+' in allowed and '*' in allowed
+            and 'const' in allowed):
+        # Variance-ranked ordering: highest-variance bits paired with highest
+        # weights.  This works because the most discriminative bit is usually
+        # the highest-order one for a true binary encoding (its sign change
+        # explains half the target range).
+        var_rank = sorted(bin_feats,
+                          key=lambda i: -float(np.var(X[:, i])))
+        try:
+            cov_rank = sorted(bin_feats,
+                              key=lambda i: -abs(float(np.cov(X[:, i], y)[0, 1])))
+        except Exception:
+            cov_rank = list(var_rank)
+
+        n_bits = min(len(bin_feats), 16)   # cap so node count stays sane
+        node_budget = 4 + 3 * n_bits       # rough lower-bound node count
+
+        for ordering in (cov_rank, list(reversed(cov_rank)),
+                         var_rank, list(reversed(var_rank))):
+            ord_bits = ordering[:n_bits]
+            cgp = _make_cgp_base(n_features, feature_names,
+                                 max_nodes=max(node_budget, CGP_NODES))
+            nf = n_features
+            slot = 0
+            const_slots = []
+            for k in range(n_bits):
+                cgp.nodes[slot] = CGPNode('const', 0, 0, float(1 << k))
+                const_slots.append(nf + slot)
+                slot += 1
+            term_slots = []
+            for k, fi in enumerate(ord_bits):
+                cgp.nodes[slot] = CGPNode('*', const_slots[k], fi)
+                term_slots.append(nf + slot)
+                slot += 1
+            running = term_slots[0]
+            for k in range(1, n_bits):
+                cgp.nodes[slot] = CGPNode('+', running, term_slots[k])
+                running = nf + slot
+                slot += 1
+            cgp.out_idx = running
+            cgp.update_active_nodes()
+            seeds.append(Individual(cgp))
+
+        # Stepping stone: plain sum-of-features (no weights).  Often useful
+        # as a partial credit anchor that mutation can refine into the
+        # weighted sum via the new pow2 const-doubling mutation.
+        cgp = _make_cgp_base(n_features, feature_names)
+        nf = n_features
+        running = bin_feats[0]
+        slot = 0
+        for fi in bin_feats[1:n_bits]:
+            cgp.nodes[slot] = CGPNode('+', running, fi)
+            running = nf + slot
+            slot += 1
+        cgp.out_idx = running
+        cgp.update_active_nodes()
+        seeds.append(Individual(cgp))
+
+    # ── Pattern B: decimal → bits  (extract bit_k via floor/mod) ──────────
+    # Triggered when the target itself looks binary while inputs do not —
+    # i.e. y ∈ {0,1} and there exists a numeric input large enough to encode
+    # multiple bits.  We seed bit_k = floor(N / 2^k) mod 2 for every plausible
+    # k, plus a couple of shortcuts (mod 2, frac, etc.).
+    target_binary = False
+    try:
+        y_unique = np.unique(np.round(y))
+        target_binary = (len(y_unique) <= 2
+                         and bool(np.all((y_unique == 0) | (y_unique == 1))))
+    except Exception:
+        pass
+
+    if target_binary and ('mod' in allowed or 'frac' in allowed):
+        # Pick numeric (non-binary) input columns sorted by how much variance
+        # they have — that's where the multi-bit number lives.
+        non_bin = [i for i in range(n_features) if i not in set(bin_feats)]
+        cand_feats = sorted(non_bin or list(range(n_features)),
+                            key=lambda i: -float(np.var(X[:, i])))[:3]
+        for fi in cand_feats:
+            xi = X[:, fi]
+            x_max = float(np.max(np.abs(xi)))
+            if not np.isfinite(x_max) or x_max < 1.0:
+                continue
+            k_top = min(int(np.ceil(np.log2(x_max + 1.0))), 16)
+            for k in range(k_top + 1):
+                # floor(N / 2^k) mod 2  — canonical bit extraction
+                if ('mod' in allowed and 'floor' in allowed and '/' in allowed
+                        and 'const' in allowed):
+                    cgp = _make_cgp_base(n_features, feature_names)
+                    nf = n_features
+                    cgp.nodes[0] = CGPNode('const', 0, 0, float(1 << k))
+                    cgp.nodes[1] = CGPNode('/',     fi, nf)
+                    cgp.nodes[2] = CGPNode('floor', nf + 1, 0)
+                    cgp.nodes[3] = CGPNode('const', 0, 0, 2.0)
+                    cgp.nodes[4] = CGPNode('mod',   nf + 2, nf + 3)
+                    cgp.out_idx = nf + 4; cgp.update_active_nodes()
+                    seeds.append(Individual(cgp))
+                # floordiv path (avoids the explicit floor wrapper)
+                if ('mod' in allowed and 'floordiv' in allowed
+                        and 'const' in allowed):
+                    cgp = _make_cgp_base(n_features, feature_names)
+                    nf = n_features
+                    cgp.nodes[0] = CGPNode('const',    0, 0, float(1 << k))
+                    cgp.nodes[1] = CGPNode('floordiv', fi, nf)
+                    cgp.nodes[2] = CGPNode('const',    0, 0, 2.0)
+                    cgp.nodes[3] = CGPNode('mod',      nf + 1, nf + 2)
+                    cgp.out_idx = nf + 3; cgp.update_active_nodes()
+                    seeds.append(Individual(cgp))
+                # round(frac(N / 2^(k+1)) * 2)  — alternate route (no floor)
+                if ('frac' in allowed and 'round' in allowed
+                        and '*' in allowed and '/' in allowed
+                        and 'const' in allowed):
+                    cgp = _make_cgp_base(n_features, feature_names)
+                    nf = n_features
+                    cgp.nodes[0] = CGPNode('const', 0, 0, float(1 << (k + 1)))
+                    cgp.nodes[1] = CGPNode('/',     fi, nf)
+                    cgp.nodes[2] = CGPNode('frac',  nf + 1, 0)
+                    cgp.nodes[3] = CGPNode('const', 0, 0, 2.0)
+                    cgp.nodes[4] = CGPNode('*',     nf + 2, nf + 3)
+                    cgp.nodes[5] = CGPNode('round', nf + 4, 0)
+                    cgp.out_idx = nf + 5; cgp.update_active_nodes()
+                    seeds.append(Individual(cgp))
+            # Lowest-bit shortcut: N - 2 * floor(N / 2)
+            if ('-' in allowed and '*' in allowed and 'floor' in allowed
+                    and '/' in allowed and 'const' in allowed):
+                cgp = _make_cgp_base(n_features, feature_names)
+                nf = n_features
+                cgp.nodes[0] = CGPNode('const', 0, 0, 2.0)
+                cgp.nodes[1] = CGPNode('/',     fi, nf)
+                cgp.nodes[2] = CGPNode('floor', nf + 1, 0)
+                cgp.nodes[3] = CGPNode('*',     nf, nf + 2)
+                cgp.nodes[4] = CGPNode('-',     fi, nf + 3)
+                cgp.out_idx = nf + 4; cgp.update_active_nodes()
                 seeds.append(Individual(cgp))
 
     return seeds
@@ -5157,16 +5395,23 @@ def mutate(parent_eq, n_features, feature_names, mut_rate=None, temperature=0.0,
     weightCompose        = 1.5     # wrap active subexpr in a new unary op
     weightDecompose      = 1.0     # split output into sum/product with new term
     weightInjectSubtree  = 1.2     # replace inactive region with coherent mini-tree
+    # Discrete-step constant ladder mutation: ×2, ÷2, ×0.5, etc.  Critical for
+    # discovering the integer power-of-2 constants needed by bit arithmetic
+    # (binary↔decimal, hex extraction); regular Gaussian / uniform-factor
+    # constant mutations almost never land exactly on a power of 2.
+    weightPow2Const      = 1.5
 
     mut_types = ['operator', 'rewire1', 'rewire2', 'rewire3',
                  'perturb_const', 'scale_const', 'reset_const',
                  'swap_ops', 'swap_pow',
-                 'compose', 'decompose', 'inject_subtree']
+                 'compose', 'decompose', 'inject_subtree',
+                 'pow2_const']
     mut_weights = [
         weightMutateOperator, weightRewireIn1, weightRewireIn2, weightRewireIn3,
         weightMutateConstant, weightScaleConstant, weightResetConstant,
         weightSwapOperands, weightSwapPow,
-        weightCompose, weightDecompose, weightInjectSubtree
+        weightCompose, weightDecompose, weightInjectSubtree,
+        weightPow2Const,
     ]
 
     for _ in range(mut_rate):
@@ -5217,6 +5462,31 @@ def mutate(parent_eq, n_features, feature_names, mut_rate=None, temperature=0.0,
         elif choice == 'reset_const':
             mag = random.choice([1, 10, 100, 0.1, 0.01])
             target.const_val = random.gauss(0, 3.0) * mag
+        elif choice == 'pow2_const':
+            # Discrete power-of-2 ladder step.  Either snap to the nearest
+            # power of 2 or move one rung up/down it.  This is the move that
+            # turns 1.7 → 2.0 → 4.0 → 8.0 …, which uniform/gaussian noise can
+            # only approximate asymptotically.
+            roll = random.random()
+            if roll < 0.30:
+                # Snap to nearest power of 2 (preserve sign and tiny values).
+                v = target.const_val
+                if abs(v) < 1e-12:
+                    target.const_val = random.choice([1.0, 2.0, 0.5])
+                else:
+                    sign = 1.0 if v >= 0 else -1.0
+                    p = round(np.log2(abs(v)))
+                    p = max(-12, min(20, int(p)))
+                    target.const_val = sign * (2.0 ** p)
+            elif roll < 0.65:
+                # Double or halve the current value.
+                factor = random.choice([2.0, 0.5])
+                target.const_val *= factor
+            else:
+                # Jump to a random power of 2 within a useful window.
+                p = random.randint(-6, 14)
+                sign = random.choice([1.0, -1.0])
+                target.const_val = sign * (2.0 ** p)
         elif choice == 'swap_ops':
             if target.op in child_eq.OPS_BINARY_SET:
                 target.in1, target.in2 = target.in2, target.in1
@@ -6060,6 +6330,147 @@ def set_constants_shared(cgp_eq, vals, cursor=0):
     return cursor
 
 
+# Pre-built ladder of "nice" candidate values used by _snap_constants_to_nice
+# below.  Includes integers, halves, simple rationals, powers of 2 and 10,
+# negatives, π / e and their multiples — anything an evolved expression is
+# likely to converge near for a real-world or arithmetic problem.
+def _build_nice_const_ladder():
+    nice = set()
+    # Integers in [-256, 256]
+    for k in range(-256, 257):
+        nice.add(float(k))
+    # Halves and simple rationals
+    nice.update([0.5, -0.5, 0.25, -0.25, 0.125, -0.125,
+                 1.5, -1.5, 2.5, -2.5, 0.1, -0.1, 0.01, -0.01,
+                 1.0/3.0, 2.0/3.0, -1.0/3.0, -2.0/3.0])
+    # Powers of 2 (positive ladder): 1024, 2048, ..., 65536; also negative.
+    for p in range(0, 17):
+        nice.add(float(1 << p))
+        nice.add(-float(1 << p))
+        nice.add(float(2.0 ** -p))
+        nice.add(-float(2.0 ** -p))
+    # Powers of 10
+    for p in range(-6, 7):
+        nice.add(float(10 ** p))
+        nice.add(-float(10 ** p))
+    # Common math constants
+    nice.update([np.pi, -np.pi, 2*np.pi, -2*np.pi, np.pi/2, -np.pi/2,
+                 np.e, -np.e, np.sqrt(2), -np.sqrt(2),
+                 np.log(2), np.log(10)])
+    arr = np.array(sorted(nice), dtype=np.float64)
+    return arr
+
+
+_NICE_CONST_LADDER = _build_nice_const_ladder()
+
+
+def _const_simplicity_score(v):
+    """
+    Heuristic ranking of how 'symbolically nice' a constant is.
+    LOWER is simpler.  Used as a tie-breaker by the snap routine so that
+    ties on loss prefer integers > halves/quarters > powers-of-2 >
+    arbitrary floats.
+    """
+    if not np.isfinite(v):
+        return 1e9
+    a = abs(v)
+    # Exact zero / one / minus-one are the simplest possible.
+    if a < 1e-12:
+        return 0.0
+    # Integer
+    if abs(v - round(v)) < 1e-9 and a < 1e6:
+        return 1.0 + np.log1p(a) * 0.01
+    # Half / quarter / eighth
+    for d in (2.0, 4.0, 8.0, 16.0):
+        if abs(v * d - round(v * d)) < 1e-9 and a < 1e6:
+            return 2.0 + np.log1p(d) * 0.1 + np.log1p(a) * 0.01
+    # Power of 2 (negative-exp territory)
+    if a > 1e-12 and abs(np.log2(a) - round(np.log2(a))) < 1e-9:
+        return 3.0
+    return 5.0 + abs(np.log10(a + 1e-30)) * 0.01
+
+
+def _snap_constants_to_nice(objective, params, current_loss,
+                            rel_tol=0.05, abs_tol=1e-3, max_candidates=8,
+                            max_rel_dist=0.05, max_abs_dist=0.02):
+    """
+    Try snapping each constant in *params* (one at a time) to its closest
+    "nice" value (integer / power-of-2 / simple rational / π / e …).
+
+    Two acceptance gates control the snap:
+
+    1. **Loss gate**: the new loss must not exceed the original loss by more
+       than ``max(rel_tol * orig_loss, abs_tol)``.  The ``abs_tol`` cushion
+       lets near-perfect fits (loss ~ 1e-3) tolerate the tiny bump that
+       integer constants impose on a smooth regression while still being
+       able to fix bit-arithmetic.
+
+    2. **Distance gate**: the candidate must be within ``max_rel_dist`` of
+       the current value (or ``max_abs_dist`` absolutely).  This stops wild
+       symbolic substitutions like 0.31 → 1/3, which the loss gate alone
+       might allow on near-zero-loss problems.  Real polishing residuals
+       from L-BFGS-B / DE are typically well under 1% of the value, so a
+       5% radius is generous but safe.
+
+    Among accepted candidates the simpler symbol wins (integer > power-of-2
+    > simple rational > arbitrary).  Floor / mod / floordiv combined with a
+    near-integer constant produce the WRONG bit on boundary rows (e.g.
+    floor(N/127.997) ≠ floor(N/128) for N = 128); snapping fixes it.
+
+    Returns the (possibly updated) parameter list.
+    """
+    if not params:
+        return params
+    params = list(params)
+    ref_loss = max(current_loss, 0.0)
+    slack = max(rel_tol * ref_loss, abs_tol)
+    for idx in range(len(params)):
+        v = float(params[idx])
+        # Closest candidates by absolute distance, plus a few explicit ones.
+        diffs = np.abs(_NICE_CONST_LADDER - v)
+        nearest = np.argsort(diffs)[:max_candidates]
+        candidates = [float(_NICE_CONST_LADDER[k]) for k in nearest]
+        if abs(v) < 1e6:
+            candidates.append(float(round(v)))
+        if abs(v) > 1e-12 and abs(v) < 1e8:
+            sign = 1.0 if v >= 0 else -1.0
+            p = round(np.log2(abs(v)))
+            candidates.append(sign * (2.0 ** int(max(-12, min(20, p)))))
+        # Distance-gate: only consider candidates within ``max_rel_dist``
+        # (relatively) or ``max_abs_dist`` (absolutely) of the current value.
+        radius = max(max_rel_dist * abs(v), max_abs_dist)
+        candidates = [c for c in candidates if abs(c - v) <= radius]
+        # Deduplicate (preserve order).
+        seen = set()
+        uniq = []
+        for c in candidates:
+            key = round(c, 10)
+            if key not in seen:
+                seen.add(key)
+                uniq.append(c)
+        # Score every acceptable candidate (including the current value).
+        best_v = v
+        best_l = current_loss
+        best_score = _const_simplicity_score(v)
+        for cand in uniq:
+            params[idx] = cand
+            try:
+                lv = float(objective(params))
+            except Exception:
+                lv = float('inf')
+            if lv <= ref_loss + slack:
+                cand_score = _const_simplicity_score(cand)
+                if (cand_score < best_score - 1e-9
+                        or (abs(cand_score - best_score) < 1e-9
+                            and lv < best_l - 1e-15)):
+                    best_v = cand
+                    best_l = lv
+                    best_score = cand_score
+        params[idx] = best_v
+        current_loss = best_l
+    return params
+
+
 # ==========================================
 # PART 4c: INDIVIDUAL
 # ==========================================
@@ -6658,11 +7069,22 @@ class Individual:
                     loss      += SOBOLEV_WEIGHT * float(
                         np.mean((tree_grads - tg_opt) ** 2 / grad_var))
                 return loss
+
+        # Seed best_loss with the actual loss at the starting point.  Without
+        # this any optimiser run that diverges (very common for discontinuous
+        # loss landscapes from floor/mod/round) silently overwrites the good
+        # starting parameters with worse ones, because the original code
+        # initialised best_loss = 1e10.
+        try:
+            best_loss = float(objective(best_params))
+        except Exception:
+            best_loss = 1e10
+
         # ------------------------------------------------------------------ #
         # Stage 1: Differential Evolution (global search)
         # Skip DE if max_iter is small (used for fast in-loop local nudges)
         # ------------------------------------------------------------------ #
-        USE_DE = (n <= 12) and (max_iter >= 50) 
+        USE_DE = (n <= 12) and (max_iter >= 50)
         if USE_DE:
             _span = np.maximum(np.abs(initial_consts), 1.0) * 10.0
             bounds = [(-s, s) for s in _span]
@@ -6696,7 +7118,7 @@ class Individual:
                 res = minimize(objective, np.array(x0), method='L-BFGS-B',
                                options={'maxiter': max_iter,
                                         'ftol': 1e-15, 'gtol': 1e-8,
-                                        'eps': 1e-8}) 
+                                        'eps': 1e-8})
                 if res.fun < best_loss:
                     best_loss = res.fun
                     best_params = list(res.x)
@@ -6711,13 +7133,85 @@ class Individual:
                 except Exception:
                     pass
 
+        # ------------------------------------------------------------------ #
+        # Stage 3: Snap to nearby "nice" values (integer / power-of-2 / ½, ⅓ …)
+        # ------------------------------------------------------------------ #
+        # The polish stage produces constants like 1.9998 or 127.997 — visually
+        # almost-correct but numerically wrong for bit/integer arithmetic.
+        # Floor/mod/floordiv combined with a near-integer constant produces
+        # the WRONG bit on boundary rows (e.g. floor(N/127.997) ≠
+        # floor(N/128) for N = 128).  Try snapping each constant to its
+        # closest "nice" value and keep the snap if the loss does not get
+        # worse.  Cheap (≤6 evals per constant) and never harms non-bit tasks.
+        #
+        # Important: the snap uses a SCALE-INVARIANT objective.  The locked
+        # affine (a, b) was fitted to the polished — and slightly off —
+        # constants and would actively reject the symbolically correct
+        # snapped values (since e.g. predicting exact bits 0/1 with affine
+        # a=0.9999, b=-0.0025 inflates loss).  We compute residuals after
+        # an *online* affine refit so the symbolic form of the snapped
+        # tree is judged on its own merits, not against the stale lock.
+        if (bg_logits is None and type_code != 6
+                and AFFINE_SCALING_ENABLED):
+            def snap_objective(params):
+                set_constants_shared(self.tree, list(params))
+                p = self.tree.evaluate(X_opt)
+                p = np.clip(np.nan_to_num(p, nan=0.0, posinf=1e9, neginf=-1e9),
+                            -1e9, 1e9)
+                p_var = float(np.var(p)) + 1e-12
+                # Online affine refit (closed-form OLS).
+                pm   = float(np.mean(p))
+                ym   = float(np.mean(y_opt))
+                cov  = float(np.mean((p - pm) * (y_opt - ym)))
+                if p_var > 1e-10:
+                    a = cov / p_var
+                    b = ym - a * pm
+                else:
+                    a, b = 1.0, ym
+                p_scaled = a * p + b
+                diff = p_scaled - y_opt
+                y_var = float(np.var(y_opt)) + 1e-8
+                if tg_opt is not None and SOBOLEV_ENABLED:
+                    tree_grads = evaluate_tree_gradients(self.tree, X_opt, a)
+                    grad_var   = np.var(target_grads, axis=0) + 1e-8
+                    sob = float(np.mean((tree_grads - tg_opt) ** 2 / grad_var))
+                else:
+                    sob = 0.0
+                return float(np.mean(diff ** 2) / y_var
+                             + np.mean(np.abs(diff)) / np.sqrt(y_var)
+                             + (SOBOLEV_WEIGHT if SOBOLEV_ENABLED else 0.0) * sob)
+            try:
+                snap_baseline = float(snap_objective(best_params))
+                snapped = _snap_constants_to_nice(
+                    snap_objective, best_params, snap_baseline)
+                snap_after = float(snap_objective(snapped))
+                if snap_after <= snap_baseline + 1e-9:
+                    best_params = snapped
+                    # Force affine refit on the next calculate_fitness so the
+                    # locked (a, b) reflect the snapped constants.
+                    self.affine_fitted = False
+                    best_loss = float(objective(best_params))
+            except Exception:
+                pass
+        else:
+            try:
+                best_params = _snap_constants_to_nice(
+                    objective, best_params, best_loss)
+                best_loss = float(objective(best_params))
+            except Exception:
+                pass
+
         set_constants_shared(self.tree, best_params)
+        # If a snap accepted new constants we cleared affine_fitted above;
+        # let calculate_fitness re-fit the affine for the snapped constants.
+        # Otherwise (no snap accepted) keep the locked affine as before.
+        _allow_refit = not self.affine_fitted
         self.calculate_fitness(X, y_target, type_code,
                                bg_logits=bg_logits,
                                class_idx_in_group=class_idx_in_group,
                                Y_group=Y_group,
                                freq_parsimony_adj=freq_parsimony_adj,
-                               update_affine=False,   # keep the locked affine
+                               update_affine=_allow_refit,
                                target_grads=target_grads)
 
 
