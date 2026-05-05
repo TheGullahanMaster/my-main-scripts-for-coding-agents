@@ -125,13 +125,19 @@ MAX_COMPLEXITY = 2500
 HOF_SIZE = 10
 COST_CONST = .0
 COST_VAR = 0.
-COST_OP_SIMPLE = 2.0    
-COST_OP_COMPLEX = 4.0   
-COST_UNARY_RISK = 3.0   
-COST_UNARY_SAFE = 3.0   
-COST_UNARY_CHEAP = 1.0  
-COST_IF = 10.0
-COST_COMPARISON = 3.0   # gt, lt, gte, lte comparison operators
+COST_OP_SIMPLE = 2.0
+COST_OP_COMPLEX = 4.0
+COST_UNARY_RISK = 3.0
+COST_UNARY_SAFE = 3.0
+COST_UNARY_CHEAP = 1.0
+# Comparison/if_else costs: kept low so the search isn't punished for
+# discovering piecewise structures.  A typical Diode-style answer
+# IF(x > c) THEN x ELSE 0 needs gt(3 → 2) + const + if_else(10 → 3) ≈ 5
+# vs. a smooth approximation (relu+max+tanh) ≈ 12.  Without lowering these,
+# parsimony pressure made smooth approximations win even when the exact
+# piecewise answer was discoverable.
+COST_IF = 3.0
+COST_COMPARISON = 2.0   # gt, lt, gte, lte comparison operators
 
 # ---- IF/ELSE Branching ----
 # When enabled, adds comparison operators (gt, lt, gte, lte) and a ternary
@@ -746,6 +752,35 @@ BINARY_OPS_EVAL = dict(_BINARY_SAFE)
 UNARY_OPS_EVAL  = dict(_UNARY_SAFE)
 
 
+# ---- Soft comparison ops for differentiable branching ----------------------
+# When DIFFERENTIABLE_BRANCHING is on, the if_else node uses a smooth sigmoid
+# blend instead of a hard threshold.  However, the input to that gate is
+# typically the output of a *hard* comparison op (gt/lt/...), which is
+# constant 0/1 with no gradient w.r.t. its threshold constant.  That kills
+# any chance of L-BFGS-B / Nelder-Mead tuning the threshold.
+#
+# The fix: when DIFFERENTIABLE_BRANCHING is on, swap the comparison ops for
+# soft sigmoid versions that still output values in (0, 1) but vary smoothly
+# with the threshold.  The gate then receives a real gradient signal and
+# const-opt can actually find the right threshold.
+def _soft_gt(v1, v2):
+    return 1.0 / (1.0 + np.exp(-np.clip(20.0 * (v1 - v2), -50.0, 50.0)))
+def _soft_lt(v1, v2):
+    return 1.0 / (1.0 + np.exp(-np.clip(20.0 * (v2 - v1), -50.0, 50.0)))
+
+
+def _apply_diff_branching_overrides():
+    """Replace gt/lt/gte/lte with soft sigmoid versions in the active dispatch
+    tables when DIFFERENTIABLE_BRANCHING is on.  Idempotent: safe to call
+    repeatedly after set_ops_mode().
+    """
+    if DIFFERENTIABLE_BRANCHING:
+        BINARY_OPS_EVAL['gt']  = _soft_gt
+        BINARY_OPS_EVAL['lt']  = _soft_lt
+        BINARY_OPS_EVAL['gte'] = _soft_gt   # >= treated like > in the soft regime
+        BINARY_OPS_EVAL['lte'] = _soft_lt
+
+
 def set_ops_mode(safe: bool):
     """
     Switch the active BINARY_OPS_EVAL / UNARY_OPS_EVAL tables in-place
@@ -760,6 +795,7 @@ def set_ops_mode(safe: bool):
     BINARY_OPS_EVAL.update(src_bin)
     UNARY_OPS_EVAL.clear()
     UNARY_OPS_EVAL.update(src_un)
+    _apply_diff_branching_overrides()
 
 
 def select_ops_safety():
@@ -1174,8 +1210,19 @@ def _select_if_else_mode():
     Adds comparison operators and the ternary if_else node to the CGP graph,
     creating a hybrid CGP + decision tree where conditions can compare any
     sub-expressions and branches can return constants, 0/1, or equations.
+
+    If the user already chose an op set that contains 'if_else' or comparison
+    ops (e.g. via the Full preset or a custom selection), the prompt
+    pre-defaults to YES.  Without this, picking the Full preset silently
+    excluded if_else from the actual search because OPS_TERNARY is gated by
+    this flag — a confusing footgun for users who think "Full means full".
     """
     global IF_ELSE_ENABLED
+
+    # Detect whether the user's op set already contains conditional ops; if so
+    # default the prompt to YES.
+    _COND_OPS = {'if_else', 'gt', 'lt', 'gte', 'lte'}
+    has_cond_ops = bool(_COND_OPS.intersection(ALLOWED_OPS))
 
     print("\n" + "─" * 70)
     print("IF/ELSE BRANCHING — CGP + Decision Tree Hybrid")
@@ -1202,8 +1249,18 @@ def _select_if_else_mode():
     print("  Cost: if_else = 10.0, comparisons = 3.0 each")
     print("─" * 70)
 
-    choice = input("Enable IF/ELSE branching? [y/N]: ").strip().lower()
-    if choice.startswith('y'):
+    if has_cond_ops:
+        print("  Detected conditional ops (if_else / gt / lt / ...) in your "
+              "operator set —")
+        print("  defaulting this prompt to YES so they actually take effect.")
+    default_str = "[Y/n]" if has_cond_ops else "[y/N]"
+    choice = input(f"Enable IF/ELSE branching? {default_str}: ").strip().lower()
+    if has_cond_ops:
+        # Default Y when already chosen
+        accept = not choice.startswith('n')
+    else:
+        accept = choice.startswith('y')
+    if accept:
         IF_ELSE_ENABLED = True
         # Add comparison ops to ALLOWED_OPS if not already there
         comparison_ops = ['gt', 'lt', 'gte', 'lte']
@@ -1237,8 +1294,15 @@ def _select_if_else_mode():
         print("  and gradient boosting gets smoother ensemble predictions.")
         print("  Trade-off: branch boundaries are slightly softer, which may reduce")
         print("  interpretability of piecewise-constant expressions.")
-        diff_choice = input("  Enable differentiable branching? [y/N]: ").strip().lower()
-        if diff_choice.startswith('y'):
+        # Default to YES — soft branching is almost always better for evolution
+        # because hard if_else has zero gradient through the condition, blocking
+        # const-opt from tuning thresholds.  The smooth sigmoid blend gives
+        # L-BFGS-B / Nelder-Mead a real gradient signal.
+        diff_choice = input("  Enable differentiable branching? [Y/n]: ").strip().lower()
+        if diff_choice.startswith('n'):
+            DIFFERENTIABLE_BRANCHING = False
+            print("    Differentiable branching OFF (hard threshold).")
+        else:
             DIFFERENTIABLE_BRANCHING = True
             steep_in = input(f"    Steepness k (10=soft, 20=default, 50=sharp) "
                              f"[default {DIFF_BRANCH_STEEPNESS}]: ").strip()
@@ -1248,9 +1312,8 @@ def _select_if_else_mode():
                 except ValueError:
                     pass
             print(f"    ✓  Differentiable branching ON (k={DIFF_BRANCH_STEEPNESS})")
-        else:
-            DIFFERENTIABLE_BRANCHING = False
-            print("    Differentiable branching OFF (hard threshold).")
+        # Refresh op tables so soft gt/lt overrides become active immediately.
+        _apply_diff_branching_overrides()
     else:
         IF_ELSE_ENABLED = False
         CGPEquation.OPS_TERNARY     = []
@@ -3229,9 +3292,15 @@ def random_cgp(n_features, max_nodes, feature_names):
         # Fill all nodes with random junk first (for neutral drift)
         for i in range(max_nodes):
             max_connect = max(0, n_features + i - 1)
-            core = [o for o in ['+', '-', '*', '/', 'const'] if o in CGPEquation.OPS_ALL]
-            if core and random.random() < 0.5:
+            core = [o for o in ['+', '-', '*', '/', 'const']
+                    if o in CGPEquation.OPS_ALL]
+            cond = [o for o in ['gt', 'lt', 'gte', 'lte', 'if_else']
+                    if o in CGPEquation.OPS_ALL]
+            roll = random.random()
+            if core and roll < 0.40:
                 op = random.choice(core)
+            elif cond and roll < 0.55:
+                op = random.choice(cond)
             else:
                 op = random.choice(CGPEquation.OPS_ALL)
             in1 = random.randint(0, max_connect)
@@ -5165,6 +5234,79 @@ def generate_residual_aware_seeds(n_features, feature_names, X, y_target,
                           mut_rate=max(1, CGP_MUT_RATE * rate_mult))
             seeds.append(Individual(tree))
 
+        # ── Step 6: Threshold-pattern detection (piecewise residual structure) ─
+        # When the HoF best is a smooth approximation that misses a piecewise
+        # behaviour, residuals show a step-like pattern along some feature.
+        # We detect this by:
+        #   1. Sorting samples by feature value
+        #   2. Computing the cumulative difference of residual means between
+        #      lower and upper halves at every candidate split
+        #   3. If the maximum cumulative jump > 2σ_res, that split is real
+        # For each detected threshold we emit:
+        #   - IF(x_i > c) THEN expr ELSE 0     (gating seed)
+        #   - hof + IF(x_i > c) THEN const ELSE -const   (additive correction)
+        if (IF_ELSE_ENABLED and 'if_else' in CGPEquation.OPS_TERNARY_SET
+                and 'gt' in allowed and 'const' in allowed):
+            for feat_idx in range(min(n_features, 6)):
+                xi = X[:, feat_idx]
+                if np.std(xi) < 1e-10:
+                    continue
+                # Sort by feature
+                order = np.argsort(xi)
+                xi_sorted = xi[order]
+                res_sorted = residuals[order]
+                n_samp = len(res_sorted)
+                if n_samp < 20:
+                    continue
+                # Check candidate splits at 20%, 30%, ..., 80% quantiles.
+                # For each, compute mean residual gap between left/right halves
+                # in std-units.  Track the largest meaningful gap.
+                best_gap = 0.0
+                best_split_idx = None
+                for split_q in (0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8):
+                    split_idx = int(n_samp * split_q)
+                    if split_idx < 5 or n_samp - split_idx < 5:
+                        continue
+                    left_mean = float(np.mean(res_sorted[:split_idx]))
+                    right_mean = float(np.mean(res_sorted[split_idx:]))
+                    # Pooled std; clip to avoid div-by-zero on near-constant
+                    # residuals.
+                    pooled = max(1e-8, float(res_std))
+                    gap = abs(right_mean - left_mean) / pooled
+                    if gap > best_gap:
+                        best_gap = gap
+                        best_split_idx = split_idx
+                # Trigger only when the gap is substantial — a lazy 0.5σ gap is
+                # often noise, while >0.8σ is a real piecewise mismatch worth
+                # acting on.
+                if best_split_idx is not None and best_gap > 0.8:
+                    threshold_val = float(xi_sorted[best_split_idx])
+                    nf = n_features
+                    # Seed: simple Diode-style gate at the detected threshold
+                    cgp = _make_cgp_base(n_features, feature_names)
+                    cgp.nodes[0] = CGPNode('const', 0, 0, threshold_val)
+                    cgp.nodes[1] = CGPNode('gt', feat_idx, nf)
+                    cgp.nodes[2] = CGPNode('const', 0, 0, 0.0)
+                    cgp.nodes[3] = CGPNode('if_else', nf + 1, feat_idx, 0.0,
+                                           in3=nf + 2)
+                    cgp.out_idx = nf + 3
+                    cgp.update_active_nodes()
+                    seeds.append(Individual(cgp))
+                    # Seed: additive piecewise constant correction with the
+                    # estimated left/right residual means baked in.
+                    left_mean = float(np.mean(res_sorted[:best_split_idx]))
+                    right_mean = float(np.mean(res_sorted[best_split_idx:]))
+                    cgp = _make_cgp_base(n_features, feature_names)
+                    cgp.nodes[0] = CGPNode('const', 0, 0, threshold_val)
+                    cgp.nodes[1] = CGPNode('gt', feat_idx, nf)
+                    cgp.nodes[2] = CGPNode('const', 0, 0, right_mean)
+                    cgp.nodes[3] = CGPNode('const', 0, 0, left_mean)
+                    cgp.nodes[4] = CGPNode('if_else', nf + 1, nf + 2, 0.0,
+                                           in3=nf + 3)
+                    cgp.out_idx = nf + 4
+                    cgp.update_active_nodes()
+                    seeds.append(Individual(cgp))
+
     except Exception:
         pass  # never let seed generation crash the main loop
 
@@ -5284,6 +5426,151 @@ def generate_seeds_v5(n_features, feature_names):
             ('*', n_features, f),
             ('relu', n_features + 1, 0),
         ]))
+
+    # 13b. Threshold ReLU (Diode-style):  relu(x_i - c)  for several thresholds
+    # Without explicit if_else, this is the smooth equivalent of "input matters
+    # only above a threshold".  One seed per (feature × common threshold) so
+    # the population always carries a few candidates pre-anchored to plausible
+    # threshold values.  Works for tasks like Diode (V_in > 0.7 → V_in else 0
+    # ≡ relu(V_in - 0.7) + something).
+    if 'relu' in allowed and '-' in allowed and 'const' in allowed:
+        for fi in range(min(n_features, 4)):
+            for thresh in [0.0, 0.5, 0.7, 1.0]:
+                seeds.append(_build_seed(n_features, feature_names, [
+                    ('const', 0, 0, thresh),
+                    ('-', fi, n_features),
+                    ('relu', n_features + 1, 0),
+                ]))
+
+    # 13c. max-style threshold gate (for op sets without relu):
+    #      max(x_i - c, 0) — same shape as relu(x - c).
+    if 'max' in allowed and '-' in allowed and 'const' in allowed and 'relu' not in allowed:
+        for fi in range(min(n_features, 4)):
+            for thresh in [0.0, 0.5, 0.7]:
+                seeds.append(_build_seed(n_features, feature_names, [
+                    ('const', 0, 0, thresh),
+                    ('-', fi, n_features),
+                    ('const', 0, 0, 0.0),
+                    ('max', n_features + 1, n_features + 2),
+                ]))
+
+    # 13d. Diode pass-through (smooth):  x * sigmoid(k*(x - c))
+    # Smooth version of "x if x > c else 0".  Const-opt on c and k can recover
+    # any threshold from a continuous gradient, even when if_else isn't enabled.
+    if ('sigmoid' in allowed and '*' in allowed and '-' in allowed
+            and 'const' in allowed):
+        for fi in range(min(n_features, 3)):
+            for thresh in [0.0, 0.7, 1.0]:
+                seeds.append(_build_seed(n_features, feature_names, [
+                    ('const', 0, 0, thresh),         # 0
+                    ('-', fi, n_features),           # 1: x - c
+                    ('const', 0, 0, 10.0),           # 2: steepness k
+                    ('*', n_features + 2, n_features + 1),  # 3: k*(x-c)
+                    ('sigmoid', n_features + 3, 0),  # 4: σ(k*(x-c))
+                    ('*', fi, n_features + 4),       # 5: x*σ(...)
+                ]))
+
+    # 13.5. min/max saturation seeds (no if_else needed) ─────────────────────
+    # min(c, x_i)  — clip-from-above.  Crucial for capacity caps (clip-size,
+    # max HP, sat sensors).  Many "saturating" problems are best expressed
+    # this way and the lazy seeds rarely place a const next to a min call.
+    if 'min' in allowed and 'const' in allowed:
+        for fi in range(min(n_features, 3)):
+            for cap in [1.0, 30.0, 100.0]:
+                seeds.append(_build_seed(n_features, feature_names, [
+                    ('const', 0, 0, cap),
+                    ('min', n_features, fi),
+                ]))
+    # max(0, x_i - c)  — clip-from-below (relu offset, hinge loss).
+    if 'max' in allowed and '-' in allowed and 'const' in allowed:
+        for fi in range(min(n_features, 3)):
+            for thresh in [0.0, 0.5, 0.7]:
+                seeds.append(_build_seed(n_features, feature_names, [
+                    ('const', 0, 0, thresh),
+                    ('-', fi, n_features),
+                    ('const', 0, 0, 0.0),
+                    ('max', n_features + 1, n_features + 2),
+                ]))
+    # min(c, x_i + x_j)  — saturating sum (reload, ammo cap).
+    if (n_features >= 2 and 'min' in allowed and '+' in allowed
+            and 'const' in allowed):
+        for cap in [30.0, 100.0, 200.0]:
+            for _ in range(2):
+                fi, fj = random.sample(range(n_features), 2)
+                seeds.append(_build_seed(n_features, feature_names, [
+                    ('+', fi, fj),
+                    ('const', 0, 0, cap),
+                    ('min', n_features + 1, n_features),
+                ]))
+    # max(0, x_i - x_j)  — saturating difference (damage-armor, overflow).
+    if (n_features >= 2 and 'max' in allowed and '-' in allowed
+            and 'const' in allowed):
+        for _ in range(3):
+            fi, fj = random.sample(range(n_features), 2)
+            seeds.append(_build_seed(n_features, feature_names, [
+                ('-', fi, fj),
+                ('const', 0, 0, 0.0),
+                ('max', n_features, n_features + 1),
+            ]))
+    # x_k - max(0, x_i - x_j)  — three-feature subtractive cap.
+    # Models "carrier loses overflow only" patterns:
+    #   new_hp = hp - max(0, dmg - armor)
+    #   balance = balance - max(0, payment - allowance)
+    # Deterministically iterate over a few feature permutations so the seeds
+    # don't depend on RNG state to cover the canonical (carrier, take, cap)
+    # ordering.
+    if (n_features >= 3 and 'max' in allowed and '-' in allowed
+            and 'const' in allowed):
+        _trios = [tuple(random.sample(range(n_features), 3)) for _ in range(2)]
+        # Plus a deterministic sweep over the first three features (every
+        # permutation of who is carrier vs take vs cap).
+        if n_features >= 3:
+            for fk in range(min(n_features, 4)):
+                for fi in range(min(n_features, 4)):
+                    for fj in range(min(n_features, 4)):
+                        if len({fk, fi, fj}) == 3:
+                            _trios.append((fk, fi, fj))
+        for fk, fi, fj in _trios:
+            seeds.append(_build_seed(n_features, feature_names, [
+                ('-', fi, fj),                          # 0: x_i - x_j
+                ('const', 0, 0, 0.0),                   # 1
+                ('max', n_features, n_features + 1),    # 2: max(0, x_i - x_j)
+                ('-', fk, n_features + 2),              # 3: x_k - max(...)
+            ]))
+    # Same shape via relu (works when relu but not max is in the op set).
+    if n_features >= 3 and 'relu' in allowed and '-' in allowed:
+        _trios = []
+        if n_features >= 3:
+            for fk in range(min(n_features, 4)):
+                for fi in range(min(n_features, 4)):
+                    for fj in range(min(n_features, 4)):
+                        if len({fk, fi, fj}) == 3:
+                            _trios.append((fk, fi, fj))
+        for fk, fi, fj in _trios:
+            seeds.append(_build_seed(n_features, feature_names, [
+                ('-', fi, fj),
+                ('relu', n_features, 0),
+                ('-', fk, n_features + 1),
+            ]))
+
+    # 13e. ELU smooth proxy:  relu(x) + alpha * (exp(min(x,0)) - 1)
+    # Captures ELU shape without if_else.  Seeded across a few alpha values.
+    if ('relu' in allowed and 'min' in allowed and 'exp' in allowed
+            and '-' in allowed and '*' in allowed and '+' in allowed
+            and 'const' in allowed):
+        for fi in range(min(n_features, 3)):
+            for alpha_val in [1.0, 0.5]:
+                seeds.append(_build_seed(n_features, feature_names, [
+                    ('const', 0, 0, 0.0),                       # 0
+                    ('min', fi, n_features),                    # 1: min(x, 0)
+                    ('exp', n_features + 1, 0),                 # 2: exp(min(x, 0))
+                    ('const', 0, 0, 1.0),                       # 3
+                    ('-', n_features + 2, n_features + 3),      # 4: exp(min(x,0)) - 1
+                    ('const', 0, 0, alpha_val),                 # 5: alpha
+                    ('*', n_features + 5, n_features + 4),      # 6: alpha*(...)
+                    ('relu', fi, 0),                            # 7: relu(x)
+                    ('+', n_features + 7, n_features + 6),      # 8: relu(x) + alpha*(...)
+                ]))
 
     # 14. Tanh: tanh(c*x)
     if 'tanh' in allowed and '*' in allowed and 'const' in allowed:
@@ -6358,6 +6645,141 @@ def generate_seeds_v5(n_features, feature_names):
             cgp.out_idx = nf + 6; cgp.update_active_nodes()
             seeds.append(Individual(cgp))
 
+        # ── Diode / threshold-pass-through seeds ──────────────────────────
+        # 88. Pure feature gate (Diode):  IF(x_i > c) THEN x_i ELSE 0
+        # The canonical "input matters above threshold" pattern.  One seed per
+        # feature, threshold drawn from common values.
+        if 'gt' in allowed and 'const' in allowed:
+            for fi in range(n_features):
+                for thresh in [0.0, 0.5, 0.7, 1.0, -0.5]:
+                    cgp = _make_cgp_base(n_features, feature_names)
+                    cgp.nodes[0] = CGPNode('const', 0, 0, thresh)
+                    cgp.nodes[1] = CGPNode('gt', fi, nf)
+                    cgp.nodes[2] = CGPNode('const', 0, 0, 0.0)
+                    cgp.nodes[3] = CGPNode('if_else', nf + 1, fi, 0.0, in3=nf + 2)
+                    cgp.out_idx = nf + 3; cgp.update_active_nodes()
+                    seeds.append(Individual(cgp))
+
+        # 89. Shifted gate (relu-like with explicit threshold const):
+        #     IF(x_i > c) THEN x_i - c ELSE 0   (≡ relu(x_i - c))
+        if 'gt' in allowed and 'const' in allowed and '-' in allowed:
+            for fi in range(min(n_features, 3)):
+                cgp = _make_cgp_base(n_features, feature_names)
+                cgp.nodes[0] = CGPNode('const', 0, 0,
+                                        random.choice([0.0, 0.5, 0.7, 1.0]))
+                cgp.nodes[1] = CGPNode('gt', fi, nf)
+                cgp.nodes[2] = CGPNode('-', fi, nf)               # x_i - c
+                cgp.nodes[3] = CGPNode('const', 0, 0, 0.0)
+                cgp.nodes[4] = CGPNode('if_else', nf + 1, nf + 2, 0.0, in3=nf + 3)
+                cgp.out_idx = nf + 4; cgp.update_active_nodes()
+                seeds.append(Individual(cgp))
+
+        # 90. ELU template:  IF(x_i > 0) THEN x_i ELSE alpha*(exp(x_i) - 1)
+        if ('gt' in allowed and 'const' in allowed and 'exp' in allowed
+                and '-' in allowed and '*' in allowed):
+            for fi in range(min(n_features, 3)):
+                for alpha_val in [1.0, 0.5, 1.5]:
+                    cgp = _make_cgp_base(n_features, feature_names)
+                    cgp.nodes[0] = CGPNode('const', 0, 0, 0.0)             # threshold 0
+                    cgp.nodes[1] = CGPNode('gt', fi, nf)                   # x > 0
+                    cgp.nodes[2] = CGPNode('exp', fi, 0)                   # exp(x)
+                    cgp.nodes[3] = CGPNode('const', 0, 0, 1.0)             # 1
+                    cgp.nodes[4] = CGPNode('-', nf + 2, nf + 3)            # exp(x) - 1
+                    cgp.nodes[5] = CGPNode('const', 0, 0, alpha_val)       # alpha
+                    cgp.nodes[6] = CGPNode('*', nf + 5, nf + 4)            # alpha*(exp(x)-1)
+                    cgp.nodes[7] = CGPNode('if_else', nf + 1, fi, 0.0, in3=nf + 6)
+                    cgp.out_idx = nf + 7; cgp.update_active_nodes()
+                    seeds.append(Individual(cgp))
+
+        # 91. Saturation / clip-from-above:  IF(x_i > c) THEN c ELSE x_i
+        if 'gt' in allowed and 'const' in allowed:
+            for fi in range(min(n_features, 3)):
+                cgp = _make_cgp_base(n_features, feature_names)
+                cgp.nodes[0] = CGPNode('const', 0, 0,
+                                        random.choice([1.0, 5.0, 10.0, 30.0, 100.0]))
+                cgp.nodes[1] = CGPNode('gt', fi, nf)
+                cgp.nodes[2] = CGPNode('if_else', nf + 1, nf, 0.0, in3=fi)
+                cgp.out_idx = nf + 2; cgp.update_active_nodes()
+                seeds.append(Individual(cgp))
+
+        # 92. Two-feature min/max via if_else (re-encoded for variety):
+        #     IF(x_i + x_j > C) THEN C ELSE x_i + x_j  (saturating sum)
+        if (n_features >= 2 and 'gt' in allowed and 'const' in allowed
+                and '+' in allowed):
+            for _ in range(2):
+                fi, fj = random.sample(range(n_features), 2)
+                cgp = _make_cgp_base(n_features, feature_names)
+                cgp.nodes[0] = CGPNode('+', fi, fj)
+                cgp.nodes[1] = CGPNode('const', 0, 0,
+                                        random.choice([10.0, 30.0, 100.0]))
+                cgp.nodes[2] = CGPNode('gt', nf, nf + 1)
+                cgp.nodes[3] = CGPNode('if_else', nf + 2, nf + 1, 0.0, in3=nf)
+                cgp.out_idx = nf + 3; cgp.update_active_nodes()
+                seeds.append(Individual(cgp))
+
+        # 92b. Reload/cap pattern via if_else:
+        #      IF(x_i + x_j > C) THEN C ELSE x_i + x_j   (no overflow)
+        # Same shape as #92 but enumerates several common cap values, since
+        # the cap is usually the trickiest constant for a generic mutation
+        # search to discover (e.g. clip/magazine sizes 30, 100, ammo caps).
+        if (n_features >= 2 and 'gt' in allowed and 'const' in allowed
+                and '+' in allowed):
+            for cap in [30.0, 100.0, 200.0, 1.0]:
+                fi, fj = random.sample(range(n_features), 2)
+                cgp = _make_cgp_base(n_features, feature_names)
+                cgp.nodes[0] = CGPNode('+', fi, fj)
+                cgp.nodes[1] = CGPNode('const', 0, 0, cap)
+                cgp.nodes[2] = CGPNode('gt', nf, nf + 1)
+                cgp.nodes[3] = CGPNode('if_else', nf + 2, nf + 1, 0.0, in3=nf)
+                cgp.out_idx = nf + 3; cgp.update_active_nodes()
+                seeds.append(Individual(cgp))
+
+        # 92c. Difference cap: IF(x_i - x_j < 0) THEN 0 ELSE x_i - x_j
+        # Equivalent to relu(x_i - x_j) — common for "damage minus armor",
+        # "balance minus payment", etc.  Provides an explicit if_else
+        # template even when relu isn't in the op set.
+        if (n_features >= 2 and 'lt' in allowed and 'const' in allowed
+                and '-' in allowed):
+            for _ in range(2):
+                fi, fj = random.sample(range(n_features), 2)
+                cgp = _make_cgp_base(n_features, feature_names)
+                cgp.nodes[0] = CGPNode('-', fi, fj)
+                cgp.nodes[1] = CGPNode('const', 0, 0, 0.0)
+                cgp.nodes[2] = CGPNode('lt', nf, nf + 1)
+                cgp.nodes[3] = CGPNode('if_else', nf + 2, nf + 1, 0.0, in3=nf)
+                cgp.out_idx = nf + 3; cgp.update_active_nodes()
+                seeds.append(Individual(cgp))
+
+        # 92d. Damage-split / threshold-routing pattern:
+        #      IF(x_i - x_j > 0) THEN x_j ELSE x_i  (damage ≥ defense → defense
+        #      was sufficient; otherwise damage carries through).  One example
+        #      from a popular game-mechanic problem class.
+        if n_features >= 2 and 'gt' in allowed and '-' in allowed and 'const' in allowed:
+            for _ in range(2):
+                fi, fj = random.sample(range(n_features), 2)
+                cgp = _make_cgp_base(n_features, feature_names)
+                cgp.nodes[0] = CGPNode('-', fi, fj)
+                cgp.nodes[1] = CGPNode('const', 0, 0, 0.0)
+                cgp.nodes[2] = CGPNode('gt', nf, nf + 1)
+                cgp.nodes[3] = CGPNode('if_else', nf + 2, fj, 0.0, in3=fi)
+                cgp.out_idx = nf + 3; cgp.update_active_nodes()
+                seeds.append(Individual(cgp))
+
+        # 93. Quadratic-discriminant guard:  IF(D >= 0) THEN sqrt(D) ELSE 0
+        # (provides a starting structural skeleton for quadratic-roots tasks.)
+        if (n_features >= 2 and 'gte' in allowed and 'const' in allowed
+                and 'sqrt' in allowed):
+            for _ in range(2):
+                fi = feat()
+                cgp = _make_cgp_base(n_features, feature_names)
+                cgp.nodes[0] = CGPNode('const', 0, 0, 0.0)
+                cgp.nodes[1] = CGPNode('gte', fi, nf)
+                cgp.nodes[2] = CGPNode('sqrt', fi, 0)
+                cgp.nodes[3] = CGPNode('const', 0, 0, 0.0)
+                cgp.nodes[4] = CGPNode('if_else', nf + 1, nf + 2, 0.0, in3=nf + 3)
+                cgp.out_idx = nf + 4; cgp.update_active_nodes()
+                seeds.append(Individual(cgp))
+
     return seeds
 
 
@@ -6370,6 +6792,10 @@ def _build_random_mini_tree(child_eq, n_features, start_slot, max_depth=3,
     Returns the slot index of the root node, or None if no space.
     *available_inputs* are the slot indices that can be referenced (features +
     any active compute nodes below start_slot).
+
+    When IF/ELSE branching is enabled, ~20% of mini-trees are deliberately
+    seeded as a piecewise gate (gt + if_else) so the inject_subtree mutation
+    can introduce conditional structures, not just arithmetic ones.
     """
     if available_inputs is None:
         available_inputs = list(range(n_features))
@@ -6387,6 +6813,37 @@ def _build_random_mini_tree(child_eq, n_features, start_slot, max_depth=3,
     def _pick_input():
         pool = list(available_inputs) + [n_features + s for s in slots_used]
         return random.choice(pool) if pool else random.randint(0, n_features - 1)
+
+    # Conditional mini-tree branch: 20% probability when if_else is available
+    # and we have at least 4 slots to spend on a gt + 2 const + if_else pattern.
+    if (IF_ELSE_ENABLED and 'if_else' in CGPEquation.OPS_TERNARY_SET
+            and 'gt' in CGPEquation.OPS_BINARY_SET
+            and 'const' in ALLOWED_OPS
+            and random.random() < 0.20
+            and (start_slot + 4) < child_eq.max_nodes):
+        # Layout:  const(thresh)  gt(feat, thresh)  const(0)  if_else(cond, feat, 0)
+        feat_choice = _pick_input()
+        # Anchor feat to a raw feature column when possible — gating a
+        # mid-graph value rarely reads the data distribution we care about.
+        raw_feat_pool = [v for v in available_inputs if v < n_features]
+        if raw_feat_pool:
+            feat_choice = random.choice(raw_feat_pool)
+        s_thr = start_slot
+        s_gt  = start_slot + 1
+        s_zero = start_slot + 2
+        s_if  = start_slot + 3
+        # Threshold drawn from common values and a small Gaussian draw.
+        thr_val = random.choice([0.0, 0.5, 0.7, 1.0, -0.5,
+                                 random.gauss(0, 1.5)])
+        child_eq.nodes[s_thr]  = CGPNode('const', 0, 0, float(thr_val))
+        child_eq.nodes[s_gt]   = CGPNode('gt', feat_choice, n_features + s_thr)
+        # False branch usually 0, sometimes a small constant.
+        false_val = 0.0 if random.random() < 0.6 else random.gauss(0, 1.0)
+        child_eq.nodes[s_zero] = CGPNode('const', 0, 0, float(false_val))
+        child_eq.nodes[s_if]   = CGPNode('if_else', n_features + s_gt,
+                                          feat_choice, 0.0,
+                                          in3=n_features + s_zero)
+        return n_features + s_if
 
     for depth in range(max_depth):
         if n_features + cur >= max_slot:
@@ -6499,10 +6956,20 @@ def mutate(parent_eq, n_features, feature_names, mut_rate=None, temperature=0.0,
             if op_affinity:
                 target.op = affinity_biased_op_choice(op_affinity, CGPEquation.OPS_ALL)
             else:
-                # Prefer arithmetic/core ops
-                core = [o for o in ['+', '-', '*', '/', 'const'] if o in CGPEquation.OPS_ALL]
-                if core and random.random() < 0.5:
+                # Three-way bias: arithmetic core (+, -, *, /, const), conditional
+                # (gt, lt, gte, lte, if_else), and the rest.  When if_else is
+                # available we deliberately put it on a 15% lane — without this,
+                # if_else has only a 1/40 chance per uniform pick and the search
+                # almost never explores piecewise structures.
+                core = [o for o in ['+', '-', '*', '/', 'const']
+                        if o in CGPEquation.OPS_ALL]
+                cond = [o for o in ['gt', 'lt', 'gte', 'lte', 'if_else']
+                        if o in CGPEquation.OPS_ALL]
+                roll = random.random()
+                if core and roll < 0.40:
                     target.op = random.choice(core)
+                elif cond and roll < 0.55:
+                    target.op = random.choice(cond)
                 else:
                     target.op = random.choice(CGPEquation.OPS_ALL)
         elif choice == 'rewire1':
@@ -9568,7 +10035,7 @@ def macro_trig_identity(cgp_eq, n_features):
     return child
 
 
-def macro_piecewise(cgp_eq, n_features, feature_names):
+def macro_piecewise(cgp_eq, n_features, feature_names, X=None):
     """
     Piecewise / if-else macro-mutation: wraps the current output in a
     conditional split, creating a piecewise expression.
@@ -9580,6 +10047,17 @@ def macro_piecewise(cgp_eq, n_features, feature_names):
          — Replaces the output with a different feature/const in one region.
       3. Blend: IF(x_i > x_j) THEN current_output ELSE x_j
          — Switches between the evolved expression and a raw feature.
+      4. Diode-style gate: IF(x_i > c) THEN x_i ELSE 0  — "feature pass-through
+         above threshold, zero below".  This is the canonical piecewise pattern
+         (Diode, ReLU(x-c), saturating sensors) that the previous strategies
+         couldn't directly produce because they wrapped the *current output*
+         instead of *the gating feature itself*.
+
+    *X* (optional N×n_features array): when supplied, threshold constants are
+    drawn from the actual feature distribution (random quantiles + small jitter)
+    rather than a generic Gaussian.  For Diode-like problems this means the
+    threshold candidates are anchored to plausible regions of the data instead
+    of having to drift there from a Gaussian draw — a huge speed-up.
 
     Only active when IF_ELSE_ENABLED is True and if_else is in the op set.
     """
@@ -9603,43 +10081,75 @@ def macro_piecewise(cgp_eq, n_features, feature_names):
     if not comp_ops:
         return child
 
-    strategy = random.random()
     cur_out = child.out_idx
     feat_idx = random.randint(0, n_features - 1)
 
-    if strategy < 0.4 and 'const' in ALLOWED_OPS:
+    def _threshold_const(fi):
+        """Pick a threshold const for feature fi: data quantile if X provided,
+        else a generic Gaussian draw."""
+        if X is not None and X.shape[0] > 0 and 0 <= fi < X.shape[1]:
+            col = X[:, fi]
+            if np.std(col) > 1e-10:
+                # Bias toward interior quantiles (10–90%) so conditions split
+                # the data meaningfully; a tiny jitter prevents identical
+                # repeats during repeated calls.
+                q = random.choice([0.1, 0.2, 0.25, 0.33, 0.5,
+                                   0.5, 0.5,  # bias slightly toward median
+                                   0.66, 0.75, 0.8, 0.9])
+                base = float(np.quantile(col, q))
+                jitter = float(np.std(col)) * random.gauss(0.0, 0.05)
+                return base + jitter
+        return random.gauss(0.0, 2.0)
+
+    strategy = random.random()
+
+    if strategy < 0.30 and 'const' in ALLOWED_OPS:
         # Strategy 1: Threshold split — IF(x > c) THEN expr ELSE const
         s1, s2, s3 = free_slots[0], free_slots[1], free_slots[2]
-        child.nodes[s1 - n_features] = CGPNode('const', 0, 0, random.gauss(0, 2.0))
+        child.nodes[s1 - n_features] = CGPNode('const', 0, 0, _threshold_const(feat_idx))
         child.nodes[s2 - n_features] = CGPNode(random.choice(comp_ops), feat_idx, s1)
-        # False branch: a learnable constant
+        # False branch: a learnable constant.  Bias toward 0 — that's the
+        # most useful "below-threshold" target for Diode/ReLU-style problems.
         if len(free_slots) >= 4:
             s4 = free_slots[3]
-            child.nodes[s4 - n_features] = CGPNode('const', 0, 0, random.gauss(0, 1.0))
+            below = 0.0 if random.random() < 0.5 else random.gauss(0, 1.0)
+            child.nodes[s4 - n_features] = CGPNode('const', 0, 0, below)
             child.nodes[s3 - n_features] = CGPNode('if_else', s2, cur_out, 0.0, in3=s4)
         else:
             child.nodes[s3 - n_features] = CGPNode('if_else', s2, cur_out, 0.0, in3=s1)
         child.out_idx = s3
-    elif strategy < 0.7 and n_features >= 2:
+    elif strategy < 0.50 and n_features >= 2:
         # Strategy 2: Feature gate — IF(x_i > x_j) THEN expr ELSE x_j
         s1, s2 = free_slots[0], free_slots[1]
         feat2 = random.choice([f for f in range(n_features) if f != feat_idx])
         child.nodes[s1 - n_features] = CGPNode(random.choice(comp_ops), feat_idx, feat2)
         child.nodes[s2 - n_features] = CGPNode('if_else', s1, cur_out, 0.0, in3=feat2)
         child.out_idx = s2
-    else:
+    elif strategy < 0.75 and 'const' in ALLOWED_OPS and len(free_slots) >= 4:
         # Strategy 3: Region blend with constant threshold
-        if 'const' in ALLOWED_OPS and len(free_slots) >= 4:
-            s1, s2, s3, s4 = free_slots[0], free_slots[1], free_slots[2], free_slots[3]
-            child.nodes[s1 - n_features] = CGPNode('const', 0, 0, random.gauss(0, 2.0))
-            child.nodes[s2 - n_features] = CGPNode(random.choice(comp_ops), feat_idx, s1)
-            # False branch: use a different feature or feature * const
-            alt_feat = random.randint(0, n_features - 1)
-            child.nodes[s3 - n_features] = CGPNode('const', 0, 0, random.uniform(0.5, 3.0))
-            child.nodes[s4 - n_features] = CGPNode('if_else', s2, cur_out, 0.0, in3=alt_feat)
-            child.out_idx = s4
-        else:
-            return child
+        s1, s2, s3, s4 = free_slots[0], free_slots[1], free_slots[2], free_slots[3]
+        child.nodes[s1 - n_features] = CGPNode('const', 0, 0, _threshold_const(feat_idx))
+        child.nodes[s2 - n_features] = CGPNode(random.choice(comp_ops), feat_idx, s1)
+        # False branch: use a different feature or feature * const
+        alt_feat = random.randint(0, n_features - 1)
+        child.nodes[s3 - n_features] = CGPNode('const', 0, 0, random.uniform(0.5, 3.0))
+        child.nodes[s4 - n_features] = CGPNode('if_else', s2, cur_out, 0.0, in3=alt_feat)
+        child.out_idx = s4
+    elif 'const' in ALLOWED_OPS and len(free_slots) >= 4:
+        # Strategy 4: Diode-style gate — IF(x_i > c) THEN x_i ELSE 0
+        # Wraps the GATING FEATURE (not the current expression) in a hard
+        # threshold gate.  This is the canonical "input matters only above
+        # a threshold" pattern.  The current expression is dropped here in
+        # favor of the raw threshold gate; subsequent mutations can re-fuse
+        # it via decompose if useful.
+        s1, s2, s3, s4 = free_slots[0], free_slots[1], free_slots[2], free_slots[3]
+        child.nodes[s1 - n_features] = CGPNode('const', 0, 0, _threshold_const(feat_idx))
+        child.nodes[s2 - n_features] = CGPNode(random.choice(comp_ops), feat_idx, s1)
+        child.nodes[s3 - n_features] = CGPNode('const', 0, 0, 0.0)
+        child.nodes[s4 - n_features] = CGPNode('if_else', s2, feat_idx, 0.0, in3=s3)
+        child.out_idx = s4
+    else:
+        return child
 
     child.update_active_nodes()
     return child
@@ -9994,7 +10504,7 @@ def _create_offspring(action, parent, population, n_features, feat_names,
     elif action == 'ablate':
         child_tree = macro_ablate_feature(parent.tree, n_features)
     elif action == 'piecewise':
-        child_tree = macro_piecewise(parent.tree, n_features, feat_names)
+        child_tree = macro_piecewise(parent.tree, n_features, feat_names, X=X)
     elif action == 'nest':
         child_tree = macro_nest_compound(parent.tree, n_features, feat_names,
                                           op_affinity=op_affinity)
@@ -10066,7 +10576,11 @@ def evolve_island_chunk(args):
     # ── IMPROVEMENT: Adaptive reproductive operator tracker ────────────────
     # Tracks which operators produce accepted children; adapts weights over time.
     _repro_ops_base = ['mutate', 'crossover', 'semantic_xover', 'grow', 'prune', 'graft', 'optimize', 'boost', 'do_nothing', 'div', 'trig', 'ablate', 'piecewise', 'nest', 'inject']
-    _repro_weights_base = [3.5, 1.0, 0.8, 0.7, 0.5, 0.7, 1.5, 0.6, 0.3, 0.5, 0.8, 0.3, 0.6 if IF_ELSE_ENABLED else 0.0, 1.2, 1.0]
+    # piecewise is bumped 0.6 → 1.5 when IF_ELSE_ENABLED so threshold/conditional
+    # structures actually get sampled regularly.  Without this, piecewise was
+    # only 4% of actions and the search defaulted to smooth approximations even
+    # when the exact piecewise answer existed in the search space.
+    _repro_weights_base = [3.5, 1.0, 0.8, 0.7, 0.5, 0.7, 1.5, 0.6, 0.3, 0.5, 0.8, 0.3, 1.5 if IF_ELSE_ENABLED else 0.0, 1.2, 1.0]
     #                      ^^^                  ^^^       ^^^                 ^^^                                               ^^^  ^^^
     #                  mutate↓  grow↑  graft↑  do_nothing↓                                                               nest  inject
     # Net effect: ~25% of actions are now structural exploration (grow+graft+nest+inject+trig+div)
@@ -10185,12 +10699,18 @@ def evolve_island_chunk(args):
         repro_weights = list(_mut_tracker.get_weights())
 
         # Stagnation boost: when stuck, shift weight toward structural mutations
-        # (nest, inject, grow, graft, trig, div) at the expense of mutate/optimize.
-        # This prevents the search from endlessly polishing constants when it
-        # needs a structural breakthrough.
+        # (nest, inject, grow, graft, trig, div, piecewise) at the expense of
+        # mutate/optimize.  This prevents the search from endlessly polishing
+        # constants when it needs a structural breakthrough.  piecewise is
+        # bundled with the structural set when IF_ELSE_ENABLED — stagnation
+        # frequently means a smooth approximation has plateaued and a piecewise
+        # restructure is exactly what's needed.
         if stag_frac > 0.3:
             structural_boost = 1.0 + 2.0 * min(1.0, (stag_frac - 0.3) / 0.5)
-            _structural_ops = {'grow', 'graft', 'nest', 'inject', 'trig', 'div', 'crossover', 'semantic_xover'}
+            _structural_ops = {'grow', 'graft', 'nest', 'inject', 'trig', 'div',
+                               'crossover', 'semantic_xover'}
+            if IF_ELSE_ENABLED:
+                _structural_ops = _structural_ops | {'piecewise'}
             _exploitation_ops = {'mutate', 'optimize', 'do_nothing'}
             for k, op_name in enumerate(repro_ops):
                 if op_name in _structural_ops:
@@ -10636,7 +11156,8 @@ def evolve_afpo(population, X, y_target, type_code,
     # ── Adaptive reproductive operator tracker (same as island model) ─────
     _repro_ops_base = ['mutate', 'crossover', 'semantic_xover', 'grow', 'prune', 'graft',
                        'optimize', 'boost', 'do_nothing', 'div', 'trig', 'ablate', 'piecewise', 'nest', 'inject']
-    _repro_weights_base = [3.5, 1.0, 0.8, 0.7, 0.5, 0.7, 1.5, 0.6, 0.3, 0.5, 0.8, 0.3, 0.6 if IF_ELSE_ENABLED else 0.0, 1.2, 1.0]
+    # See evolve_island_chunk for rationale on the piecewise weight bump.
+    _repro_weights_base = [3.5, 1.0, 0.8, 0.7, 0.5, 0.7, 1.5, 0.6, 0.3, 0.5, 0.8, 0.3, 1.5 if IF_ELSE_ENABLED else 0.0, 1.2, 1.0]
     _mut_tracker = AdaptiveMutationTracker(_repro_ops_base, _repro_weights_base, alpha=0.07)
 
     local_stag = stag_counter
@@ -10696,7 +11217,10 @@ def evolve_afpo(population, X, y_target, type_code,
         repro_weights = list(_mut_tracker.get_weights())
         if stag_frac > 0.3:
             structural_boost = 1.0 + 2.0 * min(1.0, (stag_frac - 0.3) / 0.5)
-            _structural_ops = {'grow', 'graft', 'nest', 'inject', 'trig', 'div', 'crossover', 'semantic_xover'}
+            _structural_ops = {'grow', 'graft', 'nest', 'inject', 'trig', 'div',
+                               'crossover', 'semantic_xover'}
+            if IF_ELSE_ENABLED:
+                _structural_ops = _structural_ops | {'piecewise'}
             _exploitation_ops = {'mutate', 'optimize', 'do_nothing'}
             for k, op_name in enumerate(_repro_ops_base):
                 if op_name in _structural_ops:
@@ -11540,6 +12064,8 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
                     elif macro_choice == 'rational':
                         ct = macro_rational_grow(parent.tree, n_features)
                     elif macro_choice == 'piecewise':
+                        # Bayesian path lacks a neat X handle, so pass None and
+                        # fall back to Gaussian thresholds (still functional).
                         ct = macro_piecewise(parent.tree, n_features, feat_names)
                     else:
                         ct = macro_trig_identity(parent.tree, n_features)
