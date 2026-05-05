@@ -3797,6 +3797,739 @@ def generate_ols_basis_seeds(n_features, feature_names, X, y, max_terms=12):
     return seeds
 
 
+def _build_monomial_seed(n_features, feature_names, exponents, c0,
+                          max_repeat=4, snap_tol=0.05):
+    """
+    Build a CGP individual that computes  c0 · ∏ x_i^{p_i}.
+
+    Splits the exponent vector into a positive-power numerator and an
+    absolute-value-of-negative-power denominator, then divides:
+
+        y  =  c0 · (∏_{p_i > 0} x_i^{p_i})  /  (∏_{p_i < 0} x_i^{|p_i|})
+
+    Integer / half-integer exponents within ``snap_tol`` of a clean value
+    are rendered as repeated multiplications, ``square``, ``cube``, or
+    ``sqrt`` to keep the graph compact and free of ``pow`` (which is the
+    most numerically delicate op).  Larger exponents fall back to ``pow``.
+
+    Returns an ``Individual`` or ``None`` if the seed doesn't fit.
+    """
+    cgp = _make_cgp_base(n_features, feature_names)
+    nf = n_features
+    cur = 0
+    max_slots = cgp.max_nodes
+    allowed = set(CGPEquation.OPS_ALL)
+
+    # Need *, /, const at minimum for any monomial form.  We can sometimes
+    # avoid '/' if all exponents are non-negative.
+    if '*' not in allowed or 'const' not in allowed:
+        return None
+
+    def _alloc():
+        nonlocal cur
+        if cur >= max_slots:
+            return None
+        s = cur
+        cur += 1
+        return s
+
+    def _build_power(feat_idx, p_abs):
+        """Return the slot of x_{feat_idx}^{p_abs}, or None if unbuildable.
+
+        p_abs is treated as POSITIVE here (sign handled by the caller via
+        numerator/denominator placement).
+        """
+        if p_abs < 1e-9:
+            return None  # nothing to build (treated as x^0 = 1, skip)
+
+        # Snap to clean exponent.
+        snap_candidates_int  = list(range(1, max_repeat + 1))
+        snap_candidates_half = [0.5, 1.5, 2.5]
+        nearest_int  = min(snap_candidates_int,  key=lambda v: abs(v - p_abs))
+        nearest_half = min(snap_candidates_half, key=lambda v: abs(v - p_abs))
+        # x^1 is just the feature itself
+        if abs(p_abs - 1.0) < snap_tol:
+            return feat_idx
+        # Integer exponent ≤ max_repeat → build via repeated multiplication
+        if abs(nearest_int - p_abs) < snap_tol:
+            p_int = int(nearest_int)
+            if p_int == 2 and 'square' in allowed:
+                ls = _alloc()
+                if ls is None:
+                    return None
+                cgp.nodes[ls] = CGPNode('square', feat_idx, 0)
+                return nf + ls
+            if p_int == 3 and 'cube' in allowed:
+                ls = _alloc()
+                if ls is None:
+                    return None
+                cgp.nodes[ls] = CGPNode('cube', feat_idx, 0)
+                return nf + ls
+            # Repeated multiplication: x*x, then *x, etc.
+            ls = _alloc()
+            if ls is None:
+                return None
+            cgp.nodes[ls] = CGPNode('*', feat_idx, feat_idx)
+            running = nf + ls
+            for _ in range(p_int - 2):
+                ls = _alloc()
+                if ls is None:
+                    return None
+                cgp.nodes[ls] = CGPNode('*', running, feat_idx)
+                running = nf + ls
+            return running
+        # 0.5 → sqrt
+        if abs(p_abs - 0.5) < snap_tol and 'sqrt' in allowed:
+            ls = _alloc()
+            if ls is None:
+                return None
+            cgp.nodes[ls] = CGPNode('sqrt', feat_idx, 0)
+            return nf + ls
+        # 1.5 → x * sqrt(x)
+        if abs(p_abs - 1.5) < snap_tol and 'sqrt' in allowed:
+            ls_s = _alloc()
+            if ls_s is None:
+                return None
+            cgp.nodes[ls_s] = CGPNode('sqrt', feat_idx, 0)
+            ls_m = _alloc()
+            if ls_m is None:
+                return None
+            cgp.nodes[ls_m] = CGPNode('*', feat_idx, nf + ls_s)
+            return nf + ls_m
+        # General: pow(x, p)
+        if 'pow' in allowed:
+            ls_c = _alloc()
+            if ls_c is None:
+                return None
+            cgp.nodes[ls_c] = CGPNode('const', 0, 0, float(p_abs))
+            ls_p = _alloc()
+            if ls_p is None:
+                return None
+            cgp.nodes[ls_p] = CGPNode('pow', feat_idx, nf + ls_c)
+            return nf + ls_p
+        # Fallback: round to nearest integer ≤ max_repeat and use repeated *
+        p_int = max(1, min(max_repeat, int(round(p_abs))))
+        ls = _alloc()
+        if ls is None:
+            return None
+        cgp.nodes[ls] = CGPNode('*', feat_idx, feat_idx)
+        running = nf + ls
+        for _ in range(p_int - 2):
+            ls = _alloc()
+            if ls is None:
+                return None
+            cgp.nodes[ls] = CGPNode('*', running, feat_idx)
+            running = nf + ls
+        return running
+
+    # Build numerator (positive exponents) and denominator (negative ones).
+    pos_terms = []
+    neg_terms = []
+    for i, p in enumerate(exponents):
+        if not np.isfinite(p) or abs(p) < 1e-9:
+            continue
+        slot = _build_power(i, abs(float(p)))
+        if slot is None:
+            continue
+        (pos_terms if p > 0 else neg_terms).append(slot)
+
+    if not pos_terms and not neg_terms:
+        return None
+
+    def _chain_mul(slots):
+        """Multiply a list of slot indices into a single output slot."""
+        if not slots:
+            return None
+        if len(slots) == 1:
+            return slots[0]
+        running = slots[0]
+        for nxt in slots[1:]:
+            ls = _alloc()
+            if ls is None:
+                return None
+            cgp.nodes[ls] = CGPNode('*', running, nxt)
+            running = nf + ls
+        return running
+
+    num_slot = _chain_mul(pos_terms) if pos_terms else None
+    den_slot = _chain_mul(neg_terms) if neg_terms else None
+
+    # Fold c0 into the numerator (or create a const-only numerator if no positive
+    # terms exist — turns the seed into c0 / denominator).
+    use_const = abs(c0 - 1.0) > 1e-6
+    if use_const:
+        ls_c = _alloc()
+        if ls_c is None:
+            return None
+        cgp.nodes[ls_c] = CGPNode('const', 0, 0, float(c0))
+        if num_slot is None:
+            num_slot = nf + ls_c
+        else:
+            ls_m = _alloc()
+            if ls_m is None:
+                return None
+            cgp.nodes[ls_m] = CGPNode('*', nf + ls_c, num_slot)
+            num_slot = nf + ls_m
+    elif num_slot is None:
+        # Pure 1/denom case: need an explicit '1' constant.
+        ls_c = _alloc()
+        if ls_c is None:
+            return None
+        cgp.nodes[ls_c] = CGPNode('const', 0, 0, 1.0)
+        num_slot = nf + ls_c
+
+    if den_slot is None:
+        cgp.out_idx = num_slot
+    else:
+        if '/' not in allowed:
+            return None
+        ls_d = _alloc()
+        if ls_d is None:
+            return None
+        cgp.nodes[ls_d] = CGPNode('/', num_slot, den_slot)
+        cgp.out_idx = nf + ls_d
+
+    cgp.update_active_nodes()
+    return Individual(cgp)
+
+
+def generate_log_ols_seeds(n_features, feature_names, X, y):
+    """
+    Solve a log-linear regression to discover monomial / rational
+    expressions of the form  y ≈ c₀ · ∏ x_iᵖᵢ  in closed form.
+
+    Why this is decisive
+    --------------------
+    The polynomial OLS in ``generate_ols_basis_seeds`` covers additive
+    combinations of features and their squares / products — but it
+    cannot represent **multiplicative** targets such as
+
+        y = a · b / (c · d)            (product over product)
+        y = a^2 · b / c^3              (Buckingham Π forms)
+        y = G · m₁ · m₂ / r²           (gravitational law)
+
+    Polynomial fits to those targets land at relative residual ≈ 0.2–0.5
+    of var(y), nowhere near the symbolic ground truth.  In log-space the
+    same targets become **linear**:
+
+        log y = c₀ + Σ pᵢ · log xᵢ
+
+    so a single least-squares solve recovers every exponent perfectly,
+    even with strong colinearity and many features.  We then transcribe
+    the result into a CGP graph with clean ``square``/``cube``/``sqrt``
+    rendering for integer/half-integer exponents and ``pow`` for the
+    rest.  Snapping (within ±0.05) is also emitted as a separate seed so
+    evolution sees both the raw fit and the symbolic-clean variant.
+
+    Returns up to 3 seeds (raw, snapped, integer-snapped).  Empty when
+    the target / inputs aren't strictly positive on enough rows for a
+    log-domain fit to make sense.
+    """
+    seeds = []
+    allowed = set(CGPEquation.OPS_ALL)
+    if {'*', 'const'} - allowed:
+        return seeds
+    if n_features < 1 or len(y) < 5 or X.size == 0:
+        return seeds
+
+    X_arr = np.nan_to_num(np.asarray(X, dtype=np.float64),
+                           nan=0.0, posinf=0.0, neginf=0.0)
+    y_arr = np.nan_to_num(np.asarray(y, dtype=np.float64),
+                           nan=0.0, posinf=0.0, neginf=0.0)
+    if np.std(y_arr) < 1e-12:
+        return seeds
+
+    # Decide on positivity:
+    #   • If both y and all features are strictly positive on enough rows,
+    #     fit log(y) directly.
+    #   • If y is consistently negative but its magnitude is positive, fit
+    #     log(|y|) and emit a seed with an outer ``-1`` constant.  Mixed
+    #     signs in y would invalidate the log-linear assumption, so skip.
+    pos_X = np.all(X_arr > 1e-12, axis=1)
+    pos_y = y_arr > 1e-12
+    neg_y = y_arr < -1e-12
+    n_pos = int(pos_X.sum())
+    if n_pos < max(10, n_features + 2):
+        return seeds
+
+    sign = 1.0
+    if pos_y.sum() >= max(10, n_features + 2) and pos_y.sum() >= 0.9 * n_pos:
+        mask = pos_X & pos_y
+    elif neg_y.sum() >= max(10, n_features + 2) and neg_y.sum() >= 0.9 * n_pos:
+        mask = pos_X & neg_y
+        sign = -1.0
+    else:
+        # Mixed-sign y → log-linear fit isn't valid; bail out.
+        return seeds
+
+    if int(mask.sum()) < max(10, n_features + 2):
+        return seeds
+
+    Xp = X_arr[mask]
+    yp = y_arr[mask] * sign  # always positive in this branch
+    log_y = np.log(yp + 1e-300)
+    log_X = np.log(Xp + 1e-300)
+    if not (np.all(np.isfinite(log_y)) and np.all(np.isfinite(log_X))):
+        return seeds
+
+    B = np.column_stack([log_X, np.ones(len(yp))])
+    try:
+        XTX = B.T @ B + 1e-8 * np.eye(B.shape[1])
+        XTy = B.T @ log_y
+        w_full = np.linalg.solve(XTX, XTy)
+    except Exception:
+        return seeds
+    if not np.all(np.isfinite(w_full)):
+        return seeds
+
+    coeffs   = w_full[:-1].astype(np.float64)
+    log_c0   = float(w_full[-1])
+    c0_raw   = float(np.exp(np.clip(log_c0, -50.0, 50.0))) * sign
+
+    # Quality gate: refuse seeds where the closed-form fit is poor — e.g.
+    # exp / sin targets that happen to be positive but aren't actually
+    # monomial.  Using std(log y) gives a scale-free comparison.
+    y_pred_raw = sign * np.exp(np.clip(B @ w_full, -50.0, 50.0))
+    rel_err = float(np.mean((y_arr[mask] - y_pred_raw) ** 2)
+                    / (float(np.var(y_arr[mask])) + 1e-12))
+    if rel_err > 0.5:
+        return seeds
+
+    # Suppress feature exponents whose contribution is numerical noise.
+    # std(log x_i) · |p_i| measures how much that feature shifts log y.
+    log_X_std = np.std(log_X, axis=0).clip(min=1e-12)
+    contrib   = np.abs(coeffs) * log_X_std
+    floor     = 0.005 * float(np.std(log_y) + 1e-12)
+    coeffs_filt = np.where(contrib >= floor, coeffs, 0.0)
+
+    # Emit raw-coeff seed (whatever the fit returned).
+    raw_seed = _build_monomial_seed(n_features, feature_names,
+                                     coeffs_filt, c0_raw)
+    if raw_seed is not None:
+        seeds.append(raw_seed)
+
+    # Emit snapped seed: round each coefficient to the nearest clean value
+    # (integer or half-integer in [-3, 3]) when within 0.05, leave alone
+    # otherwise.  Most physical / textbook targets snap exactly here.
+    snap_grid = [-3, -2.5, -2, -1.5, -1, -0.5, 0, 0.5, 1, 1.5, 2, 2.5, 3]
+    snapped = np.array([
+        float(min(snap_grid, key=lambda v: abs(v - c))) if (
+            abs(min(snap_grid, key=lambda v: abs(v - c)) - c) < 0.05
+            and abs(c) > 1e-9) else float(c)
+        for c in coeffs_filt
+    ], dtype=np.float64)
+    if not np.allclose(snapped, coeffs_filt):
+        # Re-fit c0 against the snapped exponents — when we round 0.97 → 1.0
+        # the constant term should compensate, otherwise we lose accuracy.
+        snap_pred_log = log_X @ snapped
+        log_c0_snap = float(np.mean(log_y - snap_pred_log))
+        c0_snap = float(np.exp(np.clip(log_c0_snap, -50.0, 50.0))) * sign
+        snap_seed = _build_monomial_seed(n_features, feature_names,
+                                          snapped, c0_snap)
+        if snap_seed is not None:
+            seeds.append(snap_seed)
+
+    # Also emit an all-integer-snap variant (rounded to the nearest
+    # integer in [-3, 3]) — captures pure rational forms like a*b/(c*d).
+    int_grid = [-3, -2, -1, 0, 1, 2, 3]
+    int_snapped = np.array([
+        float(min(int_grid, key=lambda v: abs(v - c))) if (
+            abs(min(int_grid, key=lambda v: abs(v - c)) - c) < 0.20
+            and abs(c) > 1e-9) else float(c)
+        for c in coeffs_filt
+    ], dtype=np.float64)
+    if (not np.allclose(int_snapped, snapped)
+            and not np.allclose(int_snapped, coeffs_filt)):
+        int_pred_log = log_X @ int_snapped
+        log_c0_int = float(np.mean(log_y - int_pred_log))
+        c0_int = float(np.exp(np.clip(log_c0_int, -50.0, 50.0))) * sign
+        int_seed = _build_monomial_seed(n_features, feature_names,
+                                         int_snapped, c0_int)
+        if int_seed is not None:
+            seeds.append(int_seed)
+
+    return seeds
+
+
+def _generate_rational_product_seeds(n_features, feature_names, X, y):
+    """
+    Combinatorial seeds for rational-product targets that the polynomial
+    and log-OLS bases miss when ``y`` has mixed signs (so log fitting
+    bails out) but the underlying form is still
+
+        y = (xᵢ · xⱼ) / (xₖ · xₗ)        — 4-feature product over product
+        y =  xᵢ      / (xⱼ · xₖ)         — 3-feature 1/2 split
+        y = (xᵢ · xⱼ) /  xₖ              — 3-feature 2/1 split
+
+    The seed pool also tries each (numerator, denominator) variable
+    assignment in turn — for n_features ≤ 6 that's only a few dozen
+    individuals, well below the population budget.  Each generated CGP
+    is just 3 nodes (mul, mul, div) so they're nearly free.
+    """
+    seeds = []
+    allowed = set(CGPEquation.OPS_ALL)
+    if not ({'*', '/'} <= allowed):
+        return seeds
+    if n_features < 2:
+        return seeds
+
+    nf = n_features
+
+    # ---- 2-feature plain ratio: a / b -------------------------------
+    if n_features >= 2:
+        for i in range(min(n_features, 6)):
+            for j in range(min(n_features, 6)):
+                if i == j:
+                    continue
+                cgp = _make_cgp_base(n_features, feature_names)
+                cgp.nodes[0] = CGPNode('/', i, j)
+                cgp.out_idx = nf; cgp.update_active_nodes()
+                seeds.append(Individual(cgp))
+
+    # ---- 3-feature (a*b)/c and a/(b*c) -----------------------------
+    if n_features >= 3:
+        F = min(n_features, 6)
+        for i in range(F):
+            for j in range(i + 1, F):
+                for k in range(F):
+                    if k == i or k == j:
+                        continue
+                    # (xi * xj) / xk
+                    cgp = _make_cgp_base(n_features, feature_names)
+                    cgp.nodes[0] = CGPNode('*', i, j)
+                    cgp.nodes[1] = CGPNode('/', nf, k)
+                    cgp.out_idx = nf + 1; cgp.update_active_nodes()
+                    seeds.append(Individual(cgp))
+        for i in range(F):
+            for j in range(F):
+                for k in range(j + 1, F):
+                    if i == j or i == k:
+                        continue
+                    # xi / (xj * xk)
+                    cgp = _make_cgp_base(n_features, feature_names)
+                    cgp.nodes[0] = CGPNode('*', j, k)
+                    cgp.nodes[1] = CGPNode('/', i, nf)
+                    cgp.out_idx = nf + 1; cgp.update_active_nodes()
+                    seeds.append(Individual(cgp))
+
+    # ---- 4-feature (a*b)/(c*d)  — the user's canonical target -------
+    # Enumerate every {i, j} numerator pair vs every disjoint {k, l}
+    # denominator pair.  For n_features = 4 this is a single seed; the
+    # combinatorial blowup stays tiny because we cap at F=6.
+    if n_features >= 4:
+        F = min(n_features, 6)
+        feats = list(range(F))
+        from itertools import combinations
+        pairs = list(combinations(feats, 2))
+        for (i, j) in pairs:
+            for (k, l) in pairs:
+                if {i, j} & {k, l}:
+                    continue
+                cgp = _make_cgp_base(n_features, feature_names)
+                cgp.nodes[0] = CGPNode('*', i, j)            # numerator
+                cgp.nodes[1] = CGPNode('*', k, l)            # denominator
+                cgp.nodes[2] = CGPNode('/', nf, nf + 1)      # divide
+                cgp.out_idx = nf + 2; cgp.update_active_nodes()
+                seeds.append(Individual(cgp))
+
+    # ---- Constant-scaled variants for the most promising 4-feature ratio
+    # Pick the configuration whose raw evaluation correlates best with y
+    # and emit a c0 · (a·b)/(c·d) version with c0 fitted to the ratio.
+    if (n_features >= 4 and 'const' in allowed and len(y) >= 4
+            and np.std(y) > 1e-10):
+        try:
+            best_corr = 0.0
+            best_quad = None
+            from itertools import combinations
+            F = min(n_features, 6)
+            for (i, j) in combinations(range(F), 2):
+                for (k, l) in combinations(range(F), 2):
+                    if {i, j} & {k, l}:
+                        continue
+                    den = X[:, k] * X[:, l]
+                    if np.any(np.abs(den) < 1e-10):
+                        continue
+                    val = (X[:, i] * X[:, j]) / den
+                    val = np.nan_to_num(val, nan=0.0, posinf=0.0, neginf=0.0)
+                    if np.std(val) < 1e-10:
+                        continue
+                    corr = abs(float(np.corrcoef(val, y)[0, 1]))
+                    if np.isnan(corr):
+                        corr = 0.0
+                    if corr > best_corr:
+                        best_corr = corr
+                        # Best-fit affine: y ≈ a · val + b → emit a · val
+                        a = float(np.cov(val, y)[0, 1] /
+                                   (np.var(val) + 1e-12))
+                        if not np.isfinite(a) or abs(a) > 1e8:
+                            continue
+                        best_quad = (i, j, k, l, a)
+            if best_quad is not None and best_corr > 0.3:
+                i, j, k, l, a = best_quad
+                cgp = _make_cgp_base(n_features, feature_names)
+                cgp.nodes[0] = CGPNode('*', i, j)
+                cgp.nodes[1] = CGPNode('*', k, l)
+                cgp.nodes[2] = CGPNode('/', nf, nf + 1)
+                cgp.nodes[3] = CGPNode('const', 0, 0, a)
+                cgp.nodes[4] = CGPNode('*', nf + 3, nf + 2)
+                cgp.out_idx = nf + 4; cgp.update_active_nodes()
+                seeds.append(Individual(cgp))
+        except Exception:
+            pass
+
+    return seeds
+
+
+def _generate_reused_input_seeds(n_features, feature_names):
+    """
+    Templates that reuse the *same* features in multiple sub-expressions,
+    targeting compositional targets such as
+
+        Z = (A · B) − (A / B) + √(2A + B)³ − 2
+
+    where A and B each appear in 3+ different operator contexts.  The
+    rest of the seed library carefully picks DIFFERENT features for each
+    sub-expression (via ``random.sample``) — perfect for additive models
+    but a mismatch for compositional algebra where the same variable
+    threads through several sub-formulas.
+
+    For every ordered pair (i, j) with i ≠ j (capped at the first six
+    features) we emit:
+
+      • A·B − A/B           (the user's canonical example)
+      • A·B + A/B
+      • (A + B) · (A − B)   (difference of squares)
+      • (A − B) / (A + B)
+      • √(c₁·A + c₂·B)
+      • (c₁·A + c₂·B)³  and  √(c₁·A + c₂·B)³
+      • A · sin(A)·cos(B)   (variable-amplitude wave with feature reuse)
+      • A · exp(−A) · B
+      • A^c · B^c (with same exponent)
+
+    These are CGP-cheap (≤ 12 nodes each) but cover the structural
+    blueprint that pure mutation has to discover otherwise.
+    """
+    seeds = []
+    allowed = set(CGPEquation.OPS_ALL)
+    if n_features < 2:
+        return seeds
+
+    F = min(n_features, 6)
+    nf = n_features
+
+    have_mul = '*' in allowed
+    have_div = '/' in allowed
+    have_add = '+' in allowed
+    have_sub = '-' in allowed
+    have_sqrt = 'sqrt' in allowed
+    have_cube = 'cube' in allowed
+    have_pow = 'pow' in allowed
+    have_const = 'const' in allowed
+    have_sin = 'sin' in allowed
+    have_cos = 'cos' in allowed
+    have_exp = 'exp' in allowed
+    have_neg = 'neg' in allowed
+    have_square = 'square' in allowed
+
+    for i in range(F):
+        for j in range(F):
+            if i == j:
+                continue
+
+            # 1) A·B − A/B  (the user's example fragment)
+            if have_mul and have_div and have_sub:
+                cgp = _make_cgp_base(n_features, feature_names)
+                cgp.nodes[0] = CGPNode('*', i, j)              # A·B
+                cgp.nodes[1] = CGPNode('/', i, j)              # A/B
+                cgp.nodes[2] = CGPNode('-', nf, nf + 1)        # A·B − A/B
+                cgp.out_idx = nf + 2; cgp.update_active_nodes()
+                seeds.append(Individual(cgp))
+
+            # 1b) A·B + A/B  — companion shape, different sign
+            if have_mul and have_div and have_add:
+                cgp = _make_cgp_base(n_features, feature_names)
+                cgp.nodes[0] = CGPNode('*', i, j)
+                cgp.nodes[1] = CGPNode('/', i, j)
+                cgp.nodes[2] = CGPNode('+', nf, nf + 1)
+                cgp.out_idx = nf + 2; cgp.update_active_nodes()
+                seeds.append(Individual(cgp))
+
+            # 2) (A + B) · (A − B)  = A² − B²  — difference of squares
+            if have_add and have_sub and have_mul:
+                cgp = _make_cgp_base(n_features, feature_names)
+                cgp.nodes[0] = CGPNode('+', i, j)
+                cgp.nodes[1] = CGPNode('-', i, j)
+                cgp.nodes[2] = CGPNode('*', nf, nf + 1)
+                cgp.out_idx = nf + 2; cgp.update_active_nodes()
+                seeds.append(Individual(cgp))
+
+            # 2b) (A − B) / (A + B)
+            if have_div and have_add and have_sub:
+                cgp = _make_cgp_base(n_features, feature_names)
+                cgp.nodes[0] = CGPNode('-', i, j)
+                cgp.nodes[1] = CGPNode('+', i, j)
+                cgp.nodes[2] = CGPNode('/', nf, nf + 1)
+                cgp.out_idx = nf + 2; cgp.update_active_nodes()
+                seeds.append(Individual(cgp))
+
+            # 3) sqrt(c1*A + c2*B)  — affine-then-sqrt template
+            if have_sqrt and have_add and have_mul and have_const:
+                cgp = _make_cgp_base(n_features, feature_names)
+                cgp.nodes[0] = CGPNode('const', 0, 0, 2.0)        # default c1=2
+                cgp.nodes[1] = CGPNode('*', nf, i)                # c1*A
+                cgp.nodes[2] = CGPNode('+', nf + 1, j)            # c1*A + B
+                cgp.nodes[3] = CGPNode('sqrt', nf + 2, 0)
+                cgp.out_idx = nf + 3; cgp.update_active_nodes()
+                seeds.append(Individual(cgp))
+
+            # 3b) sqrt(2A + B)³  = (2A+B)^{1.5}  — exact match for user example
+            if have_sqrt and have_add and have_mul and have_const and have_cube:
+                cgp = _make_cgp_base(n_features, feature_names)
+                cgp.nodes[0] = CGPNode('const', 0, 0, 2.0)
+                cgp.nodes[1] = CGPNode('*', nf, i)
+                cgp.nodes[2] = CGPNode('+', nf + 1, j)
+                cgp.nodes[3] = CGPNode('sqrt', nf + 2, 0)
+                cgp.nodes[4] = CGPNode('cube', nf + 3, 0)
+                cgp.out_idx = nf + 4; cgp.update_active_nodes()
+                seeds.append(Individual(cgp))
+
+            # 3c) (2A + B)³  — same affine inner, integer cube
+            if have_cube and have_add and have_mul and have_const:
+                cgp = _make_cgp_base(n_features, feature_names)
+                cgp.nodes[0] = CGPNode('const', 0, 0, 2.0)
+                cgp.nodes[1] = CGPNode('*', nf, i)
+                cgp.nodes[2] = CGPNode('+', nf + 1, j)
+                cgp.nodes[3] = CGPNode('cube', nf + 2, 0)
+                cgp.out_idx = nf + 3; cgp.update_active_nodes()
+                seeds.append(Individual(cgp))
+
+            # 4) Full user template:
+            #      (A·B − A/B) + sqrt(2A + B)³ − 2
+            if (have_mul and have_div and have_sub and have_add
+                    and have_sqrt and have_cube and have_const):
+                cgp = _make_cgp_base(n_features, feature_names)
+                cgp.nodes[0] = CGPNode('*', i, j)               # A·B
+                cgp.nodes[1] = CGPNode('/', i, j)               # A/B
+                cgp.nodes[2] = CGPNode('-', nf, nf + 1)         # A·B − A/B
+                cgp.nodes[3] = CGPNode('const', 0, 0, 2.0)      # 2
+                cgp.nodes[4] = CGPNode('*', nf + 3, i)          # 2A
+                cgp.nodes[5] = CGPNode('+', nf + 4, j)          # 2A + B
+                cgp.nodes[6] = CGPNode('sqrt', nf + 5, 0)       # sqrt(2A+B)
+                cgp.nodes[7] = CGPNode('cube', nf + 6, 0)       # ^3
+                cgp.nodes[8] = CGPNode('+', nf + 2, nf + 7)     # combine
+                cgp.nodes[9] = CGPNode('const', 0, 0, 2.0)      # constant 2
+                cgp.nodes[10] = CGPNode('-', nf + 8, nf + 9)
+                cgp.out_idx = nf + 10; cgp.update_active_nodes()
+                seeds.append(Individual(cgp))
+
+            # 5) A · sin(A) · cos(B)  — same-feature trig modulation
+            if have_sin and have_cos and have_mul:
+                cgp = _make_cgp_base(n_features, feature_names)
+                cgp.nodes[0] = CGPNode('sin', i, 0)
+                cgp.nodes[1] = CGPNode('cos', j, 0)
+                cgp.nodes[2] = CGPNode('*', nf, nf + 1)         # sin(A)·cos(B)
+                cgp.nodes[3] = CGPNode('*', i, nf + 2)          # A · sin(A)·cos(B)
+                cgp.out_idx = nf + 3; cgp.update_active_nodes()
+                seeds.append(Individual(cgp))
+
+            # 5b) sin(A)·cos(A)  — feature reused inside the trig product
+            if have_sin and have_cos and have_mul:
+                cgp = _make_cgp_base(n_features, feature_names)
+                cgp.nodes[0] = CGPNode('sin', i, 0)
+                cgp.nodes[1] = CGPNode('cos', i, 0)
+                cgp.nodes[2] = CGPNode('*', nf, nf + 1)
+                cgp.out_idx = nf + 2; cgp.update_active_nodes()
+                seeds.append(Individual(cgp))
+
+            # 6) A · exp(−A) · B  — exponential decay * linear
+            if have_exp and have_mul and (have_neg or have_sub):
+                cgp = _make_cgp_base(n_features, feature_names)
+                if have_neg:
+                    cgp.nodes[0] = CGPNode('neg', i, 0)
+                    cgp.nodes[1] = CGPNode('exp', nf, 0)
+                else:
+                    cgp.nodes[0] = CGPNode('const', 0, 0, 0.0)
+                    cgp.nodes[1] = CGPNode('-', nf, i)         # 0 − A
+                    # exp slot follows
+                    cgp.nodes[1] = CGPNode('-', nf, i)
+                    cgp.nodes[2] = CGPNode('exp', nf + 1, 0)   # repurpose slot 2
+                # Reuse slot offsets carefully
+                if have_neg:
+                    cgp.nodes[2] = CGPNode('*', nf + 1, i)     # exp(-A) · A
+                    cgp.nodes[3] = CGPNode('*', nf + 2, j)     # · B
+                    cgp.out_idx = nf + 3
+                else:
+                    cgp.nodes[3] = CGPNode('*', nf + 2, i)
+                    cgp.nodes[4] = CGPNode('*', nf + 3, j)
+                    cgp.out_idx = nf + 4
+                cgp.update_active_nodes()
+                seeds.append(Individual(cgp))
+
+            # 7) A·B / (A + B)  — harmonic-style with feature reuse
+            if have_mul and have_add and have_div:
+                cgp = _make_cgp_base(n_features, feature_names)
+                cgp.nodes[0] = CGPNode('*', i, j)
+                cgp.nodes[1] = CGPNode('+', i, j)
+                cgp.nodes[2] = CGPNode('/', nf, nf + 1)
+                cgp.out_idx = nf + 2; cgp.update_active_nodes()
+                seeds.append(Individual(cgp))
+
+            # 8) A^p · B^p  — same exponent on both, common in dimensionless physics
+            if have_pow and have_mul and have_const:
+                for _p in (2.0, 3.0, 0.5, -1.0):
+                    cgp = _make_cgp_base(n_features, feature_names)
+                    cgp.nodes[0] = CGPNode('const', 0, 0, _p)
+                    cgp.nodes[1] = CGPNode('pow', i, nf)
+                    cgp.nodes[2] = CGPNode('pow', j, nf)
+                    cgp.nodes[3] = CGPNode('*', nf + 1, nf + 2)
+                    cgp.out_idx = nf + 3; cgp.update_active_nodes()
+                    seeds.append(Individual(cgp))
+
+            # 9) A² · B − A · B²  — antisymmetric quadratic with reused features
+            if have_mul and have_sub:
+                cgp = _make_cgp_base(n_features, feature_names)
+                if have_square:
+                    cgp.nodes[0] = CGPNode('square', i, 0)      # A²
+                    cgp.nodes[1] = CGPNode('square', j, 0)      # B²
+                else:
+                    cgp.nodes[0] = CGPNode('*', i, i)
+                    cgp.nodes[1] = CGPNode('*', j, j)
+                cgp.nodes[2] = CGPNode('*', nf, j)              # A²·B
+                cgp.nodes[3] = CGPNode('*', i, nf + 1)          # A·B²
+                cgp.nodes[4] = CGPNode('-', nf + 2, nf + 3)
+                cgp.out_idx = nf + 4; cgp.update_active_nodes()
+                seeds.append(Individual(cgp))
+
+    # 10) Single-feature compositional reuse (n_features ≥ 1):
+    #       A · sin(A) + cos(A)
+    #       A² + 1/A
+    #       (A + 1) · (A − 1)  = A² − 1
+    if have_mul and have_sin and have_cos and have_add:
+        for i in range(min(n_features, 6)):
+            cgp = _make_cgp_base(n_features, feature_names)
+            cgp.nodes[0] = CGPNode('sin', i, 0)
+            cgp.nodes[1] = CGPNode('*', i, nf)             # A · sin(A)
+            cgp.nodes[2] = CGPNode('cos', i, 0)
+            cgp.nodes[3] = CGPNode('+', nf + 1, nf + 2)
+            cgp.out_idx = nf + 3; cgp.update_active_nodes()
+            seeds.append(Individual(cgp))
+
+    if have_mul and have_div and have_add:
+        for i in range(min(n_features, 6)):
+            cgp = _make_cgp_base(n_features, feature_names)
+            if have_square:
+                cgp.nodes[0] = CGPNode('square', i, 0)
+            else:
+                cgp.nodes[0] = CGPNode('*', i, i)
+            cgp.nodes[1] = CGPNode('const', 0, 0, 1.0) if have_const else CGPNode('+', i, i)
+            cgp.nodes[2] = CGPNode('/', nf + 1, i) if have_const else CGPNode('+', i, i)
+            cgp.nodes[3] = CGPNode('+', nf, nf + 2)
+            cgp.out_idx = nf + 3; cgp.update_active_nodes()
+            seeds.append(Individual(cgp))
+
+    return seeds
+
+
 def generate_importance_biased_seeds(n_features, feature_names, X, y):
     """
     Generate seeds biased by feature importance analysis.
@@ -3816,6 +4549,41 @@ def generate_importance_biased_seeds(n_features, feature_names, X, y):
     try:
         ols_seeds = generate_ols_basis_seeds(n_features, feature_names, X, y)
         seeds.extend(ols_seeds)
+    except Exception:
+        pass
+
+    # ── Log-linear OLS for monomial / rational targets ─────────────────
+    # Polynomial OLS cannot represent  y = a·b/(c·d), Buckingham Π forms,
+    # or any pure power product.  In log-space those targets become linear,
+    # so a single least-squares solve recovers the exponents exactly.  This
+    # is the analogous closed-form move for the multiplicative regime.
+    try:
+        log_seeds = generate_log_ols_seeds(n_features, feature_names, X, y)
+        seeds.extend(log_seeds)
+    except Exception:
+        pass
+
+    # ── Combinatorial rational-product seeds ───────────────────────────
+    # Hard-coded (xᵢ·xⱼ)/(xₖ·xₗ) style templates over the first few
+    # features.  Catches the user's canonical a·b/(c·d) target even when
+    # log-OLS bails out on mixed-sign data.
+    try:
+        rat_seeds = _generate_rational_product_seeds(
+            n_features, feature_names, X, y)
+        seeds.extend(rat_seeds)
+    except Exception:
+        pass
+
+    # ── Reused-input compositional seeds ───────────────────────────────
+    # Multi-step templates where the SAME features appear in several
+    # operator contexts (A·B − A/B, sqrt(2A + B)³, sin(A)·cos(A) …).
+    # The rest of the seed library uses `random.sample` to draw distinct
+    # features per sub-expression — fine for additive models, wrong for
+    # compositional ones, where the variable threads through several
+    # branches of the formula.
+    try:
+        ru_seeds = _generate_reused_input_seeds(n_features, feature_names)
+        seeds.extend(ru_seeds)
     except Exception:
         pass
 
@@ -5835,13 +6603,23 @@ def mutate(parent_eq, n_features, feature_names, mut_rate=None, temperature=0.0,
             if len(free_slots) >= 3 and binary_ops_avail:
                 # Build a small new term in free slots
                 s1, s2, s3 = free_slots[0], free_slots[1], free_slots[2]
-                # Pick a feature (prefer unused ones)
+                # Pick a feature.  Default = prefer unused (additive-correction
+                # discovery), but ~30 % of the time deliberately reuse an
+                # already-active feature so compositional targets like
+                # A·B − A/B can be assembled from a starting expression that
+                # already references both A and B.
                 used_feats = set()
                 for idx in child_eq.active_nodes:
                     if idx < n_features:
                         used_feats.add(idx)
                 unused = [f for f in range(n_features) if f not in used_feats]
-                new_feat = random.choice(unused) if unused else random.randint(0, n_features - 1)
+                used_list = sorted(used_feats)
+                if used_list and random.random() < 0.30:
+                    new_feat = random.choice(used_list)
+                elif unused:
+                    new_feat = random.choice(unused)
+                else:
+                    new_feat = random.randint(0, n_features - 1)
                 # Build: unary(feature) or const*feature
                 unary_ops = CGPEquation.OPS_UNARY or []
                 if unary_ops and random.random() < 0.6:
@@ -8897,10 +9675,22 @@ def macro_nest_compound(cgp_eq, n_features, feature_names, op_affinity=None):
     if len(free_slots) < 4:
         return child
 
-    # Pick a feature — prefer unused ones
+    # Pick a feature.  Default bias is towards unused features (additive
+    # corrections to the existing expression), but ~30% of the time we
+    # deliberately *reuse* an already-active feature.  Without this
+    # branch, compositional targets where the same input threads through
+    # multiple sub-expressions (e.g. A·B − A/B + √(2A+B)³) are nearly
+    # impossible to assemble via mutation, because every grow step is
+    # forced onto a fresh feature.
     used_feats = _active_feature_set(child, n_features)
     unused = [f for f in range(n_features) if f not in used_feats]
-    feat = random.choice(unused) if unused else random.randint(0, n_features - 1)
+    used_list = sorted(used_feats)
+    if used_list and random.random() < 0.30:
+        feat = random.choice(used_list)
+    elif unused:
+        feat = random.choice(unused)
+    else:
+        feat = random.randint(0, n_features - 1)
 
     unary_ops  = [op for op in CGPEquation.OPS_UNARY  if op in ALLOWED_OPS]
     binary_ops = [op for op in CGPEquation.OPS_BINARY if op in ALLOWED_OPS]
@@ -9038,14 +9828,21 @@ def macro_inject_subtree(cgp_eq, n_features, feature_names):
     nf = n_features
     cur_out = child.out_idx
 
-    # Pick features — prefer diverse ones
+    # Pick features.  Default bias is toward diversity (unused features),
+    # but ~30% of the time we deliberately reuse an already-active feature
+    # so compositional targets like sin(A)·cos(A), A·B − A/B, and
+    # √(2A+B)³ can be assembled via subtree injection too.
     used_feats = _active_feature_set(child, n_features)
     all_feats = list(range(n_features))
     unused = [f for f in all_feats if f not in used_feats]
+    used_list = sorted(used_feats)
 
     def _pick_feat(prefer_unused=True):
-        if prefer_unused and unused:
-            return random.choice(unused)
+        if prefer_unused:
+            if used_list and random.random() < 0.30:
+                return random.choice(used_list)
+            if unused:
+                return random.choice(unused)
         return random.choice(all_feats)
 
     template = random.choices(
