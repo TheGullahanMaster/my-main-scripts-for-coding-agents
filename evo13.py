@@ -204,6 +204,25 @@ SIGMA_MAX = 20.0
 # 0.0 = no parsimony; 0.01 = gentle; 0.05 = moderate; 0.2+ = strong.
 PARSIMONY_STRENGTH = 0.01
 
+# How often (in generations) to retarget the residual-aware seed generator at
+# the *current* HoF-best's residuals and inject the new seeds into each
+# island's population.  Built-in seeds are otherwise consumed only at startup,
+# so on problems where no startup seed solves the target the search has to
+# rediscover correction terms from scratch.  This keeps the high-quality seed
+# generators in the live loop.  0 disables re-injection.
+RESEED_PERIOD = 250
+RESEED_INJECT_N = 5     # how many fresh seeds to splice into each island
+
+# Plateau-driven meta-extinction: when global best loss has not improved by
+# more than META_PLATEAU_REL in META_PLATEAU_GENS generations, wipe all
+# islands except the global elite (`META_KEEP_FRAC`) and rebuild from fresh
+# seeds (v5 + importance-biased + residual-aware).  Capped at META_MAX_FIRES
+# per run so we don't thrash on intrinsically hard problems.
+META_PLATEAU_GENS  = 1000
+META_PLATEAU_REL   = 1e-5
+META_KEEP_FRAC     = 0.05
+META_MAX_FIRES     = 5
+
 # Maximum loss an individual may have to enter the Hall of Fame.
 # Expressions with billion-scale losses (abs(x)^feature blowups, etc.) would
 # otherwise occupy every high-complexity HoF slot and block genuinely good
@@ -10511,7 +10530,8 @@ def macro_inject_subtree(cgp_eq, n_features, feature_names):
 
 def _create_offspring(action, parent, population, n_features, feat_names,
                       eff_rate, sa_temp, parent_sigma, X,
-                      op_affinity=None, y_residuals=None):
+                      op_affinity=None, y_residuals=None,
+                      tournament_k=3):
     """Shared offspring creation logic for both island evolution and AFPO.
 
     Returns (child_tree, child_sigma) after applying the chosen reproductive
@@ -10520,13 +10540,17 @@ def _create_offspring(action, parent, population, n_features, feat_names,
     y_residuals : optional (N,) array — current target residuals, used by
                   semantic crossover to guide recombination toward residual-
                   reducing combinations.
+
+    tournament_k : tournament size used when picking the second parent for
+                  crossover.  Callers may scale this with a cosine schedule
+                  (low k early for exploration, high k late for exploitation).
     """
     child_sigma = float(np.clip(
         parent_sigma * np.exp(random.gauss(0, SIGMA_TAU)),
         SIGMA_MIN, SIGMA_MAX))
 
     if action == 'crossover' and len(population) >= 2:
-        parent2    = tournament_select(population, k=3)
+        parent2    = tournament_select(population, k=tournament_k)
         child_tree = crossover(parent.tree, parent2.tree)
         if not _is_semantically_novel(child_tree, parent.tree, parent2.tree, X):
             child_tree = mutate(child_tree, n_features, feat_names,
@@ -10540,7 +10564,7 @@ def _create_offspring(action, parent, population, n_features, feat_names,
             SIGMA_MIN, SIGMA_MAX))
     elif action == 'semantic_xover' and len(population) >= 2:
         # Semantic-ish crossover: combine parents based on residual behavior
-        parent2 = tournament_select(population, k=3)
+        parent2 = tournament_select(population, k=tournament_k)
         child_tree = _semantic_crossover(parent.tree, parent2.tree, X,
                                           y_residuals)
         # Light mutation to explore around the semantic combination
@@ -10659,6 +10683,45 @@ def evolve_island_chunk(args):
     _LIGHT_CONST_OPT_FREQ  = 75   # run every 75 generations
     _LIGHT_CONST_OPT_TOP_N = max(1, len(island_pop) // 10)
 
+    # ── IMPROVEMENT (B8): cheap behavioural-novelty bonus on fitness ─────
+    # Compute a 16-row prediction fingerprint per child (quantised to 3 sig
+    # figs) and shave a small bonus off the child's fitness when its
+    # fingerprint is NOT seen anywhere else in the island.  This is implicit
+    # fitness sharing: structurally distinct lineages with different output
+    # shapes survive the death tournament more often even at equal raw loss.
+    # Bonus is small (1 % of an MSE-of-1 worth) so it never inverts genuine
+    # rank.
+    _NOVELTY_PROBE_K = 16
+    _NOVELTY_BONUS   = 0.005
+    if X.shape[0] > 0:
+        _novelty_idx = np.random.choice(
+            X.shape[0], min(_NOVELTY_PROBE_K, X.shape[0]), replace=False)
+        _X_novelty   = X[_novelty_idx]
+    else:
+        _X_novelty   = None
+
+    def _novelty_fp(tree):
+        try:
+            p = tree.evaluate(_X_novelty)
+            p = np.nan_to_num(p, nan=0.0, posinf=1e9, neginf=-1e9)
+            # Quantise to 3 sig-figs so floating-point noise doesn't
+            # fragment otherwise-identical predictions into "novel" bins.
+            return tuple(float(f"{v:.3g}") for v in p)
+        except Exception:
+            return None
+
+    # ── IMPROVEMENT (B7): diversity-driven structural boost ──────────────
+    # `_compute_island_diversity` was previously measured-but-ignored.  When
+    # the per-island prediction-fingerprint diversity collapses below
+    # _DIVERSITY_THRESHOLD, set a window during which structural operators
+    # receive an extra multiplier on top of the stagnation boost so the
+    # island can break out of a behavioural basin.
+    _DIVERSITY_CHECK_FREQ   = 50
+    _DIVERSITY_THRESHOLD    = 1e-3
+    _DIVERSITY_BOOST_WINDOW = 50          # gens of boost after a collapse
+    _DIVERSITY_BOOST_MULT   = 2.0
+    _diversity_boost_until  = -1
+
     for gen in range(generations):
         for ind in island_pop:
             ind.age += 1
@@ -10743,6 +10806,74 @@ def evolve_island_chunk(args):
         if gen % _AFFINITY_UPDATE_FREQ == 0 and local_hof.best_by_complexity:
             _op_affinity = compute_hof_operator_affinity([local_hof])
 
+        # ── IMPROVEMENT (B7): periodic diversity check ───────────────────────
+        if gen > 0 and gen % _DIVERSITY_CHECK_FREQ == 0 and X.shape[0] > 0:
+            try:
+                _div_idx = np.random.choice(
+                    X.shape[0], min(16, X.shape[0]), replace=False)
+                _div_score = _compute_island_diversity(island_pop, X[_div_idx])
+                if _div_score < _DIVERSITY_THRESHOLD:
+                    _diversity_boost_until = gen + _DIVERSITY_BOOST_WINDOW
+            except Exception:
+                pass
+
+        # ── IMPROVEMENT: Periodic local-HoF re-injection ──────────────────────
+        # Even outside of extinction the island can drift away from a deep
+        # insight in `local_hof`.  Once every _HOF_REINJECT_FREQ gens we
+        # rescue a small handful of HoF members at age 0, replacing only
+        # the worst slots so the cost is bounded.
+        _HOF_REINJECT_FREQ = 100
+        if (gen > 0 and gen % _HOF_REINJECT_FREQ == 0
+                and local_hof.best_by_complexity):
+            _hof_inds = list(local_hof.best_by_complexity.values())
+            random.shuffle(_hof_inds)
+            _n_inject = min(2, max(1, len(island_pop) // 25))
+            for _hof_ind in _hof_inds[:_n_inject]:
+                if not island_pop:
+                    break
+                worst = max(island_pop, key=lambda x: x.fitness)
+                if _hof_ind.fitness >= worst.fitness:
+                    continue   # nothing to gain
+                island_pop.remove(worst)
+                _re = copy.deepcopy(_hof_ind)
+                _re.age = 0
+                island_pop.append(_re)
+
+        # ── IMPROVEMENT: Periodic residual-aware re-seeding ───────────────────
+        # Built-in seed generators run only once at startup, so on problems
+        # where no startup seed solves the target the search has to discover
+        # correction structure from scratch.  Every RESEED_PERIOD gens we
+        # retarget `generate_residual_aware_seeds` at the *current* HoF best's
+        # residuals and splice the top RESEED_INJECT_N into the worst slots
+        # of the island.  Skipped for classification (no meaningful residual)
+        # and joint-softmax outputs (residuals don't decompose per-output).
+        if (RESEED_PERIOD > 0 and gen > 0 and gen % RESEED_PERIOD == 0
+                and type_code != 6 and bg_logits is None
+                and local_hof.best_by_complexity):
+            _hof_best = local_hof.get_best_overall()
+            if _hof_best is not None:
+                try:
+                    _new_seeds = generate_residual_aware_seeds(
+                        n_features, feat_names, X, y_target,
+                        _hof_best, max_seeds=RESEED_INJECT_N * 2)
+                    if _new_seeds:
+                        # Score the new seeds and keep the best RESEED_INJECT_N.
+                        for _s in _new_seeds:
+                            _s.calculate_fitness(X, y_target, type_code,
+                                                 target_grads=target_grads)
+                        _new_seeds.sort(key=lambda x: x.fitness)
+                        _new_seeds = _new_seeds[:RESEED_INJECT_N]
+                        # Replace the worst (highest-fitness) members of the
+                        # island, but never the current chunk champion.
+                        island_pop.sort(key=lambda x: x.fitness)
+                        for k, seed in enumerate(_new_seeds):
+                            replace_idx = len(island_pop) - 1 - k
+                            if replace_idx <= 0:
+                                break
+                            island_pop[replace_idx] = seed
+                except Exception:
+                    pass   # never let re-seeding crash the loop
+
         # 1. Parent selection
         parent = epsilon_lexicase_selection(island_pop, X, y_target, type_code,
                                             bg_logits=bg_logits,
@@ -10775,8 +10906,16 @@ def evolve_island_chunk(args):
         # bundled with the structural set when IF_ELSE_ENABLED — stagnation
         # frequently means a smooth approximation has plateaued and a piecewise
         # restructure is exactly what's needed.
-        if stag_frac > 0.3:
-            structural_boost = 1.0 + 2.0 * min(1.0, (stag_frac - 0.3) / 0.5)
+        # B7: also boost when diversity collapsed recently — the two boosts
+        # compound, so a stagnant *and* semantically collapsed island gets
+        # the strongest push.
+        _div_active = gen <= _diversity_boost_until
+        if stag_frac > 0.3 or _div_active:
+            structural_boost = 1.0
+            if stag_frac > 0.3:
+                structural_boost *= 1.0 + 2.0 * min(1.0, (stag_frac - 0.3) / 0.5)
+            if _div_active:
+                structural_boost *= _DIVERSITY_BOOST_MULT
             _structural_ops = {'grow', 'graft', 'nest', 'inject', 'trig', 'div',
                                'crossover', 'semantic_xover'}
             if IF_ELSE_ENABLED:
@@ -10790,11 +10929,17 @@ def evolve_island_chunk(args):
 
         action = random.choices(repro_ops, weights=repro_weights, k=1)[0]
 
+        # Adaptive tournament k for the crossover 2nd-parent: low k early
+        # (uniform-ish exploration) and high k late (greedier exploitation).
+        # cosine_decay rides 1.0 → 0.1 over the chunk, so (1-cosine_decay)
+        # ranges 0 → 0.9.
+        _tk = 2 + int(round(5.0 * max(0.0, 1.0 - cosine_decay)))
         child_tree, child_sigma = _create_offspring(
             action, parent, island_pop, n_features, feat_names,
             eff_rate, sa_temp, parent_sigma, X,
             op_affinity=_op_affinity if _op_affinity else None,
-            y_residuals=y_target)
+            y_residuals=y_target,
+            tournament_k=_tk)
 
         child       = Individual(child_tree)
         child.sigma = child_sigma
@@ -10816,15 +10961,54 @@ def evolve_island_chunk(args):
         child_freq_adj = freq_adj.get(int(round(child.tree.get_complexity())), 0.0)
 
         if action == 'optimize':
-            # PySR runs a fast optimization cycle here: no DE, just a quick
-            # 15-iteration L-BFGS-B nudge into the local gradient basin.
-            child.optimize_constants(X, y_target, type_code,
-                                     max_rows=None, n_restarts=1, max_iter=15,
-                                     bg_logits=bg_logits,
-                                     class_idx_in_group=class_idx_in_group,
-                                     Y_group=Y_group,
-                                     freq_parsimony_adj=child_freq_adj,
-                                     target_grads=target_grads)
+            # EI-gated tiered constant optimisation.  Previously every
+            # `optimize` action paid the full 15-iteration L-BFGS-B cost
+            # regardless of whether the child had any constants worth
+            # tuning or whether the optimiser was actually making progress.
+            # We now run a cheap 3-iter probe first and only escalate to
+            # the deeper polish when the probe shows real improvement.
+            _const_count = len(get_constants_shared(child.tree))
+            if _const_count == 0:
+                # No constants — just evaluate.  optimize_constants would
+                # short-circuit anyway, but skipping it avoids the function
+                # call's own overhead.
+                child.calculate_fitness(X, y_target, type_code,
+                                        bg_logits=bg_logits,
+                                        class_idx_in_group=class_idx_in_group,
+                                        Y_group=Y_group,
+                                        freq_parsimony_adj=child_freq_adj,
+                                        target_grads=target_grads)
+            else:
+                # Baseline before any optimisation.
+                child.calculate_fitness(X, y_target, type_code,
+                                        bg_logits=bg_logits,
+                                        class_idx_in_group=class_idx_in_group,
+                                        Y_group=Y_group,
+                                        freq_parsimony_adj=child_freq_adj,
+                                        target_grads=target_grads)
+                _pre_loss = child.loss if np.isfinite(child.loss) else 1e10
+                _probe_iter = 3 if _const_count <= 4 else 5
+                child.optimize_constants(X, y_target, type_code,
+                                         max_rows=None, n_restarts=1,
+                                         max_iter=_probe_iter,
+                                         bg_logits=bg_logits,
+                                         class_idx_in_group=class_idx_in_group,
+                                         Y_group=Y_group,
+                                         freq_parsimony_adj=child_freq_adj,
+                                         target_grads=target_grads)
+                # Escalate only if the probe knocked at least 1 % off the
+                # loss — otherwise the deeper polish is unlikely to find
+                # anything either.
+                if child.loss < _pre_loss * 0.99 - 1e-12:
+                    _polish_iter = 10 if _const_count <= 4 else 12
+                    child.optimize_constants(X, y_target, type_code,
+                                             max_rows=None, n_restarts=1,
+                                             max_iter=_polish_iter,
+                                             bg_logits=bg_logits,
+                                             class_idx_in_group=class_idx_in_group,
+                                             Y_group=Y_group,
+                                             freq_parsimony_adj=child_freq_adj,
+                                             target_grads=target_grads)
         elif action == 'boost':
             # Intra-individual gradient boosting: evolve a correction on residuals
             child.calculate_fitness(X, y_target, type_code,
@@ -10857,6 +11041,26 @@ def evolve_island_chunk(args):
         _probe_idx = np.random.choice(X.shape[0], min(8, X.shape[0]), replace=False)
         _X_probe   = X[_probe_idx]
         victim = _crowding_death_select(death_sample, X_probe=_X_probe)
+
+        # ── B8: behavioural-novelty bonus on child fitness ────────────────
+        # Quantised 16-row prediction fingerprint; if no current population
+        # member shares it, shave _NOVELTY_BONUS off the child's fitness so
+        # genuinely-different lineages are slightly preferred at otherwise-
+        # equal raw loss.  The bonus is small enough that it cannot invert
+        # rank against meaningful loss differences.
+        if _X_novelty is not None and np.isfinite(child.fitness):
+            _child_fp = _novelty_fp(child.tree)
+            if _child_fp is not None:
+                _is_novel = True
+                # Compare against a small random sample to keep the check
+                # cheap — exact uniqueness across all members isn't worth
+                # the O(pop_size) cost.
+                for _peer in random.sample(island_pop, min(12, len(island_pop))):
+                    if _novelty_fp(_peer.tree) == _child_fp:
+                        _is_novel = False
+                        break
+                if _is_novel:
+                    child.fitness -= _NOVELTY_BONUS
 
         # ── PySR Simulated Annealing acceptance ──────────────────────────
         # Accept child even if it is worse than the victim with probability
@@ -11268,11 +11472,13 @@ def evolve_afpo(population, X, y_target, type_code,
                 rescued.age = 0
                 population.append(rescued)
 
-        # ── PySR-style SA temperature ─────────────────────────────────────────
+        # ── PySR-style SA temperature with cosine annealing ─────────────────
         valid_losses = [ind.loss for ind in population
                         if np.isfinite(ind.loss) and ind.loss < 1e9]
         mean_loss    = float(np.mean(valid_losses)) if valid_losses else 1.0
-        sa_temp      = SA_ALPHA * mean_loss if SA_ENABLED else 0.0
+        gen_frac     = gen / max(1, n_generations - 1)
+        cosine_decay = 0.1 + 0.9 * 0.5 * (1.0 + np.cos(np.pi * gen_frac))
+        sa_temp      = SA_ALPHA * mean_loss * cosine_decay if SA_ENABLED else 0.0
 
         # ── PySR adaptive complexity frequency parsimony ──────────────────────
         freq_adj = compute_complexity_frequency_adjustment(population)
@@ -11281,6 +11487,48 @@ def evolve_afpo(population, X, y_target, type_code,
         # as stagnation progresses, avoiding the abrupt jumps of discrete levels.
         stag_frac = local_stag / max(ext_patience, 1)
         stag_mul = 1.0 + 3.0 / (1.0 + np.exp(-10.0 * (stag_frac - 0.5)))
+
+        # ── Periodic HoF re-injection (mirrors evolve_island_chunk B4) ───────
+        _HOF_REINJECT_FREQ = 100
+        if (gen > 0 and gen % _HOF_REINJECT_FREQ == 0
+                and hof.best_by_complexity):
+            _hof_inds = list(hof.best_by_complexity.values())
+            random.shuffle(_hof_inds)
+            _n_inject = min(2, max(1, len(population) // 25))
+            for _hof_ind in _hof_inds[:_n_inject]:
+                _re = copy.deepcopy(_hof_ind)
+                _re.age = 0
+                population.append(_re)
+            # Let the Pareto trim decide which of {old, new} survive — we
+            # don't directly evict members (AFPO invariant).
+            population = _trim_to_pareto_front_3obj(population, target_size)
+
+        # ── Periodic residual-aware re-seeding (mirrors evolve_island_chunk) ─
+        if (RESEED_PERIOD > 0 and gen > 0 and gen % RESEED_PERIOD == 0
+                and type_code != 6 and bg_logits is None
+                and hof.best_by_complexity):
+            _hof_best = hof.get_best_overall()
+            if _hof_best is not None:
+                try:
+                    _new_seeds = generate_residual_aware_seeds(
+                        n_features, feat_names, X, y_target,
+                        _hof_best, max_seeds=RESEED_INJECT_N * 2)
+                    if _new_seeds:
+                        for _s in _new_seeds:
+                            _s.calculate_fitness(X, y_target, type_code,
+                                                 target_grads=target_grads)
+                        _new_seeds.sort(key=lambda x: x.fitness)
+                        _new_seeds = _new_seeds[:RESEED_INJECT_N]
+                        # AFPO: append fresh seeds at age 0 — the Pareto trim
+                        # will decide which survive; this preserves the
+                        # invariant rather than directly evicting members.
+                        for seed in _new_seeds:
+                            seed.age = 0
+                            population.append(seed)
+                        population = _trim_to_pareto_front_3obj(
+                            population, target_size)
+                except Exception:
+                    pass   # never let re-seeding crash the loop
 
         parent       = epsilon_lexicase_selection(population, X, y_target, type_code,
                                                   bg_logits=bg_logits,
@@ -11316,10 +11564,13 @@ def evolve_afpo(population, X, y_target, type_code,
                     repro_weights[k] *= max(0.3, 1.0 / structural_boost)
         action = random.choices(_repro_ops_base, weights=repro_weights, k=1)[0]
 
+        # Adaptive tournament k for crossover 2nd-parent (B6).
+        _tk = 2 + int(round(5.0 * max(0.0, 1.0 - cosine_decay)))
         child_tree, child_sigma = _create_offspring(
             action, parent, population, n_features, feat_names,
             eff_rate, sa_temp, parent_sigma, X,
-            y_residuals=y_target)
+            y_residuals=y_target,
+            tournament_k=_tk)
 
         child       = Individual(child_tree)
         child.sigma = child_sigma
@@ -11338,13 +11589,42 @@ def evolve_afpo(population, X, y_target, type_code,
         child_freq_adj = freq_adj.get(int(round(child.tree.get_complexity())), 0.0)
 
         if action == 'optimize':
-            child.optimize_constants(X, y_target, type_code,
-                                     max_rows=None, n_restarts=1, max_iter=15,
-                                     bg_logits=bg_logits,
-                                     class_idx_in_group=class_idx_in_group,
-                                     Y_group=Y_group,
-                                     freq_parsimony_adj=child_freq_adj,
-                                     target_grads=target_grads)
+            # EI-gated tiered constant optimisation (mirrors evolve_island_chunk).
+            _const_count = len(get_constants_shared(child.tree))
+            if _const_count == 0:
+                child.calculate_fitness(X, y_target, type_code,
+                                        bg_logits=bg_logits,
+                                        class_idx_in_group=class_idx_in_group,
+                                        Y_group=Y_group,
+                                        freq_parsimony_adj=child_freq_adj,
+                                        target_grads=target_grads)
+            else:
+                child.calculate_fitness(X, y_target, type_code,
+                                        bg_logits=bg_logits,
+                                        class_idx_in_group=class_idx_in_group,
+                                        Y_group=Y_group,
+                                        freq_parsimony_adj=child_freq_adj,
+                                        target_grads=target_grads)
+                _pre_loss = child.loss if np.isfinite(child.loss) else 1e10
+                _probe_iter = 3 if _const_count <= 4 else 5
+                child.optimize_constants(X, y_target, type_code,
+                                         max_rows=None, n_restarts=1,
+                                         max_iter=_probe_iter,
+                                         bg_logits=bg_logits,
+                                         class_idx_in_group=class_idx_in_group,
+                                         Y_group=Y_group,
+                                         freq_parsimony_adj=child_freq_adj,
+                                         target_grads=target_grads)
+                if child.loss < _pre_loss * 0.99 - 1e-12:
+                    _polish_iter = 10 if _const_count <= 4 else 12
+                    child.optimize_constants(X, y_target, type_code,
+                                             max_rows=None, n_restarts=1,
+                                             max_iter=_polish_iter,
+                                             bg_logits=bg_logits,
+                                             class_idx_in_group=class_idx_in_group,
+                                             Y_group=Y_group,
+                                             freq_parsimony_adj=child_freq_adj,
+                                             target_grads=target_grads)
         elif action == 'boost':
             # Intra-individual gradient boosting: evolve a correction on residuals
             child.calculate_fitness(X, y_target, type_code,
@@ -11554,6 +11834,95 @@ def evolve_afpo_island_chunk(args):
         target_grads=target_grads,
     )
     return population, local_stag, island_idx, out_idx, local_hof
+
+
+def _meta_extinction(islands_pop, hofs, X, Y, out_types,
+                     n_features, feat_names, target_grads_list=None):
+    """Plateau-driven, all-islands extinction.
+
+    Per-island extinction (inside `evolve_island_chunk`) handles short
+    stalls.  When the *global* best loss has not improved for a long
+    stretch of generations the per-island cycle is no longer enough — the
+    global optimum is just out of structural reach of every population.
+    This helper wipes most of every island and rebuilds from the same
+    high-quality seed generators that fired at startup, plus a residual-
+    aware seeder targeted at each output's current HoF best.
+
+    Mutates `islands_pop` in place.  Designed to be called rarely
+    (capped by META_MAX_FIRES in train_mode).
+    """
+    n_outputs = len(hofs)
+    n_islands = len(islands_pop)
+    if n_outputs == 0 or n_islands == 0:
+        return
+
+    for o_idx in range(n_outputs):
+        # 1. Collect global elite for this output across all islands.
+        all_inds = []
+        for isl in islands_pop:
+            if o_idx < len(isl):
+                all_inds.extend(isl[o_idx])
+        if not all_inds:
+            continue
+        all_inds.sort(key=lambda x: x.fitness)
+        keep_n = max(1, int(len(all_inds) * META_KEEP_FRAC))
+        elite  = [copy.deepcopy(ind) for ind in all_inds[:keep_n]]
+        for e in elite:
+            e.age = 0
+
+        # 2. Generate fresh seeds — same generators used at startup, plus a
+        # residual-aware run if the HoF has a usable best.
+        is_cls   = (out_types[o_idx] == 6)
+        seeds: list = []
+        try:
+            seeds.extend(generate_seeds_v5(n_features, feat_names))
+        except Exception:
+            pass
+        try:
+            seeds.extend(generate_importance_biased_seeds(
+                n_features, feat_names, X, Y[:, o_idx]))
+        except Exception:
+            pass
+        hof_best = hofs[o_idx].get_best_overall() if hofs[o_idx] else None
+        if hof_best is not None and not is_cls:
+            try:
+                seeds.extend(generate_residual_aware_seeds(
+                    n_features, feat_names, X, Y[:, o_idx], hof_best,
+                    max_seeds=20))
+            except Exception:
+                pass
+
+        # 3. Score the new seeds so the islands receive evaluated members.
+        tg = target_grads_list[o_idx] if target_grads_list else None
+        for s in seeds:
+            try:
+                s.calculate_fitness(X, Y[:, o_idx], out_types[o_idx],
+                                    target_grads=tg)
+            except Exception:
+                s.fitness = 1e10
+
+        # 4. Refill each island with elite + scored seeds + random_cgp pad.
+        for isl in islands_pop:
+            if o_idx >= len(isl):
+                continue
+            target_n = len(isl[o_idx]) or 50
+            new_pop  = [copy.deepcopy(e) for e in elite]
+            random.shuffle(seeds)
+            for s in seeds:
+                if len(new_pop) >= target_n:
+                    break
+                new_pop.append(copy.deepcopy(s))
+            while len(new_pop) < target_n:
+                new_pop.append(Individual(random_cgp(
+                    n_features, CGP_NODES, feat_names)))
+            isl[o_idx] = new_pop[:target_n]
+
+    # The fitness cache is keyed by tree fingerprint + target hash; entries
+    # for evicted individuals are wasted memory after a wipe.
+    try:
+        _FITNESS_CACHE.clear()
+    except Exception:
+        pass
 
 
 def _deep_optimize_hofs(hofs, X, Y, out_types,
@@ -14430,6 +14799,14 @@ def train_mode():
 
         gen = 0
         perfect_outputs = set()   # outputs that reached perfect performance
+        # Plateau-driven meta-extinction bookkeeping (see B2 in the audit
+        # plan).  Track the global best loss and the generation at which it
+        # last improved meaningfully; if META_PLATEAU_GENS pass without a
+        # > META_PLATEAU_REL relative improvement, fire `_meta_extinction`
+        # to wipe-and-reseed every island.  Capped at META_MAX_FIRES.
+        _meta_best_loss   = float('inf')
+        _meta_last_imp_gen = 0
+        _meta_fires       = 0
         try:
             with concurrent.futures.ProcessPoolExecutor(max_workers=NUM_ISLANDS) as executor:
                 while True:
@@ -14490,12 +14867,27 @@ def train_mode():
                         else:
                             col_bg, local_k, Y_group_i = None, None, None
 
-                        for island_idx in range(NUM_ISLANDS):
+                        # ── Stagnation-aware chunk size ──────────────────────
+                    # When the worst-stagnated output is more than half-way to
+                    # extinction patience, halve the chunk length so islands
+                    # exchange migrants twice as often.  This pulls fresh
+                    # phenotypes between populations during long plateaus
+                    # without changing migration code itself.
+                    _max_stag = 0
+                    for _ic in stagnation_counters:
+                        for _v in _ic:
+                            if _v > _max_stag:
+                                _max_stag = _v
+                    if _max_stag > EXTINCTION_PATIENCE // 2:
+                        chunk_freq = max(10, MIGRATION_FREQ // 2)
+                    else:
+                        chunk_freq = MIGRATION_FREQ
+                    for island_idx in range(NUM_ISLANDS):
                             args = (
                                 islands_pop[island_idx][i],
                                 X_b, Y_b[:, i], out_types[i],
                                 n_features, feat_names,
-                                MIGRATION_FREQ, island_idx, i,
+                                chunk_freq, island_idx, i,
                                 EXTINCTION_PATIENCE,
                                 stagnation_counters[island_idx][i],
                                 list(_ADF_REGISTRY),   # ← ADF broadcast
@@ -14517,7 +14909,43 @@ def train_mode():
                                       f"New Best (Comp {ind.complexity:.0f}): "
                                       f"loss={ind.loss:.4f}  {metric}")
 
-                    gen += MIGRATION_FREQ
+                    gen += chunk_freq
+
+                    # ── Plateau-driven meta-extinction bookkeeping ────────
+                    # Use the smallest current HoF loss across non-perfect
+                    # outputs as a global progress proxy.  If it drops by a
+                    # relative amount > META_PLATEAU_REL we record a fresh
+                    # improvement; if too many generations pass without one
+                    # we fire a single global rebuild.
+                    _meta_losses = [hofs[i].get_best_overall().loss
+                                    for i in range(n_outputs)
+                                    if i not in perfect_outputs
+                                    and hofs[i].get_best_overall() is not None]
+                    if _meta_losses:
+                        _cur_loss = float(min(_meta_losses))
+                        if (np.isfinite(_cur_loss)
+                                and _cur_loss < _meta_best_loss
+                                * (1.0 - META_PLATEAU_REL)):
+                            _meta_best_loss   = _cur_loss
+                            _meta_last_imp_gen = gen
+                        elif (_meta_fires < META_MAX_FIRES
+                                and gen - _meta_last_imp_gen >= META_PLATEAU_GENS):
+                            _meta_fires += 1
+                            print(f"\n  ⟂ Plateau detected (no >"
+                                  f"{META_PLATEAU_REL:.0e} relative "
+                                  f"improvement in {META_PLATEAU_GENS} gens) — "
+                                  f"firing meta-extinction "
+                                  f"{_meta_fires}/{META_MAX_FIRES}")
+                            _meta_extinction(islands_pop, hofs, X, Y,
+                                             out_types, n_features, feat_names,
+                                             target_grads_list)
+                            # Reset stagnation counters so per-island
+                            # extinction doesn't fire again immediately.
+                            for _ic in stagnation_counters:
+                                for _oi in range(len(_ic)):
+                                    _ic[_oi] = 0
+                            _meta_last_imp_gen = gen
+                            _meta_best_loss   = _cur_loss
 
                     # ---- Island migration (diverse ring topology) ----
                     # Select up to 2 diverse migrants per island (best-loss +
