@@ -587,12 +587,19 @@ def compute_hof_operator_affinity(hofs, smoothing: float = 0.5) -> dict:
 
 
 def affinity_biased_op_choice(affinity: dict, ops: list | None = None) -> str:
-    """Sample from ops (default: OPS_ALL) weighted by HoF affinity."""
+    """Sample from ops (default: OPS_ALL) weighted by HoF affinity.
+
+    A small exploration floor (0.10) is enforced on every operator so that
+    once the HoF stabilizes on a few primitives, exploration of the rest
+    doesn't collapse to ~0 probability.  Without the floor a HoF using only
+    `+ * /` would zero-pressure `sin/exp/log` discovery; with the floor each
+    such op still has at least a 10% relative chance of being sampled.
+    """
     if ops is None:
         ops = CGPEquation.OPS_ALL
     if not affinity:
         return random.choice(ops)
-    weights = [affinity.get(op, 0.3) for op in ops]
+    weights = [max(affinity.get(op, 0.3), 0.10) for op in ops]
     return random.choices(ops, weights=weights, k=1)[0]
 
 # ==========================================
@@ -1869,6 +1876,12 @@ def apply_simplification_pass(islands_pop, hofs, X, Y, out_types, target_grads_l
                 _refit = _diff_frac >= 0.25
                 if _refit:
                     ind.affine_fitted = False
+                    # Boost corrections were trained against the pre-simplify
+                    # predictions; after a structural rewrite their additive
+                    # contribution is noise, not signal.  Drop them so the
+                    # individual is re-evaluated on its base tree.
+                    if getattr(ind, 'boost_stages', None):
+                        ind.boost_stages = []
                 ind.calculate_fitness(X, Y[:, o_idx], out_types[o_idx],
                                       update_affine=_refit,
                                       target_grads=(target_grads_list[o_idx]
@@ -1892,6 +1905,10 @@ def apply_simplification_pass(islands_pop, hofs, X, Y, out_types, target_grads_l
             _refit = _diff_frac >= 0.25
             if _refit:
                 ind.affine_fitted = False
+                # Same rationale as the island branch above — drop stale boost
+                # corrections after a structural rewrite.
+                if getattr(ind, 'boost_stages', None):
+                    ind.boost_stages = []
             ind.calculate_fitness(X, Y[:, o_idx], out_types[o_idx],
                                   update_affine=_refit,
                                   target_grads=(target_grads_list[o_idx]
@@ -7102,7 +7119,10 @@ def mutate(parent_eq, n_features, feature_names, mut_rate=None, temperature=0.0,
                               if s not in set(active_compute)]
                 if free_after:
                     dst = free_after[0]
-                    new_op = random.choice(unary_ops)
+                    if op_affinity:
+                        new_op = affinity_biased_op_choice(op_affinity, unary_ops)
+                    else:
+                        new_op = random.choice(unary_ops)
                     child_eq.nodes[dst] = CGPNode(new_op, wrap_target_global, 0,
                                                    random.gauss(0, 1.0))
                     # Rewire anything that referenced wrap_target to use the new node
@@ -7152,7 +7172,10 @@ def mutate(parent_eq, n_features, feature_names, mut_rate=None, temperature=0.0,
                 # Build: unary(feature) or const*feature
                 unary_ops = CGPEquation.OPS_UNARY or []
                 if unary_ops and random.random() < 0.6:
-                    new_op = random.choice(unary_ops)
+                    if op_affinity:
+                        new_op = affinity_biased_op_choice(op_affinity, unary_ops)
+                    else:
+                        new_op = random.choice(unary_ops)
                     child_eq.nodes[s1] = CGPNode(new_op, new_feat, 0, random.gauss(0, 2.0))
                     new_term = n_features + s1
                     combine_slot = s2
@@ -7229,7 +7252,22 @@ def _subtree_crossover(p1, p2):
     child = copy.deepcopy(p1)
     # Block size: 10–33% of the graph
     width = random.randint(max(1, n // 10), max(1, n // 3))
-    start = random.randint(0, n - width)
+    # Bias the block start toward p2's active region.  Uniform-random over
+    # node-index space means ~70% of blocks are entirely inactive (random)
+    # nodes — copying junk over junk leaves p1's active graph unchanged and
+    # the crossover is effectively a no-op.  Picking a start that covers at
+    # least one active p2 slot makes the operator actually transfer
+    # computation in the majority of cases.
+    n_feat = p2.n_features
+    p2_active_local = sorted(i - n_feat for i in p2.active_nodes if i >= n_feat)
+    if p2_active_local:
+        # Start so that the block contains at least one active p2 slot.
+        anchor = random.choice(p2_active_local)
+        lo     = max(0, anchor - width + 1)
+        hi     = min(n - width, anchor)
+        start  = random.randint(lo, hi) if hi >= lo else random.randint(0, n - width)
+    else:
+        start  = random.randint(0, n - width)
     for i in range(start, start + width):
         child.nodes[i] = copy.deepcopy(p2.nodes[i])
     if random.random() < 0.35:
@@ -8523,6 +8561,14 @@ class Individual:
                 self.r2       = 1.0 - ss_res / (ss_tot + 1e-8)
                 self.accuracy = float(self.r2)
 
+                # Clamp the BASE loss before adding flat/clipped penalties so
+                # those large additive penalties remain visible to selection.
+                # Without this pre-clamp the final hard ceiling would erase
+                # them: a flat-prediction tree's MSE/var≈1, +10 penalty=11,
+                # then clamped to 6 — same final value as a NaN explosion,
+                # so the penalty's signal collapses.
+                self.loss = min(self.loss, HOF_LOSS_CEILING)
+
                 if np.std(y_eval) > 1e-6 and np.std(preds) < 1e-6:
                     self.loss += 10.0
 
@@ -8566,11 +8612,17 @@ class Individual:
 
             # ── Hard loss ceiling ────────────────────────────────────────────
             # Clamp loss so catastrophically bad individuals (abs(x)^feature
-            # explosions, etc.) don't appear as extreme outliers on the fitness
-            # axis and thereby survive crowding-distance death selection longer
-            # than mediocre-but-harmless individuals.  HOF_LOSS_CEILING + 1
-            # ensures they still score strictly worse than the ceiling itself.
-            self.loss = min(self.loss, HOF_LOSS_CEILING + 1.0)
+            # explosions, etc.) don't appear as extreme outliers on the
+            # fitness axis.  The cap is much higher than HOF_LOSS_CEILING+1
+            # so that the additive +10 penalties for flat predictions /
+            # clipped evaluations / large constants remain *visible* to
+            # selection — earlier the cap was HOF_LOSS_CEILING+1=6.0 which
+            # neutralized those penalties (a flat-pred individual ended up
+            # indistinguishable from a NaN-explosion one).  All HoF-relevant
+            # penalised individuals still fail the HoF entry test
+            # (`loss > HOF_LOSS_CEILING`) — they just retain a usable fitness
+            # gradient for selection during evolution.
+            self.loss = min(self.loss, HOF_LOSS_CEILING + 25.0)
 
             MODULARITY_REWARD = 0.5
             # Parsimony shrinks as loss shrinks, allowing late-stage structural fine-tuning
@@ -9267,16 +9319,22 @@ def tree_to_sympy(cgp_eq, feature_vars, safe=None):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # Thresholds for "perfect" performance.
-# Previously disabled for regression (R² >= 2.0 / MSE <= -1.0, both impossible)
-# to force evolution to keep searching even on near-solved problems.  In
-# practice this meant the regression early-stop never fired and the engine
-# ground forever even after a clearly-good fit.  We now use *reachable*
-# thresholds (R² >= 0.999 AND MSE relative to var(Y) below MSE_REL_TOL).
-# Both must be met before declaring perfect, so a vacuously-flat constant
-# prediction (high R² on a constant target) cannot trigger early stop.
-_PERFECT_R2_THRESHOLD       = 0.999
-_PERFECT_MSE_REL_TOLERANCE  = 1e-6        # MSE / var(Y) below this counts as perfect
-_PERFECT_ACCURACY_THRESHOLD = 1.0 - 1e-9  # accuracy >= this for classification
+# Regression early-stop is DISABLED by default (impossible thresholds): a
+# polynomial / OLS seed reaching R² ≈ 0.9995 on a target like ELU/GELU/sigmoid
+# would otherwise trigger the stop and freeze evolution before structural
+# search has a chance to find the true closed-form expression.  We want the
+# search to keep refining even after a clearly-good fit, because "good fit"
+# is exactly where structural discovery becomes valuable.
+# Set REGRESSION_PERFECT_STOP=True to re-enable a reachable threshold pair if
+# you have a use case where wall-clock matters more than structural truth.
+REGRESSION_PERFECT_STOP     = False
+if REGRESSION_PERFECT_STOP:
+    _PERFECT_R2_THRESHOLD      = 0.999
+    _PERFECT_MSE_REL_TOLERANCE = 1e-6        # MSE / var(Y) below this counts as perfect
+else:
+    _PERFECT_R2_THRESHOLD      = 2.0         # R² can never exceed 1.0 → never fires
+    _PERFECT_MSE_REL_TOLERANCE = -1.0        # MSE / var(Y) is never < 0 → never fires
+_PERFECT_ACCURACY_THRESHOLD = 1.0 - 1e-9  # accuracy >= this for classification (always active)
 
 
 def _check_output_perfect(hof, X, Y_col, out_type):
@@ -9939,15 +9997,22 @@ def epsilon_lexicase_selection(population, X, y_target, type_code, n_cases=20,
         err_arr = np.array(errors)
         mad = float(np.median(np.abs(err_arr - np.median(err_arr))))
         if mad > 1e-10:
-            epsilon = best_err + mad
+            epsilon_band = mad
         else:
-            # Degenerate: all errors are nearly identical, use small relative
-            epsilon = best_err + abs(best_err) * 0.05 + 1e-6
+            epsilon_band = abs(best_err) * 0.05 + 1e-6
+        # Always keep an additive floor on the band so even a near-degenerate
+        # population preserves more than one survivor per case — otherwise
+        # lexicase collapses to single-case greedy on near-perfect pops.
+        epsilon = best_err + max(epsilon_band, 1e-3)
         pool = [ind for ind, err in zip(pool, errors) if err <= epsilon]
         if len(pool) == 1:
             break
 
-    return min(pool, key=lambda x: x.complexity)
+    # Canonical ε-lexicase breaks final ties uniformly at random; the prior
+    # `min(...key=complexity)` deterministically picked the simplest survivor
+    # every call, hard-biasing the search toward small expressions and
+    # preventing structurally-rich individuals from ever reproducing.
+    return random.choice(pool)
 
 
 import concurrent.futures
@@ -10379,7 +10444,7 @@ def macro_nest_compound(cgp_eq, n_features, feature_names, op_affinity=None):
     return child
 
 
-def macro_inject_subtree(cgp_eq, n_features, feature_names):
+def macro_inject_subtree(cgp_eq, n_features, feature_names, op_affinity=None):
     """
     Inject a coherent random sub-expression into the CGP graph as a new
     independent branch, then wire it into the output.
@@ -10394,6 +10459,12 @@ def macro_inject_subtree(cgp_eq, n_features, feature_names):
       2. f(x_i) op g(x_j) — product/sum of independent transforms
       3. c * f(c2 * x_i)  — scaled transform with frequency
       4. (x_i op c) op x_j — nested binary with constant
+
+    op_affinity (optional): see compute_hof_operator_affinity — when supplied,
+    biases unary/binary op picks toward operators that already appear in HoF
+    expressions on this problem.  Without it the macro picks ops uniformly
+    at random, which means HoF feedback only reaches ~10% of structural
+    mutations.
 
     This mutation is the primary mechanism for discovering novel functional
     forms that weren't covered by seeds.
@@ -10415,6 +10486,14 @@ def macro_inject_subtree(cgp_eq, n_features, feature_names):
 
     if not binary_ops:
         return child
+
+    def _pick_op(pool):
+        """Affinity-biased op picker; falls back to uniform if no affinity."""
+        if not pool:
+            return None
+        if op_affinity and len(pool) > 1:
+            return affinity_biased_op_choice(op_affinity, pool)
+        return random.choice(pool)
 
     nf = n_features
     cur_out = child.out_idx
@@ -10446,8 +10525,8 @@ def macro_inject_subtree(cgp_eq, n_features, feature_names):
         # f(x_i op x_j) — e.g. sin(x1 * x2), exp(x1 + x2)
         s1, s2, s3, s4 = free_slots[:4]
         fi, fj = _pick_feat(), _pick_feat(prefer_unused=False)
-        inner_op = random.choice(binary_ops)
-        outer_op = random.choice(unary_ops)
+        inner_op = _pick_op(binary_ops)
+        outer_op = _pick_op(unary_ops)
         child.nodes[s1 - nf] = CGPNode(inner_op, fi, fj, random.gauss(0, 1.0))
         child.nodes[s2 - nf] = CGPNode(outer_op, s1, 0, random.gauss(0, 1.0))
         combine = random.choices(['+', '*', '-'], weights=[4, 3, 2], k=1)[0]
@@ -10461,8 +10540,8 @@ def macro_inject_subtree(cgp_eq, n_features, feature_names):
         # f(x_i) * g(x_j) — e.g. sin(x1) * exp(x2)
         s1, s2, s3, s4, s5 = free_slots[:5]
         fi, fj = _pick_feat(), _pick_feat(prefer_unused=False)
-        u1 = random.choice(unary_ops)
-        u2 = random.choice(unary_ops)
+        u1 = _pick_op(unary_ops)
+        u2 = _pick_op(unary_ops)
         child.nodes[s1 - nf] = CGPNode(u1, fi, 0, random.gauss(0, 1.0))
         child.nodes[s2 - nf] = CGPNode(u2, fj, 0, random.gauss(0, 1.0))
         child.nodes[s3 - nf] = CGPNode('*' if '*' in set(binary_ops) else binary_ops[0],
@@ -10483,7 +10562,7 @@ def macro_inject_subtree(cgp_eq, n_features, feature_names):
                                                          np.pi, 2*np.pi, 0.1]))
         child.nodes[s2 - nf] = CGPNode('*' if '*' in set(binary_ops) else binary_ops[0],
                                          s1, fi)
-        child.nodes[s3 - nf] = CGPNode(random.choice(unary_ops), s2, 0)
+        child.nodes[s3 - nf] = CGPNode(_pick_op(unary_ops), s2, 0)
         child.nodes[s4 - nf] = CGPNode('const', 0, 0, random.uniform(0.1, 5.0))
         combine = '+' if '+' in set(binary_ops) else binary_ops[0]
         child.nodes[s5 - nf] = CGPNode(combine, cur_out, s3)
@@ -10493,8 +10572,8 @@ def macro_inject_subtree(cgp_eq, n_features, feature_names):
         # (x_i op c) op2 x_j — e.g. (x1 + 3) * x2, (x1 / 2) + x2
         s1, s2, s3, s4 = free_slots[:4]
         fi, fj = _pick_feat(), _pick_feat(prefer_unused=False)
-        op1 = random.choice(binary_ops)
-        op2 = random.choice(binary_ops)
+        op1 = _pick_op(binary_ops)
+        op2 = _pick_op(binary_ops)
         child.nodes[s1 - nf] = CGPNode('const', 0, 0, random.gauss(0, 3.0))
         child.nodes[s2 - nf] = CGPNode(op1, fi, s1)
         child.nodes[s3 - nf] = CGPNode(op2, s2, fj)
@@ -10553,11 +10632,14 @@ def _create_offspring(action, parent, population, n_features, feat_names,
         parent2    = tournament_select(population, k=tournament_k)
         child_tree = crossover(parent.tree, parent2.tree)
         if not _is_semantically_novel(child_tree, parent.tree, parent2.tree, X):
+            # Crossover collapsed back into a copy of one parent — apply a
+            # disruptive mutation so we don't waste an evaluation on a clone.
             child_tree = mutate(child_tree, n_features, feat_names,
                                 mut_rate=max(2, eff_rate), temperature=sa_temp)
-        else:
-            child_tree = mutate(child_tree, n_features, feat_names,
-                                mut_rate=max(1, eff_rate // 2), temperature=sa_temp)
+        # else: novel crossover child — keep it intact.  A post-mutation pass
+        # here re-randomizes the recombination we just produced (especially
+        # because `mutate`'s 'operator' weight is 2.0 and frequently flips
+        # whole node ops), undoing the structural blend.
         p2_sigma    = getattr(parent2, 'sigma', float(CGP_MUT_RATE))
         child_sigma = float(np.clip(
             (parent_sigma + p2_sigma) / 2.0 * np.exp(random.gauss(0, SIGMA_TAU * 0.5)),
@@ -10595,7 +10677,8 @@ def _create_offspring(action, parent, population, n_features, feat_names,
         child_tree = macro_nest_compound(parent.tree, n_features, feat_names,
                                           op_affinity=op_affinity)
     elif action == 'inject':
-        child_tree = macro_inject_subtree(parent.tree, n_features, feat_names)
+        child_tree = macro_inject_subtree(parent.tree, n_features, feat_names,
+                                          op_affinity=op_affinity)
     else:  # mutate
         child_tree = mutate(parent.tree, n_features, feat_names,
                             mut_rate=eff_rate, temperature=sa_temp,
@@ -10943,7 +11026,14 @@ def evolve_island_chunk(args):
 
         child       = Individual(child_tree)
         child.sigma = child_sigma
-        child.age   = int(parent.age * 0.5)
+        # Children start at age 0.  Previous code used `int(parent.age * 0.5)`
+        # which let lineage age accumulate monotonically (every gen +1, every
+        # birth halves but adds a fresh age accumulation).  The death
+        # tournament's tiebreak `x.fitness + x.age * 0.01` then preferentially
+        # purged old lineages even when they held the only useful structure
+        # in the population.  Aligning with AFPO's age=0 invariant fixes the
+        # leak; the lexicase / crowding-distance pressures still apply.
+        child.age   = 0
         # Inherit boost stages from parent only when the child's tree is
         # structurally identical to the parent's.  Boost corrections are
         # trained against the parent's predictions; a structurally different
@@ -11068,12 +11158,17 @@ def evolve_island_chunk(args):
         # This prevents premature convergence by allowing occasional uphill
         # moves, exactly as PySR's annealing=True does.
         delta_fit = child.fitness - victim.fitness
-        # Tracker reward = "operator produced a genuine improvement".  A
-        # SA-accepted uphill move is good for diversity but does not mean
-        # the operator was effective at lowering loss; counting it as a
-        # success previously biased weights toward operators that simply
-        # produced offspring rather than ones that actually improved fit.
-        op_improved = (delta_fit < 0)
+        # Tracker reward = "operator produced a genuine improvement over the
+        # PARENT we sampled".  Comparing to `victim.fitness` (as before) reads
+        # well only when the death-tournament victim is the population's
+        # worst, but the death sample is random — a child that beats a poor
+        # victim looks "successful" even if it lost ground vs the parent it
+        # was derived from.  AFPO already uses parent comparison; align the
+        # island worker so adaptive-operator weights converge to the same
+        # signal in both models.
+        op_improved = (np.isfinite(child.fitness)
+                       and np.isfinite(parent.fitness)
+                       and child.fitness < parent.fitness)
         if delta_fit < 0:
             # Child is strictly better — always accept
             island_pop.remove(victim)
@@ -11260,13 +11355,19 @@ def _trim_to_pareto_front_3obj(population, target_size):
             for k in range(1, len(order) - 1):
                 cd[order[k]] += (vals[order[k+1]] - vals[order[k-1]]) / span
 
-        # Sort by crowding distance descending, keep top target_size
-        ranked = sorted(range(len(survivors)), key=lambda i: cd[i], reverse=True)
-        keep_indices = set(ranked[:target_size])
-        # Ensure champion is always kept
-        champ_idx = next(i for i, ind in enumerate(survivors) if ind is champion)
-        keep_indices.add(champ_idx)
-        survivors = [survivors[i] for i in sorted(keep_indices)][:target_size]
+        # Sort by crowding distance descending, keep top target_size.
+        # Champion is *always* included.  The previous implementation built a
+        # `set` of top-target_size indices, then `add()`-ed the champion, then
+        # sliced `[:target_size]` of the sorted union — which silently dropped
+        # the champion when its survivor-index happened to be the largest.
+        # We now always allocate the champion's slot first and fill the
+        # remaining target_size-1 slots from the CD-ranked list (excluding the
+        # champion to avoid duplicate keeping).
+        champ_idx  = next(i for i, ind in enumerate(survivors) if ind is champion)
+        ranked     = sorted(range(len(survivors)), key=lambda i: cd[i], reverse=True)
+        keep_order = [champ_idx] + [i for i in ranked if i != champ_idx]
+        keep_idx   = keep_order[:max(1, target_size)]
+        survivors  = [survivors[i] for i in keep_idx]
 
     return survivors
 
@@ -11902,16 +12003,23 @@ def _meta_extinction(islands_pop, hofs, X, Y, out_types,
                 s.fitness = 1e10
 
         # 4. Refill each island with elite + scored seeds + random_cgp pad.
+        # Use random.sample (not shuffle+prefix) per island so each island
+        # gets a different subset of the seed pool.  Prior implementation
+        # shuffled the seed list in place but always took its first
+        # `target_n - len(elite)` items — meaning seeds at the tail of the
+        # shuffle never made it into ANY island, and there was no diversity
+        # in WHICH seeds each island received.
         for isl in islands_pop:
             if o_idx >= len(isl):
                 continue
             target_n = len(isl[o_idx]) or 50
             new_pop  = [copy.deepcopy(e) for e in elite]
-            random.shuffle(seeds)
-            for s in seeds:
-                if len(new_pop) >= target_n:
-                    break
-                new_pop.append(copy.deepcopy(s))
+            slots    = max(0, target_n - len(new_pop))
+            if seeds and slots > 0:
+                pick_n   = min(slots, len(seeds))
+                picked   = random.sample(seeds, pick_n)
+                for s in picked:
+                    new_pop.append(copy.deepcopy(s))
             while len(new_pop) < target_n:
                 new_pop.append(Individual(random_cgp(
                     n_features, CGP_NODES, feat_names)))
@@ -12300,22 +12408,41 @@ class BayesianCGPOptimizer:
 
     def _transform_fitness(self, loss):
         """Transform loss to a GP-friendly target: -log(loss + eps).
-        Higher = better, roughly Gaussian for well-behaved losses."""
+        Higher = better, roughly Gaussian for well-behaved losses.
+
+        NaN-safety: ``np.clip(np.nan, …)`` returns NaN, which would otherwise
+        end up in ``y_observed`` and break GP fitting (the bare ``except`` in
+        ``fit_surrogate`` would silently set ``gp_fitted=False``, leaving
+        ``score_candidates`` to return random scores forever).  Map NaN /
+        +Inf / -Inf to a very-bad-but-finite value before the clip.
+        """
+        loss = float(np.nan_to_num(loss, nan=1e10, posinf=1e10, neginf=1e10))
         return -np.log(np.clip(loss, 1e-15, 1e10))
 
     def add_observation(self, individual, cgp_eq):
-        """Record an evaluated individual."""
+        """Record an evaluated individual.
+
+        When the buffer exceeds ``self.max_points`` we evict the WORST
+        observations (lowest transformed fitness) instead of the oldest.
+        FIFO eviction was kicking the best Phase-1 seeds out within ~7
+        BO iterations because each iter inserts ~60 noisy mutation
+        observations.  Worst-first preserves the high-quality signal
+        for the GP.
+        """
         vec = cgp_to_vector(cgp_eq, self.max_nodes, X_probe=self.X_probe)
         y   = self._transform_fitness(individual.loss)
         self.X_observed.append(vec)
         self.y_observed.append(y)
         self.individuals.append(individual)
 
-        # Cap the training set size (FIFO eviction of oldest)
         if len(self.X_observed) > self.max_points:
-            self.X_observed = self.X_observed[-self.max_points:]
-            self.y_observed = self.y_observed[-self.max_points:]
-            self.individuals = self.individuals[-self.max_points:]
+            # Keep the top-`max_points` by transformed fitness; among ties
+            # keep the most recent (np.argsort is stable).
+            order = np.argsort(self.y_observed)
+            keep_idx = sorted(order[-self.max_points:].tolist())
+            self.X_observed  = [self.X_observed[i]  for i in keep_idx]
+            self.y_observed  = [self.y_observed[i]  for i in keep_idx]
+            self.individuals = [self.individuals[i] for i in keep_idx]
 
     def fit_surrogate(self):
         """(Re)fit the GP surrogate on current observations."""
@@ -12414,14 +12541,23 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
         X_init, Y_init = X, Y
 
     for o_idx in range(n_outputs):
-        # Use seeded individuals + random ones
-        seeds = generate_seeds_v5(n_features, feat_names)
+        # Use seeded individuals + random ones.  Importance-biased seeds
+        # (OLS / log-OLS / rational / reused-input / bit-arithmetic) carry
+        # the structural priors the recent commits added; they MUST not be
+        # silently truncated when generate_seeds_v5 already emits more
+        # individuals than BAYESIAN_INITIAL_SAMPLES.
+        v5_seeds = generate_seeds_v5(n_features, feat_names)
         try:
             imp_seeds = generate_importance_biased_seeds(
                 n_features, feat_names, X_init, Y_init[:, o_idx])
-            seeds.extend(imp_seeds)
         except Exception:
-            pass
+            imp_seeds = []
+        # Importance-biased seeds get FIRST claim on the budget; v5 fills
+        # the rest.  Both pools are individually shuffled so we don't
+        # systematically take, e.g., only the linear OLS variants.
+        random.shuffle(v5_seeds)
+        random.shuffle(imp_seeds)
+        seeds = list(imp_seeds) + list(v5_seeds)
         while len(seeds) < BAYESIAN_INITIAL_SAMPLES:
             seeds.append(Individual(random_cgp(n_features, CGP_NODES, feat_names)))
 
@@ -12435,7 +12571,14 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
         print(f"  Output {o_idx}: {len(seeds)} initial samples evaluated, "
               f"best loss = {min(ind.loss for ind in seeds):.5f}")
 
-    # Re-evaluate HoF on full data if we sub-sampled
+    # Re-evaluate HoF on full data if we sub-sampled, AND rebuild the GP
+    # observation buffer with the full-data losses.  The previous code
+    # only rescored the HoF; ``optimizers[o_idx]`` retained the
+    # subsample-fidelity losses (and subsample-fitted affine), so the
+    # GP's `best_f` reference and EI computation drifted across phases —
+    # one observation per individual at three different fidelities
+    # (subsample seed, screen, mini-batch) ended up in the buffer for
+    # the remainder of the run.
     if N_train > _INIT_SUBSAMPLE_CAP:
         print("  Re-scoring Hall of Fame on full dataset…")
         for o_idx in range(n_outputs):
@@ -12443,6 +12586,17 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
                 ind.affine_fitted = False
                 ind.calculate_fitness(X, Y[:, o_idx], out_types[o_idx],
                                       target_grads=target_grads_list[o_idx])
+        # Replace each optimizer's buffer with the full-data HoF entries
+        # so subsequent iterations train the GP on a single fidelity
+        # surface.  Worst-first eviction (BO-3) will fold in Phase 2's
+        # mini-batch observations as they accumulate.
+        for o_idx in range(n_outputs):
+            opt = optimizers[o_idx]
+            opt.X_observed.clear()
+            opt.y_observed.clear()
+            opt.individuals.clear()
+            for ind in hofs[o_idx].best_by_complexity.values():
+                opt.add_observation(ind, ind.tree)
     _INIT_PHASE = False
 
     # Fit initial surrogates
@@ -12483,10 +12637,26 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
                     continue
                 opt = optimizers[o_idx]
 
-                # ── Generate candidates by mutating top individuals ────────
-                top_inds = opt.get_best_individuals(n=10)
+                # ── Source top_inds from BOTH HoF and the buffer ───────────
+                # The observation buffer is FIFO/worst-first managed and may
+                # be missing the global HoF best after a few iterations of
+                # eviction; using the buffer alone causes mutation parents
+                # to drift away from the actual best-known structure.
+                hof_inds_for_top = list(hofs[o_idx].best_by_complexity.values())
+                buf_top          = opt.get_best_individuals(n=10)
+                top_inds = (hof_inds_for_top + buf_top)[:10]
                 if not top_inds:
                     top_inds = [Individual(random_cgp(n_features, CGP_NODES, feat_names))]
+
+                # ── Operator-affinity bias from current HoF ─────────────────
+                # Compute once per output per iteration so all mutation /
+                # macro candidates share the same prior.  Costs O(|HoF|) and
+                # was simply absent from the BO path before.
+                try:
+                    _bo_op_affinity = compute_hof_operator_affinity([hofs[o_idx]])
+                except Exception:
+                    _bo_op_affinity = None
+                _bo_op_affinity = _bo_op_affinity or None
 
                 candidate_trees = []
                 # 60% from mutating top individuals (exploitation)
@@ -12496,7 +12666,8 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
                     # Vary mutation rate: mostly light, occasionally heavy
                     rate = random.choice([1, 1, 2, 2, 3, 5])
                     child_tree = mutate(parent.tree, n_features, feat_names,
-                                        mut_rate=rate, temperature=0.0)
+                                        mut_rate=rate, temperature=0.0,
+                                        op_affinity=_bo_op_affinity)
                     candidate_trees.append(child_tree)
 
                 # 15% from crossover of top individuals
@@ -12506,7 +12677,8 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
                         p1, p2 = random.sample(top_inds, 2)
                         child_tree = crossover(p1.tree, p2.tree)
                         child_tree = mutate(child_tree, n_features, feat_names,
-                                            mut_rate=1)
+                                            mut_rate=1,
+                                            op_affinity=_bo_op_affinity)
                     else:
                         child_tree = random_cgp(n_features, CGP_NODES, feat_names)
                     candidate_trees.append(child_tree)
@@ -12515,12 +12687,14 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
                 n_macro = int(BAYESIAN_N_CANDIDATES * 0.10)
                 for _ in range(n_macro):
                     parent = random.choice(top_inds)
-                    _macro_choices = ['grow', 'prune', 'graft', 'rational', 'trig']
+                    _macro_choices = ['grow', 'prune', 'graft', 'rational',
+                                      'trig', 'inject', 'nest']
                     if IF_ELSE_ENABLED:
                         _macro_choices.append('piecewise')
                     macro_choice = random.choice(_macro_choices)
                     if macro_choice == 'grow':
-                        ct = macro_grow(parent.tree, n_features, feat_names)
+                        ct = macro_grow(parent.tree, n_features, feat_names,
+                                        op_affinity=_bo_op_affinity)
                     elif macro_choice == 'prune':
                         ct = macro_prune(parent.tree, n_features)
                     elif macro_choice == 'graft':
@@ -12528,9 +12702,21 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
                     elif macro_choice == 'rational':
                         ct = macro_rational_grow(parent.tree, n_features)
                     elif macro_choice == 'piecewise':
-                        # Bayesian path lacks a neat X handle, so pass None and
-                        # fall back to Gaussian thresholds (still functional).
-                        ct = macro_piecewise(parent.tree, n_features, feat_names)
+                        # Pass X so threshold seeds are quantiles of the
+                        # actual data distribution (commit 9d4c820 fix).
+                        # Without X, thresholds default to Gaussian draws,
+                        # which is the pre-fix behaviour for diode/ReLU-style
+                        # targets and a known weakness.
+                        ct = macro_piecewise(parent.tree, n_features, feat_names,
+                                             X=X)
+                    elif macro_choice == 'inject':
+                        ct = macro_inject_subtree(parent.tree, n_features,
+                                                  feat_names,
+                                                  op_affinity=_bo_op_affinity)
+                    elif macro_choice == 'nest':
+                        ct = macro_nest_compound(parent.tree, n_features,
+                                                 feat_names,
+                                                 op_affinity=_bo_op_affinity)
                     else:
                         ct = macro_trig_identity(parent.tree, n_features)
                     candidate_trees.append(ct)
@@ -12558,6 +12744,32 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
                     candidate_trees.append(
                         random_cgp(n_features, CGP_NODES, feat_names))
 
+                # ── Residual-aware reseed (every 25 iters, regression only) ──
+                # The evolutionary path injects residual-targeted seeds on
+                # extinction (lines 11126/11513/11727 etc.) so it can escape
+                # a seed basin once one is identified.  BO had no analogous
+                # mechanism — once stuck in a basin, EI kept proposing
+                # mutations of the same wrong template forever.  Re-target
+                # the residual seed generator at the current HoF best every
+                # ``_BO_RESEED_FREQ`` iterations and add a handful of fresh
+                # candidates that specifically attack the HoF best's error
+                # pattern.  Skip for classification (no decomposable
+                # residual) and joint-softmax outputs.
+                _BO_RESEED_FREQ = 25
+                _bo_is_cls = (out_types[o_idx] == 6)
+                if (iteration % _BO_RESEED_FREQ == 0 and not _bo_is_cls):
+                    _bo_hof_best = hofs[o_idx].get_best_overall()
+                    if _bo_hof_best is not None:
+                        try:
+                            _bo_res_seeds = generate_residual_aware_seeds(
+                                n_features, feat_names, X, Y[:, o_idx],
+                                _bo_hof_best,
+                                max_seeds=max(5, BAYESIAN_BATCH_SIZE // 2))
+                            for _rs in _bo_res_seeds:
+                                candidate_trees.append(_rs.tree)
+                        except Exception:
+                            pass
+
                 # ── Score candidates with Expected Improvement ──────────────
                 ei_scores = opt.score_candidates(candidate_trees)
 
@@ -12577,7 +12789,14 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
                 else:
                     X_screen, Y_screen = X_b, Y_b
 
-                # Stage 1: cheap screening
+                # Stage 1: cheap screening — evaluate each candidate on a
+                # subsample to rank them, but DON'T add to the GP yet.
+                # Adding screen-fidelity observations and then re-adding
+                # full-fidelity observations for the survivors creates
+                # duplicate (x, y) pairs in the GP buffer where x is the
+                # same vector but y differs (small-sample noise).  The
+                # WhiteKernel fits that as observation noise and corrupts
+                # the surrogate's hyperparameters.
                 screen_results = []
                 for ci in screen_indices:
                     child = Individual(candidate_trees[ci])
@@ -12585,18 +12804,31 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
                         X_screen, Y_screen[:, o_idx], out_types[o_idx],
                         target_grads=target_grads_list[o_idx])
                     screen_results.append((ci, child))
-                    # Even screening evaluations are useful data for the GP surrogate
-                    opt.add_observation(child, child.tree)
 
-                # Stage 2: pick best B from screening, evaluate on full data
+                # Stage 2: pick best B from screening, evaluate on full data.
                 screen_results.sort(key=lambda x: x[1].loss)
-                top_indices = [ci for ci, _ in screen_results[:BAYESIAN_BATCH_SIZE]]
+                top_indices = set(ci for ci, _ in screen_results[:BAYESIAN_BATCH_SIZE])
+
+                # Add screen-fidelity observations for the candidates that
+                # WON'T be promoted to Stage 2 (otherwise we'd lose useful
+                # signal from the cheap evals).  Survivors are added below
+                # with their full-fidelity loss only.
+                for ci, child_screen in screen_results:
+                    if ci in top_indices:
+                        continue
+                    opt.add_observation(child_screen, child_screen.tree)
 
                 n_improved = 0
                 for ci in top_indices:
                     child = Individual(candidate_trees[ci])
+                    # Evaluate Stage 2 on the FULL training set, not the
+                    # iteration's mini-batch.  HoF admittance keys off
+                    # ``child.loss``; using the noisier mini-batch loss let
+                    # mini-batch-overfit candidates poison the HoF.  The
+                    # comment block above ("Stage 2: re-evaluate the best B
+                    # on full data") documents this intent.
                     child.calculate_fitness(
-                        X_b, Y_b[:, o_idx], out_types[o_idx],
+                        X, Y[:, o_idx], out_types[o_idx],
                         target_grads=target_grads_list[o_idx])
                     total_evals += 1
 
@@ -14849,6 +15081,22 @@ def train_mode():
                                 elite.age = 0   # reset age so AFPO doesn't kill it
                                 pop.append(elite)
 
+                    # ── Stagnation-aware chunk size ──────────────────────
+                    # When the worst-stagnated output is more than half-way to
+                    # extinction patience, halve the chunk length so islands
+                    # exchange migrants twice as often.  This pulls fresh
+                    # phenotypes between populations during long plateaus
+                    # without changing migration code itself.
+                    _max_stag = 0
+                    for _ic in stagnation_counters:
+                        for _v in _ic:
+                            if _v > _max_stag:
+                                _max_stag = _v
+                    if _max_stag > EXTINCTION_PATIENCE // 2:
+                        chunk_freq = max(10, MIGRATION_FREQ // 2)
+                    else:
+                        chunk_freq = MIGRATION_FREQ
+
                     futures = []
                     for i in range(n_outputs):
                         if i in perfect_outputs:
@@ -14867,22 +15115,7 @@ def train_mode():
                         else:
                             col_bg, local_k, Y_group_i = None, None, None
 
-                        # ── Stagnation-aware chunk size ──────────────────────
-                    # When the worst-stagnated output is more than half-way to
-                    # extinction patience, halve the chunk length so islands
-                    # exchange migrants twice as often.  This pulls fresh
-                    # phenotypes between populations during long plateaus
-                    # without changing migration code itself.
-                    _max_stag = 0
-                    for _ic in stagnation_counters:
-                        for _v in _ic:
-                            if _v > _max_stag:
-                                _max_stag = _v
-                    if _max_stag > EXTINCTION_PATIENCE // 2:
-                        chunk_freq = max(10, MIGRATION_FREQ // 2)
-                    else:
-                        chunk_freq = MIGRATION_FREQ
-                    for island_idx in range(NUM_ISLANDS):
+                        for island_idx in range(NUM_ISLANDS):
                             args = (
                                 islands_pop[island_idx][i],
                                 X_b, Y_b[:, i], out_types[i],
