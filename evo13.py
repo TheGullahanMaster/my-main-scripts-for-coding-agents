@@ -1835,10 +1835,23 @@ def apply_simplification_pass(islands_pop, hofs, X, Y, out_types, target_grads_l
         for o_idx, pop in enumerate(island_pops):
             for ind in pop:
                 old_c = ind.complexity
+                old_active = set(ind.tree.active_nodes) if ind.tree is not None else set()
                 ind.tree = simplify_cgp_tree(ind.tree)
                 ind.tree.update_active_nodes()
+                # When simplification materially changes the active-node set,
+                # the locked affine was fitted to a different tree — refit it.
+                # 25% Jaccard distance is the threshold: smaller tweaks (e.g.,
+                # constant folding) leave the affine valid; large rewrites
+                # (subtree elimination, identity collapses) do not.
+                _new_active = set(ind.tree.active_nodes)
+                _union = old_active | _new_active
+                _diff_frac = (len(_union - (old_active & _new_active))
+                              / max(1, len(_union)))
+                _refit = _diff_frac >= 0.25
+                if _refit:
+                    ind.affine_fitted = False
                 ind.calculate_fitness(X, Y[:, o_idx], out_types[o_idx],
-                                      update_affine=False,
+                                      update_affine=_refit,
                                       target_grads=(target_grads_list[o_idx]
                                                     if target_grads_list else None))
                 total_before += old_c
@@ -1850,10 +1863,18 @@ def apply_simplification_pass(islands_pop, hofs, X, Y, out_types, target_grads_l
         for c_key in list(hof.best_by_complexity.keys()):
             ind = hof.best_by_complexity[c_key]
             old_c = ind.complexity
+            old_active = set(ind.tree.active_nodes) if ind.tree is not None else set()
             ind.tree = simplify_cgp_tree(ind.tree)
             ind.tree.update_active_nodes()
+            _new_active = set(ind.tree.active_nodes)
+            _union = old_active | _new_active
+            _diff_frac = (len(_union - (old_active & _new_active))
+                          / max(1, len(_union)))
+            _refit = _diff_frac >= 0.25
+            if _refit:
+                ind.affine_fitted = False
             ind.calculate_fitness(X, Y[:, o_idx], out_types[o_idx],
-                                  update_affine=False,
+                                  update_affine=_refit,
                                   target_grads=(target_grads_list[o_idx]
                                                 if target_grads_list else None))
             total_before += old_c
@@ -10617,15 +10638,17 @@ def evolve_island_chunk(args):
     # ── IMPROVEMENT: Adaptive reproductive operator tracker ────────────────
     # Tracks which operators produce accepted children; adapts weights over time.
     _repro_ops_base = ['mutate', 'crossover', 'semantic_xover', 'grow', 'prune', 'graft', 'optimize', 'boost', 'do_nothing', 'div', 'trig', 'ablate', 'piecewise', 'nest', 'inject']
-    # piecewise is bumped 0.6 → 1.5 when IF_ELSE_ENABLED so threshold/conditional
-    # structures actually get sampled regularly.  Without this, piecewise was
-    # only 4% of actions and the search defaulted to smooth approximations even
-    # when the exact piecewise answer existed in the search space.
-    _repro_weights_base = [3.5, 1.0, 0.8, 0.7, 0.5, 0.7, 1.5, 0.6, 0.3, 0.5, 0.8, 0.3, 1.5 if IF_ELSE_ENABLED else 0.0, 1.2, 1.0]
-    #                      ^^^                  ^^^       ^^^                 ^^^                                               ^^^  ^^^
-    #                  mutate↓  grow↑  graft↑  do_nothing↓                                                               nest  inject
-    # Net effect: ~25% of actions are now structural exploration (grow+graft+nest+inject+trig+div)
-    # vs ~10% before.  mutate still dominates but its internal weights are rebalanced too.
+    # Convergence-tuning rebalance: previously `mutate` dominated at 3.5 and
+    # the structural operators only kicked in heavily after stagnation
+    # (`stag_frac > 0.3`, ≈45+ stalled gens).  On problems where no built-in
+    # seed already solves the target, that meant the search spent dozens of
+    # generations polishing a wrong basin before exploring structurally.
+    # Now `mutate` is 2.0 and crossover / semantic_xover / grow / graft /
+    # nest / inject are bumped so structural exploration is comparable to
+    # mutate from generation 0.  The stagnation-aware boost still applies on
+    # top of these new defaults; we just stop relying on it as the only
+    # source of structural search.  `piecewise` keeps its conditional bump.
+    _repro_weights_base = [2.0, 1.6, 1.4, 1.0, 0.6, 1.0, 1.2, 0.5, 0.2, 0.5, 0.8, 0.3, 1.5 if IF_ELSE_ENABLED else 0.0, 1.4, 1.4]
     _mut_tracker = AdaptiveMutationTracker(_repro_ops_base, _repro_weights_base, alpha=0.07)
 
     # ── IMPROVEMENT: Operator affinity (updated every 200 gens) ───────────
@@ -10841,28 +10864,28 @@ def evolve_island_chunk(args):
         # This prevents premature convergence by allowing occasional uphill
         # moves, exactly as PySR's annealing=True does.
         delta_fit = child.fitness - victim.fitness
+        # Tracker reward = "operator produced a genuine improvement".  A
+        # SA-accepted uphill move is good for diversity but does not mean
+        # the operator was effective at lowering loss; counting it as a
+        # success previously biased weights toward operators that simply
+        # produced offspring rather than ones that actually improved fit.
+        op_improved = (delta_fit < 0)
         if delta_fit < 0:
             # Child is strictly better — always accept
             island_pop.remove(victim)
             island_pop.append(child)
-            _mut_tracker.record(action, success=True)
         elif SA_ENABLED and sa_temp > 1e-10:
             import math as _math
             if random.random() < _math.exp(-delta_fit / sa_temp):
                 island_pop.remove(victim)
                 island_pop.append(child)
-                _mut_tracker.record(action, success=True)
-            else:
-                _mut_tracker.record(action, success=False)
             # else: child rejected, victim stays (population unchanged)
         else:
             # SA disabled or temperature is negligible — strict greedy acceptance
             if delta_fit <= 0:
                 island_pop.remove(victim)
                 island_pop.append(child)
-                _mut_tracker.record(action, success=True)
-            else:
-                _mut_tracker.record(action, success=False)
+        _mut_tracker.record(action, success=op_improved)
 
         # 6. HoF update & stagnation tracking
         child_freq_adj = freq_adj.get(int(round(child.complexity)), 0.0)
@@ -11213,8 +11236,10 @@ def evolve_afpo(population, X, y_target, type_code,
     # ── Adaptive reproductive operator tracker (same as island model) ─────
     _repro_ops_base = ['mutate', 'crossover', 'semantic_xover', 'grow', 'prune', 'graft',
                        'optimize', 'boost', 'do_nothing', 'div', 'trig', 'ablate', 'piecewise', 'nest', 'inject']
-    # See evolve_island_chunk for rationale on the piecewise weight bump.
-    _repro_weights_base = [3.5, 1.0, 0.8, 0.7, 0.5, 0.7, 1.5, 0.6, 0.3, 0.5, 0.8, 0.3, 1.5 if IF_ELSE_ENABLED else 0.0, 1.2, 1.0]
+    # Weights match evolve_island_chunk's convergence-tuning rebalance — see
+    # the comment there for why mutate dropped from 3.5 to 2.0 and structural
+    # ops are bumped.
+    _repro_weights_base = [2.0, 1.6, 1.4, 1.0, 0.6, 1.0, 1.2, 0.5, 0.2, 0.5, 0.8, 0.3, 1.5 if IF_ELSE_ENABLED else 0.0, 1.4, 1.4]
     _mut_tracker = AdaptiveMutationTracker(_repro_ops_base, _repro_weights_base, alpha=0.07)
 
     local_stag = stag_counter
@@ -11346,8 +11371,13 @@ def evolve_afpo(population, X, y_target, type_code,
 
         population.append(child)
         population = _trim_to_pareto_front_3obj(population, target_size)
-        # Track whether the child survived the Pareto trim
-        _mut_tracker.record(action, success=(child in population))
+        # Reward operators that genuinely improved fitness over the parent.
+        # Pareto survival is a weaker signal — a child may survive the
+        # 3-objective trim purely by being young or simple — so it biased
+        # the tracker toward operators that produced offspring rather than
+        # ones that actually lowered loss.
+        _mut_tracker.record(
+            action, success=(child.fitness < parent.fitness))
 
         # ── Complexity budget cap ─────────────────────────────────────────────
         # Prevent unbounded memory growth: if total active-node count across
@@ -12279,11 +12309,19 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
                 for o_idx, hof in enumerate(hofs):
                     for c_key in list(hof.best_by_complexity.keys()):
                         ind = hof.best_by_complexity[c_key]
+                        old_active = set(ind.tree.active_nodes) if ind.tree is not None else set()
                         ind.tree = simplify_cgp_tree(ind.tree)
                         ind.tree.update_active_nodes()
+                        _new_active = set(ind.tree.active_nodes)
+                        _union = old_active | _new_active
+                        _diff_frac = (len(_union - (old_active & _new_active))
+                                      / max(1, len(_union)))
+                        _refit = _diff_frac >= 0.25
+                        if _refit:
+                            ind.affine_fitted = False
                         ind.calculate_fitness(
                             X, Y[:, o_idx], out_types[o_idx],
-                            update_affine=False,
+                            update_affine=_refit,
                             target_grads=target_grads_list[o_idx])
                     # Rebuild HoF keyed by new complexity
                     new_dict = {}
