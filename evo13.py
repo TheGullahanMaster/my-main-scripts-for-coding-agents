@@ -12371,10 +12371,43 @@ def _expected_improvement(mu, sigma, best_f, xi=0.01):
 
     Returns EI values (higher = more promising).
     """
-    sigma = np.maximum(sigma, 1e-9)
-    z = (mu - best_f - xi) / sigma
-    ei = sigma * (z * _SCIPY_NORM.cdf(z) + _SCIPY_NORM.pdf(z))
-    return ei
+    mu = np.asarray(mu, dtype=np.float64)
+    sigma = np.asarray(sigma, dtype=np.float64)
+    best_f = float(np.nan_to_num(best_f, nan=-1e12, posinf=1e12, neginf=-1e12))
+    sigma = np.maximum(np.nan_to_num(sigma, nan=0.0, posinf=1e6, neginf=0.0), 1e-9)
+    improvement = np.nan_to_num(mu - best_f - xi, nan=-1e12, posinf=1e12, neginf=-1e12)
+    z = np.clip(improvement / sigma, -12.0, 12.0)
+    ei = improvement * _SCIPY_NORM.cdf(z) + sigma * _SCIPY_NORM.pdf(z)
+    return np.maximum(np.nan_to_num(ei, nan=0.0, posinf=1e12, neginf=0.0), 0.0)
+
+
+def _slice_optional_rows(arr, indices):
+    """Return ``arr[indices]`` when both are present, else ``arr``.
+
+    Bayesian CGP performs several subsampled evaluations outside the normal
+    ``batch_indices`` path.  Sobolev targets (and any future row-aligned
+    side-channel arrays) must be sliced to the same rows as ``X``/``y``;
+    otherwise gradient matching either crashes on shape mismatch or compares
+    each candidate against the wrong target gradients.
+    """
+    if arr is None or indices is None:
+        return arr
+    return arr[indices]
+
+
+def _bo_clone_for_buffer(individual):
+    """Snapshot an Individual before storing it in the BO observation buffer.
+
+    HoF constant optimisation mutates Individuals in place.  Storing the same
+    object by reference made historical observations drift away from their
+    encoded GP vectors (old X_observed + new tree/loss), which corrupted parent
+    selection and summary statistics.  A bounded BO buffer (<=500 by default)
+    can afford deep-copy snapshots.
+    """
+    try:
+        return copy.deepcopy(individual)
+    except Exception:
+        return individual
 
 
 class BayesianCGPOptimizer:
@@ -12438,7 +12471,7 @@ class BayesianCGPOptimizer:
         y   = self._transform_fitness(individual.loss)
         self.X_observed.append(vec)
         self.y_observed.append(y)
-        self.individuals.append(individual)
+        self.individuals.append(_bo_clone_for_buffer(individual))
 
         if len(self.X_observed) > self.max_points:
             # Keep the top-`max_points` by transformed fitness; among ties
@@ -12454,8 +12487,14 @@ class BayesianCGPOptimizer:
         if len(self.X_observed) < 10:
             self.gp_fitted = False
             return
-        X = np.array(self.X_observed)
-        y = np.array(self.y_observed)
+        X = np.asarray(self.X_observed, dtype=np.float64)
+        y = np.asarray(self.y_observed, dtype=np.float64)
+        finite = np.isfinite(y) & np.all(np.isfinite(X), axis=1)
+        if np.count_nonzero(finite) < 10:
+            self.gp_fitted = False
+            return
+        X = X[finite]
+        y = y[finite]
         try:
             self.gp.fit(X, y)
             self.gp_fitted = True
@@ -12469,18 +12508,21 @@ class BayesianCGPOptimizer:
         Returns EI values (higher = more promising) or random scores if
         GP is not fitted.
         """
+        if not candidate_trees:
+            return np.array([], dtype=np.float64)
         if not self.gp_fitted or len(self.X_observed) < 10:
             return np.random.rand(len(candidate_trees))
 
-        vecs = np.array([cgp_to_vector(t, self.max_nodes, X_probe=self.X_probe)
-                         for t in candidate_trees])
+        vecs = np.asarray([cgp_to_vector(t, self.max_nodes, X_probe=self.X_probe)
+                           for t in candidate_trees], dtype=np.float64)
         try:
             mu, sigma = self.gp.predict(vecs, return_std=True)
         except Exception:
             return np.random.rand(len(candidate_trees))
 
         best_f = max(self.y_observed)
-        return _expected_improvement(mu, sigma, best_f, self.xi)
+        scores = _expected_improvement(mu, sigma, best_f, self.xi)
+        return np.nan_to_num(scores, nan=0.0, posinf=1e12, neginf=0.0)
 
     def get_best_individuals(self, n=5):
         """Return the top-n individuals by loss (lowest loss first)."""
@@ -12568,8 +12610,10 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
 
         seeds = seeds[:BAYESIAN_INITIAL_SAMPLES]
         for ind in seeds:
-            ind.calculate_fitness(X_init, Y_init[:, o_idx], out_types[o_idx],
-                                  target_grads=target_grads_list[o_idx])
+            ind.calculate_fitness(
+                X_init, Y_init[:, o_idx], out_types[o_idx],
+                target_grads=_slice_optional_rows(target_grads_list[o_idx],
+                                                  init_idx if N_train > _INIT_SUBSAMPLE_CAP else None))
             hofs[o_idx].update(ind)
             optimizers[o_idx].add_observation(ind, ind.tree)
 
@@ -12646,8 +12690,9 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
     try:
         while True:
             iteration += 1
-            batch_idx = (np.random.choice(X.shape[0], BATCH_SIZE, replace=False)
-                         if BATCH_SIZE > 0 else None)
+            _batch_n = min(int(BATCH_SIZE), X.shape[0]) if BATCH_SIZE else 0
+            batch_idx = (np.random.choice(X.shape[0], _batch_n, replace=False)
+                         if _batch_n > 0 else None)
             X_b = X[batch_idx] if batch_idx is not None else X
             Y_b = Y[batch_idx] if batch_idx is not None else Y
 
@@ -12825,8 +12870,13 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
                     _screen_idx = np.random.choice(_N, _screen_rows, replace=False)
                     X_screen = X_b[_screen_idx]
                     Y_screen = Y_b[_screen_idx]
+                    _screen_global_idx = (batch_idx[_screen_idx]
+                                          if batch_idx is not None else _screen_idx)
                 else:
                     X_screen, Y_screen = X_b, Y_b
+                    _screen_global_idx = batch_idx
+                target_grads_screen = _slice_optional_rows(
+                    target_grads_list[o_idx], _screen_global_idx)
 
                 # Stage 1: cheap screening — evaluate each candidate on a
                 # subsample to rank them, but DON'T add to the GP yet.
@@ -12841,7 +12891,7 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
                     child = Individual(candidate_trees[ci])
                     child.calculate_fitness(
                         X_screen, Y_screen[:, o_idx], out_types[o_idx],
-                        target_grads=target_grads_list[o_idx])
+                        target_grads=target_grads_screen)
                     screen_results.append((ci, child))
                 # Each screening pass costs an evaluation too; the previous
                 # counter only tallied Stage 2 evaluations, so the printed
@@ -12853,15 +12903,12 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
                 screen_results.sort(key=lambda x: x[1].loss)
                 top_indices = set(ci for ci, _ in screen_results[:BAYESIAN_BATCH_SIZE])
 
-                # Add screen-fidelity observations for the candidates that
-                # WON'T be promoted to Stage 2 (otherwise we'd lose useful
-                # signal from the cheap evals).  Survivors are added below
-                # with their full-fidelity loss only.
-                for ci, child_screen in screen_results:
-                    if ci in top_indices:
-                        continue
-                    opt.add_observation(child_screen, child_screen.tree)
-
+                # Do NOT add screen-fidelity observations to the GP.  The
+                # surrogate models full-data loss; mixing row-subset losses into
+                # the same target space creates duplicate/noisy labels for the
+                # same genotype and makes the WhiteKernel explain fidelity noise
+                # instead of genotype uncertainty.  The screen pass is used only
+                # to choose which candidates deserve full evaluation.
                 for ci in top_indices:
                     child = Individual(candidate_trees[ci])
                     # Evaluate Stage 2 on the FULL training set, not the
