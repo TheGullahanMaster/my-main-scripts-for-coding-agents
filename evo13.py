@@ -14649,6 +14649,27 @@ def train_mode():
         else:
             print("  Please enter 1, 2, 3, 4, or 5.")
 
+    # ---- Population size (evolutionary modes only) ----
+    POP_SIZE_USER = 50
+    if EVOLUTION_MODEL != "bayesian_cgp":
+        print("\n" + "─" * 70)
+        print("POPULATION SIZE")
+        print("─" * 70)
+        print("  Number of individuals in each evolving population.")
+        print("  Island modes : individuals per island.")
+        print("  AFPO modes   : base size; the actual AFPO pool is 2× this value")
+        print("                 (Age Group Islands scales it by tier count).")
+        print("  Larger populations carry more diversity but are slower per gen.")
+        print("  Typical range: 30 (fast, small problems) – 200 (large, complex).")
+        print("─" * 70)
+        pop_in = input(f"Population size [default {POP_SIZE_USER}]: ").strip()
+        if pop_in:
+            try:
+                POP_SIZE_USER = max(5, int(pop_in))
+                print(f"  ✓  Population size set to {POP_SIZE_USER}.")
+            except ValueError:
+                print("  Invalid value; keeping default.")
+
     # ---- DS-Lexicase fraction ----
     print("\n" + "─" * 70)
     print("DOWN-SAMPLED LEXICASE (DS-Lexicase)")
@@ -14859,7 +14880,7 @@ def train_mode():
         print("  Done.\n")
 
     # ---- Shared population config ----
-    POP_SIZE            = 50
+    POP_SIZE            = POP_SIZE_USER
     MIGRATION_FREQ      = 50
     EXTINCTION_PATIENCE = 150
     feature_weights = np.ones(n_features)
