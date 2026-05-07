@@ -12292,6 +12292,12 @@ try:
 except ImportError:
     HAS_SKLEARN_GP = False
 
+# Hoist scipy.stats.norm out of ``_expected_improvement`` — that function is
+# called once per BO iteration on hundreds of candidate vectors, so the
+# repeated ``from scipy.stats import norm`` was paying a (small) import-cache
+# lookup tax inside the hot path.
+from scipy.stats import norm as _SCIPY_NORM
+
 
 def cgp_to_vector(cgp_eq, max_nodes, X_probe=None):
     """
@@ -12367,8 +12373,7 @@ def _expected_improvement(mu, sigma, best_f, xi=0.01):
     """
     sigma = np.maximum(sigma, 1e-9)
     z = (mu - best_f - xi) / sigma
-    from scipy.stats import norm
-    ei = sigma * (z * norm.cdf(z) + norm.pdf(z))
+    ei = sigma * (z * _SCIPY_NORM.cdf(z) + _SCIPY_NORM.pdf(z))
     return ei
 
 
@@ -12664,9 +12669,15 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
                 # be missing the global HoF best after a few iterations of
                 # eviction; using the buffer alone causes mutation parents
                 # to drift away from the actual best-known structure.
+                # Sort the union by loss before truncating; ``best_by_complexity``
+                # iterates in dict-insertion order and a HoF that fills early
+                # would otherwise push the buffer's best entries past the
+                # 10-slot cut-off purely by ordering accident.
                 hof_inds_for_top = list(hofs[o_idx].best_by_complexity.values())
                 buf_top          = opt.get_best_individuals(n=10)
-                top_inds = (hof_inds_for_top + buf_top)[:10]
+                combined         = hof_inds_for_top + buf_top
+                combined.sort(key=lambda x: x.loss)
+                top_inds = combined[:10]
                 if not top_inds:
                     top_inds = [Individual(random_cgp(n_features, CGP_NODES, feat_names))]
 
@@ -12745,6 +12756,11 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
 
                 # 10% from HoF elite crossover — recombine structural motifs
                 # from different complexity levels of the Hall of Fame.
+                # The post-recombination mutation must share the per-output
+                # ``op_affinity`` prior with the rest of the BO candidate
+                # generation; the BO-12 audit added it to the regular crossover
+                # branch but missed this path, so ~10% of candidates were
+                # being mutated with uniform operator weights.
                 n_hof_cross = int(BAYESIAN_N_CANDIDATES * 0.10)
                 hof_inds_bo = list(hofs[o_idx].best_by_complexity.values())
                 if len(hof_inds_bo) >= 2:
@@ -12752,7 +12768,8 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
                         p1, p2 = random.sample(hof_inds_bo, 2)
                         child_tree = crossover(p1.tree, p2.tree)
                         child_tree = mutate(child_tree, n_features, feat_names,
-                                            mut_rate=random.choice([1, 2]))
+                                            mut_rate=random.choice([1, 2]),
+                                            op_affinity=_bo_op_affinity)
                         candidate_trees.append(child_tree)
                 else:
                     # Not enough HoF entries; fill with random
@@ -12826,6 +12843,11 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
                         X_screen, Y_screen[:, o_idx], out_types[o_idx],
                         target_grads=target_grads_list[o_idx])
                     screen_results.append((ci, child))
+                # Each screening pass costs an evaluation too; the previous
+                # counter only tallied Stage 2 evaluations, so the printed
+                # ``total_evals`` underreported real cost by ~50% (Stage 1
+                # evaluates 2×BATCH_SIZE per output per iteration).
+                total_evals += len(screen_results)
 
                 # Stage 2: pick best B from screening, evaluate on full data.
                 screen_results.sort(key=lambda x: x[1].loss)
@@ -12870,17 +12892,42 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
                     opt.fit_surrogate()
 
                 # ── Light constant optimisation on HoF ──────────────────────
+                # ``optimize_constants`` mutates ``ind.tree`` in place and may
+                # land on parameters that score worse on the FULL training set
+                # than the locked-affine baseline (the optimiser tracks
+                # ``X_opt`` subsample loss + the snap stage uses an online
+                # affine refit, so the final full-data evaluation can regress).
+                # Without a revert path the HoF entry is silently degraded —
+                # the dict value is the same object we just made worse.
+                # Snapshot the relevant Individual state and restore on
+                # regression so const-opt is monotone for the HoF.
                 if iteration % BAYESIAN_CONST_OPT_FREQ == 0:
-                    for ind in hofs[o_idx].best_by_complexity.values():
-                        if get_constants_shared(ind.tree):
-                            old_loss = ind.loss
-                            ind.optimize_constants(
-                                X, Y[:, o_idx], out_types[o_idx],
-                                max_rows=min(500, X.shape[0]),
-                                n_restarts=2, max_iter=30,
-                                target_grads=target_grads_list[o_idx])
-                            if ind.loss < old_loss - 1e-8:
-                                opt.add_observation(ind, ind.tree)
+                    for ind in list(hofs[o_idx].best_by_complexity.values()):
+                        old_consts = get_constants_shared(ind.tree)
+                        if not old_consts:
+                            continue
+                        old_loss          = ind.loss
+                        old_r2            = ind.r2
+                        old_accuracy      = ind.accuracy
+                        old_affine_a      = ind.affine_a
+                        old_affine_b      = ind.affine_b
+                        old_affine_fitted = ind.affine_fitted
+                        ind.optimize_constants(
+                            X, Y[:, o_idx], out_types[o_idx],
+                            max_rows=min(500, X.shape[0]),
+                            n_restarts=2, max_iter=30,
+                            target_grads=target_grads_list[o_idx])
+                        if ind.loss < old_loss - 1e-8:
+                            opt.add_observation(ind, ind.tree)
+                        elif ind.loss > old_loss + 1e-8:
+                            # Const-opt regressed; revert the in-place mutation.
+                            set_constants_shared(ind.tree, list(old_consts))
+                            ind.affine_a       = old_affine_a
+                            ind.affine_b       = old_affine_b
+                            ind.affine_fitted  = old_affine_fitted
+                            ind.loss           = old_loss
+                            ind.r2             = old_r2
+                            ind.accuracy       = old_accuracy
 
             # ── Periodic status ─────────────────────────────────────────
             print(f"--- BO Iteration {iteration}  "
