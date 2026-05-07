@@ -12579,25 +12579,47 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
     # one observation per individual at three different fidelities
     # (subsample seed, screen, mini-batch) ended up in the buffer for
     # the remainder of the run.
+    #
+    # Clear ``_INIT_PHASE`` BEFORE re-evaluation so ``get_graph_modularity``
+    # actually runs.  The previous order left every re-scored HoF entry
+    # with ``modularity == 0``, which silently neutralised the
+    # ``MODULARITY_REWARD`` term in ``Individual.fitness`` for the
+    # remainder of the run and biased ``get_best_overall`` selection.
+    _INIT_PHASE = False
     if N_train > _INIT_SUBSAMPLE_CAP:
-        print("  Re-scoring Hall of Fame on full dataset…")
+        print("  Re-scoring Hall of Fame and GP buffer on full dataset…")
         for o_idx in range(n_outputs):
             for ind in hofs[o_idx].best_by_complexity.values():
                 ind.affine_fitted = False
                 ind.calculate_fitness(X, Y[:, o_idx], out_types[o_idx],
                                       target_grads=target_grads_list[o_idx])
-        # Replace each optimizer's buffer with the full-data HoF entries
-        # so subsequent iterations train the GP on a single fidelity
-        # surface.  Worst-first eviction (BO-3) will fold in Phase 2's
-        # mini-batch observations as they accumulate.
+            # Drop entries whose full-data loss now exceeds the HoF ceiling
+            # or that are cross-complexity Pareto-dominated.  Without this
+            # the buffer rebuild below would fold catastrophic-loss
+            # individuals back into the GP training set.
+            hofs[o_idx].sanitize()
+
+        # Rebuild each optimizer's buffer at full fidelity by re-evaluating
+        # EVERY Phase-1 individual on the full dataset.  The previous code
+        # only re-added HoF entries (typically 5–15 of the 100 Phase-1
+        # samples), which routinely dropped the buffer below the GP's
+        # 10-point fitting threshold and forced the first ~5 BO iterations
+        # to fall back to random scoring — defeating the purpose of the
+        # surrogate.  Re-evaluating the whole pool keeps the GP on a
+        # single fidelity surface (the comment-block intent) AND retains
+        # the high-loss observations that anchor the GP's uncertainty
+        # estimates away from explored-but-bad regions.
         for o_idx in range(n_outputs):
             opt = optimizers[o_idx]
+            old_individuals = list(opt.individuals)
             opt.X_observed.clear()
             opt.y_observed.clear()
             opt.individuals.clear()
-            for ind in hofs[o_idx].best_by_complexity.values():
+            for ind in old_individuals:
+                ind.affine_fitted = False
+                ind.calculate_fitness(X, Y[:, o_idx], out_types[o_idx],
+                                      target_grads=target_grads_list[o_idx])
                 opt.add_observation(ind, ind.tree)
-    _INIT_PHASE = False
 
     # Fit initial surrogates
     print("\nFitting initial GP surrogates…")
@@ -12818,7 +12840,6 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
                         continue
                     opt.add_observation(child_screen, child_screen.tree)
 
-                n_improved = 0
                 for ci in top_indices:
                     child = Individual(candidate_trees[ci])
                     # Evaluate Stage 2 on the FULL training set, not the
@@ -12833,7 +12854,6 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
                     total_evals += 1
 
                     if hofs[o_idx].update(child):
-                        n_improved += 1
                         is_cls = (out_types[o_idx] == 6)
                         metric = (f"Acc={getattr(child,'accuracy',0):.4f}"
                                   if is_cls
