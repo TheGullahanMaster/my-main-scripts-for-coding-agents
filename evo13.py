@@ -353,6 +353,10 @@ BAYESIAN_GP_REFIT_FREQ   = 5      # refit GP every N iterations
 BAYESIAN_EXPLORATION     = 0.01   # exploration–exploitation trade-off (xi for EI)
 BAYESIAN_MAX_GP_POINTS   = 500    # cap on GP training set (oldest evicted first)
 BAYESIAN_CONST_OPT_FREQ  = 10     # run light const-opt on HoF every N iterations
+BAYESIAN_VARIANT         = "regular" # bayesian variant
+
+QUALITY_DIVERSITY_ENABLED = False # QD algorithms
+
 
 
 # --- IMPORTS FOR SIMPLIFICATION ---
@@ -14436,7 +14440,8 @@ def train_mode():
     global AGE_GROUP_N_GROUPS, AGE_GROUP_ISLANDS_PER_GROUP, AGE_GROUP_GRAD_FREQ
     global BAYESIAN_INITIAL_SAMPLES, BAYESIAN_BATCH_SIZE, BAYESIAN_N_CANDIDATES
     global BAYESIAN_EXPLORATION, BAYESIAN_GP_REFIT_FREQ, BAYESIAN_MAX_GP_POINTS
-    global BAYESIAN_CONST_OPT_FREQ
+    global BAYESIAN_CONST_OPT_FREQ, BAYESIAN_VARIANT
+    global QUALITY_DIVERSITY_ENABLED
     global _INIT_PHASE
 
     # ---- Load CSV ----
@@ -14664,6 +14669,29 @@ def train_mode():
                 break
             EVOLUTION_MODEL = "bayesian_cgp"
             NUM_ISLANDS_GLOBAL = 1
+
+            print("\n  Bayesian Variants:")
+            print("    [1] Bayesian regular")
+            print("    [2] Bayesian with AFPO Generator")
+            print("    [3] Bayesian with Islands")
+            print("    [4] Bayesian with Islanded AFPO")
+            print("    [5] Bayesian with AFPO Islands")
+            print("    [6] Bayesian with Quality-Diversity (QD) algorithms")
+            b_var = input("  Choose variant [1]: ").strip()
+
+            if b_var == '2':
+                BAYESIAN_VARIANT = "afpo"
+            elif b_var == '3':
+                BAYESIAN_VARIANT = "islands"
+            elif b_var == '4':
+                BAYESIAN_VARIANT = "islanded_afpo"
+            elif b_var == '5':
+                BAYESIAN_VARIANT = "afpo_islands"
+            elif b_var == '6':
+                BAYESIAN_VARIANT = "qd"
+            else:
+                BAYESIAN_VARIANT = "regular"
+
             # Bayesian CGP hyperparameters
             init_in = input(f"  Initial random samples [default {BAYESIAN_INITIAL_SAMPLES}]: ").strip()
             if init_in:
@@ -14695,6 +14723,24 @@ def train_mode():
             break
         else:
             print("  Please enter 1, 2, 3, 4, or 5.")
+
+    # ---- Quality-Diversity algorithms ----
+    print("\n" + "─" * 70)
+    print("QUALITY-DIVERSITY (QD) ALGORITHMS")
+    print("─" * 70)
+    print("  When enabled, maintains an archive of high-performing individuals")
+    print("  spread across a behavioral descriptor space, optimizing for both")
+    print("  performance and diversity.")
+    print("─" * 70)
+    qd_in = input("Enable Quality-Diversity (QD) algorithms? [y/N]: ").strip().lower()
+    if qd_in.startswith('y'):
+        QUALITY_DIVERSITY_ENABLED = True
+        print("  ✓  Quality-Diversity algorithms ENABLED.")
+        if BAYESIAN_VARIANT != "qd":
+            pass # Keep user's bayesian variant if they set it. But if they enable QD generally it applies.
+    else:
+        QUALITY_DIVERSITY_ENABLED = False
+        print("  Quality-Diversity algorithms disabled.")
 
     # ---- Population size (evolutionary modes only) ----
     POP_SIZE_USER = 50
