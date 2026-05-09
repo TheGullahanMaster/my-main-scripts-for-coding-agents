@@ -3202,83 +3202,46 @@ class HallOfFame:
         """Calculate PySR's -d(log(loss)) / d(complexity) score for the Pareto front."""
         sorted_complexities = sorted(self.best_by_complexity.keys())
         scores = {}
+        last_loss = None
+        last_complexity = 0
         
-        for i, c in enumerate(sorted_complexities):
-            if i == 0:
-                scores[c] = 0.0
+        for c in sorted_complexities:
+            ind = self.best_by_complexity[c]
+            cur_loss = ind.loss
+            cur_complexity = ind.complexity
+
+            if last_loss is None:
+                cur_score = 0.0
             else:
-                prev_c = sorted_complexities[i - 1]
-                ind = self.best_by_complexity[c]
-                prev_ind = self.best_by_complexity[prev_c]
-                
-                delta_c = ind.complexity - prev_ind.complexity
-                
-                if delta_c > 0 and ind.loss < prev_ind.loss:
-                    # Clamp the loss to a tiny epsilon to prevent log(0) 
-                    # but still grant a massive score for perfect fits
-                    safe_loss = max(ind.loss, 1e-15)
-                    safe_prev = max(prev_ind.loss, 1e-15)
-                    score = -np.log(safe_loss / safe_prev) / delta_c
+                if cur_loss > 0.0:
+                    delta_c = cur_complexity - last_complexity
+                    if delta_c > 0:
+                        safe_cur = max(cur_loss, 1e-15)
+                        safe_last = max(last_loss, 1e-15)
+                        cur_score = -np.log(safe_cur / safe_last) / delta_c
+                    else:
+                        cur_score = 0.0
                 else:
-                    score = 0.0
-                scores[c] = score
+                    cur_score = np.inf
+
+            scores[c] = cur_score
+            last_loss = cur_loss
+            last_complexity = cur_complexity
+
         return scores
     def get_best_overall(self):
         if not self.best_by_complexity: return None
-
-        # 1. THE ABSOLUTE OVERRIDE
-        # If any model has functionally zero loss, it is a perfect solution.
-        # Ignore PySR derivatives and just return the simplest perfect model.
-        perfect_models = [ind for ind in self.best_by_complexity.values() if ind.loss < 1e-5]
-        if perfect_models:
-            return min(perfect_models, key=lambda x: x.complexity)
-
-        # 2. Normal PySR scoring for typical (non-perfect) frontiers
         scores = self.compute_pysr_scores()
-        if not scores:
+
+        min_loss = min(ind.loss for ind in self.best_by_complexity.values())
+        threshold = 1.5 * min_loss
+
+        valid_complexities = [c for c, ind in self.best_by_complexity.items() if ind.loss <= threshold]
+        if not valid_complexities:
             return min(self.best_by_complexity.values(), key=lambda x: x.loss)
 
-        best_c = max(scores, key=scores.get)
-
-        # Fallback to absolute lowest loss if no meaningful scores exist
-        if scores[best_c] == 0.0:
-             return min(self.best_by_complexity.values(), key=lambda x: x.loss)
-
-        score_pick = self.best_by_complexity[best_c]
-
-        # 3. R²-AWARE OVERRIDE
-        # The PySR score rewards *marginal* loss improvement per complexity unit.
-        # This can pick a simple but poorly-fitting model (e.g. R²=0.25) over a
-        # much better model (e.g. R²=0.96) just because the score derivative was
-        # higher at the simpler end.  Fix: if the best-R² model on the frontier
-        # has a substantially higher R² than the score-picked model, prefer it —
-        # but only when the R² gap is large enough to clearly indicate a better
-        # model, not just a marginal gain from over-fitting extra complexity.
-        all_inds = list(self.best_by_complexity.values())
-        # Use R² for regression; for classification this attribute is 0.0 so
-        # the override won't trigger (classification uses accuracy instead).
-        score_r2 = getattr(score_pick, 'r2', 0.0)
-
-        # Find the model with the best R² on the frontier
-        best_r2_ind = max(all_inds, key=lambda x: getattr(x, 'r2', 0.0))
-        best_r2 = getattr(best_r2_ind, 'r2', 0.0)
-
-        if best_r2 > score_r2:
-            r2_gap = best_r2 - score_r2
-            # Adaptive threshold: the required R² gap shrinks as overall R²
-            # increases (near-perfect models need smaller gaps to matter).
-            # At R²~0.0 the threshold is 0.15; at R²~1.0 it's 0.02.
-            threshold = max(0.02, 0.15 * (1.0 - best_r2))
-
-            if r2_gap > threshold:
-                # Among all models with R² close to the best (within 0.01),
-                # prefer the simplest one — Occam's razor still applies.
-                near_best = [ind for ind in all_inds
-                             if getattr(ind, 'r2', 0.0) >= best_r2 - 0.01]
-                return min(near_best, key=lambda x: x.complexity)
-
-        return score_pick
-
+        best_c = max(valid_complexities, key=lambda c: scores[c])
+        return self.best_by_complexity[best_c]
 
     def print_frontier(self, out_type=5, label=""):
         is_cls = (out_type == 6)
@@ -8393,10 +8356,7 @@ class Individual:
                 self.affine_a   = cached['affine_a']
                 self.affine_b   = cached['affine_b']
                 self.affine_fitted = True
-                dynamic_parsimony = PARSIMONY_STRENGTH * min(1.0, self.loss / 0.5)
-                self.fitness = (self.loss
-                                + (dynamic_parsimony + freq_parsimony_adj) * self.complexity
-                                - 0.5 * self.modularity)
+                self.fitness = self.loss + PARSIMONY_STRENGTH * self.complexity
                 return self.fitness
         try:
             X_eval = X[batch_indices] if batch_indices is not None else X
@@ -8628,10 +8588,7 @@ class Individual:
             # gradient for selection during evolution.
             self.loss = min(self.loss, HOF_LOSS_CEILING + 25.0)
 
-            MODULARITY_REWARD = 0.5
-            # Parsimony shrinks as loss shrinks, allowing late-stage structural fine-tuning
-            dynamic_parsimony = PARSIMONY_STRENGTH * min(1.0, self.loss / 0.5) 
-            self.fitness = self.loss + (dynamic_parsimony + freq_parsimony_adj) * self.complexity - MODULARITY_REWARD * self.modularity
+            self.fitness = self.loss + PARSIMONY_STRENGTH * self.complexity
 
             # ── Populate fitness cache ───────────────────────────────────────
             if _cacheable and batch_indices is None and bg_logits is None:
@@ -14542,7 +14499,7 @@ def train_mode():
     # ---- Parsimony strength ----
     print("\nPARSIMONY STRENGTH")
     print(f"  Controls how heavily expression complexity is penalised in fitness.")
-    print(f"  formula:  fitness = loss + PARSIMONY * complexity - modularity_bonus")
+    print(f"  formula:  fitness = loss + PARSIMONY * complexity")
     print(f"  0.00 = no penalty (fastest, but expressions bloat).")
     print(f"  0.01 = very gentle — only prunes runaway bloat.")
     print(f"  0.05 = moderate  (default) — balanced size/accuracy.")
