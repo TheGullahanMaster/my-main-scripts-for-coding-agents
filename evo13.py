@@ -12508,6 +12508,1040 @@ class BayesianCGPOptimizer:
                 f"GP_fitted={self.gp_fitted}")
 
 
+
+def run_bayesian_afpo(X, Y, n_features, n_outputs, feat_names, out_types,
+                      hofs, target_grads_list, dp,
+                      X_val=None, Y_val=None, BATCH_SIZE=0):
+    """
+    Bayesian CGP combined with Age-Fitness Pareto Optimisation (AFPO).
+    Maintains a population where individuals have 'age', but uses GP
+    surrogates to score and select candidates instead of random mutation.
+    """
+    global _INIT_PHASE
+
+    print("\n" + "═" * 70)
+    print("BAYESIAN AFPO — Surrogate-Assisted Pareto Optimisation")
+    print("═" * 70)
+    print(f"  Initial random samples : {BAYESIAN_INITIAL_SAMPLES}")
+    print(f"  Batch size per iter    : {BAYESIAN_BATCH_SIZE}")
+    print(f"  Candidates per iter    : {BAYESIAN_N_CANDIDATES}")
+    print(f"  GP refit frequency     : every {BAYESIAN_GP_REFIT_FREQ} iterations")
+    print(f"  Exploration (xi)       : {BAYESIAN_EXPLORATION}")
+    print("═" * 70 + "\n")
+
+    _probe_n = min(20, X.shape[0])
+    _probe_idx = np.random.choice(X.shape[0], _probe_n, replace=False)
+    X_probe = X[_probe_idx]
+
+    optimizers = [
+        BayesianCGPOptimizer(n_features, CGP_NODES, feat_names,
+                             X_probe=X_probe,
+                             max_points=BAYESIAN_MAX_GP_POINTS,
+                             xi=BAYESIAN_EXPLORATION)
+        for _ in range(n_outputs)
+    ]
+
+    AFPO_POP_SIZE = POPULATION_SIZE * 2
+    afpo_pops = [[] for _ in range(n_outputs)]
+
+    # ── Phase 1: Initial random sampling ────────────────────────────────
+    print(f"Phase 1: Evaluating {BAYESIAN_INITIAL_SAMPLES} random individuals…")
+    _INIT_PHASE = True
+    N_train = X.shape[0]
+    if N_train > _INIT_SUBSAMPLE_CAP:
+        init_idx = np.random.choice(N_train, _INIT_SUBSAMPLE_CAP, replace=False)
+        X_init, Y_init = X[init_idx], Y[init_idx]
+    else:
+        X_init, Y_init = X, Y
+
+    for o_idx in range(n_outputs):
+        v5_seeds = generate_seeds_v5(n_features, feat_names)
+        try:
+            imp_seeds = generate_importance_biased_seeds(
+                n_features, feat_names, X_init, Y_init[:, o_idx])
+        except Exception:
+            imp_seeds = []
+
+        random.shuffle(v5_seeds)
+        random.shuffle(imp_seeds)
+        seeds = list(imp_seeds) + list(v5_seeds)
+        while len(seeds) < BAYESIAN_INITIAL_SAMPLES:
+            seeds.append(Individual(random_cgp(n_features, CGP_NODES, feat_names)))
+
+        seeds = seeds[:BAYESIAN_INITIAL_SAMPLES]
+        for ind in seeds:
+            ind.age = 0
+            ind.calculate_fitness(
+                X_init, Y_init[:, o_idx], out_types[o_idx],
+                target_grads=_slice_optional_rows(target_grads_list[o_idx],
+                                                  init_idx if N_train > _INIT_SUBSAMPLE_CAP else None))
+            hofs[o_idx].update(ind)
+            optimizers[o_idx].add_observation(ind, ind.tree)
+            afpo_pops[o_idx].append(ind)
+
+        # AFPO specifically relies on _trim_to_pareto_front_3obj (or similar)
+        # to manage population size
+        afpo_pops[o_idx] = _trim_to_pareto_front_3obj(afpo_pops[o_idx], AFPO_POP_SIZE)
+
+        print(f"  Output {o_idx}: {len(seeds)} initial samples evaluated, "
+              f"best loss = {min(ind.loss for ind in seeds):.5f}")
+
+    _INIT_PHASE = False
+    if N_train > _INIT_SUBSAMPLE_CAP:
+        print("  Re-scoring Hall of Fame and GP buffer on full dataset…")
+        for o_idx in range(n_outputs):
+            for ind in hofs[o_idx].best_by_complexity.values():
+                ind.affine_fitted = False
+                ind.calculate_fitness(X, Y[:, o_idx], out_types[o_idx],
+                                      target_grads=target_grads_list[o_idx])
+            hofs[o_idx].sanitize()
+
+            opt = optimizers[o_idx]
+            old_individuals = list(opt.individuals)
+            opt.X_observed.clear()
+            opt.y_observed.clear()
+            opt.individuals.clear()
+
+            # Re-evaluate the population
+            for ind in afpo_pops[o_idx]:
+                ind.affine_fitted = False
+                ind.calculate_fitness(X, Y[:, o_idx], out_types[o_idx],
+                                      target_grads=target_grads_list[o_idx])
+                opt.add_observation(ind, ind.tree)
+
+            afpo_pops[o_idx] = _trim_to_pareto_front_3obj(afpo_pops[o_idx], AFPO_POP_SIZE)
+
+    print("\nFitting initial GP surrogates…")
+    for opt in optimizers:
+        opt.fit_surrogate()
+        print(f"  {opt.summary_str()}")
+
+    # ── Phase 2: Bayesian AFPO loop ─────────────────────────────
+    print("\nPhase 2: Bayesian AFPO optimisation. Ctrl+C to stop.\n")
+    iteration = 0
+    total_evals = BAYESIAN_INITIAL_SAMPLES * n_outputs
+    perfect_outputs = set()
+    _bo_xi_start = max(BAYESIAN_EXPLORATION * 5.0, 0.05)
+    _bo_xi_end   = BAYESIAN_EXPLORATION
+
+    try:
+        while True:
+            iteration += 1
+            _batch_n = min(int(BATCH_SIZE), X.shape[0]) if BATCH_SIZE else 0
+            batch_idx = (np.random.choice(X.shape[0], _batch_n, replace=False)
+                         if _batch_n > 0 else None)
+            X_b = X[batch_idx] if batch_idx is not None else X
+            Y_b = Y[batch_idx] if batch_idx is not None else Y
+
+            decay = np.exp(-0.014 * iteration)
+            current_xi = _bo_xi_end + (_bo_xi_start - _bo_xi_end) * decay
+            for opt in optimizers:
+                opt.xi = current_xi
+
+            for o_idx in range(n_outputs):
+                if o_idx in perfect_outputs:
+                    continue
+                opt = optimizers[o_idx]
+                pop = afpo_pops[o_idx]
+
+                # Age everyone in population
+                for ind in pop:
+                    ind.age += 1
+
+                try:
+                    _bo_op_affinity = compute_hof_operator_affinity([hofs[o_idx]])
+                except Exception:
+                    _bo_op_affinity = None
+                _bo_op_affinity = _bo_op_affinity or None
+
+                candidate_trees = []
+
+                # We draw candidates by mutating the AFPO population
+                n_exploit = int(BAYESIAN_N_CANDIDATES * 0.6)
+                for _ in range(n_exploit):
+                    parent = random.choice(pop) if pop else Individual(random_cgp(n_features, CGP_NODES, feat_names))
+                    rate = random.choice([1, 1, 2, 2, 3, 5])
+                    child_tree = mutate(parent.tree, n_features, feat_names,
+                                        mut_rate=rate, temperature=0.0,
+                                        op_affinity=_bo_op_affinity)
+                    candidate_trees.append(child_tree)
+
+                n_cross = int(BAYESIAN_N_CANDIDATES * 0.15)
+                for _ in range(n_cross):
+                    if len(pop) >= 2:
+                        p1, p2 = random.sample(pop, 2)
+                        child_tree = crossover(p1.tree, p2.tree)
+                        child_tree = mutate(child_tree, n_features, feat_names,
+                                            mut_rate=1, op_affinity=_bo_op_affinity)
+                    else:
+                        child_tree = random_cgp(n_features, CGP_NODES, feat_names)
+                    candidate_trees.append(child_tree)
+
+                n_macro = int(BAYESIAN_N_CANDIDATES * 0.10)
+                for _ in range(n_macro):
+                    parent = random.choice(pop) if pop else Individual(random_cgp(n_features, CGP_NODES, feat_names))
+                    _macro_choices = ['grow', 'prune', 'graft', 'rational',
+                                      'trig', 'inject', 'nest']
+                    if IF_ELSE_ENABLED:
+                        _macro_choices.append('piecewise')
+                    macro_choice = random.choice(_macro_choices)
+                    if macro_choice == 'grow':
+                        ct = macro_grow(parent.tree, n_features, feat_names, op_affinity=_bo_op_affinity)
+                    elif macro_choice == 'prune':
+                        ct = macro_prune(parent.tree, n_features)
+                    elif macro_choice == 'graft':
+                        ct = macro_graft_feature(parent.tree, n_features, feat_names)
+                    elif macro_choice == 'rational':
+                        ct = macro_rational_grow(parent.tree, n_features)
+                    elif macro_choice == 'piecewise':
+                        ct = macro_piecewise(parent.tree, n_features, feat_names, X=X)
+                    elif macro_choice == 'inject':
+                        ct = macro_inject_subtree(parent.tree, n_features, feat_names, op_affinity=_bo_op_affinity)
+                    elif macro_choice == 'nest':
+                        ct = macro_nest_compound(parent.tree, n_features, feat_names, op_affinity=_bo_op_affinity)
+                    else:
+                        ct = macro_trig_identity(parent.tree, n_features)
+                    candidate_trees.append(ct)
+
+                n_hof_cross = int(BAYESIAN_N_CANDIDATES * 0.10)
+                hof_inds_bo = list(hofs[o_idx].best_by_complexity.values())
+                if len(hof_inds_bo) >= 2:
+                    for _ in range(n_hof_cross):
+                        p1, p2 = random.sample(hof_inds_bo, 2)
+                        child_tree = crossover(p1.tree, p2.tree)
+                        child_tree = mutate(child_tree, n_features, feat_names,
+                                            mut_rate=random.choice([1, 2]),
+                                            op_affinity=_bo_op_affinity)
+                        candidate_trees.append(child_tree)
+                else:
+                    for _ in range(n_hof_cross):
+                        candidate_trees.append(random_cgp(n_features, CGP_NODES, feat_names))
+
+                n_random = BAYESIAN_N_CANDIDATES - n_exploit - n_cross - n_macro - n_hof_cross
+                for _ in range(max(0, n_random)):
+                    candidate_trees.append(random_cgp(n_features, CGP_NODES, feat_names))
+
+                # Expected Improvement
+                ei_scores = opt.score_candidates(candidate_trees)
+
+                n_screen = min(BAYESIAN_BATCH_SIZE * 2, len(candidate_trees))
+                screen_indices = np.argsort(ei_scores)[-n_screen:]
+
+                _N = X_b.shape[0]
+                _screen_rows = min(max(50, _N // 4), _N)
+                if _screen_rows < _N:
+                    _screen_idx = np.random.choice(_N, _screen_rows, replace=False)
+                    X_screen = X_b[_screen_idx]
+                    Y_screen = Y_b[_screen_idx]
+                    _screen_global_idx = (batch_idx[_screen_idx]
+                                          if batch_idx is not None else _screen_idx)
+                else:
+                    X_screen, Y_screen = X_b, Y_b
+                    _screen_global_idx = batch_idx
+                target_grads_screen = _slice_optional_rows(
+                    target_grads_list[o_idx], _screen_global_idx)
+
+                screen_results = []
+                for ci in screen_indices:
+                    child = Individual(candidate_trees[ci])
+                    child.calculate_fitness(
+                        X_screen, Y_screen[:, o_idx], out_types[o_idx],
+                        target_grads=target_grads_screen)
+                    screen_results.append((ci, child))
+                total_evals += len(screen_results)
+
+                screen_results.sort(key=lambda x: x[1].loss)
+                top_indices = set(ci for ci, _ in screen_results[:BAYESIAN_BATCH_SIZE])
+
+                for ci in top_indices:
+                    child = Individual(candidate_trees[ci])
+                    child.age = 0 # AFPO invariant
+                    child.calculate_fitness(
+                        X, Y[:, o_idx], out_types[o_idx],
+                        target_grads=target_grads_list[o_idx])
+                    total_evals += 1
+
+                    # Add to AFPO pop
+                    pop.append(child)
+
+                    if hofs[o_idx].update(child):
+                        is_cls = (out_types[o_idx] == 6)
+                        metric = (f"Acc={getattr(child,'accuracy',0):.4f}"
+                                  if is_cls
+                                  else f"R²={getattr(child,'r2',0):.4f}")
+                        print(f"  [BO AFPO iter {iteration} | Out {o_idx}] "
+                              f"New HoF (Comp {child.complexity:.0f}): "
+                              f"loss={child.loss:.5f}  {metric}")
+
+                    opt.add_observation(child, child.tree)
+
+                # Trim Pareto front
+                afpo_pops[o_idx] = _trim_to_pareto_front_3obj(pop, AFPO_POP_SIZE)
+
+                if iteration % BAYESIAN_GP_REFIT_FREQ == 0:
+                    opt.fit_surrogate()
+
+            print(f"--- BO AFPO Iteration {iteration}  (total evals: {total_evals}) ---")
+
+            if iteration % 5 == 0:
+                for o_idx in range(n_outputs):
+                    if o_idx not in perfect_outputs:
+                        print(f"  [Out {o_idx}] GP: {optimizers[o_idx].summary_str()}")
+
+            for o_idx in range(n_outputs):
+                if o_idx in perfect_outputs:
+                    continue
+                is_perf, best_ind = _check_output_perfect(
+                    hofs[o_idx], X, Y[:, o_idx], out_types[o_idx])
+                if is_perf:
+                    out_label = dp.output_map[o_idx] if o_idx < len(dp.output_map) else f"Out{o_idx}"
+                    print(f"\n  ★ Output {o_idx} ({out_label}) reached PERFECT performance!")
+                    _simplify_perfect_output(
+                        hofs[o_idx], X, Y[:, o_idx], out_types[o_idx],
+                        target_grads=target_grads_list[o_idx])
+                    perfect_outputs.add(o_idx)
+
+            if len(perfect_outputs) == n_outputs:
+                print("\n  ★★★ ALL outputs reached perfect performance! Stopping Bayesian AFPO.")
+                break
+
+            if iteration % 25 == 0:
+                for o_idx, hof in enumerate(hofs):
+                    out_label = (dp.output_map[o_idx]
+                                 if o_idx < len(dp.output_map) else f"Out{o_idx}")
+                    pf_tag = " [PERFECT]" if o_idx in perfect_outputs else ""
+                    hof.print_frontier(
+                        out_type=out_types[o_idx],
+                        label=f"Output {o_idx} ({out_label}){pf_tag}")
+
+            if (SIMPLIFICATION_FREQ > 0
+                    and iteration % max(1, SIMPLIFICATION_FREQ // 50) == 0):
+                print(f"\n[BO AFPO iter {iteration}] Running algebraic simplification on HoF…")
+                for o_idx, hof in enumerate(hofs):
+                    for c_key in list(hof.best_by_complexity.keys()):
+                        ind = hof.best_by_complexity[c_key]
+                        old_active = set(ind.tree.active_nodes) if ind.tree is not None else set()
+                        ind.tree = simplify_cgp_tree(ind.tree)
+                        ind.tree.update_active_nodes()
+                        _new_active = set(ind.tree.active_nodes)
+                        _union = old_active | _new_active
+                        _diff_frac = (len(_union - (old_active & _new_active))
+                                      / max(1, len(_union)))
+                        _refit = _diff_frac >= 0.25
+                        if _refit:
+                            ind.affine_fitted = False
+                        ind.calculate_fitness(
+                            X, Y[:, o_idx], out_types[o_idx],
+                            update_affine=_refit,
+                            target_grads=target_grads_list[o_idx])
+                    new_dict = {}
+                    for ind in hof.best_by_complexity.values():
+                        nc = ind.complexity
+                        if nc not in new_dict or ind.loss < new_dict[nc].loss:
+                            new_dict[nc] = ind
+                    hof.best_by_complexity = new_dict
+                    hof.sanitize()
+
+    except KeyboardInterrupt:
+        print("\nStopping Bayesian AFPO…")
+
+
+
+
+def run_bayesian_islands(X, Y, n_features, n_outputs, feat_names, out_types,
+                         hofs, target_grads_list, dp,
+                         X_val=None, Y_val=None, BATCH_SIZE=0):
+    """
+    Bayesian CGP combined with Island Model.
+    Maintains NUM_ISLANDS separate populations and uses GP surrogates to score
+    candidates. Periodic migration occurs between islands to share diversity.
+    """
+    global _INIT_PHASE
+
+    NUM_ISLANDS = NUM_ISLANDS_GLOBAL
+    ISLAND_SIZE = POPULATION_SIZE
+
+    print("\n" + "═" * 70)
+    print("BAYESIAN ISLANDS — Surrogate-Assisted Multi-Population")
+    print("═" * 70)
+    print(f"  Islands                : {NUM_ISLANDS}")
+    print(f"  Population per island  : {ISLAND_SIZE}")
+    print(f"  Initial random samples : {BAYESIAN_INITIAL_SAMPLES}")
+    print(f"  Batch size per iter    : {BAYESIAN_BATCH_SIZE}")
+    print(f"  Candidates per iter    : {BAYESIAN_N_CANDIDATES}")
+    print(f"  GP refit frequency     : every {BAYESIAN_GP_REFIT_FREQ} iterations")
+    print(f"  Exploration (xi)       : {BAYESIAN_EXPLORATION}")
+    print("═" * 70 + "\n")
+
+    _probe_n = min(20, X.shape[0])
+    _probe_idx = np.random.choice(X.shape[0], _probe_n, replace=False)
+    X_probe = X[_probe_idx]
+
+    optimizers = [
+        BayesianCGPOptimizer(n_features, CGP_NODES, feat_names,
+                             X_probe=X_probe,
+                             max_points=BAYESIAN_MAX_GP_POINTS,
+                             xi=BAYESIAN_EXPLORATION)
+        for _ in range(n_outputs)
+    ]
+
+    islands_pop = [[[] for _ in range(n_outputs)] for _ in range(NUM_ISLANDS)]
+
+    # ── Phase 1: Initial random sampling ────────────────────────────────
+    print(f"Phase 1: Evaluating {BAYESIAN_INITIAL_SAMPLES} random individuals per island…")
+    _INIT_PHASE = True
+    N_train = X.shape[0]
+    if N_train > _INIT_SUBSAMPLE_CAP:
+        init_idx = np.random.choice(N_train, _INIT_SUBSAMPLE_CAP, replace=False)
+        X_init, Y_init = X[init_idx], Y[init_idx]
+    else:
+        X_init, Y_init = X, Y
+
+    for island_idx in range(NUM_ISLANDS):
+        for o_idx in range(n_outputs):
+            v5_seeds = generate_seeds_v5(n_features, feat_names)
+            try:
+                imp_seeds = generate_importance_biased_seeds(
+                    n_features, feat_names, X_init, Y_init[:, o_idx])
+            except Exception:
+                imp_seeds = []
+
+            random.shuffle(v5_seeds)
+            random.shuffle(imp_seeds)
+            seeds = list(imp_seeds) + list(v5_seeds)
+
+            # Start filling this island
+            while len(seeds) < BAYESIAN_INITIAL_SAMPLES:
+                seeds.append(Individual(random_cgp(n_features, CGP_NODES, feat_names)))
+
+            seeds = seeds[:BAYESIAN_INITIAL_SAMPLES]
+            for ind in seeds:
+                ind.calculate_fitness(
+                    X_init, Y_init[:, o_idx], out_types[o_idx],
+                    target_grads=_slice_optional_rows(target_grads_list[o_idx],
+                                                      init_idx if N_train > _INIT_SUBSAMPLE_CAP else None))
+                hofs[o_idx].update(ind)
+                optimizers[o_idx].add_observation(ind, ind.tree)
+
+            # Take top ISLAND_SIZE individuals to initialize this island's pop
+            seeds.sort(key=lambda x: x.loss)
+            islands_pop[island_idx][o_idx] = seeds[:ISLAND_SIZE]
+
+    _INIT_PHASE = False
+    if N_train > _INIT_SUBSAMPLE_CAP:
+        print("  Re-scoring Hall of Fame and GP buffer on full dataset…")
+        for o_idx in range(n_outputs):
+            for ind in hofs[o_idx].best_by_complexity.values():
+                ind.affine_fitted = False
+                ind.calculate_fitness(X, Y[:, o_idx], out_types[o_idx],
+                                      target_grads=target_grads_list[o_idx])
+            hofs[o_idx].sanitize()
+
+            opt = optimizers[o_idx]
+            opt.X_observed.clear()
+            opt.y_observed.clear()
+            opt.individuals.clear()
+
+            # Re-evaluate all individuals across all islands
+            for island_idx in range(NUM_ISLANDS):
+                for ind in islands_pop[island_idx][o_idx]:
+                    ind.affine_fitted = False
+                    ind.calculate_fitness(X, Y[:, o_idx], out_types[o_idx],
+                                          target_grads=target_grads_list[o_idx])
+                    opt.add_observation(ind, ind.tree)
+
+            # Re-sort islands
+            for island_idx in range(NUM_ISLANDS):
+                islands_pop[island_idx][o_idx].sort(key=lambda x: x.fitness)
+                islands_pop[island_idx][o_idx] = islands_pop[island_idx][o_idx][:ISLAND_SIZE]
+
+    print("\nFitting initial GP surrogates…")
+    for opt in optimizers:
+        opt.fit_surrogate()
+
+    # ── Phase 2: Bayesian Islands loop ─────────────────────────────
+    print("\nPhase 2: Bayesian Islands optimisation. Ctrl+C to stop.\n")
+    iteration = 0
+    total_evals = BAYESIAN_INITIAL_SAMPLES * n_outputs * NUM_ISLANDS
+    perfect_outputs = set()
+    _bo_xi_start = max(BAYESIAN_EXPLORATION * 5.0, 0.05)
+    _bo_xi_end   = BAYESIAN_EXPLORATION
+
+    try:
+        while True:
+            iteration += 1
+            _batch_n = min(int(BATCH_SIZE), X.shape[0]) if BATCH_SIZE else 0
+            batch_idx = (np.random.choice(X.shape[0], _batch_n, replace=False)
+                         if _batch_n > 0 else None)
+            X_b = X[batch_idx] if batch_idx is not None else X
+            Y_b = Y[batch_idx] if batch_idx is not None else Y
+
+            decay = np.exp(-0.014 * iteration)
+            current_xi = _bo_xi_end + (_bo_xi_start - _bo_xi_end) * decay
+            for opt in optimizers:
+                opt.xi = current_xi
+
+            for o_idx in range(n_outputs):
+                if o_idx in perfect_outputs:
+                    continue
+                opt = optimizers[o_idx]
+
+                try:
+                    _bo_op_affinity = compute_hof_operator_affinity([hofs[o_idx]])
+                except Exception:
+                    _bo_op_affinity = None
+                _bo_op_affinity = _bo_op_affinity or None
+
+                for island_idx in range(NUM_ISLANDS):
+                    pop = islands_pop[island_idx][o_idx]
+                    top_inds = pop[:max(1, len(pop)//2)]
+
+                    candidate_trees = []
+
+                    n_exploit = int(BAYESIAN_N_CANDIDATES * 0.6)
+                    for _ in range(n_exploit):
+                        parent = random.choice(top_inds) if top_inds else Individual(random_cgp(n_features, CGP_NODES, feat_names))
+                        rate = random.choice([1, 1, 2, 2, 3, 5])
+                        child_tree = mutate(parent.tree, n_features, feat_names,
+                                            mut_rate=rate, temperature=0.0,
+                                            op_affinity=_bo_op_affinity)
+                        candidate_trees.append(child_tree)
+
+                    n_cross = int(BAYESIAN_N_CANDIDATES * 0.15)
+                    for _ in range(n_cross):
+                        if len(top_inds) >= 2:
+                            p1, p2 = random.sample(top_inds, 2)
+                            child_tree = crossover(p1.tree, p2.tree)
+                            child_tree = mutate(child_tree, n_features, feat_names,
+                                                mut_rate=1, op_affinity=_bo_op_affinity)
+                        else:
+                            child_tree = random_cgp(n_features, CGP_NODES, feat_names)
+                        candidate_trees.append(child_tree)
+
+                    n_macro = int(BAYESIAN_N_CANDIDATES * 0.10)
+                    for _ in range(n_macro):
+                        parent = random.choice(top_inds) if top_inds else Individual(random_cgp(n_features, CGP_NODES, feat_names))
+                        _macro_choices = ['grow', 'prune', 'graft', 'rational',
+                                          'trig', 'inject', 'nest']
+                        if IF_ELSE_ENABLED:
+                            _macro_choices.append('piecewise')
+                        macro_choice = random.choice(_macro_choices)
+                        if macro_choice == 'grow':
+                            ct = macro_grow(parent.tree, n_features, feat_names, op_affinity=_bo_op_affinity)
+                        elif macro_choice == 'prune':
+                            ct = macro_prune(parent.tree, n_features)
+                        elif macro_choice == 'graft':
+                            ct = macro_graft_feature(parent.tree, n_features, feat_names)
+                        elif macro_choice == 'rational':
+                            ct = macro_rational_grow(parent.tree, n_features)
+                        elif macro_choice == 'piecewise':
+                            ct = macro_piecewise(parent.tree, n_features, feat_names, X=X)
+                        elif macro_choice == 'inject':
+                            ct = macro_inject_subtree(parent.tree, n_features, feat_names, op_affinity=_bo_op_affinity)
+                        elif macro_choice == 'nest':
+                            ct = macro_nest_compound(parent.tree, n_features, feat_names, op_affinity=_bo_op_affinity)
+                        else:
+                            ct = macro_trig_identity(parent.tree, n_features)
+                        candidate_trees.append(ct)
+
+                    n_hof_cross = int(BAYESIAN_N_CANDIDATES * 0.10)
+                    hof_inds_bo = list(hofs[o_idx].best_by_complexity.values())
+                    if len(hof_inds_bo) >= 2:
+                        for _ in range(n_hof_cross):
+                            p1, p2 = random.sample(hof_inds_bo, 2)
+                            child_tree = crossover(p1.tree, p2.tree)
+                            child_tree = mutate(child_tree, n_features, feat_names,
+                                                mut_rate=random.choice([1, 2]),
+                                                op_affinity=_bo_op_affinity)
+                            candidate_trees.append(child_tree)
+                    else:
+                        for _ in range(n_hof_cross):
+                            candidate_trees.append(random_cgp(n_features, CGP_NODES, feat_names))
+
+                    n_random = BAYESIAN_N_CANDIDATES - n_exploit - n_cross - n_macro - n_hof_cross
+                    for _ in range(max(0, n_random)):
+                        candidate_trees.append(random_cgp(n_features, CGP_NODES, feat_names))
+
+                    ei_scores = opt.score_candidates(candidate_trees)
+
+                    n_screen = min(BAYESIAN_BATCH_SIZE * 2, len(candidate_trees))
+                    screen_indices = np.argsort(ei_scores)[-n_screen:]
+
+                    _N = X_b.shape[0]
+                    _screen_rows = min(max(50, _N // 4), _N)
+                    if _screen_rows < _N:
+                        _screen_idx = np.random.choice(_N, _screen_rows, replace=False)
+                        X_screen = X_b[_screen_idx]
+                        Y_screen = Y_b[_screen_idx]
+                        _screen_global_idx = (batch_idx[_screen_idx]
+                                              if batch_idx is not None else _screen_idx)
+                    else:
+                        X_screen, Y_screen = X_b, Y_b
+                        _screen_global_idx = batch_idx
+                    target_grads_screen = _slice_optional_rows(
+                        target_grads_list[o_idx], _screen_global_idx)
+
+                    screen_results = []
+                    for ci in screen_indices:
+                        child = Individual(candidate_trees[ci])
+                        child.calculate_fitness(
+                            X_screen, Y_screen[:, o_idx], out_types[o_idx],
+                            target_grads=target_grads_screen)
+                        screen_results.append((ci, child))
+                    total_evals += len(screen_results)
+
+                    screen_results.sort(key=lambda x: x[1].loss)
+                    top_indices = set(ci for ci, _ in screen_results[:BAYESIAN_BATCH_SIZE])
+
+                    for ci in top_indices:
+                        child = Individual(candidate_trees[ci])
+                        child.calculate_fitness(
+                            X, Y[:, o_idx], out_types[o_idx],
+                            target_grads=target_grads_list[o_idx])
+                        total_evals += 1
+
+                        pop.append(child)
+
+                        if hofs[o_idx].update(child):
+                            is_cls = (out_types[o_idx] == 6)
+                            metric = (f"Acc={getattr(child,'accuracy',0):.4f}"
+                                      if is_cls
+                                      else f"R²={getattr(child,'r2',0):.4f}")
+                            print(f"  [BO Isl {island_idx} iter {iteration} | Out {o_idx}] "
+                                  f"New HoF (Comp {child.complexity:.0f}): "
+                                  f"loss={child.loss:.5f}  {metric}")
+
+                        opt.add_observation(child, child.tree)
+
+                    # Standard survival selection (e.g. tournament or sort)
+                    pop.sort(key=lambda x: x.fitness)
+                    islands_pop[island_idx][o_idx] = pop[:ISLAND_SIZE]
+
+                # Migration (every 5 iterations)
+                if iteration % 5 == 0 and NUM_ISLANDS > 1:
+                    _probe_idx_mig = np.random.choice(X.shape[0], min(16, X.shape[0]), replace=False)
+                    _X_probe_mig = X[_probe_idx_mig]
+                    for island_idx in range(NUM_ISLANDS):
+                        next_island = (island_idx + 1) % NUM_ISLANDS
+                        src_pop = islands_pop[island_idx][o_idx]
+                        n_mig = min(2, max(1, len(src_pop) // 25))
+                        migrants = _select_diverse_migrants(src_pop, n_migrants=n_mig, X_probe=_X_probe_mig)
+                        target_pop = islands_pop[next_island][o_idx]
+                        for mig in migrants:
+                            mig_copy = copy.deepcopy(mig)
+                            if target_pop:
+                                worst = max(target_pop, key=lambda x: x.fitness)
+                                target_pop.remove(worst)
+                            target_pop.append(mig_copy)
+
+                if iteration % BAYESIAN_GP_REFIT_FREQ == 0:
+                    opt.fit_surrogate()
+
+            print(f"--- BO Islands Iteration {iteration}  (total evals: {total_evals}) ---")
+
+            for o_idx in range(n_outputs):
+                if o_idx in perfect_outputs:
+                    continue
+                is_perf, best_ind = _check_output_perfect(
+                    hofs[o_idx], X, Y[:, o_idx], out_types[o_idx])
+                if is_perf:
+                    out_label = dp.output_map[o_idx] if o_idx < len(dp.output_map) else f"Out{o_idx}"
+                    print(f"\n  ★ Output {o_idx} ({out_label}) reached PERFECT performance!")
+                    _simplify_perfect_output(
+                        hofs[o_idx], X, Y[:, o_idx], out_types[o_idx],
+                        target_grads=target_grads_list[o_idx])
+                    perfect_outputs.add(o_idx)
+
+            if len(perfect_outputs) == n_outputs:
+                print("\n  ★★★ ALL outputs reached perfect performance! Stopping Bayesian Islands.")
+                break
+
+            if iteration % 25 == 0:
+                for o_idx, hof in enumerate(hofs):
+                    out_label = (dp.output_map[o_idx]
+                                 if o_idx < len(dp.output_map) else f"Out{o_idx}")
+                    pf_tag = " [PERFECT]" if o_idx in perfect_outputs else ""
+                    hof.print_frontier(
+                        out_type=out_types[o_idx],
+                        label=f"Output {o_idx} ({out_label}){pf_tag}")
+
+            if (SIMPLIFICATION_FREQ > 0
+                    and iteration % max(1, SIMPLIFICATION_FREQ // 50) == 0):
+                print(f"\n[BO Islands iter {iteration}] Running algebraic simplification on HoF…")
+                for o_idx, hof in enumerate(hofs):
+                    for c_key in list(hof.best_by_complexity.keys()):
+                        ind = hof.best_by_complexity[c_key]
+                        old_active = set(ind.tree.active_nodes) if ind.tree is not None else set()
+                        ind.tree = simplify_cgp_tree(ind.tree)
+                        ind.tree.update_active_nodes()
+                        _new_active = set(ind.tree.active_nodes)
+                        _union = old_active | _new_active
+                        _diff_frac = (len(_union - (old_active & _new_active))
+                                      / max(1, len(_union)))
+                        _refit = _diff_frac >= 0.25
+                        if _refit:
+                            ind.affine_fitted = False
+                        ind.calculate_fitness(
+                            X, Y[:, o_idx], out_types[o_idx],
+                            update_affine=_refit,
+                            target_grads=target_grads_list[o_idx])
+                    new_dict = {}
+                    for ind in hof.best_by_complexity.values():
+                        nc = ind.complexity
+                        if nc not in new_dict or ind.loss < new_dict[nc].loss:
+                            new_dict[nc] = ind
+                    hof.best_by_complexity = new_dict
+                    hof.sanitize()
+
+    except KeyboardInterrupt:
+        print("\nStopping Bayesian Islands…")
+
+
+def run_bayesian_islanded_afpo(X, Y, n_features, n_outputs, feat_names, out_types,
+                               hofs, target_grads_list, dp,
+                               X_val=None, Y_val=None, BATCH_SIZE=0):
+    """
+    Bayesian CGP combined with Islanded AFPO.
+    Maintains multiple AFPO populations, runs Bayesian generation/evaluation loops
+    per island, and periodically migrates between islands.
+    """
+    global _INIT_PHASE
+
+    NUM_ISLANDS = NUM_ISLANDS_GLOBAL
+    AFPO_POP_SIZE = POPULATION_SIZE * 2
+
+    print("\n" + "═" * 70)
+    print("BAYESIAN ISLANDED AFPO — Surrogate-Assisted Multi-Population Pareto")
+    print("═" * 70)
+    print(f"  Islands                : {NUM_ISLANDS}")
+    print(f"  Population per island  : {AFPO_POP_SIZE}")
+    print(f"  Initial random samples : {BAYESIAN_INITIAL_SAMPLES}")
+    print(f"  Batch size per iter    : {BAYESIAN_BATCH_SIZE}")
+    print(f"  Candidates per iter    : {BAYESIAN_N_CANDIDATES}")
+    print(f"  GP refit frequency     : every {BAYESIAN_GP_REFIT_FREQ} iterations")
+    print(f"  Exploration (xi)       : {BAYESIAN_EXPLORATION}")
+    print("═" * 70 + "\n")
+
+    _probe_n = min(20, X.shape[0])
+    _probe_idx = np.random.choice(X.shape[0], _probe_n, replace=False)
+    X_probe = X[_probe_idx]
+
+    optimizers = [
+        BayesianCGPOptimizer(n_features, CGP_NODES, feat_names,
+                             X_probe=X_probe,
+                             max_points=BAYESIAN_MAX_GP_POINTS,
+                             xi=BAYESIAN_EXPLORATION)
+        for _ in range(n_outputs)
+    ]
+
+    islands_pop = [[[] for _ in range(n_outputs)] for _ in range(NUM_ISLANDS)]
+
+    # ── Phase 1: Initial random sampling ────────────────────────────────
+    print(f"Phase 1: Evaluating {BAYESIAN_INITIAL_SAMPLES} random individuals per island…")
+    _INIT_PHASE = True
+    N_train = X.shape[0]
+    if N_train > _INIT_SUBSAMPLE_CAP:
+        init_idx = np.random.choice(N_train, _INIT_SUBSAMPLE_CAP, replace=False)
+        X_init, Y_init = X[init_idx], Y[init_idx]
+    else:
+        X_init, Y_init = X, Y
+
+    for island_idx in range(NUM_ISLANDS):
+        for o_idx in range(n_outputs):
+            v5_seeds = generate_seeds_v5(n_features, feat_names)
+            try:
+                imp_seeds = generate_importance_biased_seeds(
+                    n_features, feat_names, X_init, Y_init[:, o_idx])
+            except Exception:
+                imp_seeds = []
+
+            random.shuffle(v5_seeds)
+            random.shuffle(imp_seeds)
+            seeds = list(imp_seeds) + list(v5_seeds)
+
+            while len(seeds) < BAYESIAN_INITIAL_SAMPLES:
+                seeds.append(Individual(random_cgp(n_features, CGP_NODES, feat_names)))
+
+            seeds = seeds[:BAYESIAN_INITIAL_SAMPLES]
+            for ind in seeds:
+                ind.age = 0
+                ind.calculate_fitness(
+                    X_init, Y_init[:, o_idx], out_types[o_idx],
+                    target_grads=_slice_optional_rows(target_grads_list[o_idx],
+                                                      init_idx if N_train > _INIT_SUBSAMPLE_CAP else None))
+                hofs[o_idx].update(ind)
+                optimizers[o_idx].add_observation(ind, ind.tree)
+
+            islands_pop[island_idx][o_idx] = _trim_to_pareto_front_3obj(seeds, AFPO_POP_SIZE)
+
+    _INIT_PHASE = False
+    if N_train > _INIT_SUBSAMPLE_CAP:
+        print("  Re-scoring Hall of Fame and GP buffer on full dataset…")
+        for o_idx in range(n_outputs):
+            for ind in hofs[o_idx].best_by_complexity.values():
+                ind.affine_fitted = False
+                ind.calculate_fitness(X, Y[:, o_idx], out_types[o_idx],
+                                      target_grads=target_grads_list[o_idx])
+            hofs[o_idx].sanitize()
+
+            opt = optimizers[o_idx]
+            opt.X_observed.clear()
+            opt.y_observed.clear()
+            opt.individuals.clear()
+
+            # Re-evaluate
+            for island_idx in range(NUM_ISLANDS):
+                for ind in islands_pop[island_idx][o_idx]:
+                    ind.affine_fitted = False
+                    ind.calculate_fitness(X, Y[:, o_idx], out_types[o_idx],
+                                          target_grads=target_grads_list[o_idx])
+                    opt.add_observation(ind, ind.tree)
+                islands_pop[island_idx][o_idx] = _trim_to_pareto_front_3obj(islands_pop[island_idx][o_idx], AFPO_POP_SIZE)
+
+    print("\nFitting initial GP surrogates…")
+    for opt in optimizers:
+        opt.fit_surrogate()
+
+    # ── Phase 2: Bayesian Islanded AFPO loop ─────────────────────────────
+    print("\nPhase 2: Bayesian Islanded AFPO optimisation. Ctrl+C to stop.\n")
+    iteration = 0
+    total_evals = BAYESIAN_INITIAL_SAMPLES * n_outputs * NUM_ISLANDS
+    perfect_outputs = set()
+    _bo_xi_start = max(BAYESIAN_EXPLORATION * 5.0, 0.05)
+    _bo_xi_end   = BAYESIAN_EXPLORATION
+
+    try:
+        while True:
+            iteration += 1
+            _batch_n = min(int(BATCH_SIZE), X.shape[0]) if BATCH_SIZE else 0
+            batch_idx = (np.random.choice(X.shape[0], _batch_n, replace=False)
+                         if _batch_n > 0 else None)
+            X_b = X[batch_idx] if batch_idx is not None else X
+            Y_b = Y[batch_idx] if batch_idx is not None else Y
+
+            decay = np.exp(-0.014 * iteration)
+            current_xi = _bo_xi_end + (_bo_xi_start - _bo_xi_end) * decay
+            for opt in optimizers:
+                opt.xi = current_xi
+
+            for o_idx in range(n_outputs):
+                if o_idx in perfect_outputs:
+                    continue
+                opt = optimizers[o_idx]
+
+                try:
+                    _bo_op_affinity = compute_hof_operator_affinity([hofs[o_idx]])
+                except Exception:
+                    _bo_op_affinity = None
+                _bo_op_affinity = _bo_op_affinity or None
+
+                for island_idx in range(NUM_ISLANDS):
+                    pop = islands_pop[island_idx][o_idx]
+
+                    for ind in pop:
+                        ind.age += 1
+
+                    candidate_trees = []
+
+                    n_exploit = int(BAYESIAN_N_CANDIDATES * 0.6)
+                    for _ in range(n_exploit):
+                        parent = random.choice(pop) if pop else Individual(random_cgp(n_features, CGP_NODES, feat_names))
+                        rate = random.choice([1, 1, 2, 2, 3, 5])
+                        child_tree = mutate(parent.tree, n_features, feat_names,
+                                            mut_rate=rate, temperature=0.0,
+                                            op_affinity=_bo_op_affinity)
+                        candidate_trees.append(child_tree)
+
+                    n_cross = int(BAYESIAN_N_CANDIDATES * 0.15)
+                    for _ in range(n_cross):
+                        if len(pop) >= 2:
+                            p1, p2 = random.sample(pop, 2)
+                            child_tree = crossover(p1.tree, p2.tree)
+                            child_tree = mutate(child_tree, n_features, feat_names,
+                                                mut_rate=1, op_affinity=_bo_op_affinity)
+                        else:
+                            child_tree = random_cgp(n_features, CGP_NODES, feat_names)
+                        candidate_trees.append(child_tree)
+
+                    n_macro = int(BAYESIAN_N_CANDIDATES * 0.10)
+                    for _ in range(n_macro):
+                        parent = random.choice(pop) if pop else Individual(random_cgp(n_features, CGP_NODES, feat_names))
+                        _macro_choices = ['grow', 'prune', 'graft', 'rational',
+                                          'trig', 'inject', 'nest']
+                        if IF_ELSE_ENABLED:
+                            _macro_choices.append('piecewise')
+                        macro_choice = random.choice(_macro_choices)
+                        if macro_choice == 'grow':
+                            ct = macro_grow(parent.tree, n_features, feat_names, op_affinity=_bo_op_affinity)
+                        elif macro_choice == 'prune':
+                            ct = macro_prune(parent.tree, n_features)
+                        elif macro_choice == 'graft':
+                            ct = macro_graft_feature(parent.tree, n_features, feat_names)
+                        elif macro_choice == 'rational':
+                            ct = macro_rational_grow(parent.tree, n_features)
+                        elif macro_choice == 'piecewise':
+                            ct = macro_piecewise(parent.tree, n_features, feat_names, X=X)
+                        elif macro_choice == 'inject':
+                            ct = macro_inject_subtree(parent.tree, n_features, feat_names, op_affinity=_bo_op_affinity)
+                        elif macro_choice == 'nest':
+                            ct = macro_nest_compound(parent.tree, n_features, feat_names, op_affinity=_bo_op_affinity)
+                        else:
+                            ct = macro_trig_identity(parent.tree, n_features)
+                        candidate_trees.append(ct)
+
+                    n_hof_cross = int(BAYESIAN_N_CANDIDATES * 0.10)
+                    hof_inds_bo = list(hofs[o_idx].best_by_complexity.values())
+                    if len(hof_inds_bo) >= 2:
+                        for _ in range(n_hof_cross):
+                            p1, p2 = random.sample(hof_inds_bo, 2)
+                            child_tree = crossover(p1.tree, p2.tree)
+                            child_tree = mutate(child_tree, n_features, feat_names,
+                                                mut_rate=random.choice([1, 2]),
+                                                op_affinity=_bo_op_affinity)
+                            candidate_trees.append(child_tree)
+                    else:
+                        for _ in range(n_hof_cross):
+                            candidate_trees.append(random_cgp(n_features, CGP_NODES, feat_names))
+
+                    n_random = BAYESIAN_N_CANDIDATES - n_exploit - n_cross - n_macro - n_hof_cross
+                    for _ in range(max(0, n_random)):
+                        candidate_trees.append(random_cgp(n_features, CGP_NODES, feat_names))
+
+                    ei_scores = opt.score_candidates(candidate_trees)
+
+                    n_screen = min(BAYESIAN_BATCH_SIZE * 2, len(candidate_trees))
+                    screen_indices = np.argsort(ei_scores)[-n_screen:]
+
+                    _N = X_b.shape[0]
+                    _screen_rows = min(max(50, _N // 4), _N)
+                    if _screen_rows < _N:
+                        _screen_idx = np.random.choice(_N, _screen_rows, replace=False)
+                        X_screen = X_b[_screen_idx]
+                        Y_screen = Y_b[_screen_idx]
+                        _screen_global_idx = (batch_idx[_screen_idx]
+                                              if batch_idx is not None else _screen_idx)
+                    else:
+                        X_screen, Y_screen = X_b, Y_b
+                        _screen_global_idx = batch_idx
+                    target_grads_screen = _slice_optional_rows(
+                        target_grads_list[o_idx], _screen_global_idx)
+
+                    screen_results = []
+                    for ci in screen_indices:
+                        child = Individual(candidate_trees[ci])
+                        child.calculate_fitness(
+                            X_screen, Y_screen[:, o_idx], out_types[o_idx],
+                            target_grads=target_grads_screen)
+                        screen_results.append((ci, child))
+                    total_evals += len(screen_results)
+
+                    screen_results.sort(key=lambda x: x[1].loss)
+                    top_indices = set(ci for ci, _ in screen_results[:BAYESIAN_BATCH_SIZE])
+
+                    for ci in top_indices:
+                        child = Individual(candidate_trees[ci])
+                        child.age = 0 # AFPO
+                        child.calculate_fitness(
+                            X, Y[:, o_idx], out_types[o_idx],
+                            target_grads=target_grads_list[o_idx])
+                        total_evals += 1
+
+                        pop.append(child)
+
+                        if hofs[o_idx].update(child):
+                            is_cls = (out_types[o_idx] == 6)
+                            metric = (f"Acc={getattr(child,'accuracy',0):.4f}"
+                                      if is_cls
+                                      else f"R²={getattr(child,'r2',0):.4f}")
+                            print(f"  [BO Isl-AFPO {island_idx} iter {iteration} | Out {o_idx}] "
+                                  f"New HoF (Comp {child.complexity:.0f}): "
+                                  f"loss={child.loss:.5f}  {metric}")
+
+                        opt.add_observation(child, child.tree)
+
+                    islands_pop[island_idx][o_idx] = _trim_to_pareto_front_3obj(pop, AFPO_POP_SIZE)
+
+                # Migration (every 5 iterations)
+                if iteration % 5 == 0 and NUM_ISLANDS > 1:
+                    _probe_idx_mig = np.random.choice(X.shape[0], min(16, X.shape[0]), replace=False)
+                    _X_probe_mig = X[_probe_idx_mig]
+                    for island_idx in range(NUM_ISLANDS):
+                        next_island = (island_idx + 1) % NUM_ISLANDS
+                        src_pop = islands_pop[island_idx][o_idx]
+                        n_mig = min(3, max(1, AFPO_POP_SIZE // 50))
+                        migrants = _select_diverse_migrants(src_pop, n_migrants=n_mig, X_probe=_X_probe_mig)
+                        target_pop = islands_pop[next_island][o_idx]
+                        for mig in migrants:
+                            mig_copy = copy.deepcopy(mig)
+                            mig_copy.age = 0
+                            if target_pop:
+                                worst = max(target_pop, key=lambda x: x.fitness)
+                                target_pop.remove(worst)
+                            target_pop.append(mig_copy)
+
+                if iteration % BAYESIAN_GP_REFIT_FREQ == 0:
+                    opt.fit_surrogate()
+
+            print(f"--- BO Islanded AFPO Iteration {iteration}  (total evals: {total_evals}) ---")
+
+            for o_idx in range(n_outputs):
+                if o_idx in perfect_outputs:
+                    continue
+                is_perf, best_ind = _check_output_perfect(
+                    hofs[o_idx], X, Y[:, o_idx], out_types[o_idx])
+                if is_perf:
+                    out_label = dp.output_map[o_idx] if o_idx < len(dp.output_map) else f"Out{o_idx}"
+                    print(f"\n  ★ Output {o_idx} ({out_label}) reached PERFECT performance!")
+                    _simplify_perfect_output(
+                        hofs[o_idx], X, Y[:, o_idx], out_types[o_idx],
+                        target_grads=target_grads_list[o_idx])
+                    perfect_outputs.add(o_idx)
+
+            if len(perfect_outputs) == n_outputs:
+                print("\n  ★★★ ALL outputs reached perfect performance! Stopping Bayesian Islanded AFPO.")
+                break
+
+            if iteration % 25 == 0:
+                for o_idx, hof in enumerate(hofs):
+                    out_label = (dp.output_map[o_idx]
+                                 if o_idx < len(dp.output_map) else f"Out{o_idx}")
+                    pf_tag = " [PERFECT]" if o_idx in perfect_outputs else ""
+                    hof.print_frontier(
+                        out_type=out_types[o_idx],
+                        label=f"Output {o_idx} ({out_label}){pf_tag}")
+
+            if (SIMPLIFICATION_FREQ > 0
+                    and iteration % max(1, SIMPLIFICATION_FREQ // 50) == 0):
+                print(f"\n[BO Islanded AFPO iter {iteration}] Running algebraic simplification on HoF…")
+                for o_idx, hof in enumerate(hofs):
+                    for c_key in list(hof.best_by_complexity.keys()):
+                        ind = hof.best_by_complexity[c_key]
+                        old_active = set(ind.tree.active_nodes) if ind.tree is not None else set()
+                        ind.tree = simplify_cgp_tree(ind.tree)
+                        ind.tree.update_active_nodes()
+                        _new_active = set(ind.tree.active_nodes)
+                        _union = old_active | _new_active
+                        _diff_frac = (len(_union - (old_active & _new_active))
+                                      / max(1, len(_union)))
+                        _refit = _diff_frac >= 0.25
+                        if _refit:
+                            ind.affine_fitted = False
+                        ind.calculate_fitness(
+                            X, Y[:, o_idx], out_types[o_idx],
+                            update_affine=_refit,
+                            target_grads=target_grads_list[o_idx])
+                    new_dict = {}
+                    for ind in hof.best_by_complexity.values():
+                        nc = ind.complexity
+                        if nc not in new_dict or ind.loss < new_dict[nc].loss:
+                            new_dict[nc] = ind
+                    hof.best_by_complexity = new_dict
+                    hof.sanitize()
+
+    except KeyboardInterrupt:
+        print("\nStopping Bayesian Islanded AFPO…")
+
+
 def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
                      hofs, target_grads_list, dp,
                      X_val=None, Y_val=None, BATCH_SIZE=0):
@@ -16350,10 +17384,26 @@ def train_mode():
     elif EVOLUTION_MODEL == "bayesian_cgp":
         hofs = [HallOfFame() for _ in range(n_outputs)]
 
-        run_bayesian_cgp(
-            X, Y, n_features, n_outputs, feat_names, out_types,
-            hofs, target_grads_list, dp,
-            X_val=X_val, Y_val=Y_val, BATCH_SIZE=BATCH_SIZE)
+        if BAYESIAN_VARIANT == "afpo":
+            run_bayesian_afpo(
+                X, Y, n_features, n_outputs, feat_names, out_types,
+                hofs, target_grads_list, dp,
+                X_val=X_val, Y_val=Y_val, BATCH_SIZE=BATCH_SIZE)
+        elif BAYESIAN_VARIANT == "islands":
+            run_bayesian_islands(
+                X, Y, n_features, n_outputs, feat_names, out_types,
+                hofs, target_grads_list, dp,
+                X_val=X_val, Y_val=Y_val, BATCH_SIZE=BATCH_SIZE)
+        elif BAYESIAN_VARIANT == "islanded_afpo":
+            run_bayesian_islanded_afpo(
+                X, Y, n_features, n_outputs, feat_names, out_types,
+                hofs, target_grads_list, dp,
+                X_val=X_val, Y_val=Y_val, BATCH_SIZE=BATCH_SIZE)
+        else:
+            run_bayesian_cgp(
+                X, Y, n_features, n_outputs, feat_names, out_types,
+                hofs, target_grads_list, dp,
+                X_val=X_val, Y_val=Y_val, BATCH_SIZE=BATCH_SIZE)
 
     best_models = [h.get_best_overall() for h in hofs]
 
