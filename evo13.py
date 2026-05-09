@@ -12258,6 +12258,7 @@ except ImportError:
 # repeated ``from scipy.stats import norm`` was paying a (small) import-cache
 # lookup tax inside the hot path.
 from scipy.stats import norm as _SCIPY_NORM
+from scipy.stats import rankdata
 
 
 def cgp_to_vector(cgp_eq, max_nodes, X_probe=None):
@@ -12406,17 +12407,15 @@ class BayesianCGPOptimizer:
         self.gp_fitted = False
 
     def _transform_fitness(self, loss):
-        """Transform loss to a GP-friendly target: -log(loss + eps).
-        Higher = better, roughly Gaussian for well-behaved losses.
+        """Transform loss to a GP-friendly target.
+        Higher is better. We return the negative loss here; the actual
+        Gaussian Copula transformation happens in `fit_surrogate` dynamically
+        on the buffer.
 
-        NaN-safety: ``np.clip(np.nan, …)`` returns NaN, which would otherwise
-        end up in ``y_observed`` and break GP fitting (the bare ``except`` in
-        ``fit_surrogate`` would silently set ``gp_fitted=False``, leaving
-        ``score_candidates`` to return random scores forever).  Map NaN /
-        +Inf / -Inf to a very-bad-but-finite value before the clip.
+        NaN-safety: map NaN / +Inf / -Inf to a very-bad-but-finite value.
         """
         loss = float(np.nan_to_num(loss, nan=1e10, posinf=1e10, neginf=1e10))
-        return -np.log(np.clip(loss, 1e-15, 1e10))
+        return -loss
 
     def add_observation(self, individual, cgp_eq):
         """Record an evaluated individual.
@@ -12455,10 +12454,20 @@ class BayesianCGPOptimizer:
             self.gp_fitted = False
             return
         X = X[finite]
-        y = y[finite]
+        y_finite = y[finite]
+
+        # Gaussian Copula transformation (rank-based)
+        # Maps the targets to standard normal quantiles to avoid extreme outliers
+        # (like when loss nears 0 and log(loss) explodes) that collapse the GP length-scale.
+        n = len(y_finite)
+        ranks = rankdata(y_finite, method='average')
+        uniform_y = (ranks - 0.5) / n
+        gaussian_y = _SCIPY_NORM.ppf(uniform_y)
+
         try:
-            self.gp.fit(X, y)
+            self.gp.fit(X, gaussian_y)
             self.gp_fitted = True
+            self.current_best_f = np.max(gaussian_y)
         except Exception as e:
             print(f"  [BO] GP fitting failed: {e}")
             self.gp_fitted = False
@@ -12481,7 +12490,7 @@ class BayesianCGPOptimizer:
         except Exception:
             return np.random.rand(len(candidate_trees))
 
-        best_f = max(self.y_observed)
+        best_f = getattr(self, 'current_best_f', 0.0)
         scores = _expected_improvement(mu, sigma, best_f, self.xi)
         return np.nan_to_num(scores, nan=0.0, posinf=1e12, neginf=0.0)
 
