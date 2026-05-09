@@ -202,7 +202,7 @@ SIGMA_MAX = 20.0
 # Parsimony pressure coefficient: multiplied by complexity and added to fitness.
 # Higher values favour simpler (shorter) expressions more aggressively.
 # 0.0 = no parsimony; 0.01 = gentle; 0.05 = moderate; 0.2+ = strong.
-PARSIMONY_STRENGTH = 0.01
+PARSIMONY_STRENGTH = 0.0001
 
 # How often (in generations) to retarget the residual-aware seed generator at
 # the *current* HoF-best's residuals and inject the new seeds into each
@@ -910,18 +910,8 @@ def select_ops_safety():
     print("═" * 78)
 
     while True:
-        choice = input("Safety mode [S=safe / U=unsafe / I=interval, default S]: ").strip().lower()
-        if not choice or choice.startswith('s'):
-            set_ops_mode(True)
-            INTERVAL_MODE = False
-            print("  ✓  SAFE mode active — all ops are guarded against domain errors.")
-            break
-        elif choice.startswith('u'):
-            set_ops_mode(False)
-            INTERVAL_MODE = False
-            print("  ✓  UNSAFE mode active — raw numpy semantics, exp is the real exp.")
-            break
-        elif choice.startswith('i'):
+        choice = input("Safety mode [S=safe / U=unsafe / I=interval, default I]: ").strip().lower()
+        if not choice or choice.startswith('i'):
             set_ops_mode(False)   # Interval uses the unsafe dispatch tables
             INTERVAL_MODE = True
             freq_in = input(f"  Interval check every N generations [default {INTERVAL_CHECK_FREQ}]: ").strip()
@@ -932,6 +922,16 @@ def select_ops_safety():
                     pass
             print(f"  ✓  INTERVAL mode active — unsafe ops + culling every "
                   f"{INTERVAL_CHECK_FREQ} gens.")
+            break
+        elif choice.startswith('s'):
+            set_ops_mode(True)
+            INTERVAL_MODE = False
+            print("  ✓  SAFE mode active — all ops are guarded against domain errors.")
+            break
+        elif choice.startswith('u'):
+            set_ops_mode(False)
+            INTERVAL_MODE = False
+            print("  ✓  UNSAFE mode active — raw numpy semantics, exp is the real exp.")
             break
         else:
             print("  Please enter S, U, or I.")
@@ -1137,7 +1137,7 @@ def select_allowed_ops():
     while True:
         choice = input("\nPreset number [default 3]: ").strip()
         if not choice:
-            choice = "3"
+            choice = "6"
         if choice in OP_PRESETS:
             break
         print("  Please enter a number from 1–7.")
@@ -14699,14 +14699,14 @@ def train_mode():
     print("  performance and diversity.")
     print("─" * 70)
     qd_in = input("Enable Quality-Diversity (QD) algorithms? [y/N]: ").strip().lower()
-    if qd_in.startswith('y'):
+    if qd_in.startswith('n'):
+        QUALITY_DIVERSITY_ENABLED = False
+        print("  Quality-Diversity algorithms disabled.")
+    else:
         QUALITY_DIVERSITY_ENABLED = True
         print("  ✓  Quality-Diversity algorithms ENABLED.")
         if BAYESIAN_VARIANT != "qd":
             pass # Keep user's bayesian variant if they set it. But if they enable QD generally it applies.
-    else:
-        QUALITY_DIVERSITY_ENABLED = False
-        print("  Quality-Diversity algorithms disabled.")
 
     # ---- Population size (evolutionary modes only) ----
     POP_SIZE_USER = 50
