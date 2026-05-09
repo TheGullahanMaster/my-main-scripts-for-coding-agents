@@ -12541,7 +12541,7 @@ def run_bayesian_afpo(X, Y, n_features, n_outputs, feat_names, out_types,
         for _ in range(n_outputs)
     ]
 
-    AFPO_POP_SIZE = POP_SIZE_USER * 2
+    AFPO_POP_SIZE = POPULATION_SIZE * 2
     afpo_pops = [[] for _ in range(n_outputs)]
 
     # ── Phase 1: Initial random sampling ────────────────────────────────
@@ -12859,7 +12859,7 @@ def run_bayesian_islands(X, Y, n_features, n_outputs, feat_names, out_types,
     global _INIT_PHASE
 
     NUM_ISLANDS = NUM_ISLANDS_GLOBAL
-    ISLAND_SIZE = POP_SIZE_USER
+    ISLAND_SIZE = POPULATION_SIZE
 
     print("\n" + "═" * 70)
     print("BAYESIAN ISLANDS — Surrogate-Assisted Multi-Population")
@@ -13208,7 +13208,7 @@ def run_bayesian_islanded_afpo(X, Y, n_features, n_outputs, feat_names, out_type
     global _INIT_PHASE
 
     NUM_ISLANDS = NUM_ISLANDS_GLOBAL
-    AFPO_POP_SIZE = POP_SIZE_USER * 2
+    AFPO_POP_SIZE = POPULATION_SIZE * 2
 
     print("\n" + "═" * 70)
     print("BAYESIAN ISLANDED AFPO — Surrogate-Assisted Multi-Population Pareto")
