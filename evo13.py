@@ -202,7 +202,7 @@ SIGMA_MAX = 20.0
 # Parsimony pressure coefficient: multiplied by complexity and added to fitness.
 # Higher values favour simpler (shorter) expressions more aggressively.
 # 0.0 = no parsimony; 0.01 = gentle; 0.05 = moderate; 0.2+ = strong.
-PARSIMONY_STRENGTH = 0.0001
+PARSIMONY_STRENGTH = 0.01
 
 # How often (in generations) to retarget the residual-aware seed generator at
 # the *current* HoF-best's residuals and inject the new seeds into each
@@ -2726,7 +2726,7 @@ class DataProcessor:
                 self.input_map.append(col_name)
 
             elif type_code == 2:  # Cat In (One Hot)
-                uniques = sorted(list(set(col_data)))
+                uniques = sorted(list(set(str(x) for x in col_data)))
                 self.stats[col_name] = {'classes': uniques, 'type': 2}
                 one_hot = np.zeros((len(col_data), len(uniques)))
                 for k, cls in enumerate(uniques):
@@ -12514,7 +12514,7 @@ def run_bayesian_afpo(X, Y, n_features, n_outputs, feat_names, out_types,
                       X_val=None, Y_val=None, BATCH_SIZE=0):
     """
     Bayesian CGP combined with Age-Fitness Pareto Optimisation (AFPO).
-    Maintains a population where individuals have 'age', but uses GP
+    Maintains a population where individuals have 'age', but uses GP 
     surrogates to score and select candidates instead of random mutation.
     """
     global _INIT_PHASE
@@ -12561,7 +12561,7 @@ def run_bayesian_afpo(X, Y, n_features, n_outputs, feat_names, out_types,
                 n_features, feat_names, X_init, Y_init[:, o_idx])
         except Exception:
             imp_seeds = []
-
+            
         random.shuffle(v5_seeds)
         random.shuffle(imp_seeds)
         seeds = list(imp_seeds) + list(v5_seeds)
@@ -12582,7 +12582,7 @@ def run_bayesian_afpo(X, Y, n_features, n_outputs, feat_names, out_types,
         # AFPO specifically relies on _trim_to_pareto_front_3obj (or similar)
         # to manage population size
         afpo_pops[o_idx] = _trim_to_pareto_front_3obj(afpo_pops[o_idx], AFPO_POP_SIZE)
-
+        
         print(f"  Output {o_idx}: {len(seeds)} initial samples evaluated, "
               f"best loss = {min(ind.loss for ind in seeds):.5f}")
 
@@ -12601,14 +12601,14 @@ def run_bayesian_afpo(X, Y, n_features, n_outputs, feat_names, out_types,
             opt.X_observed.clear()
             opt.y_observed.clear()
             opt.individuals.clear()
-
+            
             # Re-evaluate the population
             for ind in afpo_pops[o_idx]:
                 ind.affine_fitted = False
                 ind.calculate_fitness(X, Y[:, o_idx], out_types[o_idx],
                                       target_grads=target_grads_list[o_idx])
                 opt.add_observation(ind, ind.tree)
-
+            
             afpo_pops[o_idx] = _trim_to_pareto_front_3obj(afpo_pops[o_idx], AFPO_POP_SIZE)
 
     print("\nFitting initial GP surrogates…")
@@ -12643,7 +12643,7 @@ def run_bayesian_afpo(X, Y, n_features, n_outputs, feat_names, out_types,
                     continue
                 opt = optimizers[o_idx]
                 pop = afpo_pops[o_idx]
-
+                
                 # Age everyone in population
                 for ind in pop:
                     ind.age += 1
@@ -12655,7 +12655,7 @@ def run_bayesian_afpo(X, Y, n_features, n_outputs, feat_names, out_types,
                 _bo_op_affinity = _bo_op_affinity or None
 
                 candidate_trees = []
-
+                
                 # We draw candidates by mutating the AFPO population
                 n_exploit = int(BAYESIAN_N_CANDIDATES * 0.6)
                 for _ in range(n_exploit):
@@ -12760,7 +12760,7 @@ def run_bayesian_afpo(X, Y, n_features, n_outputs, feat_names, out_types,
                         X, Y[:, o_idx], out_types[o_idx],
                         target_grads=target_grads_list[o_idx])
                     total_evals += 1
-
+                    
                     # Add to AFPO pop
                     pop.append(child)
 
@@ -12853,7 +12853,7 @@ def run_bayesian_islands(X, Y, n_features, n_outputs, feat_names, out_types,
                          X_val=None, Y_val=None, BATCH_SIZE=0):
     """
     Bayesian CGP combined with Island Model.
-    Maintains NUM_ISLANDS separate populations and uses GP surrogates to score
+    Maintains NUM_ISLANDS separate populations and uses GP surrogates to score 
     candidates. Periodic migration occurs between islands to share diversity.
     """
     global _INIT_PHASE
@@ -12905,11 +12905,11 @@ def run_bayesian_islands(X, Y, n_features, n_outputs, feat_names, out_types,
                     n_features, feat_names, X_init, Y_init[:, o_idx])
             except Exception:
                 imp_seeds = []
-
+                
             random.shuffle(v5_seeds)
             random.shuffle(imp_seeds)
             seeds = list(imp_seeds) + list(v5_seeds)
-
+            
             # Start filling this island
             while len(seeds) < BAYESIAN_INITIAL_SAMPLES:
                 seeds.append(Individual(random_cgp(n_features, CGP_NODES, feat_names)))
@@ -12922,7 +12922,7 @@ def run_bayesian_islands(X, Y, n_features, n_outputs, feat_names, out_types,
                                                       init_idx if N_train > _INIT_SUBSAMPLE_CAP else None))
                 hofs[o_idx].update(ind)
                 optimizers[o_idx].add_observation(ind, ind.tree)
-
+                
             # Take top ISLAND_SIZE individuals to initialize this island's pop
             seeds.sort(key=lambda x: x.loss)
             islands_pop[island_idx][o_idx] = seeds[:ISLAND_SIZE]
@@ -12941,7 +12941,7 @@ def run_bayesian_islands(X, Y, n_features, n_outputs, feat_names, out_types,
             opt.X_observed.clear()
             opt.y_observed.clear()
             opt.individuals.clear()
-
+            
             # Re-evaluate all individuals across all islands
             for island_idx in range(NUM_ISLANDS):
                 for ind in islands_pop[island_idx][o_idx]:
@@ -12949,7 +12949,7 @@ def run_bayesian_islands(X, Y, n_features, n_outputs, feat_names, out_types,
                     ind.calculate_fitness(X, Y[:, o_idx], out_types[o_idx],
                                           target_grads=target_grads_list[o_idx])
                     opt.add_observation(ind, ind.tree)
-
+            
             # Re-sort islands
             for island_idx in range(NUM_ISLANDS):
                 islands_pop[island_idx][o_idx].sort(key=lambda x: x.fitness)
@@ -12997,7 +12997,7 @@ def run_bayesian_islands(X, Y, n_features, n_outputs, feat_names, out_types,
                     top_inds = pop[:max(1, len(pop)//2)]
 
                     candidate_trees = []
-
+                    
                     n_exploit = int(BAYESIAN_N_CANDIDATES * 0.6)
                     for _ in range(n_exploit):
                         parent = random.choice(top_inds) if top_inds else Individual(random_cgp(n_features, CGP_NODES, feat_names))
@@ -13099,7 +13099,7 @@ def run_bayesian_islands(X, Y, n_features, n_outputs, feat_names, out_types,
                             X, Y[:, o_idx], out_types[o_idx],
                             target_grads=target_grads_list[o_idx])
                         total_evals += 1
-
+                        
                         pop.append(child)
 
                         if hofs[o_idx].update(child):
@@ -13202,7 +13202,7 @@ def run_bayesian_islanded_afpo(X, Y, n_features, n_outputs, feat_names, out_type
                                X_val=None, Y_val=None, BATCH_SIZE=0):
     """
     Bayesian CGP combined with Islanded AFPO.
-    Maintains multiple AFPO populations, runs Bayesian generation/evaluation loops
+    Maintains multiple AFPO populations, runs Bayesian generation/evaluation loops 
     per island, and periodically migrates between islands.
     """
     global _INIT_PHASE
@@ -13254,11 +13254,11 @@ def run_bayesian_islanded_afpo(X, Y, n_features, n_outputs, feat_names, out_type
                     n_features, feat_names, X_init, Y_init[:, o_idx])
             except Exception:
                 imp_seeds = []
-
+                
             random.shuffle(v5_seeds)
             random.shuffle(imp_seeds)
             seeds = list(imp_seeds) + list(v5_seeds)
-
+            
             while len(seeds) < BAYESIAN_INITIAL_SAMPLES:
                 seeds.append(Individual(random_cgp(n_features, CGP_NODES, feat_names)))
 
@@ -13271,7 +13271,7 @@ def run_bayesian_islanded_afpo(X, Y, n_features, n_outputs, feat_names, out_type
                                                       init_idx if N_train > _INIT_SUBSAMPLE_CAP else None))
                 hofs[o_idx].update(ind)
                 optimizers[o_idx].add_observation(ind, ind.tree)
-
+                
             islands_pop[island_idx][o_idx] = _trim_to_pareto_front_3obj(seeds, AFPO_POP_SIZE)
 
     _INIT_PHASE = False
@@ -13288,7 +13288,7 @@ def run_bayesian_islanded_afpo(X, Y, n_features, n_outputs, feat_names, out_type
             opt.X_observed.clear()
             opt.y_observed.clear()
             opt.individuals.clear()
-
+            
             # Re-evaluate
             for island_idx in range(NUM_ISLANDS):
                 for ind in islands_pop[island_idx][o_idx]:
@@ -13337,12 +13337,12 @@ def run_bayesian_islanded_afpo(X, Y, n_features, n_outputs, feat_names, out_type
 
                 for island_idx in range(NUM_ISLANDS):
                     pop = islands_pop[island_idx][o_idx]
-
+                    
                     for ind in pop:
                         ind.age += 1
 
                     candidate_trees = []
-
+                    
                     n_exploit = int(BAYESIAN_N_CANDIDATES * 0.6)
                     for _ in range(n_exploit):
                         parent = random.choice(pop) if pop else Individual(random_cgp(n_features, CGP_NODES, feat_names))
@@ -13445,7 +13445,7 @@ def run_bayesian_islanded_afpo(X, Y, n_features, n_outputs, feat_names, out_type
                             X, Y[:, o_idx], out_types[o_idx],
                             target_grads=target_grads_list[o_idx])
                         total_evals += 1
-
+                        
                         pop.append(child)
 
                         if hofs[o_idx].update(child):
