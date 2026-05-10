@@ -487,6 +487,78 @@ _FITNESS_CACHE = _FitnessCache(maxsize=8000)
 _INIT_PHASE = False
 _INIT_SUBSAMPLE_CAP = 5000   # max rows during init evaluation
 
+# ============================================================
+# Per-feature priors (importance weights) shared across the
+# search.  When set, ``random_cgp`` and the rewire/decompose
+# branches of ``mutate`` bias their feature-pick toward
+# features that actually correlate with the target.  Critical
+# for problems with > 5-7 input variables, where uniform
+# feature selection drowns the relevant inputs in junk.
+#
+# The dict is keyed by output index because feature importance
+# can differ across outputs.  A None value means "fall back to
+# uniform"; the helpers below handle that case transparently.
+# ============================================================
+FEATURE_PRIORS = None        # numpy array of length n_features, or None
+FEATURE_PRIOR_BIAS = 0.65    # mixing weight: 1.0 = pure prior, 0.0 = uniform
+
+
+def set_feature_priors(weights):
+    """Set the global per-feature importance prior used during search.
+
+    ``weights`` should be a numpy array (length n_features) summing to 1.
+    Pass ``None`` to disable (fall back to uniform feature selection).
+    """
+    global FEATURE_PRIORS
+    if weights is None:
+        FEATURE_PRIORS = None
+        return
+    arr = np.asarray(weights, dtype=np.float64)
+    if not np.isfinite(arr).all() or arr.size == 0:
+        FEATURE_PRIORS = None
+        return
+    s = float(arr.sum())
+    if s <= 0:
+        FEATURE_PRIORS = None
+        return
+    FEATURE_PRIORS = arr / s
+
+
+def _pick_feature_idx(n_features, max_index=None, bias=None):
+    """Pick a feature index, optionally biased by ``FEATURE_PRIORS``.
+
+    ``max_index`` caps the upper bound (exclusive); when None, defaults to
+    ``n_features``.  When ``FEATURE_PRIORS`` is set, mixes prior * uniform
+    according to ``bias`` (defaults to ``FEATURE_PRIOR_BIAS``).  Falls
+    back to uniform when the prior is missing or has wrong shape.
+    """
+    if max_index is None:
+        max_index = n_features
+    max_index = max(1, int(max_index))
+    if max_index >= n_features:
+        max_index = n_features
+
+    if FEATURE_PRIORS is None or len(FEATURE_PRIORS) != n_features or max_index <= 1:
+        return random.randint(0, max_index - 1)
+
+    b = FEATURE_PRIOR_BIAS if bias is None else float(bias)
+    b = max(0.0, min(1.0, b))
+    # When max_index < n_features (e.g. early CGP slots that can't
+    # reference later features), restrict the prior to the feasible head
+    # and renormalise on the fly.
+    head = FEATURE_PRIORS[:max_index].astype(np.float64)
+    s = float(head.sum())
+    if s <= 0:
+        return random.randint(0, max_index - 1)
+    head = head / s
+    uniform = np.full(max_index, 1.0 / max_index, dtype=np.float64)
+    mixed = b * head + (1.0 - b) * uniform
+    mixed = mixed / float(mixed.sum())
+    try:
+        return int(np.random.choice(max_index, p=mixed))
+    except Exception:
+        return random.randint(0, max_index - 1)
+
 
 # ==========================================
 # IMPROVEMENT 2: ADAPTIVE REPRODUCTIVE OPERATOR WEIGHTS
@@ -3334,6 +3406,24 @@ def random_cgp(n_features, max_nodes, feature_names):
 
     use_structured = random.random() < 0.50
 
+    # Helper: pick a wiring index ≤ max_connect, biased toward important
+    # raw-feature inputs when ``FEATURE_PRIORS`` is set.  When the
+    # connection budget extends into the compute-node range we always
+    # default to uniform over the full range, since intermediate nodes
+    # don't carry feature-level importance.
+    def _pick_input(max_connect):
+        if max_connect <= 0:
+            return 0
+        if FEATURE_PRIORS is not None and n_features > 1:
+            # 50% of the time bias toward important features (only those
+            # below the connection cap).  The other 50% uses uniform draw
+            # over the full reachable index range so compute-node referencing
+            # remains diverse.
+            if random.random() < 0.5:
+                cap = min(n_features, max_connect + 1)
+                return _pick_feature_idx(n_features, max_index=cap)
+        return random.randint(0, max_connect)
+
     if use_structured:
         # --- Structured random: build a tree bottom-up ---
         # Target depth 2-5 nodes of active computation, ensuring every node
@@ -3355,15 +3445,33 @@ def random_cgp(n_features, max_nodes, feature_names):
                 op = random.choice(cond)
             else:
                 op = random.choice(CGPEquation.OPS_ALL)
-            in1 = random.randint(0, max_connect)
-            in2 = random.randint(0, max_connect)
-            in3 = random.randint(0, max_connect)
+            in1 = _pick_input(max_connect)
+            in2 = _pick_input(max_connect)
+            in3 = _pick_input(max_connect)
             eq.nodes.append(CGPNode(op, in1, in2, _random_const(), in3=in3))
 
         # Now build a coherent chain in the first `target_depth` slots.
         # Layer 0: operate on raw features
         # Layer k: operate on layer k-1 outputs + features
-        layer_outputs = list(range(n_features))  # start with raw features
+        # When FEATURE_PRIORS is set, seed the initial layer outputs with
+        # a prior-weighted feature subsample instead of every raw feature.
+        # That keeps the structured tree's initial fan-in concentrated on
+        # promising variables so multi-variable problems don't waste depth
+        # on irrelevant inputs.
+        if FEATURE_PRIORS is not None and n_features > 4:
+            n_seed = min(6, n_features)
+            seed_feats = []
+            tries = 0
+            while len(seed_feats) < n_seed and tries < n_features * 4:
+                f = _pick_feature_idx(n_features)
+                if f not in seed_feats:
+                    seed_feats.append(f)
+                tries += 1
+            if not seed_feats:
+                seed_feats = list(range(min(n_features, 6)))
+            layer_outputs = seed_feats
+        else:
+            layer_outputs = list(range(n_features))  # start with raw features
 
         for layer in range(target_depth):
             slot = layer
@@ -3381,7 +3489,7 @@ def random_cgp(n_features, max_nodes, feature_names):
                 in1 = random.choice(layer_outputs)
                 # For binary: sometimes pick a feature, sometimes a layer output
                 if random.random() < 0.5 and n_features > 0:
-                    in2 = random.randint(0, n_features - 1)
+                    in2 = _pick_feature_idx(n_features)
                 else:
                     in2 = random.choice(layer_outputs)
                 # Clamp to valid range
@@ -3413,9 +3521,9 @@ def random_cgp(n_features, max_nodes, feature_names):
                 op = random.choice(core)
             else:
                 op = random.choice(CGPEquation.OPS_ALL)
-            in1 = random.randint(0, max_connect)
-            in2 = random.randint(0, max_connect)
-            in3 = random.randint(0, max_connect)
+            in1 = _pick_input(max_connect)
+            in2 = _pick_input(max_connect)
+            in3 = _pick_input(max_connect)
             eq.nodes.append(CGPNode(op, in1, in2, _random_const(), in3=in3))
         eq.out_idx = random.randint(0, n_features + max_nodes - 1)
 
@@ -4272,7 +4380,8 @@ def generate_log_ols_seeds(n_features, feature_names, X, y):
     return seeds
 
 
-def _generate_rational_product_seeds(n_features, feature_names, X, y):
+def _generate_rational_product_seeds(n_features, feature_names, X, y,
+                                      feat_priority=None):
     """
     Combinatorial seeds for rational-product targets that the polynomial
     and log-OLS bases miss when ``y`` has mixed signs (so log fitting
@@ -4286,6 +4395,13 @@ def _generate_rational_product_seeds(n_features, feature_names, X, y):
     assignment in turn — for n_features ≤ 6 that's only a few dozen
     individuals, well below the population budget.  Each generated CGP
     is just 3 nodes (mul, mul, div) so they're nearly free.
+
+    When ``feat_priority`` is provided (an importance-ranked list of
+    feature indices) we draw the working pool from its top entries
+    instead of ``range(6)``.  Without this, multi-variable problems
+    where the relevant features sit beyond index 5 received no rational
+    seeds at all even though they're the exact pattern these templates
+    target.
     """
     seeds = []
     allowed = set(CGPEquation.OPS_ALL)
@@ -4295,11 +4411,18 @@ def _generate_rational_product_seeds(n_features, feature_names, X, y):
         return seeds
 
     nf = n_features
+    if feat_priority is not None:
+        feat_pool = [int(f) for f in feat_priority
+                     if 0 <= int(f) < n_features][:6]
+        if len(feat_pool) < 2:
+            feat_pool = list(range(min(n_features, 6)))
+    else:
+        feat_pool = list(range(min(n_features, 6)))
 
     # ---- 2-feature plain ratio: a / b -------------------------------
     if n_features >= 2:
-        for i in range(min(n_features, 6)):
-            for j in range(min(n_features, 6)):
+        for i in feat_pool:
+            for j in feat_pool:
                 if i == j:
                     continue
                 cgp = _make_cgp_base(n_features, feature_names)
@@ -4309,10 +4432,9 @@ def _generate_rational_product_seeds(n_features, feature_names, X, y):
 
     # ---- 3-feature (a*b)/c and a/(b*c) -----------------------------
     if n_features >= 3:
-        F = min(n_features, 6)
-        for i in range(F):
-            for j in range(i + 1, F):
-                for k in range(F):
+        for ii, i in enumerate(feat_pool):
+            for j in feat_pool[ii + 1:]:
+                for k in feat_pool:
                     if k == i or k == j:
                         continue
                     # (xi * xj) / xk
@@ -4321,9 +4443,9 @@ def _generate_rational_product_seeds(n_features, feature_names, X, y):
                     cgp.nodes[1] = CGPNode('/', nf, k)
                     cgp.out_idx = nf + 1; cgp.update_active_nodes()
                     seeds.append(Individual(cgp))
-        for i in range(F):
-            for j in range(F):
-                for k in range(j + 1, F):
+        for i in feat_pool:
+            for jj, j in enumerate(feat_pool):
+                for k in feat_pool[jj + 1:]:
                     if i == j or i == k:
                         continue
                     # xi / (xj * xk)
@@ -4338,8 +4460,7 @@ def _generate_rational_product_seeds(n_features, feature_names, X, y):
     # denominator pair.  For n_features = 4 this is a single seed; the
     # combinatorial blowup stays tiny because we cap at F=6.
     if n_features >= 4:
-        F = min(n_features, 6)
-        feats = list(range(F))
+        feats = feat_pool
         from itertools import combinations
         pairs = list(combinations(feats, 2))
         for (i, j) in pairs:
@@ -4362,9 +4483,8 @@ def _generate_rational_product_seeds(n_features, feature_names, X, y):
             best_corr = 0.0
             best_quad = None
             from itertools import combinations
-            F = min(n_features, 6)
-            for (i, j) in combinations(range(F), 2):
-                for (k, l) in combinations(range(F), 2):
+            for (i, j) in combinations(feat_pool, 2):
+                for (k, l) in combinations(feat_pool, 2):
                     if {i, j} & {k, l}:
                         continue
                     den = X[:, k] * X[:, l]
@@ -4401,7 +4521,7 @@ def _generate_rational_product_seeds(n_features, feature_names, X, y):
     return seeds
 
 
-def _generate_reused_input_seeds(n_features, feature_names):
+def _generate_reused_input_seeds(n_features, feature_names, feat_priority=None):
     """
     Templates that reuse the *same* features in multiple sub-expressions,
     targeting compositional targets such as
@@ -4414,8 +4534,9 @@ def _generate_reused_input_seeds(n_features, feature_names):
     but a mismatch for compositional algebra where the same variable
     threads through several sub-formulas.
 
-    For every ordered pair (i, j) with i ≠ j (capped at the first six
-    features) we emit:
+    For every ordered pair (i, j) with i ≠ j (capped at six features —
+    selected from ``feat_priority`` when given, otherwise the first six)
+    we emit:
 
       • A·B − A/B           (the user's canonical example)
       • A·B + A/B
@@ -4429,13 +4550,26 @@ def _generate_reused_input_seeds(n_features, feature_names):
 
     These are CGP-cheap (≤ 12 nodes each) but cover the structural
     blueprint that pure mutation has to discover otherwise.
+
+    When ``n_features`` exceeds 6, restricting templates to ``range(6)``
+    starves multi-variable problems of compositional priors — the
+    relevant features may simply be at higher indices.  ``feat_priority``
+    is a list of feature indices ordered most-→least important; we take
+    its first six entries instead.
     """
     seeds = []
     allowed = set(CGPEquation.OPS_ALL)
     if n_features < 2:
         return seeds
 
-    F = min(n_features, 6)
+    if feat_priority is not None:
+        feat_pool = [int(f) for f in feat_priority
+                     if 0 <= int(f) < n_features][:6]
+        if len(feat_pool) < 2:
+            feat_pool = list(range(min(n_features, 6)))
+    else:
+        feat_pool = list(range(min(n_features, 6)))
+    F = len(feat_pool)
     nf = n_features
 
     have_mul = '*' in allowed
@@ -4452,8 +4586,8 @@ def _generate_reused_input_seeds(n_features, feature_names):
     have_neg = 'neg' in allowed
     have_square = 'square' in allowed
 
-    for i in range(F):
-        for j in range(F):
+    for i in feat_pool:
+        for j in feat_pool:
             if i == j:
                 continue
 
@@ -4626,7 +4760,7 @@ def _generate_reused_input_seeds(n_features, feature_names):
     #       A² + 1/A
     #       (A + 1) · (A − 1)  = A² − 1
     if have_mul and have_sin and have_cos and have_add:
-        for i in range(min(n_features, 6)):
+        for i in feat_pool:
             cgp = _make_cgp_base(n_features, feature_names)
             cgp.nodes[0] = CGPNode('sin', i, 0)
             cgp.nodes[1] = CGPNode('*', i, nf)             # A · sin(A)
@@ -4636,7 +4770,7 @@ def _generate_reused_input_seeds(n_features, feature_names):
             seeds.append(Individual(cgp))
 
     if have_mul and have_div and have_add:
-        for i in range(min(n_features, 6)):
+        for i in feat_pool:
             cgp = _make_cgp_base(n_features, feature_names)
             if have_square:
                 cgp.nodes[0] = CGPNode('square', i, 0)
@@ -4684,13 +4818,25 @@ def generate_importance_biased_seeds(n_features, feature_names, X, y):
     except Exception:
         pass
 
+    # Compute feature importance EARLY so it can prioritise the rational-
+    # product and reused-input seed feature pools below.  When
+    # ``n_features`` exceeds 6 those templates (capped at six features)
+    # were starving on ``range(6)`` regardless of which features
+    # actually correlated with the target — multi-variable problems with
+    # relevant inputs at higher indices received no compositional or
+    # rational seeds at all.
+    importance, transform_imp, pair_imp = compute_feature_importance(X, y)
+    data_consts = compute_data_constants(X, y)
+    ranked = sorted(importance.items(), key=lambda x: -x[1])
+    feat_priority = [f for f, _ in ranked]
+
     # ── Combinatorial rational-product seeds ───────────────────────────
-    # Hard-coded (xᵢ·xⱼ)/(xₖ·xₗ) style templates over the first few
+    # Hard-coded (xᵢ·xⱼ)/(xₖ·xₗ) style templates over the top ranked
     # features.  Catches the user's canonical a·b/(c·d) target even when
     # log-OLS bails out on mixed-sign data.
     try:
         rat_seeds = _generate_rational_product_seeds(
-            n_features, feature_names, X, y)
+            n_features, feature_names, X, y, feat_priority=feat_priority)
         seeds.extend(rat_seeds)
     except Exception:
         pass
@@ -4703,16 +4849,11 @@ def generate_importance_biased_seeds(n_features, feature_names, X, y):
     # compositional ones, where the variable threads through several
     # branches of the formula.
     try:
-        ru_seeds = _generate_reused_input_seeds(n_features, feature_names)
+        ru_seeds = _generate_reused_input_seeds(
+            n_features, feature_names, feat_priority=feat_priority)
         seeds.extend(ru_seeds)
     except Exception:
         pass
-
-    importance, transform_imp, pair_imp = compute_feature_importance(X, y)
-    data_consts = compute_data_constants(X, y)
-
-    # Sort features by importance
-    ranked = sorted(importance.items(), key=lambda x: -x[1])
 
     # For the top-3 most important features, seed with their best transform
     for feat_idx, imp in ranked[:3]:
@@ -6858,7 +6999,26 @@ def _build_random_mini_tree(child_eq, n_features, start_slot, max_depth=3,
 
     def _pick_input():
         pool = list(available_inputs) + [n_features + s for s in slots_used]
-        return random.choice(pool) if pool else random.randint(0, n_features - 1)
+        if not pool:
+            return _pick_feature_idx(n_features) if n_features > 0 else 0
+        # When a feature-importance prior is available, favour drawing
+        # raw-feature inputs from the prior 50% of the time.  Otherwise
+        # fall back to uniform draw across the full pool.
+        if (FEATURE_PRIORS is not None and n_features > 4
+                and random.random() < 0.5):
+            raw_feats = [p for p in pool if p < n_features]
+            if raw_feats:
+                # Choose by prior weight among the available raw features.
+                w = np.array(
+                    [max(1e-3, FEATURE_PRIORS[p])
+                     if 0 <= p < len(FEATURE_PRIORS) else 1e-3
+                     for p in raw_feats], dtype=np.float64)
+                w = w / w.sum()
+                try:
+                    return int(np.random.choice(raw_feats, p=w))
+                except Exception:
+                    pass
+        return random.choice(pool)
 
     # Conditional mini-tree branch: 20% probability when if_else is available
     # and we have at least 4 slots to spend on a gt + 2 const + if_else pattern.
@@ -7019,11 +7179,31 @@ def mutate(parent_eq, n_features, feature_names, mut_rate=None, temperature=0.0,
                 else:
                     target.op = random.choice(CGPEquation.OPS_ALL)
         elif choice == 'rewire1':
-            target.in1 = random.randint(0, max_connect)
+            # Rewires occasionally bias toward important features when a
+            # global FEATURE_PRIORS prior has been set.  Without this, on
+            # high-feature problems most rewires connect to junk variables
+            # and the search can't find compositions involving the right
+            # inputs in any reasonable budget.
+            if (FEATURE_PRIORS is not None and n_features > 4
+                    and random.random() < 0.5):
+                cap = min(n_features, max_connect + 1)
+                target.in1 = _pick_feature_idx(n_features, max_index=cap)
+            else:
+                target.in1 = random.randint(0, max_connect)
         elif choice == 'rewire2':
-            target.in2 = random.randint(0, max_connect)
+            if (FEATURE_PRIORS is not None and n_features > 4
+                    and random.random() < 0.5):
+                cap = min(n_features, max_connect + 1)
+                target.in2 = _pick_feature_idx(n_features, max_index=cap)
+            else:
+                target.in2 = random.randint(0, max_connect)
         elif choice == 'rewire3':
-            target.in3 = random.randint(0, max_connect)
+            if (FEATURE_PRIORS is not None and n_features > 4
+                    and random.random() < 0.5):
+                cap = min(n_features, max_connect + 1)
+                target.in3 = _pick_feature_idx(n_features, max_index=cap)
+            else:
+                target.in3 = random.randint(0, max_connect)
         elif choice == 'perturb_const':
             noise_sigma = (abs(target.const_val) * 0.3 + 1.0) * perturb_scale
             target.const_val += random.gauss(0, noise_sigma)
@@ -7133,9 +7313,24 @@ def mutate(parent_eq, n_features, feature_names, mut_rate=None, temperature=0.0,
                 if used_list and random.random() < 0.30:
                     new_feat = random.choice(used_list)
                 elif unused:
-                    new_feat = random.choice(unused)
+                    # Pick the unused feature with the highest importance
+                    # prior (when available).  Without this, decompose was
+                    # picking irrelevant features uniformly when n_features
+                    # was large, so the decomposition rarely added signal.
+                    if FEATURE_PRIORS is not None and n_features > 4 and len(unused) > 1:
+                        unused_sorted = sorted(
+                            unused, key=lambda f: -FEATURE_PRIORS[f]
+                            if 0 <= f < len(FEATURE_PRIORS) else 0)
+                        # 60% top-half, 40% uniform — preserve some exploration
+                        if random.random() < 0.60:
+                            new_feat = unused_sorted[
+                                random.randrange(max(1, len(unused_sorted) // 2))]
+                        else:
+                            new_feat = random.choice(unused)
+                    else:
+                        new_feat = random.choice(unused)
                 else:
-                    new_feat = random.randint(0, n_features - 1)
+                    new_feat = _pick_feature_idx(n_features)
                 # Build: unary(feature) or const*feature
                 unary_ops = CGPEquation.OPS_UNARY or []
                 if unary_ops and random.random() < 0.6:
@@ -12261,63 +12456,252 @@ from scipy.stats import norm as _SCIPY_NORM
 from scipy.stats import rankdata
 
 
-def cgp_to_vector(cgp_eq, max_nodes, X_probe=None):
+# ── Operator categories used by the GP-surrogate descriptor ───────────────
+# Grouping operators into ~8 semantic classes turns the 30-40 distinct ops
+# into a low-cardinality histogram that the GP can actually model.  The raw
+# per-node op index used to dominate the genotype vector with high-frequency
+# noise that swamped the meaningful structural signal.
+_BO_OP_CATEGORIES = {
+    'arith':   {'+', '-', '*', '/', 'square', 'cube', 'inv', 'neg', 'abs'},
+    'trig':    {'sin', 'cos', 'tan', 'sinh', 'cosh', 'asin', 'acos', 'atan'},
+    'bounded': {'tanh', 'sigmoid', 'erf', 'sinc'},
+    'expon':   {'exp', '10^x', 'pow'},
+    'log':     {'log', 'log10', 'sqrt'},
+    'cond':    {'gt', 'lt', 'gte', 'lte', 'if_else', 'min', 'max', 'sign'},
+    'const':   {'const'},
+}
+_BO_OP_CATEGORY_LIST = ['arith', 'trig', 'bounded', 'expon',
+                        'log', 'cond', 'const', 'other']
+_BO_NUM_OP_CATEGORIES = len(_BO_OP_CATEGORY_LIST)
+_BO_OP_TO_CATEGORY = {}
+for _cat, _ops in _BO_OP_CATEGORIES.items():
+    for _op in _ops:
+        _BO_OP_TO_CATEGORY[_op] = _cat
+
+
+def _bo_op_category(op_name: str) -> str:
+    """Return the semantic category for a CGP operator name."""
+    return _BO_OP_TO_CATEGORY.get(op_name, 'other')
+
+
+# Public dimensionality helpers.  ``BayesianCGPOptimizer.__init__`` and the
+# ARD kernel both need to know the encoding layout in advance so the GP can
+# be built before any individual is encoded.
+_BO_STRUCT_HEADER_DIMS = (
+    1                            # 0:  active node count / max_nodes
+    + _BO_NUM_OP_CATEGORIES      # 1..N: op-category histogram (sums to 1 if active)
+    + 4                          # constants stats: count, mean_tanh, std_tanh, abs_max_tanh
+    + 3                          # output kind one-hot: (feat, const, compute)
+    + 1                          # active depth / max_nodes
+)
+
+
+def _bo_struct_dim(n_features: int) -> int:
+    """Total dimensionality of the genotype-structural part of the encoding."""
+    return _BO_STRUCT_HEADER_DIMS + max(0, int(n_features))
+
+
+def _bo_phenotype_dim(probe_size: int, has_y_probe: bool) -> int:
+    """Total dimensionality of the phenotype/probe part of the encoding."""
+    return (4 if has_y_probe else 0) + max(0, int(probe_size))
+
+
+def cgp_to_vector(cgp_eq, max_nodes, X_probe=None, y_probe=None,
+                  y_probe_stats=None):
     """
-    Encode a CGPEquation as a fixed-length numeric vector suitable for GP
-    surrogate modelling.
+    Encode a CGPEquation as a fixed-length descriptor for the GP surrogate.
 
-    Encoding per node (5 values):
-      [op_index_normalised, in1_normalised, in2_normalised, in3_normalised, const_val_norm]
+    The previous encoding interleaved per-node ``[op_idx, in1, in2, in3, c]``
+    tuples for every node slot, producing a ~125-dim vector dominated by
+    high-frequency noise (inactive nodes, normalised wiring indices).
+    A 5/2-Matérn GP with a single isotropic length scale could not separate
+    the signal from the noise — most of the GP's modelling capacity went
+    into fitting random differences in junk-DNA wiring.
 
-    Plus:
-      - one trailing element for out_idx_normalised.
-      - phenotypic probe outputs (if X_probe is provided).
+    This re-encoding is structural and phenotype-aware:
 
-    Inactive nodes are masked (all features set to -1.0) to reduce genotype noise.
-    Constants are squashed using tanh to handle wide ranges gracefully.
+      Structural part (deterministic-length):
+        ─ active node count / max_nodes                      (complexity)
+        ─ operator-category histogram (8 cells, sums to 1)   (structural shape)
+        ─ constants stats: count, mean_tanh, std_tanh, |max|_tanh
+        ─ output-kind 3-vector: 1.0 for (feature | const-node | compute-node)
+        ─ active-depth / max_nodes                           (chain length)
+        ─ per-feature usage fraction (n_features cells)      (variable selection)
+
+      Phenotype part (only when X_probe is given):
+        ─ phenotype-vs-target summary (4 cells, when y_probe is given):
+            * Pearson r(preds, y_probe)
+            * tanh(- normalised_rmse)         (higher is better)
+            * sign-agreement fraction (preds vs y_probe)
+            * tanh(std(preds) / std(y_probe)) (output-scale match)
+        ─ phenotype probe (probe_size cells, robustly normalised)
+
+    Why this matters for symbolic regression
+    ----------------------------------------
+    The phenotype-vs-target block lets the GP learn directly from
+    ``how well does this candidate explain the target``, which is the
+    actual signal the surrogate needs.  The per-feature usage vector
+    scales naturally with ``n_features`` instead of disappearing into
+    normalised wiring indices that compress to ~0.04 spacing once
+    ``n_features`` exceeds 10.  Combined the encoding is typically
+    ~30-50 dimensions for n_features ≤ 25, which a single Matérn 5/2
+    kernel can model reliably with the buffer sizes BO maintains.
     """
     n_feat = cgp_eq.n_features
-    total_slots = n_feat + max_nodes
-    ops_list = CGPEquation.OPS_ALL
-    n_ops = len(ops_list)
-    op_to_idx = {op: i for i, op in enumerate(ops_list)}
 
     cgp_eq.update_active_nodes()
     active = cgp_eq.active_nodes
 
-    vec_parts = []
+    # Pre-compute slot → node mapping for active compute nodes
+    active_compute_nodes = []
+    feature_use_counts = np.zeros(max(n_feat, 1), dtype=np.float64)
+    op_hist = np.zeros(_BO_NUM_OP_CATEGORIES, dtype=np.float64)
+    const_vals = []
+    max_active_idx = -1
 
-    # 1. Genotype encoding
-    genotype_vec = np.full(max_nodes * 5, -1.0, dtype=np.float64)
-    for i, node in enumerate(cgp_eq.nodes[:max_nodes]):
-        idx = n_feat + i
-        if idx not in active:
+    for idx in active:
+        if idx < n_feat:
+            # Feature index is "used" if it appears as an active input
+            if idx < len(feature_use_counts):
+                feature_use_counts[idx] += 1.0
             continue
+        node_pos = idx - n_feat
+        if 0 <= node_pos < len(cgp_eq.nodes):
+            node = cgp_eq.nodes[node_pos]
+            active_compute_nodes.append(node)
+            cat = _bo_op_category(node.op)
+            try:
+                cat_idx = _BO_OP_CATEGORY_LIST.index(cat)
+                op_hist[cat_idx] += 1.0
+            except ValueError:
+                op_hist[-1] += 1.0  # 'other' bucket
+            if node.op == 'const':
+                const_vals.append(float(node.const_val))
+            if node_pos > max_active_idx:
+                max_active_idx = node_pos
 
-        base = i * 5
-        # Normalised op index in [0, 1]
-        genotype_vec[base + 0] = op_to_idx.get(node.op, 0) / max(n_ops - 1, 1)
-        # Normalised input indices in [0, 1]
-        genotype_vec[base + 1] = node.in1 / max(total_slots - 1, 1)
-        genotype_vec[base + 2] = node.in2 / max(total_slots - 1, 1)
-        genotype_vec[base + 3] = node.in3 / max(total_slots - 1, 1)
-        # Squashed constant value in [-1, 1]
-        genotype_vec[base + 4] = np.tanh(node.const_val / 10.0)
+    n_active = len(active_compute_nodes)
 
-    vec_parts.append(genotype_vec)
+    # Normalise op histogram so it always sums to 1 (or stays all-zero for
+    # degenerate "output is a feature/const" individuals).  Without
+    # normalisation the GP receives the raw count and gets confused between
+    # "small expression with all arith" and "large expression with mixed ops".
+    op_hist_total = float(op_hist.sum())
+    if op_hist_total > 0:
+        op_hist = op_hist / op_hist_total
 
-    # 2. Output pointer
-    vec_parts.append(np.array([cgp_eq.out_idx / max(total_slots - 1, 1)]))
+    # Constants stats — tanh-squashed to keep them in [-1, 1]
+    if const_vals:
+        const_arr = np.asarray(const_vals, dtype=np.float64)
+        c_count = min(1.0, len(const_vals) / max(1.0, max_nodes))
+        c_mean  = float(np.tanh(np.mean(const_arr) / 10.0))
+        c_std   = float(np.tanh(np.std(const_arr) / 10.0))
+        c_amax  = float(np.tanh(np.max(np.abs(const_arr)) / 10.0))
+    else:
+        c_count = 0.0
+        c_mean = 0.0
+        c_std = 0.0
+        c_amax = 0.0
 
-    # 3. Phenotypic encoding (Probe outputs)
+    # Output-kind one-hot
+    out_idx = cgp_eq.out_idx
+    out_is_feat    = 1.0 if (0 <= out_idx < n_feat) else 0.0
+    out_is_const   = 0.0
+    out_is_compute = 0.0
+    if out_idx >= n_feat:
+        op = (cgp_eq.nodes[out_idx - n_feat].op
+              if (out_idx - n_feat) < len(cgp_eq.nodes) else 'other')
+        if op == 'const':
+            out_is_const = 1.0
+        else:
+            out_is_compute = 1.0
+
+    # Active-depth proxy: distance of furthest active node from feature row
+    active_depth = (max_active_idx + 1) / max(max_nodes, 1) if max_active_idx >= 0 else 0.0
+
+    # Per-feature usage fraction (relative to active node count)
+    if n_active > 0:
+        feature_use_norm = feature_use_counts / max(n_active, 1.0)
+    else:
+        feature_use_norm = feature_use_counts  # all zeros
+
+    # Final structural header
+    struct = np.empty(_bo_struct_dim(n_feat), dtype=np.float64)
+    cur = 0
+    struct[cur] = n_active / max(max_nodes, 1); cur += 1
+    struct[cur:cur + _BO_NUM_OP_CATEGORIES] = op_hist; cur += _BO_NUM_OP_CATEGORIES
+    struct[cur] = c_count; cur += 1
+    struct[cur] = c_mean;  cur += 1
+    struct[cur] = c_std;   cur += 1
+    struct[cur] = c_amax;  cur += 1
+    struct[cur] = out_is_feat;    cur += 1
+    struct[cur] = out_is_const;   cur += 1
+    struct[cur] = out_is_compute; cur += 1
+    struct[cur] = active_depth;   cur += 1
+    if n_feat > 0:
+        struct[cur:cur + n_feat] = np.clip(feature_use_norm, 0.0, 4.0)
+        cur += n_feat
+
+    vec_parts = [struct]
+
+    # ── Phenotype block ─────────────────────────────────────────────────
     if X_probe is not None:
         try:
             preds = cgp_eq.evaluate(X_probe)
-            # Normalise/clamp probe outputs to prevent scale issues in GP
-            preds = np.tanh(np.nan_to_num(preds, nan=0.0) / 10.0)
-            vec_parts.append(preds)
+            preds = np.nan_to_num(preds, nan=0.0, posinf=1e9, neginf=-1e9)
         except Exception:
-            vec_parts.append(np.zeros(X_probe.shape[0]))
+            preds = np.zeros(X_probe.shape[0], dtype=np.float64)
+
+        if y_probe is not None and len(y_probe) == len(preds):
+            y_arr = np.asarray(y_probe, dtype=np.float64)
+            # Pearson correlation
+            if np.std(preds) > 1e-12 and np.std(y_arr) > 1e-12:
+                try:
+                    r = float(np.corrcoef(preds, y_arr)[0, 1])
+                    if not np.isfinite(r):
+                        r = 0.0
+                except Exception:
+                    r = 0.0
+            else:
+                r = 0.0
+            # Normalised RMSE — affine-invariant by design (we use the
+            # candidate's affine fit if available, otherwise raw preds).
+            if y_probe_stats is not None:
+                y_std = max(float(y_probe_stats.get('std', 1.0)), 1e-12)
+            else:
+                y_std = max(float(np.std(y_arr)), 1e-12)
+            rmse = float(np.sqrt(np.mean((preds - y_arr) ** 2)))
+            nrmse = rmse / y_std
+            nrmse_signal = float(np.tanh(-nrmse))  # higher = better fit
+            # Sign agreement on centred predictions
+            try:
+                pc = preds - np.mean(preds)
+                yc = y_arr - np.mean(y_arr)
+                agree = float(np.mean(np.sign(pc) == np.sign(yc)))
+            except Exception:
+                agree = 0.5
+            # Output-scale match
+            try:
+                scale_match = float(np.tanh(
+                    np.std(preds) / max(y_std, 1e-12)))
+            except Exception:
+                scale_match = 0.0
+            vec_parts.append(np.array([r, nrmse_signal,
+                                       2.0 * agree - 1.0, scale_match],
+                                      dtype=np.float64))
+
+        # Phenotypic probe — robust normalisation against y stats when
+        # available, else by the prediction's own MAD.
+        if y_probe_stats is not None:
+            y_std = max(float(y_probe_stats.get('std', 1.0)), 1e-12)
+            y_mean = float(y_probe_stats.get('mean', 0.0))
+            preds_n = (preds - y_mean) / y_std
+            preds_n = np.tanh(preds_n / 3.0)  # gentle saturation at ~3σ
+        else:
+            mad = float(np.median(np.abs(preds - np.median(preds))))
+            scale = max(mad * 1.4826, 1.0)
+            preds_n = np.tanh((preds - np.median(preds)) / (3.0 * scale))
+        vec_parts.append(preds_n.astype(np.float64))
 
     return np.concatenate(vec_parts)
 
@@ -12381,13 +12765,23 @@ class BayesianCGPOptimizer:
     """
 
     def __init__(self, n_features, max_nodes, feat_names, X_probe=None,
+                 y_probe=None, y_probe_stats=None,
                  max_points=500, xi=0.01):
         self.n_features = n_features
         self.max_nodes  = max_nodes
         self.feat_names = feat_names
         self.X_probe    = X_probe
-        probe_size      = X_probe.shape[0] if X_probe is not None else 0
-        self.vec_dim    = max_nodes * 5 + 1 + probe_size
+        self.y_probe    = y_probe
+        # ``y_probe_stats`` (dict with keys ``mean`` / ``std``) is computed
+        # against the FULL training target so the probe normalisation in
+        # ``cgp_to_vector`` is invariant across BO iterations even when the
+        # probe set changes.  Without this, two identical genotypes evaluated
+        # against differently-scaled probe samples would produce different
+        # encoded vectors and confuse the surrogate.
+        self.y_probe_stats = y_probe_stats
+        probe_size = X_probe.shape[0] if X_probe is not None else 0
+        self.vec_dim = (_bo_struct_dim(n_features)
+                        + _bo_phenotype_dim(probe_size, y_probe is not None))
         self.xi         = xi
         self.max_points = max_points
 
@@ -12396,9 +12790,17 @@ class BayesianCGPOptimizer:
         self.y_observed = []   # transformed fitness (neg log loss)
         self.individuals = []  # matching Individual objects
 
-        # GP surrogate — Matérn 5/2 + WhiteKernel for noise
+        # GP surrogate — anisotropic Matérn 5/2 + WhiteKernel for noise.
+        # Per-dimension length scales (ARD) let the GP discover that the
+        # phenotype-vs-target block carries far more signal than the
+        # operator histogram or per-feature usage; with isotropic length
+        # scales the relevant dimensions were drowned in less informative
+        # ones and EI was effectively guessing.  We bound length scales
+        # tightly enough that the optimiser converges in 2-3 restarts even
+        # at our 500-point buffer cap.
         kernel = (ConstantKernel(1.0, (1e-3, 1e3))
-                  * Matern(length_scale=1.0, length_scale_bounds=(1e-2, 1e2),
+                  * Matern(length_scale=np.ones(self.vec_dim, dtype=np.float64),
+                           length_scale_bounds=(1e-2, 1e2),
                            nu=2.5)
                   + WhiteKernel(noise_level=0.1, noise_level_bounds=(1e-5, 1e1)))
         self.gp = GaussianProcessRegressor(
@@ -12417,6 +12819,14 @@ class BayesianCGPOptimizer:
         loss = float(np.nan_to_num(loss, nan=1e10, posinf=1e10, neginf=1e10))
         return -loss
 
+    def _encode(self, cgp_eq):
+        """Encode a CGP equation using the configured probe/y stats."""
+        return cgp_to_vector(
+            cgp_eq, self.max_nodes,
+            X_probe=self.X_probe,
+            y_probe=self.y_probe,
+            y_probe_stats=self.y_probe_stats)
+
     def add_observation(self, individual, cgp_eq):
         """Record an evaluated individual.
 
@@ -12427,7 +12837,7 @@ class BayesianCGPOptimizer:
         observations.  Worst-first preserves the high-quality signal
         for the GP.
         """
-        vec = cgp_to_vector(cgp_eq, self.max_nodes, X_probe=self.X_probe)
+        vec = self._encode(cgp_eq)
         y   = self._transform_fitness(individual.loss)
         self.X_observed.append(vec)
         self.y_observed.append(y)
@@ -12483,8 +12893,8 @@ class BayesianCGPOptimizer:
         if not self.gp_fitted or len(self.X_observed) < 10:
             return np.random.rand(len(candidate_trees))
 
-        vecs = np.asarray([cgp_to_vector(t, self.max_nodes, X_probe=self.X_probe)
-                           for t in candidate_trees], dtype=np.float64)
+        vecs = np.asarray([self._encode(t) for t in candidate_trees],
+                          dtype=np.float64)
         try:
             mu, sigma = self.gp.predict(vecs, return_std=True)
         except Exception:
@@ -12508,6 +12918,239 @@ class BayesianCGPOptimizer:
                 f"GP_fitted={self.gp_fitted}")
 
 
+# ════════════════════════════════════════════════════════════════
+# QUALITY-DIVERSITY (MAP-ELITES) ARCHIVE
+# ════════════════════════════════════════════════════════════════
+# Symbolic regression often gets trapped in seed basins: the population
+# converges to a single template (e.g. linear OLS) and never explores other
+# equally-promising structural niches.  Quality-Diversity (Mouret &
+# Clune, 2015 — MAP-Elites) breaks this by maintaining an *archive* of
+# the best individual found in each cell of a behavioural-descriptor
+# (BD) space, instead of a single elitist front.
+#
+# For symbolic regression the BD that matters most is structural:
+#   ─ which features the expression actually uses
+#   ─ what kind of operators dominate the active subgraph
+#   ─ how complex the active subgraph is
+# We hash these into a 3-tuple so the archive is dense (one cell per
+# observed combination) rather than a fixed grid.  Selection samples
+# cells uniformly so rare-but-good niches get attention proportional to
+# their absence in the rest of the population.
+
+class QualityDiversityArchive:
+    """MAP-Elites style archive over the symbolic-regression behaviour space.
+
+    Behavioural descriptor (BD) for an individual:
+        ( complexity_bucket , feature_subset_signature , dominant_op_class )
+
+    where:
+      ─ complexity_bucket = floor(active_node_count / 3) clipped to ``max_complexity_buckets``
+      ─ feature_subset_signature = sorted tuple of feature indices that appear
+        as inputs in the active subgraph (capped at ``max_feat_in_signature``
+        to keep the archive bounded as ``n_features`` grows)
+      ─ dominant_op_class = the operator category (arith/trig/expon/log/cond/…)
+        that contributes the most active nodes; ties broken by category order
+
+    Each cell stores the best-loss individual found there.  ``add()`` returns
+    True when the candidate replaces the cell's previous occupant (or
+    establishes a new cell), which the BO loop uses to drive a "novelty"
+    counter without needing a separate novelty estimator.
+    """
+
+    def __init__(self, n_features, max_nodes, max_feat_in_signature=8):
+        self.n_features = n_features
+        self.max_nodes = max_nodes
+        self.max_feat_in_signature = max_feat_in_signature
+        self.cells = {}            # bd_key → Individual
+        self.add_count = 0         # total successful adds (for stats)
+        self.last_replace_iter = 0
+
+    # ── BD computation ──────────────────────────────────────────────────
+    def descriptor(self, individual):
+        """Compute the behavioural-descriptor key for ``individual``."""
+        tree = individual.tree if hasattr(individual, 'tree') else individual
+        try:
+            tree.update_active_nodes()
+        except Exception:
+            return ('error', (), 'other')
+
+        n_feat = tree.n_features
+        active = tree.active_nodes
+
+        feat_used = sorted(idx for idx in active if idx < n_feat)
+        # Cap signature length so cells don't proliferate when many features
+        # are nominally "used"; we keep the lowest-indexed ones because they
+        # are typically the most important after feature ranking.
+        if len(feat_used) > self.max_feat_in_signature:
+            feat_used = feat_used[:self.max_feat_in_signature]
+        feat_sig = tuple(feat_used)
+
+        # Operator histogram → dominant class
+        op_counts = {cat: 0 for cat in _BO_OP_CATEGORY_LIST}
+        n_active = 0
+        for idx in active:
+            if idx < n_feat:
+                continue
+            pos = idx - n_feat
+            if 0 <= pos < len(tree.nodes):
+                cat = _bo_op_category(tree.nodes[pos].op)
+                op_counts[cat] = op_counts.get(cat, 0) + 1
+                n_active += 1
+
+        if n_active == 0:
+            dominant = 'const'
+        else:
+            # Pick the category with the most nodes; deterministic tie-break
+            dominant = max(_BO_OP_CATEGORY_LIST,
+                           key=lambda c: (op_counts.get(c, 0), -_BO_OP_CATEGORY_LIST.index(c)))
+
+        # Complexity bucket — log-linear so simple expressions get more
+        # resolution near the origin, matching where most of the search
+        # spends its time.
+        bucket = min(8, int(np.log2(max(1, n_active)) + 1))
+
+        return (bucket, feat_sig, dominant)
+
+    # ── Archive management ─────────────────────────────────────────────
+    def add(self, individual, iteration=None):
+        """Insert ``individual`` if better than the current cell occupant.
+
+        Returns True iff the cell was created or replaced.  The BO loop
+        treats this as a novelty signal: bursts of new-cell discoveries
+        mean the search is exploring fresh territory; a long quiet stretch
+        means the BD space has saturated and exploration should ramp up.
+        """
+        loss = float(getattr(individual, 'loss', np.inf))
+        if not np.isfinite(loss):
+            return False
+        key = self.descriptor(individual)
+        prev = self.cells.get(key)
+        if prev is None or loss < float(getattr(prev, 'loss', np.inf)) - 1e-9:
+            try:
+                stored = copy.deepcopy(individual)
+            except Exception:
+                stored = individual
+            self.cells[key] = stored
+            self.add_count += 1
+            if iteration is not None:
+                self.last_replace_iter = iteration
+            return True
+        return False
+
+    # ── Sampling & queries ─────────────────────────────────────────────
+    def sample(self, n=1, prefer_new=True):
+        """Return up to ``n`` individuals uniformly sampled from the archive.
+
+        When ``prefer_new`` is True we bias the draw toward sparsely-explored
+        cells (uniform over cells, not over individuals): cells with one
+        member get the same selection probability as cells with many,
+        which is exactly the QD diversification objective.
+        """
+        if not self.cells:
+            return []
+        keys = list(self.cells.keys())
+        if n >= len(keys):
+            return [self.cells[k] for k in keys]
+        if prefer_new:
+            picks = random.sample(keys, n)
+        else:
+            picks = [random.choice(keys) for _ in range(n)]
+        return [self.cells[k] for k in picks]
+
+    def best(self, n=5):
+        """Return the lowest-loss occupants across all cells."""
+        if not self.cells:
+            return []
+        ranked = sorted(self.cells.values(),
+                        key=lambda x: float(getattr(x, 'loss', np.inf)))
+        return ranked[:n]
+
+    def coverage(self):
+        return len(self.cells)
+
+    def best_loss(self):
+        if not self.cells:
+            return float('inf')
+        return min(float(getattr(ind, 'loss', np.inf))
+                   for ind in self.cells.values())
+
+    def summary_str(self):
+        if not self.cells:
+            return "QD archive: empty"
+        return (f"QD cells={self.coverage()}, adds={self.add_count}, "
+                f"best_loss={self.best_loss():.5f}")
+
+
+def _bo_build_optimizers(n_features, n_outputs, feat_names, X, Y, X_probe, probe_idx):
+    """Construct one ``BayesianCGPOptimizer`` per output, supplying the
+    target-aware probe statistics each one needs.
+
+    The previous code instantiated optimizers without ``y_probe`` /
+    ``y_probe_stats``, so the encoding fell back to its scale-free
+    fallback path even though the full target distribution was already
+    available right here in the caller.  Threading the per-output ``y``
+    slice through is the single biggest improvement to the surrogate's
+    signal-to-noise ratio for symbolic regression.
+    """
+    optimizers = []
+    for o_idx in range(n_outputs):
+        y_full = np.asarray(Y[:, o_idx], dtype=np.float64)
+        y_finite = y_full[np.isfinite(y_full)]
+        if y_finite.size > 0:
+            y_stats = {
+                'mean': float(np.mean(y_finite)),
+                'std':  float(max(np.std(y_finite), 1e-12)),
+            }
+        else:
+            y_stats = {'mean': 0.0, 'std': 1.0}
+        y_probe_o = (y_full[probe_idx] if probe_idx is not None else None)
+        optimizers.append(
+            BayesianCGPOptimizer(
+                n_features, CGP_NODES, feat_names,
+                X_probe=X_probe,
+                y_probe=y_probe_o,
+                y_probe_stats=y_stats,
+                max_points=BAYESIAN_MAX_GP_POINTS,
+                xi=BAYESIAN_EXPLORATION))
+    return optimizers
+
+
+def _bo_global_feature_priors(X, y_target, n_features):
+    """Compute a per-feature importance prior used to bias mutation/random_cgp.
+
+    Returns a length-``n_features`` numpy array of weights summing to 1.
+    Falls back to uniform weights when ``X`` lacks variance or correlations
+    can't be computed.  Used in BO-driven candidate generation so feature
+    selection is concentrated on variables that actually correlate with the
+    target — critical when ``n_features > 5`` because uniform feature
+    selection turns the search into a needle-in-a-haystack problem.
+    """
+    n = max(int(n_features), 1)
+    weights = np.ones(n, dtype=np.float64)
+    if X is None or y_target is None or X.shape[1] != n or X.shape[0] < 5:
+        return weights / weights.sum()
+    y_arr = np.asarray(y_target, dtype=np.float64)
+    if not np.isfinite(y_arr).any() or np.std(y_arr) < 1e-12:
+        return weights / weights.sum()
+    for i in range(n):
+        xi = X[:, i]
+        if np.std(xi) < 1e-10:
+            weights[i] = 0.05
+            continue
+        try:
+            r = abs(float(np.corrcoef(xi, y_arr)[0, 1]))
+        except Exception:
+            r = 0.0
+        if not np.isfinite(r):
+            r = 0.0
+        # Floor at 0.1 so even unimportant-looking features remain reachable
+        # (correlation isn't the whole story — interactions can hide there).
+        weights[i] = max(0.1, r)
+    s = float(weights.sum())
+    if s <= 0:
+        return np.ones(n, dtype=np.float64) / n
+    return weights / s
+
 
 def run_bayesian_afpo(X, Y, n_features, n_outputs, feat_names, out_types,
                       hofs, target_grads_list, dp,
@@ -12529,16 +13172,26 @@ def run_bayesian_afpo(X, Y, n_features, n_outputs, feat_names, out_types,
     print(f"  Exploration (xi)       : {BAYESIAN_EXPLORATION}")
     print("═" * 70 + "\n")
 
-    _probe_n = min(20, X.shape[0])
+    # Probe set: a stratified sample of training rows.  Larger samples help
+    # the surrogate when n_features is high (more chance of differing
+    # phenotypic responses between candidates), so scale gently with
+    # ``n_features`` while staying within the 32-row soft cap that keeps
+    # cgp_to_vector evaluation cheap.
+    _probe_n = min(max(20, n_features * 2), 32, X.shape[0])
     _probe_idx = np.random.choice(X.shape[0], _probe_n, replace=False)
     X_probe = X[_probe_idx]
 
-    optimizers = [
-        BayesianCGPOptimizer(n_features, CGP_NODES, feat_names,
-                             X_probe=X_probe,
-                             max_points=BAYESIAN_MAX_GP_POINTS,
-                             xi=BAYESIAN_EXPLORATION)
-        for _ in range(n_outputs)
+    optimizers = _bo_build_optimizers(
+        n_features, n_outputs, feat_names, X, Y, X_probe, _probe_idx)
+
+    # Per-output feature-importance prior — biases random_cgp / mutate to
+    # rewire toward variables that actually correlate with the target.
+    # Critical when n_features > 5: uniform feature selection turns the
+    # search into a needle-in-a-haystack problem because most CGP slots
+    # end up referencing irrelevant variables.
+    feature_priors = [
+        _bo_global_feature_priors(X, Y[:, o_idx], n_features)
+        for o_idx in range(n_outputs)
     ]
 
     AFPO_POP_SIZE = POPULATION_SIZE * 2
@@ -12653,6 +13306,13 @@ def run_bayesian_afpo(X, Y, n_features, n_outputs, feat_names, out_types,
                 except Exception:
                     _bo_op_affinity = None
                 _bo_op_affinity = _bo_op_affinity or None
+
+                # Activate the per-output feature-importance prior so
+                # ``mutate`` and ``random_cgp`` bias rewires/picks toward
+                # variables that actually correlate with this output's
+                # target.  Without this BO on n_features > 5 spent most
+                # of its mutations rewiring to irrelevant variables.
+                set_feature_priors(feature_priors[o_idx])
 
                 candidate_trees = []
                 
@@ -12844,6 +13504,11 @@ def run_bayesian_afpo(X, Y, n_features, n_outputs, feat_names, out_types,
 
     except KeyboardInterrupt:
         print("\nStopping Bayesian AFPO…")
+    finally:
+        # Always restore the global feature prior to ``None`` so downstream
+        # code paths (script generation, evolution mode follow-ups) don't
+        # inherit BO-specific feature biases.
+        set_feature_priors(None)
 
 
 
@@ -12873,16 +13538,26 @@ def run_bayesian_islands(X, Y, n_features, n_outputs, feat_names, out_types,
     print(f"  Exploration (xi)       : {BAYESIAN_EXPLORATION}")
     print("═" * 70 + "\n")
 
-    _probe_n = min(20, X.shape[0])
+    # Probe set: a stratified sample of training rows.  Larger samples help
+    # the surrogate when n_features is high (more chance of differing
+    # phenotypic responses between candidates), so scale gently with
+    # ``n_features`` while staying within the 32-row soft cap that keeps
+    # cgp_to_vector evaluation cheap.
+    _probe_n = min(max(20, n_features * 2), 32, X.shape[0])
     _probe_idx = np.random.choice(X.shape[0], _probe_n, replace=False)
     X_probe = X[_probe_idx]
 
-    optimizers = [
-        BayesianCGPOptimizer(n_features, CGP_NODES, feat_names,
-                             X_probe=X_probe,
-                             max_points=BAYESIAN_MAX_GP_POINTS,
-                             xi=BAYESIAN_EXPLORATION)
-        for _ in range(n_outputs)
+    optimizers = _bo_build_optimizers(
+        n_features, n_outputs, feat_names, X, Y, X_probe, _probe_idx)
+
+    # Per-output feature-importance prior — biases random_cgp / mutate to
+    # rewire toward variables that actually correlate with the target.
+    # Critical when n_features > 5: uniform feature selection turns the
+    # search into a needle-in-a-haystack problem because most CGP slots
+    # end up referencing irrelevant variables.
+    feature_priors = [
+        _bo_global_feature_priors(X, Y[:, o_idx], n_features)
+        for o_idx in range(n_outputs)
     ]
 
     islands_pop = [[[] for _ in range(n_outputs)] for _ in range(NUM_ISLANDS)]
@@ -12991,6 +13666,13 @@ def run_bayesian_islands(X, Y, n_features, n_outputs, feat_names, out_types,
                 except Exception:
                     _bo_op_affinity = None
                 _bo_op_affinity = _bo_op_affinity or None
+
+                # Activate the per-output feature-importance prior so
+                # ``mutate`` and ``random_cgp`` bias rewires/picks toward
+                # variables that actually correlate with this output's
+                # target.  Without this BO on n_features > 5 spent most
+                # of its mutations rewiring to irrelevant variables.
+                set_feature_priors(feature_priors[o_idx])
 
                 for island_idx in range(NUM_ISLANDS):
                     pop = islands_pop[island_idx][o_idx]
@@ -13195,6 +13877,8 @@ def run_bayesian_islands(X, Y, n_features, n_outputs, feat_names, out_types,
 
     except KeyboardInterrupt:
         print("\nStopping Bayesian Islands…")
+    finally:
+        set_feature_priors(None)
 
 
 def run_bayesian_islanded_afpo(X, Y, n_features, n_outputs, feat_names, out_types,
@@ -13222,16 +13906,26 @@ def run_bayesian_islanded_afpo(X, Y, n_features, n_outputs, feat_names, out_type
     print(f"  Exploration (xi)       : {BAYESIAN_EXPLORATION}")
     print("═" * 70 + "\n")
 
-    _probe_n = min(20, X.shape[0])
+    # Probe set: a stratified sample of training rows.  Larger samples help
+    # the surrogate when n_features is high (more chance of differing
+    # phenotypic responses between candidates), so scale gently with
+    # ``n_features`` while staying within the 32-row soft cap that keeps
+    # cgp_to_vector evaluation cheap.
+    _probe_n = min(max(20, n_features * 2), 32, X.shape[0])
     _probe_idx = np.random.choice(X.shape[0], _probe_n, replace=False)
     X_probe = X[_probe_idx]
 
-    optimizers = [
-        BayesianCGPOptimizer(n_features, CGP_NODES, feat_names,
-                             X_probe=X_probe,
-                             max_points=BAYESIAN_MAX_GP_POINTS,
-                             xi=BAYESIAN_EXPLORATION)
-        for _ in range(n_outputs)
+    optimizers = _bo_build_optimizers(
+        n_features, n_outputs, feat_names, X, Y, X_probe, _probe_idx)
+
+    # Per-output feature-importance prior — biases random_cgp / mutate to
+    # rewire toward variables that actually correlate with the target.
+    # Critical when n_features > 5: uniform feature selection turns the
+    # search into a needle-in-a-haystack problem because most CGP slots
+    # end up referencing irrelevant variables.
+    feature_priors = [
+        _bo_global_feature_priors(X, Y[:, o_idx], n_features)
+        for o_idx in range(n_outputs)
     ]
 
     islands_pop = [[[] for _ in range(n_outputs)] for _ in range(NUM_ISLANDS)]
@@ -13334,6 +14028,13 @@ def run_bayesian_islanded_afpo(X, Y, n_features, n_outputs, feat_names, out_type
                 except Exception:
                     _bo_op_affinity = None
                 _bo_op_affinity = _bo_op_affinity or None
+
+                # Activate the per-output feature-importance prior so
+                # ``mutate`` and ``random_cgp`` bias rewires/picks toward
+                # variables that actually correlate with this output's
+                # target.  Without this BO on n_features > 5 spent most
+                # of its mutations rewiring to irrelevant variables.
+                set_feature_priors(feature_priors[o_idx])
 
                 for island_idx in range(NUM_ISLANDS):
                     pop = islands_pop[island_idx][o_idx]
@@ -13540,6 +14241,8 @@ def run_bayesian_islanded_afpo(X, Y, n_features, n_outputs, feat_names, out_type
 
     except KeyboardInterrupt:
         print("\nStopping Bayesian Islanded AFPO…")
+    finally:
+        set_feature_priors(None)
 
 
 def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
@@ -13566,18 +14269,25 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
     print(f"  Exploration (xi)       : {BAYESIAN_EXPLORATION}")
     print("═" * 70 + "\n")
 
-    # Select phenotypic probe set: 20 points sampled from training data
-    _probe_n = min(20, X.shape[0])
+    # Select phenotypic probe set: scale gently with n_features so the
+    # surrogate has enough phenotypic signal in higher-dimensional regimes.
+    _probe_n = min(max(20, n_features * 2), 32, X.shape[0])
     _probe_idx = np.random.choice(X.shape[0], _probe_n, replace=False)
     X_probe = X[_probe_idx]
 
-    # One BO optimizer per output
-    optimizers = [
-        BayesianCGPOptimizer(n_features, CGP_NODES, feat_names,
-                             X_probe=X_probe,
-                             max_points=BAYESIAN_MAX_GP_POINTS,
-                             xi=BAYESIAN_EXPLORATION)
-        for _ in range(n_outputs)
+    # One BO optimizer per output, each carrying its own y-stats so probe
+    # values get normalised against the actual target distribution.
+    optimizers = _bo_build_optimizers(
+        n_features, n_outputs, feat_names, X, Y, X_probe, _probe_idx)
+
+    # Per-output feature-importance prior — biases random_cgp / mutate to
+    # rewire toward variables that actually correlate with the target.
+    # Critical when n_features > 5: uniform feature selection turns the
+    # search into a needle-in-a-haystack problem because most CGP slots
+    # end up referencing irrelevant variables.
+    feature_priors = [
+        _bo_global_feature_priors(X, Y[:, o_idx], n_features)
+        for o_idx in range(n_outputs)
     ]
 
     # ── Phase 1: Initial random sampling ────────────────────────────────
@@ -13739,6 +14449,13 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
                 except Exception:
                     _bo_op_affinity = None
                 _bo_op_affinity = _bo_op_affinity or None
+
+                # Activate the per-output feature-importance prior so
+                # ``mutate`` and ``random_cgp`` bias rewires/picks toward
+                # variables that actually correlate with this output's
+                # target.  Without this BO on n_features > 5 spent most
+                # of its mutations rewiring to irrelevant variables.
+                set_feature_priors(feature_priors[o_idx])
 
                 candidate_trees = []
                 # 60% from mutating top individuals (exploitation)
@@ -14057,6 +14774,454 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
 
     except KeyboardInterrupt:
         print("\nStopping Bayesian CGP…")
+    finally:
+        set_feature_priors(None)
+
+
+def run_bayesian_qd(X, Y, n_features, n_outputs, feat_names, out_types,
+                    hofs, target_grads_list, dp,
+                    X_val=None, Y_val=None, BATCH_SIZE=0):
+    """Quality-Diversity (MAP-Elites) variant of Bayesian CGP.
+
+    Instead of (or alongside) a single elitist population, the search
+    maintains a *behavioural-descriptor archive* per output: each cell
+    holds the best individual found in a particular structural niche
+    (complexity bucket, feature-subset signature, dominant-op class).
+
+    Why this matters for symbolic regression
+    ----------------------------------------
+    Without QD, the BO loop tends to converge on whichever seed template
+    happens to score lowest first.  Once that template's basin is fully
+    exploited, the search is stuck — the GP has only seen mutations of
+    that one template, so EI proposes more of the same.
+
+    With QD, every fundamentally different structure (e.g. polynomial vs
+    rational vs trigonometric) earns its own cell.  Selection draws from
+    cells uniformly, so rarely-occupied niches get attention proportional
+    to their absence in the converged frontier.  The cells naturally
+    quench premature convergence and supply diverse parents that crossover
+    can recombine into solutions no single basin could reach.
+    """
+    global _INIT_PHASE
+
+    print("\n" + "═" * 70)
+    print("BAYESIAN QD (MAP-Elites) — Surrogate-Assisted Quality-Diversity")
+    print("═" * 70)
+    print(f"  Initial random samples : {BAYESIAN_INITIAL_SAMPLES}")
+    print(f"  Batch size per iter    : {BAYESIAN_BATCH_SIZE}")
+    print(f"  Candidates per iter    : {BAYESIAN_N_CANDIDATES}")
+    print(f"  GP refit frequency     : every {BAYESIAN_GP_REFIT_FREQ} iterations")
+    print(f"  Exploration (xi)       : {BAYESIAN_EXPLORATION}")
+    print("═" * 70 + "\n")
+
+    _probe_n = min(max(20, n_features * 2), 32, X.shape[0])
+    _probe_idx = np.random.choice(X.shape[0], _probe_n, replace=False)
+    X_probe = X[_probe_idx]
+
+    optimizers = _bo_build_optimizers(
+        n_features, n_outputs, feat_names, X, Y, X_probe, _probe_idx)
+
+    # Per-output feature-importance prior — biases random_cgp / mutate to
+    # rewire toward variables that actually correlate with the target.
+    # Critical when n_features > 5: uniform feature selection turns the
+    # search into a needle-in-a-haystack problem because most CGP slots
+    # end up referencing irrelevant variables.
+    feature_priors = [
+        _bo_global_feature_priors(X, Y[:, o_idx], n_features)
+        for o_idx in range(n_outputs)
+    ]
+
+    archives = [QualityDiversityArchive(n_features, CGP_NODES)
+                for _ in range(n_outputs)]
+
+    # ── Phase 1: Seed the archive ───────────────────────────────────────
+    print(f"Phase 1: Seeding QD archive with {BAYESIAN_INITIAL_SAMPLES} individuals…")
+    _INIT_PHASE = True
+    N_train = X.shape[0]
+    if N_train > _INIT_SUBSAMPLE_CAP:
+        init_idx = np.random.choice(N_train, _INIT_SUBSAMPLE_CAP, replace=False)
+        X_init, Y_init = X[init_idx], Y[init_idx]
+    else:
+        init_idx = None
+        X_init, Y_init = X, Y
+
+    for o_idx in range(n_outputs):
+        v5_seeds = generate_seeds_v5(n_features, feat_names)
+        try:
+            imp_seeds = generate_importance_biased_seeds(
+                n_features, feat_names, X_init, Y_init[:, o_idx])
+        except Exception:
+            imp_seeds = []
+        random.shuffle(v5_seeds)
+        random.shuffle(imp_seeds)
+        seeds = list(imp_seeds) + list(v5_seeds)
+        # QD benefits from a wider seed pool than vanilla BO because each
+        # seed potentially populates a different cell.
+        target_seed_count = max(BAYESIAN_INITIAL_SAMPLES,
+                                BAYESIAN_INITIAL_SAMPLES + 2 * n_features)
+        while len(seeds) < target_seed_count:
+            seeds.append(Individual(random_cgp(n_features, CGP_NODES, feat_names)))
+        seeds = seeds[:target_seed_count]
+
+        for ind in seeds:
+            ind.calculate_fitness(
+                X_init, Y_init[:, o_idx], out_types[o_idx],
+                target_grads=_slice_optional_rows(
+                    target_grads_list[o_idx], init_idx))
+            hofs[o_idx].update(ind)
+            optimizers[o_idx].add_observation(ind, ind.tree)
+            archives[o_idx].add(ind, iteration=0)
+
+        print(f"  Output {o_idx}: {archives[o_idx].coverage()} cells filled "
+              f"({len(seeds)} seeds), best loss = "
+              f"{archives[o_idx].best_loss():.5f}")
+
+    _INIT_PHASE = False
+    if N_train > _INIT_SUBSAMPLE_CAP:
+        print("  Re-scoring HoF and rebuilding QD archive on full dataset…")
+        for o_idx in range(n_outputs):
+            for ind in hofs[o_idx].best_by_complexity.values():
+                ind.affine_fitted = False
+                ind.calculate_fitness(X, Y[:, o_idx], out_types[o_idx],
+                                      target_grads=target_grads_list[o_idx])
+            hofs[o_idx].sanitize()
+
+            opt = optimizers[o_idx]
+            old_individuals = list(opt.individuals)
+            opt.X_observed.clear()
+            opt.y_observed.clear()
+            opt.individuals.clear()
+            archives[o_idx] = QualityDiversityArchive(n_features, CGP_NODES)
+
+            for ind in old_individuals:
+                ind.affine_fitted = False
+                ind.calculate_fitness(X, Y[:, o_idx], out_types[o_idx],
+                                      target_grads=target_grads_list[o_idx])
+                opt.add_observation(ind, ind.tree)
+                archives[o_idx].add(ind, iteration=0)
+
+    print("\nFitting initial GP surrogates…")
+    for opt in optimizers:
+        opt.fit_surrogate()
+        print(f"  {opt.summary_str()}")
+
+    # ── Phase 2: QD loop ────────────────────────────────────────────────
+    print("\nPhase 2: Bayesian QD optimisation. Ctrl+C to stop.\n")
+    iteration = 0
+    total_evals = BAYESIAN_INITIAL_SAMPLES * n_outputs
+    perfect_outputs = set()
+    _bo_xi_start = max(BAYESIAN_EXPLORATION * 5.0, 0.05)
+    _bo_xi_end   = BAYESIAN_EXPLORATION
+
+    try:
+        while True:
+            iteration += 1
+            _batch_n = min(int(BATCH_SIZE), X.shape[0]) if BATCH_SIZE else 0
+            batch_idx = (np.random.choice(X.shape[0], _batch_n, replace=False)
+                         if _batch_n > 0 else None)
+            X_b = X[batch_idx] if batch_idx is not None else X
+            Y_b = Y[batch_idx] if batch_idx is not None else Y
+
+            decay = np.exp(-0.014 * iteration)
+            current_xi = _bo_xi_end + (_bo_xi_start - _bo_xi_end) * decay
+            for opt in optimizers:
+                opt.xi = current_xi
+
+            for o_idx in range(n_outputs):
+                if o_idx in perfect_outputs:
+                    continue
+                opt = optimizers[o_idx]
+                arc = archives[o_idx]
+
+                # Parents: a mix of HoF, archive cells, and the optimiser
+                # buffer.  Archive sampling supplies diversity; HoF supplies
+                # the best-quality structural seeds; buffer supplies
+                # recently-explored mutations.
+                hof_inds = list(hofs[o_idx].best_by_complexity.values())
+                arc_inds = arc.sample(n=min(8, max(1, arc.coverage())),
+                                      prefer_new=True)
+                buf_top  = opt.get_best_individuals(n=5)
+                combined = hof_inds + arc_inds + buf_top
+                if not combined:
+                    combined = [Individual(random_cgp(n_features, CGP_NODES, feat_names))]
+                # Deduplicate on identity to avoid biasing the parent set
+                seen = set()
+                top_inds = []
+                for ind in combined:
+                    if id(ind) in seen:
+                        continue
+                    seen.add(id(ind))
+                    top_inds.append(ind)
+                top_inds.sort(key=lambda x: x.loss)
+                top_inds = top_inds[:12]
+
+                try:
+                    _bo_op_affinity = compute_hof_operator_affinity([hofs[o_idx]])
+                except Exception:
+                    _bo_op_affinity = None
+                _bo_op_affinity = _bo_op_affinity or None
+
+                # Activate the per-output feature-importance prior so
+                # ``mutate`` and ``random_cgp`` bias rewires/picks toward
+                # variables that actually correlate with this output's
+                # target.  Without this BO on n_features > 5 spent most
+                # of its mutations rewiring to irrelevant variables.
+                set_feature_priors(feature_priors[o_idx])
+
+                candidate_trees = []
+                # 50%: mutations of QD archive cells (diversification)
+                n_qd_mut = int(BAYESIAN_N_CANDIDATES * 0.50)
+                arc_pool = arc.sample(n=min(arc.coverage(), 16), prefer_new=True) or top_inds
+                for _ in range(n_qd_mut):
+                    parent = random.choice(arc_pool)
+                    rate = random.choice([1, 1, 2, 2, 3, 5])
+                    child_tree = mutate(parent.tree, n_features, feat_names,
+                                        mut_rate=rate, temperature=0.0,
+                                        op_affinity=_bo_op_affinity)
+                    candidate_trees.append(child_tree)
+
+                # 20%: cross-cell crossover (combine structures from
+                # different niches — the QD analogue of HoF crossover)
+                n_cross_cell = int(BAYESIAN_N_CANDIDATES * 0.20)
+                for _ in range(n_cross_cell):
+                    if len(arc_pool) >= 2:
+                        p1, p2 = random.sample(arc_pool, 2)
+                        child_tree = crossover(p1.tree, p2.tree)
+                        child_tree = mutate(child_tree, n_features, feat_names,
+                                            mut_rate=1, op_affinity=_bo_op_affinity)
+                    else:
+                        child_tree = random_cgp(n_features, CGP_NODES, feat_names)
+                    candidate_trees.append(child_tree)
+
+                # 15%: macro-mutations (structural exploration)
+                n_macro = int(BAYESIAN_N_CANDIDATES * 0.15)
+                for _ in range(n_macro):
+                    parent = random.choice(top_inds)
+                    _macro_choices = ['grow', 'prune', 'graft', 'rational',
+                                      'trig', 'inject', 'nest']
+                    if IF_ELSE_ENABLED:
+                        _macro_choices.append('piecewise')
+                    macro_choice = random.choice(_macro_choices)
+                    if macro_choice == 'grow':
+                        ct = macro_grow(parent.tree, n_features, feat_names,
+                                        op_affinity=_bo_op_affinity)
+                    elif macro_choice == 'prune':
+                        ct = macro_prune(parent.tree, n_features)
+                    elif macro_choice == 'graft':
+                        ct = macro_graft_feature(parent.tree, n_features, feat_names)
+                    elif macro_choice == 'rational':
+                        ct = macro_rational_grow(parent.tree, n_features)
+                    elif macro_choice == 'piecewise':
+                        ct = macro_piecewise(parent.tree, n_features, feat_names, X=X)
+                    elif macro_choice == 'inject':
+                        ct = macro_inject_subtree(parent.tree, n_features, feat_names,
+                                                  op_affinity=_bo_op_affinity)
+                    elif macro_choice == 'nest':
+                        ct = macro_nest_compound(parent.tree, n_features, feat_names,
+                                                 op_affinity=_bo_op_affinity)
+                    else:
+                        ct = macro_trig_identity(parent.tree, n_features)
+                    candidate_trees.append(ct)
+
+                # 10%: HoF crossover
+                n_hof_cross = int(BAYESIAN_N_CANDIDATES * 0.10)
+                if len(hof_inds) >= 2:
+                    for _ in range(n_hof_cross):
+                        p1, p2 = random.sample(hof_inds, 2)
+                        child_tree = crossover(p1.tree, p2.tree)
+                        child_tree = mutate(child_tree, n_features, feat_names,
+                                            mut_rate=random.choice([1, 2]),
+                                            op_affinity=_bo_op_affinity)
+                        candidate_trees.append(child_tree)
+                else:
+                    for _ in range(n_hof_cross):
+                        candidate_trees.append(random_cgp(n_features, CGP_NODES, feat_names))
+
+                # 5%: random injection (always)
+                n_random = BAYESIAN_N_CANDIDATES - n_qd_mut - n_cross_cell - n_macro - n_hof_cross
+                for _ in range(max(0, n_random)):
+                    candidate_trees.append(random_cgp(n_features, CGP_NODES, feat_names))
+
+                # Residual-aware reseed (every 25 iters, regression only)
+                _bo_is_cls = (out_types[o_idx] == 6)
+                if iteration % 25 == 0 and not _bo_is_cls:
+                    _bo_hof_best = hofs[o_idx].get_best_overall()
+                    if _bo_hof_best is not None:
+                        try:
+                            _bo_res_seeds = generate_residual_aware_seeds(
+                                n_features, feat_names, X, Y[:, o_idx],
+                                _bo_hof_best,
+                                max_seeds=max(5, BAYESIAN_BATCH_SIZE // 2))
+                            for _rs in _bo_res_seeds:
+                                candidate_trees.append(_rs.tree)
+                        except Exception:
+                            pass
+
+                # Score with EI; tiebreak by encouraging diversity (BD novelty)
+                ei_scores = opt.score_candidates(candidate_trees)
+                # Apply a mild novelty multiplier: candidates whose BD is not
+                # in the archive get a small score boost.
+                novelty_boost = np.ones_like(ei_scores)
+                for ci, ct in enumerate(candidate_trees):
+                    try:
+                        bd = arc.descriptor(Individual(ct))
+                        if bd not in arc.cells:
+                            novelty_boost[ci] = 1.25
+                    except Exception:
+                        pass
+                ei_scores = ei_scores * novelty_boost
+
+                n_screen = min(BAYESIAN_BATCH_SIZE * 2, len(candidate_trees))
+                screen_indices = np.argsort(ei_scores)[-n_screen:]
+
+                _N = X_b.shape[0]
+                _screen_rows = min(max(50, _N // 4), _N)
+                if _screen_rows < _N:
+                    _screen_idx = np.random.choice(_N, _screen_rows, replace=False)
+                    X_screen = X_b[_screen_idx]
+                    Y_screen = Y_b[_screen_idx]
+                    _screen_global_idx = (batch_idx[_screen_idx]
+                                          if batch_idx is not None else _screen_idx)
+                else:
+                    X_screen, Y_screen = X_b, Y_b
+                    _screen_global_idx = batch_idx
+                target_grads_screen = _slice_optional_rows(
+                    target_grads_list[o_idx], _screen_global_idx)
+
+                screen_results = []
+                for ci in screen_indices:
+                    child = Individual(candidate_trees[ci])
+                    child.calculate_fitness(
+                        X_screen, Y_screen[:, o_idx], out_types[o_idx],
+                        target_grads=target_grads_screen)
+                    screen_results.append((ci, child))
+                total_evals += len(screen_results)
+
+                screen_results.sort(key=lambda x: x[1].loss)
+                top_indices = set(ci for ci, _ in screen_results[:BAYESIAN_BATCH_SIZE])
+
+                for ci in top_indices:
+                    child = Individual(candidate_trees[ci])
+                    child.calculate_fitness(
+                        X, Y[:, o_idx], out_types[o_idx],
+                        target_grads=target_grads_list[o_idx])
+                    total_evals += 1
+
+                    new_cell = arc.add(child, iteration=iteration)
+                    if hofs[o_idx].update(child):
+                        is_cls = (out_types[o_idx] == 6)
+                        metric = (f"Acc={getattr(child,'accuracy',0):.4f}"
+                                  if is_cls
+                                  else f"R²={getattr(child,'r2',0):.4f}")
+                        nov = " [new cell]" if new_cell else ""
+                        print(f"  [BO QD iter {iteration} | Out {o_idx}] "
+                              f"New HoF (Comp {child.complexity:.0f}): "
+                              f"loss={child.loss:.5f}  {metric}{nov}")
+
+                    opt.add_observation(child, child.tree)
+
+                if iteration % BAYESIAN_GP_REFIT_FREQ == 0:
+                    opt.fit_surrogate()
+
+                if iteration % BAYESIAN_CONST_OPT_FREQ == 0:
+                    for ind in list(hofs[o_idx].best_by_complexity.values()):
+                        old_consts = get_constants_shared(ind.tree)
+                        if not old_consts:
+                            continue
+                        old_loss = ind.loss
+                        old_r2 = ind.r2
+                        old_accuracy = ind.accuracy
+                        old_affine_a = ind.affine_a
+                        old_affine_b = ind.affine_b
+                        old_affine_fitted = ind.affine_fitted
+                        ind.optimize_constants(
+                            X, Y[:, o_idx], out_types[o_idx],
+                            max_rows=min(500, X.shape[0]),
+                            n_restarts=2, max_iter=30,
+                            target_grads=target_grads_list[o_idx])
+                        if ind.loss < old_loss - 1e-8:
+                            opt.add_observation(ind, ind.tree)
+                            arc.add(ind, iteration=iteration)
+                        elif ind.loss > old_loss + 1e-8:
+                            set_constants_shared(ind.tree, list(old_consts))
+                            ind.affine_a = old_affine_a
+                            ind.affine_b = old_affine_b
+                            ind.affine_fitted = old_affine_fitted
+                            ind.loss = old_loss
+                            ind.r2 = old_r2
+                            ind.accuracy = old_accuracy
+
+            print(f"--- BO QD Iteration {iteration}  (total evals: {total_evals}) ---")
+
+            if iteration % 5 == 0:
+                for o_idx in range(n_outputs):
+                    if o_idx not in perfect_outputs:
+                        print(f"  [Out {o_idx}] GP: {optimizers[o_idx].summary_str()}")
+                        print(f"  [Out {o_idx}] {archives[o_idx].summary_str()}")
+
+            for o_idx in range(n_outputs):
+                if o_idx in perfect_outputs:
+                    continue
+                is_perf, best_ind = _check_output_perfect(
+                    hofs[o_idx], X, Y[:, o_idx], out_types[o_idx])
+                if is_perf:
+                    out_label = dp.output_map[o_idx] if o_idx < len(dp.output_map) else f"Out{o_idx}"
+                    print(f"\n  ★ Output {o_idx} ({out_label}) reached PERFECT performance!")
+                    _simplify_perfect_output(
+                        hofs[o_idx], X, Y[:, o_idx], out_types[o_idx],
+                        target_grads=target_grads_list[o_idx])
+                    perfect_outputs.add(o_idx)
+
+            if len(perfect_outputs) == n_outputs:
+                print("\n  ★★★ ALL outputs reached perfect performance! Stopping Bayesian QD.")
+                break
+
+            if iteration % 25 == 0:
+                for o_idx, hof in enumerate(hofs):
+                    out_label = (dp.output_map[o_idx]
+                                 if o_idx < len(dp.output_map) else f"Out{o_idx}")
+                    pf_tag = " [PERFECT]" if o_idx in perfect_outputs else ""
+                    hof.print_frontier(
+                        out_type=out_types[o_idx],
+                        label=f"Output {o_idx} ({out_label}){pf_tag}")
+                if X_val is not None and Y_val is not None:
+                    _print_validation_metrics(hofs, X_val, Y_val, out_types, dp)
+
+            if (SIMPLIFICATION_FREQ > 0
+                    and iteration % max(1, SIMPLIFICATION_FREQ // 50) == 0):
+                print(f"\n[BO QD iter {iteration}] Running algebraic simplification on HoF…")
+                for o_idx, hof in enumerate(hofs):
+                    for c_key in list(hof.best_by_complexity.keys()):
+                        ind = hof.best_by_complexity[c_key]
+                        old_active = set(ind.tree.active_nodes) if ind.tree is not None else set()
+                        ind.tree = simplify_cgp_tree(ind.tree)
+                        ind.tree.update_active_nodes()
+                        _new_active = set(ind.tree.active_nodes)
+                        _union = old_active | _new_active
+                        _diff_frac = (len(_union - (old_active & _new_active))
+                                      / max(1, len(_union)))
+                        _refit = _diff_frac >= 0.25
+                        if _refit:
+                            ind.affine_fitted = False
+                        ind.calculate_fitness(
+                            X, Y[:, o_idx], out_types[o_idx],
+                            update_affine=_refit,
+                            target_grads=target_grads_list[o_idx])
+                    new_dict = {}
+                    for ind in hof.best_by_complexity.values():
+                        nc = ind.complexity
+                        if nc not in new_dict or ind.loss < new_dict[nc].loss:
+                            new_dict[nc] = ind
+                    hof.best_by_complexity = new_dict
+                    hof.sanitize()
+
+            if iteration > 0 and iteration % 50 == 0:
+                _deep_optimize_hofs(hofs, X, Y, out_types)
+
+    except KeyboardInterrupt:
+        print("\nStopping Bayesian QD…")
+    finally:
+        set_feature_priors(None)
 
 
 # ════════════════════════════════════════════════════════════════
@@ -15728,9 +16893,18 @@ def train_mode():
     print("\n" + "─" * 70)
     print("QUALITY-DIVERSITY (QD) ALGORITHMS")
     print("─" * 70)
-    print("  When enabled, maintains an archive of high-performing individuals")
-    print("  spread across a behavioral descriptor space, optimizing for both")
-    print("  performance and diversity.")
+    print("  When enabled, maintains a MAP-Elites archive of high-performing")
+    print("  individuals spread across a behavioural-descriptor space:")
+    print("    BD = (complexity bucket, feature subset, dominant op class)")
+    print("  Each cell keeps the best individual found in that niche so the")
+    print("  search can escape seed basins by drawing diverse parents.")
+    print("  ")
+    print("  NOTE: QD is currently implemented as a Bayesian variant only.")
+    print("        Enabling it routes the BO loop through run_bayesian_qd")
+    print("        regardless of which sibling Bayesian variant was picked.")
+    print("        Selecting QD on a non-Bayesian evolutionary mode has no")
+    print("        effect on the search itself (the flag is recorded but")
+    print("        not yet wired into the evolutionary loops).")
     print("─" * 70)
     qd_in = input("Enable Quality-Diversity (QD) algorithms? [y/N]: ").strip().lower()
     if qd_in.startswith('n'):
@@ -15739,8 +16913,13 @@ def train_mode():
     else:
         QUALITY_DIVERSITY_ENABLED = True
         print("  ✓  Quality-Diversity algorithms ENABLED.")
-        if BAYESIAN_VARIANT != "qd":
-            pass # Keep user's bayesian variant if they set it. But if they enable QD generally it applies.
+        if EVOLUTION_MODEL == "bayesian_cgp":
+            # The dispatcher will route to ``run_bayesian_qd`` when the
+            # global flag is on, regardless of which sibling variant was
+            # picked, so let the user know explicitly.
+            print("    → Will use Bayesian QD (MAP-Elites) runner.")
+        else:
+            print("    → No-op for non-Bayesian evolution mode (see note above).")
 
     # ---- Population size (evolutionary modes only) ----
     POP_SIZE_USER = 50
@@ -17384,18 +18563,44 @@ def train_mode():
     elif EVOLUTION_MODEL == "bayesian_cgp":
         hofs = [HallOfFame() for _ in range(n_outputs)]
 
-        if BAYESIAN_VARIANT == "afpo":
+        # Dispatch to the requested Bayesian variant.  When QD is also
+        # globally enabled (``QUALITY_DIVERSITY_ENABLED``) we route to the
+        # QD runner regardless of which sibling variant was chosen — the
+        # archive-driven exploration is the dominant design choice and
+        # composing it with AFPO/Islands underneath would double-count the
+        # population structure.  Users who want a non-QD variant simply
+        # leave ``QUALITY_DIVERSITY_ENABLED`` false (default).
+        _bo_variant = BAYESIAN_VARIANT
+        if QUALITY_DIVERSITY_ENABLED:
+            _bo_variant = "qd"
+
+        if _bo_variant == "afpo":
             run_bayesian_afpo(
                 X, Y, n_features, n_outputs, feat_names, out_types,
                 hofs, target_grads_list, dp,
                 X_val=X_val, Y_val=Y_val, BATCH_SIZE=BATCH_SIZE)
-        elif BAYESIAN_VARIANT == "islands":
+        elif _bo_variant == "islands":
             run_bayesian_islands(
                 X, Y, n_features, n_outputs, feat_names, out_types,
                 hofs, target_grads_list, dp,
                 X_val=X_val, Y_val=Y_val, BATCH_SIZE=BATCH_SIZE)
-        elif BAYESIAN_VARIANT == "islanded_afpo":
+        elif _bo_variant == "islanded_afpo":
             run_bayesian_islanded_afpo(
+                X, Y, n_features, n_outputs, feat_names, out_types,
+                hofs, target_grads_list, dp,
+                X_val=X_val, Y_val=Y_val, BATCH_SIZE=BATCH_SIZE)
+        elif _bo_variant in ("afpo_islands",):
+            # The original UI exposed an "AFPO Islands" option that fell
+            # through to vanilla BO because no dedicated runner existed.
+            # Route it to the islanded-AFPO implementation, which is the
+            # closest match in spirit (multi-population AFPO), instead of
+            # silently downgrading to single-pop BO.
+            run_bayesian_islanded_afpo(
+                X, Y, n_features, n_outputs, feat_names, out_types,
+                hofs, target_grads_list, dp,
+                X_val=X_val, Y_val=Y_val, BATCH_SIZE=BATCH_SIZE)
+        elif _bo_variant == "qd":
+            run_bayesian_qd(
                 X, Y, n_features, n_outputs, feat_names, out_types,
                 hofs, target_grads_list, dp,
                 X_val=X_val, Y_val=Y_val, BATCH_SIZE=BATCH_SIZE)
