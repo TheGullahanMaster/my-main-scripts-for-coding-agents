@@ -12756,6 +12756,101 @@ def _bo_clone_for_buffer(individual):
         return individual
 
 
+# ── Section-grouped Matérn kernel ────────────────────────────────────────
+# The previous kernel used per-dimension ARD (one length scale per input
+# dim).  In our 50-80-dim encoding this turned each L-BFGS-B gradient step
+# into O(D · N^3) — the GP fit at the 400-point buffer (Islands variant)
+# took several minutes per output, which is what made "Fitting initial GP
+# surrogates…" hang for ages.
+#
+# Anisotropy is only meaningful at the SECTION level: the 4
+# phenotype-vs-target stats genuinely carry more signal than the
+# 32-dim probe block, but the 32 probe dims among themselves don't need
+# individual length scales.  The classes below build an additive kernel
+# of section-scoped (isotropic) Matérn 5/2 components, cutting the number
+# of optimised hyperparameters from O(vec_dim) to ~5 and the per-fit
+# cost by an order of magnitude — without losing the section-level
+# anisotropy that drove the recent BO improvement.
+
+_BO_GP_FIT_CAP = 250  # max training points per GP fit (Cholesky O(N^3))
+
+
+if HAS_SKLEARN_GP:
+
+    class _BO_SlicedMatern(Matern):
+        """Matérn 5/2 kernel that operates on ``X[:, slice_start:slice_stop]``.
+
+        Used to assemble a sum kernel where each logical section of the
+        BO encoding gets its own (isotropic) length scale.  Slicing is a
+        view, so this adds no copy overhead, and the parent's gradient
+        machinery just produces a single-hyperparameter gradient slab
+        per section — which the surrounding Sum kernel concatenates.
+        """
+
+        def __init__(self, slice_start=0, slice_stop=1,
+                     length_scale=1.0,
+                     length_scale_bounds=(1e-2, 1e2),
+                     nu=2.5):
+            super().__init__(length_scale=length_scale,
+                             length_scale_bounds=length_scale_bounds,
+                             nu=nu)
+            self.slice_start = int(slice_start)
+            self.slice_stop  = int(slice_stop)
+
+        def __call__(self, X, Y=None, eval_gradient=False):
+            Xs = X[:, self.slice_start:self.slice_stop]
+            if Y is None:
+                return super().__call__(Xs, None, eval_gradient=eval_gradient)
+            Ys = Y[:, self.slice_start:self.slice_stop]
+            return super().__call__(Xs, Ys, eval_gradient=eval_gradient)
+
+
+    def _bo_build_kernel(n_features: int, probe_size: int,
+                         has_y_probe: bool):
+        """Construct the section-grouped GP kernel for the BO surrogate.
+
+        Layout (one isotropic length scale per non-empty section):
+            [0 .. 17)                          structural header (op-hist,
+                                               const stats, output kind, …)
+            [17 .. 17 + n_features)            per-feature usage
+            [17 + n_features .. + 4)           phenotype-vs-target stats
+                                               (only when ``has_y_probe``)
+            [.. + probe_size)                  phenotype probe rows
+        """
+        sections = []
+        cur = 0
+        sections.append((cur, cur + _BO_STRUCT_HEADER_DIMS))
+        cur += _BO_STRUCT_HEADER_DIMS
+        if n_features > 0:
+            sections.append((cur, cur + n_features))
+            cur += n_features
+        if probe_size > 0 and has_y_probe:
+            sections.append((cur, cur + 4))
+            cur += 4
+        if probe_size > 0:
+            sections.append((cur, cur + probe_size))
+            cur += probe_size
+
+        section_kernels = [
+            _BO_SlicedMatern(start, stop,
+                             length_scale=1.0,
+                             length_scale_bounds=(1e-2, 1e2),
+                             nu=2.5)
+            for (start, stop) in sections if stop > start
+        ]
+        if not section_kernels:
+            section_kernels = [Matern(length_scale=1.0,
+                                      length_scale_bounds=(1e-2, 1e2),
+                                      nu=2.5)]
+
+        kernel = section_kernels[0]
+        for k in section_kernels[1:]:
+            kernel = kernel + k
+        return (ConstantKernel(1.0, (1e-3, 1e3)) * kernel
+                + WhiteKernel(noise_level=0.1,
+                              noise_level_bounds=(1e-5, 1e1)))
+
+
 class BayesianCGPOptimizer:
     """
     Surrogate-assisted Bayesian optimisation for CGP symbolic regression.
@@ -12790,22 +12885,22 @@ class BayesianCGPOptimizer:
         self.y_observed = []   # transformed fitness (neg log loss)
         self.individuals = []  # matching Individual objects
 
-        # GP surrogate — anisotropic Matérn 5/2 + WhiteKernel for noise.
-        # Per-dimension length scales (ARD) let the GP discover that the
-        # phenotype-vs-target block carries far more signal than the
-        # operator histogram or per-feature usage; with isotropic length
-        # scales the relevant dimensions were drowned in less informative
-        # ones and EI was effectively guessing.  We bound length scales
-        # tightly enough that the optimiser converges in 2-3 restarts even
-        # at our 500-point buffer cap.
-        kernel = (ConstantKernel(1.0, (1e-3, 1e3))
-                  * Matern(length_scale=np.ones(self.vec_dim, dtype=np.float64),
-                           length_scale_bounds=(1e-2, 1e2),
-                           nu=2.5)
-                  + WhiteKernel(noise_level=0.1, noise_level_bounds=(1e-5, 1e1)))
+        # GP surrogate — additive Matérn 5/2 kernel with one length scale
+        # per logical SECTION of the encoding (structural header, per-feature
+        # usage, phenotype-vs-target stats, phenotype probe).  Per-dim ARD
+        # over the whole vector was correct in spirit but its O(D · N^3)
+        # gradient cost stalled the initial fit for minutes once the buffer
+        # exceeded ~200 points.  Section-grouped anisotropy preserves what
+        # actually mattered (the phenotype-vs-target block gets its own
+        # length scale, distinct from the structural junk) at ~5
+        # hyperparameters total — see ``_bo_build_kernel`` above.
+        kernel = _bo_build_kernel(
+            n_features=int(n_features),
+            probe_size=int(probe_size),
+            has_y_probe=(y_probe is not None))
         self.gp = GaussianProcessRegressor(
             kernel=kernel, alpha=1e-6, normalize_y=True,
-            n_restarts_optimizer=2)
+            n_restarts_optimizer=1)
         self.gp_fitted = False
 
     def _transform_fitness(self, loss):
@@ -12865,6 +12960,25 @@ class BayesianCGPOptimizer:
             return
         X = X[finite]
         y_finite = y[finite]
+
+        # Cap the GP training set: the Cholesky factorisation inside
+        # ``GaussianProcessRegressor.fit`` is O(N^3), and the Islands /
+        # QD variants can hand us up to ``BAYESIAN_MAX_GP_POINTS`` (500)
+        # observations on the very first fit.  Beyond ~250 points the
+        # marginal accuracy gain doesn't justify the cubic blow-up.  We
+        # always keep the top-fitness half of the buffer (so promising
+        # regions stay densely modelled) and uniformly subsample the
+        # rest for broader coverage.
+        if len(y_finite) > _BO_GP_FIT_CAP:
+            order = np.argsort(-y_finite)               # best first
+            n_top = _BO_GP_FIT_CAP // 2
+            top_idx = order[:n_top]
+            rest = order[n_top:]
+            rest_pick = np.random.choice(
+                rest, size=_BO_GP_FIT_CAP - n_top, replace=False)
+            keep = np.concatenate([top_idx, rest_pick])
+            X = X[keep]
+            y_finite = y_finite[keep]
 
         # Gaussian Copula transformation (rank-based)
         # Maps the targets to standard normal quantiles to avoid extreme outliers
