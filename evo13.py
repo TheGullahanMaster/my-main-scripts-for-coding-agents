@@ -12727,6 +12727,144 @@ def _expected_improvement(mu, sigma, best_f, xi=0.01):
     return np.maximum(np.nan_to_num(ei, nan=0.0, posinf=1e12, neginf=0.0), 0.0)
 
 
+def _log_expected_improvement(mu, sigma, best_f, xi=0.01):
+    """Numerically stable Log Expected Improvement.
+
+    Standard EI saturates at zero for any candidate where the predicted
+    improvement is many sigmas below ``best_f`` (the Gaussian tail
+    underflows in float64).  Once the surrogate is well-fit, this
+    happens to the **vast majority** of candidates within a few BO
+    iterations — the top-B argsort then degenerates to picking the
+    first B array indices among the zero plateau, which is effectively
+    random and discards every signal LogEI still carries.
+
+    The implementation factorises EI(x) = σ · h(z), with
+        h(z) = z · Φ(z) + φ(z),   z = (μ − best_f − xi) / σ.
+    For ``z ≥ -5`` we evaluate ``h(z)`` directly and take ``log``.
+    For ``z < -5`` we use the asymptotic
+        h(z) ≈ φ(z) / z²    (leading term of Mill's ratio for the
+                              improvement integral)
+    so ``log h(z) ≈ -z²/2 − ½·log(2π) − 2·log(-z)``, which is finite
+    and monotone all the way down — preserving the EI ordering across
+    the entire candidate pool.
+
+    Returns log-EI values (higher = more promising; same argsort
+    direction as EI).  Negative-infinity is never produced, so
+    ``argpartition`` and ``argsort`` give meaningful orderings even
+    when raw EI would be identically zero.
+    """
+    mu = np.asarray(mu, dtype=np.float64)
+    sigma = np.asarray(sigma, dtype=np.float64)
+    best_f = float(np.nan_to_num(best_f, nan=-1e12, posinf=1e12, neginf=-1e12))
+    sigma = np.maximum(np.nan_to_num(sigma, nan=0.0, posinf=1e6, neginf=0.0), 1e-12)
+    diff = np.nan_to_num(mu - best_f - xi, nan=-1e12, posinf=1e12, neginf=-1e12)
+    z = diff / sigma
+
+    # Direct path: stable for z >= -5; clip extreme positive z to avoid
+    # overflow in the cdf*z product (cdf saturates at 1 for large z).
+    z_dir = np.clip(z, -5.0, 50.0)
+    h_dir = z_dir * _SCIPY_NORM.cdf(z_dir) + _SCIPY_NORM.pdf(z_dir)
+    log_h_dir = np.log(np.maximum(h_dir, 1e-300))
+
+    # Asymptotic path for very negative z: log h(z) ≈ log(phi(z)/z^2)
+    # which factorises into a polynomial + log term, no underflow.
+    z_asy = np.minimum(z, -5.0)  # only used where z < -5
+    log_h_asy = (-0.5 * z_asy * z_asy
+                 - 0.5 * np.log(2.0 * np.pi)
+                 - 2.0 * np.log(-z_asy))
+
+    log_h = np.where(z >= -5.0, log_h_dir, log_h_asy)
+    log_sigma = np.log(sigma)
+    log_ei = log_h + log_sigma
+    return np.nan_to_num(log_ei, nan=-1e12, posinf=1e12, neginf=-1e12)
+
+
+def _greedy_diverse_batch(scores, vectors, k, length_scale=None,
+                          penalty_weight=2.0):
+    """Greedy batch selection with local penalisation.
+
+    Picks ``k`` candidate indices that jointly maximise EI minus a
+    distance-decaying penalty against the already-selected indices.
+    This avoids the standard ``argsort(ei)[-k:]`` failure mode where
+    the top-k are near-duplicates clustered around the same EI peak —
+    e.g., k mutations that all share the same active subgraph and
+    differ only in inactive junk DNA — wasting most of a (typically
+    expensive) screen-batch on the same effective evaluation.
+
+    Penalty model
+    -------------
+    After picking index ``i`` we subtract ``penalty_weight · exp(-d²/2ℓ²)``
+    from every remaining candidate's score, where ``d²`` is the
+    squared Euclidean distance in the encoded feature space.  This is
+    the local-penalisation trick from González et al. (2016), adapted
+    to log-EI scores (which is why the penalty is additive rather
+    than multiplicative — we operate on log-acquisition magnitudes
+    of order O(1-10), so a unit-scale penalty meaningfully demotes
+    near-duplicates without flattening the entire ranking).
+
+    Parameters
+    ----------
+    scores : (N,) array of acquisition values (e.g. LogEI).
+    vectors : (N, D) array of candidate encodings (must align with ``scores``).
+    k : desired batch size.
+    length_scale : kernel bandwidth; when None, falls back to the
+        median pairwise distance among the candidates (robust default).
+    penalty_weight : how strongly to suppress near-duplicates.  Larger
+        values give more diversity at the cost of slightly lower
+        per-pick EI.
+
+    Returns
+    -------
+    np.ndarray of selected candidate indices (length min(k, N)).
+    """
+    n = int(len(scores))
+    k = max(0, min(int(k), n))
+    if k <= 0:
+        return np.array([], dtype=np.int64)
+    if k == 1 or vectors is None or len(vectors) != n:
+        return np.argsort(scores)[-k:][::-1].astype(np.int64)
+
+    V = np.asarray(vectors, dtype=np.float64)
+    S = np.asarray(scores, dtype=np.float64).copy()
+    S = np.nan_to_num(S, nan=-1e12, posinf=1e12, neginf=-1e12)
+
+    # Auto length-scale: median pairwise distance among a sub-sample
+    # (capped to keep the construction cheap regardless of candidate count).
+    if length_scale is None:
+        m = min(n, 64)
+        if m >= 4:
+            sub = V[np.random.choice(n, m, replace=False)]
+            diffs = sub[:, None, :] - sub[None, :, :]
+            d = np.sqrt(np.sum(diffs * diffs, axis=-1))
+            # mask the diagonal before taking the median
+            iu = np.triu_indices(m, k=1)
+            if iu[0].size > 0:
+                length_scale = float(np.median(d[iu]))
+            else:
+                length_scale = 1.0
+        else:
+            length_scale = 1.0
+    length_scale = max(float(length_scale), 1e-6)
+    inv_2ls2 = 1.0 / (2.0 * length_scale * length_scale)
+
+    selected = np.empty(k, dtype=np.int64)
+    for slot in range(k):
+        i = int(np.argmax(S))
+        selected[slot] = i
+        if slot == k - 1:
+            break
+        # Penalise the rest by their Gaussian similarity to the pick.
+        diff = V - V[i:i + 1]
+        dist_sq = np.einsum('ij,ij->i', diff, diff)
+        penalty = np.exp(-dist_sq * inv_2ls2)
+        S = S - penalty_weight * penalty
+        # Mark the selected slot as effectively -inf so it cannot
+        # re-win on a later iteration (which would otherwise happen
+        # for a candidate exactly coinciding with itself: penalty=1).
+        S[i] = -1e18
+    return selected
+
+
 def _slice_optional_rows(arr, indices):
     """Return ``arr[indices]`` when both are present, else ``arr``.
 
@@ -12773,6 +12911,31 @@ def _bo_clone_for_buffer(individual):
 # anisotropy that drove the recent BO improvement.
 
 _BO_GP_FIT_CAP = 250  # max training points per GP fit (Cholesky O(N^3))
+
+
+def _collect_length_scales(kernel, out_list):
+    """Recursively gather every ``length_scale`` from a (possibly composite)
+    sklearn kernel.
+
+    The section-grouped Matérn used by ``_bo_build_kernel`` is a sum of
+    ``_BO_SlicedMatern`` components wrapped in ConstantKernel + WhiteKernel.
+    After ``self.gp.fit`` the per-section length scales hold the GP's
+    estimate of input smoothness; the geometric mean of those values is
+    a reasonable single-scalar bandwidth for the local-penalisation
+    diversity penalty in ``_greedy_diverse_batch``.
+    """
+    if kernel is None:
+        return
+    ls = getattr(kernel, 'length_scale', None)
+    if ls is not None:
+        ls = np.atleast_1d(np.asarray(ls, dtype=np.float64))
+        for v in ls.ravel():
+            if np.isfinite(v) and v > 0:
+                out_list.append(float(v))
+    for attr in ('k1', 'k2'):
+        sub = getattr(kernel, attr, None)
+        if sub is not None:
+            _collect_length_scales(sub, out_list)
 
 
 if HAS_SKLEARN_GP:
@@ -12878,12 +13041,52 @@ class BayesianCGPOptimizer:
         self.vec_dim = (_bo_struct_dim(n_features)
                         + _bo_phenotype_dim(probe_size, y_probe is not None))
         self.xi         = xi
+        self.xi_base    = xi          # baseline xi — adaptive control multiplies this
         self.max_points = max_points
 
         # Observed data
         self.X_observed = []   # list of vectors
         self.y_observed = []   # transformed fitness (neg log loss)
         self.individuals = []  # matching Individual objects
+
+        # ── Encoding cache ────────────────────────────────────────────────
+        # ``cgp_to_vector`` is the dominant cost of EI scoring (>200
+        # candidates per output per BO iteration) because each call
+        # evaluates the candidate on the X_probe sample.  The encoding
+        # is fully determined by the tree's active-graph fingerprint
+        # plus the optimiser's static probe/y_probe/y_probe_stats —
+        # we can therefore memoise it.  Cache hits are common because:
+        #   * HoF parents recur across iterations (top_inds pool)
+        #   * Many mutations produce structurally identical children
+        #     (e.g. rewiring inactive junk DNA changes nothing visible
+        #     to ``update_active_nodes``)
+        #   * Screen-then-evaluate evaluates the same tree twice
+        # FIFO eviction at ``_encoding_cache_maxsize`` to keep the
+        # memo bounded; the cache is regenerated on demand on miss.
+        self._encoding_cache: dict = {}
+        self._encoding_cache_order: list = []
+        self._encoding_cache_maxsize = 4096
+        self._encoding_hits = 0
+        self._encoding_misses = 0
+
+        # ── Adaptive trust-region xi (TuRBO-lite) ─────────────────────────
+        # Track recent improvement / non-improvement streaks per optimiser
+        # so we can scale ``xi`` UP after several barren iterations
+        # (force more exploration in EI) and DOWN once the surrogate
+        # starts finding wins again (let exploitation pay off).  The
+        # outer BO loops already implement an iteration-decay schedule
+        # on top of ``xi_base``; this multiplier rides on top of that
+        # global schedule and is local to each output's surrogate so
+        # one stuck output doesn't yank exploration high for the
+        # outputs that are still improving.
+        self._success_streak = 0
+        self._failure_streak = 0
+        self.xi_scale = 1.0           # current adaptive multiplier
+        self._xi_scale_min = 0.5
+        self._xi_scale_max = 4.0
+        # Last-batch EI vectors cache, used by ``select_diverse_batch``
+        # to do local-penalised batch construction without re-encoding.
+        self._last_candidate_vecs = None
 
         # GP surrogate — additive Matérn 5/2 kernel with one length scale
         # per logical SECTION of the encoding (structural header, per-feature
@@ -12902,6 +13105,8 @@ class BayesianCGPOptimizer:
             kernel=kernel, alpha=1e-6, normalize_y=True,
             n_restarts_optimizer=1)
         self.gp_fitted = False
+        self._gp_length_scale = None  # cached after fit_surrogate; used as
+                                       # length scale for diverse selection
 
     def _transform_fitness(self, loss):
         """Transform loss to a GP-friendly target.
@@ -12915,12 +13120,49 @@ class BayesianCGPOptimizer:
         return -loss
 
     def _encode(self, cgp_eq):
-        """Encode a CGP equation using the configured probe/y stats."""
-        return cgp_to_vector(
+        """Encode a CGP equation, memoising on the active-graph fingerprint.
+
+        The encoding depends only on the tree's *active* subgraph and on
+        the optimiser's frozen probe / y-stats, so reusing a cached
+        vector for the same fingerprint is exact (no approximation).
+        Cache lookup costs one ``_FitnessCache._fingerprint`` call
+        (which is what the global fitness cache already does on every
+        evaluate, so the marginal cost is small) and avoids a full
+        ``cgp_to_vector`` pass — including the per-candidate
+        ``cgp_eq.evaluate(X_probe)`` call that dominates the
+        encoding's wall-clock cost when the probe set is non-trivial.
+        """
+        try:
+            fp = _FITNESS_CACHE._fingerprint(cgp_eq)
+        except Exception:
+            # Fingerprinting failed (unusual tree shape) — fall back
+            # to direct encoding without caching.
+            return cgp_to_vector(
+                cgp_eq, self.max_nodes,
+                X_probe=self.X_probe,
+                y_probe=self.y_probe,
+                y_probe_stats=self.y_probe_stats)
+        cached = self._encoding_cache.get(fp)
+        if cached is not None:
+            self._encoding_hits += 1
+            return cached
+        self._encoding_misses += 1
+        vec = cgp_to_vector(
             cgp_eq, self.max_nodes,
             X_probe=self.X_probe,
             y_probe=self.y_probe,
             y_probe_stats=self.y_probe_stats)
+        # FIFO eviction: drop oldest 25 % of cache on overflow.  We don't
+        # need LRU because the encoding is deterministic and re-computing
+        # an evicted entry is cheap relative to a full BO iteration.
+        if len(self._encoding_cache) >= self._encoding_cache_maxsize:
+            evict_n = max(1, self._encoding_cache_maxsize // 4)
+            for old_fp in self._encoding_cache_order[:evict_n]:
+                self._encoding_cache.pop(old_fp, None)
+            self._encoding_cache_order = self._encoding_cache_order[evict_n:]
+        self._encoding_cache[fp] = vec
+        self._encoding_cache_order.append(fp)
+        return vec
 
     def add_observation(self, individual, cgp_eq):
         """Record an evaluated individual.
@@ -12992,31 +13234,127 @@ class BayesianCGPOptimizer:
             self.gp.fit(X, gaussian_y)
             self.gp_fitted = True
             self.current_best_f = np.max(gaussian_y)
+            # Cache the geometric-mean fitted length scale across the
+            # section-grouped Matérn components.  Used by
+            # ``select_diverse_batch`` to set the local-penalisation
+            # bandwidth on the right scale (otherwise the median
+            # pairwise-distance fallback can be off by an order of
+            # magnitude when the candidate cloud is highly clustered).
+            try:
+                ls_values = []
+                _collect_length_scales(self.gp.kernel_, ls_values)
+                if ls_values:
+                    self._gp_length_scale = float(np.exp(np.mean(np.log(
+                        np.maximum(ls_values, 1e-6)))))
+                else:
+                    self._gp_length_scale = None
+            except Exception:
+                self._gp_length_scale = None
         except Exception as e:
             print(f"  [BO] GP fitting failed: {e}")
             self.gp_fitted = False
 
     def score_candidates(self, candidate_trees):
-        """
-        Score a list of CGPEquation trees using Expected Improvement.
-        Returns EI values (higher = more promising) or random scores if
-        GP is not fitted.
+        """Score candidate trees with Log Expected Improvement.
+
+        Returns LogEI values (higher = more promising; can be negative).
+        The encoded vectors are stashed on ``self._last_candidate_vecs``
+        so ``select_diverse_batch`` can do local-penalised selection
+        without re-paying the (cached but still non-trivial) encode cost.
+
+        LogEI vs EI
+        -----------
+        Standard EI underflows to identically zero for the bulk of
+        candidates after a few BO iterations (the GP is well-fit and
+        most random mutations score multiple sigmas below ``best_f``).
+        ``argsort`` on that zero plateau is effectively random, so
+        ~80% of the screen budget was being spent on candidates with
+        no detectable advantage over each other.  LogEI uses the
+        Mill's-ratio asymptotic for very negative z so the *ordering*
+        among low-EI candidates is preserved — the surrogate's
+        information about which "barely-improving" candidate is least
+        bad survives all the way down to ``z = -50`` without
+        underflow.
         """
         if not candidate_trees:
+            self._last_candidate_vecs = None
             return np.array([], dtype=np.float64)
         if not self.gp_fitted or len(self.X_observed) < 10:
+            # Random fallback when the surrogate isn't ready.  We
+            # still encode + cache so subsequent operations (diverse
+            # batch selection) have the vectors available.
+            try:
+                vecs = np.asarray([self._encode(t) for t in candidate_trees],
+                                  dtype=np.float64)
+                self._last_candidate_vecs = vecs
+            except Exception:
+                self._last_candidate_vecs = None
             return np.random.rand(len(candidate_trees))
 
         vecs = np.asarray([self._encode(t) for t in candidate_trees],
                           dtype=np.float64)
+        self._last_candidate_vecs = vecs
         try:
             mu, sigma = self.gp.predict(vecs, return_std=True)
         except Exception:
             return np.random.rand(len(candidate_trees))
 
         best_f = getattr(self, 'current_best_f', 0.0)
-        scores = _expected_improvement(mu, sigma, best_f, self.xi)
-        return np.nan_to_num(scores, nan=0.0, posinf=1e12, neginf=0.0)
+        # Apply the adaptive xi multiplier on top of the iteration-decay
+        # xi set by the outer loop (``opt.xi``).  Multiplier >1 forces
+        # broader exploration after a failure streak; <1 lets EI focus
+        # exploitatively while improvements keep arriving.
+        effective_xi = float(self.xi) * float(self.xi_scale)
+        scores = _log_expected_improvement(mu, sigma, best_f, effective_xi)
+        return np.nan_to_num(scores, nan=-1e12, posinf=1e12, neginf=-1e12)
+
+    def select_diverse_batch(self, scores, k, candidate_vecs=None):
+        """Pick ``k`` candidate indices balancing acquisition and diversity.
+
+        Wraps the module-level ``_greedy_diverse_batch`` with the
+        optimiser's cached candidate vectors and GP length scale so
+        the local-penalisation bandwidth matches the surrogate's
+        learned smoothness.  Falls back to plain top-k by ``scores``
+        when no vectors are available.
+        """
+        if candidate_vecs is None:
+            candidate_vecs = self._last_candidate_vecs
+        if candidate_vecs is None or len(candidate_vecs) != len(scores):
+            return np.argsort(scores)[-int(k):][::-1].astype(np.int64)
+        ls = self._gp_length_scale  # may be None — _greedy_diverse_batch
+                                    # will then use a median-distance default
+        return _greedy_diverse_batch(scores, candidate_vecs, int(k),
+                                     length_scale=ls,
+                                     penalty_weight=2.0)
+
+    def record_iteration_outcome(self, improved: bool):
+        """Update the adaptive xi multiplier from this iteration's result.
+
+        ``improved`` should be True iff at least one full-fidelity
+        evaluation this iteration produced a better-than-previous-best
+        observation for this output (typically: a HoF admit or an
+        improvement to the optimiser's running min loss).  We bump
+        ``xi_scale`` UP after a few consecutive non-improvements
+        (force more EI exploration) and DOWN after a few consecutive
+        improvements (let EI converge).  The result rides on top of
+        the outer BO loop's iteration-decay schedule and is local to
+        each output's surrogate, so a stuck output doesn't drag the
+        exploration up for outputs that are still improving.
+        """
+        if improved:
+            self._success_streak += 1
+            self._failure_streak = 0
+            if self._success_streak >= 2:
+                self.xi_scale = max(self._xi_scale_min,
+                                    self.xi_scale * 0.85)
+                self._success_streak = 0
+        else:
+            self._failure_streak += 1
+            self._success_streak = 0
+            if self._failure_streak >= 3:
+                self.xi_scale = min(self._xi_scale_max,
+                                    self.xi_scale * 1.5)
+                self._failure_streak = 0
 
     def get_best_individuals(self, n=5):
         """Return the top-n individuals by loss (lowest loss first)."""
@@ -13495,11 +13833,15 @@ def run_bayesian_afpo(X, Y, n_features, n_outputs, feat_names, out_types,
                 for _ in range(max(0, n_random)):
                     candidate_trees.append(random_cgp(n_features, CGP_NODES, feat_names))
 
-                # Expected Improvement
+                # Log Expected Improvement (numerically stable; preserves
+                # ranking among low-EI candidates that raw EI underflows
+                # to 0 once the surrogate is well-fit).
                 ei_scores = opt.score_candidates(candidate_trees)
 
                 n_screen = min(BAYESIAN_BATCH_SIZE * 2, len(candidate_trees))
-                screen_indices = np.argsort(ei_scores)[-n_screen:]
+                # Local-penalised batch selection: avoid blowing the screen
+                # budget on a cluster of near-duplicate top-EI candidates.
+                screen_indices = opt.select_diverse_batch(ei_scores, n_screen)
 
                 _N = X_b.shape[0]
                 _screen_rows = min(max(50, _N // 4), _N)
@@ -13527,6 +13869,11 @@ def run_bayesian_afpo(X, Y, n_features, n_outputs, feat_names, out_types,
                 screen_results.sort(key=lambda x: x[1].loss)
                 top_indices = set(ci for ci, _ in screen_results[:BAYESIAN_BATCH_SIZE])
 
+                # Track this iteration's best loss BEFORE evaluations so the
+                # trust-region xi adaptation can detect genuine improvement.
+                _bo_prev_best = min((ind.loss for ind in opt.individuals),
+                                    default=float('inf'))
+                _bo_improved = False
                 for ci in top_indices:
                     child = Individual(candidate_trees[ci])
                     child.age = 0 # AFPO invariant
@@ -13534,7 +13881,7 @@ def run_bayesian_afpo(X, Y, n_features, n_outputs, feat_names, out_types,
                         X, Y[:, o_idx], out_types[o_idx],
                         target_grads=target_grads_list[o_idx])
                     total_evals += 1
-                    
+
                     # Add to AFPO pop
                     pop.append(child)
 
@@ -13546,8 +13893,13 @@ def run_bayesian_afpo(X, Y, n_features, n_outputs, feat_names, out_types,
                         print(f"  [BO AFPO iter {iteration} | Out {o_idx}] "
                               f"New HoF (Comp {child.complexity:.0f}): "
                               f"loss={child.loss:.5f}  {metric}")
+                        _bo_improved = True
 
                     opt.add_observation(child, child.tree)
+                    if child.loss < _bo_prev_best - 1e-9:
+                        _bo_improved = True
+
+                opt.record_iteration_outcome(_bo_improved)
 
                 # Trim Pareto front
                 afpo_pops[o_idx] = _trim_to_pareto_front_3obj(pop, AFPO_POP_SIZE)
@@ -13861,7 +14213,8 @@ def run_bayesian_islands(X, Y, n_features, n_outputs, feat_names, out_types,
                     ei_scores = opt.score_candidates(candidate_trees)
 
                     n_screen = min(BAYESIAN_BATCH_SIZE * 2, len(candidate_trees))
-                    screen_indices = np.argsort(ei_scores)[-n_screen:]
+                    # Local-penalised batch selection (see select_diverse_batch).
+                    screen_indices = opt.select_diverse_batch(ei_scores, n_screen)
 
                     _N = X_b.shape[0]
                     _screen_rows = min(max(50, _N // 4), _N)
@@ -13889,13 +14242,16 @@ def run_bayesian_islands(X, Y, n_features, n_outputs, feat_names, out_types,
                     screen_results.sort(key=lambda x: x[1].loss)
                     top_indices = set(ci for ci, _ in screen_results[:BAYESIAN_BATCH_SIZE])
 
+                    _bo_prev_best = min((ind.loss for ind in opt.individuals),
+                                        default=float('inf'))
+                    _bo_improved = False
                     for ci in top_indices:
                         child = Individual(candidate_trees[ci])
                         child.calculate_fitness(
                             X, Y[:, o_idx], out_types[o_idx],
                             target_grads=target_grads_list[o_idx])
                         total_evals += 1
-                        
+
                         pop.append(child)
 
                         if hofs[o_idx].update(child):
@@ -13906,8 +14262,13 @@ def run_bayesian_islands(X, Y, n_features, n_outputs, feat_names, out_types,
                             print(f"  [BO Isl {island_idx} iter {iteration} | Out {o_idx}] "
                                   f"New HoF (Comp {child.complexity:.0f}): "
                                   f"loss={child.loss:.5f}  {metric}")
+                            _bo_improved = True
 
                         opt.add_observation(child, child.tree)
+                        if child.loss < _bo_prev_best - 1e-9:
+                            _bo_improved = True
+
+                    opt.record_iteration_outcome(_bo_improved)
 
                     # Standard survival selection (e.g. tournament or sort)
                     pop.sort(key=lambda x: x.fitness)
@@ -14225,7 +14586,8 @@ def run_bayesian_islanded_afpo(X, Y, n_features, n_outputs, feat_names, out_type
                     ei_scores = opt.score_candidates(candidate_trees)
 
                     n_screen = min(BAYESIAN_BATCH_SIZE * 2, len(candidate_trees))
-                    screen_indices = np.argsort(ei_scores)[-n_screen:]
+                    # Local-penalised batch selection (see select_diverse_batch).
+                    screen_indices = opt.select_diverse_batch(ei_scores, n_screen)
 
                     _N = X_b.shape[0]
                     _screen_rows = min(max(50, _N // 4), _N)
@@ -14253,6 +14615,9 @@ def run_bayesian_islanded_afpo(X, Y, n_features, n_outputs, feat_names, out_type
                     screen_results.sort(key=lambda x: x[1].loss)
                     top_indices = set(ci for ci, _ in screen_results[:BAYESIAN_BATCH_SIZE])
 
+                    _bo_prev_best = min((ind.loss for ind in opt.individuals),
+                                        default=float('inf'))
+                    _bo_improved = False
                     for ci in top_indices:
                         child = Individual(candidate_trees[ci])
                         child.age = 0 # AFPO
@@ -14260,7 +14625,7 @@ def run_bayesian_islanded_afpo(X, Y, n_features, n_outputs, feat_names, out_type
                             X, Y[:, o_idx], out_types[o_idx],
                             target_grads=target_grads_list[o_idx])
                         total_evals += 1
-                        
+
                         pop.append(child)
 
                         if hofs[o_idx].update(child):
@@ -14271,8 +14636,13 @@ def run_bayesian_islanded_afpo(X, Y, n_features, n_outputs, feat_names, out_type
                             print(f"  [BO Isl-AFPO {island_idx} iter {iteration} | Out {o_idx}] "
                                   f"New HoF (Comp {child.complexity:.0f}): "
                                   f"loss={child.loss:.5f}  {metric}")
+                            _bo_improved = True
 
                         opt.add_observation(child, child.tree)
+                        if child.loss < _bo_prev_best - 1e-9:
+                            _bo_improved = True
+
+                    opt.record_iteration_outcome(_bo_improved)
 
                     islands_pop[island_idx][o_idx] = _trim_to_pareto_front_3obj(pop, AFPO_POP_SIZE)
 
@@ -14689,7 +15059,11 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
                         except Exception:
                             pass
 
-                # ── Score candidates with Expected Improvement ──────────────
+                # ── Score candidates with Log Expected Improvement ──────────
+                # LogEI is numerically stable across the entire candidate
+                # cloud, including the bulk that raw EI would map to 0
+                # (and thereby lose information about) once the surrogate
+                # is well-fit.
                 ei_scores = opt.score_candidates(candidate_trees)
 
                 # ── Multi-fidelity evaluation ─────────────────────────────
@@ -14697,7 +15071,9 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
                 # Stage 2: re-evaluate the best B on full data
                 # This halves the cost of full evaluations per iteration.
                 n_screen = min(BAYESIAN_BATCH_SIZE * 2, len(candidate_trees))
-                screen_indices = np.argsort(ei_scores)[-n_screen:]
+                # Local-penalised batch selection avoids spending the
+                # screen budget on duplicates of the top-EI peak.
+                screen_indices = opt.select_diverse_batch(ei_scores, n_screen)
 
                 _N = X_b.shape[0]
                 _screen_rows = min(max(50, _N // 4), _N)
@@ -14744,6 +15120,9 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
                 # same genotype and makes the WhiteKernel explain fidelity noise
                 # instead of genotype uncertainty.  The screen pass is used only
                 # to choose which candidates deserve full evaluation.
+                _bo_prev_best = min((ind.loss for ind in opt.individuals),
+                                    default=float('inf'))
+                _bo_improved = False
                 for ci in top_indices:
                     child = Individual(candidate_trees[ci])
                     # Evaluate Stage 2 on the FULL training set, not the
@@ -14765,9 +15144,16 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
                         print(f"  [BO iter {iteration} | Out {o_idx}] "
                               f"New HoF (Comp {child.complexity:.0f}): "
                               f"loss={child.loss:.5f}  {metric}")
+                        _bo_improved = True
 
                     # Update GP with full-fidelity evaluation
                     opt.add_observation(child, child.tree)
+                    if child.loss < _bo_prev_best - 1e-9:
+                        _bo_improved = True
+
+                # Adaptive trust-region xi: bump exploration after a few
+                # iterations with no improvement; relax it once wins resume.
+                opt.record_iteration_outcome(_bo_improved)
 
                 # ── Refit GP surrogate periodically ─────────────────────────
                 if iteration % BAYESIAN_GP_REFIT_FREQ == 0:
@@ -15171,22 +15557,29 @@ def run_bayesian_qd(X, Y, n_features, n_outputs, feat_names, out_types,
                         except Exception:
                             pass
 
-                # Score with EI; tiebreak by encouraging diversity (BD novelty)
+                # Score with Log Expected Improvement (numerically stable).
+                # Tiebreak by encouraging BD-space novelty: candidates whose
+                # archive cell is empty get an additive log-bonus.  We use
+                # ADDITION (not multiplication) because LogEI scores are
+                # on a log scale and can be negative — multiplying a
+                # negative score by 1.25 flips its ranking.  ``log(1.25)
+                # ≈ 0.223`` reproduces the original behaviour of the raw-EI
+                # ×1.25 multiplier in log space.
                 ei_scores = opt.score_candidates(candidate_trees)
-                # Apply a mild novelty multiplier: candidates whose BD is not
-                # in the archive get a small score boost.
-                novelty_boost = np.ones_like(ei_scores)
+                novelty_bonus = np.zeros_like(ei_scores)
+                _NOV_LOG_BONUS = 0.22314355131420976  # log(1.25)
                 for ci, ct in enumerate(candidate_trees):
                     try:
                         bd = arc.descriptor(Individual(ct))
                         if bd not in arc.cells:
-                            novelty_boost[ci] = 1.25
+                            novelty_bonus[ci] = _NOV_LOG_BONUS
                     except Exception:
                         pass
-                ei_scores = ei_scores * novelty_boost
+                ei_scores = ei_scores + novelty_bonus
 
                 n_screen = min(BAYESIAN_BATCH_SIZE * 2, len(candidate_trees))
-                screen_indices = np.argsort(ei_scores)[-n_screen:]
+                # Local-penalised batch selection (see select_diverse_batch).
+                screen_indices = opt.select_diverse_batch(ei_scores, n_screen)
 
                 _N = X_b.shape[0]
                 _screen_rows = min(max(50, _N // 4), _N)
@@ -15214,6 +15607,9 @@ def run_bayesian_qd(X, Y, n_features, n_outputs, feat_names, out_types,
                 screen_results.sort(key=lambda x: x[1].loss)
                 top_indices = set(ci for ci, _ in screen_results[:BAYESIAN_BATCH_SIZE])
 
+                _bo_prev_best = min((ind.loss for ind in opt.individuals),
+                                    default=float('inf'))
+                _bo_improved = False
                 for ci in top_indices:
                     child = Individual(candidate_trees[ci])
                     child.calculate_fitness(
@@ -15231,8 +15627,19 @@ def run_bayesian_qd(X, Y, n_features, n_outputs, feat_names, out_types,
                         print(f"  [BO QD iter {iteration} | Out {o_idx}] "
                               f"New HoF (Comp {child.complexity:.0f}): "
                               f"loss={child.loss:.5f}  {metric}{nov}")
+                        _bo_improved = True
 
                     opt.add_observation(child, child.tree)
+                    if child.loss < _bo_prev_best - 1e-9:
+                        _bo_improved = True
+                    if new_cell:
+                        # Discovering a fresh BD cell also counts as
+                        # progress for the trust-region adaptation —
+                        # QD specifically values novel-cell creation
+                        # even when the cell's loss isn't a new best.
+                        _bo_improved = True
+
+                opt.record_iteration_outcome(_bo_improved)
 
                 if iteration % BAYESIAN_GP_REFIT_FREQ == 0:
                     opt.fit_surrogate()
