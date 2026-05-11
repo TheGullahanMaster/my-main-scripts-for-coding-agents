@@ -5085,6 +5085,244 @@ def generate_importance_biased_seeds(n_features, feature_names, X, y):
     # simultaneously.  Detect the data shape and seed accordingly.
     seeds.extend(_generate_bit_arithmetic_seeds(n_features, feature_names, X, y))
 
+    # ════════════════════════════════════════════════════════════════
+    # MODULAR-SHIFT SEEDS  (time/angle wrap, day-of-week shift, …)
+    # ════════════════════════════════════════════════════════════════
+    # OLS on (x_i + c) mod M targets returns a near-zero R² because the
+    # wrap discontinuity defeats linear regression.  The Bayesian surrogate
+    # then anchors on that flat basin and rarely escapes via random
+    # mutation.  When the data really is integer-valued with a hidden
+    # modular shift, an exact-match seed avoids that trap entirely.
+    seeds.extend(_generate_modular_shift_seeds(n_features, feature_names, X, y))
+
+    return seeds
+
+
+def _generate_modular_shift_seeds(n_features, feature_names, X, y):
+    """Detect modular-shift / carry-mod relationships and seed them directly.
+
+    Pattern A (single-feature):  y = (x_i + c) mod M
+        Examples:
+          • SSnext = (SS + 17) mod 60          (clock +17 sec)
+          • day_next = (day + 1) mod 7         (day-of-week tick)
+          • angle_next = (angle + 30) mod 360  (angular increment)
+
+    Pattern B (two-feature carry):
+        y = (x_i + floor((x_j + k) / M_j)) mod M_i
+        Example:
+          • MMnext = (MM + floor((SS + 17) / 60)) mod 60
+
+    The wrap discontinuity in these targets gives Pearson R² ≈ 0, so
+    none of the OLS / log-OLS / rational seed paths fit.  Without a
+    direct template the Bayesian surrogate locks onto the linear basin
+    and mutation has to discover the const(c)/+/const(M)/mod scaffold
+    by accident, which takes 4–8 specific gene placements to land
+    simultaneously — empirically intractable on the BO budget.
+
+    Detection is exact: we accept Pattern A at ≥95% row match (so a
+    near-identity wrap like HHnext = HH for 99.5 % of rows still seeds)
+    and Pattern B at exact equality on every row.  Integer-only targets
+    and features qualify; continuous data is rejected fast.
+    """
+    seeds = []
+    allowed = set(CGPEquation.OPS_ALL)
+    if (n_features < 1 or X is None or y is None
+            or '+' not in allowed or 'const' not in allowed):
+        return seeds
+    try:
+        y_arr = np.asarray(y, dtype=np.float64).ravel()
+    except Exception:
+        return seeds
+    if y_arr.size < 10 or not np.all(np.isfinite(y_arr)):
+        return seeds
+    y_rounded = np.round(y_arr)
+    if float(np.max(np.abs(y_arr - y_rounded))) > 1e-3:
+        return seeds
+    y_int = y_rounded.astype(np.int64)
+    if int(y_int.min()) < 0:
+        return seeds
+    y_max = int(y_int.max())
+    if int(y_int.max() - y_int.min()) < 1:
+        return seeds
+
+    # Candidate moduli: bounded common cycles + observed-range upper bound.
+    common_M = [2, 4, 7, 8, 10, 12, 16, 24, 30, 60, 100, 360, 1000]
+    dyn_M = y_max + 1
+    candidates_M = sorted({m for m in common_M if m > y_max} | {dyn_M})
+    candidates_M = [m for m in candidates_M if 2 <= m <= 10000]
+    if not candidates_M:
+        return seeds
+
+    # Pre-screen integer features once.
+    int_feats = []
+    for fi in range(n_features):
+        xi = np.asarray(X[:, fi], dtype=np.float64)
+        if not np.all(np.isfinite(xi)):
+            continue
+        xi_r = np.round(xi)
+        if float(np.max(np.abs(xi - xi_r))) > 1e-3:
+            continue
+        xi_int = xi_r.astype(np.int64)
+        if int(xi_int.min()) < 0 or int(xi_int.max() - xi_int.min()) < 1:
+            continue
+        int_feats.append((fi, xi_int))
+    if not int_feats:
+        return seeds
+
+    has_mod      = 'mod'      in allowed
+    has_floor    = 'floor'    in allowed
+    has_div      = '/'        in allowed
+    has_sub      = '-'        in allowed
+    has_mul      = '*'        in allowed
+    has_floordiv = 'floordiv' in allowed
+
+    # Need at least one way to express  (x + c) mod M.
+    # Native:    mod(x + c, M)
+    # Fallback:  (x + c) - M * floor((x + c) / M)
+    can_native_mod = has_mod
+    can_fallback_mod = has_floor and has_div and has_sub and has_mul
+    if not (can_native_mod or can_fallback_mod):
+        return seeds
+
+    def _build_mod_node_block(cgp, nf, slot, value_idx, M_val):
+        """Append a ``v mod M_val`` subgraph and return (next_slot, out_idx)."""
+        if can_native_mod:
+            cgp.nodes[slot]     = CGPNode('const', 0, 0, float(M_val))
+            const_M_idx         = nf + slot
+            slot               += 1
+            cgp.nodes[slot]     = CGPNode('mod', value_idx, const_M_idx)
+            out_idx             = nf + slot
+            slot               += 1
+            return slot, out_idx
+        # Fallback path: v - M * floor(v / M)
+        cgp.nodes[slot]   = CGPNode('const', 0, 0, float(M_val))
+        const_M_idx       = nf + slot
+        slot             += 1
+        if has_floordiv:
+            cgp.nodes[slot] = CGPNode('floordiv', value_idx, const_M_idx)
+            floor_div_idx   = nf + slot
+            slot           += 1
+        else:
+            cgp.nodes[slot] = CGPNode('/', value_idx, const_M_idx)
+            div_idx         = nf + slot
+            slot           += 1
+            cgp.nodes[slot] = CGPNode('floor', div_idx, 0)
+            floor_div_idx   = nf + slot
+            slot           += 1
+        cgp.nodes[slot] = CGPNode('*', const_M_idx, floor_div_idx)
+        mul_idx         = nf + slot
+        slot           += 1
+        cgp.nodes[slot] = CGPNode('-', value_idx, mul_idx)
+        out_idx         = nf + slot
+        slot           += 1
+        return slot, out_idx
+
+    MAX_SEEDS_OUT = 8
+    detected_keys = set()
+
+    # ── Pattern A: single-feature  (x_i + c) mod M  ────────────────────
+    for fi, xi_int in int_feats:
+        x_max_i = int(xi_int.max())
+        for M in candidates_M:
+            # Need both x_i and y to fit in [0, M-1] for the wrap to be exact.
+            if x_max_i >= M or y_max >= M:
+                continue
+            diff = np.mod(y_int - xi_int, M)
+            # Most frequent residual = candidate shift c.
+            vals, counts = np.unique(diff, return_counts=True)
+            dom = int(counts.argmax())
+            c = int(vals[dom])
+            pred = np.mod(xi_int + c, M)
+            score = float(np.mean(pred == y_int))
+            if score < 0.95:
+                continue
+            # Skip c == 0 — the existing identity seed already covers that.
+            if c == 0:
+                continue
+            key = (fi, c, M, 'A')
+            if key in detected_keys:
+                continue
+            detected_keys.add(key)
+            cgp = _make_cgp_base(n_features, feature_names)
+            nf = n_features
+            cgp.nodes[0] = CGPNode('const', 0, 0, float(c))
+            cgp.nodes[1] = CGPNode('+', fi, nf)
+            plus_idx     = nf + 1
+            _, out_idx   = _build_mod_node_block(cgp, nf, 2, plus_idx, M)
+            cgp.out_idx  = out_idx
+            cgp.update_active_nodes()
+            seeds.append(Individual(cgp))
+            if len(seeds) >= MAX_SEEDS_OUT:
+                return seeds
+
+    # ── Pattern B: two-feature carry-mod ──────────────────────────────
+    # y = (x_i + floor((x_j + k) / M_j)) mod M_i
+    if can_fallback_mod or (can_native_mod and has_floor and has_div):
+        for fi, xi_int in int_feats:
+            x_max_i = int(xi_int.max())
+            for M_i in candidates_M:
+                if x_max_i >= M_i or y_max >= M_i:
+                    continue
+                r = np.mod(y_int - xi_int, M_i)
+                r_unique = np.unique(r)
+                # Carry should be a few small integers (typically {0, 1, 2}).
+                if len(r_unique) < 2 or len(r_unique) > 5:
+                    continue
+                if int(r_unique.max()) > 10 or int(r_unique.min()) < 0:
+                    continue
+                for fj, xj_int in int_feats:
+                    if fj == fi:
+                        continue
+                    x_max_j = int(xj_int.max())
+                    for M_j in candidates_M:
+                        # x_j needs to fit within a couple of cycles of M_j;
+                        # otherwise the floor-divide would emit huge carries.
+                        if x_max_j >= 3 * M_j:
+                            continue
+                        for k in range(M_j):
+                            carry = (xj_int + k) // M_j
+                            if int(carry.max()) > int(r_unique.max()):
+                                # Once the carry exceeds the residual range
+                                # further k only inflates it — stop scanning.
+                                break
+                            if not np.array_equal(carry, r):
+                                continue
+                            key = (fi, fj, k, M_j, M_i, 'B')
+                            if key in detected_keys:
+                                break
+                            detected_keys.add(key)
+                            cgp = _make_cgp_base(n_features, feature_names)
+                            nf = n_features
+                            cgp.nodes[0] = CGPNode('const', 0, 0, float(k))
+                            cgp.nodes[1] = CGPNode('+', fj, nf)
+                            sum_j_idx    = nf + 1
+                            cgp.nodes[2] = CGPNode('const', 0, 0, float(M_j))
+                            const_Mj_idx = nf + 2
+                            if has_floordiv:
+                                cgp.nodes[3] = CGPNode('floordiv',
+                                                        sum_j_idx, const_Mj_idx)
+                                carry_idx    = nf + 3
+                                slot         = 4
+                            else:
+                                cgp.nodes[3] = CGPNode('/',
+                                                        sum_j_idx, const_Mj_idx)
+                                div_idx      = nf + 3
+                                cgp.nodes[4] = CGPNode('floor', div_idx, 0)
+                                carry_idx    = nf + 4
+                                slot         = 5
+                            cgp.nodes[slot] = CGPNode('+', fi, carry_idx)
+                            inner_sum_idx   = nf + slot
+                            slot           += 1
+                            _, out_idx = _build_mod_node_block(
+                                cgp, nf, slot, inner_sum_idx, M_i)
+                            cgp.out_idx = out_idx
+                            cgp.update_active_nodes()
+                            seeds.append(Individual(cgp))
+                            if len(seeds) >= MAX_SEEDS_OUT:
+                                return seeds
+                            # Found k for this (fi, M_i, fj, M_j); move on.
+                            break
+
     return seeds
 
 
