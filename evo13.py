@@ -12420,6 +12420,140 @@ def build_bg_logits(hofs, group_indices, X):
     return bg
 
 
+def _make_negated_tree(tree):
+    """Return a deep-copy of `tree` whose output is the negation (−output).
+
+    Used for cross-output sibling mining in binary one-hot class groups: a
+    tree that predicts class A well typically predicts class B well after
+    negation (since σ(−f) = 1 − σ(f), so a BCE-good detector for one class
+    is a BCE-good detector for the other under sign flip).
+
+    Negation method (in order of preference):
+      • Single ``neg(x)`` node when ``'neg'`` is in the active op set.
+      • Two-slot ``const(0) → sub(0, x)`` when ``'-'`` is available
+        (universally allowed in every standard op profile).
+      • Two-slot ``const(-1) → mul(-1, x)`` when ``'*'`` is available
+        but ``'-'`` is not.
+    Returns ``None`` only if neither path can find enough free node slots
+    AFTER the current output slot (so the new wiring stays acyclic).
+    """
+    has_neg = 'neg' in CGPEquation.OPS_ALL
+    has_sub = '-'   in CGPEquation.OPS_ALL
+    has_mul = '*'   in CGPEquation.OPS_ALL
+    has_const = 'const' in CGPEquation.OPS_ALL
+    if not (has_neg or (has_sub and has_const) or (has_mul and has_const)):
+        return None
+    try:
+        nt = copy.deepcopy(tree)
+        nt.update_active_nodes()
+    except Exception:
+        return None
+    out_buf_idx = nt.out_idx
+    out_node_idx = out_buf_idx - nt.n_features
+    start_slot = max(0, out_node_idx + 1)
+    # Collect free slots strictly after the current output to keep CGP acyclic.
+    free_slots = [s for s in range(start_slot, nt.max_nodes)
+                  if (s + nt.n_features) not in nt.active_nodes]
+    if not free_slots:
+        return None
+
+    # Path 1 — single neg node (1 slot).
+    if has_neg:
+        slot = free_slots[0]
+        nt.nodes[slot] = CGPNode('neg', out_buf_idx, 0)
+        nt.out_idx = nt.n_features + slot
+        nt.update_active_nodes()
+        return nt
+
+    # Path 2 — const(0) then sub(0, x) (2 slots).
+    if has_sub and has_const and len(free_slots) >= 2:
+        s0, s1 = free_slots[0], free_slots[1]
+        nt.nodes[s0] = CGPNode('const', 0, 0, 0.0)
+        nt.nodes[s1] = CGPNode('-', nt.n_features + s0, out_buf_idx)
+        nt.out_idx = nt.n_features + s1
+        nt.update_active_nodes()
+        return nt
+
+    # Path 3 — const(-1) then mul(-1, x) (2 slots).
+    if has_mul and has_const and len(free_slots) >= 2:
+        s0, s1 = free_slots[0], free_slots[1]
+        nt.nodes[s0] = CGPNode('const', 0, 0, -1.0)
+        nt.nodes[s1] = CGPNode('*', nt.n_features + s0, out_buf_idx)
+        nt.out_idx = nt.n_features + s1
+        nt.update_active_nodes()
+        return nt
+    return None
+
+
+def _collect_sibling_hof_trees(o_idx, class_groups_info, hofs, max_count=8):
+    """Cross-output sibling mining for one-hot class groups.
+
+    When the current output ``o_idx`` belongs to a one-hot class group,
+    collect candidate trees from its SIBLING outputs' HoFs.  For binary
+    groups (K=2) also includes negated copies — under BCE/sigmoid the
+    same structure (sign-flipped) classifies the complementary class.
+
+    Returns a list of fresh CGPEquation trees (deep-copied) ready to be
+    evaluated.  Empty list if ``o_idx`` is not in a class group or no
+    sibling has a usable HoF entry.
+
+    Rationale: in 2-class one-hot problems (e.g. leap_year_True vs
+    leap_year_False) one output frequently discovers the discriminator
+    while its sibling stays trapped at the majority-class prior.  By
+    transferring the sibling's structural discovery, the stuck output
+    can jump out of the prior basin in a single iteration instead of
+    re-deriving the same structure from scratch.
+    """
+    if not class_groups_info:
+        return []
+    g_info = class_groups_info.get(o_idx)
+    if g_info is None:
+        return []
+    group_idxs, _ = g_info
+    siblings = [s for s in group_idxs if s != o_idx]
+    if not siblings:
+        return []
+    is_binary = (len(group_idxs) == 2)
+    # Per-sibling budget — divide budget across siblings (and halve again
+    # for binary, since each entry contributes both itself and its negation).
+    per_sib = max(1, max_count // (len(siblings) * (2 if is_binary else 1)))
+    trees = []
+    for sib in siblings:
+        sib_hof = hofs[sib]
+        if not sib_hof.best_by_complexity:
+            continue
+        sib_inds = sorted(sib_hof.best_by_complexity.values(),
+                          key=lambda x: x.loss)
+        for ind in sib_inds[:per_sib]:
+            try:
+                trees.append(copy.deepcopy(ind.tree))
+            except Exception:
+                continue
+            if is_binary:
+                neg = _make_negated_tree(ind.tree)
+                if neg is not None:
+                    trees.append(neg)
+            if len(trees) >= max_count:
+                break
+        if len(trees) >= max_count:
+            break
+    return trees[:max_count]
+
+
+def _build_class_groups_info(dp, out_types):
+    """Convenience wrapper: detect one-hot class groups AND build a
+    ``out_idx → (group_indices_list, local_class_index)`` lookup in one
+    call.  Returns ``(class_groups_dict, out_group_info_dict)``.  Both
+    are empty when no one-hot group is present.
+    """
+    class_groups = detect_class_groups(dp, out_types)
+    out_group_info = {}
+    for _col_name, group_idxs in class_groups.items():
+        for local_k, global_k in enumerate(group_idxs):
+            out_group_info[global_k] = (group_idxs, local_k)
+    return class_groups, out_group_info
+
+
 
 # ==========================================
 # BAYESIAN CGP — Surrogate-Assisted Optimisation
@@ -13721,6 +13855,19 @@ def run_bayesian_afpo(X, Y, n_features, n_outputs, feat_names, out_types,
         opt.fit_surrogate()
         print(f"  {opt.summary_str()}")
 
+    # ── One-hot class-group detection for cross-output sibling mining ──
+    # See ``run_bayesian_qd`` for the full rationale: this lets a stuck
+    # categorical output borrow structural discoveries (with negation,
+    # for binary groups) from a sibling that already found the
+    # discriminator, instead of re-deriving the same structure from
+    # scratch generation after generation.
+    _bo_class_groups, _bo_out_group_info = _build_class_groups_info(dp, out_types)
+    if _bo_class_groups:
+        print(f"  [Sibling Mining] Detected {len(_bo_class_groups)} one-hot "
+              "class group(s): " + ", ".join(
+                  f"{k}({len(v)} classes)"
+                  for k, v in _bo_class_groups.items()))
+
     # ── Phase 2: Bayesian AFPO loop ─────────────────────────────
     print("\nPhase 2: Bayesian AFPO optimisation. Ctrl+C to stop.\n")
     iteration = 0
@@ -13832,6 +13979,18 @@ def run_bayesian_afpo(X, Y, n_features, n_outputs, feat_names, out_types,
                 n_random = BAYESIAN_N_CANDIDATES - n_exploit - n_cross - n_macro - n_hof_cross
                 for _ in range(max(0, n_random)):
                     candidate_trees.append(random_cgp(n_features, CGP_NODES, feat_names))
+
+                # Cross-output sibling mining for one-hot class groups.
+                # See ``run_bayesian_qd`` for the full rationale.
+                if _bo_out_group_info.get(o_idx) is not None:
+                    _n_sib = max(4, BAYESIAN_N_CANDIDATES // 20)
+                    try:
+                        _sib_trees = _collect_sibling_hof_trees(
+                            o_idx, _bo_out_group_info, hofs,
+                            max_count=_n_sib)
+                        candidate_trees.extend(_sib_trees)
+                    except Exception:
+                        pass
 
                 # Log Expected Improvement (numerically stable; preserves
                 # ranking among low-EI candidates that raw EI underflows
@@ -14100,6 +14259,15 @@ def run_bayesian_islands(X, Y, n_features, n_outputs, feat_names, out_types,
     for opt in optimizers:
         opt.fit_surrogate()
 
+    # ── One-hot class-group detection for cross-output sibling mining ──
+    # See ``run_bayesian_qd`` for the full rationale.
+    _bo_class_groups, _bo_out_group_info = _build_class_groups_info(dp, out_types)
+    if _bo_class_groups:
+        print(f"  [Sibling Mining] Detected {len(_bo_class_groups)} one-hot "
+              "class group(s): " + ", ".join(
+                  f"{k}({len(v)} classes)"
+                  for k, v in _bo_class_groups.items()))
+
     # ── Phase 2: Bayesian Islands loop ─────────────────────────────
     print("\nPhase 2: Bayesian Islands optimisation. Ctrl+C to stop.\n")
     iteration = 0
@@ -14209,6 +14377,18 @@ def run_bayesian_islands(X, Y, n_features, n_outputs, feat_names, out_types,
                     n_random = BAYESIAN_N_CANDIDATES - n_exploit - n_cross - n_macro - n_hof_cross
                     for _ in range(max(0, n_random)):
                         candidate_trees.append(random_cgp(n_features, CGP_NODES, feat_names))
+
+                    # Cross-output sibling mining for one-hot class groups.
+                    # See ``run_bayesian_qd`` for the full rationale.
+                    if _bo_out_group_info.get(o_idx) is not None:
+                        _n_sib = max(4, BAYESIAN_N_CANDIDATES // 20)
+                        try:
+                            _sib_trees = _collect_sibling_hof_trees(
+                                o_idx, _bo_out_group_info, hofs,
+                                max_count=_n_sib)
+                            candidate_trees.extend(_sib_trees)
+                        except Exception:
+                            pass
 
                     ei_scores = opt.score_candidates(candidate_trees)
 
@@ -14471,6 +14651,15 @@ def run_bayesian_islanded_afpo(X, Y, n_features, n_outputs, feat_names, out_type
     for opt in optimizers:
         opt.fit_surrogate()
 
+    # ── One-hot class-group detection for cross-output sibling mining ──
+    # See ``run_bayesian_qd`` for the full rationale.
+    _bo_class_groups, _bo_out_group_info = _build_class_groups_info(dp, out_types)
+    if _bo_class_groups:
+        print(f"  [Sibling Mining] Detected {len(_bo_class_groups)} one-hot "
+              "class group(s): " + ", ".join(
+                  f"{k}({len(v)} classes)"
+                  for k, v in _bo_class_groups.items()))
+
     # ── Phase 2: Bayesian Islanded AFPO loop ─────────────────────────────
     print("\nPhase 2: Bayesian Islanded AFPO optimisation. Ctrl+C to stop.\n")
     iteration = 0
@@ -14582,6 +14771,18 @@ def run_bayesian_islanded_afpo(X, Y, n_features, n_outputs, feat_names, out_type
                     n_random = BAYESIAN_N_CANDIDATES - n_exploit - n_cross - n_macro - n_hof_cross
                     for _ in range(max(0, n_random)):
                         candidate_trees.append(random_cgp(n_features, CGP_NODES, feat_names))
+
+                    # Cross-output sibling mining for one-hot class groups.
+                    # See ``run_bayesian_qd`` for the full rationale.
+                    if _bo_out_group_info.get(o_idx) is not None:
+                        _n_sib = max(4, BAYESIAN_N_CANDIDATES // 20)
+                        try:
+                            _sib_trees = _collect_sibling_hof_trees(
+                                o_idx, _bo_out_group_info, hofs,
+                                max_count=_n_sib)
+                            candidate_trees.extend(_sib_trees)
+                        except Exception:
+                            pass
 
                     ei_scores = opt.score_candidates(candidate_trees)
 
@@ -14874,6 +15075,15 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
         opt.fit_surrogate()
         print(f"  {opt.summary_str()}")
 
+    # ── One-hot class-group detection for cross-output sibling mining ──
+    # See ``run_bayesian_qd`` for the full rationale.
+    _bo_class_groups, _bo_out_group_info = _build_class_groups_info(dp, out_types)
+    if _bo_class_groups:
+        print(f"  [Sibling Mining] Detected {len(_bo_class_groups)} one-hot "
+              "class group(s): " + ", ".join(
+                  f"{k}({len(v)} classes)"
+                  for k, v in _bo_class_groups.items()))
+
     # ── Phase 2: Bayesian optimisation loop ─────────────────────────────
     print("\nPhase 2: Bayesian optimisation. Ctrl+C to stop.\n")
     iteration = 0
@@ -15058,6 +15268,18 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
                                 candidate_trees.append(_rs.tree)
                         except Exception:
                             pass
+
+                # Cross-output sibling mining for one-hot class groups.
+                # See ``run_bayesian_qd`` for the full rationale.
+                if _bo_out_group_info.get(o_idx) is not None:
+                    _n_sib = max(4, BAYESIAN_N_CANDIDATES // 20)
+                    try:
+                        _sib_trees = _collect_sibling_hof_trees(
+                            o_idx, _bo_out_group_info, hofs,
+                            max_count=_n_sib)
+                        candidate_trees.extend(_sib_trees)
+                    except Exception:
+                        pass
 
                 # ── Score candidates with Log Expected Improvement ──────────
                 # LogEI is numerically stable across the entire candidate
@@ -15405,6 +15627,19 @@ def run_bayesian_qd(X, Y, n_features, n_outputs, feat_names, out_types,
         opt.fit_surrogate()
         print(f"  {opt.summary_str()}")
 
+    # ── One-hot class-group detection for cross-output sibling mining ──
+    # Categorical outputs that share a column (e.g. leap_year_True /
+    # leap_year_False) often have the property that one sibling discovers
+    # the discriminator while the other is stuck at the majority-class
+    # prior.  Detect them here so each iteration can inject a few candidate
+    # trees harvested (and negated, for binary groups) from sibling HoFs.
+    _bo_class_groups, _bo_out_group_info = _build_class_groups_info(dp, out_types)
+    if _bo_class_groups:
+        print(f"  [Sibling Mining] Detected {len(_bo_class_groups)} one-hot "
+              "class group(s): " + ", ".join(
+                  f"{k}({len(v)} classes)"
+                  for k, v in _bo_class_groups.items()))
+
     # ── Phase 2: QD loop ────────────────────────────────────────────────
     print("\nPhase 2: Bayesian QD optimisation. Ctrl+C to stop.\n")
     iteration = 0
@@ -15556,6 +15791,25 @@ def run_bayesian_qd(X, Y, n_features, n_outputs, feat_names, out_types,
                                 candidate_trees.append(_rs.tree)
                         except Exception:
                             pass
+
+                # Cross-output sibling mining for one-hot class groups.
+                # When this output belongs to a one-hot group, inject a
+                # handful of candidates harvested from sibling outputs'
+                # HoFs (with negated copies for binary groups).  This
+                # breaks the "majority-class-prior" basin where one
+                # categorical output stays stuck while its sibling has
+                # already learned the discriminator.  Added as bonus
+                # candidates on top of the regular budget so the EI
+                # screen decides whether they're worth evaluating.
+                if _bo_out_group_info.get(o_idx) is not None:
+                    _n_sib = max(4, BAYESIAN_N_CANDIDATES // 20)
+                    try:
+                        _sib_trees = _collect_sibling_hof_trees(
+                            o_idx, _bo_out_group_info, hofs,
+                            max_count=_n_sib)
+                        candidate_trees.extend(_sib_trees)
+                    except Exception:
+                        pass
 
                 # Score with Log Expected Improvement (numerically stable).
                 # Tiebreak by encouraging BD-space novelty: candidates whose
