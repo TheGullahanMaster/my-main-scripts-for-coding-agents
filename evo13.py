@@ -13020,6 +13020,150 @@ def _build_class_groups_info(dp, out_types):
     return class_groups, out_group_info
 
 
+def _bo_collect_mc_indices(out_group_info):
+    """Return the set of output indices that belong to a multi-class group.
+
+    Used by ``_bo_build_optimizers`` to reserve the joint-softmax
+    phenotype cells in the right surrogates from the outset.  Binary
+    one-hot groups (K=2) also benefit — joint softmax over two columns
+    is equivalent to a re-scaled BCE but still couples the sibling — so
+    they're included.
+    """
+    if not out_group_info:
+        return set()
+    return set(int(k) for k in out_group_info.keys())
+
+
+def _bo_build_y_group_full(Y, group_indices):
+    """Pull out the one-hot label columns for a class group, contiguous.
+
+    ``Y`` may be a wider matrix (multiple targets, possibly mixing
+    regression + classification); ``group_indices`` lists the contiguous
+    block of K output columns that one-hot a single categorical column.
+    """
+    return np.asarray(Y[:, list(group_indices)], dtype=np.float64)
+
+
+def _bo_refresh_multiclass_state(optimizers, hofs, X, X_probe, Y,
+                                 probe_idx, out_group_info):
+    """Push the latest sibling bg_logits into every multi-class optimiser.
+
+    Called once per BO iteration.  For each output ``o`` that belongs to a
+    one-hot class group we:
+      1. Build ``bg_logits_full`` (N, K) and ``bg_logits_probe`` (P, K)
+         from the current HoF-best model of each sibling — the ``o``-th
+         column is left as zeros so the surrogate / fitness call fills it
+         with the candidate's own predictions.
+      2. Build ``Y_group_full`` (N, K) and ``Y_group_probe`` (P, K) by
+         slicing the contiguous one-hot block out of ``Y``.
+      3. Call ``opt.set_multiclass_state(...)`` which bumps the encoding
+         cache id and stores both sides of the context.
+
+    Returns the number of optimisers actually updated (mostly useful for
+    logging in the variant loops).
+    """
+    if not out_group_info:
+        return 0
+    updated = 0
+    # Cache per-group full bg_logits so siblings sharing the same group
+    # only pay the HoF-best evaluation cost once.
+    group_cache = {}
+    probe_cache = {}
+    for o_idx, (group_idxs, class_idx) in out_group_info.items():
+        if o_idx >= len(optimizers):
+            continue
+        opt = optimizers[o_idx]
+        if not getattr(opt, 'has_mc_context', False):
+            continue
+        gkey = tuple(group_idxs)
+        if gkey not in group_cache:
+            try:
+                bg_full = build_bg_logits(hofs, list(group_idxs), X)
+            except Exception:
+                bg_full = np.zeros((X.shape[0], len(group_idxs)),
+                                   dtype=np.float64)
+            group_cache[gkey] = bg_full
+            try:
+                bg_probe = (bg_full[probe_idx]
+                            if probe_idx is not None and X_probe is not None
+                            else None)
+            except Exception:
+                bg_probe = None
+            probe_cache[gkey] = bg_probe
+        bg_full = group_cache[gkey]
+        bg_probe = probe_cache[gkey]
+        try:
+            Y_group_full = _bo_build_y_group_full(Y, list(group_idxs))
+        except Exception:
+            Y_group_full = None
+        if Y_group_full is None:
+            continue
+        Y_group_probe = (Y_group_full[probe_idx]
+                         if probe_idx is not None and bg_probe is not None
+                         else None)
+        # Zero the candidate's OWN column in bg_logits so the surrogate
+        # encoder and joint-softmax CE both treat that slot as "the
+        # contribution being scored" rather than a stale HoF carry-over.
+        bg_full_self = bg_full.copy()
+        bg_full_self[:, class_idx] = 0.0
+        if bg_probe is not None:
+            bg_probe_self = bg_probe.copy()
+            bg_probe_self[:, class_idx] = 0.0
+        else:
+            bg_probe_self = None
+        try:
+            opt.set_multiclass_state(
+                bg_logits_full=bg_full_self,
+                Y_group_full=Y_group_full,
+                bg_logits_probe=bg_probe_self,
+                Y_group_probe=Y_group_probe,
+                class_idx=class_idx)
+            updated += 1
+        except Exception:
+            continue
+    return updated
+
+
+def _bo_calc_fitness(child, X, y_target, type_code, opt=None,
+                     screen_global_idx=None, **kwargs):
+    """``Individual.calculate_fitness`` wrapper that injects the live
+    multi-class joint-softmax context from ``opt`` when present.
+
+    ``screen_global_idx`` is the row-index mapping from ``X`` rows back
+    into the full training set, used to slice the optimiser's full-data
+    bg_logits to match.  When ``X`` IS the full training set, leave it
+    ``None``.
+
+    The wrapper is a no-op for regression / binary-classification
+    outputs (returns the underlying ``calculate_fitness`` directly).
+    """
+    if opt is not None:
+        mc = opt.get_full_mc_context()
+    else:
+        mc = None
+    if mc is None:
+        return child.calculate_fitness(X, y_target, type_code, **kwargs)
+    bg_full, yg_full, cls_idx = mc
+    if screen_global_idx is not None:
+        try:
+            idx = np.asarray(screen_global_idx)
+            bg = bg_full[idx]
+            yg = yg_full[idx]
+        except Exception:
+            bg, yg = bg_full, yg_full
+    else:
+        bg, yg = bg_full, yg_full
+    if bg.shape[0] != X.shape[0]:
+        # Defensive: row-count mismatch (e.g. probe/screen indices got
+        # out of sync after a re-shuffle).  Fall back to BCE so we don't
+        # corrupt the loss with a misaligned bg.
+        return child.calculate_fitness(X, y_target, type_code, **kwargs)
+    return child.calculate_fitness(
+        X, y_target, type_code,
+        bg_logits=bg, class_idx_in_group=cls_idx, Y_group=yg,
+        **kwargs)
+
+
 
 # ==========================================
 # BAYESIAN CGP — Surrogate-Assisted Optimisation
@@ -13101,13 +13245,28 @@ def _bo_struct_dim(n_features: int) -> int:
     return _BO_STRUCT_HEADER_DIMS + max(0, int(n_features))
 
 
-def _bo_phenotype_dim(probe_size: int, has_y_probe: bool) -> int:
-    """Total dimensionality of the phenotype/probe part of the encoding."""
-    return (4 if has_y_probe else 0) + max(0, int(probe_size))
+# Number of extra encoding cells contributed by multi-class context.  Kept
+# as a module constant so the kernel builder and `_bo_phenotype_dim` agree
+# on the layout without threading the integer through everywhere.
+_BO_MULTICLASS_FEATURE_DIMS = 5
+
+
+def _bo_phenotype_dim(probe_size: int, has_y_probe: bool,
+                      has_mc_context: bool = False) -> int:
+    """Total dimensionality of the phenotype/probe part of the encoding.
+
+    ``has_mc_context`` adds the multi-class joint-softmax phenotype block
+    (mean log-prob of true class, mean margin, joint accuracy, per-class
+    recall-probability, and a class-vs-rest agreement score).  These are
+    only meaningful when the output belongs to a one-hot class group, so
+    the kernel section is omitted otherwise to avoid wasting GP capacity.
+    """
+    base = (4 if has_y_probe else 0) + max(0, int(probe_size))
+    return base + (_BO_MULTICLASS_FEATURE_DIMS if has_mc_context else 0)
 
 
 def cgp_to_vector(cgp_eq, max_nodes, X_probe=None, y_probe=None,
-                  y_probe_stats=None):
+                  y_probe_stats=None, mc_context=None):
     """
     Encode a CGPEquation as a fixed-length descriptor for the GP surrogate.
 
@@ -13135,6 +13294,19 @@ def cgp_to_vector(cgp_eq, max_nodes, X_probe=None, y_probe=None,
             * sign-agreement fraction (preds vs y_probe)
             * tanh(std(preds) / std(y_probe)) (output-scale match)
         ─ phenotype probe (probe_size cells, robustly normalised)
+
+      Multi-class phenotype block (5 cells, when ``mc_context`` is given):
+        Treats this candidate's output as one column of a one-hot class
+        group whose other columns are filled by the current HoF-best logits
+        of each sibling.  Lets the surrogate model the joint softmax
+        directly instead of the one-vs-rest BCE approximation.
+            * tanh(mean log-prob of TRUE class under softmax(logits))
+            * tanh(mean margin true_logit - max_other_logit / 5.0)
+            * 2*joint_accuracy - 1         (argmax matches true class)
+            * 2*recall_when_this_class - 1 (prob assigned to this class
+                                            when this class is the true one)
+            * 2*precision_when_argmax - 1  (frac of argmax==this where
+                                            true class equals this)
 
     Why this matters for symbolic regression
     ----------------------------------------
@@ -13302,6 +13474,85 @@ def cgp_to_vector(cgp_eq, max_nodes, X_probe=None, y_probe=None,
             scale = max(mad * 1.4826, 1.0)
             preds_n = np.tanh((preds - np.median(preds)) / (3.0 * scale))
         vec_parts.append(preds_n.astype(np.float64))
+
+        # ── Multi-class joint-softmax phenotype block ──────────────────────
+        # When the caller supplies ``mc_context``, the candidate's predictions
+        # are stitched into the sibling background logits and the surrogate
+        # gets to model joint softmax quality directly — closing the loop
+        # that vanilla one-vs-rest BCE features open between "looks great in
+        # isolation" and "actually wins the multi-class softmax".  Five
+        # cells are emitted (see docstring) so the kernel section size in
+        # ``_bo_build_kernel`` matches `_BO_MULTICLASS_FEATURE_DIMS`.
+        if (mc_context is not None
+                and mc_context.get('bg_logits_probe') is not None
+                and mc_context.get('Y_group_probe') is not None):
+            try:
+                bg_p = np.asarray(mc_context['bg_logits_probe'],
+                                  dtype=np.float64)
+                yg_p = np.asarray(mc_context['Y_group_probe'],
+                                  dtype=np.float64)
+                cls_idx = int(mc_context.get('class_idx', 0))
+                if (bg_p.shape[0] == len(preds)
+                        and yg_p.shape == bg_p.shape
+                        and 0 <= cls_idx < bg_p.shape[1]):
+                    logits = bg_p.copy()
+                    logits[:, cls_idx] = preds
+                    # Numerically stable softmax / log-softmax
+                    row_max = logits.max(axis=1, keepdims=True)
+                    shifted = np.clip(logits - row_max, -500.0, 0.0)
+                    exp_l = np.exp(shifted)
+                    denom = exp_l.sum(axis=1, keepdims=True) + 1e-30
+                    sm = exp_l / denom
+                    log_sm = shifted - np.log(denom)
+                    true_cls = np.argmax(yg_p, axis=1).astype(np.int64)
+                    rows = np.arange(logits.shape[0])
+                    # Mean log-prob of true class (negative; tanh-squashed).
+                    mean_ll = float(np.mean(log_sm[rows, true_cls]))
+                    cell_mean_ll = float(np.tanh(mean_ll / 3.0))
+                    # Mean margin (true_logit - max_other_logit).  Positive
+                    # = candidate genuinely separates true class from rivals.
+                    true_logits = logits[rows, true_cls]
+                    mask = np.ones_like(logits, dtype=bool)
+                    mask[rows, true_cls] = False
+                    other_max = np.where(mask, logits,
+                                         -np.inf).max(axis=1)
+                    margins = true_logits - other_max
+                    cell_margin = float(np.tanh(
+                        float(np.mean(margins)) / 5.0))
+                    # Joint argmax accuracy under softmax(stitched logits).
+                    pred_cls = np.argmax(logits, axis=1)
+                    joint_acc = float(np.mean(pred_cls == true_cls))
+                    cell_acc = 2.0 * joint_acc - 1.0
+                    # Recall-like: when this class is the true class, what
+                    # softmax prob does the candidate assign to it?
+                    this_true = yg_p[:, cls_idx] > 0.5
+                    if np.any(this_true):
+                        recall_p = float(np.mean(sm[this_true, cls_idx]))
+                    else:
+                        recall_p = 0.0
+                    cell_recall = 2.0 * recall_p - 1.0
+                    # Precision-like: when argmax picks this class, how
+                    # often is this class the true label?
+                    pred_this = pred_cls == cls_idx
+                    if np.any(pred_this):
+                        prec_p = float(np.mean(
+                            (true_cls == cls_idx)[pred_this]))
+                    else:
+                        # No row was predicted as this class — treat as a
+                        # neutral signal (0.5) so the surrogate doesn't
+                        # punish over-confidence at zero prediction rate.
+                        prec_p = 0.5
+                    cell_prec = 2.0 * prec_p - 1.0
+                    vec_parts.append(np.array(
+                        [cell_mean_ll, cell_margin, cell_acc,
+                         cell_recall, cell_prec],
+                        dtype=np.float64))
+                else:
+                    vec_parts.append(np.zeros(_BO_MULTICLASS_FEATURE_DIMS,
+                                              dtype=np.float64))
+            except Exception:
+                vec_parts.append(np.zeros(_BO_MULTICLASS_FEATURE_DIMS,
+                                          dtype=np.float64))
 
     return np.concatenate(vec_parts)
 
@@ -13569,7 +13820,7 @@ if HAS_SKLEARN_GP:
 
 
     def _bo_build_kernel(n_features: int, probe_size: int,
-                         has_y_probe: bool):
+                         has_y_probe: bool, has_mc_context: bool = False):
         """Construct the section-grouped GP kernel for the BO surrogate.
 
         Layout (one isotropic length scale per non-empty section):
@@ -13579,6 +13830,13 @@ if HAS_SKLEARN_GP:
             [17 + n_features .. + 4)           phenotype-vs-target stats
                                                (only when ``has_y_probe``)
             [.. + probe_size)                  phenotype probe rows
+            [.. + _BO_MULTICLASS_FEATURE_DIMS) joint-softmax phenotype block
+                                               (only when ``has_mc_context``)
+
+        The multi-class section gets its own length scale so a stuck
+        categorical output can have the GP focus its smoothness assumption
+        on the joint softmax features instead of letting the structural
+        block dominate.
         """
         sections = []
         cur = 0
@@ -13593,6 +13851,9 @@ if HAS_SKLEARN_GP:
         if probe_size > 0:
             sections.append((cur, cur + probe_size))
             cur += probe_size
+        if has_mc_context:
+            sections.append((cur, cur + _BO_MULTICLASS_FEATURE_DIMS))
+            cur += _BO_MULTICLASS_FEATURE_DIMS
 
         section_kernels = [
             _BO_SlicedMatern(start, stop,
@@ -13624,7 +13885,8 @@ class BayesianCGPOptimizer:
 
     def __init__(self, n_features, max_nodes, feat_names, X_probe=None,
                  y_probe=None, y_probe_stats=None,
-                 max_points=500, xi=0.01):
+                 max_points=500, xi=0.01,
+                 has_mc_context: bool = False):
         self.n_features = n_features
         self.max_nodes  = max_nodes
         self.feat_names = feat_names
@@ -13637,12 +13899,31 @@ class BayesianCGPOptimizer:
         # against differently-scaled probe samples would produce different
         # encoded vectors and confuse the surrogate.
         self.y_probe_stats = y_probe_stats
+        # ``has_mc_context`` is a structural flag: when True we reserve the
+        # 5 multi-class phenotype cells in the encoding and kernel from the
+        # outset, so the live bg_logits (set via ``set_multiclass_state``
+        # each BO iteration) can be plugged in without rebuilding the GP.
+        self.has_mc_context = bool(has_mc_context)
         probe_size = X_probe.shape[0] if X_probe is not None else 0
         self.vec_dim = (_bo_struct_dim(n_features)
-                        + _bo_phenotype_dim(probe_size, y_probe is not None))
+                        + _bo_phenotype_dim(probe_size, y_probe is not None,
+                                            has_mc_context=self.has_mc_context))
         self.xi         = xi
         self.xi_base    = xi          # baseline xi — adaptive control multiplies this
         self.max_points = max_points
+
+        # ── Multi-class joint-softmax state ─────────────────────────────────
+        # Populated by ``set_multiclass_state`` once per BO iteration when
+        # this output belongs to a one-hot class group.  ``mc_state_id`` is
+        # bumped on every refresh so the encoding cache (which depends on
+        # ``bg_logits_probe``) is invalidated on schedule without flushing
+        # genuinely structural cache hits.  Probe versions feed the encoder;
+        # full versions feed ``calculate_fitness`` for joint-softmax CE.
+        self.mc_context = None          # encoder-side: probe bg_logits + labels
+        self.mc_full = None             # fitness-side: full bg_logits + labels
+        self.mc_state_id = 0
+        self._mc_obs_state_id = []      # mc_state_id at which each buffer
+                                        # entry's loss was computed
 
         # Observed data
         self.X_observed = []   # list of vectors
@@ -13700,7 +13981,8 @@ class BayesianCGPOptimizer:
         kernel = _bo_build_kernel(
             n_features=int(n_features),
             probe_size=int(probe_size),
-            has_y_probe=(y_probe is not None))
+            has_y_probe=(y_probe is not None),
+            has_mc_context=self.has_mc_context)
         self.gp = GaussianProcessRegressor(
             kernel=kernel, alpha=1e-6, normalize_y=True,
             n_restarts_optimizer=1)
@@ -13725,8 +14007,12 @@ class BayesianCGPOptimizer:
         The encoding depends only on the tree's *active* subgraph and on
         the optimiser's frozen probe / y-stats, so reusing a cached
         vector for the same fingerprint is exact (no approximation).
-        Cache lookup costs one ``_FitnessCache._fingerprint`` call
-        (which is what the global fitness cache already does on every
+        When multi-class context is active the encoding ALSO depends on
+        the current ``bg_logits_probe``, so the cache key includes
+        ``mc_state_id`` — bumped each time ``set_multiclass_state`` is
+        called — to keep entries valid only within their generation
+        iteration.  Cache lookup costs one ``_FitnessCache._fingerprint``
+        call (which is what the global fitness cache already does on every
         evaluate, so the marginal cost is small) and avoids a full
         ``cgp_to_vector`` pass — including the per-candidate
         ``cgp_eq.evaluate(X_probe)`` call that dominates the
@@ -13741,8 +14027,13 @@ class BayesianCGPOptimizer:
                 cgp_eq, self.max_nodes,
                 X_probe=self.X_probe,
                 y_probe=self.y_probe,
-                y_probe_stats=self.y_probe_stats)
-        cached = self._encoding_cache.get(fp)
+                y_probe_stats=self.y_probe_stats,
+                mc_context=self.mc_context)
+        # Mix the multi-class state id into the cache key so a refresh
+        # of bg_logits forces re-encoding (the probe-side mc features
+        # are a function of bg_logits_probe).
+        cache_key = (fp, self.mc_state_id) if self.has_mc_context else fp
+        cached = self._encoding_cache.get(cache_key)
         if cached is not None:
             self._encoding_hits += 1
             return cached
@@ -13751,7 +14042,8 @@ class BayesianCGPOptimizer:
             cgp_eq, self.max_nodes,
             X_probe=self.X_probe,
             y_probe=self.y_probe,
-            y_probe_stats=self.y_probe_stats)
+            y_probe_stats=self.y_probe_stats,
+            mc_context=self.mc_context)
         # FIFO eviction: drop oldest 25 % of cache on overflow.  We don't
         # need LRU because the encoding is deterministic and re-computing
         # an evicted entry is cheap relative to a full BO iteration.
@@ -13760,8 +14052,8 @@ class BayesianCGPOptimizer:
             for old_fp in self._encoding_cache_order[:evict_n]:
                 self._encoding_cache.pop(old_fp, None)
             self._encoding_cache_order = self._encoding_cache_order[evict_n:]
-        self._encoding_cache[fp] = vec
-        self._encoding_cache_order.append(fp)
+        self._encoding_cache[cache_key] = vec
+        self._encoding_cache_order.append(cache_key)
         return vec
 
     def add_observation(self, individual, cgp_eq):
@@ -13779,6 +14071,10 @@ class BayesianCGPOptimizer:
         self.X_observed.append(vec)
         self.y_observed.append(y)
         self.individuals.append(_bo_clone_for_buffer(individual))
+        # Track the bg_logits "epoch" this loss was measured against so
+        # ``reeval_buffer_for_mc`` knows which entries are still consistent
+        # with the live bg_logits and which need a refresh.
+        self._mc_obs_state_id.append(self.mc_state_id)
 
         if len(self.X_observed) > self.max_points:
             # Keep the top-`max_points` by transformed fitness; among ties
@@ -13788,6 +14084,138 @@ class BayesianCGPOptimizer:
             self.X_observed  = [self.X_observed[i]  for i in keep_idx]
             self.y_observed  = [self.y_observed[i]  for i in keep_idx]
             self.individuals = [self.individuals[i] for i in keep_idx]
+            self._mc_obs_state_id = [self._mc_obs_state_id[i]
+                                     for i in keep_idx]
+
+    # ── Multi-class joint-softmax helpers ───────────────────────────────────
+    def set_multiclass_state(self, bg_logits_full, Y_group_full,
+                             bg_logits_probe, Y_group_probe,
+                             class_idx):
+        """Refresh this output's view of its sibling logits.
+
+        Called once per BO iteration after the latest sibling HoF-best
+        models have been collected.  Bumps ``mc_state_id`` so cached
+        encodings (which use the probe bg_logits) are invalidated and
+        ``reeval_buffer_for_mc`` knows which buffer entries are stale.
+
+        The ``_full`` arrays are kept for joint-softmax CE fitness calls;
+        the ``_probe`` arrays drive the surrogate's phenotype encoding.
+
+        After updating the state we also RE-ENCODE every buffered tree so
+        the GP's training X always lives in the same (current) encoding
+        space as the candidate vectors it scores between refits.  Without
+        this, the multi-class phenotype cells of training and prediction
+        vectors disagree on what counts as "this sibling logit", and the
+        GP's distance metric collapses to noise on that section.
+        """
+        if not self.has_mc_context:
+            return
+        if bg_logits_full is None or Y_group_full is None:
+            self.mc_full = None
+            self.mc_context = None
+            return
+        self.mc_full = {
+            'bg_logits':        np.asarray(bg_logits_full, dtype=np.float64),
+            'Y_group':          np.asarray(Y_group_full,   dtype=np.float64),
+            'class_idx':        int(class_idx),
+        }
+        if bg_logits_probe is not None and Y_group_probe is not None:
+            self.mc_context = {
+                'bg_logits_probe': np.asarray(bg_logits_probe,
+                                              dtype=np.float64),
+                'Y_group_probe':   np.asarray(Y_group_probe,
+                                              dtype=np.float64),
+                'class_idx':       int(class_idx),
+            }
+        else:
+            self.mc_context = None
+        self.mc_state_id += 1
+        # Keep X_observed encodings in sync with the new probe bg_logits.
+        # Cheap: probe is ≤32 rows and the encoding cache will absorb
+        # repeated-genotype hits within this state.
+        self._reencode_buffer()
+
+    def _reencode_buffer(self):
+        """Re-encode every buffer entry under the current ``mc_state_id``.
+
+        The encoding's multi-class cells depend on ``bg_logits_probe``, so
+        when ``set_multiclass_state`` advances the state every cached
+        vector needs to be regenerated to stay on the same descriptor
+        manifold as new candidate encodings.  Errors are swallowed because
+        a stale-vector buffer is still better than a half-encoded one.
+        """
+        if not self.individuals:
+            return
+        for i, ind in enumerate(self.individuals):
+            try:
+                self.X_observed[i] = self._encode(ind.tree)
+            except Exception:
+                pass
+
+    def get_full_mc_context(self):
+        """Return the live ``(bg_logits, Y_group, class_idx)`` tuple for
+        joint-softmax ``calculate_fitness`` calls, or ``None`` when this
+        output isn't part of a one-hot class group (or no siblings have
+        produced HoF entries yet).
+        """
+        if self.mc_full is None:
+            return None
+        return (self.mc_full['bg_logits'],
+                self.mc_full['Y_group'],
+                self.mc_full['class_idx'])
+
+    def reeval_buffer_for_mc(self, X, y_target, type_code,
+                             target_grads=None, max_reeval=None):
+        """Re-evaluate buffered observations under the LIVE bg_logits.
+
+        Without this, the GP buffer ends up storing each genotype's loss
+        from whichever iteration first added it — joint-softmax CE shifts
+        as siblings improve, so a buffer mixing epochs would feed the GP a
+        noisy moving target.  Re-evaluating brings the targets back onto
+        the latest loss surface so EI ranking sees a coherent landscape.
+
+        Only stale entries (``_mc_obs_state_id`` < current ``mc_state_id``)
+        are refreshed; up to ``max_reeval`` per call to bound wall-clock
+        cost.  Prioritises top-quality entries (they drive ``best_f`` and
+        therefore EI scaling) over middling ones.
+        """
+        if not self.has_mc_context or self.mc_full is None:
+            return 0
+        if not self.individuals:
+            return 0
+        bg = self.mc_full['bg_logits']
+        yg = self.mc_full['Y_group']
+        cls_idx = self.mc_full['class_idx']
+        # Find stale indices, prioritised by current loss (best first).
+        stale = [i for i, sid in enumerate(self._mc_obs_state_id)
+                 if sid != self.mc_state_id]
+        if not stale:
+            return 0
+        if max_reeval is not None and len(stale) > max_reeval:
+            losses = [self.individuals[i].loss for i in stale]
+            order = np.argsort(losses)
+            stale = [stale[k] for k in order[:int(max_reeval)]]
+        refreshed = 0
+        for i in stale:
+            ind = self.individuals[i]
+            try:
+                ind.affine_fitted = False
+                ind.calculate_fitness(
+                    X, y_target, type_code,
+                    bg_logits=bg, class_idx_in_group=cls_idx,
+                    Y_group=yg,
+                    target_grads=target_grads, use_cache=False)
+            except Exception:
+                continue
+            self.y_observed[i] = self._transform_fitness(ind.loss)
+            # Encoding may also depend on mc_state_id; refresh the cell.
+            try:
+                self.X_observed[i] = self._encode(ind.tree)
+            except Exception:
+                pass
+            self._mc_obs_state_id[i] = self.mc_state_id
+            refreshed += 1
+        return refreshed
 
     def fit_surrogate(self):
         """(Re)fit the GP surrogate on current observations."""
@@ -14133,7 +14561,8 @@ class QualityDiversityArchive:
                 f"best_loss={self.best_loss():.5f}")
 
 
-def _bo_build_optimizers(n_features, n_outputs, feat_names, X, Y, X_probe, probe_idx):
+def _bo_build_optimizers(n_features, n_outputs, feat_names, X, Y, X_probe,
+                         probe_idx, mc_out_indices=None):
     """Construct one ``BayesianCGPOptimizer`` per output, supplying the
     target-aware probe statistics each one needs.
 
@@ -14143,7 +14572,13 @@ def _bo_build_optimizers(n_features, n_outputs, feat_names, X, Y, X_probe, probe
     available right here in the caller.  Threading the per-output ``y``
     slice through is the single biggest improvement to the surrogate's
     signal-to-noise ratio for symbolic regression.
+
+    ``mc_out_indices`` is the set of output indices that belong to a
+    multi-class one-hot group; those optimisers reserve the joint-softmax
+    phenotype block in their encoding so ``set_multiclass_state`` can plug
+    in live bg_logits without a kernel rebuild.
     """
+    mc_set = set(mc_out_indices) if mc_out_indices is not None else set()
     optimizers = []
     for o_idx in range(n_outputs):
         y_full = np.asarray(Y[:, o_idx], dtype=np.float64)
@@ -14163,7 +14598,8 @@ def _bo_build_optimizers(n_features, n_outputs, feat_names, X, Y, X_probe, probe
                 y_probe=y_probe_o,
                 y_probe_stats=y_stats,
                 max_points=BAYESIAN_MAX_GP_POINTS,
-                xi=BAYESIAN_EXPLORATION))
+                xi=BAYESIAN_EXPLORATION,
+                has_mc_context=(o_idx in mc_set)))
     return optimizers
 
 
@@ -14233,8 +14669,20 @@ def run_bayesian_afpo(X, Y, n_features, n_outputs, feat_names, out_types,
     _probe_idx = np.random.choice(X.shape[0], _probe_n, replace=False)
     X_probe = X[_probe_idx]
 
+    # Detect one-hot class groups UP-FRONT so each per-output optimiser
+    # reserves the joint-softmax phenotype block in its kernel from the
+    # outset (see ``run_bayesian_cgp`` for the full rationale).
+    _bo_class_groups, _bo_out_group_info = _build_class_groups_info(dp, out_types)
+    _bo_mc_outs = _bo_collect_mc_indices(_bo_out_group_info)
+    if _bo_class_groups:
+        print(f"  [Multi-class BO] Detected {len(_bo_class_groups)} one-hot "
+              "class group(s): " + ", ".join(
+                  f"{k}({len(v)} classes)"
+                  for k, v in _bo_class_groups.items()))
+
     optimizers = _bo_build_optimizers(
-        n_features, n_outputs, feat_names, X, Y, X_probe, _probe_idx)
+        n_features, n_outputs, feat_names, X, Y, X_probe, _probe_idx,
+        mc_out_indices=_bo_mc_outs)
 
     # Per-output feature-importance prior — biases random_cgp / mutate to
     # rewire toward variables that actually correlate with the target.
@@ -14266,7 +14714,7 @@ def run_bayesian_afpo(X, Y, n_features, n_outputs, feat_names, out_types,
                 n_features, feat_names, X_init, Y_init[:, o_idx])
         except Exception:
             imp_seeds = []
-            
+
         random.shuffle(v5_seeds)
         random.shuffle(imp_seeds)
         seeds = list(imp_seeds) + list(v5_seeds)
@@ -14287,7 +14735,7 @@ def run_bayesian_afpo(X, Y, n_features, n_outputs, feat_names, out_types,
         # AFPO specifically relies on _trim_to_pareto_front_3obj (or similar)
         # to manage population size
         afpo_pops[o_idx] = _trim_to_pareto_front_3obj(afpo_pops[o_idx], AFPO_POP_SIZE)
-        
+
         print(f"  Output {o_idx}: {len(seeds)} initial samples evaluated, "
               f"best loss = {min(ind.loss for ind in seeds):.5f}")
 
@@ -14321,19 +14769,6 @@ def run_bayesian_afpo(X, Y, n_features, n_outputs, feat_names, out_types,
         opt.fit_surrogate()
         print(f"  {opt.summary_str()}")
 
-    # ── One-hot class-group detection for cross-output sibling mining ──
-    # See ``run_bayesian_qd`` for the full rationale: this lets a stuck
-    # categorical output borrow structural discoveries (with negation,
-    # for binary groups) from a sibling that already found the
-    # discriminator, instead of re-deriving the same structure from
-    # scratch generation after generation.
-    _bo_class_groups, _bo_out_group_info = _build_class_groups_info(dp, out_types)
-    if _bo_class_groups:
-        print(f"  [Sibling Mining] Detected {len(_bo_class_groups)} one-hot "
-              "class group(s): " + ", ".join(
-                  f"{k}({len(v)} classes)"
-                  for k, v in _bo_class_groups.items()))
-
     # ── Phase 2: Bayesian AFPO loop ─────────────────────────────
     print("\nPhase 2: Bayesian AFPO optimisation. Ctrl+C to stop.\n")
     iteration = 0
@@ -14350,6 +14785,12 @@ def run_bayesian_afpo(X, Y, n_features, n_outputs, feat_names, out_types,
                          if _batch_n > 0 else None)
             X_b = X[batch_idx] if batch_idx is not None else X
             Y_b = Y[batch_idx] if batch_idx is not None else Y
+
+            # Refresh joint-softmax bg_logits for every multi-class output.
+            if _bo_out_group_info:
+                _bo_refresh_multiclass_state(
+                    optimizers, hofs, X, X_probe, Y, _probe_idx,
+                    _bo_out_group_info)
 
             decay = np.exp(-0.014 * iteration)
             current_xi = _bo_xi_end + (_bo_xi_start - _bo_xi_end) * decay
@@ -14485,8 +14926,9 @@ def run_bayesian_afpo(X, Y, n_features, n_outputs, feat_names, out_types,
                 screen_results = []
                 for ci in screen_indices:
                     child = Individual(candidate_trees[ci])
-                    child.calculate_fitness(
-                        X_screen, Y_screen[:, o_idx], out_types[o_idx],
+                    _bo_calc_fitness(
+                        child, X_screen, Y_screen[:, o_idx], out_types[o_idx],
+                        opt=opt, screen_global_idx=_screen_global_idx,
                         target_grads=target_grads_screen)
                     screen_results.append((ci, child))
                 total_evals += len(screen_results)
@@ -14502,9 +14944,9 @@ def run_bayesian_afpo(X, Y, n_features, n_outputs, feat_names, out_types,
                 for ci in top_indices:
                     child = Individual(candidate_trees[ci])
                     child.age = 0 # AFPO invariant
-                    child.calculate_fitness(
-                        X, Y[:, o_idx], out_types[o_idx],
-                        target_grads=target_grads_list[o_idx])
+                    _bo_calc_fitness(
+                        child, X, Y[:, o_idx], out_types[o_idx],
+                        opt=opt, target_grads=target_grads_list[o_idx])
                     total_evals += 1
 
                     # Add to AFPO pop
@@ -14530,6 +14972,11 @@ def run_bayesian_afpo(X, Y, n_features, n_outputs, feat_names, out_types,
                 afpo_pops[o_idx] = _trim_to_pareto_front_3obj(pop, AFPO_POP_SIZE)
 
                 if iteration % BAYESIAN_GP_REFIT_FREQ == 0:
+                    if opt.has_mc_context and opt.mc_full is not None:
+                        opt.reeval_buffer_for_mc(
+                            X, Y[:, o_idx], out_types[o_idx],
+                            target_grads=target_grads_list[o_idx],
+                            max_reeval=max(50, BAYESIAN_MAX_GP_POINTS // 4))
                     opt.fit_surrogate()
 
             print(f"--- BO AFPO Iteration {iteration}  (total evals: {total_evals}) ---")
@@ -14638,8 +15085,19 @@ def run_bayesian_islands(X, Y, n_features, n_outputs, feat_names, out_types,
     _probe_idx = np.random.choice(X.shape[0], _probe_n, replace=False)
     X_probe = X[_probe_idx]
 
+    # Detect one-hot class groups UP-FRONT so each per-output optimiser
+    # reserves the joint-softmax phenotype block from the outset.
+    _bo_class_groups, _bo_out_group_info = _build_class_groups_info(dp, out_types)
+    _bo_mc_outs = _bo_collect_mc_indices(_bo_out_group_info)
+    if _bo_class_groups:
+        print(f"  [Multi-class BO] Detected {len(_bo_class_groups)} one-hot "
+              "class group(s): " + ", ".join(
+                  f"{k}({len(v)} classes)"
+                  for k, v in _bo_class_groups.items()))
+
     optimizers = _bo_build_optimizers(
-        n_features, n_outputs, feat_names, X, Y, X_probe, _probe_idx)
+        n_features, n_outputs, feat_names, X, Y, X_probe, _probe_idx,
+        mc_out_indices=_bo_mc_outs)
 
     # Per-output feature-importance prior — biases random_cgp / mutate to
     # rewire toward variables that actually correlate with the target.
@@ -14671,11 +15129,11 @@ def run_bayesian_islands(X, Y, n_features, n_outputs, feat_names, out_types,
                     n_features, feat_names, X_init, Y_init[:, o_idx])
             except Exception:
                 imp_seeds = []
-                
+
             random.shuffle(v5_seeds)
             random.shuffle(imp_seeds)
             seeds = list(imp_seeds) + list(v5_seeds)
-            
+
             # Start filling this island
             while len(seeds) < BAYESIAN_INITIAL_SAMPLES:
                 seeds.append(Individual(random_cgp(n_features, CGP_NODES, feat_names)))
@@ -14688,7 +15146,7 @@ def run_bayesian_islands(X, Y, n_features, n_outputs, feat_names, out_types,
                                                       init_idx if N_train > _INIT_SUBSAMPLE_CAP else None))
                 hofs[o_idx].update(ind)
                 optimizers[o_idx].add_observation(ind, ind.tree)
-                
+
             # Take top ISLAND_SIZE individuals to initialize this island's pop
             seeds.sort(key=lambda x: x.loss)
             islands_pop[island_idx][o_idx] = seeds[:ISLAND_SIZE]
@@ -14725,15 +15183,6 @@ def run_bayesian_islands(X, Y, n_features, n_outputs, feat_names, out_types,
     for opt in optimizers:
         opt.fit_surrogate()
 
-    # ── One-hot class-group detection for cross-output sibling mining ──
-    # See ``run_bayesian_qd`` for the full rationale.
-    _bo_class_groups, _bo_out_group_info = _build_class_groups_info(dp, out_types)
-    if _bo_class_groups:
-        print(f"  [Sibling Mining] Detected {len(_bo_class_groups)} one-hot "
-              "class group(s): " + ", ".join(
-                  f"{k}({len(v)} classes)"
-                  for k, v in _bo_class_groups.items()))
-
     # ── Phase 2: Bayesian Islands loop ─────────────────────────────
     print("\nPhase 2: Bayesian Islands optimisation. Ctrl+C to stop.\n")
     iteration = 0
@@ -14750,6 +15199,12 @@ def run_bayesian_islands(X, Y, n_features, n_outputs, feat_names, out_types,
                          if _batch_n > 0 else None)
             X_b = X[batch_idx] if batch_idx is not None else X
             Y_b = Y[batch_idx] if batch_idx is not None else Y
+
+            # Refresh joint-softmax bg_logits for every multi-class output.
+            if _bo_out_group_info:
+                _bo_refresh_multiclass_state(
+                    optimizers, hofs, X, X_probe, Y, _probe_idx,
+                    _bo_out_group_info)
 
             decay = np.exp(-0.014 * iteration)
             current_xi = _bo_xi_end + (_bo_xi_start - _bo_xi_end) * decay
@@ -14879,8 +15334,11 @@ def run_bayesian_islands(X, Y, n_features, n_outputs, feat_names, out_types,
                     screen_results = []
                     for ci in screen_indices:
                         child = Individual(candidate_trees[ci])
-                        child.calculate_fitness(
-                            X_screen, Y_screen[:, o_idx], out_types[o_idx],
+                        _bo_calc_fitness(
+                            child, X_screen, Y_screen[:, o_idx],
+                            out_types[o_idx],
+                            opt=opt,
+                            screen_global_idx=_screen_global_idx,
                             target_grads=target_grads_screen)
                         screen_results.append((ci, child))
                     total_evals += len(screen_results)
@@ -14893,8 +15351,9 @@ def run_bayesian_islands(X, Y, n_features, n_outputs, feat_names, out_types,
                     _bo_improved = False
                     for ci in top_indices:
                         child = Individual(candidate_trees[ci])
-                        child.calculate_fitness(
-                            X, Y[:, o_idx], out_types[o_idx],
+                        _bo_calc_fitness(
+                            child, X, Y[:, o_idx], out_types[o_idx],
+                            opt=opt,
                             target_grads=target_grads_list[o_idx])
                         total_evals += 1
 
@@ -14938,6 +15397,11 @@ def run_bayesian_islands(X, Y, n_features, n_outputs, feat_names, out_types,
                             target_pop.append(mig_copy)
 
                 if iteration % BAYESIAN_GP_REFIT_FREQ == 0:
+                    if opt.has_mc_context and opt.mc_full is not None:
+                        opt.reeval_buffer_for_mc(
+                            X, Y[:, o_idx], out_types[o_idx],
+                            target_grads=target_grads_list[o_idx],
+                            max_reeval=max(50, BAYESIAN_MAX_GP_POINTS // 4))
                     opt.fit_surrogate()
 
             print(f"--- BO Islands Iteration {iteration}  (total evals: {total_evals}) ---")
@@ -15036,8 +15500,19 @@ def run_bayesian_islanded_afpo(X, Y, n_features, n_outputs, feat_names, out_type
     _probe_idx = np.random.choice(X.shape[0], _probe_n, replace=False)
     X_probe = X[_probe_idx]
 
+    # Detect one-hot class groups UP-FRONT so each per-output optimiser
+    # reserves the joint-softmax phenotype block from the outset.
+    _bo_class_groups, _bo_out_group_info = _build_class_groups_info(dp, out_types)
+    _bo_mc_outs = _bo_collect_mc_indices(_bo_out_group_info)
+    if _bo_class_groups:
+        print(f"  [Multi-class BO] Detected {len(_bo_class_groups)} one-hot "
+              "class group(s): " + ", ".join(
+                  f"{k}({len(v)} classes)"
+                  for k, v in _bo_class_groups.items()))
+
     optimizers = _bo_build_optimizers(
-        n_features, n_outputs, feat_names, X, Y, X_probe, _probe_idx)
+        n_features, n_outputs, feat_names, X, Y, X_probe, _probe_idx,
+        mc_out_indices=_bo_mc_outs)
 
     # Per-output feature-importance prior — biases random_cgp / mutate to
     # rewire toward variables that actually correlate with the target.
@@ -15069,11 +15544,11 @@ def run_bayesian_islanded_afpo(X, Y, n_features, n_outputs, feat_names, out_type
                     n_features, feat_names, X_init, Y_init[:, o_idx])
             except Exception:
                 imp_seeds = []
-                
+
             random.shuffle(v5_seeds)
             random.shuffle(imp_seeds)
             seeds = list(imp_seeds) + list(v5_seeds)
-            
+
             while len(seeds) < BAYESIAN_INITIAL_SAMPLES:
                 seeds.append(Individual(random_cgp(n_features, CGP_NODES, feat_names)))
 
@@ -15086,7 +15561,7 @@ def run_bayesian_islanded_afpo(X, Y, n_features, n_outputs, feat_names, out_type
                                                       init_idx if N_train > _INIT_SUBSAMPLE_CAP else None))
                 hofs[o_idx].update(ind)
                 optimizers[o_idx].add_observation(ind, ind.tree)
-                
+
             islands_pop[island_idx][o_idx] = _trim_to_pareto_front_3obj(seeds, AFPO_POP_SIZE)
 
     _INIT_PHASE = False
@@ -15117,15 +15592,6 @@ def run_bayesian_islanded_afpo(X, Y, n_features, n_outputs, feat_names, out_type
     for opt in optimizers:
         opt.fit_surrogate()
 
-    # ── One-hot class-group detection for cross-output sibling mining ──
-    # See ``run_bayesian_qd`` for the full rationale.
-    _bo_class_groups, _bo_out_group_info = _build_class_groups_info(dp, out_types)
-    if _bo_class_groups:
-        print(f"  [Sibling Mining] Detected {len(_bo_class_groups)} one-hot "
-              "class group(s): " + ", ".join(
-                  f"{k}({len(v)} classes)"
-                  for k, v in _bo_class_groups.items()))
-
     # ── Phase 2: Bayesian Islanded AFPO loop ─────────────────────────────
     print("\nPhase 2: Bayesian Islanded AFPO optimisation. Ctrl+C to stop.\n")
     iteration = 0
@@ -15142,6 +15608,12 @@ def run_bayesian_islanded_afpo(X, Y, n_features, n_outputs, feat_names, out_type
                          if _batch_n > 0 else None)
             X_b = X[batch_idx] if batch_idx is not None else X
             Y_b = Y[batch_idx] if batch_idx is not None else Y
+
+            # Refresh joint-softmax bg_logits for every multi-class output.
+            if _bo_out_group_info:
+                _bo_refresh_multiclass_state(
+                    optimizers, hofs, X, X_probe, Y, _probe_idx,
+                    _bo_out_group_info)
 
             decay = np.exp(-0.014 * iteration)
             current_xi = _bo_xi_end + (_bo_xi_start - _bo_xi_end) * decay
@@ -15273,8 +15745,11 @@ def run_bayesian_islanded_afpo(X, Y, n_features, n_outputs, feat_names, out_type
                     screen_results = []
                     for ci in screen_indices:
                         child = Individual(candidate_trees[ci])
-                        child.calculate_fitness(
-                            X_screen, Y_screen[:, o_idx], out_types[o_idx],
+                        _bo_calc_fitness(
+                            child, X_screen, Y_screen[:, o_idx],
+                            out_types[o_idx],
+                            opt=opt,
+                            screen_global_idx=_screen_global_idx,
                             target_grads=target_grads_screen)
                         screen_results.append((ci, child))
                     total_evals += len(screen_results)
@@ -15288,8 +15763,9 @@ def run_bayesian_islanded_afpo(X, Y, n_features, n_outputs, feat_names, out_type
                     for ci in top_indices:
                         child = Individual(candidate_trees[ci])
                         child.age = 0 # AFPO
-                        child.calculate_fitness(
-                            X, Y[:, o_idx], out_types[o_idx],
+                        _bo_calc_fitness(
+                            child, X, Y[:, o_idx], out_types[o_idx],
+                            opt=opt,
                             target_grads=target_grads_list[o_idx])
                         total_evals += 1
 
@@ -15332,6 +15808,11 @@ def run_bayesian_islanded_afpo(X, Y, n_features, n_outputs, feat_names, out_type
                             target_pop.append(mig_copy)
 
                 if iteration % BAYESIAN_GP_REFIT_FREQ == 0:
+                    if opt.has_mc_context and opt.mc_full is not None:
+                        opt.reeval_buffer_for_mc(
+                            X, Y[:, o_idx], out_types[o_idx],
+                            target_grads=target_grads_list[o_idx],
+                            max_reeval=max(50, BAYESIAN_MAX_GP_POINTS // 4))
                     opt.fit_surrogate()
 
             print(f"--- BO Islanded AFPO Iteration {iteration}  (total evals: {total_evals}) ---")
@@ -15426,10 +15907,23 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
     _probe_idx = np.random.choice(X.shape[0], _probe_n, replace=False)
     X_probe = X[_probe_idx]
 
+    # Detect one-hot class groups UP-FRONT so each per-output optimiser
+    # can reserve the multi-class phenotype block in its kernel from the
+    # outset.  Without this, switching joint-softmax on mid-run would
+    # require rebuilding the GP and re-fitting all hyperparameters.
+    _bo_class_groups, _bo_out_group_info = _build_class_groups_info(dp, out_types)
+    _bo_mc_outs = _bo_collect_mc_indices(_bo_out_group_info)
+    if _bo_class_groups:
+        print(f"  [Multi-class BO] Detected {len(_bo_class_groups)} one-hot "
+              "class group(s): " + ", ".join(
+                  f"{k}({len(v)} classes)"
+                  for k, v in _bo_class_groups.items()))
+
     # One BO optimizer per output, each carrying its own y-stats so probe
     # values get normalised against the actual target distribution.
     optimizers = _bo_build_optimizers(
-        n_features, n_outputs, feat_names, X, Y, X_probe, _probe_idx)
+        n_features, n_outputs, feat_names, X, Y, X_probe, _probe_idx,
+        mc_out_indices=_bo_mc_outs)
 
     # Per-output feature-importance prior — biases random_cgp / mutate to
     # rewire toward variables that actually correlate with the target.
@@ -15541,15 +16035,6 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
         opt.fit_surrogate()
         print(f"  {opt.summary_str()}")
 
-    # ── One-hot class-group detection for cross-output sibling mining ──
-    # See ``run_bayesian_qd`` for the full rationale.
-    _bo_class_groups, _bo_out_group_info = _build_class_groups_info(dp, out_types)
-    if _bo_class_groups:
-        print(f"  [Sibling Mining] Detected {len(_bo_class_groups)} one-hot "
-              "class group(s): " + ", ".join(
-                  f"{k}({len(v)} classes)"
-                  for k, v in _bo_class_groups.items()))
-
     # ── Phase 2: Bayesian optimisation loop ─────────────────────────────
     print("\nPhase 2: Bayesian optimisation. Ctrl+C to stop.\n")
     iteration = 0
@@ -15569,6 +16054,16 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
                          if _batch_n > 0 else None)
             X_b = X[batch_idx] if batch_idx is not None else X
             Y_b = Y[batch_idx] if batch_idx is not None else Y
+
+            # ── Refresh joint-softmax bg_logits for every multi-class output
+            # so this iteration's EI scoring and fitness evaluations couple
+            # candidates against the LATEST sibling HoF-best predictions.
+            # Cheap (one HoF-best evaluation per sibling), and prevents the
+            # surrogate from optimising against a stale background.
+            if _bo_out_group_info:
+                _bo_refresh_multiclass_state(
+                    optimizers, hofs, X, X_probe, Y, _probe_idx,
+                    _bo_out_group_info)
 
             # ── Adaptive exploration decay ────────────────────────────────
             # Exponential decay from _bo_xi_start toward _bo_xi_end over
@@ -15788,8 +16283,9 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
                 screen_results = []
                 for ci in screen_indices:
                     child = Individual(candidate_trees[ci])
-                    child.calculate_fitness(
-                        X_screen, Y_screen[:, o_idx], out_types[o_idx],
+                    _bo_calc_fitness(
+                        child, X_screen, Y_screen[:, o_idx], out_types[o_idx],
+                        opt=opt, screen_global_idx=_screen_global_idx,
                         target_grads=target_grads_screen)
                     screen_results.append((ci, child))
                 # Each screening pass costs an evaluation too; the previous
@@ -15819,9 +16315,12 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
                     # mini-batch-overfit candidates poison the HoF.  The
                     # comment block above ("Stage 2: re-evaluate the best B
                     # on full data") documents this intent.
-                    child.calculate_fitness(
-                        X, Y[:, o_idx], out_types[o_idx],
-                        target_grads=target_grads_list[o_idx])
+                    # Joint-softmax CE replaces per-class BCE when this
+                    # output belongs to a multi-class group, via the
+                    # bg_logits set on ``opt`` by the per-iteration refresh.
+                    _bo_calc_fitness(
+                        child, X, Y[:, o_idx], out_types[o_idx],
+                        opt=opt, target_grads=target_grads_list[o_idx])
                     total_evals += 1
 
                     if hofs[o_idx].update(child):
@@ -15845,6 +16344,15 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
 
                 # ── Refit GP surrogate periodically ─────────────────────────
                 if iteration % BAYESIAN_GP_REFIT_FREQ == 0:
+                    # Refresh stale buffer entries to the latest bg_logits
+                    # FIRST so the GP fits on a single, current loss surface
+                    # instead of mixing epochs.  Cap re-evals so the cost
+                    # stays bounded for big buffers.
+                    if opt.has_mc_context and opt.mc_full is not None:
+                        opt.reeval_buffer_for_mc(
+                            X, Y[:, o_idx], out_types[o_idx],
+                            target_grads=target_grads_list[o_idx],
+                            max_reeval=max(50, BAYESIAN_MAX_GP_POINTS // 4))
                     opt.fit_surrogate()
 
                 # ── Light constant optimisation on HoF ──────────────────────
@@ -15858,6 +16366,15 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
                 # Snapshot the relevant Individual state and restore on
                 # regression so const-opt is monotone for the HoF.
                 if iteration % BAYESIAN_CONST_OPT_FREQ == 0:
+                    # Pass joint-softmax context through to const-opt for
+                    # multi-class outputs so it minimises the SAME loss the
+                    # surrogate / HoF admission see.  Without this, const-opt
+                    # silently regresses joint-CE-good entries because its
+                    # objective was BCE-only.
+                    mc_ctx = (opt.get_full_mc_context()
+                              if opt.has_mc_context else None)
+                    co_bg, co_yg, co_cls = (mc_ctx if mc_ctx is not None
+                                             else (None, None, None))
                     for ind in list(hofs[o_idx].best_by_complexity.values()):
                         old_consts = get_constants_shared(ind.tree)
                         if not old_consts:
@@ -15872,6 +16389,8 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
                             X, Y[:, o_idx], out_types[o_idx],
                             max_rows=min(500, X.shape[0]),
                             n_restarts=2, max_iter=30,
+                            bg_logits=co_bg, class_idx_in_group=co_cls,
+                            Y_group=co_yg,
                             target_grads=target_grads_list[o_idx])
                         if ind.loss < old_loss - 1e-8:
                             opt.add_observation(ind, ind.tree)
@@ -16006,8 +16525,19 @@ def run_bayesian_qd(X, Y, n_features, n_outputs, feat_names, out_types,
     _probe_idx = np.random.choice(X.shape[0], _probe_n, replace=False)
     X_probe = X[_probe_idx]
 
+    # Detect one-hot class groups UP-FRONT so each per-output optimiser
+    # reserves the joint-softmax phenotype block from the outset.
+    _bo_class_groups, _bo_out_group_info = _build_class_groups_info(dp, out_types)
+    _bo_mc_outs = _bo_collect_mc_indices(_bo_out_group_info)
+    if _bo_class_groups:
+        print(f"  [Multi-class BO] Detected {len(_bo_class_groups)} one-hot "
+              "class group(s): " + ", ".join(
+                  f"{k}({len(v)} classes)"
+                  for k, v in _bo_class_groups.items()))
+
     optimizers = _bo_build_optimizers(
-        n_features, n_outputs, feat_names, X, Y, X_probe, _probe_idx)
+        n_features, n_outputs, feat_names, X, Y, X_probe, _probe_idx,
+        mc_out_indices=_bo_mc_outs)
 
     # Per-output feature-importance prior — biases random_cgp / mutate to
     # rewire toward variables that actually correlate with the target.
@@ -16093,19 +16623,6 @@ def run_bayesian_qd(X, Y, n_features, n_outputs, feat_names, out_types,
         opt.fit_surrogate()
         print(f"  {opt.summary_str()}")
 
-    # ── One-hot class-group detection for cross-output sibling mining ──
-    # Categorical outputs that share a column (e.g. leap_year_True /
-    # leap_year_False) often have the property that one sibling discovers
-    # the discriminator while the other is stuck at the majority-class
-    # prior.  Detect them here so each iteration can inject a few candidate
-    # trees harvested (and negated, for binary groups) from sibling HoFs.
-    _bo_class_groups, _bo_out_group_info = _build_class_groups_info(dp, out_types)
-    if _bo_class_groups:
-        print(f"  [Sibling Mining] Detected {len(_bo_class_groups)} one-hot "
-              "class group(s): " + ", ".join(
-                  f"{k}({len(v)} classes)"
-                  for k, v in _bo_class_groups.items()))
-
     # ── Phase 2: QD loop ────────────────────────────────────────────────
     print("\nPhase 2: Bayesian QD optimisation. Ctrl+C to stop.\n")
     iteration = 0
@@ -16122,6 +16639,12 @@ def run_bayesian_qd(X, Y, n_features, n_outputs, feat_names, out_types,
                          if _batch_n > 0 else None)
             X_b = X[batch_idx] if batch_idx is not None else X
             Y_b = Y[batch_idx] if batch_idx is not None else Y
+
+            # Refresh joint-softmax bg_logits for every multi-class output.
+            if _bo_out_group_info:
+                _bo_refresh_multiclass_state(
+                    optimizers, hofs, X, X_probe, Y, _probe_idx,
+                    _bo_out_group_info)
 
             decay = np.exp(-0.014 * iteration)
             current_xi = _bo_xi_end + (_bo_xi_start - _bo_xi_end) * decay
@@ -16318,8 +16841,9 @@ def run_bayesian_qd(X, Y, n_features, n_outputs, feat_names, out_types,
                 screen_results = []
                 for ci in screen_indices:
                     child = Individual(candidate_trees[ci])
-                    child.calculate_fitness(
-                        X_screen, Y_screen[:, o_idx], out_types[o_idx],
+                    _bo_calc_fitness(
+                        child, X_screen, Y_screen[:, o_idx], out_types[o_idx],
+                        opt=opt, screen_global_idx=_screen_global_idx,
                         target_grads=target_grads_screen)
                     screen_results.append((ci, child))
                 total_evals += len(screen_results)
@@ -16332,9 +16856,9 @@ def run_bayesian_qd(X, Y, n_features, n_outputs, feat_names, out_types,
                 _bo_improved = False
                 for ci in top_indices:
                     child = Individual(candidate_trees[ci])
-                    child.calculate_fitness(
-                        X, Y[:, o_idx], out_types[o_idx],
-                        target_grads=target_grads_list[o_idx])
+                    _bo_calc_fitness(
+                        child, X, Y[:, o_idx], out_types[o_idx],
+                        opt=opt, target_grads=target_grads_list[o_idx])
                     total_evals += 1
 
                     new_cell = arc.add(child, iteration=iteration)
@@ -16362,9 +16886,20 @@ def run_bayesian_qd(X, Y, n_features, n_outputs, feat_names, out_types,
                 opt.record_iteration_outcome(_bo_improved)
 
                 if iteration % BAYESIAN_GP_REFIT_FREQ == 0:
+                    if opt.has_mc_context and opt.mc_full is not None:
+                        opt.reeval_buffer_for_mc(
+                            X, Y[:, o_idx], out_types[o_idx],
+                            target_grads=target_grads_list[o_idx],
+                            max_reeval=max(50, BAYESIAN_MAX_GP_POINTS // 4))
                     opt.fit_surrogate()
 
                 if iteration % BAYESIAN_CONST_OPT_FREQ == 0:
+                    # Joint-softmax context through to const-opt so it
+                    # minimises the SAME loss the surrogate / HoF use.
+                    mc_ctx = (opt.get_full_mc_context()
+                              if opt.has_mc_context else None)
+                    co_bg, co_yg, co_cls = (mc_ctx if mc_ctx is not None
+                                             else (None, None, None))
                     for ind in list(hofs[o_idx].best_by_complexity.values()):
                         old_consts = get_constants_shared(ind.tree)
                         if not old_consts:
@@ -16379,6 +16914,8 @@ def run_bayesian_qd(X, Y, n_features, n_outputs, feat_names, out_types,
                             X, Y[:, o_idx], out_types[o_idx],
                             max_rows=min(500, X.shape[0]),
                             n_restarts=2, max_iter=30,
+                            bg_logits=co_bg, class_idx_in_group=co_cls,
+                            Y_group=co_yg,
                             target_grads=target_grads_list[o_idx])
                         if ind.loss < old_loss - 1e-8:
                             opt.add_observation(ind, ind.tree)
