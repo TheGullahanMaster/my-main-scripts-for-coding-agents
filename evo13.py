@@ -136,15 +136,19 @@ def _multiclass_sample_weights(yg, mode=None):
     Returns None when class-weighting is disabled (mode='none' or
     CLASS_WEIGHT_ENABLED is False).
     """
+    if yg is not None and len(yg.shape) == 1:
+        yg = np.eye(2)[yg.astype(int)]
     if mode is None:
         mode = CLASS_WEIGHT_MODE
     if (not CLASS_WEIGHT_ENABLED) or mode == 'none' or yg is None:
         return None
     counts = yg.sum(axis=0)  # (K,)
     K = yg.shape[1]
-    # Guard against zero-count classes in this batch — fall back to uniform.
+    # Guard against zero-count classes in this batch.
+    # We replace zero counts with 1.0 to avoid division by zero. Since the class
+    # is not present in the batch, it will not be accessed by `sw = cls_w[true_cls]`.
     if not np.all(counts > 0):
-        return None
+        counts = np.where(counts == 0, 1.0, counts)
     N = float(yg.shape[0])
     if mode == 'balanced':
         cls_w = N / (K * counts)
@@ -12877,9 +12881,7 @@ def build_bg_logits(hofs, group_indices, X):
                 # Keeping constant entries at 0 (neutral) means every class
                 # must always compete as if it is the marginal discoverer,
                 # maintaining selection pressure toward feature use.
-                if np.std(preds) > 1e-4:
-                    bg[:, local_k] = preds
-                # else: leave column as 0.0 (neutral — same as "not found yet")
+                bg[:, local_k] = preds
             except Exception:
                 pass  # leave column as 0.0
 
