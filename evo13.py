@@ -120,9 +120,79 @@ def evaluate_tree_gradients(tree, X, affine_a, eps=1e-5):
         # d/dx (a * f(x) + b) = a * f'(x)
         raw_grad = (y_plus - y_minus) / (2 * eps)
         grads[:, j] = affine_a * raw_grad
-        
+
     # Sanitize to prevent explosions from polluting the loss
     return np.clip(np.nan_to_num(grads, nan=0.0, posinf=1e5, neginf=-1e5), -1e5, 1e5)
+
+
+def _multiclass_sample_weights(yg, mode=None):
+    """
+    Per-sample weights for a one-hot multi-class label matrix `yg` (N, K).
+
+    Returns an (N,) array whose mean is 1.0 (so the over-all loss scale stays
+    comparable to the unweighted case), with each sample weighted inversely to
+    its true class's empirical frequency.
+
+    Returns None when class-weighting is disabled (mode='none' or
+    CLASS_WEIGHT_ENABLED is False).
+    """
+    if mode is None:
+        mode = CLASS_WEIGHT_MODE
+    if (not CLASS_WEIGHT_ENABLED) or mode == 'none' or yg is None:
+        return None
+    counts = yg.sum(axis=0)  # (K,)
+    K = yg.shape[1]
+    # Guard against zero-count classes in this batch — fall back to uniform.
+    if not np.all(counts > 0):
+        return None
+    N = float(yg.shape[0])
+    if mode == 'balanced':
+        cls_w = N / (K * counts)
+    elif mode == 'sqrt_balanced':
+        cls_w = np.sqrt(N / (K * counts))
+    else:
+        return None
+    true_cls = np.argmax(yg, axis=1)
+    sw = cls_w[true_cls]
+    # Re-normalise to mean 1.0 (defensive — the formulas above already do this
+    # under exact label counts, but minibatches can drift)
+    m = float(np.mean(sw))
+    if m > 1e-12:
+        sw = sw / m
+    return sw
+
+
+def _binary_sample_weights(y_eval, mode=None):
+    """
+    Per-sample weights for a binary target vector `y_eval` (treated as 0/1).
+    Mean is normalised to 1.0.  Returns None when weighting is disabled or the
+    batch is degenerate (all-one-class).
+    """
+    if mode is None:
+        mode = CLASS_WEIGHT_MODE
+    if (not CLASS_WEIGHT_ENABLED) or mode == 'none' or y_eval is None:
+        return None
+    y_bin = (np.asarray(y_eval) >= 0.5).astype(np.float64)
+    n_pos = float(y_bin.sum())
+    n_neg = float(len(y_bin) - n_pos)
+    if n_pos < 1.0 or n_neg < 1.0:
+        # Degenerate batch — no minority class present.  Skip weighting so we
+        # don't divide by zero or amplify noise.
+        return None
+    N = float(len(y_bin))
+    if mode == 'balanced':
+        w_pos, w_neg = N / (2.0 * n_pos), N / (2.0 * n_neg)
+    elif mode == 'sqrt_balanced':
+        w_pos = np.sqrt(N / (2.0 * n_pos))
+        w_neg = np.sqrt(N / (2.0 * n_neg))
+    else:
+        return None
+    sw = y_bin * w_pos + (1.0 - y_bin) * w_neg
+    m = float(np.mean(sw))
+    if m > 1e-12:
+        sw = sw / m
+    return sw
+
 
 # --- CONFIGURATION ---
 POPULATION_SIZE = 200
@@ -340,6 +410,38 @@ INTERVAL_CHECK_FREQ = 100     # how often (in generations) to run stability scan
 LOGIT_SATURATION_THRESHOLD  = 12.0   # |logit| above this is penalised
 LOGIT_SATURATION_WEIGHT     = 0.05   # penalty coefficient
 LOGIT_SATURATION_REG_ENABLE = False  # also apply to regression (extreme pred penalty)
+
+# ---- Class-Imbalance Handling ----
+# With unbalanced multiclass / binary classification targets, the un-weighted
+# softmax-CE / BCE loss is dominated by the majority class.  Evolution then
+# converges to "predict the majority class" because rare-class samples only
+# contribute a tiny fraction of the mean loss — exactly the failure mode the
+# user reported on the orbital-temperature dataset (Habitable rows are ~7 %).
+#
+# When CLASS_WEIGHT_MODE is non-'none', each sample contributes to the loss
+# weighted by 1/freq(true_class), normalised so the mean weight stays ≈1.
+# This gives every class equal voice in the gradient-search signal, so rare
+# classes get developed instead of being absorbed into the majority prior.
+#
+# Modes:
+#   'none'           → no re-weighting (legacy behaviour)
+#   'balanced'       → w_c = N / (K · count_c) (sklearn-style; strongest)
+#   'sqrt_balanced'  → w_c = sqrt(N / (K · count_c)) (gentler; recommended
+#                      default — strong enough to develop rare classes
+#                      without making rare-class noise dominate)
+#
+# Applied to:
+#   • Softmax-CE loss for multi-class one-hot groups (calculate_fitness)
+#   • BCE loss for binary classification outputs (calculate_fitness)
+#   • optimize_constants objective for both above
+#   • epsilon-lexicase per-case errors (so rare-class cases survive case-by-case
+#     filtering in proportion to their importance, not their raw count)
+#   • Gradient-boosting Hessian weights (so the regression-on-residuals stage
+#     upweights rare-class rows when fitting pseudo-residuals)
+#
+# Accuracy/argmax metrics remain unweighted so they stay comparable.
+CLASS_WEIGHT_MODE     = 'sqrt_balanced'  # 'none' | 'balanced' | 'sqrt_balanced'
+CLASS_WEIGHT_ENABLED  = True             # toggled interactively at startup
 
 # ---- Bayesian CGP Settings ----
 # Bayesian optimisation uses a Gaussian Process surrogate to model the
@@ -1564,6 +1666,55 @@ def _select_gradient_boosting():
         extras.append(f"L2={GRADIENT_BOOSTING_L2_LEAF}")
     if extras:
         print(f"     {', '.join(extras)}")
+
+
+def _select_class_weight_mode():
+    """
+    Ask the user how to handle class imbalance for classification outputs.
+
+    When a categorical target has a rare class (e.g. only ~7 % of rows are
+    Habitable), the un-weighted softmax/BCE loss is dominated by the majority
+    class and evolution converges to "predict majority for every row".
+    Inverse-frequency weighting equalises each class's contribution to the
+    loss so rare-class detectors actually get developed.
+    """
+    global CLASS_WEIGHT_MODE, CLASS_WEIGHT_ENABLED
+
+    print("\n" + "─" * 70)
+    print("CLASS-IMBALANCE HANDLING (classification)")
+    print("─" * 70)
+    print("  Re-weights softmax-CE / BCE losses so rare classes contribute as")
+    print("  much to the gradient signal as common ones.  Without this, a 90/10")
+    print("  imbalance lets a 'predict-majority' solution win at 90% accuracy")
+    print("  and the rare class never gets a discriminator developed.")
+    print()
+    print("  Applied to: softmax CE (multi-class groups), BCE (binary),")
+    print("              lexicase per-case errors, gradient-boosting Hessian")
+    print("              weights.  Accuracy stays unweighted for clarity.")
+    print()
+    print("  Modes:")
+    print("    1  none           — un-weighted (legacy; majority-class wins)")
+    print("    2  sqrt_balanced  — w = sqrt(N / (K * count_c)), recommended")
+    print("    3  balanced       — w = N / (K * count_c) (sklearn-style; strongest)")
+    print("─" * 70)
+    default_label = {'none': '1', 'sqrt_balanced': '2', 'balanced': '3'}.get(
+        CLASS_WEIGHT_MODE, '2')
+    choice = input(
+        f"Class weighting mode [1/2/3, default {default_label}]: ").strip()
+    if not choice:
+        choice = default_label
+    if choice == '1':
+        CLASS_WEIGHT_MODE = 'none'
+        CLASS_WEIGHT_ENABLED = False
+        print("  ✓  Class weighting disabled.")
+    elif choice == '3':
+        CLASS_WEIGHT_MODE = 'balanced'
+        CLASS_WEIGHT_ENABLED = True
+        print("  ✓  Class weighting: balanced (1/freq).")
+    else:
+        CLASS_WEIGHT_MODE = 'sqrt_balanced'
+        CLASS_WEIGHT_ENABLED = True
+        print("  ✓  Class weighting: sqrt_balanced.")
 
 
 # ==========================================
@@ -8810,7 +8961,16 @@ class Individual:
                 exp_l    = np.exp(np.clip(logits - row_max, -500, 0))
                 log_sm   = (logits - row_max) - np.log(exp_l.sum(axis=1, keepdims=True) + 1e-30)
 
-                self.loss     = float(-np.mean((yg * log_sm).sum(axis=1)))
+                # Per-sample CE before reduction so class-weighting can apply
+                # inverse-frequency weights to rare-class rows.  Without this,
+                # the un-weighted mean is dominated by the majority class and
+                # evolution collapses to "predict the majority" for every row.
+                per_row_ce = -(yg * log_sm).sum(axis=1)
+                cls_w = _multiclass_sample_weights(yg)
+                if cls_w is not None:
+                    self.loss = float(np.mean(cls_w * per_row_ce))
+                else:
+                    self.loss = float(np.mean(per_row_ce))
                 self.r2       = 0.0
                 pred_cls      = np.argmax(logits, axis=1)
                 true_cls      = np.argmax(yg,     axis=1)
@@ -8839,7 +8999,15 @@ class Individual:
             elif type_code == 6:  # Classification — Binary Cross Entropy + Accuracy
                 # Numerically stable BCE: log(1+exp(F)) - F*y == logaddexp(0,F) - F*y
                 bce = np.logaddexp(0.0, preds) - preds * y_eval
-                self.loss = np.mean(bce)
+                # Inverse-frequency class weighting so the minority class isn't
+                # drowned out by the majority's contribution to the mean.  When
+                # CLASS_WEIGHT_MODE='none' (or the batch is single-class) this
+                # returns None and we fall back to plain mean BCE.
+                cls_w = _binary_sample_weights(y_eval)
+                if cls_w is not None:
+                    self.loss = float(np.mean(cls_w * bce))
+                else:
+                    self.loss = float(np.mean(bce))
                 # Accuracy: sigmoid threshold at 0.5
                 pred_class = (1.0 / (1.0 + np.exp(-preds))) >= 0.5
                 self.r2       = 0.0   # not meaningful for classification
@@ -9046,7 +9214,8 @@ class Individual:
     def optimize_constants(self, X, y_target, type_code,
                            max_rows=None, n_restarts=5, max_iter=200,
                            bg_logits=None, class_idx_in_group=None, Y_group=None,
-                           freq_parsimony_adj=0.0, target_grads=None):
+                           freq_parsimony_adj=0.0, target_grads=None,
+                           sample_weights=None):
         """
         Two-stage constant optimisation.
 
@@ -9057,6 +9226,10 @@ class Individual:
         If SOBOLEV_ENABLED and target_grads is provided, the objective also
         includes the Sobolev gradient-matching penalty so constant optimisation
         pushes toward correct derivative behaviour as well as correct values.
+
+        sample_weights (regression only) carries per-row weights — used by
+        gradient-boosting stages so the inner const-opt objective matches the
+        outer weighted-MSE fitness (Hessian × class-imbalance weights).
         """
         initial_consts = get_constants_shared(self.tree)
         if not initial_consts:
@@ -9073,10 +9246,12 @@ class Individual:
             bg_opt = bg_logits[idx] if bg_logits is not None else None
             yg_opt = Y_group[idx]   if Y_group  is not None else None
             tg_opt = target_grads[idx] if target_grads is not None else None
+            sw_opt = sample_weights[idx] if sample_weights is not None else None
         else:
             X_opt, y_opt = X, y_target
             bg_opt, yg_opt = bg_logits, Y_group
             tg_opt = target_grads
+            sw_opt = sample_weights
 
         n = len(initial_consts)
         best_params = list(initial_consts)
@@ -9094,17 +9269,29 @@ class Individual:
                 row_max = logits.max(axis=1, keepdims=True)
                 exp_l   = np.exp(np.clip(logits - row_max, -500, 0))
                 log_sm  = (logits - row_max) - np.log(exp_l.sum(axis=1, keepdims=True) + 1e-30)
-                return float(-np.mean((yg_opt * log_sm).sum(axis=1)))
+                per_row_ce = -(yg_opt * log_sm).sum(axis=1)
+                cls_w = _multiclass_sample_weights(yg_opt)
+                if cls_w is not None:
+                    return float(np.mean(cls_w * per_row_ce))
+                return float(np.mean(per_row_ce))
             elif type_code == 6:
                 bce = np.logaddexp(0.0, p) - p * y_opt
+                cls_w = _binary_sample_weights(y_opt)
+                if cls_w is not None:
+                    return float(np.mean(cls_w * bce))
                 return float(np.mean(bce))
             else:
                 # Use LOCKED affine — do not refit during constant optimisation
                 p = self.affine_a * p + self.affine_b
                 diff  = p - y_opt
                 y_var = float(np.var(y_opt)) + 1e-8
-                loss  = float(np.mean(diff**2) / y_var
-                              + np.mean(np.abs(diff)) / np.sqrt(y_var))
+                if sw_opt is not None:
+                    w_norm = sw_opt * (len(sw_opt) / (np.sum(sw_opt) + 1e-30))
+                    loss = float(np.mean(w_norm * diff**2) / y_var
+                                 + np.mean(w_norm * np.abs(diff)) / np.sqrt(y_var))
+                else:
+                    loss = float(np.mean(diff**2) / y_var
+                                 + np.mean(np.abs(diff)) / np.sqrt(y_var))
                 if tg_opt is not None and SOBOLEV_ENABLED:
                     tree_grads = evaluate_tree_gradients(self.tree, X_opt, self.affine_a)
                     grad_var   = np.var(target_grads, axis=0) + 1e-8
@@ -9265,7 +9452,8 @@ class Individual:
                                Y_group=Y_group,
                                freq_parsimony_adj=freq_parsimony_adj,
                                update_affine=_allow_refit,
-                               target_grads=target_grads)
+                               target_grads=target_grads,
+                               sample_weights=sample_weights)
 
 
     def get_case_errors(self, X, y_target, type_code, indices,
@@ -9280,9 +9468,21 @@ class Individual:
             row_max = logits.max(axis=1, keepdims=True)
             exp_l   = np.exp(np.clip(logits - row_max, -500, 0))
             log_sm  = (logits - row_max) - np.log(exp_l.sum(axis=1, keepdims=True) + 1e-30)
-            return -(yg * log_sm).sum(axis=1)   
+            per_row_ce = -(yg * log_sm).sum(axis=1)
+            # Lexicase epsilon-thresholds compare per-row errors directly, so
+            # the per-row weighting must be applied here too — otherwise rare-
+            # class cases are still effectively outvoted during case filtering.
+            cls_w = _multiclass_sample_weights(yg)
+            if cls_w is not None:
+                return cls_w * per_row_ce
+            return per_row_ce
         elif type_code == 6:
-            return np.logaddexp(0.0, preds) - preds * y_target[indices]
+            y_eval = y_target[indices]
+            bce = np.logaddexp(0.0, preds) - preds * y_eval
+            cls_w = _binary_sample_weights(y_eval)
+            if cls_w is not None:
+                return cls_w * bce
+            return bce
         else:
             # --- Apply locked affine scaling + boost corrections ---
             a = getattr(self, 'affine_a', 1.0)
@@ -11112,16 +11312,32 @@ def evolve_island_chunk(args):
         to 45 % of point-mutations, reflecting PySR's weightMutateConstant=10
         philosophy: constants are cheap to tune and critical for fit quality.
     """
-    (island_pop, X, y_target, type_code,
-     n_features, feat_names, generations,
-     island_idx, out_idx, ext_patience, current_stag,
-     adf_registry,
-     bg_logits, class_idx_in_group, Y_group,
-     target_grads) = args
+    # Support both the 16-tuple legacy form and a 17-tuple form that carries
+    # per-sample fitness weights (boosting stages forward Hessian × class
+    # weights here so rare-class rows survive the regression-on-residuals
+    # fit).  Older callers stay binary-compatible by not supplying the 17th
+    # element.
+    if len(args) == 17:
+        (island_pop, X, y_target, type_code,
+         n_features, feat_names, generations,
+         island_idx, out_idx, ext_patience, current_stag,
+         adf_registry,
+         bg_logits, class_idx_in_group, Y_group,
+         target_grads, sample_weights) = args
+    else:
+        (island_pop, X, y_target, type_code,
+         n_features, feat_names, generations,
+         island_idx, out_idx, ext_patience, current_stag,
+         adf_registry,
+         bg_logits, class_idx_in_group, Y_group,
+         target_grads) = args
+        sample_weights = None
     # bg_logits / class_idx_in_group / Y_group: non-None for class groups using
     # joint softmax CE.  bg_logits is (N, n_classes) with all sibling class logits
     # pre-filled from the main process HoF; column class_idx_in_group is overwritten
     # by each individual's predictions during fitness evaluation.
+    # sample_weights: optional per-row regression-loss weights (None during
+    # standard evolution; populated by gradient-boosting stages).
 
     for d in adf_registry:
         _register_adf_from_dict(d)
@@ -11244,7 +11460,8 @@ def evolve_island_chunk(args):
                         bg_logits=bg_logits,
                         class_idx_in_group=class_idx_in_group,
                         Y_group=Y_group,
-                        target_grads=target_grads)
+                        target_grads=target_grads,
+                        sample_weights=sample_weights)
                     # If const-opt improved the individual, clear its cache entry
                     # (the tree's constants changed, so the cached result is stale).
                     if _ind.loss < _old_loss - 1e-8:
@@ -11275,7 +11492,8 @@ def evolve_island_chunk(args):
                         # Re-evaluate with the new boost correction
                         _ind.calculate_fitness(X, y_target, type_code,
                                                update_affine=False,
-                                               target_grads=target_grads)
+                                               target_grads=target_grads,
+                                               sample_weights=sample_weights)
                         if _ind.loss < _old_loss - 1e-8:
                             local_hof.update(_ind)
 
@@ -11337,7 +11555,8 @@ def evolve_island_chunk(args):
                         # Score the new seeds and keep the best RESEED_INJECT_N.
                         for _s in _new_seeds:
                             _s.calculate_fitness(X, y_target, type_code,
-                                                 target_grads=target_grads)
+                                                 target_grads=target_grads,
+                                                 sample_weights=sample_weights)
                         _new_seeds.sort(key=lambda x: x.fitness)
                         _new_seeds = _new_seeds[:RESEED_INJECT_N]
                         # Replace the worst (highest-fitness) members of the
@@ -11461,7 +11680,8 @@ def evolve_island_chunk(args):
                                         class_idx_in_group=class_idx_in_group,
                                         Y_group=Y_group,
                                         freq_parsimony_adj=child_freq_adj,
-                                        target_grads=target_grads)
+                                        target_grads=target_grads,
+                                        sample_weights=sample_weights)
             else:
                 # Baseline before any optimisation.
                 child.calculate_fitness(X, y_target, type_code,
@@ -11469,7 +11689,8 @@ def evolve_island_chunk(args):
                                         class_idx_in_group=class_idx_in_group,
                                         Y_group=Y_group,
                                         freq_parsimony_adj=child_freq_adj,
-                                        target_grads=target_grads)
+                                        target_grads=target_grads,
+                                        sample_weights=sample_weights)
                 _pre_loss = child.loss if np.isfinite(child.loss) else 1e10
                 _probe_iter = 3 if _const_count <= 4 else 5
                 child.optimize_constants(X, y_target, type_code,
@@ -11479,7 +11700,8 @@ def evolve_island_chunk(args):
                                          class_idx_in_group=class_idx_in_group,
                                          Y_group=Y_group,
                                          freq_parsimony_adj=child_freq_adj,
-                                         target_grads=target_grads)
+                                         target_grads=target_grads,
+                                         sample_weights=sample_weights)
                 # Escalate only if the probe knocked at least 1 % off the
                 # loss — otherwise the deeper polish is unlikely to find
                 # anything either.
@@ -11492,7 +11714,8 @@ def evolve_island_chunk(args):
                                              class_idx_in_group=class_idx_in_group,
                                              Y_group=Y_group,
                                              freq_parsimony_adj=child_freq_adj,
-                                             target_grads=target_grads)
+                                             target_grads=target_grads,
+                                             sample_weights=sample_weights)
         elif action == 'boost':
             # Intra-individual gradient boosting: evolve a correction on residuals
             child.calculate_fitness(X, y_target, type_code,
@@ -11500,7 +11723,8 @@ def evolve_island_chunk(args):
                                     class_idx_in_group=class_idx_in_group,
                                     Y_group=Y_group,
                                     freq_parsimony_adj=child_freq_adj,
-                                    target_grads=target_grads)
+                                    target_grads=target_grads,
+                                    sample_weights=sample_weights)
             if type_code != 6 and bg_logits is None:
                 child.boost_on_residuals(X, y_target, type_code,
                                          n_features, feat_names)
@@ -11508,14 +11732,16 @@ def evolve_island_chunk(args):
                 child.calculate_fitness(X, y_target, type_code,
                                         freq_parsimony_adj=child_freq_adj,
                                         update_affine=False,
-                                        target_grads=target_grads)
+                                        target_grads=target_grads,
+                                        sample_weights=sample_weights)
         else:
             child.calculate_fitness(X, y_target, type_code,
                                     bg_logits=bg_logits,
                                     class_idx_in_group=class_idx_in_group,
                                     Y_group=Y_group,
                                     freq_parsimony_adj=child_freq_adj,
-                                    target_grads=target_grads)
+                                    target_grads=target_grads,
+                                    sample_weights=sample_weights)
 
         # 5. Death tournament — crowding-distance selection with semantic probe
         # (Behaviorally unique individuals get crowding-distance bonus protection)
@@ -11588,7 +11814,8 @@ def evolve_island_chunk(args):
                                 Y_group=Y_group,
                                 freq_parsimony_adj=child_freq_adj,
                                 update_affine=False,
-                                target_grads=target_grads)
+                                target_grads=target_grads,
+                                sample_weights=sample_weights)
         if local_hof.update(child):
             local_stag = 0
         else:
@@ -11674,7 +11901,8 @@ def evolve_island_chunk(args):
                                       bg_logits=bg_logits,
                                       class_idx_in_group=class_idx_in_group,
                                       Y_group=Y_group,
-                                      target_grads=target_grads)
+                                      target_grads=target_grads,
+                                      sample_weights=sample_weights)
             island_pop = survivors + new_blood
             local_stag = 0
 
@@ -16549,6 +16777,12 @@ def _run_boosting_stage_evolution(X, residuals, n_features, feat_names,
                                 pop.append(copy.deepcopy(hof_best))
 
                 futures = []
+                # Subset sample_weights to the current mini-batch so the
+                # weighted-MSE fitness inside each worker matches the data
+                # subset it actually sees this generation.
+                sw_b = (sw_stage[batch_idx]
+                        if (sw_stage is not None and batch_idx is not None)
+                        else sw_stage)
                 for isl in range(NUM_ISLANDS_STAGE):
                     args = (
                         islands_pop[isl][0],
@@ -16560,6 +16794,7 @@ def _run_boosting_stage_evolution(X, residuals, n_features, feat_names,
                         list(_ADF_REGISTRY),
                         None, None, None,   # no softmax group
                         stage_target_grads,  # Sobolev
+                        sw_b,                # per-row sample weights (boosting only)
                     )
                     futures.append(executor.submit(evolve_island_chunk, args))
 
@@ -16654,6 +16889,16 @@ def run_gradient_boosted_evolution(X, Y, n_features, n_outputs, feat_names,
         for gi in grp_indices:
             class_names.append(dp.output_map[gi] if gi < len(dp.output_map) else f"cls{gi}")
 
+        # Per-sample class weights (mean ≈ 1.0).  Used both to scale the
+        # pseudo-residuals AND the Hessian weights of every boosting stage,
+        # so rare-class rows contribute proportionally to the regression-on-
+        # residuals fit instead of being averaged out by the majority class.
+        mc_class_w = _multiclass_sample_weights(y_onehot)
+        if mc_class_w is not None:
+            print(f"  [Class Weight] mode={CLASS_WEIGHT_MODE}  "
+                  f"counts={[int(c) for c in y_onehot.sum(axis=0)]}  "
+                  f"w_range=[{mc_class_w.min():.3f}, {mc_class_w.max():.3f}]")
+
         print(f"\n  [Multiclass '{grp_name}'] {K} classes: {class_names}")
 
         # Initialise: F_k = log(prior_k + eps)
@@ -16711,6 +16956,15 @@ def run_gradient_boosted_evolution(X, Y, n_features, n_outputs, feat_names,
                     newton_t = np.clip(newton_t, -50.0, 50.0)
                     mc_hessian_weights = h_k
                     stage_residuals = newton_t
+                # Class-imbalance weighting: scale Hessian weights so the
+                # weighted-MSE stage fitness gives equal voice to rare-class
+                # rows.  When 1st-order boosting is used (no Hessian), the
+                # class weights themselves become the sample weights.
+                if mc_class_w is not None:
+                    if mc_hessian_weights is None:
+                        mc_hessian_weights = mc_class_w.copy()
+                    else:
+                        mc_hessian_weights = mc_hessian_weights * mc_class_w
 
                 # Evolve a CGP model on the (Newton) residuals
                 stage_hof = HallOfFame()
@@ -16802,6 +17056,14 @@ def run_gradient_boosted_evolution(X, Y, n_features, n_outputs, feat_names,
             print(f"\n  [Output {o_idx} ({out_label})] Binary classification boosting…")
             print(f"    Prior: {p_mean:.4f}  →  log-odds intercept: {F0:.4f}")
 
+            # Per-sample class weights for the binary target (mean ≈ 1.0,
+            # None when class-weighting disabled or batch is single-class).
+            bin_class_w = _binary_sample_weights(y_binary)
+            if bin_class_w is not None:
+                print(f"    [Class Weight] mode={CLASS_WEIGHT_MODE}  "
+                      f"pos={int(y_binary.sum())}/{int(N)}  "
+                      f"w_range=[{bin_class_w.min():.3f}, {bin_class_w.max():.3f}]")
+
         else:
             # ── Regression boosting ───────────────────────────────────
             y_mean = float(np.mean(y_target))
@@ -16811,6 +17073,7 @@ def run_gradient_boosted_evolution(X, Y, n_features, n_outputs, feat_names,
             ss_tot = float(np.sum((y_target - y_mean) ** 2)) + 1e-8
             print(f"\n  [Output {o_idx} ({out_label})] Regression boosting…")
             print(f"    Initial residual variance: {np.var(y_target - y_mean):.6f}")
+            bin_class_w = None  # not used in the regression branch
 
         best_val_metric = -float('inf')
         val_patience = 0
@@ -16838,6 +17101,15 @@ def run_gradient_boosted_evolution(X, Y, n_features, n_outputs, feat_names,
                     newton_targets = np.clip(newton_targets, -50.0, 50.0)
                     hessian_weights = h
                     residuals = newton_targets
+                # Class-imbalance: upweight rare-class rows in the stage's
+                # weighted-MSE fitness.  Multiplied into Hessian weights (or
+                # used as standalone sample weights when 1st-order boosting
+                # is in use).
+                if bin_class_w is not None:
+                    if hessian_weights is None:
+                        hessian_weights = bin_class_w.copy()
+                    else:
+                        hessian_weights = hessian_weights * bin_class_w
             else:
                 residuals = y_target - F
 
@@ -16873,6 +17145,11 @@ def run_gradient_boosted_evolution(X, Y, n_features, n_outputs, feat_names,
                             h_drop = np.clip(p_drop * (1.0 - p_drop), 1e-6, None)
                             residuals = np.clip(residuals / h_drop, -50.0, 50.0)
                             hessian_weights = h_drop
+                        if bin_class_w is not None:
+                            if hessian_weights is None:
+                                hessian_weights = bin_class_w.copy()
+                            else:
+                                hessian_weights = hessian_weights * bin_class_w
                     else:
                         residuals = y_target - F_nodrop
                     print(f"      DART: dropped {len(dropped_stages)} stage(s)")
@@ -17672,6 +17949,9 @@ def train_mode():
 
     # ---- Gradient boosting mode ----
     _select_gradient_boosting()
+
+    # ---- Class-imbalance handling ----
+    _select_class_weight_mode()
 
     # ---- Safe vs Unsafe ops ----
     select_ops_safety()
