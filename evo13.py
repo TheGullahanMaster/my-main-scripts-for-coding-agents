@@ -10748,11 +10748,29 @@ def generate_script(models, dp, filename="best_model.py", X_data=None):
 
     # ------------------------------------------------------------------ #
     # 3. Embed DataProcessor source so pickle can find the class.
+    #    The class references CAT_HIGH_CARD_THRESHOLD as a default arg and
+    #    its methods call module-level helpers (_is_object_like_dtype,
+    #    _detect_boolean_like_column, _convert_boolean_column_to_numeric,
+    #    _column_is_mostly_numeric).  All must be present in the generated
+    #    script's namespace BEFORE the class body executes, otherwise even
+    #    parsing the class definition raises NameError.
     # ------------------------------------------------------------------ #
     try:
         dp_class_src = inspect.getsource(DataProcessor)
     except Exception:
         dp_class_src = "# DataProcessor source unavailable"
+
+    dp_helper_srcs = []
+    for _helper in (_detect_boolean_like_column,
+                    _convert_boolean_column_to_numeric,
+                    _is_object_like_dtype,
+                    _column_is_mostly_numeric):
+        try:
+            dp_helper_srcs.append(inspect.getsource(_helper))
+        except Exception:
+            pass
+    dp_helpers_src = "\n\n".join(dp_helper_srcs)
+    dp_constants_src = f"CAT_HIGH_CARD_THRESHOLD = {CAT_HIGH_CARD_THRESHOLD}"
 
     dp_bytes = pickle.dumps(dp)
     dp_b64   = base64.b64encode(dp_bytes).decode('utf-8')
@@ -10785,6 +10803,12 @@ def _erf_vec(x):
         return np.vectorize(math.erf)(x)
 # Monkey-patch so that SymPy-generated math.erf(…) calls work on arrays
 math.erf = _erf_vec
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── DataProcessor constants & helpers (needed by class body and methods) ────
+{dp_constants_src}
+
+{dp_helpers_src}
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── DataProcessor class (embedded so pickle can resolve it) ──────────────────
@@ -18727,11 +18751,29 @@ def _generate_boosted_script(boosted_models, dp, X_data=None):
 
     # ------------------------------------------------------------------ #
     # 3. Embed DataProcessor source so pickle can find the class.
+    #    The class references CAT_HIGH_CARD_THRESHOLD as a default arg and
+    #    its methods call module-level helpers (_is_object_like_dtype,
+    #    _detect_boolean_like_column, _convert_boolean_column_to_numeric,
+    #    _column_is_mostly_numeric).  All must be present in the generated
+    #    script's namespace BEFORE the class body executes, otherwise even
+    #    parsing the class definition raises NameError.
     # ------------------------------------------------------------------ #
     try:
         dp_class_src = inspect.getsource(DataProcessor)
     except Exception:
         dp_class_src = "# DataProcessor source unavailable"
+
+    dp_helper_srcs = []
+    for _helper in (_detect_boolean_like_column,
+                    _convert_boolean_column_to_numeric,
+                    _is_object_like_dtype,
+                    _column_is_mostly_numeric):
+        try:
+            dp_helper_srcs.append(inspect.getsource(_helper))
+        except Exception:
+            pass
+    dp_helpers_src = "\n\n".join(dp_helper_srcs)
+    dp_constants_src = f"CAT_HIGH_CARD_THRESHOLD = {CAT_HIGH_CARD_THRESHOLD}"
 
     dp_bytes = pickle.dumps(dp)
     dp_b64   = base64.b64encode(dp_bytes).decode('utf-8')
@@ -18764,6 +18806,12 @@ def _erf_vec(x):
         return np.vectorize(math.erf)(x)
 # Monkey-patch so that SymPy-generated math.erf(…) calls work on arrays
 math.erf = _erf_vec
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── DataProcessor constants & helpers (needed by class body and methods) ────
+{dp_constants_src}
+
+{dp_helpers_src}
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── DataProcessor class (embedded so pickle can resolve it) ──────────────────
