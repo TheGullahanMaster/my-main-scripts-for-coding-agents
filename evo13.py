@@ -198,6 +198,141 @@ def _binary_sample_weights(y_eval, mode=None):
     return sw
 
 
+# ==========================================
+# DATA-SCALE HINT & TYPE-COERCION HELPERS
+# ==========================================
+# Dataset-scale hint set once during train_mode after preprocessing.  Used by
+# the constant optimiser to size DE bounds, by mutation operators to generate
+# new constants on the right order of magnitude, and by _random_const to seed
+# initial populations near plausible scales.  Without this, a dataset whose
+# answer involves constants like 700_000 or 30 is unreachable from the default
+# magnitudes (gauss(0, 2) * 1000 ≈ 6000 maximum).
+_DATA_SCALE_HINT = 10.0
+
+def _set_data_scale_hint(X, Y):
+    """Set the module-level _DATA_SCALE_HINT from training data."""
+    global _DATA_SCALE_HINT
+    try:
+        parts = []
+        if X is not None and getattr(X, 'size', 0) > 0:
+            xa = np.abs(np.asarray(X, dtype=float))
+            xa = xa[np.isfinite(xa)]
+            if xa.size > 0:
+                parts.append(float(np.max(xa)))
+        if Y is not None and getattr(Y, 'size', 0) > 0:
+            ya = np.abs(np.asarray(Y, dtype=float))
+            ya = ya[np.isfinite(ya)]
+            if ya.size > 0:
+                parts.append(float(np.max(ya)))
+        if parts:
+            s = max(parts)
+            if np.isfinite(s) and s > 0:
+                _DATA_SCALE_HINT = max(10.0, s)
+    except Exception:
+        pass
+    return _DATA_SCALE_HINT
+
+
+# Tokens recognised as boolean values when a user picks a numeric type on an
+# object/string column.  Case-insensitive.  Y/N and 1/0 are included so binary
+# survey-style data ("Y", "N") and 0/1 strings ("0", "1") all collapse to
+# clean 0.0/1.0 numerics without needing one-hot encoding.
+_BOOLEAN_TRUE_TOKENS  = frozenset({'true',  't', 'yes', 'y'})
+_BOOLEAN_FALSE_TOKENS = frozenset({'false', 'f', 'no',  'n'})
+
+def _detect_boolean_like_column(col_data):
+    """
+    Inspect *col_data* (object/string column).  If every non-null value is one
+    of True/False or Yes/No/Y/N (case-insensitive), return
+    ``(True, true_tokens, false_tokens)`` describing which tokens map to 1
+    and which to 0.  Otherwise return ``(False, None, None)``.
+    """
+    try:
+        s = pd.Series(col_data)
+        s = s[s.notna()]
+        if len(s) == 0:
+            return False, None, None
+        tokens = set(str(v).strip().lower() for v in s.values)
+        if not tokens:
+            return False, None, None
+        if tokens.issubset({'true', 'false'}):
+            return True, {'true'}, {'false'}
+        if tokens.issubset({'t', 'f'}):
+            return True, {'t'}, {'f'}
+        # Yes/No (allow Y and N mixed with Yes and No)
+        if tokens.issubset({'yes', 'no', 'y', 'n'}):
+            return True, {'yes', 'y'}, {'no', 'n'}
+        return False, None, None
+    except Exception:
+        return False, None, None
+
+
+def _convert_boolean_column_to_numeric(col_data, true_tokens, false_tokens):
+    """
+    Map each entry of *col_data* to 1.0 if it matches *true_tokens*, 0.0 if
+    it matches *false_tokens*, NaN otherwise (preserves missing values so the
+    downstream imputer can decide how to fill them).
+    """
+    out = np.full(len(col_data), np.nan, dtype=float)
+    for i, v in enumerate(col_data):
+        if v is None:
+            continue
+        # pd.isna handles both None and float NaN; guard against array-likes.
+        try:
+            if pd.isna(v):
+                continue
+        except (TypeError, ValueError):
+            pass
+        s = str(v).strip().lower()
+        if s in true_tokens:
+            out[i] = 1.0
+        elif s in false_tokens:
+            out[i] = 0.0
+    return out
+
+
+def _is_object_like_dtype(dtype):
+    """
+    True if *dtype* is non-numeric and holds strings/mixed values.  Handles
+    both numpy ``object`` arrays (pandas <2.x default) and the modern pandas
+    ``string`` / StringArray dtype.  ``dtype == object`` alone misses the
+    latter on pandas ≥ 2.0.
+    """
+    try:
+        if pd.api.types.is_numeric_dtype(dtype):
+            return False
+        if pd.api.types.is_bool_dtype(dtype):
+            return False
+        if pd.api.types.is_datetime64_any_dtype(dtype):
+            return False
+        # Catch object, string, category, and the generic 'O' kind.
+        if pd.api.types.is_string_dtype(dtype):
+            return True
+        if hasattr(dtype, 'kind') and dtype.kind == 'O':
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def _column_is_mostly_numeric(col_data, threshold=0.8):
+    """
+    Return True if at least *threshold* of the non-null values in *col_data*
+    can be parsed as numbers via pd.to_numeric.  Used to decide whether an
+    object-dtype column the user marked as numeric is genuinely numeric
+    (stored as strings like '1.5') vs. truly categorical strings.
+    """
+    try:
+        s = pd.Series(col_data)
+        n_non_null = int(s.notna().sum())
+        if n_non_null == 0:
+            return True
+        parsed = pd.to_numeric(s, errors='coerce')
+        return int(parsed.notna().sum()) / n_non_null >= threshold
+    except Exception:
+        return False
+
+
 # --- CONFIGURATION ---
 POPULATION_SIZE = 200
 TOURNAMENT_SIZE = 20
@@ -2919,55 +3054,291 @@ def try_extract_adfs_from_population(population, X, y_target, type_code):
 
 
 
+CAT_HIGH_CARD_THRESHOLD = 12   # > this many unique values → use compact encoding
+
+
 class DataProcessor:
-    def __init__(self, scale=False):
+    def __init__(self, scale=False, one_hot_threshold=CAT_HIGH_CARD_THRESHOLD):
         self.scale = scale
+        self.one_hot_threshold = one_hot_threshold
         self.col_configs = []
         self.stats = {}
         self.input_map = []
         self.output_map = []
         self.output_slices = {}
+        # Per-column count of cells that were NaN/missing on fit; printed as a
+        # summary after preprocessing so the user can see at a glance whether
+        # imputation kicked in for any of their columns.
+        self.nan_report = {}
 
     def set_configs(self, configs): self.col_configs = configs
 
+    # ----------------------------------------------------------- helpers
+    def _impute_numeric(self, col_name, vals, stat_target):
+        """
+        Replace NaN/Inf cells in *vals* with the column median (computed from
+        the finite values).  Stores the imputed value in ``stat_target`` so
+        ``transform`` can reproduce the fill for validation/inference data.
+        Counts and records missing cells in ``self.nan_report``.
+        """
+        vals = np.asarray(vals, dtype=float)
+        bad_mask = ~np.isfinite(vals)
+        n_bad = int(bad_mask.sum())
+        if n_bad > 0:
+            self.nan_report[col_name] = self.nan_report.get(col_name, 0) + n_bad
+            finite_vals = vals[~bad_mask]
+            if finite_vals.size > 0:
+                fill = float(np.median(finite_vals))
+                if not np.isfinite(fill):
+                    fill = 0.0
+            else:
+                fill = 0.0
+            stat_target['nan_fill'] = fill
+            vals = np.where(bad_mask, fill, vals)
+        else:
+            stat_target.setdefault('nan_fill', 0.0)
+        return vals
+
+    def _coerce_numeric_column(self, col_name, col_data, stat_target):
+        """
+        Convert *col_data* to a 1-D float array suitable for use as a numeric
+        feature/target.  Handles three cases automatically:
+
+          * Object column whose values are True/False or Yes/No/Y/N
+            (case-insensitive) → mapped to 1.0 / 0.0 (Requirement 5).
+          * Object column that's mostly numeric strings → coerced via
+            pd.to_numeric, unparseable cells become NaN and are imputed.
+          * Numeric column → pd.to_numeric pass-through.
+        """
+        # Object → boolean detection first (avoid losing True/False info to
+        # silent NaN-coercion that would later flatten the column to 0).
+        # We accept both numpy ``object`` arrays and pandas StringArrays
+        # (which look like a ``string`` extension dtype on pandas ≥ 2.0).
+        if hasattr(col_data, 'dtype'):
+            is_object = _is_object_like_dtype(col_data.dtype)
+        else:
+            is_object = False
+        if is_object:
+            is_bool, true_tokens, false_tokens = _detect_boolean_like_column(col_data)
+            if is_bool:
+                vals = _convert_boolean_column_to_numeric(
+                    col_data, true_tokens, false_tokens)
+                stat_target['boolean'] = True
+                stat_target['true_tokens']  = list(true_tokens)
+                stat_target['false_tokens'] = list(false_tokens)
+                return vals
+        vals = pd.to_numeric(col_data, errors='coerce')
+        return np.asarray(vals, dtype=float)
+
+    def _encode_categorical(self, col_name, col_data, stat_target,
+                            input_map_target, y_for_target_encoding=None):
+        """
+        Encode a categorical column.  NaN/missing cells become an explicit
+        '__MISSING__' category (Requirement 3) so missingness is itself a
+        learnable signal rather than silently flattened to '0' or 'nan'.
+
+        Encoding strategy:
+          * K ≤ one_hot_threshold  →  classic one-hot (K binary columns).
+          * K  > one_hot_threshold →  COMPACT encoding (Requirement 2):
+              - frequency (how common this category is, in [0, 1]),
+              - target mean (if y is available),
+              - ordinal-by-target-mean (a single sorted index per category).
+            This collapses a column with hundreds of labels to 2–3 numeric
+            features so the symbolic regressor doesn't have to discover both
+            which one-hot column matters AND a constant for it.
+        """
+        s = pd.Series(col_data).astype(object)
+        s = s.where(s.notna(), '__MISSING__')
+        cleaned = s.astype(str).values
+        n_missing = int(np.sum(cleaned == '__MISSING__'))
+        if n_missing > 0:
+            self.nan_report[col_name] = self.nan_report.get(col_name, 0) + n_missing
+
+        uniques = sorted(list(set(cleaned)))
+        K = len(uniques)
+        stat_target['classes']  = uniques
+        stat_target['n_unique'] = K
+
+        if K <= self.one_hot_threshold:
+            stat_target['encoding'] = 'one_hot'
+            one_hot = np.zeros((len(cleaned), K), dtype=float)
+            for k, cls in enumerate(uniques):
+                one_hot[:, k] = (cleaned == cls).astype(float)
+                input_map_target.append(f"{col_name}_{cls}")
+            return one_hot
+
+        # Compact encoding for high-cardinality columns.
+        stat_target['encoding'] = 'compact'
+        n = len(cleaned)
+        # 1) Frequency feature
+        freq_map = {cls: float(np.sum(cleaned == cls)) / n for cls in uniques}
+        freq_col = np.array([freq_map[v] for v in cleaned], dtype=float).reshape(-1, 1)
+        stat_target['freq_map'] = freq_map
+        input_map_target.append(f"{col_name}_freq")
+        cols = [freq_col]
+
+        # 2) Target-mean encoding (regression / scalar y).
+        target_mean_map = None
+        global_tm = 0.0
+        if y_for_target_encoding is not None and y_for_target_encoding.size > 0:
+            y = np.asarray(y_for_target_encoding, dtype=float).reshape(-1)
+            if y.shape[0] == n and np.any(np.isfinite(y)):
+                finite = np.isfinite(y)
+                global_tm = float(np.mean(y[finite])) if finite.any() else 0.0
+                tm = {}
+                for cls in uniques:
+                    mask = (cleaned == cls) & finite
+                    tm[cls] = float(np.mean(y[mask])) if mask.any() else global_tm
+                target_mean_map = tm
+                tm_col = np.array([tm[v] for v in cleaned], dtype=float).reshape(-1, 1)
+                input_map_target.append(f"{col_name}_target_mean")
+                cols.append(tm_col)
+                # 3) Ordinal-by-target-mean: rank categories so close-mean
+                # labels sit at close indices.  Lets a single feature capture
+                # monotonic categorical→target relationships.
+                sorted_classes = sorted(uniques, key=lambda c: tm[c])
+                ordinal_map = {c: float(i) for i, c in enumerate(sorted_classes)}
+                ord_col = np.array([ordinal_map[v] for v in cleaned],
+                                   dtype=float).reshape(-1, 1)
+                input_map_target.append(f"{col_name}_ordinal_tm")
+                cols.append(ord_col)
+                stat_target['ordinal_map'] = ordinal_map
+        stat_target['target_mean_map'] = target_mean_map
+        stat_target['global_target_mean'] = global_tm
+        return np.hstack(cols)
+
+    # ----------------------------------------------------------- fit_transform
     def fit_transform(self, df):
+        """
+        Two-pass preprocessing:
+          Pass 1  Build Y from output columns first so high-cardinality
+                  categorical INPUTS can use target-mean encoding.
+          Pass 2  Build X from input columns, in the original column order
+                  (preserving feature index stability between runs).
+
+        Object-dtype columns marked as numeric (type 1/5) are auto-handled:
+          * If only True/False or Yes/No/Y/N values → converted to 0/1
+            (Requirement 5).  No category-blow-up occurs.
+          * If mostly numeric strings → coerced.  Stray text cells become NaN
+            and are median-imputed (Requirement 3).
+          * Otherwise → silently promoted to the matching categorical type
+            (Requirement 4): 1 → 2 for inputs, 5 → 6 for outputs.
+        """
         X_parts, Y_parts = [], []
         self.input_map, self.output_map = [], []
         self.output_slices = {}
+        self.nan_report = {}
         y_cursor = 0
 
+        # First, finalise the effective type for each column (handles
+        # auto-promotion to categorical for misclassified object columns).
+        effective_configs = []
         for col_name, type_code in self.col_configs:
+            if col_name not in df.columns:
+                effective_configs.append((col_name, type_code))
+                continue
             col_data = df[col_name].values
-            if type_code == 0: continue
+            is_object = _is_object_like_dtype(df[col_name].dtype)
+            if type_code == 1 and is_object:
+                # Numeric input chosen on a string column.  Booleans stay
+                # numeric; mostly-numeric strings stay numeric; otherwise
+                # auto-switch to categorical input.
+                is_bool, _, _ = _detect_boolean_like_column(col_data)
+                if not is_bool and not _column_is_mostly_numeric(col_data):
+                    print(f"  ⚠  Column '{col_name}' is type object but was marked "
+                          f"Numeric Input — auto-switching to Categorical Input.")
+                    type_code = 2
+            elif type_code == 5 and is_object:
+                is_bool, _, _ = _detect_boolean_like_column(col_data)
+                if not is_bool and not _column_is_mostly_numeric(col_data):
+                    print(f"  ⚠  Column '{col_name}' is type object but was marked "
+                          f"Numeric Output — auto-switching to Categorical Output.")
+                    type_code = 6
+            effective_configs.append((col_name, type_code))
+        # Cache so transform/transform_input_sample use the same effective types.
+        self.effective_configs = effective_configs
 
-            elif type_code == 1:  # Num In
-                vals = pd.to_numeric(col_data, errors='coerce')
-                vals = np.nan_to_num(vals)
+        # ---- Pass 1: build Y from output columns -----------------------
+        for col_name, type_code in effective_configs:
+            if type_code < 5 or col_name not in df.columns:
+                continue
+            col_data = df[col_name].values
+            if type_code == 5:  # Num Out
+                stat = {'type': 5}
+                vals = self._coerce_numeric_column(col_name, col_data, stat)
+                vals = self._impute_numeric(col_name, vals, stat)
                 if self.scale:
-                    mean, std = np.mean(vals), np.std(vals) + 1e-8
-                    self.stats[col_name] = {'mean': mean, 'std': std, 'type': 1}
+                    mean = float(np.mean(vals))
+                    std  = float(np.std(vals)) + 1e-8
+                    stat['mean'] = mean
+                    stat['std']  = std
                     vals = (vals - mean) / std
-                else:
-                    self.stats[col_name] = {'type': 1}
+                self.stats[col_name] = stat
+                Y_parts.append(vals.reshape(-1, 1))
+                self.output_map.append(col_name)
+                self.output_slices[col_name] = (y_cursor, y_cursor + 1)
+                y_cursor += 1
+            elif type_code == 6:  # Cat Out — explicit MISSING category for NaN
+                s = pd.Series(col_data).astype(object)
+                s = s.where(s.notna(), '__MISSING__')
+                cleaned = s.astype(str).values
+                n_missing = int(np.sum(cleaned == '__MISSING__'))
+                if n_missing > 0:
+                    self.nan_report[col_name] = self.nan_report.get(col_name, 0) + n_missing
+                uniques = sorted(list(set(cleaned)))
+                stat = {'classes': uniques, 'type': 6, 'encoding': 'one_hot'}
+                one_hot = np.zeros((len(cleaned), len(uniques)), dtype=float)
+                for k, cls in enumerate(uniques):
+                    one_hot[:, k] = (cleaned == cls).astype(float)
+                    self.output_map.append(f"{col_name}_{cls}")
+                self.stats[col_name] = stat
+                Y_parts.append(one_hot)
+                self.output_slices[col_name] = (y_cursor, y_cursor + len(uniques))
+                y_cursor += len(uniques)
+
+        # Sample y-column to drive target-mean encoding.  Picks the first
+        # regression output if any, else the first column of Y_parts.
+        y_for_te = None
+        if Y_parts:
+            y_for_te = Y_parts[0][:, 0]
+
+        # ---- Pass 2: build X from input columns ------------------------
+        for col_name, type_code in effective_configs:
+            if type_code == 0 or type_code >= 5 or col_name not in df.columns:
+                continue
+            col_data = df[col_name].values
+
+            if type_code == 1:  # Num In
+                stat = {'type': 1}
+                vals = self._coerce_numeric_column(col_name, col_data, stat)
+                vals = self._impute_numeric(col_name, vals, stat)
+                if self.scale:
+                    mean = float(np.mean(vals))
+                    std  = float(np.std(vals)) + 1e-8
+                    stat['mean'] = mean
+                    stat['std']  = std
+                    vals = (vals - mean) / std
+                self.stats[col_name] = stat
                 X_parts.append(vals.reshape(-1, 1))
                 self.input_map.append(col_name)
 
-            elif type_code == 2:  # Cat In (One Hot)
-                uniques = sorted(list(set(str(x) for x in col_data)))
-                self.stats[col_name] = {'classes': uniques, 'type': 2}
-                one_hot = np.zeros((len(col_data), len(uniques)))
-                for k, cls in enumerate(uniques):
-                    one_hot[:, k] = (col_data == cls).astype(float)
-                    self.input_map.append(f"{col_name}_{cls}")
-                X_parts.append(one_hot)
+            elif type_code == 2:  # Cat In
+                stat = {'type': 2}
+                block = self._encode_categorical(
+                    col_name, col_data, stat, self.input_map,
+                    y_for_target_encoding=y_for_te)
+                self.stats[col_name] = stat
+                X_parts.append(block)
 
             elif type_code == 3:  # Char In
-                str_data = col_data.astype(str)
-                max_len = max(len(s) for s in str_data)
+                str_data = pd.Series(col_data).fillna('').astype(str).values
+                max_len = max(len(s) for s in str_data) if len(str_data) else 1
                 chars = sorted(list(set("".join(str_data))))
                 char_map = {c: i + 1 for i, c in enumerate(chars)}
-                self.stats[col_name] = {'char_map': char_map, 'max_len': max_len, 'type': 3}
-                feature_block = np.zeros((len(str_data), max_len * len(chars)))
+                self.stats[col_name] = {'char_map': char_map,
+                                        'max_len': max_len, 'type': 3}
+                feature_block = np.zeros((len(str_data),
+                                          max_len * max(len(chars), 1)))
                 for i, s in enumerate(str_data):
                     for j, char in enumerate(s):
                         if j >= max_len: break
@@ -2979,66 +3350,92 @@ class DataProcessor:
                     for c in chars:
                         self.input_map.append(f"{col_name}_pos{j}_{c}")
 
-            elif type_code == 5:  # Num Out
-                vals = pd.to_numeric(col_data, errors='coerce')
-                vals = np.nan_to_num(vals)
-                if self.scale:
-                    mean, std = np.mean(vals), np.std(vals) + 1e-8
-                    self.stats[col_name] = {'mean': mean, 'std': std, 'type': 5}
-                    vals = (vals - mean) / std
-                else:
-                    self.stats[col_name] = {'type': 5}
-                Y_parts.append(vals.reshape(-1, 1))
-                self.output_map.append(col_name)
-                self.output_slices[col_name] = (y_cursor, y_cursor + 1)
-                y_cursor += 1
-
-            elif type_code == 6:  # Cat Out
-                uniques = sorted(list(set(col_data)))
-                self.stats[col_name] = {'classes': uniques, 'type': 6}
-                one_hot = np.zeros((len(col_data), len(uniques)))
-                for k, cls in enumerate(uniques):
-                    one_hot[:, k] = (col_data == cls).astype(float)
-                    self.output_map.append(f"{col_name}_{cls}")
-                Y_parts.append(one_hot)
-                self.output_slices[col_name] = (y_cursor, y_cursor + len(uniques))
-                y_cursor += len(uniques)
-
         X = np.hstack(X_parts) if X_parts else np.array([])
         Y = np.hstack(Y_parts) if Y_parts else np.array([])
+
+        # Print a NaN-imputation summary so the user sees what happened.
+        if self.nan_report:
+            print("\n  NaN / missing cells (auto-handled):")
+            for col_name, n_bad in self.nan_report.items():
+                stat = self.stats.get(col_name, {})
+                t = stat.get('type', '?')
+                if t in (1, 5):
+                    fill = stat.get('nan_fill', 0.0)
+                    print(f"    • {col_name:<30} {n_bad:>6} cells → median {fill:.4g}")
+                else:
+                    print(f"    • {col_name:<30} {n_bad:>6} cells → '__MISSING__' category")
         return X, Y
 
     def transform(self, df):
         """
         Apply already-fitted stats/encodings to a new dataframe (e.g. a
         validation or test set).  Must be called after fit_transform().
+
+        Mirrors fit_transform: same NaN imputation (uses the stored fill
+        value), same boolean conversion, same compact encoding for
+        high-cardinality categoricals.
         """
         X_parts, Y_parts = [], []
-        for col_name, type_code in self.col_configs:
+        configs_iter = getattr(self, 'effective_configs', None) or self.col_configs
+        for col_name, type_code in configs_iter:
             if type_code == 0:
                 continue
             col_data = df[col_name].values if col_name in df.columns else \
-                       np.zeros(len(df))
+                       np.full(len(df), np.nan, dtype=object)
             stat = self.stats.get(col_name, {})
 
             if type_code == 1:
-                vals = pd.to_numeric(col_data, errors='coerce')
-                vals = np.nan_to_num(vals)
-                if self.scale:
+                if stat.get('boolean'):
+                    vals = _convert_boolean_column_to_numeric(
+                        col_data, set(stat.get('true_tokens', [])),
+                        set(stat.get('false_tokens', [])))
+                else:
+                    vals = pd.to_numeric(col_data, errors='coerce')
+                    vals = np.asarray(vals, dtype=float)
+                fill = float(stat.get('nan_fill', 0.0))
+                bad = ~np.isfinite(vals)
+                if bad.any():
+                    vals = np.where(bad, fill, vals)
+                if self.scale and 'mean' in stat:
                     vals = (vals - stat['mean']) / stat['std']
                 X_parts.append(vals.reshape(-1, 1))
             elif type_code == 2:
+                s = pd.Series(col_data).astype(object)
+                s = s.where(s.notna(), '__MISSING__')
+                cleaned = s.astype(str).values
                 uniques = stat.get('classes', [])
-                one_hot = np.zeros((len(col_data), len(uniques)))
-                for k, cls in enumerate(uniques):
-                    one_hot[:, k] = (col_data == cls).astype(float)
-                X_parts.append(one_hot)
+                encoding = stat.get('encoding', 'one_hot')
+                if encoding == 'one_hot':
+                    one_hot = np.zeros((len(cleaned), len(uniques)))
+                    for k, cls in enumerate(uniques):
+                        one_hot[:, k] = (cleaned == cls).astype(float)
+                    X_parts.append(one_hot)
+                else:
+                    freq_map = stat.get('freq_map', {})
+                    cols = [np.array([freq_map.get(v, 0.0) for v in cleaned],
+                                     dtype=float).reshape(-1, 1)]
+                    tm = stat.get('target_mean_map')
+                    if tm is not None:
+                        gtm = float(stat.get('global_target_mean', 0.0))
+                        cols.append(np.array([tm.get(v, gtm) for v in cleaned],
+                                             dtype=float).reshape(-1, 1))
+                        om = stat.get('ordinal_map', {})
+                        # Unseen categories get the median ordinal so they
+                        # don't sit at index 0 (which would alias them with
+                        # the lowest-mean class).
+                        if om:
+                            default_ord = float(np.median(list(om.values())))
+                        else:
+                            default_ord = 0.0
+                        cols.append(np.array([om.get(v, default_ord) for v in cleaned],
+                                             dtype=float).reshape(-1, 1))
+                    X_parts.append(np.hstack(cols))
             elif type_code == 3:
                 char_map = stat.get('char_map', {})
                 max_len  = stat.get('max_len', 1)
                 chars    = sorted(char_map.keys())
-                str_data = col_data.astype(str)
-                feature_block = np.zeros((len(str_data), max_len * len(chars)))
+                str_data = pd.Series(col_data).fillna('').astype(str).values
+                feature_block = np.zeros((len(str_data), max_len * max(len(chars), 1)))
                 for i, s in enumerate(str_data):
                     for j, char in enumerate(s):
                         if j >= max_len: break
@@ -3047,16 +3444,28 @@ class DataProcessor:
                             feature_block[i, j * len(chars) + char_idx] = 1.0
                 X_parts.append(feature_block)
             elif type_code == 5:
-                vals = pd.to_numeric(col_data, errors='coerce')
-                vals = np.nan_to_num(vals)
-                if self.scale:
+                if stat.get('boolean'):
+                    vals = _convert_boolean_column_to_numeric(
+                        col_data, set(stat.get('true_tokens', [])),
+                        set(stat.get('false_tokens', [])))
+                else:
+                    vals = pd.to_numeric(col_data, errors='coerce')
+                    vals = np.asarray(vals, dtype=float)
+                fill = float(stat.get('nan_fill', 0.0))
+                bad = ~np.isfinite(vals)
+                if bad.any():
+                    vals = np.where(bad, fill, vals)
+                if self.scale and 'mean' in stat:
                     vals = (vals - stat['mean']) / stat['std']
                 Y_parts.append(vals.reshape(-1, 1))
             elif type_code == 6:
+                s = pd.Series(col_data).astype(object)
+                s = s.where(s.notna(), '__MISSING__')
+                cleaned = s.astype(str).values
                 uniques = stat.get('classes', [])
-                one_hot = np.zeros((len(col_data), len(uniques)))
+                one_hot = np.zeros((len(cleaned), len(uniques)))
                 for k, cls in enumerate(uniques):
-                    one_hot[:, k] = (col_data == cls).astype(float)
+                    one_hot[:, k] = (cleaned == cls).astype(float)
                 Y_parts.append(one_hot)
 
         X = np.hstack(X_parts) if X_parts else np.array([])
@@ -3065,32 +3474,70 @@ class DataProcessor:
 
     def transform_input_sample(self, input_dict):
         vec_parts = []
-        for col_name, type_code in self.col_configs:
+        configs_iter = getattr(self, 'effective_configs', None) or self.col_configs
+        for col_name, type_code in configs_iter:
             if type_code in [0, 5, 6, 7]: continue
             val = input_dict.get(col_name)
             stat = self.stats.get(col_name, {})
             if type_code == 1:
-                # SAFE FALLBACK: If an unused variable is missing, default to 0.0
-                val = float(val) if val is not None and val != '' else 0.0
-                if self.scale: val = (val - stat['mean']) / stat['std']
-                vec_parts.append([val])
+                if stat.get('boolean'):
+                    if val is None or val == '':
+                        fval = float(stat.get('nan_fill', 0.0))
+                    else:
+                        s = str(val).strip().lower()
+                        if s in set(stat.get('true_tokens', [])):
+                            fval = 1.0
+                        elif s in set(stat.get('false_tokens', [])):
+                            fval = 0.0
+                        else:
+                            fval = float(stat.get('nan_fill', 0.0))
+                else:
+                    try:
+                        fval = float(val) if val is not None and val != '' else float('nan')
+                    except (TypeError, ValueError):
+                        fval = float('nan')
+                    if not np.isfinite(fval):
+                        fval = float(stat.get('nan_fill', 0.0))
+                if self.scale and 'mean' in stat:
+                    fval = (fval - stat['mean']) / stat['std']
+                vec_parts.append([fval])
             elif type_code == 2:
-                classes = stat['classes']
-                one_hot = [0.0] * len(classes)
-                if val in classes: one_hot[classes.index(val)] = 1.0
-                vec_parts.append(one_hot)
+                classes = stat.get('classes', [])
+                key = '__MISSING__' if (val is None or val == '') else str(val)
+                if stat.get('encoding', 'one_hot') == 'one_hot':
+                    one_hot = [0.0] * len(classes)
+                    if key in classes:
+                        one_hot[classes.index(key)] = 1.0
+                    vec_parts.append(one_hot)
+                else:
+                    freq_map = stat.get('freq_map', {})
+                    parts = [freq_map.get(key, 0.0)]
+                    tm = stat.get('target_mean_map')
+                    if tm is not None:
+                        parts.append(tm.get(key, float(stat.get('global_target_mean', 0.0))))
+                        om = stat.get('ordinal_map', {})
+                        if om:
+                            default_ord = float(np.median(list(om.values())))
+                        else:
+                            default_ord = 0.0
+                        parts.append(om.get(key, default_ord))
+                    vec_parts.append(parts)
+        if not vec_parts:
+            return np.array([], dtype=float)
         return np.concatenate(vec_parts)
 
     def inverse_transform_output(self, y_pred_vec):
         res = {}
-        for col_name, type_code in self.col_configs:
+        configs_iter = getattr(self, 'effective_configs', None) or self.col_configs
+        for col_name, type_code in configs_iter:
             if type_code not in [5, 6, 7]: continue
             start, end = self.output_slices[col_name]
             col_preds = y_pred_vec[start:end]
             stat = self.stats[col_name]
             if type_code == 5:
                 val = col_preds[0]
-                if self.scale: val = (val * stat['std']) + stat['mean']
+                if self.scale and 'mean' in stat:
+                    val = (val * stat['std']) + stat['mean']
                 res[col_name] = val
             elif type_code == 6:
                 best_idx = np.argmax(col_preds)
@@ -3099,7 +3546,8 @@ class DataProcessor:
 
     def get_output_types_flat(self):
         types_list = []
-        for col_name, type_code in self.col_configs:
+        configs_iter = getattr(self, 'effective_configs', None) or self.col_configs
+        for col_name, type_code in configs_iter:
             if type_code < 5: continue
             if type_code == 5: types_list.append(5)
             elif type_code == 6: types_list.extend([6] * len(self.stats[col_name]['classes']))
@@ -3539,6 +3987,11 @@ def random_cgp(n_features, max_nodes, feature_names):
 
     def _random_const():
         roll = random.random()
+        # Data-scale-aware magnitudes: when the dataset implies a large
+        # natural scale (e.g. 700_000), include matching round-number seeds
+        # so initial populations can find big coefficients without needing
+        # 10+ generations of doubling mutations.
+        ds = max(1.0, float(_DATA_SCALE_HINT))
         if roll < 0.15:
             return random.choice([0.0, 1.0, -1.0, 2.0, -2.0, 0.5, -0.5,
                                     np.pi, 2*np.pi, np.e, 10.0, 100.0,
@@ -3552,11 +4005,21 @@ def random_cgp(n_features, max_nodes, feature_names):
                                   128.0, 256.0, 512.0, 1024.0, 2048.0,
                                   4096.0, 8192.0, 16384.0, 32768.0,
                                   0.5, 0.25, 0.125, 0.0625, 0.03125])
-        elif roll < 0.5:
+        elif roll < 0.45:
             return random.choice([-5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
                                     0.25, 0.33, 0.5, 0.67, 0.75, 1.5, 2.5, 3.5])
+        elif roll < 0.65 and ds > 50.0:
+            # Data-scale ladder — round numbers from 10 up to ds*10.  Lets
+            # large-magnitude problems (length 700_000, money 1_000_000,
+            # pressures 1e5 Pa) have seed constants in the right ballpark.
+            sign  = random.choice([1.0, -1.0])
+            mult  = random.choice([1.0, 2.0, 2.5, 3.0, 5.0, 7.0])
+            decade_max = max(1, int(np.log10(ds * 10.0)))
+            decade = random.randint(1, decade_max)
+            return sign * mult * (10.0 ** decade)
         else:
-            mag = random.choice([0.1, 1.0, 10.0, 100.0, 1000.0])
+            mag = random.choice([0.1, 1.0, 10.0, 100.0, 1000.0,
+                                 max(100.0, ds * 0.1), max(1000.0, ds)])
             return random.gauss(0, 2.0) * mag
 
     use_structured = random.random() < 0.50
@@ -7603,7 +8066,16 @@ def mutate(parent_eq, n_features, feature_names, mut_rate=None, temperature=0.0,
         elif choice == 'scale_const':
             target.const_val *= random.uniform(0.2, 5.0)
         elif choice == 'reset_const':
-            mag = random.choice([1, 10, 100, 0.1, 0.01])
+            # Data-scale-aware reset magnitudes — without the ds entries a
+            # constant can only escape the [-300, 300] window through many
+            # consecutive scale_const(5x) draws (each ~1/N of the population).
+            ds = max(1.0, float(_DATA_SCALE_HINT))
+            mag_pool = [1.0, 10.0, 100.0, 0.1, 0.01]
+            if ds > 50.0:
+                mag_pool.extend([max(100.0, ds * 0.1),
+                                 max(1000.0, ds),
+                                 max(10000.0, ds * 10.0)])
+            mag = random.choice(mag_pool)
             target.const_val = random.gauss(0, 3.0) * mag
         elif choice == 'pow2_const':
             # Discrete power-of-2 ladder step.  Either snap to the nearest
@@ -7626,8 +8098,15 @@ def mutate(parent_eq, n_features, feature_names, mut_rate=None, temperature=0.0,
                 factor = random.choice([2.0, 0.5])
                 target.const_val *= factor
             else:
-                # Jump to a random power of 2 within a useful window.
-                p = random.randint(-6, 14)
+                # Jump to a random power of 2 within a useful window.  Extend
+                # the upper bound when the dataset implies large constants
+                # (2^14 = 16384 is too small for 700_000-scale targets).
+                ds = max(1.0, float(_DATA_SCALE_HINT))
+                p_hi = 14
+                if ds > 1000.0:
+                    p_hi = max(14, int(np.log2(ds * 10.0)))
+                    p_hi = min(p_hi, 30)
+                p = random.randint(-6, p_hi)
                 sign = random.choice([1.0, -1.0])
                 target.const_val = sign * (2.0 ** p)
         elif choice == 'swap_ops':
@@ -8579,9 +9058,33 @@ def _const_simplicity_score(v):
     return 5.0 + abs(np.log10(a + 1e-30)) * 0.01
 
 
+def _build_data_scale_candidates(scale):
+    """
+    Build a small list of 'nice' candidates around a given dataset scale.
+    Adds round numbers (1, 5, 10, ...) times every power of 10 from 10^1 up
+    to ~scale*10 so values like 30, 7e5 or 8e6 can be snapped even though
+    the static nice ladder caps at 1e6.
+
+    Used by _snap_constants_to_nice to extend its candidate pool.  Cheap
+    (≤30 numbers) and never harms small-scale problems.
+    """
+    if not np.isfinite(scale) or scale < 10.0:
+        return []
+    out = []
+    decade = 10
+    while decade <= max(scale * 10.0, 100.0) and decade <= 1e9:
+        for mult in (1.0, 2.0, 2.5, 3.0, 5.0, 7.0, 10.0):
+            v = mult * decade
+            out.append(v)
+            out.append(-v)
+        decade *= 10
+    return out
+
+
 def _snap_constants_to_nice(objective, params, current_loss,
                             rel_tol=0.05, abs_tol=1e-3, max_candidates=8,
-                            max_rel_dist=0.05, max_abs_dist=0.02):
+                            max_rel_dist=0.05, max_abs_dist=0.02,
+                            data_scale=None):
     """
     Try snapping each constant in *params* (one at a time) to its closest
     "nice" value (integer / power-of-2 / simple rational / π / e …).
@@ -8613,12 +9116,24 @@ def _snap_constants_to_nice(objective, params, current_loss,
     params = list(params)
     ref_loss = max(current_loss, 0.0)
     slack = max(rel_tol * ref_loss, abs_tol)
+    # Extra candidates derived from the dataset scale (e.g. 7e5, 3e7 ...).
+    # Without these the static ladder caps at 1e6 and a constant like
+    # 700_000 has no nearby snap target, so the optimiser leaves it at the
+    # exact numerical polish value (e.g. 700_001.347).
+    extra_scale_cands = (_build_data_scale_candidates(data_scale)
+                         if data_scale is not None else [])
     for idx in range(len(params)):
         v = float(params[idx])
         # Closest candidates by absolute distance, plus a few explicit ones.
         diffs = np.abs(_NICE_CONST_LADDER - v)
         nearest = np.argsort(diffs)[:max_candidates]
         candidates = [float(_NICE_CONST_LADDER[k]) for k in nearest]
+        if extra_scale_cands:
+            # Add the few closest data-scale candidates so they compete with
+            # the static ladder on a level field.
+            scale_arr = np.asarray(extra_scale_cands, dtype=float)
+            sc_near = np.argsort(np.abs(scale_arr - v))[:max_candidates]
+            candidates.extend(float(scale_arr[k]) for k in sc_near)
         if abs(v) < 1e6:
             candidates.append(float(round(v)))
         if abs(v) > 1e-12 and abs(v) < 1e8:
@@ -9317,9 +9832,32 @@ class Individual:
         # Stage 1: Differential Evolution (global search)
         # Skip DE if max_iter is small (used for fast in-loop local nudges)
         # ------------------------------------------------------------------ #
+        # DATA-SCALE-AWARE BOUNDS: scale DE search bounds by the dataset
+        # magnitude so problems whose true constants are 30, 700_000 etc. are
+        # actually reachable.  Without this, a starting const of 3.5 produces
+        # bounds [-35, 35] — the optimiser literally cannot find a coefficient
+        # of 700_000.  We also compute a runtime data scale from y_target /
+        # X_opt so the bounds adapt per-batch.
+        try:
+            data_scale = float(max(
+                _DATA_SCALE_HINT,
+                np.nanmax(np.abs(y_opt)) if y_opt is not None and y_opt.size else 0.0,
+                np.nanmax(np.abs(X_opt)) if X_opt is not None and X_opt.size else 0.0,
+                1.0))
+            if not np.isfinite(data_scale) or data_scale <= 0.0:
+                data_scale = 10.0
+        except Exception:
+            data_scale = max(_DATA_SCALE_HINT, 10.0)
+
         USE_DE = (n <= 12) and (max_iter >= 50)
         if USE_DE:
-            _span = np.maximum(np.abs(initial_consts), 1.0) * 10.0
+            # Span = max(10 × |initial_const|, data_scale × 2).  The data-scale
+            # floor guarantees we can reach answers like 700 000 even when
+            # initial consts are tiny.  Capped at 1e7 to avoid pathological
+            # blow-ups when y is extreme.
+            _per_const = np.maximum(np.abs(initial_consts), 1.0) * 10.0
+            _data_floor = float(min(1e7, max(data_scale * 2.0, 100.0)))
+            _span = np.maximum(_per_const, _data_floor)
             bounds = [(-s, s) for s in _span]
             try:
                 de_result = differential_evolution(
@@ -9332,27 +9870,43 @@ class Individual:
                     best_loss = de_result.fun
                     best_params = list(de_result.x)
             except Exception:
-                pass 
+                pass
 
         # ------------------------------------------------------------------ #
         # Stage 2: L-BFGS-B (fast local polish)
         # ------------------------------------------------------------------ #
         polish_starts = [best_params]
         if not USE_DE:
-            scale = max(np.std(initial_consts), 1.0) if initial_consts else 1.0
-            for _ in range(n_restarts - 1):
-                polish_starts.append(
-                    (np.array(best_params) + np.random.randn(n) * scale).tolist()
-                )
+            # When DE is skipped, seed restarts with data-scale-aware jitter so
+            # at least one start has a chance of being near a large true
+            # constant even when initial_consts are all near zero.
+            const_scale = max(np.std(initial_consts), 1.0) if initial_consts else 1.0
+            scale = max(const_scale, min(data_scale * 0.5, 1e6))
+            for r in range(n_restarts - 1):
+                # Alternate between gaussian jitter and full-range data-scale
+                # samples so we cover both fine-tuning AND large-jump restarts.
+                if r % 2 == 0:
+                    polish_starts.append(
+                        (np.array(best_params) + np.random.randn(n) * scale).tolist()
+                    )
+                else:
+                    polish_starts.append(
+                        (np.random.uniform(-data_scale, data_scale, size=n)).tolist()
+                    )
 
         # L-BFGS-B bounds: keep constants in a sane range during optimisation
         # so transient overflow can't poison the objective and so the final
-        # snap stage gets reasonable values to consider.  Matches the
-        # post-mutation ±1e6 clamp used elsewhere.
-        _polish_bounds = [(-1e6, 1e6)] * n
+        # snap stage gets reasonable values to consider.  We lift the bound
+        # above 1e6 when the dataset implies larger natural constants — a
+        # problem with 1e10-scale targets shouldn't have its 1e8-scale
+        # coefficient clipped just because the legacy default was 1e6.  Capped
+        # at 1e10 to keep numerical issues bounded.
+        _polish_bound_mag = float(min(1e10, max(1e6, data_scale * 2.0)))
+        _polish_bounds = [(-_polish_bound_mag, _polish_bound_mag)] * n
         for x0 in polish_starts:
             try:
-                _x0 = np.clip(np.array(x0, dtype=float), -1e6, 1e6)
+                _x0 = np.clip(np.array(x0, dtype=float),
+                              -_polish_bound_mag, _polish_bound_mag)
                 # Increased eps from 1e-5 to 1e-3 to handle unscaled raw feature gradients
                 res = minimize(objective, _x0, method='L-BFGS-B',
                                bounds=_polish_bounds,
@@ -9375,7 +9929,8 @@ class Individual:
 
         # Hard clamp before any downstream code reads constants — defends
         # against any optimiser path that escaped the bounds (e.g. NM fallback).
-        best_params = [float(np.clip(c, -1e6, 1e6)) for c in best_params]
+        best_params = [float(np.clip(c, -_polish_bound_mag, _polish_bound_mag))
+                       for c in best_params]
 
         # ------------------------------------------------------------------ #
         # Stage 3: Snap to nearby "nice" values (integer / power-of-2 / ½, ⅓ …)
@@ -9427,7 +9982,8 @@ class Individual:
             try:
                 snap_baseline = float(snap_objective(best_params))
                 snapped = _snap_constants_to_nice(
-                    snap_objective, best_params, snap_baseline)
+                    snap_objective, best_params, snap_baseline,
+                    data_scale=data_scale)
                 snap_after = float(snap_objective(snapped))
                 if snap_after <= snap_baseline + 1e-9:
                     best_params = snapped
@@ -9440,7 +9996,8 @@ class Individual:
         else:
             try:
                 best_params = _snap_constants_to_nice(
-                    objective, best_params, best_loss)
+                    objective, best_params, best_loss,
+                    data_scale=data_scale)
                 best_loss = float(objective(best_params))
             except Exception:
                 pass
@@ -10495,12 +11052,23 @@ def get_configs(df):
     Types:
       0 = Ignore      — column is completely excluded from training.
       1 = Numeric In  — continuous numeric feature (input).
-      2 = Categoric In— categorical/string feature; one-hot encoded automatically.
+      2 = Categoric In— categorical/string feature; one-hot or compact-encoded.
       5 = Numeric Out — continuous regression target.
       6 = Categoric Out — categorical classification target; one-hot encoded.
 
     Shortcut syntax  'T*N'  applies type T to the next N consecutive columns,
     e.g. '1*10' marks the next 10 columns as numeric inputs.
+
+    Auto-coercion (applied later by DataProcessor):
+      * Numeric (1 or 5) chosen on an object column → auto-promoted to the
+        matching categorical type unless the column is boolean-like
+        (True/False, Yes/No, Y/N — case-insensitive) or contains mostly
+        numeric strings.
+      * Boolean-like object columns marked numeric → mapped to 0/1.
+      * High-cardinality categorical inputs (> {CAT_HIGH_CARD_THRESHOLD}
+        unique values) use compact frequency + target-mean + ordinal
+        encoding instead of one-hot, so the regressor sees one informative
+        numeric per such column rather than many sparse indicators.
     """
     configs = []
     i = 0
@@ -10509,20 +11077,48 @@ def get_configs(df):
     print("=" * 65)
     print("  0  Ignore         — skip this column entirely")
     print("  1  Numeric  Input — continuous number used as a feature")
-    print("  2  Categoric Input— text/category, auto one-hot encoded as input")
+    print("  2  Categoric Input— text/category, auto-encoded (one-hot if few")
+    print("                      classes, compact freq+target+ordinal if many)")
     print("  5  Numeric  Output— continuous regression target")
     print("  6  Categoric Output—classification target (BCE loss, Accuracy metric)")
     print()
     print("  Shortcut: 'T*N'  applies type T to the next N columns (e.g. 1*20)")
+    print("  Auto-handling: object cols → categorical unless they parse as")
+    print("                 numeric or are bool-like (True/False, Yes/No, Y/N).")
+    print("                 Missing cells: numeric → median, categorical →")
+    print("                 '__MISSING__' class.")
     print("=" * 65)
 
     while i < len(df.columns):
         col = df.columns[i]
-        unique_count = df[col].nunique()
-        sample_val = df[col].sample(1).values[0]
+        unique_count = df[col].nunique(dropna=True)
+        nan_count    = int(df[col].isna().sum())
+        try:
+            sample_val = df[col].dropna().sample(1).values[0]
+        except Exception:
+            sample_val = df[col].iloc[0] if len(df[col]) else ''
         dtype = df[col].dtype
+
+        # Hint about how an object column will be auto-handled if the user
+        # picks numeric.  Cheap pre-check using the same helpers used by
+        # DataProcessor.fit_transform so the hint never lies.
+        hint = ""
+        if _is_object_like_dtype(dtype):
+            is_bool, _, _ = _detect_boolean_like_column(df[col].values)
+            if is_bool:
+                hint = "  → bool-like, will map to 0/1 if marked numeric"
+            elif _column_is_mostly_numeric(df[col].values):
+                hint = "  → mostly numeric strings, will coerce if marked numeric"
+            else:
+                hint = f"  → text; numeric (1/5) will auto-promote to categorical (2/6)"
+        if unique_count > CAT_HIGH_CARD_THRESHOLD:
+            hint += f"  [high-cardinality: {unique_count} classes → compact encoding if cat]"
+        nan_hint = f" | NaN: {nan_count}" if nan_count > 0 else ""
+
         print(f"\n--> [{i+1}/{len(df.columns)}] COLUMN: {col}")
-        print(f"    Dtype: {dtype} | Unique values: {unique_count} | Sample: '{sample_val}'")
+        print(f"    Dtype: {dtype} | Unique values: {unique_count}{nan_hint} | Sample: '{sample_val}'")
+        if hint:
+            print(f"    {hint}")
         valid = False
         while not valid:
             u = input("    Set Type [0/1/2/5/6 or T*N]: ").strip()
@@ -18811,6 +19407,14 @@ def train_mode():
     X, Y = dp.fit_transform(df)
     n_features, n_outputs = X.shape[1], Y.shape[1]
     feat_names, out_types = dp.input_map, dp.get_output_types_flat()
+
+    # Data-scale hint: lets constant optimisation, mutation and seed
+    # generation size their search by the dataset magnitude.  Without this,
+    # a problem whose constants are 700_000 is unreachable from defaults
+    # (initial constants are gauss(0, 2)*1000 ≈ ±6000 maximum).
+    _ds = _set_data_scale_hint(X, Y)
+    print(f"  Data-scale hint: {_ds:.4g}  "
+          f"(seeds, mutation and const-opt bounds adapt to this magnitude.)")
 
     # ── Validation set setup ─────────────────────────────────────────────────
     X_val, Y_val = None, None
