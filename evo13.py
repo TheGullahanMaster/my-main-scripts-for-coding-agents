@@ -5765,6 +5765,24 @@ def generate_importance_biased_seeds(n_features, feature_names, X, y):
     # modular shift, an exact-match seed avoids that trap entirely.
     seeds.extend(_generate_modular_shift_seeds(n_features, feature_names, X, y))
 
+    # ════════════════════════════════════════════════════════════════
+    # CLIP / CLAMP / RELU6 SEEDS  (double-plateau saturating shapes)
+    # ════════════════════════════════════════════════════════════════
+    # Targets shaped like  y = min(hi, max(lo, slope·x + bias))  — ReLU6,
+    # hard-tanh, hard-sigmoid, generic clamps — are flat on both ends of
+    # x and linear in the middle.  OLS on a polynomial basis fits the
+    # plateaus poorly (residuals concentrated outside the linear band),
+    # and the existing single-sided clamp templates ``min(c, x)`` and
+    # ``max(0, x - c)`` cover only one plateau.  The Bayesian surrogate
+    # then anchors on whichever single-sided / sqrt / polynomial seed
+    # has the best initial loss and rarely composes the second clamp.
+    # Direct two-sided templates here put the full shape in the seed
+    # pool from iteration zero.
+    try:
+        seeds.extend(_generate_clip_seeds(n_features, feature_names, X, y))
+    except Exception:
+        pass
+
     return seeds
 
 
@@ -5994,6 +6012,218 @@ def _generate_modular_shift_seeds(n_features, feature_names, X, y):
                             break
 
     return seeds
+
+
+def _generate_clip_seeds(n_features, feature_names, X, y):
+    """Detect saturating / double-plateau (clip/clamp/ReLU6-style) targets and
+    seed them directly.
+
+    Pattern: y has a flat lower plateau, a monotone transition region, and a
+    flat upper plateau as a function of some feature x_i:
+
+        y ≈ min(hi, max(lo, slope · x_i + bias))
+
+    Catches:
+      • ReLU6:        y = min(max(0, x), 6)        (PyTorch, MobileNet)
+      • Hard-tanh:    y = max(-1, min(1, x))
+      • Hard-sigmoid: y = max(0, min(1, 0.2·x + 0.5))
+      • Generic clamp / clip on a sensor or ramp + saturation.
+
+    Without these seeds, BO on 1-feature ReLU6 locks onto unstable sqrt /
+    polynomial fits: the OLS basis cannot represent the flat regions and the
+    existing ``min(c, x)`` / ``max(0, x - c)`` templates clamp on only one
+    side.  Three-/four-node templates that clamp on BOTH sides are emitted
+    here so the surrogate sees a full-shape candidate from iteration zero.
+    """
+    seeds = []
+    allowed = set(CGPEquation.OPS_ALL)
+    if (X is None or y is None or n_features < 1
+            or 'const' not in allowed):
+        return seeds
+
+    has_min  = 'min'      in allowed
+    has_max  = 'max'      in allowed
+    has_relu = 'relu'     in allowed
+    has_soft = 'softplus' in allowed
+    has_mul  = '*'        in allowed
+    has_add  = '+'        in allowed
+    has_sub  = '-'        in allowed
+    # Need at least one expressive clamp operator pair.  Variant D
+    # (``hi − relu(hi − relu(ramp))``) only needs ``relu`` + ``-`` so even
+    # op sets without min/max/softplus get an exact ReLU6 seed.
+    if not ((has_min and has_max) or (has_min and has_relu)
+            or (has_relu and has_sub) or has_soft):
+        return seeds
+
+    try:
+        y_arr = np.asarray(y, dtype=np.float64).ravel()
+    except Exception:
+        return seeds
+    if y_arr.size < 20 or not np.all(np.isfinite(y_arr)):
+        return seeds
+
+    y_lo_data = float(np.min(y_arr))
+    y_hi_data = float(np.max(y_arr))
+    y_range   = y_hi_data - y_lo_data
+    if y_range < 1e-8:
+        return seeds
+
+    # Plateau mass test: ≥10% of samples within 2% of y_range from each
+    # extremum, AND ≥5% of samples strictly between (the ramp region).
+    plateau_tol = max(1e-8, 0.02 * y_range)
+    lo_mask = np.abs(y_arr - y_lo_data) <= plateau_tol
+    hi_mask = np.abs(y_arr - y_hi_data) <= plateau_tol
+    n_total = y_arr.size
+    frac_lo = float(lo_mask.sum()) / n_total
+    frac_hi = float(hi_mask.sum()) / n_total
+    if frac_lo < 0.10 or frac_hi < 0.10:
+        return seeds
+    middle_mask = ~(lo_mask | hi_mask)
+    if float(middle_mask.sum()) / n_total < 0.05:
+        return seeds
+
+    emitted_features = 0
+    MAX_FEATS = 3
+    for fi in range(n_features):
+        if emitted_features >= MAX_FEATS:
+            break
+        xi = X[:, fi].astype(np.float64)
+        if not np.all(np.isfinite(xi)) or float(np.std(xi)) < 1e-10:
+            continue
+        mid_idx = np.where(middle_mask)[0]
+        if mid_idx.size < 5:
+            continue
+        xi_mid = xi[mid_idx]
+        y_mid  = y_arr[mid_idx]
+        if float(np.std(xi_mid)) < 1e-10:
+            continue
+        # Correlation on the transition region tells us this feature is the
+        # ramp axis; off-axis features get a near-zero r and are skipped.
+        try:
+            r_mid = float(np.corrcoef(xi_mid, y_mid)[0, 1])
+        except Exception:
+            r_mid = 0.0
+        if not np.isfinite(r_mid) or abs(r_mid) < 0.5:
+            continue
+        var_x = float(np.var(xi_mid))
+        if var_x < 1e-12:
+            continue
+        slope = float(np.cov(xi_mid, y_mid)[0, 1] / var_x)
+        bias  = float(np.mean(y_mid) - slope * np.mean(xi_mid))
+        if not (np.isfinite(slope) and np.isfinite(bias)):
+            continue
+        # Snap to canonical activation plateau levels when within rounding
+        # distance, so interpretable formulas (exact ReLU6 / hard-tanh /
+        # hard-sigmoid) can come out of the const-opt pass unchanged.
+        lo_levels = [y_lo_data]
+        hi_levels = [y_hi_data]
+        for canon in (0.0, -1.0):
+            if abs(canon - y_lo_data) <= 0.05 * y_range + 0.05:
+                if canon not in lo_levels:
+                    lo_levels.append(canon)
+        for canon in (1.0, 6.0):
+            if abs(canon - y_hi_data) <= 0.05 * y_range + 0.05:
+                if canon not in hi_levels:
+                    hi_levels.append(canon)
+        for lo in lo_levels:
+            for hi in hi_levels:
+                if hi <= lo + 1e-6:
+                    continue
+                seeds.extend(_build_clip_seed_variants(
+                    n_features, feature_names, fi, slope, bias, lo, hi,
+                    has_min=has_min, has_max=has_max, has_relu=has_relu,
+                    has_soft=has_soft, has_mul=has_mul, has_add=has_add,
+                    has_sub=has_sub))
+        emitted_features += 1
+
+    return seeds
+
+
+def _build_clip_seed_variants(n_features, feature_names, fi, slope, bias,
+                              lo, hi, has_min, has_max, has_relu,
+                              has_soft, has_mul, has_add, has_sub):
+    """Build the family of clip / clamp seed templates for one feature."""
+    out = []
+
+    # Build the affine ramp (slope · x_fi + bias) as a node prefix.  When
+    # slope ≈ 1 and bias ≈ 0 the ramp is just the raw feature; no nodes
+    # are needed and `ramp_idx` is the feature index itself.
+    use_raw = (abs(slope - 1.0) < 1e-6 and abs(bias) < 1e-6)
+    if use_raw:
+        prefix = []
+        ramp_idx = fi
+    elif has_mul and has_add and abs(bias) > 1e-6:
+        prefix = [
+            ('const', 0, 0, slope),
+            ('*', n_features + 0, fi),
+            ('const', 0, 0, bias),
+            ('+', n_features + 1, n_features + 2),
+        ]
+        ramp_idx = n_features + 3
+    elif has_mul:
+        prefix = [
+            ('const', 0, 0, slope),
+            ('*', n_features + 0, fi),
+        ]
+        ramp_idx = n_features + 1
+    else:
+        prefix = []
+        ramp_idx = fi
+    base = len(prefix)
+
+    def _emit(extra_nodes):
+        try:
+            seed = _build_seed(n_features, feature_names,
+                               list(prefix) + list(extra_nodes))
+            if seed is not None:
+                out.append(seed)
+        except Exception:
+            pass
+
+    # Variant A: min(hi, max(lo, ramp))   — exact ReLU6/clip when (lo,hi)=(0,6)
+    if has_min and has_max:
+        _emit([
+            ('const', 0, 0, lo),
+            ('max', ramp_idx, n_features + base),
+            ('const', 0, 0, hi),
+            ('min', n_features + base + 1, n_features + base + 2),
+        ])
+    # Variant B: max(lo, min(hi, ramp))   — equivalent ordering for evolution
+    if has_min and has_max:
+        _emit([
+            ('const', 0, 0, hi),
+            ('min', ramp_idx, n_features + base),
+            ('const', 0, 0, lo),
+            ('max', n_features + base + 1, n_features + base + 2),
+        ])
+    # Variant C: min(hi, relu(ramp))      — ReLU6 canonical form (lo == 0)
+    if has_min and has_relu and abs(lo) < 1e-6:
+        _emit([
+            ('relu', ramp_idx, 0),
+            ('const', 0, 0, hi),
+            ('min', n_features + base, n_features + base + 1),
+        ])
+    # Variant D: hi − relu(hi − relu(ramp))   — pure-ReLU encoding of ReLU6
+    if has_relu and has_sub and abs(lo) < 1e-6:
+        _emit([
+            ('relu', ramp_idx, 0),                            # base
+            ('const', 0, 0, hi),                              # base+1
+            ('-', n_features + base + 1, n_features + base),  # base+2
+            ('relu', n_features + base + 2, 0),               # base+3
+            ('-', n_features + base + 1, n_features + base + 3),  # base+4
+        ])
+    # Variant E: softplus(ramp) − softplus(ramp − hi)
+    # Smooth ReLU6 surrogate; useful when neither min nor max is enabled and
+    # only softplus + relu are available.
+    if has_soft and has_sub and abs(lo) < 1e-6:
+        _emit([
+            ('softplus', ramp_idx, 0),                              # base
+            ('const', 0, 0, hi),                                    # base+1
+            ('-', ramp_idx, n_features + base + 1),                 # base+2
+            ('softplus', n_features + base + 2, 0),                 # base+3
+            ('-', n_features + base, n_features + base + 3),        # base+4
+        ])
+    return out
 
 
 def _generate_bit_arithmetic_seeds(n_features, feature_names, X, y):
