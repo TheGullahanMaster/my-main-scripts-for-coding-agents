@@ -14348,10 +14348,12 @@ class _GpHedgePortfolio:
 
     Maintains a list of acquisition functions and an exponential-weight
     bookkeeper of recent rewards.  On each call to ``choose()`` we
-    sample one arm probabilistically and remember the choice; once the
-    iteration produces an observed reward, ``update(reward)`` credits
-    every arm by how much it *would have* gained if its top-scoring
-    candidate had been the one evaluated.
+    sample one arm probabilistically; per-iteration credit is then
+    dispatched via ``update_all`` — every arm receives a counterfactual
+    reward equal to the surrogate's posterior mean at the candidate
+    that arm would have picked (the canonical GP-Hedge update), plus a
+    bonus to the actually-picked arm when an observed loss improvement
+    confirmed its pick in the real world.
 
     Why we keep all four arms always active
     --------------------------------------
@@ -14359,11 +14361,21 @@ class _GpHedgePortfolio:
     pay off in transient regimes the main arm can't see — UCB rescues
     runs that get stuck in a single basin, Thompson-lite probes the
     posterior randomness for unmapped niches, PI takes the quick win
-    when the surrogate is locally exploitable.  The Hedge update
-    means the portfolio NEVER fully retires an arm (``softmax`` floors
-    each weight at ``exp(η·(min_R - max_R))`` which stays positive),
-    so a previously-dominated acquisition recovers if the surrogate
-    landscape shifts under it.
+    when the surrogate is locally exploitable.  Three knobs keep the
+    portfolio from collapsing to a single arm:
+
+      * ``decay`` exponentially fades cumulative reward each iteration
+        (half-life ≈ 23 iters at 0.97), so a regime shift actually
+        moves the weights rather than being drowned by stale credit.
+      * ``eps`` mixes the softmax with a uniform floor — every arm is
+        guaranteed at least ``eps / K`` sampling probability so none
+        can starve permanently.
+      * ``eta`` controls the softmax sharpness; tuned for the
+        centered counterfactual reward scale (≈ O(σ_μ across arms)).
+
+    Together these reproduce Hoffman et al.'s claim that the portfolio
+    never fully retires an arm while still letting the long-run leader
+    accumulate the lion's share of pulls.
 
     Arms
     ----
@@ -14375,8 +14387,11 @@ class _GpHedgePortfolio:
 
     ARMS = ('logei', 'ucb', 'logpi', 'ts')
 
-    def __init__(self, eta: float = 1.0):
+    def __init__(self, eta: float = 0.5, decay: float = 0.97,
+                 eps: float = 0.1):
         self.eta = float(eta)
+        self.decay = float(np.clip(decay, 0.5, 1.0))
+        self.eps = float(np.clip(eps, 0.0, 1.0))
         n = len(self.ARMS)
         self.rewards = np.zeros(n, dtype=np.float64)
         # Per-arm pull count (for diagnostics; never gates selection).
@@ -14388,13 +14403,22 @@ class _GpHedgePortfolio:
         self.iter = 0
 
     def weights(self):
-        """Softmax over current cumulative rewards (η-tempered)."""
+        """Softmax over current cumulative rewards, mixed with a uniform
+        floor.  The floor guarantees a minimum sampling rate of
+        ``eps / K`` per arm — even a long-dominated arm can't be
+        permanently starved out of the rotation.
+        """
         r = self.rewards - np.max(self.rewards)
         w = np.exp(self.eta * r)
         s = float(w.sum())
+        n = len(w)
         if not np.isfinite(s) or s <= 0:
-            return np.full_like(w, 1.0 / len(w))
-        return w / s
+            w_soft = np.full_like(w, 1.0 / n)
+        else:
+            w_soft = w / s
+        # Epsilon-greedy mixing: at most (1-eps) goes to the softmax,
+        # at least eps is split uniformly across all arms.
+        return (1.0 - self.eps) * w_soft + self.eps / n
 
     def choose(self, rng=None):
         """Sample an arm index and remember the choice."""
@@ -14409,18 +14433,59 @@ class _GpHedgePortfolio:
         return idx, self.ARMS[idx]
 
     def update(self, reward: float):
-        """Credit the most-recently-chosen arm with an observed reward.
+        """Single-arm credit (legacy fallback path).
 
-        The reward should be on the same units we want to maximise
-        (we use the per-iteration log-improvement; see
-        ``BayesianCGPOptimizer.record_iteration_outcome``).  We
-        clip to avoid runaway weights from a single jackpot.
+        Used when ``update_all`` can't be called (e.g. early iterations
+        before the GP is fitted, or if the candidate scoring raised an
+        exception).  Decays the cumulative rewards first so a
+        single-arm reward doesn't dwarf the centered counterfactual
+        updates accumulated alongside it.
         """
         if self.last_arm is None:
             return
         r = float(np.nan_to_num(reward, nan=0.0, posinf=10.0, neginf=-10.0))
         r = float(np.clip(r, -5.0, 5.0))
+        self.rewards *= self.decay
         self.rewards[self.last_arm] += r
+        self.last_arm = None
+
+    def update_all(self, arm_rewards, bonus: float = 0.0):
+        """Counterfactual credit to every arm (canonical GP-Hedge).
+
+        ``arm_rewards`` is one value per arm in the order of ``ARMS``,
+        typically the surrogate posterior mean ``mu`` at each arm's
+        top-scoring candidate this iteration.  We center the per-iter
+        reward across arms so the cumulative bookkeeper tracks
+        *relative* arm performance — the absolute scale of ``mu`` can
+        drift as the surrogate refits, but the within-iteration
+        differences across arms reflect their actual disagreement
+        about where the next-best point is.
+
+        ``bonus`` (optional) is a real-world signal layered on top of
+        the actually-picked arm's counterfactual baseline: when an
+        evaluation produced an observed loss improvement, the arm
+        whose pick led to it deserves more credit than the surrogate
+        alone can attribute.  Falls back to a small penalty when the
+        iteration produced no improvement, so arms with consistent
+        no-op picks slowly lose share.
+        """
+        if self.last_arm is None:
+            return
+        rs = np.asarray(arm_rewards, dtype=np.float64).ravel()
+        if rs.size != len(self.ARMS):
+            return
+        rs = np.nan_to_num(rs, nan=0.0, posinf=10.0, neginf=-10.0)
+        # Center across arms so absolute mu drift cancels out — only
+        # within-iteration differences carry into the cumulative
+        # reward.
+        rs = rs - float(np.mean(rs))
+        rs = np.clip(rs, -5.0, 5.0)
+        if bonus != 0.0:
+            b = float(np.nan_to_num(bonus, nan=0.0,
+                                    posinf=5.0, neginf=-5.0))
+            rs[self.last_arm] += float(np.clip(b, -5.0, 5.0))
+        self.rewards *= self.decay
+        self.rewards += rs
         self.last_arm = None
 
     def ucb_beta(self):
@@ -14975,16 +15040,26 @@ class BayesianCGPOptimizer:
 
         # ── Acquisition portfolio (GP-Hedge) ───────────────────────────
         # Maintains LogEI / UCB / LogPI / Thompson-lite and adapts
-        # their sampling weights to which arm is producing the most
-        # iteration-over-iteration improvement on THIS output's
-        # surrogate.  See ``_GpHedgePortfolio`` for the algorithm.
-        self._portfolio = _GpHedgePortfolio(eta=1.0)
+        # their sampling weights to which arm is picking the highest-μ
+        # candidates on THIS output's surrogate.  Defaults pair a
+        # moderate ``eta`` with reward decay and a uniform-mix floor
+        # so a transient lead can't lock the softmax onto one arm
+        # forever.  See ``_GpHedgePortfolio`` for the algorithm.
+        self._portfolio = _GpHedgePortfolio(eta=0.5, decay=0.97, eps=0.1)
         # ``_last_arm_name`` is the string label of the arm picked on
         # the most recent ``score_candidates`` call.  We use it to
         # decide UCB's effective β in the call (after ``choose()``
         # bumped the iteration counter) and to credit the right arm
         # when ``record_iteration_outcome`` arrives later.
         self._last_arm_name = None
+        # ``_arm_counterfactual_rewards`` holds the surrogate's
+        # posterior mean (μ) at each arm's top-scoring candidate from
+        # the most recent ``score_candidates`` call, in ARMS order.
+        # ``record_iteration_outcome`` dispatches these as
+        # counterfactual credit to ``_GpHedgePortfolio.update_all`` —
+        # every arm gets a per-iter signal so the softmax can't
+        # collapse onto whichever arm happened to be sampled first.
+        self._arm_counterfactual_rewards = None
         # ``_best_y_at_iter_start`` is the buffer's max transformed
         # fitness recorded when ``score_candidates`` was called for
         # this iteration.  ``record_iteration_outcome`` then uses it
@@ -15342,6 +15417,7 @@ class BayesianCGPOptimizer:
         if not candidate_trees:
             self._last_candidate_vecs = None
             self._last_arm_name = None
+            self._arm_counterfactual_rewards = None
             return np.array([], dtype=np.float64)
         if not self.gp_fitted or len(self.X_observed) < 10:
             # Random fallback when the surrogate isn't ready.  We
@@ -15354,6 +15430,7 @@ class BayesianCGPOptimizer:
             except Exception:
                 self._last_candidate_vecs = None
             self._last_arm_name = None
+            self._arm_counterfactual_rewards = None
             return np.random.rand(len(candidate_trees))
 
         vecs = np.asarray([self._encode(t) for t in candidate_trees],
@@ -15363,6 +15440,7 @@ class BayesianCGPOptimizer:
             mu, sigma = self.gp.predict(vecs, return_std=True)
         except Exception:
             self._last_arm_name = None
+            self._arm_counterfactual_rewards = None
             return np.random.rand(len(candidate_trees))
 
         best_f = getattr(self, 'current_best_f', 0.0)
@@ -15373,10 +15451,45 @@ class BayesianCGPOptimizer:
         # arriving.
         effective_xi = float(self.xi) * float(self.xi_scale)
 
+        # Compute scores for ALL arms so we can attribute counterfactual
+        # credit to each (canonical GP-Hedge: every arm is evaluated
+        # every iteration even though only one is sampled for the
+        # actual buffer write).  Without this every-arm scoring the
+        # update degenerates to "winner takes all" — the picked arm
+        # accumulates positive credit while the unpicked arms stay at
+        # zero, locking the softmax onto whichever arm happened to
+        # find improvement first.
+        beta = self._portfolio.ucb_beta() * max(0.25, float(self.xi_scale))
+        all_scores = {
+            'logei': _log_expected_improvement(mu, sigma, best_f,
+                                                effective_xi),
+            'ucb':   _upper_confidence_bound(mu, sigma, beta=beta),
+            'logpi': _log_probability_of_improvement(mu, sigma, best_f,
+                                                     effective_xi),
+            'ts':    _thompson_lite(mu, sigma),
+        }
+
+        # Counterfactual reward for each arm: the surrogate's predicted
+        # posterior mean at the candidate THAT ARM would have picked.
+        # All arms are scored on the same mu/sigma surface, so their
+        # picks are directly comparable — within an iteration the arm
+        # whose pick has the highest predicted mu gets the most credit,
+        # independent of which one was actually sampled for evaluation.
+        counterfactual = np.empty(len(self._portfolio.ARMS),
+                                  dtype=np.float64)
+        for i, name in enumerate(self._portfolio.ARMS):
+            s = all_scores[name]
+            if s.size == 0:
+                counterfactual[i] = 0.0
+                continue
+            top_idx = int(np.argmax(s))
+            counterfactual[i] = float(mu[top_idx])
+        self._arm_counterfactual_rewards = counterfactual
+
         # Pick an arm from the portfolio (samples proportional to
         # recent reward — initially uniform, then increasingly
-        # biased toward whichever arm is producing observed
-        # iteration-over-iteration improvement).
+        # biased toward whichever arm has been picking higher-μ
+        # candidates that produce observed improvement).
         _arm_idx, arm_name = self._portfolio.choose()
         self._last_arm_name = arm_name
         # Snapshot the buffer best so ``record_iteration_outcome``
@@ -15387,22 +15500,7 @@ class BayesianCGPOptimizer:
         else:
             self._best_y_at_iter_start = None
 
-        if arm_name == 'ucb':
-            # UCB β decays automatically with iteration count inside
-            # the portfolio (GP-UCB schedule).  We also widen β when
-            # the local xi_scale > 1 (failure streak) and tighten
-            # when xi_scale < 1, mirroring the LogEI xi behaviour
-            # so all arms feel the same exploration push.
-            beta = self._portfolio.ucb_beta() * max(0.25, float(self.xi_scale))
-            scores = _upper_confidence_bound(mu, sigma, beta=beta)
-        elif arm_name == 'logpi':
-            scores = _log_probability_of_improvement(mu, sigma, best_f,
-                                                     effective_xi)
-        elif arm_name == 'ts':
-            scores = _thompson_lite(mu, sigma)
-        else:  # 'logei' (default arm)
-            scores = _log_expected_improvement(mu, sigma, best_f, effective_xi)
-
+        scores = all_scores[arm_name]
         return np.nan_to_num(scores, nan=-1e12, posinf=1e12, neginf=-1e12)
 
     def select_diverse_batch(self, scores, k, candidate_vecs=None):
@@ -15518,19 +15616,46 @@ class BayesianCGPOptimizer:
                     gap = cur_best_y - start_best_y
                     if gap > 0:
                         inferred_amount = float(gap)
+
+            # Real-world bonus to layer on top of the counterfactual
+            # baseline: when the picked arm's evaluation actually
+            # delivered an improvement we credit it more than the
+            # surrogate alone can attribute.  ``log1p`` keeps the
+            # mapping monotone but compresses jackpot improvements so
+            # one lucky iteration can't dominate the cumulative
+            # bookkeeper.  Small magnitude (≤ ~1 in practice) keeps
+            # the bonus comparable to the per-iter centered
+            # counterfactual rewards (which are also O(1)).
             if improved or inferred_amount > 0:
-                # log1p so a 10× and 100× improvement get similar — but
-                # still distinguishable — credit.
-                reward = float(np.log1p(max(inferred_amount, 0.0)))
-                if reward <= 0:
-                    reward = 1.0   # binary fallback when the buffer
-                                   # transform compressed the gap to 0
+                bonus = float(np.log1p(max(inferred_amount, 0.0)))
+                if bonus <= 0:
+                    bonus = 0.25  # buffer transform compressed the
+                                  # gap — small positive nudge so the
+                                  # arm isn't penalised for an
+                                  # improvement that genuinely
+                                  # happened.
             else:
-                reward = -0.1   # small penalty so unsuccessful arms decay
-            self._portfolio.update(reward)
-            # Clear the iteration-start snapshot so a second update
+                bonus = -0.05  # mild penalty so an arm that keeps
+                               # nominating no-op picks slowly loses
+                               # share.
+
+            cf = getattr(self, '_arm_counterfactual_rewards', None)
+            if cf is not None and len(cf) == len(self._portfolio.ARMS):
+                # Canonical GP-Hedge: every arm gets a counterfactual
+                # reward (μ at its top pick) plus the picked arm gets
+                # the observed bonus.  Centering inside ``update_all``
+                # eliminates absolute μ-scale drift so cumulative
+                # rewards only track relative arm performance.
+                self._portfolio.update_all(cf, bonus=bonus)
+            else:
+                # Legacy single-arm fallback (e.g. GP not yet fitted,
+                # or score_candidates raised before stashing cf).
+                self._portfolio.update(bonus)
+
+            # Clear the iteration-state snapshots so a second update
             # without an intervening ``score_candidates`` call won't
-            # award the arm twice for the same gap.
+            # award credit twice for the same gap.
+            self._arm_counterfactual_rewards = None
             self._best_y_at_iter_start = None
         except Exception:
             pass
