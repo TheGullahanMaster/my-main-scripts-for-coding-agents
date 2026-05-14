@@ -14252,6 +14252,357 @@ def _log_expected_improvement(mu, sigma, best_f, xi=0.01):
     return np.nan_to_num(log_ei, nan=-1e12, posinf=1e12, neginf=-1e12)
 
 
+# ── Additional acquisition functions ─────────────────────────────────────
+# LogEI is the workhorse, but it has known failure modes:
+#   * After the surrogate plateaus near the truth it becomes
+#     near-deterministic and underexplores promising tail regions.
+#   * On heavy-tailed loss landscapes (one shape with brilliant fitness,
+#     another with mediocre-but-stable fitness) it concentrates on the
+#     already-discovered basin and ignores the alternative.
+# A portfolio of acquisitions (GP-Hedge, Hoffman et al. 2011) sidesteps
+# these by maintaining LogEI alongside UCB (exploration-heavy), PI
+# (exploitation-heavy), and a Thompson-style randomised score (covers
+# arbitrary multi-modal posteriors).  The portfolio learns which
+# acquisition is paying off on THIS surrogate over the current
+# iterations and biases sampling toward it without ever fully retiring
+# the others.
+
+def _upper_confidence_bound(mu, sigma, beta=2.0):
+    """Upper Confidence Bound: μ + β·σ.
+
+    With β ~ 2 this is the canonical GP-UCB acquisition.  Higher β
+    drives more exploration; lower β tightens exploitation.  Returns
+    raw acquisition values (higher = more promising).  Sigma is
+    clipped to a small floor so candidates with collapsed uncertainty
+    still get a finite UCB.
+    """
+    mu = np.asarray(mu, dtype=np.float64)
+    sigma = np.asarray(sigma, dtype=np.float64)
+    sigma = np.maximum(np.nan_to_num(sigma, nan=0.0, posinf=1e6, neginf=0.0),
+                       1e-12)
+    mu = np.nan_to_num(mu, nan=-1e12, posinf=1e12, neginf=-1e12)
+    return mu + float(beta) * sigma
+
+
+def _log_probability_of_improvement(mu, sigma, best_f, xi=0.01):
+    """Numerically stable Log Probability of Improvement.
+
+    PI = Φ(z),  z = (μ − best_f − xi) / σ.  Standard PI heavily favours
+    exploitation (does not weight by improvement *magnitude*), which
+    is a useful counterweight to UCB inside a portfolio.  Returns
+    log-PI so the value range matches LogEI for portfolio reward
+    bookkeeping.
+
+    For z ≥ -5 we use ``log(Φ(z))`` directly (well-behaved).
+    For z < -5 we use the Mill's-ratio asymptotic
+        log Φ(z) ≈ -z²/2 − log(-z) − ½·log(2π),
+    finite all the way down so argsort stays meaningful.
+    """
+    mu = np.asarray(mu, dtype=np.float64)
+    sigma = np.asarray(sigma, dtype=np.float64)
+    best_f = float(np.nan_to_num(best_f, nan=-1e12, posinf=1e12, neginf=-1e12))
+    sigma = np.maximum(np.nan_to_num(sigma, nan=0.0, posinf=1e6, neginf=0.0),
+                       1e-12)
+    diff = np.nan_to_num(mu - best_f - xi, nan=-1e12, posinf=1e12, neginf=-1e12)
+    z = diff / sigma
+
+    z_dir = np.clip(z, -5.0, 50.0)
+    log_pi_dir = np.log(np.maximum(_SCIPY_NORM.cdf(z_dir), 1e-300))
+
+    z_asy = np.minimum(z, -5.0)
+    log_pi_asy = (-0.5 * z_asy * z_asy
+                  - np.log(-z_asy)
+                  - 0.5 * np.log(2.0 * np.pi))
+
+    log_pi = np.where(z >= -5.0, log_pi_dir, log_pi_asy)
+    return np.nan_to_num(log_pi, nan=-1e12, posinf=1e12, neginf=-1e12)
+
+
+def _thompson_lite(mu, sigma, rng=None):
+    """Randomised Thompson-style acquisition.
+
+    A full Thompson sample requires a joint posterior draw which is
+    O((N+M)^3) in M (candidate count) — far too expensive at our
+    M=200 candidates per iteration.  This *independent* randomisation
+    is a coarse-grained approximation: each candidate's score is a
+    draw from its own marginal posterior, ignoring cross-candidate
+    correlation.  Empirically this gives the exploration benefit
+    of Thompson sampling without the cubic cost; the GP-Hedge
+    portfolio quickly down-weights it when correlations matter
+    enough that the lite version misranks the top picks.
+    """
+    mu = np.asarray(mu, dtype=np.float64)
+    sigma = np.asarray(sigma, dtype=np.float64)
+    mu = np.nan_to_num(mu, nan=-1e12, posinf=1e12, neginf=-1e12)
+    sigma = np.maximum(np.nan_to_num(sigma, nan=0.0, posinf=1e6, neginf=0.0),
+                       1e-12)
+    if rng is None:
+        z = np.random.standard_normal(mu.shape)
+    else:
+        z = rng.standard_normal(mu.shape)
+    return mu + sigma * z
+
+
+class _GpHedgePortfolio:
+    """GP-Hedge multi-acquisition portfolio (Hoffman, Brochu, de Freitas 2011).
+
+    Maintains a list of acquisition functions and an exponential-weight
+    bookkeeper of recent rewards.  On each call to ``choose()`` we
+    sample one arm probabilistically and remember the choice; once the
+    iteration produces an observed reward, ``update(reward)`` credits
+    every arm by how much it *would have* gained if its top-scoring
+    candidate had been the one evaluated.
+
+    Why we keep all four arms always active
+    --------------------------------------
+    Even when LogEI dominates the long-run reward, the alternatives
+    pay off in transient regimes the main arm can't see — UCB rescues
+    runs that get stuck in a single basin, Thompson-lite probes the
+    posterior randomness for unmapped niches, PI takes the quick win
+    when the surrogate is locally exploitable.  The Hedge update
+    means the portfolio NEVER fully retires an arm (``softmax`` floors
+    each weight at ``exp(η·(min_R - max_R))`` which stays positive),
+    so a previously-dominated acquisition recovers if the surrogate
+    landscape shifts under it.
+
+    Arms
+    ----
+    LogEI (`logei`)             - balanced, default workhorse
+    UCB (`ucb`, beta schedule)  - exploration-heavy with decaying β
+    LogPI (`logpi`)             - exploitation-heavy, exact-improve focus
+    Thompson-lite (`ts`)        - randomised, breaks symmetry
+    """
+
+    ARMS = ('logei', 'ucb', 'logpi', 'ts')
+
+    def __init__(self, eta: float = 1.0):
+        self.eta = float(eta)
+        n = len(self.ARMS)
+        self.rewards = np.zeros(n, dtype=np.float64)
+        # Per-arm pull count (for diagnostics; never gates selection).
+        self.pulls   = np.zeros(n, dtype=np.int64)
+        self.last_arm: int | None = None
+        # Iteration counter drives UCB's beta decay (more exploration
+        # early, more exploitation late) independent of which arm was
+        # actually picked last iteration.
+        self.iter = 0
+
+    def weights(self):
+        """Softmax over current cumulative rewards (η-tempered)."""
+        r = self.rewards - np.max(self.rewards)
+        w = np.exp(self.eta * r)
+        s = float(w.sum())
+        if not np.isfinite(s) or s <= 0:
+            return np.full_like(w, 1.0 / len(w))
+        return w / s
+
+    def choose(self, rng=None):
+        """Sample an arm index and remember the choice."""
+        w = self.weights()
+        if rng is None:
+            idx = int(np.random.choice(len(self.ARMS), p=w))
+        else:
+            idx = int(rng.choice(len(self.ARMS), p=w))
+        self.last_arm = idx
+        self.pulls[idx] += 1
+        self.iter += 1
+        return idx, self.ARMS[idx]
+
+    def update(self, reward: float):
+        """Credit the most-recently-chosen arm with an observed reward.
+
+        The reward should be on the same units we want to maximise
+        (we use the per-iteration log-improvement; see
+        ``BayesianCGPOptimizer.record_iteration_outcome``).  We
+        clip to avoid runaway weights from a single jackpot.
+        """
+        if self.last_arm is None:
+            return
+        r = float(np.nan_to_num(reward, nan=0.0, posinf=10.0, neginf=-10.0))
+        r = float(np.clip(r, -5.0, 5.0))
+        self.rewards[self.last_arm] += r
+        self.last_arm = None
+
+    def ucb_beta(self):
+        """Iteration-aware β for the UCB arm.
+
+        We use the standard GP-UCB schedule β = 2·log(t²·π²/6·δ⁻¹)
+        with δ=0.1, capped so the value stays in a tractable range
+        even when the BO runs for hundreds of iterations.
+        """
+        t = max(1, int(self.iter))
+        beta_sq = 2.0 * np.log(t * t * np.pi * np.pi / (6.0 * 0.1))
+        beta = float(np.sqrt(max(beta_sq, 0.25)))
+        return float(np.clip(beta, 0.5, 6.0))
+
+    def status_str(self):
+        w = self.weights()
+        return ' | '.join(
+            f"{name}:{w[i]:.2f}({int(self.pulls[i])})"
+            for i, name in enumerate(self.ARMS))
+
+
+def _dpp_greedy_batch(scores, vectors, k, length_scale=None,
+                       quality_temperature=1.0):
+    """Greedy log-determinant batch selection (k-DPP MAP).
+
+    A determinantal point process over the candidate set with kernel
+        L_{ij} = q_i · q_j · k(v_i, v_j),   q_i = exp(score_i / T)
+    encodes both quality (through ``q_i``) and diversity (through the
+    similarity kernel).  Selecting the size-k subset that maximises
+    ``log det L_{S,S}`` is NP-hard, but the standard greedy
+    approximation gives a (1 − 1/e)-optimal solution in O(k·N·d).
+
+    Compared to ``_greedy_diverse_batch`` (which uses additive local
+    penalisation), DPP-MAP scales naturally with batch size and is
+    less sensitive to ``length_scale`` mis-calibration: a too-large
+    length scale collapses the local-penalisation kernel to ~1
+    everywhere, but the log-det formulation always *requires*
+    near-orthogonal columns to admit a new pick, so it stays
+    diverse even when the bandwidth is wrong by a factor of 5–10×.
+
+    Parameters
+    ----------
+    scores : (N,) acquisition values (e.g. LogEI, UCB).
+    vectors : (N, D) candidate encodings.
+    k : desired batch size.
+    length_scale : kernel bandwidth; falls back to median pairwise
+        distance among a sub-sample when None.
+    quality_temperature : softmax temperature applied to ``scores``
+        when building the quality term q_i.  Larger T means lower
+        weight on score and more emphasis on diversity.
+
+    Returns
+    -------
+    np.ndarray of selected candidate indices (length min(k, N)).
+    """
+    n = int(len(scores))
+    k = max(0, min(int(k), n))
+    if k <= 0:
+        return np.array([], dtype=np.int64)
+    if k == 1 or vectors is None or len(vectors) != n:
+        return np.argsort(scores)[-k:][::-1].astype(np.int64)
+
+    V = np.asarray(vectors, dtype=np.float64)
+    S = np.asarray(scores, dtype=np.float64)
+    S = np.nan_to_num(S, nan=-1e12, posinf=1e12, neginf=-1e12)
+
+    # Auto length-scale: median pairwise distance among a sub-sample.
+    if length_scale is None:
+        m = min(n, 64)
+        if m >= 4:
+            sub = V[np.random.choice(n, m, replace=False)]
+            diffs = sub[:, None, :] - sub[None, :, :]
+            d = np.sqrt(np.sum(diffs * diffs, axis=-1))
+            iu = np.triu_indices(m, k=1)
+            if iu[0].size > 0:
+                length_scale = float(np.median(d[iu]))
+            else:
+                length_scale = 1.0
+        else:
+            length_scale = 1.0
+    length_scale = max(float(length_scale), 1e-6)
+    inv_2ls2 = 1.0 / (2.0 * length_scale * length_scale)
+
+    # Quality term q_i (in log-space to avoid overflow on extreme scores):
+    # log q_i = (score_i - score_max) / T  ≤ 0  for all i.
+    T = max(float(quality_temperature), 1e-6)
+    s_max = float(np.max(S))
+    log_q = (S - s_max) / T
+    # Avoid pathological −∞ in log_q which would zero out the column;
+    # clip at −30 ≈ exp(−30) ~ 1e-13 below the best (effectively excluded
+    # but still admits being broken-tied if everything else is also bad).
+    log_q = np.maximum(log_q, -30.0)
+
+    # Incremental greedy log-det maximisation (Chen et al. 2018).
+    # Track the Schur-complement diagonal ``c_i`` of the conditional
+    # covariance: starts at L_{ii} = exp(2·log_q_i)·k(v_i,v_i)
+    # = exp(2·log_q_i)·1 = exp(2·log_q_i) for the unit-variance RBF.
+    # After picking j, c_i ← c_i − (L_{ij} − c_i_proj)² / c_j_proj.
+
+    # Initial diagonal: 2*log_q_i (in log-space) because k(v_i, v_i)=1.
+    log_c = 2.0 * log_q
+    selected = np.empty(k, dtype=np.int64)
+    chosen_mask = np.zeros(n, dtype=bool)
+    # ``ci_history`` stores, for each picked j, the projection-corrected
+    # similarity column L̃_{·, j} / sqrt(c_j) so we can update other
+    # rows incrementally without re-decomposing.
+    ci_history = []
+
+    # Numerical guardrail: with unit-variance RBF and log_q ≤ 0 the
+    # marginal variances ``c_i`` are mathematically in [0, 1].  Numerical
+    # error in the rank-1 updates can drive them slightly outside this
+    # range, so we cap everywhere to keep ``exp(log_c)`` finite and
+    # never let the b-vectors blow up.  Saturation at ``c_min`` is a
+    # sufficient stopping condition: once a column has effectively
+    # been spanned by the already-picked vectors there is no marginal
+    # information left for it to contribute and the DPP greedy step
+    # would otherwise just oscillate between equally-degenerate picks.
+    c_min = 1e-20
+
+    for slot in range(k):
+        # Pick the candidate with the largest current log-c (the
+        # conditional log-variance, which is exactly the marginal
+        # gain in log det once we factor in the chosen anchors).
+        local_log_c = log_c.copy()
+        local_log_c[chosen_mask] = -np.inf
+        if not np.any(np.isfinite(local_log_c)):
+            # Everything was masked or numerically degenerate; fall back
+            # to top score from remaining.
+            remaining = np.where(~chosen_mask)[0]
+            if len(remaining) == 0:
+                return selected[:slot]
+            j = int(remaining[np.argmax(S[remaining])])
+        else:
+            j = int(np.argmax(local_log_c))
+        selected[slot] = j
+        chosen_mask[j] = True
+        if slot == k - 1:
+            break
+
+        # Compute similarity column k(v_j, v_*) and the conditional
+        # update vector b_* = (L_{*j} − Σ_p b_*^{(p)}·b_j^{(p)}) / sqrt(c_j).
+        diff = V - V[j:j + 1]
+        dist_sq = np.einsum('ij,ij->i', diff, diff)
+        # similarity = exp(-d²/2ℓ²) but in log space: log_sim
+        log_sim_col = -dist_sq * inv_2ls2  # shape (n,)
+        # L_{*j} = q_* · q_j · sim_*j → in log space, then back to
+        # linear space with the log_q ≤ 0 invariant ensuring L_{*,*} ≤ 1.
+        log_L_col = log_q + log_q[j] + log_sim_col   # (n,)
+        L_col = np.exp(np.clip(log_L_col, -700.0, 0.0))
+        # Conditional Schur complement of L_{j,j} after previous picks:
+        # c_j = L_{jj} − sum over previous picks of b_j^{(p)}².
+        c_j = float(np.exp(np.clip(log_c[j], -700.0, 0.0)))
+        for prev_col in ci_history:
+            c_j -= float(prev_col[j]) * float(prev_col[j])
+        if c_j <= c_min:
+            # Column j is already in the span of previously picked
+            # vectors; stop early — every remaining candidate would
+            # similarly produce numerical noise.
+            return selected[:slot + 1]
+        sqrt_c_j = np.sqrt(c_j)
+        # b_* = (L_{*j} − Σ_p b_*^{(p)}·b_j^{(p)}) / sqrt(c_j)
+        b_col = L_col.copy()
+        for prev_col in ci_history:
+            b_col = b_col - prev_col * prev_col[j]
+        b_col = b_col / sqrt_c_j
+        # Numerical sanity: clip absurdly large b values that can
+        # appear when sqrt_c_j is at the noise floor.  Mathematically
+        # b_* ∈ [0, sqrt(L_{ii})] ≤ 1 for our kernel, so a cap at 2
+        # is generously above the legal range.
+        b_col = np.clip(b_col, -2.0, 2.0)
+        # Update remaining log_c values: c_i ← c_i − b_i²
+        c_lin = np.exp(np.clip(log_c, -700.0, 0.0))
+        c_lin = c_lin - b_col * b_col
+        c_lin = np.clip(c_lin, c_min, 1.0)
+        log_c = np.log(c_lin)
+        # Mark picked entry as exhausted.
+        log_c[j] = -np.inf
+        ci_history.append(b_col)
+
+    return selected
+
+
 def _greedy_diverse_batch(scores, vectors, k, length_scale=None,
                           penalty_weight=2.0):
     """Greedy batch selection with local penalisation.
@@ -14605,12 +14956,46 @@ class BayesianCGPOptimizer:
             probe_size=int(probe_size),
             has_y_probe=(y_probe is not None),
             has_mc_context=self.has_mc_context)
+        # n_restarts_optimizer=3: the marginal-likelihood surface for the
+        # section-grouped Matérn is multimodal in low-data regimes (the
+        # initial buffer of ~100 points often admits two competing minima
+        # — short structural length scale + long phenotype length scale,
+        # or vice versa).  A single restart locks into whichever local
+        # optimum L-BFGS-B happened to find from the default initial
+        # guess; bumping to 3 restarts trades ~3× the fit time (still
+        # <1s at the 250-point fit cap) for a much smaller chance of
+        # converging on a degenerate fit that smears all sections at
+        # the same length scale.
         self.gp = GaussianProcessRegressor(
             kernel=kernel, alpha=1e-6, normalize_y=True,
-            n_restarts_optimizer=1)
+            n_restarts_optimizer=3)
         self.gp_fitted = False
         self._gp_length_scale = None  # cached after fit_surrogate; used as
                                        # length scale for diverse selection
+
+        # ── Acquisition portfolio (GP-Hedge) ───────────────────────────
+        # Maintains LogEI / UCB / LogPI / Thompson-lite and adapts
+        # their sampling weights to which arm is producing the most
+        # iteration-over-iteration improvement on THIS output's
+        # surrogate.  See ``_GpHedgePortfolio`` for the algorithm.
+        self._portfolio = _GpHedgePortfolio(eta=1.0)
+        # ``_last_arm_name`` is the string label of the arm picked on
+        # the most recent ``score_candidates`` call.  We use it to
+        # decide UCB's effective β in the call (after ``choose()``
+        # bumped the iteration counter) and to credit the right arm
+        # when ``record_iteration_outcome`` arrives later.
+        self._last_arm_name = None
+        # ``_best_y_at_iter_start`` is the buffer's max transformed
+        # fitness recorded when ``score_candidates`` was called for
+        # this iteration.  ``record_iteration_outcome`` then uses it
+        # to compute the per-iteration improvement gap as a portfolio
+        # reward signal — bracketing the credit to changes that
+        # actually happened in this BO iteration rather than the
+        # cumulative buffer history.  ``None`` means "no acquisition
+        # call has happened yet", which suppresses portfolio credit
+        # on the first ``record_iteration_outcome`` after a fresh
+        # optimiser (e.g. before Phase 2 starts).
+        self._best_y_at_iter_start = None
 
     def _transform_fitness(self, loss):
         """Transform loss to a GP-friendly target.
@@ -14872,10 +15257,25 @@ class BayesianCGPOptimizer:
             X = X[keep]
             y_finite = y_finite[keep]
 
+        # Winsorize before the copula transform: the bottom 1 % of
+        # transformed fitness values usually correspond to catastrophic
+        # losses (NaN clamps, blow-ups) that, while finite, can still
+        # drag the lowest few rank positions outward enough to shift
+        # the median rank.  Clipping at the 1st / 99th percentiles
+        # of the raw values stabilises the rank assignment without
+        # losing the broader trend.  This is a no-op on small buffers
+        # (n < 50) where the percentile clipping would collapse onto
+        # actual data points.
+        n = len(y_finite)
+        if n >= 50:
+            lo = float(np.quantile(y_finite, 0.01))
+            hi = float(np.quantile(y_finite, 0.99))
+            if hi > lo:
+                y_finite = np.clip(y_finite, lo, hi)
+
         # Gaussian Copula transformation (rank-based)
         # Maps the targets to standard normal quantiles to avoid extreme outliers
         # (like when loss nears 0 and log(loss) explodes) that collapse the GP length-scale.
-        n = len(y_finite)
         ranks = rankdata(y_finite, method='average')
         uniform_y = (ranks - 0.5) / n
         gaussian_y = _SCIPY_NORM.ppf(uniform_y)
@@ -14905,29 +15305,43 @@ class BayesianCGPOptimizer:
             self.gp_fitted = False
 
     def score_candidates(self, candidate_trees):
-        """Score candidate trees with Log Expected Improvement.
+        """Score candidate trees with a GP-Hedge portfolio of acquisitions.
 
-        Returns LogEI values (higher = more promising; can be negative).
-        The encoded vectors are stashed on ``self._last_candidate_vecs``
-        so ``select_diverse_batch`` can do local-penalised selection
-        without re-paying the (cached but still non-trivial) encode cost.
+        Returns acquisition values (higher = more promising; can be
+        negative).  The encoded vectors are stashed on
+        ``self._last_candidate_vecs`` so ``select_diverse_batch`` can
+        do diversity-aware selection without re-paying the (cached
+        but still non-trivial) encode cost.
 
-        LogEI vs EI
-        -----------
-        Standard EI underflows to identically zero for the bulk of
-        candidates after a few BO iterations (the GP is well-fit and
-        most random mutations score multiple sigmas below ``best_f``).
-        ``argsort`` on that zero plateau is effectively random, so
-        ~80% of the screen budget was being spent on candidates with
-        no detectable advantage over each other.  LogEI uses the
-        Mill's-ratio asymptotic for very negative z so the *ordering*
-        among low-EI candidates is preserved — the surrogate's
-        information about which "barely-improving" candidate is least
-        bad survives all the way down to ``z = -50`` without
-        underflow.
+        Acquisition portfolio
+        ---------------------
+        On every call we sample one of {LogEI, UCB, LogPI, Thompson-lite}
+        proportionally to its recent reward (see ``_GpHedgePortfolio``)
+        and score the candidates with that single acquisition.  This
+        is preferable to ranking by a *weighted sum* of acquisitions
+        because:
+          * Each acquisition has a different value scale; a fixed
+            weighting would silently anoint whichever one has the
+            largest magnitude.
+          * GP-Hedge's reward bookkeeping needs the iteration's pick
+            to be attributable to a single arm.
+          * The argsort over a single acquisition is exact; over a
+            sum it's an approximation.
+
+        After each iteration ``record_iteration_outcome`` credits the
+        chosen arm with the observed log-improvement, so the next
+        ``score_candidates`` call samples toward whichever acquisition
+        has been most productive on this output's surrogate.
+
+        LogEI fallback path
+        -------------------
+        If the GP isn't fitted yet (early Phase-1) we return random
+        scores — the BO loop is still random-sampling in that phase
+        and won't actually rank-select against this signal.
         """
         if not candidate_trees:
             self._last_candidate_vecs = None
+            self._last_arm_name = None
             return np.array([], dtype=np.float64)
         if not self.gp_fitted or len(self.X_observed) < 10:
             # Random fallback when the surrogate isn't ready.  We
@@ -14939,6 +15353,7 @@ class BayesianCGPOptimizer:
                 self._last_candidate_vecs = vecs
             except Exception:
                 self._last_candidate_vecs = None
+            self._last_arm_name = None
             return np.random.rand(len(candidate_trees))
 
         vecs = np.asarray([self._encode(t) for t in candidate_trees],
@@ -14947,38 +15362,106 @@ class BayesianCGPOptimizer:
         try:
             mu, sigma = self.gp.predict(vecs, return_std=True)
         except Exception:
+            self._last_arm_name = None
             return np.random.rand(len(candidate_trees))
 
         best_f = getattr(self, 'current_best_f', 0.0)
         # Apply the adaptive xi multiplier on top of the iteration-decay
         # xi set by the outer loop (``opt.xi``).  Multiplier >1 forces
-        # broader exploration after a failure streak; <1 lets EI focus
-        # exploitatively while improvements keep arriving.
+        # broader exploration after a failure streak; <1 lets the
+        # acquisition focus exploitatively while improvements keep
+        # arriving.
         effective_xi = float(self.xi) * float(self.xi_scale)
-        scores = _log_expected_improvement(mu, sigma, best_f, effective_xi)
+
+        # Pick an arm from the portfolio (samples proportional to
+        # recent reward — initially uniform, then increasingly
+        # biased toward whichever arm is producing observed
+        # iteration-over-iteration improvement).
+        _arm_idx, arm_name = self._portfolio.choose()
+        self._last_arm_name = arm_name
+        # Snapshot the buffer best so ``record_iteration_outcome``
+        # can attribute only the improvement that occurred AFTER
+        # this acquisition call — not the cumulative buffer history.
+        if self.y_observed:
+            self._best_y_at_iter_start = float(max(self.y_observed))
+        else:
+            self._best_y_at_iter_start = None
+
+        if arm_name == 'ucb':
+            # UCB β decays automatically with iteration count inside
+            # the portfolio (GP-UCB schedule).  We also widen β when
+            # the local xi_scale > 1 (failure streak) and tighten
+            # when xi_scale < 1, mirroring the LogEI xi behaviour
+            # so all arms feel the same exploration push.
+            beta = self._portfolio.ucb_beta() * max(0.25, float(self.xi_scale))
+            scores = _upper_confidence_bound(mu, sigma, beta=beta)
+        elif arm_name == 'logpi':
+            scores = _log_probability_of_improvement(mu, sigma, best_f,
+                                                     effective_xi)
+        elif arm_name == 'ts':
+            scores = _thompson_lite(mu, sigma)
+        else:  # 'logei' (default arm)
+            scores = _log_expected_improvement(mu, sigma, best_f, effective_xi)
+
         return np.nan_to_num(scores, nan=-1e12, posinf=1e12, neginf=-1e12)
 
     def select_diverse_batch(self, scores, k, candidate_vecs=None):
         """Pick ``k`` candidate indices balancing acquisition and diversity.
 
-        Wraps the module-level ``_greedy_diverse_batch`` with the
-        optimiser's cached candidate vectors and GP length scale so
-        the local-penalisation bandwidth matches the surrogate's
-        learned smoothness.  Falls back to plain top-k by ``scores``
-        when no vectors are available.
+        Uses a determinantal-point-process-style greedy log-det
+        selector (``_dpp_greedy_batch``) by default — it scales more
+        gracefully to larger ``k`` and is less sensitive to length-
+        scale miscalibration than the additive local-penalisation
+        approach (which can collapse to "always pick top-k" when the
+        bandwidth is too large or "always pick spread-out duds" when
+        it's too small).
+
+        Falls back to the original ``_greedy_diverse_batch`` (additive
+        local penalisation) when DPP returns fewer than ``k`` picks
+        — this can happen when the kernel matrix is numerically
+        singular over the candidate cloud (e.g. all candidates fall
+        into one structural cell of the encoder).
+
+        Falls back to plain top-k by ``scores`` when no vectors are
+        available.
         """
         if candidate_vecs is None:
             candidate_vecs = self._last_candidate_vecs
         if candidate_vecs is None or len(candidate_vecs) != len(scores):
             return np.argsort(scores)[-int(k):][::-1].astype(np.int64)
-        ls = self._gp_length_scale  # may be None — _greedy_diverse_batch
-                                    # will then use a median-distance default
-        return _greedy_diverse_batch(scores, candidate_vecs, int(k),
+        ls = self._gp_length_scale  # may be None — DPP will then use a
+                                    # median-distance default
+        k_int = int(k)
+        # Quality-vs-diversity balance: when the portfolio just picked
+        # the exploration-heavy "ts" arm we crank up the diversity
+        # temperature so the batch spreads even further.  For "logpi"
+        # (exploitation-heavy) we keep T low so the batch hugs the
+        # acquisition mode tightly.
+        arm_name = getattr(self, '_last_arm_name', None)
+        if arm_name == 'ts':
+            quality_T = 3.0
+        elif arm_name == 'logpi':
+            quality_T = 0.5
+        else:
+            quality_T = 1.0
+        try:
+            picks = _dpp_greedy_batch(scores, candidate_vecs, k_int,
+                                       length_scale=ls,
+                                       quality_temperature=quality_T)
+        except Exception:
+            picks = np.array([], dtype=np.int64)
+        if picks.size >= k_int:
+            return picks[:k_int]
+        # Fallback to additive local-penalisation if DPP came up short
+        # (e.g. degenerate kernel matrix over the candidate cloud).
+        return _greedy_diverse_batch(scores, candidate_vecs, k_int,
                                      length_scale=ls,
                                      penalty_weight=2.0)
 
-    def record_iteration_outcome(self, improved: bool):
-        """Update the adaptive xi multiplier from this iteration's result.
+    def record_iteration_outcome(self, improved: bool,
+                                 improvement_amount: float = 0.0):
+        """Update the adaptive xi multiplier and portfolio from this
+        iteration's result.
 
         ``improved`` should be True iff at least one full-fidelity
         evaluation this iteration produced a better-than-previous-best
@@ -14990,6 +15473,15 @@ class BayesianCGPOptimizer:
         the outer BO loop's iteration-decay schedule and is local to
         each output's surrogate, so a stuck output doesn't drag the
         exploration up for outputs that are still improving.
+
+        ``improvement_amount`` (optional) is the magnitude of the
+        improvement on the LOSS scale.  When not supplied (older
+        callers) we infer it from the optimiser's own buffer: the
+        loss-side gap between the running best and the previously
+        recorded best.  The portfolio is then credited with the
+        log-scaled improvement, so the arm picked in this iteration's
+        last ``score_candidates`` call gets attribution proportional
+        to its observed gain.
         """
         if improved:
             self._success_streak += 1
@@ -15006,6 +15498,43 @@ class BayesianCGPOptimizer:
                                     self.xi_scale * 1.5)
                 self._failure_streak = 0
 
+        # Infer improvement amount from the optimiser's own buffer when
+        # the caller didn't supply one.  We use the gap between the
+        # buffer's current best transformed fitness and the buffer's
+        # best AT THE START of this iteration (captured by
+        # ``score_candidates``).  Bracketing the credit this way
+        # ensures the first arm picked doesn't get credit for the
+        # entire Phase-1 seed pool — only for what its iteration
+        # actually produced.
+        try:
+            if self._portfolio is None:
+                return
+            inferred_amount = improvement_amount
+            if inferred_amount <= 0 and self.y_observed:
+                cur_best_y = float(max(self.y_observed))
+                start_best_y = self._best_y_at_iter_start
+                if (start_best_y is not None and np.isfinite(cur_best_y)
+                        and np.isfinite(start_best_y)):
+                    gap = cur_best_y - start_best_y
+                    if gap > 0:
+                        inferred_amount = float(gap)
+            if improved or inferred_amount > 0:
+                # log1p so a 10× and 100× improvement get similar — but
+                # still distinguishable — credit.
+                reward = float(np.log1p(max(inferred_amount, 0.0)))
+                if reward <= 0:
+                    reward = 1.0   # binary fallback when the buffer
+                                   # transform compressed the gap to 0
+            else:
+                reward = -0.1   # small penalty so unsuccessful arms decay
+            self._portfolio.update(reward)
+            # Clear the iteration-start snapshot so a second update
+            # without an intervening ``score_candidates`` call won't
+            # award the arm twice for the same gap.
+            self._best_y_at_iter_start = None
+        except Exception:
+            pass
+
     def get_best_individuals(self, n=5):
         """Return the top-n individuals by loss (lowest loss first)."""
         if not self.individuals:
@@ -15016,8 +15545,19 @@ class BayesianCGPOptimizer:
     def summary_str(self):
         n = len(self.X_observed)
         best_loss = min(ind.loss for ind in self.individuals) if self.individuals else float('inf')
-        return (f"observations={n}, best_loss={best_loss:.5f}, "
+        base = (f"observations={n}, best_loss={best_loss:.5f}, "
                 f"GP_fitted={self.gp_fitted}")
+        # Append portfolio arm weights when available so the BO log
+        # shows which acquisition is currently dominating.  Tucked
+        # behind an attribute check so this works even if the
+        # optimiser was unpickled from an older buffer that predates
+        # the portfolio.
+        try:
+            if self._portfolio is not None:
+                base += f", acq=[{self._portfolio.status_str()}]"
+        except Exception:
+            pass
+        return base
 
 
 # ════════════════════════════════════════════════════════════════
