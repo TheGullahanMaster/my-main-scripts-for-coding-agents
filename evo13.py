@@ -16368,6 +16368,7 @@ def run_bayesian_afpo(X, Y, n_features, n_outputs, feat_names, out_types,
             opt.X_observed.clear()
             opt.y_observed.clear()
             opt.individuals.clear()
+            opt._mc_obs_state_id.clear()  # <-- Add this line
             
             # Re-evaluate the population
             for ind in afpo_pops[o_idx]:
@@ -16779,6 +16780,7 @@ def run_bayesian_islands(X, Y, n_features, n_outputs, feat_names, out_types,
             opt.X_observed.clear()
             opt.y_observed.clear()
             opt.individuals.clear()
+            opt._mc_obs_state_id.clear()  # <-- Add this line
             
             # Re-evaluate all individuals across all islands
             for island_idx in range(NUM_ISLANDS):
@@ -17192,6 +17194,7 @@ def run_bayesian_islanded_afpo(X, Y, n_features, n_outputs, feat_names, out_type
             opt.X_observed.clear()
             opt.y_observed.clear()
             opt.individuals.clear()
+            opt._mc_obs_state_id.clear()  # <-- Add this line
             
             # Re-evaluate
             for island_idx in range(NUM_ISLANDS):
@@ -17637,6 +17640,7 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
             opt.X_observed.clear()
             opt.y_observed.clear()
             opt.individuals.clear()
+            opt._mc_obs_state_id.clear()  # <-- Add this line
             for ind in old_individuals:
                 ind.affine_fitted = False
                 ind.calculate_fitness(X, Y[:, o_idx], out_types[o_idx],
@@ -18223,6 +18227,7 @@ def run_bayesian_qd(X, Y, n_features, n_outputs, feat_names, out_types,
             opt.X_observed.clear()
             opt.y_observed.clear()
             opt.individuals.clear()
+            opt._mc_obs_state_id.clear()  # <-- Add this line
             archives[o_idx] = QualityDiversityArchive(n_features, CGP_NODES)
 
             for ind in old_individuals:
