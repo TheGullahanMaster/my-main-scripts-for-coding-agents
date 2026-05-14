@@ -1860,11 +1860,58 @@ def _select_class_weight_mode():
 # ALGEBRAIC SIMPLIFICATION
 # ==========================================
 
+class _SimplifyTimeout(Exception):
+    """Raised internally when a sympy simplification strategy is forcibly
+    interrupted because it ran past ``ADVANCED_SIMPLIFY_TIMEOUT_SEC``."""
+
+
+# Per-strategy soft cap for ``advanced_simplify_expr``.  Pathological
+# expressions (e.g. anything containing ComplexInfinity from `mod(x,x)`)
+# can lock sympy.simplify in what looks like an infinite loop.  The
+# SIGALRM-based guard below caps each strategy individually so a single
+# misbehaving call can't freeze the whole training run.
+ADVANCED_SIMPLIFY_TIMEOUT_SEC = 1.0
+
+
+def _run_with_alarm_timeout(fn, timeout_sec):
+    """Run ``fn()`` with a SIGALRM-based wall-clock timeout.
+
+    Raises ``_SimplifyTimeout`` on expiry.  Falls through transparently
+    (no timeout) when SIGALRM is unavailable (Windows) or when called
+    off the main thread — ``signal.signal`` and ``setitimer`` only work
+    from the main thread on POSIX.
+    """
+    import signal as _signal
+    import threading as _threading
+
+    if (not hasattr(_signal, 'SIGALRM')
+            or _threading.current_thread() is not _threading.main_thread()):
+        return fn()
+
+    def _handler(signum, frame):
+        raise _SimplifyTimeout()
+
+    prev_handler = _signal.signal(_signal.SIGALRM, _handler)
+    try:
+        _signal.setitimer(_signal.ITIMER_REAL, float(timeout_sec))
+        return fn()
+    finally:
+        # Always cancel the timer first so an ALRM that fires here can't
+        # leak into surrounding code, then restore the original handler.
+        _signal.setitimer(_signal.ITIMER_REAL, 0)
+        _signal.signal(_signal.SIGALRM, prev_handler)
+
+
 def advanced_simplify_expr(sympy_expr):
     """
     Try multiple sympy simplification strategies and return the shortest result.
     Strategies tried: simplify, expand, factor, cancel, radsimp, trigsimp,
     powsimp, and nsimplify. This is much more thorough than a plain simplify().
+
+    Each strategy is wrapped in a SIGALRM-based timeout so a single
+    pathological expression (e.g. one containing ComplexInfinity from
+    ``mod(x, x)``) cannot lock sympy in an apparent infinite loop and
+    freeze the calling process.
     """
     if sympy is None or sympy_expr is None:
         return sympy_expr
@@ -1883,11 +1930,16 @@ def advanced_simplify_expr(sympy_expr):
         try:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
-                result = strat(sympy_expr)
+                result = _run_with_alarm_timeout(
+                    lambda: strat(sympy_expr),
+                    ADVANCED_SIMPLIFY_TIMEOUT_SEC)
             rlen = len(str(result))
             if rlen < best_len:
                 best = result
                 best_len = rlen
+        except _SimplifyTimeout:
+            # Single strategy timed out; move on to the next one.
+            continue
         except Exception:
             pass
     return best
@@ -10469,6 +10521,183 @@ def tree_to_sympy(cgp_eq, feature_vars, safe=None):
     return buf.get(cgp_eq.out_idx, sympy.Float(0))
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Direct CGP-tree → NumPy Python expression emitter.
+#
+# This is the **fallback** path for code generation when SymPy can't be used
+# or its output is non-renderable (e.g. `mod(x, x)` simplifies to 0, making
+# `x / mod(x, x)` evaluate to ComplexInfinity which NumPyPrinter cannot emit
+# and raises KeyError 'ComplexInfinity').  The previous fallback used
+# `str(ind.tree)`, which produced human-readable but syntactically invalid
+# Python (`IF cond THEN a ELSE b`, `frac(x)`, `gaussian(x)`, etc.) — every
+# such exported model would fail to import with `SyntaxError`.
+#
+# The emitted expressions mirror `_BINARY_SAFE`/`_UNARY_SAFE` (or the UNSAFE
+# variants) so the exported model reproduces what was evaluated during
+# training.  ADF operators are emitted as bare function calls; the export
+# pipeline already emits matching helper definitions.
+# ─────────────────────────────────────────────────────────────────────────────
+def _binary_python_expr(op, v1, v2, safe):
+    if op == '+': return f"({v1} + {v2})"
+    if op == '-': return f"({v1} - {v2})"
+    if op == '*': return f"({v1} * {v2})"
+    if op == '/':
+        if safe:
+            return (f"(({v1}) / np.where(np.abs({v2}) > 1e-8, ({v2}), "
+                    f"np.sign(({v2}) + 1e-18) * 1e-8))")
+        return f"(({v1}) / ({v2}))"
+    if op == 'max': return f"np.maximum({v1}, {v2})"
+    if op == 'min': return f"np.minimum({v1}, {v2})"
+    if op == 'pow':
+        if safe:
+            return (
+                f"np.where(np.abs(np.round({v2}) - ({v2})) < 1e-4, "
+                f"np.where(np.abs(np.mod(np.round({v2}), 2)) < 1e-8, "
+                f"np.power(np.abs({v1}) + 1e-30, np.clip({v2}, -250.0, 250.0)), "
+                f"np.copysign(np.power(np.abs({v1}) + 1e-30, np.clip({v2}, -250.0, 250.0)), {v1})), "
+                f"np.power(np.abs({v1}) + 1e-30, np.clip({v2}, -250.0, 250.0)))"
+            )
+        return f"np.power({v1}, {v2})"
+    if op == 'hypot':   return f"np.sqrt(({v1})**2 + ({v2})**2)"
+    if op == 'atan2':   return f"np.arctan2({v1}, {v2})"
+    if op == 'harmonic':
+        if safe:
+            return f"(2.0 * ({v1}) * ({v2}) / (np.abs(({v1}) + ({v2})) + 1e-8))"
+        return f"(2.0 * ({v1}) * ({v2}) / (({v1}) + ({v2})))"
+    if op == 'geometric':
+        if safe:
+            return f"np.sqrt(np.abs(({v1}) * ({v2})))"
+        return f"np.sqrt(({v1}) * ({v2}))"
+    if op == 'mod':
+        if safe:
+            return f"np.mod({v1}, np.where(np.abs({v2}) > 1e-8, ({v2}), 1.0))"
+        return f"np.mod({v1}, {v2})"
+    if op == 'copysign': return f"(np.abs({v1}) * np.sign({v2}))"
+    if op == 'floordiv':
+        if safe:
+            return (f"np.floor(({v1}) / np.where(np.abs({v2}) > 1e-8, ({v2}), "
+                    f"np.sign(({v2}) + 1e-18) * 1e-8))")
+        return f"np.floor(({v1}) / ({v2}))"
+    if op == 'gt':  return f"np.where(({v1}) > ({v2}), 1.0, 0.0)"
+    if op == 'lt':  return f"np.where(({v1}) < ({v2}), 1.0, 0.0)"
+    if op == 'gte': return f"np.where(({v1}) >= ({v2}), 1.0, 0.0)"
+    if op == 'lte': return f"np.where(({v1}) <= ({v2}), 1.0, 0.0)"
+    if op.startswith('adf_'):
+        return f"{op}({v1}, {v2})"
+    return "0.0"
+
+
+def _ternary_python_expr(op, v1, v2, v3):
+    if op == 'if_else':
+        # Match the runtime if_else: condition > 0.5 selects the true branch.
+        return f"np.where(({v1}) > 0.5, {v2}, {v3})"
+    return "0.0"
+
+
+def _unary_python_expr(op, v1, safe):
+    if op == 'sin': return f"np.sin({v1})"
+    if op == 'cos': return f"np.cos({v1})"
+    if op == 'tan':
+        if safe:
+            return (f"np.clip(np.where(np.abs(np.cos({v1})) > 1e-8, "
+                    f"np.sin({v1}) / np.cos({v1}), 0.0), -1e6, 1e6)")
+        return f"np.tan({v1})"
+    if op == 'exp':
+        if safe: return f"np.exp(np.clip({v1}, -700.0, 700.0))"
+        return f"np.exp({v1})"
+    if op == 'log':
+        if safe: return f"np.log(np.abs({v1}) + 1e-30)"
+        return f"np.log({v1})"
+    if op == 'sqrt':
+        if safe: return f"np.sqrt(np.abs({v1}))"
+        return f"np.sqrt({v1})"
+    if op == 'abs':    return f"np.abs({v1})"
+    if op == 'square': return f"(({v1}) * ({v1}))"
+    if op == 'neg':    return f"(-({v1}))"
+    if op == 'frac':   return f"(({v1}) - np.floor({v1}))"
+    if op == 'round':  return f"np.round({v1})"
+    if op == '10^x':
+        if safe: return f"np.power(10.0, np.clip({v1}, -300.0, 300.0))"
+        return f"np.power(10.0, {v1})"
+    if op == 'log10':
+        if safe: return f"np.log10(np.abs({v1}) + 1e-30)"
+        return f"np.log10({v1})"
+    if op == 'sigmoid':
+        if safe: return f"(1.0 / (1.0 + np.exp(-np.clip({v1}, -50.0, 50.0))))"
+        return f"(1.0 / (1.0 + np.exp(-({v1}))))"
+    if op == 'tanh':       return f"np.tanh({v1})"
+    if op == 'relu':       return f"np.maximum(0.0, {v1})"
+    if op == 'leaky_relu': return f"np.where(({v1}) >= 0, {v1}, 0.01 * ({v1}))"
+    if op == 'atan':       return f"np.arctan({v1})"
+    if op == 'gaussian':
+        if safe: return f"np.exp(-np.clip(({v1})**2, 0, 500.0))"
+        return f"np.exp(-(({v1})**2))"
+    if op == 'softplus':
+        if safe: return f"np.log1p(np.exp(np.clip({v1}, -500.0, 30.0)))"
+        return f"np.logaddexp(0.0, {v1})"
+    if op == 'sign':  return f"np.sign({v1})"
+    if op == 'floor': return f"np.floor({v1})"
+    if op == 'ceil':  return f"np.ceil({v1})"
+    if op == 'cube':  return f"(({v1})**3)"
+    if op == 'sinc':  return f"np.sinc(({v1}) / np.pi)"
+    if op == 'xlogx':
+        if safe: return f"(({v1}) * np.log(np.abs({v1}) + 1e-8))"
+        return f"(({v1}) * np.log(np.abs({v1})))"
+    if op == 'erf':
+        # math.erf is monkey-patched in the exported script so it accepts arrays.
+        return f"math.erf({v1})"
+    if op == 'inv':
+        if safe: return f"(1.0 / (np.abs({v1}) + 1e-30))"
+        return f"(1.0 / ({v1}))"
+    if op.startswith('adf_'):
+        return f"{op}({v1})"
+    return "0.0"
+
+
+def tree_to_python_expr(cgp_eq, feature_var_names, safe=None):
+    """
+    Convert a CGP expression tree directly to an inline NumPy Python
+    expression string. Always returns syntactically valid Python.
+
+    Used by `generate_script` as the fallback when SymPy is unavailable or
+    raises during simplification/printing. ADF operators are emitted as
+    function calls (the helper definitions are emitted separately by the
+    export pipeline).
+    """
+    if safe is None:
+        safe = SAFE_OPS_MODE
+
+    if not cgp_eq.active_nodes:
+        cgp_eq.update_active_nodes()
+
+    buf = {i: feature_var_names[i] for i in range(cgp_eq.n_features)}
+
+    for idx in sorted(cgp_eq.active_nodes):
+        if idx < cgp_eq.n_features:
+            continue
+        node = cgp_eq.nodes[idx - cgp_eq.n_features]
+
+        if node.op == 'const':
+            buf[idx] = repr(float(node.const_val))
+            continue
+
+        v1 = buf.get(node.in1, "0.0")
+
+        if node.op in cgp_eq.OPS_BINARY_SET:
+            v2 = buf.get(node.in2, "0.0")
+            buf[idx] = _binary_python_expr(node.op, v1, v2, safe)
+        elif node.op in cgp_eq.OPS_TERNARY_SET:
+            v2 = buf.get(node.in2, "0.0")
+            v3 = buf.get(node.in3, "0.0")
+            buf[idx] = _ternary_python_expr(node.op, v1, v2, v3)
+        elif node.op in cgp_eq.OPS_UNARY_SET:
+            buf[idx] = _unary_python_expr(node.op, v1, safe)
+        else:
+            buf[idx] = "0.0"
+
+    return buf.get(cgp_eq.out_idx, "0.0")
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # PERFECT OUTPUT EARLY STOPPING
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -10712,20 +10941,29 @@ def generate_script(models, dp, filename="best_model.py", X_data=None):
 
     for i, ind in enumerate(models):
         out_name = dp.output_map[i]
+        # Direct tree→NumPy emission is always syntactically valid and
+        # serves as a fallback when SymPy's path can't render the
+        # simplified expression (e.g. `mod(x,x)` → 0 makes division
+        # collapse to ComplexInfinity, which NumPyPrinter rejects).
+        fallback_expr = tree_to_python_expr(ind.tree, final_vars,
+                                            safe=SAFE_OPS_MODE)
+        py_expr = fallback_expr
         if sympy:
             try:
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore")
                     raw_sym    = tree_to_sympy(ind.tree, sym_vars, safe=SAFE_OPS_MODE)
                     simplified = advanced_simplify_expr(raw_sym)
-                py_expr = NumPyPrinter().doprint(simplified)
-                py_expr = py_expr.replace('numpy.', 'np.')
+                _sym_expr = NumPyPrinter().doprint(simplified)
+                _sym_expr = _sym_expr.replace('numpy.', 'np.')
+                # Validate syntax; some sympy edge cases (e.g. ComplexInfinity
+                # surviving as Python literal) yield strings that won't parse.
+                compile(_sym_expr, '<expr>', 'eval')
+                py_expr = _sym_expr
             except Exception:
-                py_expr = str(ind.tree)
-        else:
-            py_expr = str(ind.tree)
-            
-        if out_types[i] == 5: 
+                py_expr = fallback_expr
+
+        if out_types[i] == 5:
             a = getattr(ind, 'affine_a', 1.0)
             b = getattr(ind, 'affine_b', 0.0)
             py_expr = f"({a} * ({py_expr}) + {b})"
@@ -14524,10 +14762,30 @@ class _GpHedgePortfolio:
     # explorer arms (UCB, PE) get a small positive head start so the
     # first ~20 iterations lean toward exploration regardless of which
     # arm happens to score highest on the (still under-fit) surrogate.
-    # The values are on the std-normalized reward scale (≈ O(1) after
+    # LogPI gets a small NEGATIVE head start: it is the most myopic /
+    # exploitation-heavy arm and a couple of early-iteration wins can
+    # lock the softmax onto it before the surrogate has enough data to
+    # know whether logpi's picks generalise.  The cold-start penalty
+    # forces logpi to earn its share via observed-improvement bonuses
+    # rather than free-rolling on counterfactual surrogate credit.
+    # All values are on the std-normalized reward scale (≈ O(1) after
     # ``update_all``'s within-iteration normalisation) and fade to ~5%
     # of the original by iter 100 under the default ``decay``.
-    _COLD_START_BIAS = {'ucb': 0.6, 'pe': 0.4}
+    _COLD_START_BIAS = {'ucb': 0.6, 'pe': 0.4, 'logpi': -0.4}
+
+    # ---- Stagnation cooldown ---------------------------------------------
+    # If an arm is the picked arm for ``_STAGNATION_THRESHOLD`` consecutive
+    # iterations without producing an observed real-world improvement, every
+    # additional stagnant pick deducts ``_STAGNATION_PENALTY`` from that
+    # arm's cumulative reward.  Without this, an arm whose surrogate-mean
+    # picks look attractive but never deliver an actual loss drop (the
+    # classic logpi failure mode) keeps winning the softmax through
+    # counterfactual credit alone — the portfolio burrows into a local
+    # optimum.  The counter resets the moment the arm DOES produce an
+    # improvement; the penalty itself decays with ``self.decay`` so the
+    # suppression naturally fades once another arm starts winning.
+    _STAGNATION_THRESHOLD = 5
+    _STAGNATION_PENALTY = 0.3
 
     def __init__(self, eta: float = 0.5, decay: float = 0.97,
                  eps: float = 0.1, adaptive_eta: bool = True,
@@ -14559,6 +14817,12 @@ class _GpHedgePortfolio:
         # for most of the wins by count but another delivers the
         # largest individual improvements.
         self.improvement_sum = np.zeros(n, dtype=np.float64)
+        # Per-arm running count of consecutive picks that produced NO
+        # observed real-world improvement.  Resets the moment a pick from
+        # this arm yields an improvement.  Drives the stagnation cooldown
+        # in ``update_all`` — see ``_STAGNATION_THRESHOLD`` /
+        # ``_STAGNATION_PENALTY`` on the class for details.
+        self._stagnation = np.zeros(n, dtype=np.int64)
         # Ring buffer of the last N picks (most recent at the right).
         # Drives the "recent picks" diagnostic: shows the arm pull
         # distribution over the last ~30 iterations, which can
@@ -14717,13 +14981,31 @@ class _GpHedgePortfolio:
             rs[self.last_arm] += float(np.clip(b, -5.0, 5.0))
         self.rewards *= self.decay
         self.rewards += rs
+        last = self.last_arm
         # Per-arm real-world improvement bookkeeping (diagnostic only;
         # ``bonus`` already feeds the improvement back into the
         # selection-driving cumulative rewards above).
         if real_improvement:
-            self.real_improvements[self.last_arm] += 1
-            self.improvement_sum[self.last_arm] += float(
+            self.real_improvements[last] += 1
+            self.improvement_sum[last] += float(
                 max(real_improvement_amount, 0.0))
+            # The arm DELIVERED — its stagnation counter resets.
+            self._stagnation[last] = 0
+        else:
+            # No improvement this iteration: extend the picked arm's
+            # stagnation streak.  Past the threshold the penalty grows
+            # LINEARLY with how deep the streak runs (`penalty * over`)
+            # so an arm that's been winning the softmax on counterfactual
+            # credit alone can't out-pace the cooldown — the longer the
+            # streak, the bigger the bite, until either another arm
+            # starts winning or the stuck arm finally delivers an
+            # improvement (resetting the streak).  This is the canonical
+            # logpi local-optimum failure mode: surrogate-attractive
+            # picks that never produce a real loss drop.
+            self._stagnation[last] += 1
+            over = int(self._stagnation[last]) - int(self._STAGNATION_THRESHOLD)
+            if over > 0:
+                self.rewards[last] -= float(self._STAGNATION_PENALTY) * float(over)
         self.last_arm = None
 
     def normalise_bonus(self, raw_bonus: float, update_rms: bool = True):
@@ -19663,18 +19945,24 @@ def _generate_boosted_script(boosted_models, dp, X_data=None):
     def _ind_to_numpy_expr(ind):
         a = getattr(ind, 'affine_a', 1.0)
         b = getattr(ind, 'affine_b', 0.0)
+        # tree_to_python_expr always yields valid Python; use it as the
+        # fallback when SymPy/NumPyPrinter can't handle the simplified
+        # expression (e.g. ComplexInfinity from `mod(x,x)`-style ops).
+        fallback_expr = tree_to_python_expr(ind.tree, final_vars,
+                                            safe=SAFE_OPS_MODE)
+        py_expr = fallback_expr
         if sympy is not None:
             try:
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore")
                     raw_sym = tree_to_sympy(ind.tree, sym_vars, safe=SAFE_OPS_MODE)
                     simplified = advanced_simplify_expr(raw_sym)
-                py_expr = NumPyPrinter().doprint(simplified)
-                py_expr = py_expr.replace('numpy.', 'np.')
+                _sym_expr = NumPyPrinter().doprint(simplified)
+                _sym_expr = _sym_expr.replace('numpy.', 'np.')
+                compile(_sym_expr, '<expr>', 'eval')
+                py_expr = _sym_expr
             except Exception:
-                py_expr = str(ind.tree)
-        else:
-            py_expr = str(ind.tree)
+                py_expr = fallback_expr
         return py_expr, a, b
 
     seen_mc_ids = set()
