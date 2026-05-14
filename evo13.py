@@ -14343,6 +14343,126 @@ def _thompson_lite(mu, sigma, rng=None):
     return mu + sigma * z
 
 
+def _thompson_joint(mu, cov, rng=None, max_joint=320):
+    """Joint Thompson sample using the full posterior covariance.
+
+    The "lite" variant draws each candidate's score independently and
+    therefore misses cross-candidate correlation: a cluster of 5
+    near-duplicate candidates each gets its own random draw, so the
+    cluster's *expected* maximum is overstated by ≈√(2 log 5) σ
+    relative to a single draw of the cluster.  This biases the lite
+    pick toward dense regions of the candidate cloud regardless of
+    the underlying posterior.
+
+    The joint sample fixes that: we Cholesky the posterior covariance
+    matrix and produce one consistent function-sample over all
+    candidates, so highly-correlated near-duplicates get the SAME
+    draw direction and the argmax over the sample is the actual joint
+    Thompson pick.
+
+    Cost is O(M^3) for the Cholesky (M = candidate count); for our
+    typical M ≤ 256 the factorisation is a few ms.  We cap at
+    ``max_joint`` candidates: above that we joint-sample the top-
+    ``max_joint`` by ``mu`` and fall back to lite-marginal samples for
+    the rest, since the marginal-tail candidates are unlikely to win
+    the argmax anyway.
+
+    Falls back to the lite variant on any numerical failure
+    (indefinite covariance after jitter, NaNs, dimension mismatch).
+    """
+    mu_arr = np.asarray(mu, dtype=np.float64)
+    n = mu_arr.size
+    if n == 0:
+        return mu_arr.copy()
+    if cov is None or cov.shape != (n, n):
+        diag = (np.sqrt(np.maximum(np.diag(cov), 1e-24))
+                if (cov is not None and cov.ndim == 2)
+                else np.full(n, 1e-6))
+        return _thompson_lite(mu_arr, diag, rng=rng)
+
+    if rng is None:
+        rng = np.random
+
+    diag = np.diag(cov).astype(np.float64, copy=True)
+    diag = np.maximum(np.nan_to_num(diag, nan=0.0, posinf=1e12, neginf=0.0),
+                      1e-24)
+    sigma_arr = np.sqrt(diag)
+
+    # Restrict the joint Cholesky to the top-``max_joint`` candidates by
+    # ``mu`` (the most likely argmax winners under the joint sample).
+    # The rest stay on the lite-marginal path — they're competing
+    # against a joint sample over the top tier, so their independent
+    # draws still get scored consistently against the same z columns
+    # via the diagonal fallback.
+    if n > max_joint:
+        top_idx = np.argpartition(-mu_arr, max_joint - 1)[:max_joint]
+        top_idx = np.sort(top_idx)
+    else:
+        top_idx = np.arange(n)
+
+    sub_cov = cov[np.ix_(top_idx, top_idx)].astype(np.float64, copy=True)
+    sub_cov = np.nan_to_num(sub_cov, nan=0.0,
+                            posinf=1e12, neginf=-1e12)
+    # Symmetrise (sklearn's predict_cov can return a non-exactly-symm
+    # matrix due to float rounding, which np.linalg.cholesky rejects).
+    sub_cov = 0.5 * (sub_cov + sub_cov.T)
+    sub_diag = np.maximum(np.diag(sub_cov), 1e-24)
+    np.fill_diagonal(sub_cov, sub_diag)
+
+    # Adaptive jitter: start at 1e-9·trace and double until Cholesky
+    # succeeds (or we exceed 1e-3·trace and concede defeat).
+    trace = float(np.trace(sub_cov)) / max(top_idx.size, 1)
+    jitter = max(1e-9 * trace, 1e-12)
+    L = None
+    for _ in range(8):
+        try:
+            L = np.linalg.cholesky(sub_cov + jitter * np.eye(top_idx.size))
+            break
+        except np.linalg.LinAlgError:
+            jitter *= 10.0
+            if jitter > max(1e-3 * trace, 1e-6):
+                break
+    if L is None:
+        return _thompson_lite(mu_arr, sigma_arr, rng=rng)
+
+    z = rng.standard_normal(top_idx.size)
+    sub_sample = mu_arr[top_idx] + L @ z
+
+    # Fold the joint sample into a full-length score vector; the
+    # off-tier (marginal-tail) candidates fall back to independent
+    # draws so they remain on the same probabilistic footing.
+    out = mu_arr.copy()
+    if n > top_idx.size:
+        rest_mask = np.ones(n, dtype=bool)
+        rest_mask[top_idx] = False
+        out[rest_mask] = (mu_arr[rest_mask]
+                          + sigma_arr[rest_mask]
+                          * rng.standard_normal(int(rest_mask.sum())))
+    out[top_idx] = sub_sample
+    return out
+
+
+def _pure_exploration(sigma):
+    """Pure-exploration acquisition: maximise predicted standard
+    deviation (BALD-lite / max-σ).
+
+    Independent of ``mu`` — picks wherever the GP is most uncertain.
+    Provides a diversification arm in the GP-Hedge portfolio that
+    the other arms (which all weight μ to varying degrees) cannot
+    replicate; especially useful right after a GP refit when the
+    posterior uncertainty has been recalibrated and unmapped regions
+    of the encoding space deserve attention.
+
+    The σ scale matches LogEI / UCB output magnitudes (both are O(σ)
+    in the "improvement-tail" regime), so per-iteration counterfactual
+    rewards stay on the same scale as the rest of the portfolio.
+    """
+    sigma = np.asarray(sigma, dtype=np.float64)
+    sigma = np.maximum(np.nan_to_num(sigma, nan=0.0, posinf=1e6, neginf=0.0),
+                       1e-12)
+    return sigma
+
+
 class _GpHedgePortfolio:
     """GP-Hedge multi-acquisition portfolio (Hoffman, Brochu, de Freitas 2011).
 
@@ -14355,13 +14475,14 @@ class _GpHedgePortfolio:
     bonus to the actually-picked arm when an observed loss improvement
     confirmed its pick in the real world.
 
-    Why we keep all four arms always active
+    Why we keep all five arms always active
     --------------------------------------
     Even when LogEI dominates the long-run reward, the alternatives
     pay off in transient regimes the main arm can't see — UCB rescues
-    runs that get stuck in a single basin, Thompson-lite probes the
+    runs that get stuck in a single basin, joint Thompson probes the
     posterior randomness for unmapped niches, PI takes the quick win
-    when the surrogate is locally exploitable.  Three knobs keep the
+    when the surrogate is locally exploitable, PE (pure exploration)
+    blasts open the σ map after a refit.  Several knobs prevent the
     portfolio from collapsing to a single arm:
 
       * ``decay`` exponentially fades cumulative reward each iteration
@@ -14371,7 +14492,15 @@ class _GpHedgePortfolio:
         guaranteed at least ``eps / K`` sampling probability so none
         can starve permanently.
       * ``eta`` controls the softmax sharpness; tuned for the
-        centered counterfactual reward scale (≈ O(σ_μ across arms)).
+        std-normalized counterfactual reward scale (≈ O(1) per arm
+        after the within-iteration normalisation in ``update_all``).
+        When ``adaptive_eta`` is True a warm-up schedule keeps η low
+        for the first few iterations so the cold-start bias and a
+        single lucky pick can't lock the softmax.
+      * Cold-start bias: explorer arms (UCB, PE) are pre-credited with
+        positive cumulative reward at construction so the first ~20
+        iterations lean toward exploration; the bias fades naturally
+        through ``decay`` once the real signal accumulates.
 
     Together these reproduce Hoffman et al.'s claim that the portfolio
     never fully retires an arm while still letting the long-run leader
@@ -14382,25 +14511,102 @@ class _GpHedgePortfolio:
     LogEI (`logei`)             - balanced, default workhorse
     UCB (`ucb`, beta schedule)  - exploration-heavy with decaying β
     LogPI (`logpi`)             - exploitation-heavy, exact-improve focus
-    Thompson-lite (`ts`)        - randomised, breaks symmetry
+    Thompson (`ts`)             - joint posterior sample (Cholesky); falls
+                                  back to independent marginals when the
+                                  joint covariance is degenerate
+    Pure-exploration (`pe`)     - max-σ; uncorrelated with any μ-driven
+                                  arm so it diversifies after refits
     """
 
-    ARMS = ('logei', 'ucb', 'logpi', 'ts')
+    ARMS = ('logei', 'ucb', 'logpi', 'ts', 'pe')
+
+    # Relative bias prepended to ``rewards`` at construction.  The
+    # explorer arms (UCB, PE) get a small positive head start so the
+    # first ~20 iterations lean toward exploration regardless of which
+    # arm happens to score highest on the (still under-fit) surrogate.
+    # The values are on the std-normalized reward scale (≈ O(1) after
+    # ``update_all``'s within-iteration normalisation) and fade to ~5%
+    # of the original by iter 100 under the default ``decay``.
+    _COLD_START_BIAS = {'ucb': 0.6, 'pe': 0.4}
 
     def __init__(self, eta: float = 0.5, decay: float = 0.97,
-                 eps: float = 0.1):
+                 eps: float = 0.1, adaptive_eta: bool = True,
+                 std_normalize: bool = True):
         self.eta = float(eta)
         self.decay = float(np.clip(decay, 0.5, 1.0))
         self.eps = float(np.clip(eps, 0.0, 1.0))
+        self.adaptive_eta = bool(adaptive_eta)
+        self.std_normalize = bool(std_normalize)
         n = len(self.ARMS)
         self.rewards = np.zeros(n, dtype=np.float64)
+        for name, bias in self._COLD_START_BIAS.items():
+            if name in self.ARMS:
+                self.rewards[self.ARMS.index(name)] = float(bias)
         # Per-arm pull count (for diagnostics; never gates selection).
         self.pulls   = np.zeros(n, dtype=np.int64)
+        # Per-arm "real-world wins": how many iterations where this arm
+        # was the picked arm AND the iteration produced an observed
+        # loss improvement.  Diagnostic only — this counter does NOT
+        # feed back into selection (the cumulative reward bookkeeper
+        # already integrates the improvement bonus).  Useful for
+        # spotting "looked good on the surrogate but never delivered"
+        # arms in the BO log.
+        self.real_improvements = np.zeros(n, dtype=np.int64)
+        # Per-arm cumulative magnitude of observed improvements (in
+        # log1p loss-gap units, before bonus normalisation).  Combined
+        # with ``real_improvements`` this gives the mean improvement
+        # magnitude per arm — informative when one arm is responsible
+        # for most of the wins by count but another delivers the
+        # largest individual improvements.
+        self.improvement_sum = np.zeros(n, dtype=np.float64)
+        # Ring buffer of the last N picks (most recent at the right).
+        # Drives the "recent picks" diagnostic: shows the arm pull
+        # distribution over the last ~30 iterations, which can
+        # disagree with the cumulative pull histogram when a regime
+        # change is in progress (decayed rewards have shifted but the
+        # cumulative pulls are dominated by the long history).
+        self._recent_picks: list = []
+        self._recent_picks_max = 30
+        # Rolling RMS of recently-observed bonus magnitudes for the
+        # adaptive bonus normalisation in ``update_with_bonus``.  Bonus
+        # values come from an outer ``log1p(loss_gap)`` whose scale
+        # depends on the loss landscape of THIS output (CE for logits
+        # vs MSE for regression vs huber for habitability, …) — without
+        # normalising them by their typical magnitude, an output with
+        # naturally large gaps would feed jackpot bonuses into every
+        # iteration and the picked arm would dominate the softmax even
+        # when its picks weren't actually better than its competitors'.
+        self._bonus_rms = 1.0
+        self._bonus_ewma_alpha = 0.2
         self.last_arm: int | None = None
         # Iteration counter drives UCB's beta decay (more exploration
         # early, more exploitation late) independent of which arm was
         # actually picked last iteration.
         self.iter = 0
+
+    def effective_eta(self):
+        """η used in the softmax for the CURRENT iteration.
+
+        Without warm-up, the very first ``choose()`` call after init
+        runs at full ``eta`` against the cold-start bias only — that
+        already gives the explorer arms ~20-30 % above-uniform
+        probability, but a SINGLE lucky-arm bonus on iter 1 would
+        also get full η weight and could lock the softmax onto a
+        random first-iteration winner.
+
+        Warm-up keeps η ramping linearly from a small floor on iter 1
+        to full ``eta`` by iter 5, so the first few iterations spread
+        their picks more uniformly while real reward signal
+        accumulates.  After iter 5 the schedule plateaus at ``eta``.
+        """
+        if not self.adaptive_eta:
+            return self.eta
+        warm = 5.0
+        t = max(int(self.iter), 1)
+        ramp = min(1.0, t / warm)
+        # Floor at 0.05·eta so iter 1 is not effectively zero; cap at
+        # 2·eta so a custom ``eta`` value can't blow up the softmax.
+        return float(np.clip(self.eta * ramp, 0.05 * self.eta, 2.0 * self.eta))
 
     def weights(self):
         """Softmax over current cumulative rewards, mixed with a uniform
@@ -14408,8 +14614,9 @@ class _GpHedgePortfolio:
         ``eps / K`` per arm — even a long-dominated arm can't be
         permanently starved out of the rotation.
         """
+        eta = self.effective_eta()
         r = self.rewards - np.max(self.rewards)
-        w = np.exp(self.eta * r)
+        w = np.exp(eta * r)
         s = float(w.sum())
         n = len(w)
         if not np.isfinite(s) or s <= 0:
@@ -14430,6 +14637,9 @@ class _GpHedgePortfolio:
         self.last_arm = idx
         self.pulls[idx] += 1
         self.iter += 1
+        self._recent_picks.append(idx)
+        if len(self._recent_picks) > self._recent_picks_max:
+            self._recent_picks.pop(0)
         return idx, self.ARMS[idx]
 
     def update(self, reward: float):
@@ -14449,7 +14659,9 @@ class _GpHedgePortfolio:
         self.rewards[self.last_arm] += r
         self.last_arm = None
 
-    def update_all(self, arm_rewards, bonus: float = 0.0):
+    def update_all(self, arm_rewards, bonus: float = 0.0,
+                   real_improvement: bool = False,
+                   real_improvement_amount: float = 0.0):
         """Counterfactual credit to every arm (canonical GP-Hedge).
 
         ``arm_rewards`` is one value per arm in the order of ``ARMS``,
@@ -14460,6 +14672,18 @@ class _GpHedgePortfolio:
         drift as the surrogate refits, but the within-iteration
         differences across arms reflect their actual disagreement
         about where the next-best point is.
+
+        Within-iteration std normalisation
+        ----------------------------------
+        After centering, when ``std_normalize`` is True we divide by
+        the within-iteration std (floored at 0.5 so we don't amplify
+        noise when arms genuinely agree).  This makes the cumulative
+        reward bookkeeper invariant to the GP target's absolute scale:
+        an iteration where arms disagree by 10 σ contributes the same
+        cumulative magnitude as one where they disagree by 1 σ, so a
+        single-output run with very tight arm agreement doesn't end
+        up with under-decayed cumulative rewards just because the
+        absolute differences happen to be small.
 
         ``bonus`` (optional) is a real-world signal layered on top of
         the actually-picked arm's counterfactual baseline: when an
@@ -14479,6 +14703,13 @@ class _GpHedgePortfolio:
         # within-iteration differences carry into the cumulative
         # reward.
         rs = rs - float(np.mean(rs))
+        if self.std_normalize:
+            # Cap the std floor at 0.5 so when arms genuinely agree
+            # (std ≪ 1) we don't amplify noise; otherwise the
+            # cumulative reward becomes scale-invariant to the GP
+            # target's absolute units.
+            std = max(float(np.std(rs)), 0.5)
+            rs = rs / std
         rs = np.clip(rs, -5.0, 5.0)
         if bonus != 0.0:
             b = float(np.nan_to_num(bonus, nan=0.0,
@@ -14486,7 +14717,42 @@ class _GpHedgePortfolio:
             rs[self.last_arm] += float(np.clip(b, -5.0, 5.0))
         self.rewards *= self.decay
         self.rewards += rs
+        # Per-arm real-world improvement bookkeeping (diagnostic only;
+        # ``bonus`` already feeds the improvement back into the
+        # selection-driving cumulative rewards above).
+        if real_improvement:
+            self.real_improvements[self.last_arm] += 1
+            self.improvement_sum[self.last_arm] += float(
+                max(real_improvement_amount, 0.0))
         self.last_arm = None
+
+    def normalise_bonus(self, raw_bonus: float, update_rms: bool = True):
+        """Map a raw observed-improvement signal to the std-normalized
+        reward scale used internally.
+
+        Bonuses arrive as ``log1p(observed_loss_gap)`` from the outer
+        BO loop, with magnitude depending entirely on the loss-scale
+        of the output being optimised (CE for class logits vs MSE for
+        a regression target vs Huber for habitability, …).  Without
+        normalising, a regression output with naturally large loss
+        gaps would feed jackpot bonuses on every winning iteration
+        and dominate the softmax even when its picks weren't
+        actually better than the competing arms'; a CE output with
+        sub-bit gaps would never accumulate enough bonus to bias
+        anything.
+
+        We track an EWMA of the absolute raw bonus magnitudes and
+        divide by it, so the normalised bonus is roughly O(1) on
+        every output regardless of loss scale — comparable to the
+        std-normalized counterfactual rewards from ``update_all``.
+        """
+        raw = float(np.nan_to_num(raw_bonus, nan=0.0,
+                                  posinf=10.0, neginf=-10.0))
+        if update_rms and abs(raw) > 1e-12:
+            a = self._bonus_ewma_alpha
+            self._bonus_rms = (1.0 - a) * self._bonus_rms + a * abs(raw)
+        denom = max(self._bonus_rms, 1e-3)
+        return float(np.clip(raw / denom, -3.0, 3.0))
 
     def ucb_beta(self):
         """Iteration-aware β for the UCB arm.
@@ -14501,10 +14767,26 @@ class _GpHedgePortfolio:
         return float(np.clip(beta, 0.5, 6.0))
 
     def status_str(self):
+        """Human-readable status: weight, total pulls, real wins, recent
+        picks distribution.
+
+        Format: ``name:wgt(pulls/wins)`` with a trailing ``recent=...``
+        slot showing the per-arm pulls over the last
+        ``_recent_picks_max`` iterations.  Recent-picks can disagree
+        with the cumulative pulls when a regime change is underway
+        (cumulative is dominated by the long history; recent reflects
+        the post-shift behaviour).
+        """
         w = self.weights()
-        return ' | '.join(
-            f"{name}:{w[i]:.2f}({int(self.pulls[i])})"
+        n = len(self.ARMS)
+        recent = np.bincount(np.asarray(self._recent_picks, dtype=np.int64),
+                             minlength=n) if self._recent_picks \
+            else np.zeros(n, dtype=np.int64)
+        body = ' | '.join(
+            f"{name}:{w[i]:.2f}({int(self.pulls[i])}/{int(self.real_improvements[i])})"
             for i, name in enumerate(self.ARMS))
+        recent_str = '/'.join(str(int(c)) for c in recent)
+        return f"{body} recent[{recent_str}] η={self.effective_eta():.2f}"
 
 
 def _dpp_greedy_batch(scores, vectors, k, length_scale=None,
@@ -15436,12 +15718,26 @@ class BayesianCGPOptimizer:
         vecs = np.asarray([self._encode(t) for t in candidate_trees],
                           dtype=np.float64)
         self._last_candidate_vecs = vecs
+        # Request the joint posterior covariance (not just diagonal std)
+        # so the Thompson arm can produce a proper joint sample.  The
+        # cost over ``return_std=True`` is essentially the same — both
+        # paths compute the M×N kernel projection internally; the
+        # ``return_cov`` path just keeps the M×M cross-block instead of
+        # discarding everything but its diagonal.  At our M ≤ ~256 the
+        # extra memory is negligible.  On any failure we fall back to
+        # ``return_std`` and the lite Thompson variant.
+        cov = None
         try:
-            mu, sigma = self.gp.predict(vecs, return_std=True)
+            mu, cov = self.gp.predict(vecs, return_cov=True)
+            sigma = np.sqrt(np.maximum(np.diag(cov), 1e-24))
         except Exception:
-            self._last_arm_name = None
-            self._arm_counterfactual_rewards = None
-            return np.random.rand(len(candidate_trees))
+            cov = None
+            try:
+                mu, sigma = self.gp.predict(vecs, return_std=True)
+            except Exception:
+                self._last_arm_name = None
+                self._arm_counterfactual_rewards = None
+                return np.random.rand(len(candidate_trees))
 
         best_f = getattr(self, 'current_best_f', 0.0)
         # Apply the adaptive xi multiplier on top of the iteration-decay
@@ -15460,13 +15756,21 @@ class BayesianCGPOptimizer:
         # zero, locking the softmax onto whichever arm happened to
         # find improvement first.
         beta = self._portfolio.ucb_beta() * max(0.25, float(self.xi_scale))
+        # LogPI uses a tighter xi than LogEI: PI is the exploitation-
+        # heavy member of the portfolio, so giving it the same xi as
+        # EI would dilute its specialisation.  Halving xi for PI biases
+        # it toward picks that are sub-best_f (improvement-by-luck)
+        # and lets it complement EI rather than mimic it.
         all_scores = {
             'logei': _log_expected_improvement(mu, sigma, best_f,
                                                 effective_xi),
             'ucb':   _upper_confidence_bound(mu, sigma, beta=beta),
             'logpi': _log_probability_of_improvement(mu, sigma, best_f,
-                                                     effective_xi),
-            'ts':    _thompson_lite(mu, sigma),
+                                                     effective_xi * 0.5),
+            'ts':    _thompson_joint(mu, cov)
+                    if cov is not None
+                    else _thompson_lite(mu, sigma),
+            'pe':    _pure_exploration(sigma),
         }
 
         # Counterfactual reward for each arm: the surrogate's predicted
@@ -15531,13 +15835,21 @@ class BayesianCGPOptimizer:
                                     # median-distance default
         k_int = int(k)
         # Quality-vs-diversity balance: when the portfolio just picked
-        # the exploration-heavy "ts" arm we crank up the diversity
+        # an exploration-heavy arm we crank up the diversity
         # temperature so the batch spreads even further.  For "logpi"
         # (exploitation-heavy) we keep T low so the batch hugs the
-        # acquisition mode tightly.
+        # acquisition mode tightly.  PE (max-σ) doesn't need extra
+        # diversity from the DPP — its score is already
+        # variance-driven, which spreads picks naturally — but we
+        # raise T modestly so the cluster around the σ peak gets
+        # broken up.
         arm_name = getattr(self, '_last_arm_name', None)
         if arm_name == 'ts':
             quality_T = 3.0
+        elif arm_name == 'pe':
+            quality_T = 2.0
+        elif arm_name == 'ucb':
+            quality_T = 1.5
         elif arm_name == 'logpi':
             quality_T = 0.5
         else:
@@ -15623,21 +15935,30 @@ class BayesianCGPOptimizer:
             # surrogate alone can attribute.  ``log1p`` keeps the
             # mapping monotone but compresses jackpot improvements so
             # one lucky iteration can't dominate the cumulative
-            # bookkeeper.  Small magnitude (≤ ~1 in practice) keeps
-            # the bonus comparable to the per-iter centered
-            # counterfactual rewards (which are also O(1)).
+            # bookkeeper.  We then divide by the rolling RMS of recent
+            # bonuses (``normalise_bonus``) so the magnitude stays
+            # roughly O(1) on every output regardless of loss scale —
+            # CE outputs with sub-bit gaps and MSE outputs with
+            # double-digit gaps both end up feeding O(1) bonuses to
+            # the std-normalized counterfactual rewards in
+            # ``update_all``.
             if improved or inferred_amount > 0:
-                bonus = float(np.log1p(max(inferred_amount, 0.0)))
-                if bonus <= 0:
-                    bonus = 0.25  # buffer transform compressed the
-                                  # gap — small positive nudge so the
-                                  # arm isn't penalised for an
-                                  # improvement that genuinely
-                                  # happened.
+                raw_bonus = float(np.log1p(max(inferred_amount, 0.0)))
+                if raw_bonus <= 0:
+                    raw_bonus = 0.25  # buffer transform compressed the
+                                      # gap — small positive nudge so
+                                      # the arm isn't penalised for an
+                                      # improvement that genuinely
+                                      # happened.
+                bonus = self._portfolio.normalise_bonus(raw_bonus,
+                                                       update_rms=True)
             else:
-                bonus = -0.05  # mild penalty so an arm that keeps
-                               # nominating no-op picks slowly loses
-                               # share.
+                # Mild penalty so an arm that keeps nominating no-op
+                # picks slowly loses share.  Skip the rolling-RMS
+                # update for the penalty branch — the RMS tracks
+                # IMPROVEMENT magnitudes, not the constant penalty
+                # baseline.
+                bonus = -0.05
 
             cf = getattr(self, '_arm_counterfactual_rewards', None)
             if cf is not None and len(cf) == len(self._portfolio.ARMS):
@@ -15645,8 +15966,14 @@ class BayesianCGPOptimizer:
                 # reward (μ at its top pick) plus the picked arm gets
                 # the observed bonus.  Centering inside ``update_all``
                 # eliminates absolute μ-scale drift so cumulative
-                # rewards only track relative arm performance.
-                self._portfolio.update_all(cf, bonus=bonus)
+                # rewards only track relative arm performance.  We
+                # also forward the real-improvement flag + amount so
+                # the portfolio can update its diagnostic counters.
+                self._portfolio.update_all(
+                    cf,
+                    bonus=bonus,
+                    real_improvement=bool(improved or inferred_amount > 0),
+                    real_improvement_amount=float(max(inferred_amount, 0.0)))
             else:
                 # Legacy single-arm fallback (e.g. GP not yet fitted,
                 # or score_candidates raised before stashing cf).
