@@ -15687,10 +15687,23 @@ if HAS_SKLEARN_GP:
             sections.append((cur, cur + _BO_MULTICLASS_FEATURE_DIMS))
             cur += _BO_MULTICLASS_FEATURE_DIMS
 
+        # Length-scale upper bound widens with section size so high-dim
+        # sections (large probe blocks at ``CGP_NODES`` ≥ 100) can land
+        # on the broader-smoothness end of the L-BFGS-B search.  The
+        # original (1e-2, 1e2) cap clipped fitted length scales at 100
+        # which corresponded to "tight detail" once the encoding had
+        # 60+ probe cells; the GP then over-fit local noise in the
+        # phenotype block.  Bound stays at 1e2 for short sections so
+        # small-graph runs keep the historical behaviour.
+        def _ls_bounds(span):
+            if span >= 32:
+                return (1e-2, 1e3)
+            return (1e-2, 1e2)
+
         section_kernels = [
             _BO_SlicedMatern(start, stop,
                              length_scale=1.0,
-                             length_scale_bounds=(1e-2, 1e2),
+                             length_scale_bounds=_ls_bounds(stop - start),
                              nu=2.5)
             for (start, stop) in sections if stop > start
         ]
@@ -15705,6 +15718,87 @@ if HAS_SKLEARN_GP:
         return (ConstantKernel(1.0, (1e-3, 1e3)) * kernel
                 + WhiteKernel(noise_level=0.1,
                               noise_level_bounds=(1e-5, 1e1)))
+
+
+# ── Scalability helpers for high-complexity search spaces ──────────────
+# When ``max_nodes`` is large (e.g. 200) and the dataset is complex, fixed
+# mutation-rate distributions ``[1, 1, 2, 2, 3, 5]`` only ever edit ~1-3%
+# of the genome per candidate.  The search then stalls because EI keeps
+# proposing near-identical mutations of the same template.  These helpers
+# scale the per-call mutation strength with the size of the search space
+# AND with each optimiser's TuRBO-lite trust region — so a stuck output
+# automatically takes broader strokes while a converging one keeps the
+# refinement-sized edits.
+
+def _bo_sample_mut_rate(max_nodes: int, scale: float = 1.0,
+                        heavy: bool = False) -> int:
+    """Sample a CGP mutation rate scaled to ``max_nodes`` and a trust-region
+    multiplier ``scale``.
+
+    Returns an integer ``k`` (≥ 1) drawn from a discrete distribution
+    whose mass is roughly proportional to ``1/k`` (Zipf-lite).  The
+    distribution's TAIL (rare heavy mutations) grows with ``max_nodes``
+    so 200-node trees can take 10-20 edits in a single call when the
+    trust region asks for it, while small (32-50 node) trees keep their
+    current ``[1, 1, 2, 2, 3, 5]`` behaviour.
+
+    Parameters
+    ----------
+    max_nodes : int
+        The CGP genome size (``tree.max_nodes``).  Caps the maximum draw
+        at ``max_nodes // 4`` so even a heavy-tailed sample can't try to
+        rewrite more than a quarter of the graph in one go.
+    scale : float
+        Trust-region multiplier in ~[0.25, 4.0].  Values >1 push the draw
+        toward bigger mutations (expansion mode); values <1 shrink toward
+        the small-edit head of the distribution.
+    heavy : bool
+        When True, double the tail length — used by macro / random-restart
+        callers that want occasional very large edits.
+    """
+    # Baseline rate that grows with max_nodes — anchored so 50-node trees
+    # get the historic distribution back.
+    base_mean = max(1.5, max_nodes / 25.0)
+    if heavy:
+        base_mean *= 2.0
+    base_mean *= max(0.25, float(scale))
+    # Discrete inverse-CDF over a small support so we keep occasional
+    # 1-edit picks for fine polishing even at large scales.
+    tail = max(5, int(round(base_mean * 4.0)))
+    cap = max(2, int(max_nodes) // 4)
+    tail = min(tail, cap)
+    # Build a 1/k weighted distribution from 1..tail
+    ks = list(range(1, tail + 1))
+    weights = [1.0 / k for k in ks]
+    return int(random.choices(ks, weights=weights, k=1)[0])
+
+
+def _bo_pool_size(max_nodes: int, base: int = 10) -> int:
+    """Suggest a parent-pool size that grows with ``max_nodes``.
+
+    Bigger genomes need more structural diversity in the parent pool —
+    a 10-deep top_inds is fine for 50-node trees but starves the
+    candidate generator of templates once 200-node trees are in play.
+    """
+    return int(max(base, base + (max_nodes - 50) // 10))
+
+
+def _bo_probe_cap(n_features: int, max_nodes: int) -> int:
+    """Adaptive cap on the phenotype probe size.
+
+    The previous hard cap of 32 was tuned for 50-node graphs over 10-ish
+    features.  For 200-node graphs over many features, a 32-row probe is
+    too coarse to discriminate phenotypes — sister templates collapse to
+    the same encoding cell and EI ranking degrades.  We let the cap grow
+    softly with both inputs while keeping ``cgp_to_vector`` evaluation
+    cheap (each probe row is a single ``cgp_eq.evaluate`` call).
+    """
+    cap = 32
+    if max_nodes > 80:
+        cap += min(32, (max_nodes - 80) // 4)
+    if n_features > 12:
+        cap += min(16, (n_features - 12) // 2)
+    return max(20, int(cap))
 
 
 class BayesianCGPOptimizer:
@@ -15778,7 +15872,16 @@ class BayesianCGPOptimizer:
         # memo bounded; the cache is regenerated on demand on miss.
         self._encoding_cache: dict = {}
         self._encoding_cache_order: list = []
-        self._encoding_cache_maxsize = 4096
+        # Cache scales with the global candidate budget so high-complexity
+        # runs (200 nodes × 1000+ candidates/iter) don't thrash the cache
+        # and force every screen pass to re-evaluate the X_probe set.  The
+        # baseline of 4096 was sized for the default 200 candidates/iter
+        # and stopped paying its way once BAYESIAN_N_CANDIDATES doubled.
+        try:
+            _cache_cap = max(4096, int(BAYESIAN_N_CANDIDATES) * 8 + 2048)
+        except Exception:
+            _cache_cap = 4096
+        self._encoding_cache_maxsize = int(min(_cache_cap, 65536))
         self._encoding_hits = 0
         self._encoding_misses = 0
 
@@ -15797,6 +15900,37 @@ class BayesianCGPOptimizer:
         self.xi_scale = 1.0           # current adaptive multiplier
         self._xi_scale_min = 0.5
         self._xi_scale_max = 4.0
+
+        # ── TuRBO-lite mutation-strength trust region ────────────────────
+        # ``tr_mut_scale`` is a separate multiplier on the candidate-
+        # generation MUTATION RATE distribution.  When the surrogate keeps
+        # finding wins we contract toward small edits (focus near best);
+        # when it stalls we expand toward bigger structural rewrites so
+        # the search can jump out of the current basin.  Unlike
+        # ``xi_scale`` (which biases EI ranking) this multiplier directly
+        # changes which CANDIDATES are generated.  Both knobs evolve
+        # independently — xi handles "explore more carefully", mutation
+        # scale handles "explore further away".
+        self.tr_mut_scale = 1.0
+        self._tr_mut_scale_min = 0.4
+        self._tr_mut_scale_max = 4.0
+        # Restart bookkeeping: when both xi and mutation scale max out
+        # AND we still haven't seen improvement for ``tr_restart_patience``
+        # iterations, the trust region effectively collapsed — we trigger
+        # a soft restart that resets the multipliers and SIGNALS the
+        # outer loop (via ``tr_restart_pending``) to inject extra random
+        # candidates that iteration so the search can re-seed.
+        self.tr_restart_count = 0
+        self.tr_restart_pending = False
+        self._tr_stuck_iters = 0
+        # ``patience=3`` expansion events ≈ 9 consecutive iterations of
+        # no improvement, which is the point at which "stuck in this
+        # basin" is far more likely than "next iteration will recover".
+        # Restarting then injects the random / macro candidate flood
+        # that the trust-region expansion alone wouldn't produce.
+        self._tr_restart_patience = 3
+        self._tr_total_fail_iters = 0
+        self._tr_total_success_iters = 0
         # Last-batch EI vectors cache, used by ``select_diverse_batch``
         # to do local-penalised batch construction without re-encoding.
         self._last_candidate_vecs = None
@@ -16111,17 +16245,51 @@ class BayesianCGPOptimizer:
         # ``GaussianProcessRegressor.fit`` is O(N^3), and the Islands /
         # QD variants can hand us up to ``BAYESIAN_MAX_GP_POINTS`` (500)
         # observations on the very first fit.  Beyond ~250 points the
-        # marginal accuracy gain doesn't justify the cubic blow-up.  We
-        # always keep the top-fitness half of the buffer (so promising
-        # regions stay densely modelled) and uniformly subsample the
-        # rest for broader coverage.
+        # marginal accuracy gain doesn't justify the cubic blow-up.
+        #
+        # Selection strategy:
+        #   * top half by fitness: keep promising regions densely modelled
+        #   * rest: pick a DPP-diverse subsample over the encoded vectors
+        #     so the GP retains uncertainty information about distinct
+        #     basins instead of collapsing onto whichever happened to be
+        #     uniformly sampled.  Uniform random was cheap but at large
+        #     buffers tended to over-represent dense low-fitness regions
+        #     and under-represent the structural variety that the section-
+        #     grouped Matérn was designed to model.
         if len(y_finite) > _BO_GP_FIT_CAP:
             order = np.argsort(-y_finite)               # best first
             n_top = _BO_GP_FIT_CAP // 2
             top_idx = order[:n_top]
             rest = order[n_top:]
-            rest_pick = np.random.choice(
-                rest, size=_BO_GP_FIT_CAP - n_top, replace=False)
+            rest_take = _BO_GP_FIT_CAP - n_top
+            rest_pick = None
+            # Try DPP-diverse selection on the non-top entries.  Use the
+            # remaining fitness gap as the "quality" signal (centred so
+            # all candidates carry positive weight), and the encoded
+            # vectors as the diversity geometry.  Fall back to uniform
+            # random when DPP comes up short (singular kernel, small
+            # rest pool, etc.).
+            if rest_take > 0 and len(rest) > rest_take * 1.5:
+                try:
+                    rest_vecs = X[rest]
+                    rest_scores = y_finite[rest]
+                    # Centre + slight shift so DPP quality weights are
+                    # strictly positive even when the GP target is
+                    # negated log-loss (range ≤ 0).
+                    rs = rest_scores - rest_scores.min() + 1e-6
+                    dpp_idx = _dpp_greedy_batch(
+                        rs, rest_vecs, int(rest_take),
+                        length_scale=self._gp_length_scale,
+                        quality_temperature=1.0)
+                    if dpp_idx is not None and dpp_idx.size >= rest_take:
+                        rest_pick = np.asarray(
+                            [rest[k] for k in dpp_idx[:rest_take]],
+                            dtype=np.int64)
+                except Exception:
+                    rest_pick = None
+            if rest_pick is None or rest_pick.size < rest_take:
+                rest_pick = np.random.choice(
+                    rest, size=rest_take, replace=False)
             keep = np.concatenate([top_idx, rest_pick])
             X = X[keep]
             y_finite = y_finite[keep]
@@ -16408,17 +16576,49 @@ class BayesianCGPOptimizer:
         if improved:
             self._success_streak += 1
             self._failure_streak = 0
+            self._tr_total_success_iters += 1
+            self._tr_stuck_iters = 0
             if self._success_streak >= 2:
                 self.xi_scale = max(self._xi_scale_min,
                                     self.xi_scale * 0.85)
+                # Contract the mutation-strength trust region too —
+                # once we're winning, polish around the current best
+                # instead of taking bigger swings.  Slower contraction
+                # than expansion so we don't snap shut after one win.
+                self.tr_mut_scale = max(self._tr_mut_scale_min,
+                                        self.tr_mut_scale * 0.9)
                 self._success_streak = 0
         else:
             self._failure_streak += 1
             self._success_streak = 0
+            self._tr_total_fail_iters += 1
             if self._failure_streak >= 3:
                 self.xi_scale = min(self._xi_scale_max,
                                     self.xi_scale * 1.5)
+                # Expand mutation strength faster than xi — broader
+                # structural exploration is the more efficient escape
+                # when the surrogate's prediction is wrong about which
+                # direction holds the next improvement.
+                self.tr_mut_scale = min(self._tr_mut_scale_max,
+                                        self.tr_mut_scale * 1.6)
                 self._failure_streak = 0
+                self._tr_stuck_iters += 1
+
+        # TuRBO restart: trust region has collapsed when both knobs are
+        # at their maximum AND we've burnt the patience budget without
+        # finding improvement.  Reset to defaults and SIGNAL the outer
+        # loop to inject extra random candidates next iteration so the
+        # search can re-seed from a fresh starting point.
+        if (self.xi_scale >= self._xi_scale_max * 0.999
+                and self.tr_mut_scale >= self._tr_mut_scale_max * 0.999
+                and self._tr_stuck_iters >= self._tr_restart_patience):
+            self.xi_scale = 1.0
+            self.tr_mut_scale = 1.0
+            self._success_streak = 0
+            self._failure_streak = 0
+            self._tr_stuck_iters = 0
+            self.tr_restart_count += 1
+            self.tr_restart_pending = True
 
         # Infer improvement amount from the optimiser's own buffer when
         # the caller didn't supply one.  We use the gap between the
@@ -16506,6 +16706,33 @@ class BayesianCGPOptimizer:
         sorted_inds = sorted(self.individuals, key=lambda x: x.loss)
         return sorted_inds[:n]
 
+    def consume_restart_flag(self) -> bool:
+        """Pop the TuRBO restart signal.
+
+        The outer BO loop calls this once per iteration; when ``True`` is
+        returned the loop should inject a chunk of fresh random / seeded
+        candidates so the search re-roots after a trust-region collapse.
+        The flag is one-shot — ``record_iteration_outcome`` sets it, the
+        next acquisition pass consumes it, and the cycle resets.
+        """
+        flag = bool(self.tr_restart_pending)
+        self.tr_restart_pending = False
+        return flag
+
+    def trust_region_info(self) -> dict:
+        """Snapshot of the trust-region state for logging / candidate
+        generation.  ``mut_scale`` is the multiplier passed to
+        ``_bo_sample_mut_rate`` for this iteration's mutations.
+        """
+        return {
+            'xi_scale':       float(self.xi_scale),
+            'mut_scale':      float(self.tr_mut_scale),
+            'restart_count':  int(self.tr_restart_count),
+            'stuck_iters':    int(self._tr_stuck_iters),
+            'fail_iters':     int(self._tr_total_fail_iters),
+            'success_iters':  int(self._tr_total_success_iters),
+        }
+
     def summary_str(self):
         n = len(self.X_observed)
         best_loss = min(ind.loss for ind in self.individuals) if self.individuals else float('inf')
@@ -16521,6 +16748,14 @@ class BayesianCGPOptimizer:
                 base += f", acq=[{self._portfolio.status_str()}]"
         except Exception:
             pass
+        # Append trust-region status when the multipliers have drifted from
+        # 1.0 (no point pretending the TR is doing work when it isn't).
+        if (abs(self.xi_scale - 1.0) > 0.05
+                or abs(self.tr_mut_scale - 1.0) > 0.05
+                or self.tr_restart_count > 0):
+            base += (f", TR(xi×{self.xi_scale:.2f}, "
+                     f"mut×{self.tr_mut_scale:.2f}, "
+                     f"restarts={self.tr_restart_count})")
         return base
 
 
@@ -16791,7 +17026,12 @@ def run_bayesian_afpo(X, Y, n_features, n_outputs, feat_names, out_types,
     # phenotypic responses between candidates), so scale gently with
     # ``n_features`` while staying within the 32-row soft cap that keeps
     # cgp_to_vector evaluation cheap.
-    _probe_n = min(max(20, n_features * 2), 32, X.shape[0])
+    # Probe cap grows with CGP_NODES and n_features (see ``_bo_probe_cap``)
+    # so 200-node trees and high-dim datasets get a richer phenotype signal
+    # in the GP encoding.  Capped above by the training-set size.
+    _probe_n = min(max(20, n_features * 2),
+                   _bo_probe_cap(n_features, CGP_NODES),
+                   X.shape[0])
     _probe_idx = np.random.choice(X.shape[0], _probe_n, replace=False)
     X_probe = X[_probe_idx]
 
@@ -16947,30 +17187,50 @@ def run_bayesian_afpo(X, Y, n_features, n_outputs, feat_names, out_types,
                 # of its mutations rewiring to irrelevant variables.
                 set_feature_priors(feature_priors[o_idx])
 
+                # TuRBO trust-region scaling for AFPO mutations.
+                _tr = opt.trust_region_info()
+                _tr_mut_scale = _tr['mut_scale']
+                _tr_restart = opt.consume_restart_flag()
+                if _tr_restart:
+                    print(f"  [BO AFPO iter {iteration} | Out {o_idx}] "
+                          f"TuRBO restart #{_tr['restart_count']} — "
+                          "re-seeding for fresh exploration.")
+                if _tr_restart:
+                    _frac_exploit, _frac_cross, _frac_macro, _frac_hof_x = (
+                        0.35, 0.10, 0.20, 0.10)
+                else:
+                    _frac_exploit, _frac_cross, _frac_macro, _frac_hof_x = (
+                        0.60, 0.15, 0.10, 0.10)
+
                 candidate_trees = []
-                
-                # We draw candidates by mutating the AFPO population
-                n_exploit = int(BAYESIAN_N_CANDIDATES * 0.6)
+
+                # We draw candidates by mutating the AFPO population.
+                n_exploit = int(BAYESIAN_N_CANDIDATES * _frac_exploit)
                 for _ in range(n_exploit):
                     parent = random.choice(pop) if pop else Individual(random_cgp(n_features, CGP_NODES, feat_names))
-                    rate = random.choice([1, 1, 2, 2, 3, 5])
+                    _mn = getattr(parent.tree, 'max_nodes', CGP_NODES)
+                    rate = _bo_sample_mut_rate(_mn, scale=_tr_mut_scale,
+                                               heavy=_tr_restart)
                     child_tree = mutate(parent.tree, n_features, feat_names,
                                         mut_rate=rate, temperature=0.0,
                                         op_affinity=_bo_op_affinity)
                     candidate_trees.append(child_tree)
 
-                n_cross = int(BAYESIAN_N_CANDIDATES * 0.15)
+                n_cross = int(BAYESIAN_N_CANDIDATES * _frac_cross)
                 for _ in range(n_cross):
                     if len(pop) >= 2:
                         p1, p2 = random.sample(pop, 2)
                         child_tree = crossover(p1.tree, p2.tree)
+                        _mn = getattr(child_tree, 'max_nodes', CGP_NODES)
                         child_tree = mutate(child_tree, n_features, feat_names,
-                                            mut_rate=1, op_affinity=_bo_op_affinity)
+                                            mut_rate=_bo_sample_mut_rate(
+                                                _mn, scale=_tr_mut_scale * 0.5),
+                                            op_affinity=_bo_op_affinity)
                     else:
                         child_tree = random_cgp(n_features, CGP_NODES, feat_names)
                     candidate_trees.append(child_tree)
 
-                n_macro = int(BAYESIAN_N_CANDIDATES * 0.10)
+                n_macro = int(BAYESIAN_N_CANDIDATES * _frac_macro)
                 for _ in range(n_macro):
                     parent = random.choice(pop) if pop else Individual(random_cgp(n_features, CGP_NODES, feat_names))
                     _macro_choices = ['grow', 'prune', 'graft', 'rational',
@@ -16996,14 +17256,16 @@ def run_bayesian_afpo(X, Y, n_features, n_outputs, feat_names, out_types,
                         ct = macro_trig_identity(parent.tree, n_features)
                     candidate_trees.append(ct)
 
-                n_hof_cross = int(BAYESIAN_N_CANDIDATES * 0.10)
+                n_hof_cross = int(BAYESIAN_N_CANDIDATES * _frac_hof_x)
                 hof_inds_bo = list(hofs[o_idx].best_by_complexity.values())
                 if len(hof_inds_bo) >= 2:
                     for _ in range(n_hof_cross):
                         p1, p2 = random.sample(hof_inds_bo, 2)
                         child_tree = crossover(p1.tree, p2.tree)
+                        _mn = getattr(child_tree, 'max_nodes', CGP_NODES)
                         child_tree = mutate(child_tree, n_features, feat_names,
-                                            mut_rate=random.choice([1, 2]),
+                                            mut_rate=_bo_sample_mut_rate(
+                                                _mn, scale=_tr_mut_scale * 0.6),
                                             op_affinity=_bo_op_affinity)
                         candidate_trees.append(child_tree)
                 else:
@@ -17208,7 +17470,12 @@ def run_bayesian_islands(X, Y, n_features, n_outputs, feat_names, out_types,
     # phenotypic responses between candidates), so scale gently with
     # ``n_features`` while staying within the 32-row soft cap that keeps
     # cgp_to_vector evaluation cheap.
-    _probe_n = min(max(20, n_features * 2), 32, X.shape[0])
+    # Probe cap grows with CGP_NODES and n_features (see ``_bo_probe_cap``)
+    # so 200-node trees and high-dim datasets get a richer phenotype signal
+    # in the GP encoding.  Capped above by the training-set size.
+    _probe_n = min(max(20, n_features * 2),
+                   _bo_probe_cap(n_features, CGP_NODES),
+                   X.shape[0])
     _probe_idx = np.random.choice(X.shape[0], _probe_n, replace=False)
     X_probe = X[_probe_idx]
 
@@ -17357,33 +17624,56 @@ def run_bayesian_islands(X, Y, n_features, n_outputs, feat_names, out_types,
                 # of its mutations rewiring to irrelevant variables.
                 set_feature_priors(feature_priors[o_idx])
 
+                # TuRBO trust-region scaling for Islands mutations.
+                # Consumed ONCE per output (not per island) so the restart
+                # signal isn't burnt on the first island and then ignored
+                # by the rest.
+                _tr = opt.trust_region_info()
+                _tr_mut_scale = _tr['mut_scale']
+                _tr_restart = opt.consume_restart_flag()
+                if _tr_restart:
+                    print(f"  [BO Islands iter {iteration} | Out {o_idx}] "
+                          f"TuRBO restart #{_tr['restart_count']} — "
+                          "re-seeding for fresh exploration.")
+                if _tr_restart:
+                    _frac_exploit, _frac_cross, _frac_macro, _frac_hof_x = (
+                        0.35, 0.10, 0.20, 0.10)
+                else:
+                    _frac_exploit, _frac_cross, _frac_macro, _frac_hof_x = (
+                        0.60, 0.15, 0.10, 0.10)
+
                 for island_idx in range(NUM_ISLANDS):
                     pop = islands_pop[island_idx][o_idx]
                     top_inds = pop[:max(1, len(pop)//2)]
 
                     candidate_trees = []
-                    
-                    n_exploit = int(BAYESIAN_N_CANDIDATES * 0.6)
+
+                    n_exploit = int(BAYESIAN_N_CANDIDATES * _frac_exploit)
                     for _ in range(n_exploit):
                         parent = random.choice(top_inds) if top_inds else Individual(random_cgp(n_features, CGP_NODES, feat_names))
-                        rate = random.choice([1, 1, 2, 2, 3, 5])
+                        _mn = getattr(parent.tree, 'max_nodes', CGP_NODES)
+                        rate = _bo_sample_mut_rate(_mn, scale=_tr_mut_scale,
+                                                   heavy=_tr_restart)
                         child_tree = mutate(parent.tree, n_features, feat_names,
                                             mut_rate=rate, temperature=0.0,
                                             op_affinity=_bo_op_affinity)
                         candidate_trees.append(child_tree)
 
-                    n_cross = int(BAYESIAN_N_CANDIDATES * 0.15)
+                    n_cross = int(BAYESIAN_N_CANDIDATES * _frac_cross)
                     for _ in range(n_cross):
                         if len(top_inds) >= 2:
                             p1, p2 = random.sample(top_inds, 2)
                             child_tree = crossover(p1.tree, p2.tree)
+                            _mn = getattr(child_tree, 'max_nodes', CGP_NODES)
                             child_tree = mutate(child_tree, n_features, feat_names,
-                                                mut_rate=1, op_affinity=_bo_op_affinity)
+                                                mut_rate=_bo_sample_mut_rate(
+                                                    _mn, scale=_tr_mut_scale * 0.5),
+                                                op_affinity=_bo_op_affinity)
                         else:
                             child_tree = random_cgp(n_features, CGP_NODES, feat_names)
                         candidate_trees.append(child_tree)
 
-                    n_macro = int(BAYESIAN_N_CANDIDATES * 0.10)
+                    n_macro = int(BAYESIAN_N_CANDIDATES * _frac_macro)
                     for _ in range(n_macro):
                         parent = random.choice(top_inds) if top_inds else Individual(random_cgp(n_features, CGP_NODES, feat_names))
                         _macro_choices = ['grow', 'prune', 'graft', 'rational',
@@ -17409,14 +17699,16 @@ def run_bayesian_islands(X, Y, n_features, n_outputs, feat_names, out_types,
                             ct = macro_trig_identity(parent.tree, n_features)
                         candidate_trees.append(ct)
 
-                    n_hof_cross = int(BAYESIAN_N_CANDIDATES * 0.10)
+                    n_hof_cross = int(BAYESIAN_N_CANDIDATES * _frac_hof_x)
                     hof_inds_bo = list(hofs[o_idx].best_by_complexity.values())
                     if len(hof_inds_bo) >= 2:
                         for _ in range(n_hof_cross):
                             p1, p2 = random.sample(hof_inds_bo, 2)
                             child_tree = crossover(p1.tree, p2.tree)
+                            _mn = getattr(child_tree, 'max_nodes', CGP_NODES)
                             child_tree = mutate(child_tree, n_features, feat_names,
-                                                mut_rate=random.choice([1, 2]),
+                                                mut_rate=_bo_sample_mut_rate(
+                                                    _mn, scale=_tr_mut_scale * 0.6),
                                                 op_affinity=_bo_op_affinity)
                             candidate_trees.append(child_tree)
                     else:
@@ -17624,7 +17916,12 @@ def run_bayesian_islanded_afpo(X, Y, n_features, n_outputs, feat_names, out_type
     # phenotypic responses between candidates), so scale gently with
     # ``n_features`` while staying within the 32-row soft cap that keeps
     # cgp_to_vector evaluation cheap.
-    _probe_n = min(max(20, n_features * 2), 32, X.shape[0])
+    # Probe cap grows with CGP_NODES and n_features (see ``_bo_probe_cap``)
+    # so 200-node trees and high-dim datasets get a richer phenotype signal
+    # in the GP encoding.  Capped above by the training-set size.
+    _probe_n = min(max(20, n_features * 2),
+                   _bo_probe_cap(n_features, CGP_NODES),
+                   X.shape[0])
     _probe_idx = np.random.choice(X.shape[0], _probe_n, replace=False)
     X_probe = X[_probe_idx]
 
@@ -17767,35 +18064,57 @@ def run_bayesian_islanded_afpo(X, Y, n_features, n_outputs, feat_names, out_type
                 # of its mutations rewiring to irrelevant variables.
                 set_feature_priors(feature_priors[o_idx])
 
+                # TuRBO trust-region scaling for Islanded-AFPO mutations.
+                # Consumed once per output (not per island) — see
+                # ``run_bayesian_islands`` for the rationale.
+                _tr = opt.trust_region_info()
+                _tr_mut_scale = _tr['mut_scale']
+                _tr_restart = opt.consume_restart_flag()
+                if _tr_restart:
+                    print(f"  [BO IslandedAFPO iter {iteration} | Out {o_idx}] "
+                          f"TuRBO restart #{_tr['restart_count']} — "
+                          "re-seeding for fresh exploration.")
+                if _tr_restart:
+                    _frac_exploit, _frac_cross, _frac_macro, _frac_hof_x = (
+                        0.35, 0.10, 0.20, 0.10)
+                else:
+                    _frac_exploit, _frac_cross, _frac_macro, _frac_hof_x = (
+                        0.60, 0.15, 0.10, 0.10)
+
                 for island_idx in range(NUM_ISLANDS):
                     pop = islands_pop[island_idx][o_idx]
-                    
+
                     for ind in pop:
                         ind.age += 1
 
                     candidate_trees = []
-                    
-                    n_exploit = int(BAYESIAN_N_CANDIDATES * 0.6)
+
+                    n_exploit = int(BAYESIAN_N_CANDIDATES * _frac_exploit)
                     for _ in range(n_exploit):
                         parent = random.choice(pop) if pop else Individual(random_cgp(n_features, CGP_NODES, feat_names))
-                        rate = random.choice([1, 1, 2, 2, 3, 5])
+                        _mn = getattr(parent.tree, 'max_nodes', CGP_NODES)
+                        rate = _bo_sample_mut_rate(_mn, scale=_tr_mut_scale,
+                                                   heavy=_tr_restart)
                         child_tree = mutate(parent.tree, n_features, feat_names,
                                             mut_rate=rate, temperature=0.0,
                                             op_affinity=_bo_op_affinity)
                         candidate_trees.append(child_tree)
 
-                    n_cross = int(BAYESIAN_N_CANDIDATES * 0.15)
+                    n_cross = int(BAYESIAN_N_CANDIDATES * _frac_cross)
                     for _ in range(n_cross):
                         if len(pop) >= 2:
                             p1, p2 = random.sample(pop, 2)
                             child_tree = crossover(p1.tree, p2.tree)
+                            _mn = getattr(child_tree, 'max_nodes', CGP_NODES)
                             child_tree = mutate(child_tree, n_features, feat_names,
-                                                mut_rate=1, op_affinity=_bo_op_affinity)
+                                                mut_rate=_bo_sample_mut_rate(
+                                                    _mn, scale=_tr_mut_scale * 0.5),
+                                                op_affinity=_bo_op_affinity)
                         else:
                             child_tree = random_cgp(n_features, CGP_NODES, feat_names)
                         candidate_trees.append(child_tree)
 
-                    n_macro = int(BAYESIAN_N_CANDIDATES * 0.10)
+                    n_macro = int(BAYESIAN_N_CANDIDATES * _frac_macro)
                     for _ in range(n_macro):
                         parent = random.choice(pop) if pop else Individual(random_cgp(n_features, CGP_NODES, feat_names))
                         _macro_choices = ['grow', 'prune', 'graft', 'rational',
@@ -17821,14 +18140,16 @@ def run_bayesian_islanded_afpo(X, Y, n_features, n_outputs, feat_names, out_type
                             ct = macro_trig_identity(parent.tree, n_features)
                         candidate_trees.append(ct)
 
-                    n_hof_cross = int(BAYESIAN_N_CANDIDATES * 0.10)
+                    n_hof_cross = int(BAYESIAN_N_CANDIDATES * _frac_hof_x)
                     hof_inds_bo = list(hofs[o_idx].best_by_complexity.values())
                     if len(hof_inds_bo) >= 2:
                         for _ in range(n_hof_cross):
                             p1, p2 = random.sample(hof_inds_bo, 2)
                             child_tree = crossover(p1.tree, p2.tree)
+                            _mn = getattr(child_tree, 'max_nodes', CGP_NODES)
                             child_tree = mutate(child_tree, n_features, feat_names,
-                                                mut_rate=random.choice([1, 2]),
+                                                mut_rate=_bo_sample_mut_rate(
+                                                    _mn, scale=_tr_mut_scale * 0.6),
                                                 op_affinity=_bo_op_affinity)
                             candidate_trees.append(child_tree)
                     else:
@@ -18022,19 +18343,28 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
     print("\n" + "═" * 70)
     print("BAYESIAN CGP — Surrogate-Assisted Symbolic Regression")
     print("═" * 70)
+    print(f"  CGP nodes / max_nodes  : {CGP_NODES}")
     print(f"  Initial random samples : {BAYESIAN_INITIAL_SAMPLES}")
     print(f"  Batch size per iter    : {BAYESIAN_BATCH_SIZE}")
     print(f"  Candidates per iter    : {BAYESIAN_N_CANDIDATES}")
     print(f"  GP refit frequency     : every {BAYESIAN_GP_REFIT_FREQ} iterations")
     print(f"  GP max training points : {BAYESIAN_MAX_GP_POINTS}")
+    print(f"  GP fit cap (Cholesky)  : {_BO_GP_FIT_CAP}")
     print(f"  Exploration (xi)       : {BAYESIAN_EXPLORATION}")
+    print(f"  TuRBO trust region     : enabled (xi×[0.5..4.0], mut×[0.4..4.0])")
     print("═" * 70 + "\n")
 
     # Select phenotypic probe set: scale gently with n_features so the
     # surrogate has enough phenotypic signal in higher-dimensional regimes.
-    _probe_n = min(max(20, n_features * 2), 32, X.shape[0])
+    # Probe cap grows with CGP_NODES and n_features (see ``_bo_probe_cap``)
+    # so 200-node trees and high-dim datasets get a richer phenotype signal
+    # in the GP encoding.  Capped above by the training-set size.
+    _probe_n = min(max(20, n_features * 2),
+                   _bo_probe_cap(n_features, CGP_NODES),
+                   X.shape[0])
     _probe_idx = np.random.choice(X.shape[0], _probe_n, replace=False)
     X_probe = X[_probe_idx]
+    print(f"  Phenotype probe size   : {_probe_n} rows\n")
 
     # Detect one-hot class groups UP-FRONT so each per-output optimiser
     # can reserve the multi-class phenotype block in its kernel from the
@@ -18216,12 +18546,15 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
                 # Sort the union by loss before truncating; ``best_by_complexity``
                 # iterates in dict-insertion order and a HoF that fills early
                 # would otherwise push the buffer's best entries past the
-                # 10-slot cut-off purely by ordering accident.
+                # ``pool_size``-slot cut-off purely by ordering accident.  Pool
+                # size grows with ``CGP_NODES`` so larger search spaces draw
+                # from a wider structural variety of parents.
+                _bo_top_pool = _bo_pool_size(CGP_NODES)
                 hof_inds_for_top = list(hofs[o_idx].best_by_complexity.values())
-                buf_top          = opt.get_best_individuals(n=10)
+                buf_top          = opt.get_best_individuals(n=_bo_top_pool)
                 combined         = hof_inds_for_top + buf_top
                 combined.sort(key=lambda x: x.loss)
-                top_inds = combined[:10]
+                top_inds = combined[:_bo_top_pool]
                 if not top_inds:
                     top_inds = [Individual(random_cgp(n_features, CGP_NODES, feat_names))]
 
@@ -18242,33 +18575,68 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
                 # of its mutations rewiring to irrelevant variables.
                 set_feature_priors(feature_priors[o_idx])
 
+                # ── TuRBO trust-region state for this iteration ────────────
+                # ``mut_scale`` rides on the optimiser's success/failure
+                # streaks and drives the per-mutation rate distribution.
+                # ``tr_restart`` is True iff the trust region just
+                # collapsed — we shift candidate composition heavily
+                # toward random / macro injection to break the basin.
+                _tr = opt.trust_region_info()
+                _tr_mut_scale = _tr['mut_scale']
+                _tr_restart = opt.consume_restart_flag()
+                if _tr_restart:
+                    print(f"  [BO iter {iteration} | Out {o_idx}] "
+                          f"TuRBO restart #{_tr['restart_count']} — "
+                          "re-seeding for fresh exploration.")
+                # Restart composition: shift the 5% random / 10% macro
+                # mass up to ~25% / 20% so the next iteration genuinely
+                # explores new structures instead of replaying the same
+                # basin under bigger mutations.
+                if _tr_restart:
+                    _frac_exploit = 0.35
+                    _frac_cross   = 0.10
+                    _frac_macro   = 0.20
+                    _frac_hof_x   = 0.10
+                else:
+                    _frac_exploit = 0.60
+                    _frac_cross   = 0.15
+                    _frac_macro   = 0.10
+                    _frac_hof_x   = 0.10
+
                 candidate_trees = []
-                # 60% from mutating top individuals (exploitation)
-                n_exploit = int(BAYESIAN_N_CANDIDATES * 0.6)
+                # Exploitation: mutating top individuals under TR scale
+                n_exploit = int(BAYESIAN_N_CANDIDATES * _frac_exploit)
                 for _ in range(n_exploit):
                     parent = random.choice(top_inds)
-                    # Vary mutation rate: mostly light, occasionally heavy
-                    rate = random.choice([1, 1, 2, 2, 3, 5])
+                    _mn = getattr(parent.tree, 'max_nodes', CGP_NODES)
+                    rate = _bo_sample_mut_rate(_mn, scale=_tr_mut_scale,
+                                               heavy=_tr_restart)
                     child_tree = mutate(parent.tree, n_features, feat_names,
                                         mut_rate=rate, temperature=0.0,
                                         op_affinity=_bo_op_affinity)
                     candidate_trees.append(child_tree)
 
-                # 15% from crossover of top individuals
-                n_cross = int(BAYESIAN_N_CANDIDATES * 0.15)
+                # Crossover of top individuals (followed by a TR-scaled
+                # touch-up mutation so the recombination doesn't always
+                # land as-is).
+                n_cross = int(BAYESIAN_N_CANDIDATES * _frac_cross)
                 for _ in range(n_cross):
                     if len(top_inds) >= 2:
                         p1, p2 = random.sample(top_inds, 2)
                         child_tree = crossover(p1.tree, p2.tree)
+                        _mn = getattr(child_tree, 'max_nodes', CGP_NODES)
                         child_tree = mutate(child_tree, n_features, feat_names,
-                                            mut_rate=1,
+                                            mut_rate=_bo_sample_mut_rate(
+                                                _mn, scale=_tr_mut_scale * 0.5),
                                             op_affinity=_bo_op_affinity)
                     else:
                         child_tree = random_cgp(n_features, CGP_NODES, feat_names)
                     candidate_trees.append(child_tree)
 
-                # 10% from macro-mutations (structural exploration)
-                n_macro = int(BAYESIAN_N_CANDIDATES * 0.10)
+                # Macro-mutations (structural exploration).  Restart mode
+                # doubles the budget here too — macros are the cheapest
+                # way to inject genuinely different structures.
+                n_macro = int(BAYESIAN_N_CANDIDATES * _frac_macro)
                 for _ in range(n_macro):
                     parent = random.choice(top_inds)
                     _macro_choices = ['grow', 'prune', 'graft', 'rational',
@@ -18305,21 +18673,24 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
                         ct = macro_trig_identity(parent.tree, n_features)
                     candidate_trees.append(ct)
 
-                # 10% from HoF elite crossover — recombine structural motifs
-                # from different complexity levels of the Hall of Fame.
-                # The post-recombination mutation must share the per-output
+                # HoF elite crossover — recombine structural motifs from
+                # different complexity levels of the Hall of Fame.  The
+                # post-recombination mutation must share the per-output
                 # ``op_affinity`` prior with the rest of the BO candidate
-                # generation; the BO-12 audit added it to the regular crossover
-                # branch but missed this path, so ~10% of candidates were
-                # being mutated with uniform operator weights.
-                n_hof_cross = int(BAYESIAN_N_CANDIDATES * 0.10)
+                # generation; the BO-12 audit added it to the regular
+                # crossover branch but missed this path, so ~10% of
+                # candidates were being mutated with uniform operator
+                # weights.
+                n_hof_cross = int(BAYESIAN_N_CANDIDATES * _frac_hof_x)
                 hof_inds_bo = list(hofs[o_idx].best_by_complexity.values())
                 if len(hof_inds_bo) >= 2:
                     for _ in range(n_hof_cross):
                         p1, p2 = random.sample(hof_inds_bo, 2)
                         child_tree = crossover(p1.tree, p2.tree)
+                        _mn = getattr(child_tree, 'max_nodes', CGP_NODES)
                         child_tree = mutate(child_tree, n_features, feat_names,
-                                            mut_rate=random.choice([1, 2]),
+                                            mut_rate=_bo_sample_mut_rate(
+                                                _mn, scale=_tr_mut_scale * 0.6),
                                             op_affinity=_bo_op_affinity)
                         candidate_trees.append(child_tree)
                 else:
@@ -18328,7 +18699,9 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
                         candidate_trees.append(
                             random_cgp(n_features, CGP_NODES, feat_names))
 
-                # 5% purely random (diversity injection)
+                # Diversity injection (random).  Restart mode pushes this up
+                # to ~25% so the trust-region collapse genuinely re-seeds
+                # instead of just taking bigger mutations of the same basin.
                 n_random = BAYESIAN_N_CANDIDATES - n_exploit - n_cross - n_macro - n_hof_cross
                 for _ in range(max(0, n_random)):
                     candidate_trees.append(
@@ -18644,16 +19017,26 @@ def run_bayesian_qd(X, Y, n_features, n_outputs, feat_names, out_types,
     print("\n" + "═" * 70)
     print("BAYESIAN QD (MAP-Elites) — Surrogate-Assisted Quality-Diversity")
     print("═" * 70)
+    print(f"  CGP nodes / max_nodes  : {CGP_NODES}")
     print(f"  Initial random samples : {BAYESIAN_INITIAL_SAMPLES}")
     print(f"  Batch size per iter    : {BAYESIAN_BATCH_SIZE}")
     print(f"  Candidates per iter    : {BAYESIAN_N_CANDIDATES}")
     print(f"  GP refit frequency     : every {BAYESIAN_GP_REFIT_FREQ} iterations")
+    print(f"  GP max training points : {BAYESIAN_MAX_GP_POINTS}")
+    print(f"  GP fit cap (Cholesky)  : {_BO_GP_FIT_CAP}")
     print(f"  Exploration (xi)       : {BAYESIAN_EXPLORATION}")
+    print(f"  TuRBO trust region     : enabled (xi×[0.5..4.0], mut×[0.4..4.0])")
     print("═" * 70 + "\n")
 
-    _probe_n = min(max(20, n_features * 2), 32, X.shape[0])
+    # Probe cap grows with CGP_NODES and n_features (see ``_bo_probe_cap``)
+    # so 200-node trees and high-dim datasets get a richer phenotype signal
+    # in the GP encoding.  Capped above by the training-set size.
+    _probe_n = min(max(20, n_features * 2),
+                   _bo_probe_cap(n_features, CGP_NODES),
+                   X.shape[0])
     _probe_idx = np.random.choice(X.shape[0], _probe_n, replace=False)
     X_probe = X[_probe_idx]
+    print(f"  Phenotype probe size   : {_probe_n} rows\n")
 
     # Detect one-hot class groups UP-FRONT so each per-output optimiser
     # reserves the joint-softmax phenotype block from the outset.
@@ -18791,11 +19174,15 @@ def run_bayesian_qd(X, Y, n_features, n_outputs, feat_names, out_types,
                 # Parents: a mix of HoF, archive cells, and the optimiser
                 # buffer.  Archive sampling supplies diversity; HoF supplies
                 # the best-quality structural seeds; buffer supplies
-                # recently-explored mutations.
+                # recently-explored mutations.  Pool size scales with
+                # ``CGP_NODES`` so 200-node trees draw from a structurally
+                # richer set of parents.
+                _bo_top_pool = _bo_pool_size(CGP_NODES, base=12)
+                _arc_sample_n = max(8, _bo_top_pool // 2)
                 hof_inds = list(hofs[o_idx].best_by_complexity.values())
-                arc_inds = arc.sample(n=min(8, max(1, arc.coverage())),
+                arc_inds = arc.sample(n=min(_arc_sample_n, max(1, arc.coverage())),
                                       prefer_new=True)
-                buf_top  = opt.get_best_individuals(n=5)
+                buf_top  = opt.get_best_individuals(n=max(5, _bo_top_pool // 2))
                 combined = hof_inds + arc_inds + buf_top
                 if not combined:
                     combined = [Individual(random_cgp(n_features, CGP_NODES, feat_names))]
@@ -18808,7 +19195,7 @@ def run_bayesian_qd(X, Y, n_features, n_outputs, feat_names, out_types,
                     seen.add(id(ind))
                     top_inds.append(ind)
                 top_inds.sort(key=lambda x: x.loss)
-                top_inds = top_inds[:12]
+                top_inds = top_inds[:_bo_top_pool]
 
                 try:
                     _bo_op_affinity = compute_hof_operator_affinity([hofs[o_idx]])
@@ -18823,33 +19210,68 @@ def run_bayesian_qd(X, Y, n_features, n_outputs, feat_names, out_types,
                 # of its mutations rewiring to irrelevant variables.
                 set_feature_priors(feature_priors[o_idx])
 
+                # ── TuRBO trust-region state for this iteration ────────────
+                # See ``run_bayesian_cgp`` for the rationale.  Restart mode
+                # in QD shifts the QD-mutation budget toward random / macro
+                # because the archive cells most likely to break a stuck
+                # search are still empty — biasing toward the existing
+                # arc_pool just replays the same niches at higher rate.
+                _tr = opt.trust_region_info()
+                _tr_mut_scale = _tr['mut_scale']
+                _tr_restart = opt.consume_restart_flag()
+                if _tr_restart:
+                    print(f"  [BO QD iter {iteration} | Out {o_idx}] "
+                          f"TuRBO restart #{_tr['restart_count']} — "
+                          "re-seeding for fresh exploration.")
+                if _tr_restart:
+                    _frac_qd_mut    = 0.30
+                    _frac_cross_cell = 0.15
+                    _frac_macro     = 0.25
+                    _frac_hof_x     = 0.05
+                else:
+                    _frac_qd_mut    = 0.50
+                    _frac_cross_cell = 0.20
+                    _frac_macro     = 0.15
+                    _frac_hof_x     = 0.10
+
                 candidate_trees = []
-                # 50%: mutations of QD archive cells (diversification)
-                n_qd_mut = int(BAYESIAN_N_CANDIDATES * 0.50)
-                arc_pool = arc.sample(n=min(arc.coverage(), 16), prefer_new=True) or top_inds
+                # Mutations of QD archive cells (diversification).  Archive
+                # pool is also widened in restart mode so we can grab
+                # potentially-better seeds the archive sampler hasn't seen
+                # picked recently.
+                n_qd_mut = int(BAYESIAN_N_CANDIDATES * _frac_qd_mut)
+                _arc_mut_pool_n = min(arc.coverage(),
+                                      24 if _tr_restart else 16)
+                arc_pool = arc.sample(n=_arc_mut_pool_n,
+                                      prefer_new=True) or top_inds
                 for _ in range(n_qd_mut):
                     parent = random.choice(arc_pool)
-                    rate = random.choice([1, 1, 2, 2, 3, 5])
+                    _mn = getattr(parent.tree, 'max_nodes', CGP_NODES)
+                    rate = _bo_sample_mut_rate(_mn, scale=_tr_mut_scale,
+                                               heavy=_tr_restart)
                     child_tree = mutate(parent.tree, n_features, feat_names,
                                         mut_rate=rate, temperature=0.0,
                                         op_affinity=_bo_op_affinity)
                     candidate_trees.append(child_tree)
 
-                # 20%: cross-cell crossover (combine structures from
-                # different niches — the QD analogue of HoF crossover)
-                n_cross_cell = int(BAYESIAN_N_CANDIDATES * 0.20)
+                # Cross-cell crossover (combine structures from different
+                # niches — the QD analogue of HoF crossover).
+                n_cross_cell = int(BAYESIAN_N_CANDIDATES * _frac_cross_cell)
                 for _ in range(n_cross_cell):
                     if len(arc_pool) >= 2:
                         p1, p2 = random.sample(arc_pool, 2)
                         child_tree = crossover(p1.tree, p2.tree)
+                        _mn = getattr(child_tree, 'max_nodes', CGP_NODES)
                         child_tree = mutate(child_tree, n_features, feat_names,
-                                            mut_rate=1, op_affinity=_bo_op_affinity)
+                                            mut_rate=_bo_sample_mut_rate(
+                                                _mn, scale=_tr_mut_scale * 0.5),
+                                            op_affinity=_bo_op_affinity)
                     else:
                         child_tree = random_cgp(n_features, CGP_NODES, feat_names)
                     candidate_trees.append(child_tree)
 
-                # 15%: macro-mutations (structural exploration)
-                n_macro = int(BAYESIAN_N_CANDIDATES * 0.15)
+                # Macro-mutations (structural exploration).
+                n_macro = int(BAYESIAN_N_CANDIDATES * _frac_macro)
                 for _ in range(n_macro):
                     parent = random.choice(top_inds)
                     _macro_choices = ['grow', 'prune', 'graft', 'rational',
@@ -18878,21 +19300,28 @@ def run_bayesian_qd(X, Y, n_features, n_outputs, feat_names, out_types,
                         ct = macro_trig_identity(parent.tree, n_features)
                     candidate_trees.append(ct)
 
-                # 10%: HoF crossover
-                n_hof_cross = int(BAYESIAN_N_CANDIDATES * 0.10)
+                # HoF crossover (fraction set above; widens to ~5% in
+                # restart mode because random injection takes over the
+                # heavy lifting of basin-breaking).
+                n_hof_cross = int(BAYESIAN_N_CANDIDATES * _frac_hof_x)
                 if len(hof_inds) >= 2:
                     for _ in range(n_hof_cross):
                         p1, p2 = random.sample(hof_inds, 2)
                         child_tree = crossover(p1.tree, p2.tree)
+                        _mn = getattr(child_tree, 'max_nodes', CGP_NODES)
                         child_tree = mutate(child_tree, n_features, feat_names,
-                                            mut_rate=random.choice([1, 2]),
+                                            mut_rate=_bo_sample_mut_rate(
+                                                _mn, scale=_tr_mut_scale * 0.6),
                                             op_affinity=_bo_op_affinity)
                         candidate_trees.append(child_tree)
                 else:
                     for _ in range(n_hof_cross):
                         candidate_trees.append(random_cgp(n_features, CGP_NODES, feat_names))
 
-                # 5%: random injection (always)
+                # Random injection.  Whatever's left of BAYESIAN_N_CANDIDATES
+                # is filled with pure-random trees — restart mode pushes the
+                # remaining fraction up to ~25% by shrinking the QD-mutation
+                # share above.
                 n_random = BAYESIAN_N_CANDIDATES - n_qd_mut - n_cross_cell - n_macro - n_hof_cross
                 for _ in range(max(0, n_random)):
                     candidate_trees.append(random_cgp(n_features, CGP_NODES, feat_names))
@@ -20827,18 +21256,55 @@ def train_mode():
             EVOLUTION_MODEL = "bayesian_cgp"
             NUM_ISLANDS_GLOBAL = 1
 
-            # Auto-scale defaults based on search space complexity
+            # Auto-scale defaults based on search-space complexity.  The
+            # baseline (50 nodes × 10 features = 500) maps to ``scale=1``;
+            # larger configurations get more candidates / wider GP buffer /
+            # bigger batch with diminishing returns to keep the per-iter
+            # cost manageable (the GP fit is O(N^3) so we apply a softer
+            # exponent to fit-cap and refit-frequency).
             n_feat = df.shape[1] - len(Y_COLS) if 'Y_COLS' in globals() else df.shape[1] - 1
             n_feat = max(1, n_feat)
+            n_rows = df.shape[0] if df is not None else 1000
             base_complexity = CGP_NODES * n_feat
 
-            # 50 nodes * 10 features = 500 is roughly baseline (scale=1.0)
             if base_complexity > 500:
+                # Soft cap at scale=10 — past that point ROI on more
+                # candidates is dominated by other terms (probe size,
+                # screen-pass cost).  Scale exponents are chosen so:
+                #   * candidates / batch / max-points grow ~linearly so
+                #     the population genuinely covers the wider space
+                #   * GP fit-cap grows ~sqrt-linearly so the O(N^3) cost
+                #     doesn't dominate
+                #   * refit frequency stretches sub-linearly so we still
+                #     get periodic surrogate updates even at scale=10
                 scale = min(10.0, base_complexity / 500.0)
-                BAYESIAN_N_CANDIDATES = int(200 * scale)
-                BAYESIAN_MAX_GP_POINTS = int(500 * scale)
-                BAYESIAN_BATCH_SIZE = int(20 * (scale ** 0.5))
-                _BO_GP_FIT_CAP = min(BAYESIAN_MAX_GP_POINTS // 2, 1000)
+                BAYESIAN_N_CANDIDATES   = int(round(200 * scale))
+                BAYESIAN_MAX_GP_POINTS  = int(round(500 * scale))
+                BAYESIAN_BATCH_SIZE     = int(round(20 * (scale ** 0.5)))
+                BAYESIAN_INITIAL_SAMPLES = int(round(
+                    100 * (scale ** 0.6)))                 # ~250 @ scale=10
+                # GP fit cap grows as scale^0.7 so Cholesky doesn't
+                # dominate the iteration wall-clock at scale=10.  Hard-
+                # capped at 800 so the per-fit Cholesky stays under
+                # ~5 seconds on a typical 8-core machine even at the
+                # highest complexity setting.
+                _BO_GP_FIT_CAP          = int(min(
+                    800,
+                    BAYESIAN_MAX_GP_POINTS // 2,
+                    max(250, round(250 * (scale ** 0.7)))))
+                # Refit less often when the buffer is bigger — each fit
+                # is O(N^3) so stretching the refit cadence is the
+                # cheapest way to claw back wall-clock time.
+                BAYESIAN_GP_REFIT_FREQ  = max(5, int(round(
+                    5 * (scale ** 0.4))))                  # ~12 @ scale=10
+                print(f"  [Auto-scale] complexity={base_complexity}, "
+                      f"scale={scale:.2f} → "
+                      f"init={BAYESIAN_INITIAL_SAMPLES}, "
+                      f"cand={BAYESIAN_N_CANDIDATES}, "
+                      f"batch={BAYESIAN_BATCH_SIZE}, "
+                      f"GP_max={BAYESIAN_MAX_GP_POINTS}, "
+                      f"GP_fit_cap={_BO_GP_FIT_CAP}, "
+                      f"refit_freq={BAYESIAN_GP_REFIT_FREQ}")
 
             print("\n  Bayesian Variants:")
             print("    [1] Bayesian regular")
