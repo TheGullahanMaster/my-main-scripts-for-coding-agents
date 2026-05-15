@@ -20596,6 +20596,7 @@ def train_mode():
     global BAYESIAN_CONST_OPT_FREQ, BAYESIAN_VARIANT
     global QUALITY_DIVERSITY_ENABLED
     global _INIT_PHASE
+    global _BO_GP_FIT_CAP
 
     # ---- Load CSV ----
     try:
@@ -20825,6 +20826,19 @@ def train_mode():
                 break
             EVOLUTION_MODEL = "bayesian_cgp"
             NUM_ISLANDS_GLOBAL = 1
+
+            # Auto-scale defaults based on search space complexity
+            n_feat = df.shape[1] - len(Y_COLS) if 'Y_COLS' in globals() else df.shape[1] - 1
+            n_feat = max(1, n_feat)
+            base_complexity = CGP_NODES * n_feat
+
+            # 50 nodes * 10 features = 500 is roughly baseline (scale=1.0)
+            if base_complexity > 500:
+                scale = min(10.0, base_complexity / 500.0)
+                BAYESIAN_N_CANDIDATES = int(200 * scale)
+                BAYESIAN_MAX_GP_POINTS = int(500 * scale)
+                BAYESIAN_BATCH_SIZE = int(20 * (scale ** 0.5))
+                _BO_GP_FIT_CAP = min(BAYESIAN_MAX_GP_POINTS // 2, 1000)
 
             print("\n  Bayesian Variants:")
             print("    [1] Bayesian regular")
