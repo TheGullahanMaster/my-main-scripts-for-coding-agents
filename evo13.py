@@ -5455,14 +5455,28 @@ def _generate_reused_input_seeds(n_features, feature_names, feat_priority=None):
     return seeds
 
 
-def generate_importance_biased_seeds(n_features, feature_names, X, y):
+def generate_importance_biased_seeds(n_features, feature_names, X, y,
+                                     return_priority_count=False):
     """
     Generate seeds biased by feature importance analysis.
     Creates targeted expressions for the most promising features and pairs.
+
+    When ``return_priority_count=True`` returns ``(seeds, n_priority)``
+    instead of just ``seeds``.  ``n_priority`` is the count of high-value
+    closed-form analytical seeds (OLS / log-OLS) at the FRONT of the list.
+    Callers that later shuffle and truncate the pool (the Bayesian variants
+    cap at ``BAYESIAN_INITIAL_SAMPLES``) can split the list at that index
+    so the analytical seeds — the ones most likely to solve the problem
+    outright on first evaluation — are never randomly dropped.  Without
+    that split, runs alternate between "BO locks on instantly" (lucky
+    shuffle kept the analytical seed) and "BO fine-tunes a bad template"
+    (unlucky shuffle pushed the analytical seed past the truncation).
     """
     seeds = []
     allowed = set(CGPEquation.OPS_ALL)
     if n_features < 1:
+        if return_priority_count:
+            return seeds, 0
         return seeds
 
     # ── Analytical OLS over polynomial basis ────────────────────────────
@@ -5487,6 +5501,14 @@ def generate_importance_biased_seeds(n_features, feature_names, X, y):
         seeds.extend(log_seeds)
     except Exception:
         pass
+
+    # Boundary between the closed-form analytical priority block above
+    # (OLS quadratic + linear-only, log-OLS raw + snapped + integer-snapped)
+    # and the combinatorial / template diversity blocks below.  BO callers
+    # that pass ``return_priority_count=True`` use this index to keep the
+    # priority seeds pinned at the front of their pool across a shuffle +
+    # truncation pass.
+    n_priority = len(seeds)
 
     # Compute feature importance EARLY so it can prioritise the rational-
     # product and reused-input seed feature pools below.  When
@@ -5783,6 +5805,8 @@ def generate_importance_biased_seeds(n_features, feature_names, X, y):
     except Exception:
         pass
 
+    if return_priority_count:
+        return seeds, n_priority
     return seeds
 
 
@@ -17076,14 +17100,24 @@ def run_bayesian_afpo(X, Y, n_features, n_outputs, feat_names, out_types,
     for o_idx in range(n_outputs):
         v5_seeds = generate_seeds_v5(n_features, feat_names)
         try:
-            imp_seeds = generate_importance_biased_seeds(
-                n_features, feat_names, X_init, Y_init[:, o_idx])
+            imp_seeds, n_priority = generate_importance_biased_seeds(
+                n_features, feat_names, X_init, Y_init[:, o_idx],
+                return_priority_count=True)
         except Exception:
-            imp_seeds = []
+            imp_seeds, n_priority = [], 0
 
         random.shuffle(v5_seeds)
-        random.shuffle(imp_seeds)
-        seeds = list(imp_seeds) + list(v5_seeds)
+        # Closed-form analytical seeds (OLS / log-OLS) at the front of
+        # ``imp_seeds`` are pinned in place; only the diversity tail is
+        # shuffled.  Shuffling the whole list then truncating at
+        # ``BAYESIAN_INITIAL_SAMPLES`` randomly dropped those analytical
+        # seeds whenever len(imp_seeds) > 100, which is the per-run
+        # variance source behind "BO solves instantly" vs "BO gets stuck
+        # fine-tuning a bad seed".
+        imp_priority = imp_seeds[:n_priority]
+        imp_tail = imp_seeds[n_priority:]
+        random.shuffle(imp_tail)
+        seeds = list(imp_priority) + list(imp_tail) + list(v5_seeds)
         while len(seeds) < BAYESIAN_INITIAL_SAMPLES:
             seeds.append(Individual(random_cgp(n_features, CGP_NODES, feat_names)))
 
@@ -17519,14 +17553,22 @@ def run_bayesian_islands(X, Y, n_features, n_outputs, feat_names, out_types,
         for o_idx in range(n_outputs):
             v5_seeds = generate_seeds_v5(n_features, feat_names)
             try:
-                imp_seeds = generate_importance_biased_seeds(
-                    n_features, feat_names, X_init, Y_init[:, o_idx])
+                imp_seeds, n_priority = generate_importance_biased_seeds(
+                    n_features, feat_names, X_init, Y_init[:, o_idx],
+                    return_priority_count=True)
             except Exception:
-                imp_seeds = []
+                imp_seeds, n_priority = [], 0
 
             random.shuffle(v5_seeds)
-            random.shuffle(imp_seeds)
-            seeds = list(imp_seeds) + list(v5_seeds)
+            # Pin closed-form analytical seeds (OLS / log-OLS) at the front;
+            # shuffle only the diversity tail.  See run_bayesian_afpo for the
+            # full rationale — without this, the BAYESIAN_INITIAL_SAMPLES
+            # truncation occasionally drops the analytical seed and BO ends
+            # up fine-tuning a v5 template instead of the closed-form fit.
+            imp_priority = imp_seeds[:n_priority]
+            imp_tail = imp_seeds[n_priority:]
+            random.shuffle(imp_tail)
+            seeds = list(imp_priority) + list(imp_tail) + list(v5_seeds)
 
             # Start filling this island
             while len(seeds) < BAYESIAN_INITIAL_SAMPLES:
@@ -17965,14 +18007,20 @@ def run_bayesian_islanded_afpo(X, Y, n_features, n_outputs, feat_names, out_type
         for o_idx in range(n_outputs):
             v5_seeds = generate_seeds_v5(n_features, feat_names)
             try:
-                imp_seeds = generate_importance_biased_seeds(
-                    n_features, feat_names, X_init, Y_init[:, o_idx])
+                imp_seeds, n_priority = generate_importance_biased_seeds(
+                    n_features, feat_names, X_init, Y_init[:, o_idx],
+                    return_priority_count=True)
             except Exception:
-                imp_seeds = []
+                imp_seeds, n_priority = [], 0
 
             random.shuffle(v5_seeds)
-            random.shuffle(imp_seeds)
-            seeds = list(imp_seeds) + list(v5_seeds)
+            # Pin closed-form analytical seeds (OLS / log-OLS) at the front;
+            # shuffle only the diversity tail.  See run_bayesian_afpo for the
+            # full rationale.
+            imp_priority = imp_seeds[:n_priority]
+            imp_tail = imp_seeds[n_priority:]
+            random.shuffle(imp_tail)
+            seeds = list(imp_priority) + list(imp_tail) + list(v5_seeds)
 
             while len(seeds) < BAYESIAN_INITIAL_SAMPLES:
                 seeds.append(Individual(random_cgp(n_features, CGP_NODES, feat_names)))
@@ -18413,16 +18461,25 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
         # individuals than BAYESIAN_INITIAL_SAMPLES.
         v5_seeds = generate_seeds_v5(n_features, feat_names)
         try:
-            imp_seeds = generate_importance_biased_seeds(
-                n_features, feat_names, X_init, Y_init[:, o_idx])
+            imp_seeds, n_priority = generate_importance_biased_seeds(
+                n_features, feat_names, X_init, Y_init[:, o_idx],
+                return_priority_count=True)
         except Exception:
-            imp_seeds = []
+            imp_seeds, n_priority = [], 0
         # Importance-biased seeds get FIRST claim on the budget; v5 fills
-        # the rest.  Both pools are individually shuffled so we don't
-        # systematically take, e.g., only the linear OLS variants.
+        # the rest.  The closed-form analytical seeds (OLS / log-OLS) at
+        # the FRONT of ``imp_seeds`` are pinned in place; only the diversity
+        # tail past them is shuffled.  Shuffling the whole list and then
+        # truncating at BAYESIAN_INITIAL_SAMPLES randomly dropped the
+        # analytical seeds whenever len(imp_seeds) > 100 (common for
+        # ≥ 5-feature problems with rich op sets), which is the source of
+        # "BO solves instantly" vs "BO gets stuck fine-tuning a bad seed"
+        # run-to-run variance.
         random.shuffle(v5_seeds)
-        random.shuffle(imp_seeds)
-        seeds = list(imp_seeds) + list(v5_seeds)
+        imp_priority = imp_seeds[:n_priority]
+        imp_tail = imp_seeds[n_priority:]
+        random.shuffle(imp_tail)
+        seeds = list(imp_priority) + list(imp_tail) + list(v5_seeds)
         while len(seeds) < BAYESIAN_INITIAL_SAMPLES:
             seeds.append(Individual(random_cgp(n_features, CGP_NODES, feat_names)))
 
@@ -19079,13 +19136,19 @@ def run_bayesian_qd(X, Y, n_features, n_outputs, feat_names, out_types,
     for o_idx in range(n_outputs):
         v5_seeds = generate_seeds_v5(n_features, feat_names)
         try:
-            imp_seeds = generate_importance_biased_seeds(
-                n_features, feat_names, X_init, Y_init[:, o_idx])
+            imp_seeds, n_priority = generate_importance_biased_seeds(
+                n_features, feat_names, X_init, Y_init[:, o_idx],
+                return_priority_count=True)
         except Exception:
-            imp_seeds = []
+            imp_seeds, n_priority = [], 0
         random.shuffle(v5_seeds)
-        random.shuffle(imp_seeds)
-        seeds = list(imp_seeds) + list(v5_seeds)
+        # Pin closed-form analytical seeds (OLS / log-OLS) at the front;
+        # shuffle only the diversity tail.  See run_bayesian_afpo for the
+        # full rationale.
+        imp_priority = imp_seeds[:n_priority]
+        imp_tail = imp_seeds[n_priority:]
+        random.shuffle(imp_tail)
+        seeds = list(imp_priority) + list(imp_tail) + list(v5_seeds)
         # QD benefits from a wider seed pool than vanilla BO because each
         # seed potentially populates a different cell.
         target_seed_count = max(BAYESIAN_INITIAL_SAMPLES,
