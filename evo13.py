@@ -14955,6 +14955,146 @@ def _pure_exploration(sigma):
     return sigma
 
 
+def _knowledge_gradient_mc(mu, cov, noise_var=1e-4, n_fantasy=32, rng=None,
+                            max_candidates=320):
+    """Monte-Carlo Knowledge Gradient over a discrete candidate set.
+
+    KG asks: "if we evaluate candidate x_i, how much will the predicted
+    maximum over the WHOLE candidate set improve?".  This is qualitatively
+    different from EI/UCB/PI, which only score each candidate's own
+    expected value — KG credits a candidate for the *information* its
+    evaluation provides about its NEIGHBOURS through the GP's covariance,
+    even when the candidate itself isn't predicted to beat ``best_f``.
+
+    The closed-form KGCP (Frazier-Powell-Dayanik 2008) requires a
+    convex-envelope scan per candidate; with a few dozen Monte-Carlo
+    fantasy draws we get the same ranking at <50× the implementation
+    cost.  Each candidate's fantasy outcome maps via the rank-1 GP
+    update to a linear shift of the posterior mean at every other
+    candidate, so we can compute the new max in a single matmul.
+
+    Args:
+        mu: (M,) GP posterior mean at candidates.
+        cov: (M, M) full posterior covariance between candidates.
+            Passed from ``GaussianProcessRegressor.predict(return_cov=True)``.
+        noise_var: assumed observation-noise variance; small floor so the
+            rank-1 update is well-conditioned when ``var(x_i) → 0``.
+        n_fantasy: number of Monte-Carlo fantasies per candidate.  32 is
+            enough to rank candidates reliably; the noise floor on
+            cumulative KG values is O(1/sqrt(n_fantasy)·σ_max).
+        rng: numpy RandomState; falls back to global ``np.random``.
+        max_candidates: cap on the candidate count we run KG over.  Above
+            this we KG-rank only the top-``max_candidates`` by ``mu`` and
+            fall back to ``mu`` itself for the marginal tail (those
+            candidates almost never win the KG argmax anyway).  Caps
+            both memory (~max·M·K bytes) and the matmul cost.
+
+    Returns:
+        (M,) array of KG values (non-negative; higher = more informative).
+    """
+    mu = np.asarray(mu, dtype=np.float64)
+    M = mu.size
+    if M <= 1:
+        return np.zeros(M, dtype=np.float64)
+    if cov is None or cov.shape != (M, M):
+        # No joint covariance available — degenerate to "expected own-mu
+        # improvement", which is just an EI proxy.  KG arm will get
+        # de-weighted by the portfolio if this path becomes a regular hit.
+        return np.maximum(mu - float(np.max(mu)), 0.0)
+
+    var_diag = np.maximum(np.diag(cov).astype(np.float64), 1e-12)
+    inv_sd = 1.0 / np.sqrt(var_diag + float(noise_var))
+    base_max = float(np.max(mu))
+
+    if rng is None:
+        z = np.random.standard_normal(int(n_fantasy))
+    else:
+        z = rng.standard_normal(int(n_fantasy))
+
+    # Restrict KG to the top-``max_candidates`` by μ so the M×M influence
+    # matmul stays cheap.  The off-tier candidates fall back to a
+    # μ-based score (effectively the EI-without-tails proxy).
+    if M > int(max_candidates):
+        top_idx = np.argpartition(-mu, int(max_candidates) - 1)[:int(max_candidates)]
+        top_idx = np.sort(top_idx)
+    else:
+        top_idx = np.arange(M)
+
+    kg = np.maximum(mu - base_max, 0.0).copy()  # fallback for off-tier rows
+
+    cov_rows = cov[top_idx, :]                  # (T, M)
+    influence = cov_rows * inv_sd[top_idx, None]  # (T, M); column j shifts by influence[i,j]·z
+    # For each i, fantasy k: max_j (mu_j + influence[i,j] * z[k]).
+    # Vectorise over i and k jointly.  T·M·K floats; we chunk the i-axis
+    # so peak memory stays bounded for large M.  Block size in bytes is
+    # ``chunk · M · K · 8``; we cap at ~16 MB so the working set fits in
+    # L3 cache and we don't blow ~64 MB allocations on every score pass
+    # at scale=10 (M=2000) which throttles the iteration on cache misses.
+    bytes_per_chunk = 16 * 1024 * 1024
+    chunk = max(1, min(top_idx.size,
+                        max(4, bytes_per_chunk
+                            // max(1, M * int(n_fantasy) * 8))))
+    new_max = np.empty((top_idx.size, z.size), dtype=np.float64)
+    for start in range(0, top_idx.size, chunk):
+        end = min(start + chunk, top_idx.size)
+        block = (mu[None, :, None]
+                 + influence[start:end, :, None] * z[None, None, :])
+        # (chunk, M, K) → reduce over M (the j-axis we're maxing over)
+        new_max[start:end] = block.max(axis=1)
+    kg_top = new_max.mean(axis=1) - base_max
+    kg[top_idx] = np.maximum(kg_top, 0.0)
+    return kg
+
+
+def _parsimony_aware_score(mu, sigma, complexity_norm, best_f, xi=0.01,
+                            lam=0.35):
+    """Parsimony-augmented improvement signal for symbolic regression.
+
+    Standard EI/UCB/KG don't care about expression size; for symbolic
+    regression that wastes optimisation budget on long-and-narrow
+    candidates (slightly-better μ at much-higher complexity) that the
+    HoF then ignores because the parsimony pressure on
+    ``Individual.fitness`` ranks them below their cheaper rivals.
+
+    This acquisition adds an explicit complexity penalty and replaces
+    the EI tail with a smooth ``μ - λ·complexity + σ`` blend so the
+    portfolio can directly express "prefer simpler when quality ties".
+    The σ term keeps the arm exploratory (we still want some posterior
+    uncertainty in the pick) while the complexity penalty trims the
+    long-and-narrow tail.
+
+    Args:
+        mu: (M,) GP posterior mean (higher is better).
+        sigma: (M,) posterior std.
+        complexity_norm: (M,) candidate active-node fraction (`vec[:, 0]`
+            from ``cgp_to_vector``).  In [0, 1] where 1 = fully filled.
+        best_f: current best buffer μ (for relative ranking; used as a
+            reference point, not a hard threshold like EI).
+        xi: small exploration constant matching the rest of the
+            portfolio.
+        lam: complexity penalty weight.  Empirically 0.35 on the
+            copula-N(0,1) μ-scale corresponds to a "two equal-mu
+            candidates differ by 0.5 σ if their complexity differs by
+            ~1.4" — i.e., a moderate Occam preference rather than
+            crushing every complex candidate.
+
+    Returns:
+        (M,) parsimony-augmented acquisition values.
+    """
+    mu = np.asarray(mu, dtype=np.float64)
+    sigma = np.asarray(sigma, dtype=np.float64)
+    c = np.asarray(complexity_norm, dtype=np.float64)
+    mu = np.nan_to_num(mu, nan=-1e12, posinf=1e12, neginf=-1e12)
+    sigma = np.maximum(np.nan_to_num(sigma, nan=0.0,
+                                     posinf=1e6, neginf=0.0), 1e-12)
+    c = np.clip(np.nan_to_num(c, nan=1.0, posinf=1.0, neginf=0.0), 0.0, 1.0)
+    # ``best_f`` is only used to centre the score so the cumulative
+    # portfolio rewards stay on the same scale as the other arms.
+    centre = float(np.nan_to_num(best_f, nan=0.0,
+                                 posinf=1e12, neginf=-1e12))
+    return (mu - centre - float(xi)) - float(lam) * c + 0.5 * sigma
+
+
 class _GpHedgePortfolio:
     """GP-Hedge multi-acquisition portfolio (Hoffman, Brochu, de Freitas 2011).
 
@@ -15008,9 +15148,22 @@ class _GpHedgePortfolio:
                                   joint covariance is degenerate
     Pure-exploration (`pe`)     - max-σ; uncorrelated with any μ-driven
                                   arm so it diversifies after refits
+    Knowledge gradient (`kg`)   - one-step lookahead via Monte-Carlo
+                                  fantasies through the joint covariance;
+                                  credits candidates for the *information*
+                                  their evaluation provides about the
+                                  posterior max even when their own μ
+                                  doesn't beat best_f.  Qualitatively
+                                  different signal from LogEI / UCB / PE.
+    Parsimony (`pars`)          - SR-specific Occam arm: μ-penalty
+                                  proportional to candidate complexity
+                                  (active-node fraction).  Lets the
+                                  portfolio express "prefer simpler when
+                                  quality ties" without baking it into
+                                  every arm.
     """
 
-    ARMS = ('logei', 'ucb', 'logpi', 'ts', 'pe')
+    ARMS = ('logei', 'ucb', 'logpi', 'ts', 'pe', 'kg', 'pars')
 
     # Relative bias prepended to ``rewards`` at construction.  The
     # explorer arms (UCB, PE) get a small positive head start so the
@@ -15022,10 +15175,15 @@ class _GpHedgePortfolio:
     # know whether logpi's picks generalise.  The cold-start penalty
     # forces logpi to earn its share via observed-improvement bonuses
     # rather than free-rolling on counterfactual surrogate credit.
+    # KG gets a modest positive bias (principled information-gathering is
+    # particularly valuable early when the surrogate is still mapping the
+    # encoding space); PARS gets a smaller bias so it nudges the early
+    # picks toward simpler templates without dominating the search.
     # All values are on the std-normalized reward scale (≈ O(1) after
     # ``update_all``'s within-iteration normalisation) and fade to ~5%
     # of the original by iter 100 under the default ``decay``.
-    _COLD_START_BIAS = {'ucb': 0.6, 'pe': 0.4, 'logpi': -0.4}
+    _COLD_START_BIAS = {'ucb': 0.6, 'pe': 0.4, 'logpi': -0.4,
+                        'kg': 0.3, 'pars': 0.15}
 
     # ---- Stagnation cooldown ---------------------------------------------
     # If an arm is the picked arm for ``_STAGNATION_THRESHOLD`` consecutive
@@ -16031,6 +16189,39 @@ class BayesianCGPOptimizer:
         # optimiser (e.g. before Phase 2 starts).
         self._best_y_at_iter_start = None
 
+        # ── Adaptive refit cadence state ───────────────────────────────────
+        # ``_obs_since_refit`` counts buffer additions since the last
+        # ``fit_surrogate`` so the outer loop can trigger an early refit
+        # when the surrogate has fallen far behind the buffer (e.g.
+        # post-restart when a flood of random candidates lands).  The
+        # outer-loop iteration-based modulo check (``iteration %
+        # BAYESIAN_GP_REFIT_FREQ == 0``) handles the normal cadence;
+        # this counter handles the "we just got 60+ new points, do not
+        # wait 4 more iterations" case.  Also bumped on
+        # ``set_multiclass_state`` so a bg_logits refresh that
+        # invalidated buffer encodings prompts a refit.
+        self._obs_since_refit = 0
+        # Iteration counter since the last successful refit.  Bumped in
+        # ``should_refit_now`` (once per call) and reset in
+        # ``fit_surrogate``.  Carried for diagnostics — it surfaces a
+        # surrogate that has been coasting on stale data for many
+        # iterations (e.g. on outputs that flagged perfect-fit and stop
+        # contributing observations) so the BO log can show "this opt
+        # hasn't refit in 20 iterations" instead of just "last refit at
+        # iter 47".
+        self._iters_since_refit = 0
+        # When True, ``should_refit_now`` returns True on its next call
+        # regardless of the iteration counter.  Set by ``add_observation``
+        # when the buffer's best transformed fitness grew by a margin
+        # exceeding the rolling-best-jump RMS, by ``set_multiclass_state``,
+        # and by the outer loop after a restart.
+        self._force_refit_pending = False
+        # Rolling RMS of single-iteration best-y jumps, used to decide
+        # when an observation justifies an early refit.  Starts at a
+        # small floor so the first real jump triggers a refit; updated
+        # in ``add_observation``.
+        self._best_jump_rms = 0.0
+
     def _transform_fitness(self, loss):
         """Transform loss to a GP-friendly target.
         Higher is better. We return the negative loss here; the actual
@@ -16109,6 +16300,16 @@ class BayesianCGPOptimizer:
         """
         vec = self._encode(cgp_eq)
         y   = self._transform_fitness(individual.loss)
+        # ── Adaptive-refit jump bookkeeper ───────────────────────────────
+        # Detect "big jumps in the buffer best" so ``should_refit_now`` can
+        # trigger an early refit when the surrogate's current fit has been
+        # invalidated by a fresh top-end observation.  We compare against
+        # the running RMS of recent jumps so a buffer that's already
+        # finding +1.0 improvements every iteration doesn't trigger refits
+        # for routine +0.3 ones — only the genuinely large jumps signal
+        # "the surrogate's prior best is now well below the actual best
+        # and EI / KG scoring is operating on a stale anchor".
+        prev_best_y = float(max(self.y_observed)) if self.y_observed else -np.inf
         self.X_observed.append(vec)
         self.y_observed.append(y)
         self.individuals.append(_bo_clone_for_buffer(individual))
@@ -16116,6 +16317,19 @@ class BayesianCGPOptimizer:
         # ``reeval_buffer_for_mc`` knows which entries are still consistent
         # with the live bg_logits and which need a refresh.
         self._mc_obs_state_id.append(self.mc_state_id)
+        self._obs_since_refit += 1
+        if np.isfinite(prev_best_y) and y > prev_best_y:
+            jump = float(y - prev_best_y)
+            # Update RMS with an EWMA so very-recent jump scale dominates.
+            self._best_jump_rms = (0.7 * self._best_jump_rms
+                                    + 0.3 * abs(jump))
+            # Trigger early refit if jump > 1.5 × rolling RMS (or if RMS
+            # is still ~0 and we just saw a moderate jump).  The 1.5×
+            # cut-off makes routine improvements coast on the scheduled
+            # cadence while genuinely surprising jumps refit immediately.
+            jump_floor = max(self._best_jump_rms * 1.5, 0.25)
+            if jump >= jump_floor:
+                self._force_refit_pending = True
 
         if len(self.X_observed) > self.max_points:
             # Keep the top-`max_points` by transformed fitness; among ties
@@ -16175,6 +16389,12 @@ class BayesianCGPOptimizer:
         # Cheap: probe is ≤32 rows and the encoding cache will absorb
         # repeated-genotype hits within this state.
         self._reencode_buffer()
+        # A bg_logits refresh moves the multi-class phenotype block under
+        # every buffer entry's foot, so the previous GP fit was trained on
+        # vectors from a different encoding manifold.  Mark a refit
+        # pending so the next ``should_refit_now`` returns True and the
+        # acquisition pass scores against a consistent surrogate.
+        self._force_refit_pending = True
 
     def _reencode_buffer(self):
         """Re-encode every buffer entry under the current ``mc_state_id``.
@@ -16391,6 +16611,89 @@ class BayesianCGPOptimizer:
             print(f"  [BO] GP fitting failed: {e}")
             self.gp_fitted = False
 
+        # Refit cadence bookkeepers — reset every fit attempt regardless of
+        # success so a chronically-failing fit doesn't accumulate phantom
+        # "force refit" pressure.  Consumers that care about whether the
+        # fit succeeded check ``gp_fitted`` separately.
+        self._obs_since_refit = 0
+        self._iters_since_refit = 0
+        self._force_refit_pending = False
+
+    def should_refit_now(self, iteration: int,
+                         interval: int = None) -> bool:
+        """Adaptive cadence: should we refit the GP this iteration?
+
+        The fixed ``iteration % BAYESIAN_GP_REFIT_FREQ == 0`` schedule
+        works for steady-state BO but misses two regimes:
+
+        * **Buffer flood**: a TuRBO restart, a multi-class state refresh,
+          or a string of strong evaluations can put 30+ observations into
+          the buffer in a few iterations.  Waiting for the scheduled
+          refit then runs ``score_candidates`` against a surrogate that
+          knows nothing about the new high-fitness region; EI / KG keep
+          proposing mutations of the *old* best.
+        * **Big-jump signal**: when ``add_observation`` records a buffer
+          best that beats the prior best by more than 1.5× the rolling
+          jump RMS, the surrogate's anchoring is stale and the next
+          acquisition pass is wasting effort.  ``_force_refit_pending``
+          captures this and short-circuits the modulo cadence.
+
+        Conversely, when the buffer hasn't grown and no big jumps have
+        landed, we LET the cadence delay a refit a little — the GP fit
+        is the most expensive single operation in the loop (~100ms at
+        the 250-point fit cap × 3 restarts) and back-to-back refits with
+        no new data just churn the kernel-hyperparameter L-BFGS-B
+        without producing a meaningfully different surrogate.
+
+        Args:
+            iteration: outer-loop iteration counter (matches the modulo
+                check in each ``run_bayesian_*`` loop).
+            interval: refit cadence; falls back to the global
+                ``BAYESIAN_GP_REFIT_FREQ`` constant when omitted so the
+                outer-loop call sites don't have to thread it through.
+
+        Returns:
+            True iff a refit should run this iteration.
+        """
+        if interval is None:
+            try:
+                interval = int(BAYESIAN_GP_REFIT_FREQ)
+            except Exception:
+                interval = 5
+        interval = max(1, int(interval))
+        self._iters_since_refit += 1
+        # Big-jump or external-force trigger: refit immediately.
+        if self._force_refit_pending:
+            return True
+        # Standard cadence: refit on the same modulo schedule the outer
+        # loops were using before.
+        if int(iteration) > 0 and int(iteration) % interval == 0:
+            return True
+        # Safety net: when an unusually large flood of new observations
+        # has piled up between scheduled refits (e.g. a post-restart
+        # iteration that triggered the larger random-candidate budget
+        # AND screening filled the full pass) we refit early so the
+        # surrogate doesn't keep scoring acquisitions against a buffer
+        # that's a quarter-stale.  Threshold scales with ``max_points``
+        # so it stays clearly outside normal-cadence accumulation
+        # (~BATCH_SIZE × interval = 100 obs by default, vs the floor
+        # below at ~125 for the default 500-point buffer).
+        flood_threshold = max(50, int(self.max_points) // 4)
+        if self._obs_since_refit >= flood_threshold:
+            return True
+        return False
+
+    def request_refit(self):
+        """External force-refit trigger (e.g. after a TuRBO restart).
+
+        Used by the outer BO loops to mark the surrogate as needing a
+        refresh outside the normal cadence — typically right after a
+        restart has flooded the candidate pool with fresh random trees.
+        ``should_refit_now`` will return True on its next call until a
+        successful refit clears the flag.
+        """
+        self._force_refit_pending = True
+
     def score_candidates(self, candidate_trees):
         """Score candidate trees with a GP-Hedge portfolio of acquisitions.
 
@@ -16491,6 +16794,15 @@ class BayesianCGPOptimizer:
         # EI would dilute its specialisation.  Halving xi for PI biases
         # it toward picks that are sub-best_f (improvement-by-luck)
         # and lets it complement EI rather than mimic it.
+        # ``vecs[:, 0]`` is the active-node fraction (see ``cgp_to_vector``);
+        # parsimony uses it directly so no second pass over the candidate
+        # trees is needed.  Falls back to zeros when the layout doesn't
+        # match expectations (defensive — keeps the arm well-behaved if
+        # the encoding ever changes).
+        if vecs.ndim == 2 and vecs.shape[1] > 0:
+            complexity_norm = np.clip(vecs[:, 0], 0.0, 1.0)
+        else:
+            complexity_norm = np.zeros(len(candidate_trees), dtype=np.float64)
         all_scores = {
             'logei': _log_expected_improvement(mu, sigma, best_f,
                                                 effective_xi),
@@ -16501,6 +16813,11 @@ class BayesianCGPOptimizer:
                     if cov is not None
                     else _thompson_lite(mu, sigma),
             'pe':    _pure_exploration(sigma),
+            'kg':    _knowledge_gradient_mc(mu, cov)
+                    if cov is not None
+                    else np.maximum(mu - best_f, 0.0),
+            'pars':  _parsimony_aware_score(mu, sigma, complexity_norm,
+                                             best_f, xi=effective_xi),
         }
 
         # Counterfactual reward for each arm: the surrogate's predicted
@@ -16578,8 +16895,20 @@ class BayesianCGPOptimizer:
             quality_T = 3.0
         elif arm_name == 'pe':
             quality_T = 2.0
+        elif arm_name == 'kg':
+            # KG's scores already encode information-gain diversity (a
+            # candidate's KG drops as similar candidates are picked because
+            # the influence vectors overlap), so the DPP only needs a
+            # modest spread on top.
+            quality_T = 1.5
         elif arm_name == 'ucb':
             quality_T = 1.5
+        elif arm_name == 'pars':
+            # Parsimony scoring is local — neighbours in encoding space
+            # usually share a complexity bin, so DPP diversity helps spread
+            # picks across complexity levels (rather than k near-duplicates
+            # all at the same Occam-frontier point).
+            quality_T = 1.2
         elif arm_name == 'logpi':
             quality_T = 0.5
         else:
@@ -16790,9 +17119,14 @@ class BayesianCGPOptimizer:
         candidates so the search re-roots after a trust-region collapse.
         The flag is one-shot — ``record_iteration_outcome`` sets it, the
         next acquisition pass consumes it, and the cycle resets.
+        Also marks a force-refit so the post-restart iteration scores
+        against a surrogate that has digested any new high-fitness
+        observations rather than the stale pre-collapse fit.
         """
         flag = bool(self.tr_restart_pending)
         self.tr_restart_pending = False
+        if flag:
+            self._force_refit_pending = True
         return flag
 
     def trust_region_info(self) -> dict:
@@ -17446,7 +17780,7 @@ def run_bayesian_afpo(X, Y, n_features, n_outputs, feat_names, out_types,
                 # Trim Pareto front
                 afpo_pops[o_idx] = _trim_to_pareto_front_3obj(pop, AFPO_POP_SIZE)
 
-                if iteration % BAYESIAN_GP_REFIT_FREQ == 0:
+                if opt.should_refit_now(iteration):
                     if opt.has_mc_context and opt.mc_full is not None:
                         opt.reeval_buffer_for_mc(
                             X, Y[:, o_idx], out_types[o_idx],
@@ -17946,7 +18280,7 @@ def run_bayesian_islands(X, Y, n_features, n_outputs, feat_names, out_types,
                                 target_pop.remove(worst)
                             target_pop.append(mig)
 
-                if iteration % BAYESIAN_GP_REFIT_FREQ == 0:
+                if opt.should_refit_now(iteration):
                     if opt.has_mc_context and opt.mc_full is not None:
                         opt.reeval_buffer_for_mc(
                             X, Y[:, o_idx], out_types[o_idx],
@@ -18421,7 +18755,7 @@ def run_bayesian_islanded_afpo(X, Y, n_features, n_outputs, feat_names, out_type
                                 target_pop.remove(worst)
                             target_pop.append(mig)
 
-                if iteration % BAYESIAN_GP_REFIT_FREQ == 0:
+                if opt.should_refit_now(iteration):
                     if opt.has_mc_context and opt.mc_full is not None:
                         opt.reeval_buffer_for_mc(
                             X, Y[:, o_idx], out_types[o_idx],
@@ -19019,7 +19353,7 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
                 opt.record_iteration_outcome(_bo_improved)
 
                 # ── Refit GP surrogate periodically ─────────────────────────
-                if iteration % BAYESIAN_GP_REFIT_FREQ == 0:
+                if opt.should_refit_now(iteration):
                     # Refresh stale buffer entries to the latest bg_logits
                     # FIRST so the GP fits on a single, current loss surface
                     # instead of mixing epochs.  Cap re-evals so the cost
@@ -19624,7 +19958,7 @@ def run_bayesian_qd(X, Y, n_features, n_outputs, feat_names, out_types,
 
                 opt.record_iteration_outcome(_bo_improved)
 
-                if iteration % BAYESIAN_GP_REFIT_FREQ == 0:
+                if opt.should_refit_now(iteration):
                     if opt.has_mc_context and opt.mc_full is not None:
                         opt.reeval_buffer_for_mc(
                             X, Y[:, o_idx], out_types[o_idx],
