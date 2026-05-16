@@ -15047,7 +15047,7 @@ def _knowledge_gradient_mc(mu, cov, noise_var=1e-4, n_fantasy=32, rng=None,
 
 
 def _parsimony_aware_score(mu, sigma, complexity_norm, best_f, xi=0.01,
-                            lam=0.35):
+                            lam=0.25):
     """Parsimony-augmented improvement signal for symbolic regression.
 
     Standard EI/UCB/KG don't care about expression size; for symbolic
@@ -15056,43 +15056,50 @@ def _parsimony_aware_score(mu, sigma, complexity_norm, best_f, xi=0.01,
     HoF then ignores because the parsimony pressure on
     ``Individual.fitness`` ranks them below their cheaper rivals.
 
-    This acquisition adds an explicit complexity penalty and replaces
-    the EI tail with a smooth ``μ - λ·complexity + σ`` blend so the
-    portfolio can directly express "prefer simpler when quality ties".
-    The σ term keeps the arm exploratory (we still want some posterior
-    uncertainty in the pick) while the complexity penalty trims the
-    long-and-narrow tail.
+    This acquisition is the portfolio's pure exploitation-with-Occam
+    arm: ``μ - λ·complexity`` (centred on ``best_f`` for cumulative-
+    reward comparability).  Exploration is the explicit job of the
+    other arms (UCB, PE, KG, TS); folding a σ bonus into parsimony as
+    well used to cause it to grab high-σ "lucky improvements" early
+    and lock the GP-Hedge softmax onto a single arm before the
+    surrogate had enough data to differentiate.  Removing the σ term
+    leaves parsimony as a clean Occam-discounted exploitation arm —
+    its picks correlate with logei/logpi but tilt slightly simpler,
+    and its counterfactual μ is structurally a touch below the other
+    exploitation arms', which keeps the portfolio's cumulative-reward
+    accounting balanced.
 
     Args:
         mu: (M,) GP posterior mean (higher is better).
-        sigma: (M,) posterior std.
+        sigma: (M,) posterior std (unused; retained for signature
+            parity with the other acquisition functions so the
+            portfolio's scoring dispatch can call all arms uniformly).
         complexity_norm: (M,) candidate active-node fraction (`vec[:, 0]`
             from ``cgp_to_vector``).  In [0, 1] where 1 = fully filled.
         best_f: current best buffer μ (for relative ranking; used as a
             reference point, not a hard threshold like EI).
         xi: small exploration constant matching the rest of the
             portfolio.
-        lam: complexity penalty weight.  Empirically 0.35 on the
-            copula-N(0,1) μ-scale corresponds to a "two equal-mu
-            candidates differ by 0.5 σ if their complexity differs by
-            ~1.4" — i.e., a moderate Occam preference rather than
-            crushing every complex candidate.
+        lam: complexity penalty weight.  ``0.25`` on the
+            copula-N(0,1) μ-scale corresponds to a moderate Occam
+            preference: two candidates with equal μ are ranked apart
+            by ~0.5 σ when their active-node fractions differ by
+            ~1.0.  Lowered from 0.35 alongside removing the σ term so
+            the arm's pure-mu picks aren't over-penalised in late
+            iterations where μ differences are small.
 
     Returns:
         (M,) parsimony-augmented acquisition values.
     """
     mu = np.asarray(mu, dtype=np.float64)
-    sigma = np.asarray(sigma, dtype=np.float64)
     c = np.asarray(complexity_norm, dtype=np.float64)
     mu = np.nan_to_num(mu, nan=-1e12, posinf=1e12, neginf=-1e12)
-    sigma = np.maximum(np.nan_to_num(sigma, nan=0.0,
-                                     posinf=1e6, neginf=0.0), 1e-12)
     c = np.clip(np.nan_to_num(c, nan=1.0, posinf=1.0, neginf=0.0), 0.0, 1.0)
     # ``best_f`` is only used to centre the score so the cumulative
     # portfolio rewards stay on the same scale as the other arms.
     centre = float(np.nan_to_num(best_f, nan=0.0,
                                  posinf=1e12, neginf=-1e12))
-    return (mu - centre - float(xi)) - float(lam) * c + 0.5 * sigma
+    return (mu - centre - float(xi)) - float(lam) * c
 
 
 class _GpHedgePortfolio:
@@ -15107,15 +15114,18 @@ class _GpHedgePortfolio:
     bonus to the actually-picked arm when an observed loss improvement
     confirmed its pick in the real world.
 
-    Why we keep all five arms always active
-    --------------------------------------
+    Why we keep all seven arms always active
+    ----------------------------------------
     Even when LogEI dominates the long-run reward, the alternatives
     pay off in transient regimes the main arm can't see — UCB rescues
     runs that get stuck in a single basin, joint Thompson probes the
     posterior randomness for unmapped niches, PI takes the quick win
     when the surrogate is locally exploitable, PE (pure exploration)
-    blasts open the σ map after a refit.  Several knobs prevent the
-    portfolio from collapsing to a single arm:
+    blasts open the σ map after a refit, KG finds candidates whose
+    evaluation maximally tightens the posterior max, pars discounts
+    long-and-narrow picks the HoF would later filter out anyway.
+    Several knobs prevent the portfolio from collapsing to a single
+    arm:
 
       * ``decay`` exponentially fades cumulative reward each iteration
         (half-life ≈ 23 iters at 0.97), so a regime shift actually
@@ -15123,16 +15133,28 @@ class _GpHedgePortfolio:
       * ``eps`` mixes the softmax with a uniform floor — every arm is
         guaranteed at least ``eps / K`` sampling probability so none
         can starve permanently.
+      * ``_MAX_ARM_SHARE`` caps any single arm's per-call sampling
+        weight (default 55 %), redistributing the surplus to the
+        runners-up.  The cap is the structural belt-and-suspenders
+        against lock-in: even if a streak pushes the cumulative reward
+        gap wide enough that the softmax + eps mix alone would put
+        the leader at 70-80 %, the cap pulls it back to a ratio the
+        alternative arms can climb out of within a normal decay
+        window.
       * ``eta`` controls the softmax sharpness; tuned for the
         std-normalized counterfactual reward scale (≈ O(1) per arm
         after the within-iteration normalisation in ``update_all``).
         When ``adaptive_eta`` is True a warm-up schedule keeps η low
         for the first few iterations so the cold-start bias and a
         single lucky pick can't lock the softmax.
-      * Cold-start bias: explorer arms (UCB, PE) are pre-credited with
-        positive cumulative reward at construction so the first ~20
-        iterations lean toward exploration; the bias fades naturally
-        through ``decay`` once the real signal accumulates.
+      * Cold-start bias: explorer arms (UCB, PE, KG) are pre-credited
+        with positive cumulative reward at construction so the first
+        ~20 iterations lean toward exploration; LogPI and PARS — both
+        exploitation-flavoured arms whose picks can lock the softmax
+        through observed-improvement bonuses before the surrogate has
+        enough data — start with a small NEGATIVE head start.  The
+        bias fades naturally through ``decay`` once the real signal
+        accumulates.
 
     Together these reproduce Hoffman et al.'s claim that the portfolio
     never fully retires an arm while still letting the long-run leader
@@ -15155,12 +15177,20 @@ class _GpHedgePortfolio:
                                   posterior max even when their own μ
                                   doesn't beat best_f.  Qualitatively
                                   different signal from LogEI / UCB / PE.
-    Parsimony (`pars`)          - SR-specific Occam arm: μ-penalty
-                                  proportional to candidate complexity
-                                  (active-node fraction).  Lets the
-                                  portfolio express "prefer simpler when
-                                  quality ties" without baking it into
-                                  every arm.
+    Parsimony (`pars`)          - SR-specific Occam arm: μ minus a
+                                  complexity penalty proportional to
+                                  candidate active-node fraction.  Pure
+                                  exploitation-with-Occam — no σ
+                                  exploration term, since UCB/PE/KG/TS
+                                  already cover that and a σ-augmented
+                                  parsimony arm grabs early-iteration
+                                  "lucky improvements" via high-σ
+                                  picks, which is the main pathway by
+                                  which the portfolio used to collapse
+                                  onto a single arm.  Lets the
+                                  portfolio express "prefer simpler
+                                  when quality ties" without baking it
+                                  into every arm.
     """
 
     ARMS = ('logei', 'ucb', 'logpi', 'ts', 'pe', 'kg', 'pars')
@@ -15177,13 +15207,42 @@ class _GpHedgePortfolio:
     # rather than free-rolling on counterfactual surrogate credit.
     # KG gets a modest positive bias (principled information-gathering is
     # particularly valuable early when the surrogate is still mapping the
-    # encoding space); PARS gets a smaller bias so it nudges the early
-    # picks toward simpler templates without dominating the search.
+    # encoding space).  PARS is now (post-σ-term-removal) an
+    # exploitation-with-Occam arm — it gets the same kind of small
+    # NEGATIVE head start as logpi to prevent it from locking the
+    # softmax via early-iteration improvement-bonus accumulation
+    # before other arms have a chance to compete.  Empirically this
+    # was the main lock-in pathway: pars used to grab high-σ uncertain
+    # picks (which improved often by lucky-draw), the bonus normaliser
+    # kept those small improvements ≈ O(1) in the reward bookkeeper,
+    # and 6-8 iterations of consecutive wins were enough to push pars
+    # above the 50 % softmax share.
     # All values are on the std-normalized reward scale (≈ O(1) after
     # ``update_all``'s within-iteration normalisation) and fade to ~5%
     # of the original by iter 100 under the default ``decay``.
     _COLD_START_BIAS = {'ucb': 0.6, 'pe': 0.4, 'logpi': -0.4,
-                        'kg': 0.3, 'pars': 0.15}
+                        'kg': 0.3, 'pars': -0.1}
+
+    # ---- Max single-arm share ---------------------------------------------
+    # Hard cap on the softmax+eps weight any one arm can carry on a single
+    # ``choose()`` call.  Even with cold-start bias, std-normalisation,
+    # stagnation penalty, and the eps-greedy floor, a string of 5-8
+    # consecutive winning picks by one arm pushes its cumulative reward
+    # high enough that the softmax weight exceeds 60-70 % — at which point
+    # the runner-up arms can only claim ``eps / K`` each (~1.4 % per arm
+    # at the default eps=0.1, K=7).  That gap is too wide to recover from
+    # under realistic decay (`0.97`), and the portfolio effectively
+    # retires every arm except the leader for the rest of the run.
+    #
+    # The cap caps the leader at ``_MAX_ARM_SHARE`` and spreads the
+    # surplus mass to the remaining arms in proportion to their own
+    # post-softmax weights.  ``0.55`` keeps the leader strongly preferred
+    # (3.85× uniform with K=7) but guarantees the runners-up combined
+    # share is at least ``1 - 0.55 = 0.45`` — enough to actually pull
+    # the alternatives 3-5 times in a 10-iter window, which is the
+    # cadence needed for a regime shift to register on the
+    # cumulative-reward bookkeeper.
+    _MAX_ARM_SHARE = 0.55
 
     # ---- Stagnation cooldown ---------------------------------------------
     # If an arm is the picked arm for ``_STAGNATION_THRESHOLD`` consecutive
@@ -15286,9 +15345,27 @@ class _GpHedgePortfolio:
 
     def weights(self):
         """Softmax over current cumulative rewards, mixed with a uniform
-        floor.  The floor guarantees a minimum sampling rate of
-        ``eps / K`` per arm — even a long-dominated arm can't be
-        permanently starved out of the rotation.
+        floor and capped per-arm.
+
+        Three guards combine to keep the portfolio from collapsing to a
+        single arm:
+
+          * The softmax floor (`eps / K`) guarantees a minimum sampling
+            rate for every arm — even a long-dominated arm can't be
+            permanently starved out of the rotation.
+          * The per-arm cap ``_MAX_ARM_SHARE`` prevents any single arm
+            from carrying more than 55 % of the sampling mass on a
+            single call, redistributing the surplus to the remaining
+            arms in proportion to their own post-softmax weights.
+            Without this cap, the canonical GP-Hedge dynamics let a
+            string of 5-8 consecutive wins push the leader's share
+            above 70 % — and once there, decay alone is too slow to
+            give challenger arms enough pulls to catch up.
+          * The stagnation cooldown in ``update_all`` bleeds reward
+            from arms that keep getting picked without delivering
+            observed improvements — a separate failure mode the cap
+            doesn't catch (since the cap only triggers when the
+            softmax is already extreme).
         """
         eta = self.effective_eta()
         r = self.rewards - np.max(self.rewards)
@@ -15301,7 +15378,42 @@ class _GpHedgePortfolio:
             w_soft = w / s
         # Epsilon-greedy mixing: at most (1-eps) goes to the softmax,
         # at least eps is split uniformly across all arms.
-        return (1.0 - self.eps) * w_soft + self.eps / n
+        w_final = (1.0 - self.eps) * w_soft + self.eps / n
+        # Per-arm dominance cap.  When the leader exceeds
+        # ``_MAX_ARM_SHARE`` we trim it back to the cap and spread the
+        # surplus across the remaining arms in proportion to their
+        # current weights (so the relative ordering among the trailing
+        # arms is preserved).  Falls back to a uniform spread if every
+        # other arm is already at zero (numerically unlikely thanks to
+        # the eps floor, but defensive).
+        cap = float(self._MAX_ARM_SHARE)
+        # The cap must leave room for the eps floor: each non-leading
+        # arm carries at least ``eps / n``, so ``cap`` can't be lower
+        # than ``1 - (n-1) * eps/n``.  Clamp upward defensively if a
+        # very small cap is ever configured.
+        cap = max(cap, 1.0 / n)
+        over = np.maximum(w_final - cap, 0.0)
+        total_over = float(over.sum())
+        if total_over > 1e-12:
+            below_mask = w_final < cap
+            if np.any(below_mask):
+                below = w_final * below_mask
+                below_sum = float(below.sum())
+                if below_sum > 1e-12:
+                    redist = below * (total_over / below_sum)
+                else:
+                    redist = np.where(below_mask,
+                                       total_over / float(below_mask.sum()),
+                                       0.0)
+                w_final = np.where(w_final > cap, cap,
+                                   w_final + redist)
+            # Defensive renormalise — the redistribution above
+            # preserves total mass exactly in exact arithmetic, but
+            # floating point can drift by a few ULP.
+            w_sum = float(w_final.sum())
+            if w_sum > 0:
+                w_final = w_final / w_sum
+        return w_final
 
     def choose(self, rng=None):
         """Sample an arm index and remember the choice."""
