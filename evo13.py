@@ -15987,6 +15987,13 @@ class BayesianCGPOptimizer:
             kernel=kernel, alpha=1e-6, normalize_y=True,
             n_restarts_optimizer=3)
         self.gp_fitted = False
+        # Initialise the copula-space best so the EI/PI improvement gap is
+        # well-defined even if ``score_candidates`` is ever reached before
+        # ``fit_surrogate`` populated this attribute (e.g. transient
+        # exception between ``self.gp.fit`` and the ``np.max`` assignment).
+        # ``-inf`` ensures every candidate looks like an improvement until
+        # the first successful fit replaces this with the true buffer max.
+        self.current_best_f = -np.inf
         self._gp_length_scale = None  # cached after fit_surrogate; used as
                                        # length scale for diverse selection
 
@@ -16175,16 +16182,30 @@ class BayesianCGPOptimizer:
         The encoding's multi-class cells depend on ``bg_logits_probe``, so
         when ``set_multiclass_state`` advances the state every cached
         vector needs to be regenerated to stay on the same descriptor
-        manifold as new candidate encodings.  Errors are swallowed because
-        a stale-vector buffer is still better than a half-encoded one.
+        manifold as new candidate encodings.  Per-entry errors are
+        tolerated (a stale-vector buffer beats a half-encoded one) but
+        we count failures and emit a one-shot diagnostic the first time
+        a non-trivial fraction fails — silent half-coherent buffers are
+        the kind of bug that gets noticed only when the GP fit looks
+        inexplicably bad.
         """
         if not self.individuals:
             return
+        n_fail = 0
         for i, ind in enumerate(self.individuals):
             try:
                 self.X_observed[i] = self._encode(ind.tree)
             except Exception:
-                pass
+                n_fail += 1
+        n_total = len(self.individuals)
+        if n_fail > 0 and n_fail >= max(5, n_total // 4):
+            # Only print the warning once per optimiser to avoid log
+            # spam if the failure mode is persistent.
+            if not getattr(self, '_reencode_warned', False):
+                print(f"  [BO] WARNING: {n_fail}/{n_total} buffer entries "
+                      "failed re-encoding under new mc_state — surrogate "
+                      "may see mixed-epoch vectors until next refresh.")
+                self._reencode_warned = True
 
     def get_full_mc_context(self):
         """Return the live ``(bg_logits, Y_group, class_idx)`` tuple for
@@ -16337,8 +16358,13 @@ class BayesianCGPOptimizer:
         # Gaussian Copula transformation (rank-based)
         # Maps the targets to standard normal quantiles to avoid extreme outliers
         # (like when loss nears 0 and log(loss) explodes) that collapse the GP length-scale.
+        # ``(ranks - 0.5) / n`` is mathematically in (0, 1) for n >= 1 with
+        # ``rankdata(..., method='average')``, but float rounding on huge ``n``
+        # or degenerate buffers can still land exactly on the open endpoints
+        # — clip defensively so ``ppf`` never produces ±inf and poisons the
+        # GP fit downstream.
         ranks = rankdata(y_finite, method='average')
-        uniform_y = (ranks - 0.5) / n
+        uniform_y = np.clip((ranks - 0.5) / n, 1e-9, 1.0 - 1e-9)
         gaussian_y = _SCIPY_NORM.ppf(uniform_y)
 
         try:
@@ -16572,30 +16598,21 @@ class BayesianCGPOptimizer:
                                      length_scale=ls,
                                      penalty_weight=2.0)
 
-    def record_iteration_outcome(self, improved: bool,
-                                 improvement_amount: float = 0.0):
-        """Update the adaptive xi multiplier and portfolio from this
-        iteration's result.
+    def tick_trust_region(self, improved: bool):
+        """Advance the TuRBO trust-region streak / restart bookkeeper.
 
-        ``improved`` should be True iff at least one full-fidelity
-        evaluation this iteration produced a better-than-previous-best
-        observation for this output (typically: a HoF admit or an
-        improvement to the optimiser's running min loss).  We bump
-        ``xi_scale`` UP after a few consecutive non-improvements
-        (force more EI exploration) and DOWN after a few consecutive
-        improvements (let EI converge).  The result rides on top of
-        the outer BO loop's iteration-decay schedule and is local to
-        each output's surrogate, so a stuck output doesn't drag the
-        exploration up for outputs that are still improving.
+        Split out of ``record_iteration_outcome`` so the islands and
+        islanded-AFPO variants — which call ``score_candidates`` +
+        ``update_portfolio_outcome`` once per island per output — can
+        still tick the trust region ONCE per output per BO iteration.
+        Without this split, ``xi_scale`` / ``tr_mut_scale`` /
+        ``tr_restart_pending`` adapt ``NUM_ISLANDS`` × faster than the
+        non-island variants, collapsing the ``_success_streak >= 2``
+        threshold to "any improvement at all".
 
-        ``improvement_amount`` (optional) is the magnitude of the
-        improvement on the LOSS scale.  When not supplied (older
-        callers) we infer it from the optimiser's own buffer: the
-        loss-side gap between the running best and the previously
-        recorded best.  The portfolio is then credited with the
-        log-scaled improvement, so the arm picked in this iteration's
-        last ``score_candidates`` call gets attribution proportional
-        to its observed gain.
+        ``improved`` should aggregate across all islands for the output
+        (i.e. ``True`` if ANY island found an improvement this
+        iteration).
         """
         if improved:
             self._success_streak += 1
@@ -16644,6 +16661,25 @@ class BayesianCGPOptimizer:
             self.tr_restart_count += 1
             self.tr_restart_pending = True
 
+    def update_portfolio_outcome(self, improved: bool,
+                                  improvement_amount: float = 0.0):
+        """Credit the GP-Hedge portfolio for the LAST ``score_candidates``
+        call on this optimiser.
+
+        Pair-wise with ``score_candidates``: each acquisition pick must
+        be matched with exactly one portfolio update so cumulative
+        rewards reflect every arm choice.  Islands variants call this
+        once per island per output (each island runs its own
+        score-then-pick cycle); the non-island variants call it once
+        per output, same cardinality as ``score_candidates``.
+
+        ``improvement_amount`` (optional) is the magnitude of the
+        improvement on the LOSS scale.  When not supplied (older
+        callers) we infer it from the optimiser's own buffer: the
+        loss-side gap between the running best and the previously
+        recorded best.  The picked arm gets attribution proportional
+        to its observed gain.
+        """
         # Infer improvement amount from the optimiser's own buffer when
         # the caller didn't supply one.  We use the gap between the
         # buffer's current best transformed fitness and the buffer's
@@ -16722,6 +16758,22 @@ class BayesianCGPOptimizer:
             self._best_y_at_iter_start = None
         except Exception:
             pass
+
+    def record_iteration_outcome(self, improved: bool,
+                                 improvement_amount: float = 0.0):
+        """Convenience wrapper: tick the trust region AND update the
+        portfolio in one call.  Used by the non-island BO variants
+        (vanilla, AFPO, QD) which run one ``score_candidates`` /
+        outcome cycle per output per BO iteration, so trust-region
+        and portfolio cadence coincide.
+
+        Islands / Islanded-AFPO call ``update_portfolio_outcome`` per
+        island and ``tick_trust_region`` once per output instead, so
+        the trust-region streaks tick at the BO-iteration cadence the
+        thresholds were designed for.
+        """
+        self.tick_trust_region(improved)
+        self.update_portfolio_outcome(improved, improvement_amount)
 
     def get_best_individuals(self, n=5):
         """Return the top-n individuals by loss (lowest loss first)."""
@@ -17684,6 +17736,13 @@ def run_bayesian_islands(X, Y, n_features, n_outputs, feat_names, out_types,
                     _frac_exploit, _frac_cross, _frac_macro, _frac_hof_x = (
                         0.60, 0.15, 0.10, 0.10)
 
+                # Aggregate improvement across islands so the trust-region
+                # streak ticks ONCE per output per BO iteration (matching
+                # the cadence of the non-island variants).  Per-island
+                # portfolio updates still happen so each island's arm
+                # pick is properly credited.
+                _bo_any_improved = False
+
                 for island_idx in range(NUM_ISLANDS):
                     pop = islands_pop[island_idx][o_idx]
                     top_inds = pop[:max(1, len(pop)//2)]
@@ -17835,28 +17894,57 @@ def run_bayesian_islands(X, Y, n_features, n_outputs, feat_names, out_types,
                         if child.loss < _bo_prev_best - 1e-9:
                             _bo_improved = True
 
-                    opt.record_iteration_outcome(_bo_improved)
+                    # Credit THIS island's portfolio pick (paired with its
+                    # own ``score_candidates`` call above); the
+                    # trust-region streak tick is deferred to once-per-
+                    # output after all islands have run.
+                    opt.update_portfolio_outcome(_bo_improved)
+                    if _bo_improved:
+                        _bo_any_improved = True
 
                     # Standard survival selection (e.g. tournament or sort)
                     pop.sort(key=lambda x: x.fitness)
                     islands_pop[island_idx][o_idx] = pop[:ISLAND_SIZE]
 
-                # Migration (every 5 iterations)
+                # Trust-region streak: aggregated across islands so the
+                # restart bookkeeper ticks at one event per BO iteration
+                # per output — matching the cadence the thresholds in
+                # ``tick_trust_region`` were calibrated for.
+                opt.tick_trust_region(_bo_any_improved)
+
+                # Migration (every 5 iterations).  IMPORTANT: snapshot
+                # the source-pop reference for every island BEFORE any
+                # migration writes happen, otherwise the ring shift
+                # cascades — migrants placed into island k by the
+                # iteration ``island_idx=k-1`` would otherwise be eligible
+                # to be re-migrated again to island k+1 when the loop
+                # reaches ``island_idx=k`` in the same migration pass,
+                # so a single island's best could hop the entire ring
+                # in one step and destroy inter-island diversity.
                 if iteration % 5 == 0 and NUM_ISLANDS > 1:
                     _probe_idx_mig = np.random.choice(X.shape[0], min(16, X.shape[0]), replace=False)
                     _X_probe_mig = X[_probe_idx_mig]
+                    # Snapshot source pops as a list of independent lists
+                    # so subsequent target-pop writes can't leak back
+                    # into a later island's source view.
+                    _mig_srcs = [list(islands_pop[i][o_idx])
+                                 for i in range(NUM_ISLANDS)]
                     for island_idx in range(NUM_ISLANDS):
                         next_island = (island_idx + 1) % NUM_ISLANDS
-                        src_pop = islands_pop[island_idx][o_idx]
+                        src_pop = _mig_srcs[island_idx]
+                        if not src_pop:
+                            continue
                         n_mig = min(2, max(1, len(src_pop) // 25))
                         migrants = _select_diverse_migrants(src_pop, n_migrants=n_mig, X_probe=_X_probe_mig)
                         target_pop = islands_pop[next_island][o_idx]
                         for mig in migrants:
-                            mig_copy = copy.deepcopy(mig)
+                            # ``_select_diverse_migrants`` already deep-
+                            # copies and resets age, so no second copy
+                            # is required.
                             if target_pop:
                                 worst = max(target_pop, key=lambda x: x.fitness)
                                 target_pop.remove(worst)
-                            target_pop.append(mig_copy)
+                            target_pop.append(mig)
 
                 if iteration % BAYESIAN_GP_REFIT_FREQ == 0:
                     if opt.has_mc_context and opt.mc_full is not None:
@@ -18129,6 +18217,13 @@ def run_bayesian_islanded_afpo(X, Y, n_features, n_outputs, feat_names, out_type
                     _frac_exploit, _frac_cross, _frac_macro, _frac_hof_x = (
                         0.60, 0.15, 0.10, 0.10)
 
+                # Aggregate improvement across islands so the trust-region
+                # streak ticks ONCE per output per BO iteration (matching
+                # the cadence of the non-island variants).  Per-island
+                # portfolio updates still happen so each island's arm
+                # pick is properly credited.
+                _bo_any_improved = False
+
                 for island_idx in range(NUM_ISLANDS):
                     pop = islands_pop[island_idx][o_idx]
 
@@ -18283,27 +18378,48 @@ def run_bayesian_islanded_afpo(X, Y, n_features, n_outputs, feat_names, out_type
                         if child.loss < _bo_prev_best - 1e-9:
                             _bo_improved = True
 
-                    opt.record_iteration_outcome(_bo_improved)
+                    # Credit THIS island's portfolio pick; the trust-region
+                    # streak is ticked once-per-output after all islands
+                    # have run.  See ``run_bayesian_islands`` for the full
+                    # rationale.
+                    opt.update_portfolio_outcome(_bo_improved)
+                    if _bo_improved:
+                        _bo_any_improved = True
 
                     islands_pop[island_idx][o_idx] = _trim_to_pareto_front_3obj(pop, AFPO_POP_SIZE)
 
-                # Migration (every 5 iterations)
+                # Trust-region streak: aggregated across islands so the
+                # restart bookkeeper ticks at one event per BO iteration
+                # per output.
+                opt.tick_trust_region(_bo_any_improved)
+
+                # Migration (every 5 iterations).  Snapshot all source
+                # pops before any migration writes so the ring shift
+                # doesn't cascade — see ``run_bayesian_islands`` for the
+                # full rationale.  ``_select_diverse_migrants`` already
+                # deep-copies; we explicitly reset age to 0 to mark
+                # migrants as freshly arrived in the AFPO Pareto frontier
+                # (a high-age migrant would be aggressively pruned by the
+                # age-fitness front trim regardless of its quality).
                 if iteration % 5 == 0 and NUM_ISLANDS > 1:
                     _probe_idx_mig = np.random.choice(X.shape[0], min(16, X.shape[0]), replace=False)
                     _X_probe_mig = X[_probe_idx_mig]
+                    _mig_srcs = [list(islands_pop[i][o_idx])
+                                 for i in range(NUM_ISLANDS)]
                     for island_idx in range(NUM_ISLANDS):
                         next_island = (island_idx + 1) % NUM_ISLANDS
-                        src_pop = islands_pop[island_idx][o_idx]
+                        src_pop = _mig_srcs[island_idx]
+                        if not src_pop:
+                            continue
                         n_mig = min(3, max(1, AFPO_POP_SIZE // 50))
                         migrants = _select_diverse_migrants(src_pop, n_migrants=n_mig, X_probe=_X_probe_mig)
                         target_pop = islands_pop[next_island][o_idx]
                         for mig in migrants:
-                            mig_copy = copy.deepcopy(mig)
-                            mig_copy.age = 0
+                            mig.age = 0
                             if target_pop:
                                 worst = max(target_pop, key=lambda x: x.fitness)
                                 target_pop.remove(worst)
-                            target_pop.append(mig_copy)
+                            target_pop.append(mig)
 
                 if iteration % BAYESIAN_GP_REFIT_FREQ == 0:
                     if opt.has_mc_context and opt.mc_full is not None:
