@@ -11413,7 +11413,7 @@ def plot_model():
 
     n_feat = N_FEATURES
     n_out = N_OUTPUTS
-    resolution = 200
+    resolution = 10000
 
     # Build defaults
     feat_defaults = {{}}
@@ -21554,7 +21554,7 @@ def plot_model():
 
     n_feat = N_FEATURES
     n_out = N_OUTPUTS
-    resolution = 200
+    resolution = 10000
 
     # Build defaults
     feat_defaults = {{}}
