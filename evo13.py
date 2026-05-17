@@ -11631,6 +11631,21 @@ def get_configs(df):
             sample_val = df[col].iloc[0] if len(df[col]) else ''
         dtype = df[col].dtype
 
+        # Auto-skip columns with ≤1 unique value: they carry zero information
+        # for the model (an input is a constant feature, an output has nothing
+        # to predict), so prompting the user for a type is wasted keystrokes.
+        # Force-set type 0 (Ignore) and move on.
+        if unique_count <= 1:
+            print(f"\n--> [{i+1}/{len(df.columns)}] COLUMN: {col}")
+            print(f"    Dtype: {dtype} | Unique values: {unique_count}"
+                  f"{' | NaN: '+str(nan_count) if nan_count > 0 else ''} "
+                  f"| Sample: '{sample_val}'")
+            print(f"    (AUTO-SKIP) Only {unique_count} unique value(s) — "
+                  f"set to Ignore (type 0).")
+            configs.append((col, 0))
+            i += 1
+            continue
+
         # Hint about how an object column will be auto-handled if the user
         # picks numeric.  Cheap pre-check using the same helpers used by
         # DataProcessor.fit_transform so the hint never lies.
@@ -11664,9 +11679,22 @@ def get_configs(df):
                 for _ in range(c):
                     if i < len(df.columns):
                         current_col = df.columns[i]
-                        configs.append((current_col, t))
-                        status = "OK" if t != 0 else "SKIP"
-                        print(f"    ({status}) {current_col} -> {t}")
+                        # Honour the auto-skip rule even when applying a bulk
+                        # ``T*N``: a column with ≤1 unique value gets forced
+                        # to type 0 regardless of what the user requested.
+                        try:
+                            cur_unique = df[current_col].nunique(dropna=True)
+                        except Exception:
+                            cur_unique = 2  # fall back to "looks fine" on errors
+                        if cur_unique <= 1:
+                            configs.append((current_col, 0))
+                            print(f"    (AUTO-SKIP) {current_col} -> 0 "
+                                  f"(only {cur_unique} unique value(s); "
+                                  f"overrides requested {t})")
+                        else:
+                            configs.append((current_col, t))
+                            status = "OK" if t != 0 else "SKIP"
+                            print(f"    ({status}) {current_col} -> {t}")
                         i += 1
                 valid = True
             except Exception:
@@ -17345,52 +17373,91 @@ class BayesianCGPOptimizer:
 class QualityDiversityArchive:
     """MAP-Elites style archive over the symbolic-regression behaviour space.
 
-    Behavioural descriptor (BD) for an individual:
-        ( complexity_bucket , feature_subset_signature , dominant_op_class )
+    Behavioural descriptor (BD) — 4-tuple — for an individual:
+        ( complexity_bucket , feature_subset_signature ,
+          dominant_op_class , op_diversity_bucket )
 
     where:
-      ─ complexity_bucket = floor(active_node_count / 3) clipped to ``max_complexity_buckets``
+      ─ complexity_bucket = log-scale active-node count, finer at the small end
+        (the regime where most of the search lives) and bounded above so very
+        big trees collapse into a few coarse cells.
       ─ feature_subset_signature = sorted tuple of feature indices that appear
         as inputs in the active subgraph (capped at ``max_feat_in_signature``
         to keep the archive bounded as ``n_features`` grows)
       ─ dominant_op_class = the operator category (arith/trig/expon/log/cond/…)
         that contributes the most active nodes; ties broken by category order
+      ─ op_diversity_bucket = the number of DISTINCT op categories in the
+        active subgraph, clipped to {0, 1, 2, 3+}.  Adding this fourth axis
+        separates "all-arith linear" from "arith+trig" from "arith+trig+log"
+        templates even when their complexity, feature set, and dominant op
+        coincide — so the search explores fundamentally different basin
+        types instead of collapsing them onto a single elite.
 
-    Each cell stores the best-loss individual found there.  ``add()`` returns
-    True when the candidate replaces the cell's previous occupant (or
-    establishes a new cell), which the BO loop uses to drive a "novelty"
-    counter without needing a separate novelty estimator.
+    Each cell stores up to ``elites_per_cell`` individuals (top-K by loss),
+    not just one.  Multi-elite cells give cross-cell crossover and within-
+    cell mutation a richer set of structurally-similar parents to recombine,
+    which is the single biggest lever for QD's diversification objective.
+    ``add()`` returns True when the candidate either creates a new cell or
+    becomes the new BEST of an existing cell — the BO loop treats this as
+    a novelty signal driving the trust-region adaptation.
+
+    Sampling defaults to *curiosity-weighted* draws: cells that were filled
+    or improved recently receive a small freshness bonus, and cells that
+    have been picked as parents many times without producing new wins get
+    a mild under-explored discount.  Empirically this beats uniform-cell
+    sampling for symbolic regression because the late-stage archive has
+    many "saturated" cells whose elite is already near-optimal — uniform
+    sampling wastes mutations on them while curiosity sampling steers
+    the search toward cells that still have room to improve.
     """
 
-    def __init__(self, n_features, max_nodes, max_feat_in_signature=8):
+    def __init__(self, n_features, max_nodes, max_feat_in_signature=8,
+                 elites_per_cell=3, archive_cap=4096):
         self.n_features = n_features
         self.max_nodes = max_nodes
         self.max_feat_in_signature = max_feat_in_signature
-        self.cells = {}            # bd_key → Individual
-        self.add_count = 0         # total successful adds (for stats)
+        self.elites_per_cell = max(1, int(elites_per_cell))
+        self.archive_cap = max(64, int(archive_cap))
+        # cells: bd_key → list[Individual] sorted ascending by loss
+        self.cells = {}
+        # Per-cell bookkeeping for curiosity / age tracking.
+        self.cell_birth = {}        # bd_key → iteration when first created
+        self.cell_last_improved = {}  # bd_key → iteration of last best-update
+        self.cell_visit_count = {}  # bd_key → times sampled as parent (curiosity)
+        # Global stats
+        self.add_count = 0          # total successful adds (best-replacements)
         self.last_replace_iter = 0
+        self.last_new_cell_iter = 0
+        self._current_iter = 0
+        # Stagnation tracking: True iff add_count has not grown for a while
+        self._iters_no_new_cell = 0
+        self._iters_no_improvement = 0
+        self._best_loss_seen = float('inf')
 
     # ── BD computation ──────────────────────────────────────────────────
     def descriptor(self, individual):
-        """Compute the behavioural-descriptor key for ``individual``."""
+        """Compute the 4-axis behavioural-descriptor key for ``individual``.
+
+        The descriptor is structural only — it depends on the active subgraph
+        and active feature set, not on phenotype.  This lets the BO loop
+        compute BDs for candidate trees *before* evaluation (so EI scoring
+        can apply a novelty bonus to genuinely-new structural niches).
+        """
         tree = individual.tree if hasattr(individual, 'tree') else individual
         try:
             tree.update_active_nodes()
         except Exception:
-            return ('error', (), 'other')
+            return ('error', (), 'other', 0)
 
         n_feat = tree.n_features
         active = tree.active_nodes
 
         feat_used = sorted(idx for idx in active if idx < n_feat)
-        # Cap signature length so cells don't proliferate when many features
-        # are nominally "used"; we keep the lowest-indexed ones because they
-        # are typically the most important after feature ranking.
         if len(feat_used) > self.max_feat_in_signature:
             feat_used = feat_used[:self.max_feat_in_signature]
         feat_sig = tuple(feat_used)
 
-        # Operator histogram → dominant class
+        # Operator histogram → dominant class + distinct-op-count
         op_counts = {cat: 0 for cat in _BO_OP_CATEGORY_LIST}
         n_active = 0
         for idx in active:
@@ -17404,86 +17471,342 @@ class QualityDiversityArchive:
 
         if n_active == 0:
             dominant = 'const'
+            distinct_ops = 0
         else:
-            # Pick the category with the most nodes; deterministic tie-break
-            dominant = max(_BO_OP_CATEGORY_LIST,
-                           key=lambda c: (op_counts.get(c, 0), -_BO_OP_CATEGORY_LIST.index(c)))
+            dominant = max(
+                _BO_OP_CATEGORY_LIST,
+                key=lambda c: (op_counts.get(c, 0),
+                               -_BO_OP_CATEGORY_LIST.index(c)))
+            distinct_ops = sum(1 for v in op_counts.values() if v > 0)
 
-        # Complexity bucket — log-linear so simple expressions get more
-        # resolution near the origin, matching where most of the search
-        # spends its time.
-        bucket = min(8, int(np.log2(max(1, n_active)) + 1))
+        # Complexity bucket — log-scale with extended range so 200-node
+        # graphs don't all collapse into bucket 8.  Multiplier of 1.5
+        # gives ≈ 13 buckets for sizes [1..200], with finer resolution
+        # near the small end where most of the search lives.
+        bucket = min(13, int(np.log2(max(1, n_active)) * 1.5))
 
-        return (bucket, feat_sig, dominant)
+        # Op-diversity bucket clipped to {0,1,2,3+} — keeps the descriptor
+        # tuple small while still separating "monoculture" from "mixed"
+        # subgraphs.
+        op_div = min(3, distinct_ops)
+
+        return (bucket, feat_sig, dominant, op_div)
 
     # ── Archive management ─────────────────────────────────────────────
     def add(self, individual, iteration=None):
-        """Insert ``individual`` if better than the current cell occupant.
+        """Insert ``individual`` into its BD cell.
 
-        Returns True iff the cell was created or replaced.  The BO loop
-        treats this as a novelty signal: bursts of new-cell discoveries
-        mean the search is exploring fresh territory; a long quiet stretch
-        means the BD space has saturated and exploration should ramp up.
+        Multi-elite semantics: each cell keeps the top ``elites_per_cell``
+        individuals by loss.  An insertion may:
+          (a) create a new cell (returns True — novel structural niche),
+          (b) become the new cell BEST (returns True — best improved), or
+          (c) take a non-top slot in an existing cell (returns False —
+              quietly added for crossover diversity, but no novelty signal).
+
+        Returning True only on (a)/(b) preserves the BO loop's existing
+        "new_cell ⇒ improvement" semantics so the trust-region adaptation
+        and improvement counters don't fire on cosmetic insertions.
         """
         loss = float(getattr(individual, 'loss', np.inf))
         if not np.isfinite(loss):
             return False
         key = self.descriptor(individual)
-        prev = self.cells.get(key)
-        if prev is None or loss < float(getattr(prev, 'loss', np.inf)) - 1e-9:
+        if iteration is not None:
+            self._current_iter = max(self._current_iter, int(iteration))
+
+        bucket = self.cells.get(key)
+        if bucket is None:
+            # Fresh cell
             try:
                 stored = copy.deepcopy(individual)
             except Exception:
                 stored = individual
-            self.cells[key] = stored
+            self.cells[key] = [stored]
+            self.cell_birth[key] = self._current_iter
+            self.cell_last_improved[key] = self._current_iter
+            self.cell_visit_count[key] = 0
             self.add_count += 1
-            if iteration is not None:
-                self.last_replace_iter = iteration
+            self.last_replace_iter = self._current_iter
+            self.last_new_cell_iter = self._current_iter
+            self._maybe_compact()
+            return True
+
+        # Existing cell — insert in sorted position
+        prev_best_loss = float(getattr(bucket[0], 'loss', np.inf))
+        if loss >= prev_best_loss - 1e-9 and len(bucket) >= self.elites_per_cell:
+            # Won't beat the worst incumbent and the slot is full
+            worst_loss = float(getattr(bucket[-1], 'loss', np.inf))
+            if loss >= worst_loss - 1e-9:
+                # Still bump visit accounting so stuck cells get
+                # deprioritised even when their parents keep returning
+                # losing children.
+                return False
+
+        try:
+            stored = copy.deepcopy(individual)
+        except Exception:
+            stored = individual
+
+        # Insort by loss; cap at ``elites_per_cell``.
+        bucket.append(stored)
+        bucket.sort(key=lambda x: float(getattr(x, 'loss', np.inf)))
+        if len(bucket) > self.elites_per_cell:
+            del bucket[self.elites_per_cell:]
+
+        # Was this a new BEST for the cell?
+        new_best_loss = float(getattr(bucket[0], 'loss', np.inf))
+        improved_best = new_best_loss < prev_best_loss - 1e-9
+        if improved_best:
+            self.add_count += 1
+            self.last_replace_iter = self._current_iter
+            self.cell_last_improved[key] = self._current_iter
             return True
         return False
 
-    # ── Sampling & queries ─────────────────────────────────────────────
-    def sample(self, n=1, prefer_new=True):
-        """Return up to ``n`` individuals uniformly sampled from the archive.
+    def _maybe_compact(self):
+        """If the archive exceeds its cap, evict the staleest low-quality
+        cells.  Stale-and-bad cells are the ones least likely to seed a
+        future improvement: their elite has been there a long time without
+        getting better AND its loss is worse than the median.  Compacting
+        keeps the curiosity sampler's denominator bounded and the per-iter
+        descriptor lookup O(1) on average for very long runs.
+        """
+        if len(self.cells) <= self.archive_cap:
+            return
+        cur = self._current_iter
+        # Score = (age_since_improvement) * (loss_rank_fraction).
+        # Higher score = better candidate for eviction.
+        cell_items = []
+        for key, bucket in self.cells.items():
+            best_loss = float(getattr(bucket[0], 'loss', np.inf))
+            age = max(0, cur - self.cell_last_improved.get(key, cur))
+            cell_items.append((key, best_loss, age))
+        # Sort by loss to compute rank fraction
+        cell_items.sort(key=lambda t: t[1])
+        n = len(cell_items)
+        scored = []
+        for i, (key, loss, age) in enumerate(cell_items):
+            loss_rank = i / max(1, n - 1)
+            score = age * (0.5 + loss_rank)  # bad+old → high score
+            scored.append((score, key))
+        scored.sort(reverse=True)
+        # Evict the worst until we are 5% under the cap (hysteresis avoids
+        # touching the archive every single add at the boundary).
+        target = int(self.archive_cap * 0.95)
+        to_evict = max(0, n - target)
+        for _, key in scored[:to_evict]:
+            self.cells.pop(key, None)
+            self.cell_birth.pop(key, None)
+            self.cell_last_improved.pop(key, None)
+            self.cell_visit_count.pop(key, None)
 
-        When ``prefer_new`` is True we bias the draw toward sparsely-explored
-        cells (uniform over cells, not over individuals): cells with one
-        member get the same selection probability as cells with many,
-        which is exactly the QD diversification objective.
+    # ── Sampling & queries ─────────────────────────────────────────────
+    def _curiosity_weights(self, keys):
+        """Build a normalised weight vector over ``keys`` for curiosity-
+        driven sampling.
+
+        Each cell's weight has three multiplicative components:
+          * recency: cells that were filled / improved recently get a
+            mild bonus (decays over ~50 iterations).
+          * under-explored: cells that have been sampled rarely as parents
+            get a 1/√(1+visits/3) discount on heavy users.
+          * fresh-cell: brand-new cells (<5 iters since birth) get a 1.5×
+            multiplier — gives the curiosity counter a chance to surface
+            them before they get amortised by repeated sampling.
+        """
+        cur = self._current_iter
+        weights = []
+        for k in keys:
+            visits = self.cell_visit_count.get(k, 0)
+            last_imp = self.cell_last_improved.get(k, 0)
+            born = self.cell_birth.get(k, 0)
+            age_imp = max(0, cur - last_imp)
+            age_birth = max(0, cur - born)
+            # under-explored discount: weight ≈ 1 at 0 visits, 0.5 at 9
+            # visits, 0.31 at 30 visits.  Mild — we don't want to starve
+            # productive cells.
+            under_explored = 1.0 / np.sqrt(1.0 + visits / 3.0)
+            # recency: fresh-improvement cells get up to +0.5 weight
+            recency = 1.0 + 0.5 / (1.0 + age_imp / 20.0)
+            # fresh-cell pop: temporary bump for cells born <5 iters ago
+            fresh_pop = 1.5 if age_birth < 5 else 1.0
+            weights.append(under_explored * recency * fresh_pop)
+        w = np.asarray(weights, dtype=np.float64)
+        total = float(w.sum())
+        if total <= 1e-12:
+            return np.ones_like(w) / max(1, len(w))
+        return w / total
+
+    def _record_sampled(self, keys):
+        """Bump the visit counter for each sampled cell — used by the
+        curiosity weighting on subsequent draws."""
+        for k in keys:
+            self.cell_visit_count[k] = self.cell_visit_count.get(k, 0) + 1
+
+    def sample(self, n=1, prefer_new=True, mode='curiosity',
+               within_cell='best'):
+        """Return up to ``n`` individuals sampled from the archive.
+
+        Parameters
+        ----------
+        n : int
+            How many individuals to return (at most ``len(cells)`` when
+            ``prefer_new=True`` since cells aren't double-picked).
+        prefer_new : bool
+            When True, cells are picked without replacement (each cell
+            contributes at most one individual to the returned list).
+            Preserves the original "uniform over cells, not individuals"
+            QD diversification objective.  When False, cells are drawn
+            with replacement.
+        mode : {'curiosity', 'uniform_cell'}
+            ``curiosity`` weights cells by the curiosity score (default —
+            see ``_curiosity_weights``).  ``uniform_cell`` is the legacy
+            unweighted draw retained for ablation / debugging.
+        within_cell : {'best', 'random'}
+            ``best`` returns the cell's lowest-loss elite (default — the
+            old single-elite behaviour).  ``random`` returns a uniformly-
+            picked elite from the cell, which is useful for cross-cell
+            crossover where intra-cell diversity helps recombination.
         """
         if not self.cells:
             return []
         keys = list(self.cells.keys())
-        if n >= len(keys):
-            return [self.cells[k] for k in keys]
-        if prefer_new:
-            picks = random.sample(keys, n)
+
+        # Decide which cells to sample
+        n_pick = min(n, len(keys)) if prefer_new else n
+        if mode == 'curiosity' and len(keys) > 1:
+            probs = self._curiosity_weights(keys)
+            if prefer_new:
+                # Weighted sample WITHOUT replacement.  ``np.random.choice``
+                # with replace=False supports a probability vector.
+                try:
+                    picked_idx = np.random.choice(
+                        len(keys), size=n_pick, replace=False, p=probs)
+                except ValueError:
+                    # Fall back to uniform if the weight vector is
+                    # numerically degenerate.
+                    picked_idx = np.random.choice(
+                        len(keys), size=n_pick, replace=False)
+                picks = [keys[i] for i in picked_idx]
+            else:
+                picked_idx = np.random.choice(
+                    len(keys), size=n_pick, replace=True, p=probs)
+                picks = [keys[i] for i in picked_idx]
         else:
-            picks = [random.choice(keys) for _ in range(n)]
-        return [self.cells[k] for k in picks]
+            if prefer_new:
+                picks = random.sample(keys, n_pick)
+            else:
+                picks = [random.choice(keys) for _ in range(n_pick)]
+
+        # Translate picked keys → individuals
+        out = []
+        for k in picks:
+            bucket = self.cells.get(k)
+            if not bucket:
+                continue
+            if within_cell == 'random' and len(bucket) > 1:
+                out.append(random.choice(bucket))
+            else:
+                out.append(bucket[0])  # cell's best elite
+        self._record_sampled(picks)
+        return out
 
     def best(self, n=5):
-        """Return the lowest-loss occupants across all cells."""
+        """Return the lowest-loss occupants across all cells (each cell
+        contributes only its best elite)."""
         if not self.cells:
             return []
-        ranked = sorted(self.cells.values(),
-                        key=lambda x: float(getattr(x, 'loss', np.inf)))
-        return ranked[:n]
+        bests = [bucket[0] for bucket in self.cells.values() if bucket]
+        bests.sort(key=lambda x: float(getattr(x, 'loss', np.inf)))
+        return bests[:n]
+
+    def iter_best_elites(self):
+        """Yield (key, best_elite_individual) for every cell.  Used by the
+        BO loop to run constant-optimisation over the whole archive, not
+        just the HoF frontier — many QD cells are at distinct complexities
+        whose elites' constants would otherwise never be tuned."""
+        for k, bucket in self.cells.items():
+            if bucket:
+                yield k, bucket[0]
 
     def coverage(self):
         return len(self.cells)
 
+    def total_elites(self):
+        """Total individuals stored across all cells (sum of bucket sizes)."""
+        return sum(len(b) for b in self.cells.values())
+
     def best_loss(self):
         if not self.cells:
             return float('inf')
-        return min(float(getattr(ind, 'loss', np.inf))
-                   for ind in self.cells.values())
+        return min(
+            float(getattr(b[0], 'loss', np.inf))
+            for b in self.cells.values() if b)
+
+    def stagnation_iters(self, current_iter=None):
+        """Iterations since the archive last grew a new cell.
+
+        The BO loop multiplies its random-injection fraction by a factor
+        proportional to this number — when the archive stops adding cells
+        the search is structurally stuck and pure exploitation just spins
+        on already-discovered niches.
+        """
+        cur = current_iter if current_iter is not None else self._current_iter
+        return max(0, cur - self.last_new_cell_iter)
+
+    def improvement_iters(self, current_iter=None):
+        """Iterations since any cell's best loss was improved."""
+        cur = current_iter if current_iter is not None else self._current_iter
+        return max(0, cur - self.last_replace_iter)
+
+    def replace_existing(self, key, ind):
+        """Force-replace the elite at ``key`` with ``ind`` (used after
+        constant-optimisation on a cell elite: the optimised version
+        replaces the stored one so subsequent sampling sees the new
+        constants).  Caller must ensure the descriptor still matches."""
+        bucket = self.cells.get(key)
+        if bucket is None:
+            return False
+        # Insert and re-sort; keep top-K
+        try:
+            stored = copy.deepcopy(ind)
+        except Exception:
+            stored = ind
+        bucket.append(stored)
+        bucket.sort(key=lambda x: float(getattr(x, 'loss', np.inf)))
+        if len(bucket) > self.elites_per_cell:
+            del bucket[self.elites_per_cell:]
+        self.cell_last_improved[key] = self._current_iter
+        return True
+
+    def novelty_bonus_for(self, key, base_log_bonus=0.22314355131420976):
+        """Compute the LogEI additive novelty bonus for a candidate whose
+        BD is ``key``.  Scales with how empty the cell is:
+          * Empty cell  → log(1.5)  ≈ 0.405   (strong push toward novelty)
+          * 1 elite     → log(1.20) ≈ 0.182   (mild push — basin already
+                                                claimed but still under-K)
+          * ≥ K elites  → 0                   (cell saturated)
+
+        ``base_log_bonus`` is the legacy log(1.25) used as the empty-cell
+        bonus when caller wants the old behaviour; it's still accepted for
+        backward compatibility but no longer used in the scaling.
+        """
+        bucket = self.cells.get(key)
+        if bucket is None:
+            return 0.4054651081081644   # log(1.5)
+        if len(bucket) < self.elites_per_cell:
+            return 0.1823215567939546   # log(1.20)
+        return 0.0
 
     def summary_str(self):
         if not self.cells:
             return "QD archive: empty"
-        return (f"QD cells={self.coverage()}, adds={self.add_count}, "
-                f"best_loss={self.best_loss():.5f}")
+        bl = self.best_loss()
+        total = self.total_elites()
+        stag = self.stagnation_iters()
+        return (f"QD cells={self.coverage()}, elites={total}, "
+                f"adds={self.add_count}, best_loss={bl:.5f}, "
+                f"stagnation={stag}it")
 
 
 def _bo_build_optimizers(n_features, n_outputs, feat_names, X, Y, X_probe,
@@ -19685,8 +20008,11 @@ def run_bayesian_qd(X, Y, n_features, n_outputs, feat_names, out_types,
 
     Instead of (or alongside) a single elitist population, the search
     maintains a *behavioural-descriptor archive* per output: each cell
-    holds the best individual found in a particular structural niche
-    (complexity bucket, feature-subset signature, dominant-op class).
+    holds the top-K individuals found in a particular structural niche.
+
+    Behavioural descriptor (4 axes — see ``QualityDiversityArchive``):
+        ( complexity_bucket , feature_subset_signature ,
+          dominant_op_class , op_diversity_bucket )
 
     Why this matters for symbolic regression
     ----------------------------------------
@@ -19696,11 +20022,29 @@ def run_bayesian_qd(X, Y, n_features, n_outputs, feat_names, out_types,
     that one template, so EI proposes more of the same.
 
     With QD, every fundamentally different structure (e.g. polynomial vs
-    rational vs trigonometric) earns its own cell.  Selection draws from
-    cells uniformly, so rarely-occupied niches get attention proportional
-    to their absence in the converged frontier.  The cells naturally
-    quench premature convergence and supply diverse parents that crossover
-    can recombine into solutions no single basin could reach.
+    rational vs trigonometric) earns its own cell.  Curiosity-weighted
+    sampling biases parent draws toward cells that are FRESH (recently
+    discovered) and UNDER-EXPLORED (sampled few times) so rarely-occupied
+    niches get attention proportional to their absence in the converged
+    frontier.  The cells naturally quench premature convergence and
+    supply diverse parents that crossover can recombine into solutions
+    no single basin could reach.
+
+    Improvements over the vanilla MAP-Elites baseline
+    -------------------------------------------------
+      * 4-axis BD (adds op-diversity to separate monoculture from mixed
+        templates at the same complexity).
+      * Multi-elite cells (top-3 by loss) supply intra-niche diversity
+        to cross-cell crossover.
+      * Curiosity-weighted sampling deprioritises saturated cells and
+        amplifies freshly-improved ones.
+      * Adaptive novelty bonus on EI scoring scales with cell occupancy
+        (empty 0.40 / under-K 0.18 / saturated 0).
+      * Stagnation detection: when coverage stops growing, the search
+        budget shifts from QD-mutation toward macro / random injection.
+      * Archive-elite const-opt runs alongside HoF const-opt every
+        ``BAYESIAN_CONST_OPT_FREQ`` iters so non-HoF cell elites get
+        their constants tuned too.
     """
     global _INIT_PHASE
 
@@ -19716,6 +20060,8 @@ def run_bayesian_qd(X, Y, n_features, n_outputs, feat_names, out_types,
     print(f"  GP fit cap (Cholesky)  : {_BO_GP_FIT_CAP}")
     print(f"  Exploration (xi)       : {BAYESIAN_EXPLORATION}")
     print(f"  TuRBO trust region     : enabled (xi×[0.5..4.0], mut×[0.4..4.0])")
+    print(f"  QD archive             : 4-axis BD, top-3 elites/cell, "
+          f"curiosity-weighted sampling")
     print("═" * 70 + "\n")
 
     # Probe cap grows with CGP_NODES and n_features (see ``_bo_probe_cap``)
@@ -19934,16 +20280,48 @@ def run_bayesian_qd(X, Y, n_features, n_outputs, feat_names, out_types,
                     _frac_macro     = 0.15
                     _frac_hof_x     = 0.10
 
+                # ── Archive-coverage stagnation correction ─────────────────
+                # When the archive hasn't grown a new cell for many
+                # iterations the search is structurally stuck — every
+                # candidate's BD falls into a cell that's already been
+                # filled.  Without intervention this state self-sustains:
+                # the QD-mutation budget keeps churning out variants of
+                # the SAME cells' elites, the GP surrogate sees only
+                # in-niche candidates, and EI has nothing structurally
+                # novel to surface.  Shift budget toward macro / random
+                # injection so the next iteration genuinely probes
+                # outside the current cell set.  This is QD's analogue
+                # of TuRBO's loss-based restart, keyed on coverage
+                # rather than loss because in QD coverage growth itself
+                # is the optimisation signal.
+                _stag = arc.stagnation_iters(iteration)
+                if _stag >= 8 and not _tr_restart:
+                    # Linear ramp: at stagnation=8 → 0.5× extra,
+                    # at stagnation=20+ → 1.0× extra (capped).
+                    _stag_strength = min(1.0, (_stag - 7) / 12.0)
+                    _shift = 0.10 * _stag_strength
+                    _frac_qd_mut    = max(0.15, _frac_qd_mut - _shift)
+                    _frac_cross_cell = max(0.10, _frac_cross_cell - _shift * 0.5)
+                    _frac_macro     = min(0.35, _frac_macro + _shift)
+                    if _stag % 25 == 0 and _stag > 0:
+                        print(f"  [BO QD iter {iteration} | Out {o_idx}] "
+                              f"Coverage stagnation: {_stag} iters since "
+                              f"last new cell — boosting exploration "
+                              f"(macro {_frac_macro:.2f}, qd_mut {_frac_qd_mut:.2f}).")
+
                 candidate_trees = []
                 # Mutations of QD archive cells (diversification).  Archive
                 # pool is also widened in restart mode so we can grab
                 # potentially-better seeds the archive sampler hasn't seen
-                # picked recently.
+                # picked recently.  Curiosity-weighted sampling (the new
+                # default) biases the draw toward freshly-improved cells
+                # and away from over-sampled saturated ones.
                 n_qd_mut = int(BAYESIAN_N_CANDIDATES * _frac_qd_mut)
                 _arc_mut_pool_n = min(arc.coverage(),
                                       24 if _tr_restart else 16)
                 arc_pool = arc.sample(n=_arc_mut_pool_n,
-                                      prefer_new=True) or top_inds
+                                      prefer_new=True,
+                                      mode='curiosity') or top_inds
                 for _ in range(n_qd_mut):
                     parent = random.choice(arc_pool)
                     _mn = getattr(parent.tree, 'max_nodes', CGP_NODES)
@@ -19955,11 +20333,19 @@ def run_bayesian_qd(X, Y, n_features, n_outputs, feat_names, out_types,
                     candidate_trees.append(child_tree)
 
                 # Cross-cell crossover (combine structures from different
-                # niches — the QD analogue of HoF crossover).
+                # niches — the QD analogue of HoF crossover).  We pick
+                # WITHIN-CELL UNIFORMLY (not just the best) so multi-elite
+                # cells contribute structurally-similar-but-distinct
+                # alternatives — recombination across niches benefits from
+                # the variation each cell's non-best elites carry.
                 n_cross_cell = int(BAYESIAN_N_CANDIDATES * _frac_cross_cell)
+                _cross_pool = arc.sample(n=_arc_mut_pool_n,
+                                         prefer_new=True,
+                                         mode='curiosity',
+                                         within_cell='random') or arc_pool
                 for _ in range(n_cross_cell):
-                    if len(arc_pool) >= 2:
-                        p1, p2 = random.sample(arc_pool, 2)
+                    if len(_cross_pool) >= 2:
+                        p1, p2 = random.sample(_cross_pool, 2)
                         child_tree = crossover(p1.tree, p2.tree)
                         _mn = getattr(child_tree, 'max_nodes', CGP_NODES)
                         child_tree = mutate(child_tree, n_features, feat_names,
@@ -20062,20 +20448,24 @@ def run_bayesian_qd(X, Y, n_features, n_outputs, feat_names, out_types,
 
                 # Score with Log Expected Improvement (numerically stable).
                 # Tiebreak by encouraging BD-space novelty: candidates whose
-                # archive cell is empty get an additive log-bonus.  We use
+                # archive cell is sparse get an additive log-bonus.  We use
                 # ADDITION (not multiplication) because LogEI scores are
                 # on a log scale and can be negative — multiplying a
-                # negative score by 1.25 flips its ranking.  ``log(1.25)
-                # ≈ 0.223`` reproduces the original behaviour of the raw-EI
-                # ×1.25 multiplier in log space.
+                # negative score by 1.25 flips its ranking.
+                #
+                # Adaptive bonus (via ``arc.novelty_bonus_for``):
+                #   empty cell   → log(1.5)  ≈ 0.405   strong push
+                #   under-K cell → log(1.20) ≈ 0.182   mild push
+                #   saturated    → 0
+                # This graded scaling lets the curiosity loop discover
+                # genuinely-novel niches first, then keep filling under-K
+                # cells before competing for saturated ones.
                 ei_scores = opt.score_candidates(candidate_trees)
                 novelty_bonus = np.zeros_like(ei_scores)
-                _NOV_LOG_BONUS = 0.22314355131420976  # log(1.25)
                 for ci, ct in enumerate(candidate_trees):
                     try:
                         bd = arc.descriptor(Individual(ct))
-                        if bd not in arc.cells:
-                            novelty_bonus[ci] = _NOV_LOG_BONUS
+                        novelty_bonus[ci] = arc.novelty_bonus_for(bd)
                     except Exception:
                         pass
                 ei_scores = ei_scores + novelty_bonus
@@ -20180,6 +20570,71 @@ def run_bayesian_qd(X, Y, n_features, n_outputs, feat_names, out_types,
                         if ind.loss < old_loss - 1e-8:
                             opt.add_observation(ind, ind.tree)
                             arc.add(ind, iteration=iteration)
+                        elif ind.loss > old_loss + 1e-8:
+                            set_constants_shared(ind.tree, list(old_consts))
+                            ind.affine_a = old_affine_a
+                            ind.affine_b = old_affine_b
+                            ind.affine_fitted = old_affine_fitted
+                            ind.loss = old_loss
+                            ind.r2 = old_r2
+                            ind.accuracy = old_accuracy
+
+                    # ── Archive-elite const-opt ──────────────────────────
+                    # Const-opt also runs over the top-N archive elites
+                    # that AREN'T already HoF entries.  This is QD-specific:
+                    # many cells are at structurally distinct complexities
+                    # whose elites' constants are still in their seed state.
+                    # Without this, the archive's diversification value is
+                    # diluted by cells whose elite is just a randomly-fitted
+                    # template.  Capped at ~12 elites per iteration so the
+                    # const-opt budget stays bounded — selection prioritises
+                    # the lowest-loss non-HoF cells (most likely to break
+                    # the HoF ceiling next).
+                    _hof_fingerprints = set()
+                    try:
+                        for _h in hofs[o_idx].best_by_complexity.values():
+                            try:
+                                _hof_fingerprints.add(
+                                    _FITNESS_CACHE._fingerprint(_h.tree))
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    _arc_co_candidates = []
+                    for _key, _elite in arc.iter_best_elites():
+                        try:
+                            _fp = _FITNESS_CACHE._fingerprint(_elite.tree)
+                        except Exception:
+                            _fp = None
+                        if _fp is not None and _fp in _hof_fingerprints:
+                            continue
+                        _arc_co_candidates.append((_key, _elite))
+                    _arc_co_candidates.sort(
+                        key=lambda t: float(getattr(t[1], 'loss', np.inf)))
+                    _arc_co_budget = min(12, len(_arc_co_candidates))
+                    for _key, ind in _arc_co_candidates[:_arc_co_budget]:
+                        old_consts = get_constants_shared(ind.tree)
+                        if not old_consts:
+                            continue
+                        old_loss = ind.loss
+                        old_r2 = ind.r2
+                        old_accuracy = ind.accuracy
+                        old_affine_a = ind.affine_a
+                        old_affine_b = ind.affine_b
+                        old_affine_fitted = ind.affine_fitted
+                        ind.optimize_constants(
+                            X, Y[:, o_idx], out_types[o_idx],
+                            max_rows=min(500, X.shape[0]),
+                            n_restarts=1, max_iter=20,
+                            bg_logits=co_bg, class_idx_in_group=co_cls,
+                            Y_group=co_yg,
+                            target_grads=target_grads_list[o_idx])
+                        if ind.loss < old_loss - 1e-8:
+                            opt.add_observation(ind, ind.tree)
+                            arc.add(ind, iteration=iteration)
+                            # Const-opt may push the elite below the HoF
+                            # ceiling — let HoF re-evaluate admittance.
+                            hofs[o_idx].update(ind)
                         elif ind.loss > old_loss + 1e-8:
                             set_constants_shared(ind.tree, list(old_consts))
                             ind.affine_a = old_affine_a
@@ -22112,10 +22567,12 @@ def train_mode():
     print("QUALITY-DIVERSITY (QD) ALGORITHMS")
     print("─" * 70)
     print("  When enabled, maintains a MAP-Elites archive of high-performing")
-    print("  individuals spread across a behavioural-descriptor space:")
-    print("    BD = (complexity bucket, feature subset, dominant op class)")
-    print("  Each cell keeps the best individual found in that niche so the")
-    print("  search can escape seed basins by drawing diverse parents.")
+    print("  individuals spread across a 4-axis behavioural-descriptor space:")
+    print("    BD = (complexity bucket, feature subset, dominant op class,")
+    print("          op-diversity bucket)")
+    print("  Each cell keeps the top-3 individuals found in that niche; sampling")
+    print("  is curiosity-weighted (fresh/under-explored cells get priority) so")
+    print("  the search can escape seed basins by drawing diverse parents.")
     print("  ")
     print("  NOTE: QD is currently implemented as a Bayesian variant only.")
     print("        Enabling it routes the BO loop through run_bayesian_qd")
