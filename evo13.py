@@ -592,10 +592,22 @@ CLASS_WEIGHT_ENABLED  = True             # toggled interactively at startup
 # to pick which candidate mutations to actually evaluate.  This is much
 # more sample-efficient than pure evolution but more expensive per iteration.
 BAYESIAN_INITIAL_SAMPLES = 100    # random individuals evaluated before BO starts
-BAYESIAN_BATCH_SIZE      = 20     # candidates evaluated per BO iteration
+BAYESIAN_BATCH_SIZE      = 30     # candidates evaluated per BO iteration
+                                  # (20→30 to give the per-iter BO throughput
+                                  # a closer match to a single evolutionary
+                                  # island's per-generation eval count — BO
+                                  # is single-process so it has to make each
+                                  # iter count)
 BAYESIAN_N_CANDIDATES    = 200    # mutation candidates generated per iteration
 BAYESIAN_GP_REFIT_FREQ   = 5      # refit GP every N iterations
-BAYESIAN_EXPLORATION     = 0.01   # exploration–exploitation trade-off (xi for EI)
+BAYESIAN_EXPLORATION     = 0.05   # exploration–exploitation trade-off (xi for EI)
+                                  # Bumped 0.01 → 0.05 because at 0.01 EI was
+                                  # essentially greedy on the GP's best-of-buffer
+                                  # estimate; the surrogate is uncertain over
+                                  # most of the encoding manifold for CGP, so
+                                  # we need more xi for the acquisition to ever
+                                  # pick candidates that aren't structurally
+                                  # adjacent to the existing buffer best.
 BAYESIAN_MAX_GP_POINTS   = 500    # cap on GP training set (oldest evicted first)
 BAYESIAN_CONST_OPT_FREQ  = 10     # run light const-opt on HoF every N iterations
 BAYESIAN_VARIANT         = "regular" # bayesian variant
@@ -16221,12 +16233,17 @@ class BayesianCGPOptimizer:
         self.tr_restart_count = 0
         self.tr_restart_pending = False
         self._tr_stuck_iters = 0
-        # ``patience=3`` expansion events ≈ 9 consecutive iterations of
+        # ``patience=5`` expansion events ≈ 15 consecutive iterations of
         # no improvement, which is the point at which "stuck in this
         # basin" is far more likely than "next iteration will recover".
-        # Restarting then injects the random / macro candidate flood
-        # that the trust-region expansion alone wouldn't produce.
-        self._tr_restart_patience = 3
+        # Bumped 3 → 5 because the restart wipes ``xi_scale`` /
+        # ``tr_mut_scale`` and the post-restart iteration spends ~3
+        # iterations re-warming the surrogate before EI is meaningful
+        # again — restarting too often kept the search permanently in
+        # "post-restart warmup" mode.  At 5 the restarts still fire
+        # when the search is genuinely stuck but don't fight the
+        # surrogate during its productive runs.
+        self._tr_restart_patience = 5
         self._tr_total_fail_iters = 0
         self._tr_total_success_iters = 0
         # Last-batch EI vectors cache, used by ``select_diverse_batch``
@@ -16407,12 +16424,21 @@ class BayesianCGPOptimizer:
     def add_observation(self, individual, cgp_eq):
         """Record an evaluated individual.
 
-        When the buffer exceeds ``self.max_points`` we evict the WORST
-        observations (lowest transformed fitness) instead of the oldest.
-        FIFO eviction was kicking the best Phase-1 seeds out within ~7
-        BO iterations because each iter inserts ~60 noisy mutation
-        observations.  Worst-first preserves the high-quality signal
-        for the GP.
+        Eviction policy: protect the top half by transformed fitness and
+        FIFO the rest.  Pure worst-first eviction (the previous policy)
+        was correct in spirit but produced a homogeneous buffer within
+        ~30 iterations — every entry sits in the same narrow fitness
+        band, every encoded vector lives in the same structural pocket,
+        and the GP's section-grouped Matérn collapses to "every input
+        predicts the buffer-mean".  EI then degenerates to ranking on
+        Pearson r alone and the search stops being smarter than plain
+        evolutionary mutation of the HoF.
+        Pure FIFO was correct in spirit too but kicked the best Phase-1
+        analytical seeds out within ~7 iterations.  Protecting the top
+        half preserves the analytical seeds and the iteration's HoF
+        winners; FIFOing the rest gives the GP enough "what bad looks
+        like" contrast to actually discriminate structural patterns,
+        which is what makes the surrogate worth running.
         """
         vec = self._encode(cgp_eq)
         y   = self._transform_fitness(individual.loss)
@@ -16448,15 +16474,27 @@ class BayesianCGPOptimizer:
                 self._force_refit_pending = True
 
         if len(self.X_observed) > self.max_points:
-            # Keep the top-`max_points` by transformed fitness; among ties
-            # keep the most recent (np.argsort is stable).
+            # Hybrid eviction: keep top-half by transformed fitness,
+            # FIFO-evict the oldest non-protected entry.  We only need
+            # to drop one entry per call (we just appended one).
+            n_protect = max(1, self.max_points // 2)
             order = np.argsort(self.y_observed)
-            keep_idx = sorted(order[-self.max_points:].tolist())
-            self.X_observed  = [self.X_observed[i]  for i in keep_idx]
-            self.y_observed  = [self.y_observed[i]  for i in keep_idx]
-            self.individuals = [self.individuals[i] for i in keep_idx]
-            self._mc_obs_state_id = [self._mc_obs_state_id[i]
-                                     for i in keep_idx]
+            protected = set(order[-n_protect:].tolist())
+            # Buffer is temporal-ordered (newer entries appended at end),
+            # so the oldest non-protected entry has the smallest index.
+            evict_idx = None
+            for i in range(len(self.X_observed)):
+                if i not in protected:
+                    evict_idx = i
+                    break
+            # Fallback: every entry happens to be in the top half
+            # (n_protect ≥ len-1), so just drop the oldest entry.
+            if evict_idx is None:
+                evict_idx = 0
+            self.X_observed.pop(evict_idx)
+            self.y_observed.pop(evict_idx)
+            self.individuals.pop(evict_idx)
+            self._mc_obs_state_id.pop(evict_idx)
 
     # ── Multi-class joint-softmax helpers ───────────────────────────────────
     def set_multiclass_state(self, bg_logits_full, Y_group_full,
@@ -17677,7 +17715,7 @@ def run_bayesian_afpo(X, Y, n_features, n_outputs, feat_names, out_types,
     iteration = 0
     total_evals = BAYESIAN_INITIAL_SAMPLES * n_outputs
     perfect_outputs = set()
-    _bo_xi_start = max(BAYESIAN_EXPLORATION * 5.0, 0.05)
+    _bo_xi_start = max(BAYESIAN_EXPLORATION * 8.0, 0.15)
     _bo_xi_end   = BAYESIAN_EXPLORATION
 
     try:
@@ -17735,8 +17773,17 @@ def run_bayesian_afpo(X, Y, n_features, n_outputs, feat_names, out_types,
                     _frac_exploit, _frac_cross, _frac_macro, _frac_hof_x = (
                         0.35, 0.10, 0.20, 0.10)
                 else:
+                    # Lowered exploit 0.60 → 0.50 so the random-injection
+                    # fraction goes 5% → 15%.  At 5% random the BO loop
+                    # depended almost entirely on mutating the top-N
+                    # buffer parents, and once those converged to a
+                    # structural pocket the GP never saw a candidate
+                    # outside it — the search became exploitative
+                    # before the surrogate had any contrast to work
+                    # with, which is the main reason BO lagged the
+                    # evolutionary islands' more diverse generation.
                     _frac_exploit, _frac_cross, _frac_macro, _frac_hof_x = (
-                        0.60, 0.15, 0.10, 0.10)
+                        0.50, 0.15, 0.10, 0.10)
 
                 candidate_trees = []
 
@@ -18127,7 +18174,7 @@ def run_bayesian_islands(X, Y, n_features, n_outputs, feat_names, out_types,
     iteration = 0
     total_evals = BAYESIAN_INITIAL_SAMPLES * n_outputs * NUM_ISLANDS
     perfect_outputs = set()
-    _bo_xi_start = max(BAYESIAN_EXPLORATION * 5.0, 0.05)
+    _bo_xi_start = max(BAYESIAN_EXPLORATION * 8.0, 0.15)
     _bo_xi_end   = BAYESIAN_EXPLORATION
 
     try:
@@ -18183,8 +18230,17 @@ def run_bayesian_islands(X, Y, n_features, n_outputs, feat_names, out_types,
                     _frac_exploit, _frac_cross, _frac_macro, _frac_hof_x = (
                         0.35, 0.10, 0.20, 0.10)
                 else:
+                    # Lowered exploit 0.60 → 0.50 so the random-injection
+                    # fraction goes 5% → 15%.  At 5% random the BO loop
+                    # depended almost entirely on mutating the top-N
+                    # buffer parents, and once those converged to a
+                    # structural pocket the GP never saw a candidate
+                    # outside it — the search became exploitative
+                    # before the surrogate had any contrast to work
+                    # with, which is the main reason BO lagged the
+                    # evolutionary islands' more diverse generation.
                     _frac_exploit, _frac_cross, _frac_macro, _frac_hof_x = (
-                        0.60, 0.15, 0.10, 0.10)
+                        0.50, 0.15, 0.10, 0.10)
 
                 # Aggregate improvement across islands so the trust-region
                 # streak ticks ONCE per output per BO iteration (matching
@@ -18609,7 +18665,7 @@ def run_bayesian_islanded_afpo(X, Y, n_features, n_outputs, feat_names, out_type
     iteration = 0
     total_evals = BAYESIAN_INITIAL_SAMPLES * n_outputs * NUM_ISLANDS
     perfect_outputs = set()
-    _bo_xi_start = max(BAYESIAN_EXPLORATION * 5.0, 0.05)
+    _bo_xi_start = max(BAYESIAN_EXPLORATION * 8.0, 0.15)
     _bo_xi_end   = BAYESIAN_EXPLORATION
 
     try:
@@ -18664,8 +18720,17 @@ def run_bayesian_islanded_afpo(X, Y, n_features, n_outputs, feat_names, out_type
                     _frac_exploit, _frac_cross, _frac_macro, _frac_hof_x = (
                         0.35, 0.10, 0.20, 0.10)
                 else:
+                    # Lowered exploit 0.60 → 0.50 so the random-injection
+                    # fraction goes 5% → 15%.  At 5% random the BO loop
+                    # depended almost entirely on mutating the top-N
+                    # buffer parents, and once those converged to a
+                    # structural pocket the GP never saw a candidate
+                    # outside it — the search became exploitative
+                    # before the surrogate had any contrast to work
+                    # with, which is the main reason BO lagged the
+                    # evolutionary islands' more diverse generation.
                     _frac_exploit, _frac_cross, _frac_macro, _frac_hof_x = (
-                        0.60, 0.15, 0.10, 0.10)
+                        0.50, 0.15, 0.10, 0.10)
 
                 # Aggregate improvement across islands so the trust-region
                 # streak ticks ONCE per output per BO iteration (matching
@@ -19126,7 +19191,7 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
     # Adaptive exploration: start at 5× the configured xi for broad
     # exploration, then decay toward the configured value over iterations.
     # This avoids premature exploitation when the GP model is uncertain.
-    _bo_xi_start = max(BAYESIAN_EXPLORATION * 5.0, 0.05)
+    _bo_xi_start = max(BAYESIAN_EXPLORATION * 8.0, 0.15)
     _bo_xi_end   = BAYESIAN_EXPLORATION
 
     try:
@@ -19221,7 +19286,9 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
                     _frac_macro   = 0.20
                     _frac_hof_x   = 0.10
                 else:
-                    _frac_exploit = 0.60
+                    # See run_bayesian_afpo for the rationale on the
+                    # exploit 0.60 → 0.50 / random 5% → 15% rebalance.
+                    _frac_exploit = 0.50
                     _frac_cross   = 0.15
                     _frac_macro   = 0.10
                     _frac_hof_x   = 0.10
@@ -19771,7 +19838,7 @@ def run_bayesian_qd(X, Y, n_features, n_outputs, feat_names, out_types,
     iteration = 0
     total_evals = BAYESIAN_INITIAL_SAMPLES * n_outputs
     perfect_outputs = set()
-    _bo_xi_start = max(BAYESIAN_EXPLORATION * 5.0, 0.05)
+    _bo_xi_start = max(BAYESIAN_EXPLORATION * 8.0, 0.15)
     _bo_xi_end   = BAYESIAN_EXPLORATION
 
     try:
@@ -19858,7 +19925,11 @@ def run_bayesian_qd(X, Y, n_features, n_outputs, feat_names, out_types,
                     _frac_macro     = 0.25
                     _frac_hof_x     = 0.05
                 else:
-                    _frac_qd_mut    = 0.50
+                    # See run_bayesian_afpo: drop the dominant qd_mut
+                    # fraction so random injection goes 5% → 15% and
+                    # the surrogate gets exposed to candidates outside
+                    # the current archive's structural pocket.
+                    _frac_qd_mut    = 0.40
                     _frac_cross_cell = 0.20
                     _frac_macro     = 0.15
                     _frac_hof_x     = 0.10
@@ -21948,7 +22019,15 @@ def train_mode():
                 scale = min(10.0, base_complexity / 500.0)
                 BAYESIAN_N_CANDIDATES   = int(round(200 * scale))
                 BAYESIAN_MAX_GP_POINTS  = int(round(500 * scale))
-                BAYESIAN_BATCH_SIZE     = int(round(20 * (scale ** 0.5)))
+                # Batch size scales faster than sqrt(scale) because the
+                # per-output BO loop is the throughput bottleneck vs the
+                # parallel evolutionary islands — each iteration only
+                # evaluates ``BAYESIAN_BATCH_SIZE`` candidates fully, so
+                # at scale=10 we used to take 63 full evals/iter, vs an
+                # evolutionary island chunk's ~2500 evals/output.  Bumping
+                # to ``30 * scale^0.65`` lands ~134 full evals/iter at
+                # scale=10 without blowing the per-iter GP-fit budget.
+                BAYESIAN_BATCH_SIZE     = int(round(30 * (scale ** 0.65)))
                 BAYESIAN_INITIAL_SAMPLES = int(round(
                     100 * (scale ** 0.6)))                 # ~250 @ scale=10
                 # GP fit cap grows as scale^0.7 so Cholesky doesn't
