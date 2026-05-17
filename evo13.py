@@ -509,6 +509,10 @@ AGE_GROUP_N_GROUPS          = 3    # number of age tiers
 AGE_GROUP_ISLANDS_PER_GROUP = 2    # AFPO islands per tier
 AGE_GROUP_GRAD_FREQ         = 100  # every N generations, graduate best from each tier
 
+# Configurable AFPO stages for "afpo" and "island_afpo" models (set interactively)
+AFPO_N_STAGES        = 1    # pipeline stages (1 = classic single-stage behaviour)
+AFPO_STAGE_GRAD_FREQ = 100  # gens between stage-graduation events (when AFPO_N_STAGES > 1)
+
 # ---- Down-Sampled Lexicase ----
 # Fraction of the training set used for DS-Lexicase each generation.
 # 0.0 = disabled (use fixed n_cases=20 as before).
@@ -21645,6 +21649,7 @@ def train_mode():
     global EVOLUTION_MODEL, DS_LEXICASE_FRAC
     global NUM_ISLANDS_GLOBAL
     global AGE_GROUP_N_GROUPS, AGE_GROUP_ISLANDS_PER_GROUP, AGE_GROUP_GRAD_FREQ
+    global AFPO_N_STAGES, AFPO_STAGE_GRAD_FREQ
     global BAYESIAN_INITIAL_SAMPLES, BAYESIAN_BATCH_SIZE, BAYESIAN_N_CANDIDATES
     global BAYESIAN_EXPLORATION, BAYESIAN_GP_REFIT_FREQ, BAYESIAN_MAX_GP_POINTS
     global BAYESIAN_CONST_OPT_FREQ, BAYESIAN_VARIANT
@@ -21833,7 +21838,26 @@ def train_mode():
         elif em_in == '2':
             EVOLUTION_MODEL = "afpo"
             NUM_ISLANDS_GLOBAL = 1   # not used, but keep consistent
-            print("  ✓  AFPO selected.")
+            n_stg_in = input(f"  Number of AFPO stages [default 1]: ").strip()
+            try:
+                AFPO_N_STAGES = int(n_stg_in) if n_stg_in else 1
+                AFPO_N_STAGES = max(1, AFPO_N_STAGES)
+            except ValueError:
+                AFPO_N_STAGES = 1
+            if AFPO_N_STAGES > 1:
+                grad_in = input(
+                    f"  Graduation frequency (gens) [default {AFPO_STAGE_GRAD_FREQ}]: "
+                ).strip()
+                try:
+                    AFPO_STAGE_GRAD_FREQ = int(grad_in) if grad_in else 100
+                    AFPO_STAGE_GRAD_FREQ = max(50, AFPO_STAGE_GRAD_FREQ)
+                except ValueError:
+                    AFPO_STAGE_GRAD_FREQ = 100
+                print(f"  ✓  AFPO selected  "
+                      f"({AFPO_N_STAGES} stages, "
+                      f"graduation every {AFPO_STAGE_GRAD_FREQ} gens).")
+            else:
+                print("  ✓  AFPO selected.")
             break
         elif em_in == '3':
             EVOLUTION_MODEL = "island_afpo"
@@ -21843,7 +21867,26 @@ def train_mode():
                 NUM_ISLANDS_GLOBAL = max(1, NUM_ISLANDS_GLOBAL)
             except ValueError:
                 NUM_ISLANDS_GLOBAL = 4
-            print(f"  ✓  Islanded AFPOs selected  ({NUM_ISLANDS_GLOBAL} islands).")
+            n_stg_in = input(f"  Number of AFPO stages [default 1]: ").strip()
+            try:
+                AFPO_N_STAGES = int(n_stg_in) if n_stg_in else 1
+                AFPO_N_STAGES = max(1, AFPO_N_STAGES)
+            except ValueError:
+                AFPO_N_STAGES = 1
+            if AFPO_N_STAGES > 1:
+                grad_in = input(
+                    f"  Graduation frequency (gens) [default {AFPO_STAGE_GRAD_FREQ}]: "
+                ).strip()
+                try:
+                    AFPO_STAGE_GRAD_FREQ = int(grad_in) if grad_in else 100
+                    AFPO_STAGE_GRAD_FREQ = max(50, AFPO_STAGE_GRAD_FREQ)
+                except ValueError:
+                    AFPO_STAGE_GRAD_FREQ = 100
+                print(f"  ✓  Islanded AFPOs selected  "
+                      f"({NUM_ISLANDS_GLOBAL} islands × {AFPO_N_STAGES} stages, "
+                      f"graduation every {AFPO_STAGE_GRAD_FREQ} gens).")
+            else:
+                print(f"  ✓  Islanded AFPOs selected  ({NUM_ISLANDS_GLOBAL} islands).")
             break
         elif em_in == '4':
             EVOLUTION_MODEL = "age_group_islands"
@@ -22766,7 +22809,7 @@ def train_mode():
     # ════════════════════════════════════════════════════════════════
     # AFPO MODEL
     # ════════════════════════════════════════════════════════════════
-    elif EVOLUTION_MODEL == "afpo":
+    elif EVOLUTION_MODEL == "afpo" and AFPO_N_STAGES <= 1:
         AFPO_POP_SIZE = POP_SIZE * 2   # AFPO typically runs a larger pool
 
         afpo_pops = []
@@ -22988,11 +23031,244 @@ def train_mode():
             print("\nStopping Evolution…")
 
     # ════════════════════════════════════════════════════════════════
+    # STAGED AFPO  (AFPO_N_STAGES > 1)
+    # N pipeline stages of independent AFPO populations (single-process).
+    # Every AFPO_STAGE_GRAD_FREQ gens the best individual from stage s
+    # graduates (age reset to 0) into stage s+1.  Vacated slot is
+    # replenished with a HoF mutation or random individual.
+    # Global HoF collects discoveries from every stage.
+    # ════════════════════════════════════════════════════════════════
+    elif EVOLUTION_MODEL == "afpo" and AFPO_N_STAGES > 1:
+        N_STAGES      = AFPO_N_STAGES
+        GRAD_FREQ_SA  = AFPO_STAGE_GRAD_FREQ
+        AFPO_POP_SIZE = POP_SIZE * 2
+
+        # stage_pops[s][out_idx] = list of Individuals
+        stage_pops  = [[] for _ in range(N_STAGES)]
+        stag_cntrs  = [[0] * n_outputs for _ in range(N_STAGES)]
+        hofs        = [HallOfFame() for _ in range(n_outputs)]
+
+        print(f"\nInitializing Staged AFPO  ({N_STAGES} stages, "
+              f"{AFPO_POP_SIZE} individuals × {n_outputs} output(s))…")
+
+        _INIT_PHASE = True
+        N_train = X.shape[0]
+        if N_train > _INIT_SUBSAMPLE_CAP:
+            init_idx = np.random.choice(N_train, _INIT_SUBSAMPLE_CAP, replace=False)
+            X_init, Y_init = X[init_idx], Y[init_idx]
+            print(f"  (using {_INIT_SUBSAMPLE_CAP}/{N_train} row subsample for fast init)")
+        else:
+            X_init, Y_init = X, Y
+
+        for s in range(N_STAGES):
+            for i in range(n_outputs):
+                pop = generate_seeds_v5(n_features, feat_names)
+                while len(pop) < AFPO_POP_SIZE:
+                    pop.append(Individual(random_cgp(n_features, CGP_NODES, feat_names)))
+                for ind in pop:
+                    ind.age = 0
+                    ind.calculate_fitness(X_init, Y_init[:, i], out_types[i],
+                                          target_grads=target_grads_list[i])
+                    hofs[i].update(ind)
+                stage_pops[s].append(pop)
+            print(f"  Stage {s+1}/{N_STAGES} initialized.")
+
+        if N_train > _INIT_SUBSAMPLE_CAP:
+            print("  Re-scoring Hall of Fame on full dataset…")
+            for i in range(n_outputs):
+                for ind in hofs[i].best_by_complexity.values():
+                    ind.affine_fitted = False
+                    ind.calculate_fitness(X, Y[:, i], out_types[i],
+                                          target_grads=target_grads_list[i])
+        _INIT_PHASE = False
+
+        class_groups_sa   = detect_class_groups(dp, out_types)
+        out_group_info_sa = {}
+        for col_name, group_idxs in class_groups_sa.items():
+            for local_k, global_k in enumerate(group_idxs):
+                out_group_info_sa[global_k] = (group_idxs, local_k)
+        if class_groups_sa:
+            print(f"  [Joint Softmax] Detected {len(class_groups_sa)} class group(s): "
+                  + ", ".join(f"{k}({len(v)} classes)"
+                               for k, v in class_groups_sa.items()))
+
+        ds_label  = (f"DS-Lexicase {DS_LEXICASE_FRAC*100:.0f}%"
+                     if DS_LEXICASE_FRAC > 0 else "standard epsilon-Lexicase")
+        adf_label = "ADF enabled" if ADF_ENABLED else "ADF disabled"
+        print(f"Staged AFPO started  ({N_STAGES} stages, "
+              f"graduation every {GRAD_FREQ_SA} gens)  "
+              f"[{ds_label} | {adf_label}]. Ctrl+C to stop.\n")
+
+        gen = 0
+        perfect_outputs = set()
+        try:
+            while True:
+                batch_idx = (np.random.choice(X.shape[0], BATCH_SIZE, replace=False)
+                             if BATCH_SIZE > 0 else None)
+                X_b = X[batch_idx] if batch_idx is not None else X
+                Y_b = Y[batch_idx] if batch_idx is not None else Y
+
+                bg_logits_cache_sa = {}
+                for col_name, group_idxs in class_groups_sa.items():
+                    bg_logits_cache_sa[col_name] = build_bg_logits(
+                        hofs, group_idxs, X_b)
+
+                for s in range(N_STAGES):
+                    for i in range(n_outputs):
+                        if i in perfect_outputs:
+                            continue
+
+                        g_info_sa = out_group_info_sa.get(i)
+                        if g_info_sa is not None:
+                            grp_idxs_sa, local_k_sa = g_info_sa
+                            col_bg_sa = next(
+                                bg_logits_cache_sa[cn]
+                                for cn, idxs in class_groups_sa.items()
+                                if grp_idxs_sa == idxs)
+                            Y_group_sa = Y_b[:, grp_idxs_sa[0]:grp_idxs_sa[-1]+1]
+                        else:
+                            col_bg_sa, local_k_sa, Y_group_sa = None, None, None
+
+                        hof_best_i = hofs[i].get_best_overall()
+                        if hof_best_i is not None and stage_pops[s][i]:
+                            pop_best = min(ind.loss for ind in stage_pops[s][i])
+                            if hof_best_i.loss < pop_best - 1e-9:
+                                worst = max(stage_pops[s][i], key=lambda x: x.fitness)
+                                stage_pops[s][i].remove(worst)
+                                elite = copy.deepcopy(hof_best_i)
+                                elite.age = 0
+                                stage_pops[s][i].append(elite)
+
+                        stage_pops[s][i], stag_cntrs[s][i] = evolve_afpo(
+                            stage_pops[s][i], X_b, Y_b[:, i], out_types[i],
+                            n_features, feat_names, AFPO_POP_SIZE,
+                            MIGRATION_FREQ,
+                            hofs[i], stag_cntrs[s][i], EXTINCTION_PATIENCE,
+                            bg_logits=col_bg_sa,
+                            class_idx_in_group=local_k_sa,
+                            Y_group=Y_group_sa,
+                            target_grads=target_grads_list[i],
+                        )
+                        for ind in stage_pops[s][i]:
+                            if hofs[i].update(ind):
+                                is_cls = (out_types[i] == 6)
+                                metric = (f"Acc={getattr(ind,'accuracy',0):.4f}"
+                                          if is_cls
+                                          else f"R²={getattr(ind,'r2',0):.4f}")
+                                print(f"[Out {i} | AFPO Stage {s}] "
+                                      f"New Best (Comp {ind.complexity:.0f}): "
+                                      f"loss={ind.loss:.4f}  {metric}")
+
+                gen += MIGRATION_FREQ
+
+                # Graduation: best of stage s → stage s+1
+                if gen % GRAD_FREQ_SA == 0:
+                    for s in range(N_STAGES - 1):
+                        ns = s + 1
+                        for i in range(n_outputs):
+                            src = stage_pops[s][i]
+                            dst = stage_pops[ns][i]
+                            if not src or not dst:
+                                continue
+                            champion = min(src, key=lambda x: x.fitness)
+                            graduate = copy.deepcopy(champion)
+                            graduate.age = 0
+                            worst = max(dst, key=lambda x: x.fitness)
+                            dst.remove(worst)
+                            dst.append(graduate)
+                            hof_best = hofs[i].get_best_overall()
+                            if hof_best is not None:
+                                tree = mutate(hof_best.tree, n_features,
+                                              feat_names, mut_rate=CGP_MUT_RATE)
+                                new_ind = Individual(tree)
+                            else:
+                                new_ind = Individual(
+                                    random_cgp(n_features, CGP_NODES, feat_names))
+                            new_ind.age = 0
+                            new_ind.calculate_fitness(
+                                X_b, Y_b[:, i], out_types[i],
+                                target_grads=target_grads_list[i])
+                            if src:
+                                weak = max(src, key=lambda x: x.fitness)
+                                src.remove(weak)
+                            src.append(new_ind)
+                    print(f"  [Gen {gen}] Stage graduation cycle complete.")
+
+                print(f"--- Generation {gen} ---")
+
+                for o_idx in range(n_outputs):
+                    if o_idx in perfect_outputs:
+                        continue
+                    is_perf, best_ind = _check_output_perfect(
+                        hofs[o_idx], X, Y[:, o_idx], out_types[o_idx])
+                    if is_perf:
+                        out_label = (dp.output_map[o_idx]
+                                     if o_idx < len(dp.output_map) else f"Out{o_idx}")
+                        print(f"\n  ★ Output {o_idx} ({out_label}) "
+                              f"reached PERFECT performance!")
+                        print(f"    Running simplification pass on perfect output...")
+                        _simplify_perfect_output(
+                            hofs[o_idx], X, Y[:, o_idx], out_types[o_idx],
+                            target_grads=target_grads_list[o_idx])
+                        perfect_outputs.add(o_idx)
+                        best_models_snapshot = [h.get_best_overall() for h in hofs]
+                        _save_backup_model(best_models_snapshot, dp, o_idx, X_data=X)
+
+                if len(perfect_outputs) == n_outputs:
+                    print("\n  ★★★ ALL outputs reached perfect performance! "
+                          "Stopping evolution.")
+                    break
+
+                if gen % 500 == 0:
+                    for o_idx, hof in enumerate(hofs):
+                        out_label = (dp.output_map[o_idx]
+                                     if o_idx < len(dp.output_map) else f"Out{o_idx}")
+                        pf_tag = " [PERFECT]" if o_idx in perfect_outputs else ""
+                        hof.print_frontier(
+                            out_type=out_types[o_idx],
+                            label=f"Output {o_idx} ({out_label}){pf_tag}")
+                    if X_val is not None and Y_val is not None:
+                        _print_validation_metrics(hofs, X_val, Y_val, out_types, dp)
+                    if _FITNESS_CACHE.hits + _FITNESS_CACHE.misses > 0:
+                        print(f"  [Cache] {_FITNESS_CACHE.stats_str()}")
+
+                if SIMPLIFICATION_FREQ > 0 and gen % SIMPLIFICATION_FREQ == 0:
+                    print(f"\n[Gen {gen}] Running algebraic simplification pass…")
+                    for s in range(N_STAGES):
+                        pseudo_isl = [[stage_pops[s][j]] for j in range(n_outputs)]
+                        apply_simplification_pass(pseudo_isl, hofs, X, Y, out_types)
+                        for j in range(n_outputs):
+                            stage_pops[s][j] = pseudo_isl[j][0]
+
+                if perfect_outputs and gen % max(
+                        100,
+                        SIMPLIFICATION_FREQ if SIMPLIFICATION_FREQ > 0 else 100) == 0:
+                    for o_idx in perfect_outputs:
+                        _simplify_perfect_output(
+                            hofs[o_idx], X, Y[:, o_idx], out_types[o_idx],
+                            target_grads=target_grads_list[o_idx])
+
+                if BATCH_SIZE > 0 and gen > 0 and gen % 200 == 0:
+                    for o_idx, hof in enumerate(hofs):
+                        for ind in hof.best_by_complexity.values():
+                            ind.affine_fitted = False
+                            ind.calculate_fitness(
+                                X, Y[:, o_idx], out_types[o_idx],
+                                update_affine=True,
+                                target_grads=target_grads_list[o_idx])
+
+                if gen > 0 and gen % 1000 == 0:
+                    _deep_optimize_hofs(hofs, X, Y, out_types)
+
+        except KeyboardInterrupt:
+            print("\nStopping Evolution…")
+
+    # ════════════════════════════════════════════════════════════════
     # ISLANDED AFPOs MODEL
     # Each island runs its own AFPO population in a separate worker
     # process.  Ring migration of the best individual after every chunk.
     # ════════════════════════════════════════════════════════════════
-    elif EVOLUTION_MODEL == "island_afpo":
+    elif EVOLUTION_MODEL == "island_afpo" and AFPO_N_STAGES <= 1:
         NUM_ISLANDS  = NUM_ISLANDS_GLOBAL
         AFPO_POP_SIZE = POP_SIZE * 2
 
@@ -23310,6 +23586,331 @@ def train_mode():
                                     target_grads=target_grads_list[o_idx])
 
                     # ---- Deep constant optimisation ----
+                    if gen > 0 and gen % 1000 == 0:
+                        _deep_optimize_hofs(hofs, X, Y, out_types)
+
+        except KeyboardInterrupt:
+            print("\nStopping Evolution…")
+
+    # ════════════════════════════════════════════════════════════════
+    # STAGED ISLANDED AFPOs  (AFPO_N_STAGES > 1)
+    # N pipeline stages × NUM_ISLANDS AFPO islands per stage (parallel).
+    # Within-stage ring migration every MIGRATION_FREQ gens.
+    # Cross-stage graduation every AFPO_STAGE_GRAD_FREQ gens: best
+    # individual from stage s graduates into stage s+1 at age=0.
+    # Vacated slot replenished with a HoF mutation or random individual.
+    # ════════════════════════════════════════════════════════════════
+    elif EVOLUTION_MODEL == "island_afpo" and AFPO_N_STAGES > 1:
+        N_STAGES      = AFPO_N_STAGES
+        N_ISL         = NUM_ISLANDS_GLOBAL
+        GRAD_FREQ_SI  = AFPO_STAGE_GRAD_FREQ
+        AFPO_POP_SIZE = max(POP_SIZE, POP_SIZE * 2 // N_STAGES)
+
+        # stage_islands[stage][island_idx][out_idx] = list of Individuals
+        stage_islands = [[[] for _ in range(N_ISL)] for _ in range(N_STAGES)]
+        hofs          = [HallOfFame() for _ in range(n_outputs)]
+        stag_counters = [[[0] * n_outputs for _ in range(N_ISL)]
+                         for _ in range(N_STAGES)]
+
+        class_groups_si   = detect_class_groups(dp, out_types)
+        out_group_info_si = {}
+        for col_name, group_idxs in class_groups_si.items():
+            for local_k, global_k in enumerate(group_idxs):
+                out_group_info_si[global_k] = (group_idxs, local_k)
+        if class_groups_si:
+            print(f"  [Joint Softmax] Detected {len(class_groups_si)} class group(s): "
+                  + ", ".join(f"{k}({len(v)} classes)"
+                               for k, v in class_groups_si.items()))
+
+        total_pops_si = N_STAGES * N_ISL
+        print(f"\nInitializing Staged Islanded AFPOs: "
+              f"{N_STAGES} stages × {N_ISL} islands "
+              f"= {total_pops_si} total AFPO populations, "
+              f"{AFPO_POP_SIZE} individuals each × {n_outputs} output(s)…")
+
+        _INIT_PHASE = True
+        N_train = X.shape[0]
+        if N_train > _INIT_SUBSAMPLE_CAP:
+            init_idx = np.random.choice(N_train, _INIT_SUBSAMPLE_CAP, replace=False)
+            X_init, Y_init = X[init_idx], Y[init_idx]
+            print(f"  (using {_INIT_SUBSAMPLE_CAP}/{N_train} row subsample for fast init)")
+        else:
+            X_init, Y_init = X, Y
+
+        for s in range(N_STAGES):
+            for isl in range(N_ISL):
+                for i in range(n_outputs):
+                    pop = generate_seeds_v5(n_features, feat_names)
+                    try:
+                        imp_seeds = generate_importance_biased_seeds(
+                            n_features, feat_names, X_init, Y_init[:, i])
+                        pop.extend(imp_seeds)
+                    except Exception:
+                        pass
+                    while len(pop) < AFPO_POP_SIZE:
+                        pop.append(Individual(random_cgp(n_features, CGP_NODES, feat_names)))
+                    for ind in pop:
+                        ind.age = 0
+                        ind.calculate_fitness(X_init, Y_init[:, i], out_types[i],
+                                              target_grads=target_grads_list[i])
+                        hofs[i].update(ind)
+                    stage_islands[s][isl].append(pop)
+            print(f"  Stage {s+1}/{N_STAGES} initialized.")
+
+        if N_train > _INIT_SUBSAMPLE_CAP:
+            print("  Re-scoring Hall of Fame on full dataset…")
+            for i in range(n_outputs):
+                for ind in hofs[i].best_by_complexity.values():
+                    ind.affine_fitted = False
+                    ind.calculate_fitness(X, Y[:, i], out_types[i],
+                                          target_grads=target_grads_list[i])
+        _INIT_PHASE = False
+
+        ds_label  = (f"DS-Lexicase {DS_LEXICASE_FRAC*100:.0f}%"
+                     if DS_LEXICASE_FRAC > 0 else "standard epsilon-Lexicase")
+        adf_label = "ADF enabled" if ADF_ENABLED else "ADF disabled"
+        print(f"Staged Islanded AFPOs started  [{ds_label} | {adf_label}]. "
+              f"Ctrl+C to stop.")
+        print(f"  Graduation every {GRAD_FREQ_SI} gens: "
+              f"best of Stage s → Stage s+1.\n")
+
+        gen = 0
+        perfect_outputs = set()
+        all_pairs_si = [(s, isl)
+                        for s in range(N_STAGES)
+                        for isl in range(N_ISL)]
+
+        try:
+            with concurrent.futures.ProcessPoolExecutor(
+                    max_workers=min(total_pops_si, 8)) as executor:
+                while True:
+                    batch_idx = (np.random.choice(X.shape[0], BATCH_SIZE, replace=False)
+                                 if BATCH_SIZE > 0 else None)
+                    X_b = X[batch_idx] if batch_idx is not None else X
+                    Y_b = Y[batch_idx] if batch_idx is not None else Y
+
+                    bg_logits_cache_si = {}
+                    for col_name, group_idxs in class_groups_si.items():
+                        bg_logits_cache_si[col_name] = build_bg_logits(
+                            hofs, group_idxs, X_b)
+
+                    # Elitist HoF injection across all stages and islands
+                    for i in range(n_outputs):
+                        hof_best_i = hofs[i].get_best_overall()
+                        if hof_best_i is None:
+                            continue
+                        for s in range(N_STAGES):
+                            for isl in range(N_ISL):
+                                pop = stage_islands[s][isl][i]
+                                if not pop:
+                                    continue
+                                pop_best = min(ind.loss for ind in pop)
+                                if hof_best_i.loss < pop_best - 1e-9:
+                                    worst = max(pop, key=lambda x: x.fitness)
+                                    pop.remove(worst)
+                                    elite = copy.deepcopy(hof_best_i)
+                                    elite.age = 0
+                                    pop.append(elite)
+
+                    # Submit AFPO chunks for every (stage, island)
+                    futures_si = []
+                    for s, isl in all_pairs_si:
+                        flat_idx = s * N_ISL + isl
+                        for i in range(n_outputs):
+                            g_info = out_group_info_si.get(i)
+                            if g_info is not None:
+                                group_idxs, local_k = g_info
+                                col_bg = next(
+                                    bg_logits_cache_si[cn]
+                                    for cn, idxs in class_groups_si.items()
+                                    if group_idxs == idxs)
+                                Y_group_i = Y_b[:, group_idxs[0]:group_idxs[-1]+1]
+                            else:
+                                col_bg, local_k, Y_group_i = None, None, None
+
+                            args_si = (
+                                stage_islands[s][isl][i],
+                                X_b, Y_b[:, i], out_types[i],
+                                n_features, feat_names,
+                                AFPO_POP_SIZE, MIGRATION_FREQ,
+                                stag_counters[s][isl][i],
+                                EXTINCTION_PATIENCE,
+                                flat_idx, i,
+                                list(_ADF_REGISTRY),
+                                col_bg, local_k, Y_group_i,
+                                target_grads_list[i],
+                            )
+                            futures_si.append(
+                                executor.submit(evolve_afpo_island_chunk, args_si))
+
+                    for future in concurrent.futures.as_completed(futures_si):
+                        ret_pop, stag, flat_idx, o_idx, local_hof = future.result()
+                        s_r   = flat_idx // N_ISL
+                        isl_r = flat_idx  % N_ISL
+                        stage_islands[s_r][isl_r][o_idx] = ret_pop
+                        stag_counters[s_r][isl_r][o_idx] = stag
+                        for c, ind in local_hof.best_by_complexity.items():
+                            if hofs[o_idx].update(ind):
+                                is_cls = (out_types[o_idx] == 6)
+                                metric = (f"Acc={getattr(ind,'accuracy',0):.4f}"
+                                          if is_cls
+                                          else f"R²={getattr(ind,'r2',0):.4f}")
+                                print(f"[Out {o_idx} | Stage {s_r} Isl {isl_r}] "
+                                      f"New Best (Comp {ind.complexity:.0f}): "
+                                      f"loss={ind.loss:.4f}  {metric}")
+
+                    gen += MIGRATION_FREQ
+
+                    # Within-stage ring migration
+                    for s in range(N_STAGES):
+                        for i in range(n_outputs):
+                            for isl in range(N_ISL):
+                                next_isl = (isl + 1) % N_ISL
+                                src_pop  = stage_islands[s][isl][i]
+                                dst_pop  = stage_islands[s][next_isl][i]
+                                if not src_pop or not dst_pop:
+                                    continue
+                                migrant = copy.deepcopy(
+                                    min(src_pop, key=lambda x: x.fitness))
+                                migrant.age = 0
+                                worst = max(dst_pop, key=lambda x: x.fitness)
+                                dst_pop.remove(worst)
+                                dst_pop.append(migrant)
+
+                    # Cross-stage graduation every GRAD_FREQ_SI gens
+                    if gen % GRAD_FREQ_SI == 0:
+                        for s in range(N_STAGES - 1):
+                            ns = s + 1
+                            for i in range(n_outputs):
+                                for isl in range(N_ISL):
+                                    src_pop = stage_islands[s][isl][i]
+                                    if not src_pop:
+                                        continue
+                                    champion = min(src_pop, key=lambda x: x.fitness)
+                                    dst_isl = random.randrange(N_ISL)
+                                    dst_pop = stage_islands[ns][dst_isl][i]
+                                    if dst_pop:
+                                        worst = max(dst_pop, key=lambda x: x.fitness)
+                                        dst_pop.remove(worst)
+                                    graduate = copy.deepcopy(champion)
+                                    graduate.age = 0
+                                    dst_pop.append(graduate)
+                                    hof_best = hofs[i].get_best_overall()
+                                    if hof_best is not None:
+                                        tree = mutate(hof_best.tree, n_features,
+                                                      feat_names, mut_rate=CGP_MUT_RATE)
+                                        new_ind = Individual(tree)
+                                    else:
+                                        new_ind = Individual(
+                                            random_cgp(n_features, CGP_NODES, feat_names))
+                                    new_ind.age = 0
+                                    new_ind.calculate_fitness(
+                                        X_b, Y_b[:, i], out_types[i],
+                                        target_grads=target_grads_list[i])
+                                    if src_pop:
+                                        weak = max(src_pop, key=lambda x: x.fitness)
+                                        src_pop.remove(weak)
+                                    src_pop.append(new_ind)
+                        print(f"  [Gen {gen}] Stage graduation cycle complete.")
+
+                    print(f"--- Generation {gen} ---")
+
+                    for o_idx in range(n_outputs):
+                        if o_idx in perfect_outputs:
+                            continue
+                        is_perf, best_ind = _check_output_perfect(
+                            hofs[o_idx], X, Y[:, o_idx], out_types[o_idx])
+                        if is_perf:
+                            out_label = (dp.output_map[o_idx]
+                                         if o_idx < len(dp.output_map)
+                                         else f"Out{o_idx}")
+                            print(f"\n  ★ Output {o_idx} ({out_label}) "
+                                  f"reached PERFECT performance!")
+                            print(f"    Running simplification pass on perfect output...")
+                            _simplify_perfect_output(
+                                hofs[o_idx], X, Y[:, o_idx], out_types[o_idx],
+                                target_grads=target_grads_list[o_idx])
+                            perfect_outputs.add(o_idx)
+                            best_models_snapshot = [h.get_best_overall() for h in hofs]
+                            _save_backup_model(best_models_snapshot, dp, o_idx, X_data=X)
+
+                    if len(perfect_outputs) == n_outputs:
+                        print("\n  ★★★ ALL outputs reached perfect performance! "
+                              "Stopping evolution.")
+                        break
+
+                    if gen % 500 == 0:
+                        for o_idx, hof in enumerate(hofs):
+                            out_label = (dp.output_map[o_idx]
+                                         if o_idx < len(dp.output_map)
+                                         else f"Out{o_idx}")
+                            pf_tag = " [PERFECT]" if o_idx in perfect_outputs else ""
+                            hof.print_frontier(
+                                out_type=out_types[o_idx],
+                                label=f"Output {o_idx} ({out_label}){pf_tag}")
+                        if X_val is not None and Y_val is not None:
+                            _print_validation_metrics(hofs, X_val, Y_val, out_types, dp)
+
+                    if INTERVAL_MODE and gen % INTERVAL_CHECK_FREQ == 0:
+                        flat_isl_si = [
+                            [stage_islands[s][isl][j] for j in range(n_outputs)]
+                            for s in range(N_STAGES)
+                            for isl in range(N_ISL)
+                        ]
+                        n_pen = _interval_cull_population(flat_isl_si, X, out_types)
+                        if n_pen:
+                            print(f"  [Interval] {n_pen} numerically unstable "
+                                  f"individual(s) penalised.")
+
+                    if ADF_ENABLED and gen % ADF_EXTRACT_FREQ == 0:
+                        print(f"\n[Gen {gen}] ADF extraction scan…")
+                        all_inds_si = [[] for _ in range(n_outputs)]
+                        for s in range(N_STAGES):
+                            for isl in range(N_ISL):
+                                for j in range(n_outputs):
+                                    all_inds_si[j].extend(stage_islands[s][isl][j])
+                        for o_idx in range(n_outputs):
+                            new_adfs = try_extract_adfs_from_population(
+                                all_inds_si[o_idx], X, Y[:, o_idx], out_types[o_idx])
+                            if new_adfs:
+                                print(f"  [ADF] {len(new_adfs)} new operator(s) "
+                                      f"({len(_ADF_REGISTRY)} total).")
+                        all_pops_si = [stage_islands[s][isl][j]
+                                        for s in range(N_STAGES)
+                                        for isl in range(N_ISL)
+                                        for j in range(n_outputs)]
+                        retired = _retire_unused_adfs(all_pops_si)
+                        if retired:
+                            print(f"  [ADF] Retired {len(retired)}: {retired}")
+
+                    if SIMPLIFICATION_FREQ > 0 and gen % SIMPLIFICATION_FREQ == 0:
+                        print(f"\n[Gen {gen}] Running algebraic simplification pass…")
+                        for s in range(N_STAGES):
+                            flat_isl = [[stage_islands[s][isl][j]
+                                         for j in range(n_outputs)]
+                                        for isl in range(N_ISL)]
+                            apply_simplification_pass(flat_isl, hofs, X, Y, out_types)
+                            for isl in range(N_ISL):
+                                for j in range(n_outputs):
+                                    stage_islands[s][isl][j] = flat_isl[isl][j]
+
+                    if perfect_outputs and gen % max(
+                            100,
+                            SIMPLIFICATION_FREQ if SIMPLIFICATION_FREQ > 0 else 100) == 0:
+                        for o_idx in perfect_outputs:
+                            _simplify_perfect_output(
+                                hofs[o_idx], X, Y[:, o_idx], out_types[o_idx],
+                                target_grads=target_grads_list[o_idx])
+
+                    if BATCH_SIZE > 0 and gen > 0 and gen % 200 == 0:
+                        for o_idx, hof in enumerate(hofs):
+                            for ind in hof.best_by_complexity.values():
+                                ind.affine_fitted = False
+                                ind.calculate_fitness(
+                                    X, Y[:, o_idx], out_types[o_idx],
+                                    update_affine=True,
+                                    target_grads=target_grads_list[o_idx])
+
                     if gen > 0 and gen % 1000 == 0:
                         _deep_optimize_hofs(hofs, X, Y, out_types)
 
