@@ -612,6 +612,45 @@ BAYESIAN_MAX_GP_POINTS   = 500    # cap on GP training set (oldest evicted first
 BAYESIAN_CONST_OPT_FREQ  = 10     # run light const-opt on HoF every N iterations
 BAYESIAN_VARIANT         = "regular" # bayesian variant
 
+# ── Interplay Escape Oracle ──────────────────────────────────────────
+# The Bayesian surrogate is excellent at refining variants of a template
+# that already scores well — and that's exactly its failure mode on
+# multi-interplay targets like
+#     (A·B)·log(B) − 10·A / (√(A·B) + (B−A) − (B/A) − (A/√B))
+# where the answer requires composing ~6 distinct (op_cat, feat_pair)
+# interplays.  Once EI locks onto one good basin the GP only ever sees
+# variants of that basin, and the search converges to whichever single
+# template fits best instead of building the compound expression.
+#
+# The Interplay Escape Oracle gives the Bayesian a way to act as the
+# "intelligent evolution master" the underlying engines need:
+#   1. It records the (op_category, feature_ancestor_set) atoms that
+#      appear in every evaluated tree, and the full structural signature
+#      of each candidate.
+#   2. When recent buffer additions collapse onto a single dominant
+#      signature (low entropy / one signature claiming >threshold of
+#      the buffer) for several consecutive iterations, the oracle
+#      flags "escape mode" for ESCAPE_DURATION iterations.
+#   3. During escape mode, the outer BO loop:
+#        - allocates ESCAPE_SEED_FRAC of its candidate budget to seeds
+#          synthesised against MISSING atoms (interplays never seen),
+#        - uses a Boltzmann (softmax-over-loss) Stage-2 selection at
+#          temperature ESCAPE_TEMPER_T so screen-losers occasionally
+#          get full evaluation — the "be less afraid to try worse
+#          formulas" mechanism,
+#        - asks the GP-Hedge portfolio to boost its exploration arms
+#          (UCB / PE / TS / KG) so the surrogate's acquisition stops
+#          ranking everything by the basin's local gradient.
+# Set BAYESIAN_ESCAPE_ENABLED = False to disable the oracle entirely.
+BAYESIAN_ESCAPE_ENABLED       = True   # master switch for the oracle
+BAYESIAN_ESCAPE_PATIENCE      = 6      # consecutive low-entropy iters before escape fires
+BAYESIAN_ESCAPE_ENTROPY_FRAC  = 0.55   # H / log(unique_signatures) below this counts as inbred
+BAYESIAN_ESCAPE_DOMINANT_FRAC = 0.50   # one signature claiming >this of buffer also counts
+BAYESIAN_ESCAPE_DURATION      = 4      # iters spent in escape mode per trigger
+BAYESIAN_ESCAPE_SEED_FRAC     = 0.25   # candidate-budget share devoted to escape seeds
+BAYESIAN_ESCAPE_TEMPER_T      = 1.5    # Stage-2 softmax temperature (× loss range)
+BAYESIAN_ESCAPE_RECENT_WINDOW = 30     # iterations tracked in the recent-signature window
+
 QUALITY_DIVERSITY_ENABLED = False # QD algorithms
 
 
@@ -15616,6 +15655,61 @@ class _GpHedgePortfolio:
         beta = float(np.sqrt(max(beta_sq, 0.25)))
         return float(np.clip(beta, 0.5, 6.0))
 
+    def escape_boost(self, strength: float = 1.0):
+        """Temporarily push cumulative reward toward the exploration arms.
+
+        Called by the Interplay Escape Oracle when the search has been
+        stuck creating variants of one template for several iterations.
+        The standard GP-Hedge bookkeeper accumulates LogEI / LogPI /
+        PARS credit through ``update_all`` and decays at ~0.97/iter —
+        once one of those arms has built up a 5-10 σ lead, the cap +
+        eps floor are the ONLY thing keeping the others from being
+        crowded out, and even with the cap a basin-stuck arm can sit
+        at 0.55 share for 30+ iterations before decay catches up.
+
+        ``escape_boost`` short-circuits that re-balancing window: the
+        exploration arms (UCB / PE / TS / KG) each get a one-shot
+        cumulative-reward bump proportional to ``strength``, and the
+        leading exploitation arms (LogEI / LogPI / PARS) get a
+        symmetric debit so the total reward mass is preserved.  The
+        boost decays naturally through ``self.decay`` over the next
+        ~20-30 iterations, so a single escape-mode tick produces ~1
+        burst of biased-toward-exploration picks rather than
+        permanently reshaping the portfolio.
+
+        ``strength`` should be in roughly [0.5, 3.0] on the
+        std-normalized reward scale used by ``update_all``.  Defaults
+        to 1.0 (≈ one std of within-iteration disagreement); larger
+        values force more drastic re-balancing.
+        """
+        if not np.isfinite(strength) or strength <= 0:
+            return
+        s = float(np.clip(strength, 0.1, 5.0))
+        # Exploration arms get the credit; exploitation arms eat a
+        # symmetric debit.  The split mirrors the cold-start bias —
+        # arms with "explorer" character (UCB, PE, KG, TS) up; the
+        # myopic / Occam arms (LogEI, LogPI, PARS) down.  LogEI is
+        # debited LIGHTLY because it remains the strongest baseline
+        # workhorse and we don't want to deprive the loop of it
+        # entirely — we just want the exploration arms to be
+        # competitive again for the next ~10 picks.
+        boost_map = {
+            'ucb': +1.0 * s,
+            'pe':  +1.0 * s,
+            'ts':  +0.7 * s,
+            'kg':  +0.7 * s,
+            'logei': -0.3 * s,
+            'logpi': -0.7 * s,
+            'pars':  -0.7 * s,
+        }
+        for name, delta in boost_map.items():
+            if name in self.ARMS:
+                self.rewards[self.ARMS.index(name)] += float(delta)
+        # Reset stagnation counters: the boost itself is the
+        # intervention, so per-arm streak penalties shouldn't
+        # double-tax the exploitation arms on top of the debit.
+        self._stagnation[:] = 0
+
     def status_str(self):
         """Human-readable status: weight, total pulls, real wins, recent
         picks distribution.
@@ -17809,6 +17903,866 @@ class QualityDiversityArchive:
                 f"stagnation={stag}it")
 
 
+# ════════════════════════════════════════════════════════════════
+# INTERPLAY ESCAPE ORACLE
+# ════════════════════════════════════════════════════════════════
+# The Bayesian surrogate's failure mode on multi-interplay targets:
+# once EI locks onto one good basin, the GP only ever sees variants
+# of that basin and the search refines the wrong template forever.
+# The oracle watches the buffer's per-iteration STRUCTURAL signature
+# distribution; when signatures collapse onto a single dominant
+# template for several consecutive iterations, escape mode fires:
+#   * a fraction of the next iteration's candidates is synthesised
+#     against MISSING (op_category, feature_pair) interplays,
+#   * Stage-2 acceptance switches from greedy top-K to softmax-over-
+#     loss sampling (the "try worse formulas" lever),
+#   * the GP-Hedge portfolio gets a one-shot exploration boost.
+#
+# The oracle is structural-only (no phenotype evaluation), so its
+# cost is O(active_nodes) per observed individual — negligible
+# next to evaluate() / GP fit.
+
+def _bo_tree_interplay_atoms(tree, n_features, max_depth=2):
+    """Return the set of (op_category, ancestor_feature_tuple) atoms
+    for every active compute node in ``tree``.
+
+    The ancestor feature tuple is the sorted list of raw feature
+    indices that flow into the node within ``max_depth`` levels of
+    ancestry — direct inputs at depth 1, inputs-of-inputs at depth 2,
+    and so on.  Capping the depth keeps the atom set bounded for
+    deep trees while still distinguishing "uses feature A" from
+    "uses feature A and B together" from "uses A processed through
+    a sub-expression involving B".
+
+    Returns
+    -------
+    atoms : set of (str, tuple[int, ...])
+        Each atom is one structural interplay this tree expresses.
+        Trees with the same set of atoms compute (very roughly) the
+        same family of feature interactions, regardless of how the
+        atoms are wired together or which inactive nodes pad the
+        graph.
+    """
+    try:
+        tree.update_active_nodes()
+    except Exception:
+        return set()
+    nf = int(n_features)
+    if not tree.active_nodes:
+        return set()
+
+    # Memoised ancestor-feature sets per node id (raw features included).
+    # Computed bottom-up so each node reuses its children's results.
+    ancestor_feats: dict = {}
+
+    def _ancestors(idx, depth):
+        if idx < nf:
+            return frozenset((idx,))
+        if depth <= 0:
+            return frozenset()
+        if idx in ancestor_feats:
+            return ancestor_feats[idx]
+        try:
+            node = tree.nodes[idx - nf]
+        except Exception:
+            return frozenset()
+        if node.op == 'const':
+            ancestor_feats[idx] = frozenset()
+            return ancestor_feats[idx]
+        out = set()
+        # Walk the actually-used inputs for this op arity.
+        inputs = [node.in1]
+        if node.op in tree.OPS_BINARY_SET:
+            inputs.append(node.in2)
+        elif node.op in tree.OPS_TERNARY_SET:
+            inputs.extend((node.in2, node.in3))
+        for inp in inputs:
+            try:
+                out |= _ancestors(inp, depth - 1)
+            except RecursionError:
+                continue
+        out_fs = frozenset(out)
+        ancestor_feats[idx] = out_fs
+        return out_fs
+
+    atoms = set()
+    for idx in tree.active_nodes:
+        if idx < nf:
+            continue
+        try:
+            node = tree.nodes[idx - nf]
+        except Exception:
+            continue
+        if node.op == 'const':
+            atoms.add(('const', ()))
+            continue
+        cat = _bo_op_category(node.op)
+        feats = tuple(sorted(_ancestors(idx, max_depth)))
+        # Cap the feature tuple length so very deep trees don't blow
+        # up the atom space — the marginal info from the 8+ raw
+        # features that thread through one node is small compared
+        # with the (op, top-5-features) summary.
+        if len(feats) > 5:
+            feats = feats[:5]
+        atoms.add((cat, feats))
+    return atoms
+
+
+def _bo_tree_interplay_signature(tree, n_features, max_depth=2):
+    """Tree-level signature: sorted tuple of all interplay atoms.
+
+    Two trees with identical signatures express the same family of
+    structural interplays even if the wiring or inactive padding
+    differs.  The signature is the key the oracle clusters by when
+    measuring inbreeding.
+    """
+    atoms = _bo_tree_interplay_atoms(tree, n_features, max_depth=max_depth)
+    return tuple(sorted(atoms))
+
+
+class _InterplayEscapeOracle:
+    """Stagnation detector + targeted-escape candidate generator for the
+    Bayesian search.
+
+    See the module-level "INTERPLAY ESCAPE ORACLE" comment for the
+    design rationale.  Public API used by the BO loops:
+
+      * ``observe(individual)`` — record an evaluated individual's
+        interplay atoms / signature in the rolling buffer.
+      * ``tick(iteration, improved)`` — advance the stagnation
+        bookkeeper; called once per BO iteration per output.
+      * ``should_escape()`` / ``in_escape_mode()`` — query the
+        current state.  ``should_escape()`` returns True on the
+        iteration the trigger fires (so the caller can log it and
+        boost the portfolio); ``in_escape_mode()`` stays True for the
+        full ``BAYESIAN_ESCAPE_DURATION`` window.
+      * ``missing_atoms()`` — return a list of (op_category,
+        feature_tuple) atoms that have NEVER appeared in any
+        observed tree.  Drives ``synthesize_escape_seed`` parent
+        biasing.
+      * ``synthesize_escape_seed(parent, n_features, feat_names)`` —
+        graft a sub-expression targeting one missing atom into a
+        copy of ``parent``.  Returns a CGPEquation.
+      * ``temper_temperature()`` — the Stage-2 acceptance softmax
+        temperature for the current iteration; 0 outside escape mode
+        (caller picks greedy top-K) and ramps with stagnation depth
+        inside it.
+      * ``summary_str()`` — human-readable diagnostic line for the
+        BO log.
+
+    The oracle is per-output: each output's Bayesian optimiser owns
+    one.  Sharing across outputs would muddle "this OUTPUT is stuck"
+    with "the search overall is stuck", and a stuck output is the
+    right place to fire an escape — its sibling outputs may still be
+    making progress at the same iteration.
+    """
+
+    # Operator categories that can be "starred" in an escape seed —
+    # i.e. operators we'll specifically try to graft into the parent
+    # when an atom referencing that category is missing.  Const has
+    # no informative interplay so we skip it; 'other' (catch-all)
+    # falls back to a random binary.
+    _ATOM_CATEGORIES = ('arith', 'trig', 'bounded', 'expon', 'log', 'cond')
+
+    def __init__(self, n_features, max_nodes,
+                 recent_window=BAYESIAN_ESCAPE_RECENT_WINDOW,
+                 patience=BAYESIAN_ESCAPE_PATIENCE,
+                 duration=BAYESIAN_ESCAPE_DURATION,
+                 entropy_frac=BAYESIAN_ESCAPE_ENTROPY_FRAC,
+                 dominant_frac=BAYESIAN_ESCAPE_DOMINANT_FRAC):
+        self.n_features = int(n_features)
+        self.max_nodes = int(max_nodes)
+        self.recent_window = max(5, int(recent_window))
+        self.patience = max(2, int(patience))
+        self.duration = max(1, int(duration))
+        self.entropy_frac = float(entropy_frac)
+        self.dominant_frac = float(dominant_frac)
+
+        # Per-signature counter over a rolling window — we use this
+        # to compute the inbreeding entropy / dominant fraction.
+        self._recent_sigs: list = []
+        # Per-signature counter over ALL observations — used for
+        # diagnostics and to bias era-snapshot retention.
+        self._cumulative_sig_counts: Counter = Counter()
+        # Set of atoms seen across ALL observations — drives the
+        # missing-atom computation.  We never evict from this set;
+        # an atom that's been seen once is permanently "explored".
+        self._seen_atoms: set = set()
+        # Bookkeeping for the era-champion snapshot mechanism.  We
+        # snapshot the best-of-era individual at each escape trigger
+        # and re-inject them as escape parents in subsequent escape
+        # windows — the search retains memory of basins the GP
+        # might have forgotten about by then.
+        self._era_champions: list = []
+        self._era_cap = 8
+
+        # Stagnation bookkeeper
+        self._low_entropy_streak = 0
+        self._escape_active_until = -1
+        self._escape_fired_this_tick = False
+        self._last_trigger_iter = -1
+        self._trigger_count = 0
+        self._cur_iter = 0
+        # Tracks consecutive iterations where the oracle was queried
+        # but no improvement landed — feeds the temperature ramp.
+        self._dry_iters = 0
+        # Last computed normalized entropy and dominant fraction
+        # (cached for ``summary_str``).
+        self._last_entropy_norm = 1.0
+        self._last_dominant_frac = 0.0
+        self._last_recent_uniques = 0
+
+    # ── Observation API ─────────────────────────────────────────────────
+    def observe(self, individual_or_tree):
+        """Record an evaluated individual / tree.  Updates the rolling
+        signature window and the cumulative atom-seen set.
+        """
+        tree = (individual_or_tree.tree
+                if hasattr(individual_or_tree, 'tree')
+                else individual_or_tree)
+        if tree is None:
+            return
+        try:
+            atoms = _bo_tree_interplay_atoms(tree, self.n_features)
+            sig = tuple(sorted(atoms))
+        except Exception:
+            return
+        if not sig:
+            return
+        self._recent_sigs.append(sig)
+        if len(self._recent_sigs) > self.recent_window:
+            self._recent_sigs.pop(0)
+        self._cumulative_sig_counts[sig] += 1
+        self._seen_atoms.update(atoms)
+
+    def remember_era_champion(self, individual):
+        """Capture an HoF best as an "era champion" — re-injected as an
+        escape parent in subsequent escape windows.  Called by the BO
+        loop on each escape trigger so the search retains memory of
+        which basin was being polished when the trigger fired.
+        """
+        if individual is None or not hasattr(individual, 'tree'):
+            return
+        try:
+            clone = copy.deepcopy(individual)
+        except Exception:
+            return
+        self._era_champions.append(clone)
+        if len(self._era_champions) > self._era_cap:
+            # Drop the oldest (FIFO) — the most recent eras carry
+            # the most relevant near-basin memory for the current
+            # surrogate, while ancient ones have already had their
+            # interplays absorbed by the cumulative-seen set.
+            self._era_champions.pop(0)
+
+    def era_champions(self):
+        return list(self._era_champions)
+
+    # ── Stagnation detection ────────────────────────────────────────────
+    def _compute_inbreeding(self):
+        """Return (normalized_entropy, dominant_signature_fraction).
+
+        ``normalized_entropy`` is H(recent) / log(unique_signatures)
+        with the convention H/log(1) = 1.0 (single signature → fully
+        inbred, entropy_norm = 0).  We clip to [0, 1] for downstream
+        comparisons.
+        """
+        if not self._recent_sigs:
+            return 1.0, 0.0
+        counts = Counter(self._recent_sigs)
+        n = sum(counts.values())
+        if n <= 0:
+            return 1.0, 0.0
+        max_count = max(counts.values()) if counts else 0
+        dom_frac = float(max_count) / float(n)
+        uniques = len(counts)
+        if uniques <= 1:
+            return 0.0, dom_frac
+        probs = np.asarray([c / n for c in counts.values()], dtype=np.float64)
+        H = float(-np.sum(probs * np.log(np.clip(probs, 1e-12, 1.0))))
+        max_H = float(np.log(uniques))
+        if max_H <= 1e-12:
+            return 0.0, dom_frac
+        return float(np.clip(H / max_H, 0.0, 1.0)), dom_frac
+
+    def tick(self, iteration, improved=False):
+        """Advance the stagnation counter.  Call once per BO iteration
+        per output (after the iteration's evaluations have been
+        ``observe``d).
+
+        Returns True if escape mode is active on THIS iteration.
+        """
+        self._cur_iter = int(iteration)
+        H_norm, dom_frac = self._compute_inbreeding()
+        self._last_entropy_norm = H_norm
+        self._last_dominant_frac = dom_frac
+        self._last_recent_uniques = len(set(self._recent_sigs))
+
+        inbred = (
+            (H_norm < self.entropy_frac and len(self._recent_sigs) >= 5)
+            or dom_frac >= self.dominant_frac
+        )
+        # The window must have stabilised before we trust the inbreeding
+        # signal — a buffer with only 2-3 entries gives spurious low
+        # entropy.  ``patience`` gates this so the escape doesn't fire
+        # on the first few iterations.
+        if inbred:
+            self._low_entropy_streak += 1
+        else:
+            self._low_entropy_streak = max(0, self._low_entropy_streak - 1)
+
+        # If the iteration didn't improve, accumulate dry counter; reset on
+        # improvement so the tempered-acceptance ramp doesn't keep climbing
+        # after a win.
+        if improved:
+            self._dry_iters = 0
+        else:
+            self._dry_iters += 1
+
+        # Fire the escape trigger when the inbreeding streak passes the
+        # patience threshold AND we are not already inside an active
+        # escape window — back-to-back triggers are wasteful, the
+        # in-progress window will run out and the streak resets via the
+        # improvements it produces.
+        self._escape_fired_this_tick = False
+        if (self._low_entropy_streak >= self.patience
+                and self._cur_iter > self._escape_active_until):
+            self._escape_active_until = self._cur_iter + self.duration - 1
+            self._last_trigger_iter = self._cur_iter
+            self._trigger_count += 1
+            self._escape_fired_this_tick = True
+            # Reset the streak — the boost itself is the response; the
+            # next ``patience`` iters of inbreeding will trigger a fresh
+            # escape if the boost didn't break the basin.
+            self._low_entropy_streak = 0
+        return self.in_escape_mode()
+
+    def in_escape_mode(self):
+        return self._cur_iter <= self._escape_active_until
+
+    def should_escape(self):
+        """True only on the iteration the trigger fires (one-shot)."""
+        return bool(self._escape_fired_this_tick)
+
+    # ── Missing-atom enumeration ────────────────────────────────────────
+    def missing_atoms(self, max_atoms=None, include_unary=True):
+        """Enumerate (op_category, feat_tuple) atoms that have NEVER
+        appeared in any observed tree.
+
+        Coverage is over the full atom space {category × feature_combinations
+        of arity ≤ 2}.  For each category we enumerate:
+          * unary atoms (singleton feature tuples) — applicable when the
+            category supports unary ops (trig/bounded/expon/log)
+          * binary atoms (pair feature tuples) — applicable for arith /
+            cond / pow / expon / log (sqrt(x*y) etc.)
+
+        Returns at most ``max_atoms`` entries (random sample if more
+        candidates qualify), with categories that have MORE missing
+        atoms prioritised — those are the dimensions of interplay
+        space the search has been most blind to.
+        """
+        nf = max(1, self.n_features)
+        # Categories that admit unary atoms (one feature ancestor).
+        unary_capable = {'trig', 'bounded', 'expon', 'log', 'arith', 'cond'}
+        # All pairs (i, j) with i ≤ j.
+        pairs = [(i, j) for i in range(nf) for j in range(i, nf)]
+
+        candidates = []
+        for cat in self._ATOM_CATEGORIES:
+            # Unary singletons
+            if include_unary and cat in unary_capable:
+                for f in range(nf):
+                    atom = (cat, (f,))
+                    if atom not in self._seen_atoms:
+                        candidates.append(atom)
+            # Binary pairs
+            if cat in {'arith', 'cond', 'expon', 'log', 'trig', 'bounded'}:
+                for (i, j) in pairs:
+                    if i == j and not include_unary:
+                        continue
+                    atom = (cat, (i, j) if i != j else (i,))
+                    if atom not in self._seen_atoms:
+                        candidates.append(atom)
+        # Deduplicate while preserving order
+        seen = set()
+        uniq = []
+        for atom in candidates:
+            if atom in seen:
+                continue
+            seen.add(atom)
+            uniq.append(atom)
+        if max_atoms is not None and len(uniq) > max_atoms:
+            # Group by category, pick a balanced sample across categories
+            # — we don't want all 8 returned atoms to be the same trig
+            # bucket just because trig has the most missing entries.
+            by_cat: dict = {}
+            for atom in uniq:
+                by_cat.setdefault(atom[0], []).append(atom)
+            balanced = []
+            per_cat = max(1, max_atoms // max(1, len(by_cat)))
+            for cat, atoms in by_cat.items():
+                random.shuffle(atoms)
+                balanced.extend(atoms[:per_cat])
+            random.shuffle(balanced)
+            return balanced[:max_atoms]
+        return uniq
+
+    # ── Tempered Stage-2 acceptance temperature ─────────────────────────
+    def temper_temperature(self):
+        """Softmax-over-loss temperature for Stage-2 candidate
+        acceptance.  0 outside escape mode (greedy top-K), ramps with
+        accumulated dry iterations inside it.
+
+        Returns a multiplier on ``BAYESIAN_ESCAPE_TEMPER_T``; the
+        caller scales by the iteration's loss-range so the absolute
+        temperature stays sensible across regression / CE / Huber loss
+        scales.
+        """
+        if not self.in_escape_mode():
+            return 0.0
+        # Iterations DEEP into the escape window pile up dry counters,
+        # so the temperature ramps to ~3× the base by the end of the
+        # window.  Keeps screen-losers from instantly dominating right
+        # at the trigger (when the surrogate's fresh exploration boost
+        # might already break the basin), then escalates if the boost
+        # didn't deliver.
+        deep = self._cur_iter - self._last_trigger_iter
+        ramp = 1.0 + min(2.0, max(0.0, deep) * 0.4)
+        return float(BAYESIAN_ESCAPE_TEMPER_T * ramp)
+
+    # ── Synthesis of escape seeds ───────────────────────────────────────
+    def synthesize_escape_seed(self, parent, n_features, feat_names,
+                                missing_atom=None):
+        """Build a new CGP individual whose active subgraph explicitly
+        expresses a missing interplay atom.
+
+        Strategy:
+          1. Pick a missing atom (caller-supplied or oracle-chosen).
+          2. Try to graft the atom into a copy of ``parent`` — either
+             replacing the output (high-impact change) or combining
+             via +/* with the existing output (additive correction).
+          3. If graft fails on this atom (e.g. trig category but no
+             trig ops in ALLOWED_OPS, or parent has no free slots),
+             try up to ~4 alternative missing atoms.
+          4. If all chosen atoms fail to graft, fall back to building
+             a fresh atom-only tree.  Final fallback is
+             ``macro_inject_subtree`` which at least breaks the
+             parent's monoculture even when it can't realise the
+             exact atom.
+        """
+        # Build a fresh seed when no parent is available
+        if parent is None or not hasattr(parent, 'tree'):
+            atom = missing_atom
+            if atom is None:
+                missing = self.missing_atoms(max_atoms=12)
+                if not missing:
+                    return None
+                atom = random.choice(missing)
+            cat, feat_tuple = atom
+            return _bo_build_atom_only_tree(cat, feat_tuple, n_features,
+                                              feat_names, self.max_nodes)
+
+        parent_tree = parent.tree if hasattr(parent, 'tree') else parent
+
+        # Up to 4 atom retries — when ``missing_atom`` is supplied
+        # the caller gets exactly one attempt at it before we expand
+        # the pool to any missing atom for the retry budget.
+        atoms_to_try = []
+        if missing_atom is not None:
+            atoms_to_try.append(missing_atom)
+        pool = self.missing_atoms(max_atoms=20)
+        random.shuffle(pool)
+        for atom in pool:
+            if atom not in atoms_to_try:
+                atoms_to_try.append(atom)
+            if len(atoms_to_try) >= 4:
+                break
+
+        for atom in atoms_to_try:
+            cat, feat_tuple = atom
+            try:
+                grafted = _bo_graft_atom_onto(parent_tree, cat, feat_tuple,
+                                                n_features, feat_names)
+                if grafted is not None:
+                    return grafted
+            except Exception:
+                continue
+
+        # All graft attempts failed — build a standalone atom-only
+        # tree from the first atom (escape candidates don't need to
+        # be tied to the parent's structure).
+        if atoms_to_try:
+            cat, feat_tuple = atoms_to_try[0]
+            try:
+                fresh = _bo_build_atom_only_tree(
+                    cat, feat_tuple, n_features, feat_names, self.max_nodes)
+                if fresh is not None:
+                    return fresh
+            except Exception:
+                pass
+
+        # Last-resort fallback: structurally novel subtree.  Won't
+        # realise the exact atom but at least breaks the monoculture.
+        try:
+            return macro_inject_subtree(parent_tree, n_features, feat_names)
+        except Exception:
+            return None
+
+    # ── Diagnostics ─────────────────────────────────────────────────────
+    def summary_str(self):
+        mode = ("ESCAPE" if self.in_escape_mode() else "ok")
+        return (f"oracle[{mode}] H/Hmax={self._last_entropy_norm:.2f} "
+                f"dom={self._last_dominant_frac:.2f} "
+                f"uniques={self._last_recent_uniques} "
+                f"streak={self._low_entropy_streak} "
+                f"seen_atoms={len(self._seen_atoms)} "
+                f"triggers={self._trigger_count}")
+
+
+# ── Atom-synthesis helpers ──────────────────────────────────────────────
+# The oracle uses these to graft / build sub-expressions that realise
+# a specified (op_category, feature_tuple) interplay atom.  Kept at
+# module level so they can be unit-tested independently of the oracle
+# state and so other variants (e.g. residual-aware re-seeding) can
+# reuse the atom→tree mapping.
+
+# Per-category, per-arity preferred operators.  When a missing atom
+# falls under ``cat`` and the desired arity is N, we pick a concrete
+# op from this table.  Filtered against ``ALLOWED_OPS`` at call site.
+_BO_ATOM_OP_CHOICES = {
+    'arith':   {1: ['neg', 'abs', 'square', 'cube', 'inv'],
+                 2: ['+', '-', '*', '/']},
+    'trig':    {1: ['sin', 'cos', 'tan'],
+                 2: []},
+    'bounded': {1: ['tanh', 'sigmoid', 'erf'],
+                 2: []},
+    'expon':   {1: ['exp', '10^x'],
+                 2: ['pow']},
+    'log':     {1: ['log', 'log10', 'sqrt'],
+                 2: []},
+    'cond':    {1: ['sign'],
+                 2: ['gt', 'lt', 'min', 'max']},
+}
+
+
+def _bo_pick_atom_op(cat, arity):
+    """Pick a concrete operator from ``cat`` with the requested
+    ``arity`` (1 or 2), filtered against the global ``ALLOWED_OPS``
+    whitelist and the CGPEquation op set.  Returns None when no
+    operator fits — caller falls back to a different strategy.
+    """
+    pool = _BO_ATOM_OP_CHOICES.get(cat, {}).get(int(arity), [])
+    if not pool:
+        return None
+    pool = [op for op in pool
+            if op in ALLOWED_OPS
+            and (op in CGPEquation.OPS_UNARY_SET
+                 if arity == 1
+                 else op in CGPEquation.OPS_BINARY_SET)]
+    if not pool:
+        return None
+    return random.choice(pool)
+
+
+def _bo_build_atom_only_tree(cat, feat_tuple, n_features, feat_names,
+                             max_nodes):
+    """Build a minimal CGPEquation whose output realises the atom.
+
+    Used when there's no parent to graft onto (e.g. very early in
+    Phase 2 when the buffer is still seeded by random initialisation).
+    """
+    nf = int(n_features)
+    eq = CGPEquation(nf, int(max_nodes), feat_names)
+    # Fill all nodes with random junk first so subsequent active-
+    # subgraph queries don't index off the end.
+    for i in range(max_nodes):
+        max_connect = max(0, nf + i - 1)
+        op = random.choice(['+', '-', '*', '/']) if max_connect > 0 else 'const'
+        in1 = random.randint(0, max_connect) if max_connect > 0 else 0
+        in2 = random.randint(0, max_connect) if max_connect > 0 else 0
+        eq.nodes.append(CGPNode(op, in1, in2, random.gauss(0.0, 1.0)))
+
+    # Walk the feature_tuple into a concrete wiring.
+    arity = max(1, min(2, len(feat_tuple))) if feat_tuple else 1
+    op = _bo_pick_atom_op(cat, arity) or _bo_pick_atom_op('arith', arity) or '+'
+    if not feat_tuple:
+        feat_tuple = (random.randint(0, max(0, nf - 1)),)
+    # Reserve the LAST node as the atom's output; if we need more
+    # depth (e.g. constant scaling), use the slots leading up to it.
+    nodes_needed = 1
+    if cat == 'expon' and arity == 1:
+        # exp(c * x) — needs const slot + multiplication slot
+        nodes_needed = 3
+    if max_nodes < nodes_needed + 1:
+        nodes_needed = 1
+
+    last_slot = max_nodes - 1
+    # Place op at the last slot.
+    if nodes_needed == 1:
+        if arity == 1:
+            f0 = int(feat_tuple[0]) % nf
+            eq.nodes[last_slot] = CGPNode(op, f0, 0, 0.0)
+        else:
+            f0 = int(feat_tuple[0]) % nf
+            f1 = int(feat_tuple[1 if len(feat_tuple) > 1 else 0]) % nf
+            if f0 == f1 and nf >= 2:
+                f1 = (f1 + 1) % nf
+            eq.nodes[last_slot] = CGPNode(op, f0, f1, 0.0)
+    else:
+        # Layered: const → mul → unary
+        c_slot = nf + last_slot - 2
+        m_slot = nf + last_slot - 1
+        u_slot = nf + last_slot
+        eq.nodes[last_slot - 2] = CGPNode('const', 0, 0,
+                                            random.choice([0.5, 1.0, 2.0]))
+        eq.nodes[last_slot - 1] = CGPNode('*', c_slot,
+                                            int(feat_tuple[0]) % nf, 0.0)
+        eq.nodes[last_slot] = CGPNode(op, m_slot, 0, 0.0)
+    eq.out_idx = nf + last_slot
+    eq.update_active_nodes()
+    return eq
+
+
+def _bo_graft_atom_onto(parent_tree, cat, feat_tuple, n_features, feat_names):
+    """Graft a sub-expression realising the atom onto a copy of
+    ``parent_tree``, combining with the parent's output via +, *, or
+    by replacing the output entirely.
+
+    Returns the new CGPEquation, or None if the parent has no free
+    slots for the graft.
+
+    Slot selection rules (CGP wiring constraint: node at index k can
+    only read inputs at indices < k):
+      * The atom slot must be > all the feature indices it references
+        — features live at indices < n_features, so any slot at
+        index >= n_features satisfies this.
+      * The combine slot must be > both atom_slot and the parent's
+        current ``out_idx`` so that it can read both as inputs.
+    Earlier versions of this function required ``slot > max_active``
+    which was overly restrictive: a parent whose active subgraph
+    happened to land at a high node index left no usable slots for
+    the graft, so the synthesis fell back to a no-op clone of the
+    parent.
+    """
+    nf = int(n_features)
+    if not feat_tuple:
+        feat_tuple = (random.randint(0, max(0, nf - 1)),)
+    arity = max(1, min(2, len(feat_tuple)))
+    op = _bo_pick_atom_op(cat, arity) or _bo_pick_atom_op('arith', arity)
+    if op is None:
+        return None
+
+    child = copy.deepcopy(parent_tree)
+    child.update_active_nodes()
+    all_slots = list(range(nf, nf + child.max_nodes))
+    free_slots = sorted(s for s in all_slots if s not in child.active_nodes)
+    if len(free_slots) < 2:
+        return None
+
+    cur_out = child.out_idx
+    # Atom must be placed below the combine slot, so split free_slots
+    # into "atom-eligible" (any) and "combine-eligible" (> cur_out).
+    combine_eligible = [s for s in free_slots if s > cur_out]
+    if not combine_eligible:
+        # Fall back to neg-wrap "replace output" mode below, which
+        # still works without a combine-eligible slot when at least
+        # one slot at the top of the genome is free.
+        replace_output = True
+    else:
+        # Pick combine mode — replace the output 25% of the time
+        # (high-impact, completely refocuses the tree); additive
+        # correction the rest (the structural piece coexists with
+        # the existing expression).
+        replace_output = random.random() < 0.25
+
+    if arity == 1:
+        f0 = int(feat_tuple[0]) % nf
+        atom_inputs = (f0, 0)
+    else:
+        f0 = int(feat_tuple[0]) % nf
+        f1 = int(feat_tuple[1 if len(feat_tuple) > 1 else 0]) % nf
+        if f0 == f1 and nf >= 2:
+            f1 = (f1 + 1) % nf
+        atom_inputs = (f0, f1)
+
+    if replace_output:
+        # Place atom at the LOWEST free slot, then optionally wrap
+        # so the final output stays at a slot > atom_idx.  When no
+        # higher slot is available we accept the atom itself as the
+        # output (a clean structural pivot).
+        s_atom = free_slots[0]
+        child.nodes[s_atom - nf] = CGPNode(op, atom_inputs[0], atom_inputs[1], 0.0)
+        # Try to wrap with a benign unary or a +0-const so the
+        # combine point is at a higher slot — purely cosmetic;
+        # functionally equivalent.
+        higher = [s for s in free_slots if s > s_atom]
+        wrap_op = ('neg' if ('neg' in ALLOWED_OPS
+                              and 'neg' in CGPEquation.OPS_UNARY_SET)
+                   else None)
+        if higher and wrap_op is not None and len(higher) >= 2:
+            s_w1 = higher[0]
+            s_w2 = higher[1]
+            child.nodes[s_w1 - nf] = CGPNode(wrap_op, s_atom, 0, 0.0)
+            child.nodes[s_w2 - nf] = CGPNode(wrap_op, s_w1, 0, 0.0)
+            child.out_idx = s_w2
+        elif higher and '+' in CGPEquation.OPS_BINARY_SET:
+            s_const = higher[0]
+            child.nodes[s_const - nf] = CGPNode('const', 0, 0, 0.0)
+            if len(higher) >= 2:
+                s_combine = higher[1]
+                child.nodes[s_combine - nf] = CGPNode(
+                    '+', s_atom, s_const, 0.0)
+                child.out_idx = s_combine
+            else:
+                child.out_idx = s_atom
+        else:
+            child.out_idx = s_atom
+    else:
+        # Additive combine path — need at least one combine-eligible
+        # slot (> cur_out) AND at least one slot below it for the
+        # atom.  When the combine-eligible list is the only option
+        # we'd still want the atom slot to be < combine slot so
+        # the wiring is legal.
+        s_combine = combine_eligible[0]
+        below = [s for s in free_slots if s < s_combine]
+        if not below:
+            # No legal slot for the atom below the combine point;
+            # fall back to replace-output behaviour.
+            s_atom = free_slots[0]
+            child.nodes[s_atom - nf] = CGPNode(op, atom_inputs[0], atom_inputs[1], 0.0)
+            child.out_idx = s_atom
+        else:
+            s_atom = below[-1]  # the highest "below" slot, closest to combine
+            child.nodes[s_atom - nf] = CGPNode(op, atom_inputs[0], atom_inputs[1], 0.0)
+            combine_op = random.choices(
+                ['+', '*', '-'], weights=[5, 3, 2], k=1)[0]
+            if combine_op not in CGPEquation.OPS_BINARY_SET:
+                combine_op = ('+' if '+' in CGPEquation.OPS_BINARY_SET
+                              else next(iter(CGPEquation.OPS_BINARY_SET), '+'))
+            child.nodes[s_combine - nf] = CGPNode(
+                combine_op, cur_out, s_atom, 0.0)
+            child.out_idx = s_combine
+
+    child.update_active_nodes()
+    return child
+
+
+def _bo_inject_oracle_escape_seeds(candidate_trees, oracle, parents,
+                                    n_features, feat_names,
+                                    target_count, include_era=True):
+    """Append up to ``target_count`` interplay-targeted seeds to
+    ``candidate_trees`` in place.
+
+    Parents are drawn from ``parents`` (usually the current
+    top_inds) plus optionally the oracle's era champions — these
+    are HoF bests snapshotted at previous escape triggers, kept so
+    the search can revisit basins the GP has since forgotten about.
+
+    Returns the number of seeds actually added (may be less than
+    ``target_count`` when the oracle has no missing atoms left or
+    none of the synthesis paths succeed).
+    """
+    if oracle is None or target_count <= 0:
+        return 0
+    missing = oracle.missing_atoms(max_atoms=max(8, target_count * 2))
+    if not missing:
+        return 0
+    parent_pool = list(parents) if parents else []
+    if include_era:
+        parent_pool.extend(oracle.era_champions())
+    added = 0
+    for _ in range(int(target_count)):
+        atom = random.choice(missing) if missing else None
+        parent = random.choice(parent_pool) if parent_pool else None
+        try:
+            seed = oracle.synthesize_escape_seed(
+                parent, n_features, feat_names, missing_atom=atom)
+        except Exception:
+            seed = None
+        if seed is not None:
+            candidate_trees.append(seed)
+            added += 1
+    return added
+
+
+def _bo_tempered_top_indices(screen_results, batch_size,
+                               temper_temp_mult=0.0,
+                               rng=None):
+    """Return Stage-2 acceptance indices from ``screen_results`` (a list
+    of ``(ci, child)`` tuples sorted ascending by loss).
+
+    Default (temper_temp_mult == 0) returns the canonical greedy
+    top-K: the first ``batch_size`` indices, which is also what the
+    BO loops did before the oracle was wired up.
+
+    When ``temper_temp_mult > 0`` (escape mode) we instead sample
+    ``batch_size`` indices WITHOUT replacement from a softmax over
+    -loss / T where T = temper_temp_mult × loss_range.  The
+    sampling guarantees:
+      * The screen winner is always included (locked in to keep
+        progress on hot basins from regressing during escape).
+      * The remaining slots may include "screen losers" — the
+        whole point of the temperature mechanism, the "be less
+        afraid to try worse formulas" lever.
+    """
+    n = len(screen_results)
+    if n == 0:
+        return set()
+    if batch_size <= 0:
+        return set()
+    if batch_size >= n:
+        return set(ci for ci, _ in screen_results)
+    if temper_temp_mult <= 0:
+        return set(ci for ci, _ in screen_results[:batch_size])
+    rng = rng or np.random
+
+    losses = np.asarray(
+        [float(getattr(c, 'loss', np.inf)) for _, c in screen_results],
+        dtype=np.float64)
+    losses = np.where(np.isfinite(losses), losses,
+                       float(np.nanmax(losses[np.isfinite(losses)]) if
+                             np.any(np.isfinite(losses)) else 1.0))
+    lo = float(np.min(losses))
+    hi = float(np.max(losses))
+    rng_loss = max(hi - lo, 1e-9)
+    T = max(rng_loss * float(temper_temp_mult), 1e-9)
+    logits = -(losses - lo) / T
+    logits -= float(np.max(logits))
+    probs = np.exp(logits)
+    s = float(probs.sum())
+    if not np.isfinite(s) or s <= 0:
+        return set(ci for ci, _ in screen_results[:batch_size])
+    probs = probs / s
+
+    # Always lock in the screen winner — the first entry in
+    # screen_results.  This protects against escape mode wiping out
+    # a genuinely strong screen candidate by random sampling.
+    locked = [0]
+    remaining = batch_size - 1
+    if remaining > 0:
+        mask = np.ones(n, dtype=bool)
+        mask[0] = False
+        mass = probs * mask
+        denom = float(mass.sum())
+        if denom <= 0:
+            extras = list(range(1, min(n, batch_size)))
+        else:
+            mass = mass / denom
+            try:
+                extras = rng.choice(
+                    n, size=remaining, replace=False, p=mass).tolist()
+            except ValueError:
+                # Fall back to greedy when sampling without replacement
+                # is infeasible (e.g. fewer non-zero-prob entries than
+                # batch_size − 1).
+                order = np.argsort(-mass)
+                extras = [int(i) for i in order[:remaining]
+                          if mask[int(i)]]
+        locked.extend(int(e) for e in extras)
+    chosen = set(int(screen_results[i][0]) for i in locked)
+    return chosen
+
+
 def _bo_build_optimizers(n_features, n_outputs, feat_names, X, Y, X_probe,
                          probe_idx, mc_out_indices=None):
     """Construct one ``BayesianCGPOptimizer`` per output, supplying the
@@ -17950,6 +18904,13 @@ def run_bayesian_afpo(X, Y, n_features, n_outputs, feat_names, out_types,
     AFPO_POP_SIZE = POPULATION_SIZE * 2
     afpo_pops = [[] for _ in range(n_outputs)]
 
+    # Per-output Interplay Escape Oracle (see module-level
+    # "INTERPLAY ESCAPE ORACLE").  Disabled when
+    # BAYESIAN_ESCAPE_ENABLED is False.
+    oracles = ([_InterplayEscapeOracle(n_features, CGP_NODES)
+                for _ in range(n_outputs)]
+               if BAYESIAN_ESCAPE_ENABLED else [None] * n_outputs)
+
     # ── Phase 1: Initial random sampling ────────────────────────────────
     print(f"Phase 1: Evaluating {BAYESIAN_INITIAL_SAMPLES} random individuals…")
     _INIT_PHASE = True
@@ -17994,6 +18955,8 @@ def run_bayesian_afpo(X, Y, n_features, n_outputs, feat_names, out_types,
             hofs[o_idx].update(ind)
             optimizers[o_idx].add_observation(ind, ind.tree)
             afpo_pops[o_idx].append(ind)
+            if oracles[o_idx] is not None:
+                oracles[o_idx].observe(ind)
 
         # AFPO specifically relies on _trim_to_pareto_front_3obj (or similar)
         # to manage population size
@@ -18178,9 +19141,37 @@ def run_bayesian_afpo(X, Y, n_features, n_outputs, feat_names, out_types,
                     for _ in range(n_hof_cross):
                         candidate_trees.append(random_cgp(n_features, CGP_NODES, feat_names))
 
+                # Random injection (with optional escape-oracle seed
+                # injection — see the equivalent block in run_bayesian_qd
+                # for the rationale).
+                _oracle = oracles[o_idx]
+                _in_escape = bool(_oracle is not None and _oracle.in_escape_mode())
                 n_random = BAYESIAN_N_CANDIDATES - n_exploit - n_cross - n_macro - n_hof_cross
+                n_oracle_seeds = 0
+                if _in_escape:
+                    n_oracle_seeds = max(0, int(round(
+                        BAYESIAN_N_CANDIDATES * BAYESIAN_ESCAPE_SEED_FRAC)))
+                    take_from_random = min(n_random, n_oracle_seeds)
+                    n_random -= take_from_random
+                    short = n_oracle_seeds - take_from_random
+                    if short > 0:
+                        n_oracle_seeds -= short
                 for _ in range(max(0, n_random)):
                     candidate_trees.append(random_cgp(n_features, CGP_NODES, feat_names))
+                if _in_escape and n_oracle_seeds > 0:
+                    _escape_parents = pop if pop else hof_inds_bo
+                    _added = _bo_inject_oracle_escape_seeds(
+                        candidate_trees, _oracle,
+                        parents=_escape_parents,
+                        n_features=n_features, feat_names=feat_names,
+                        target_count=n_oracle_seeds,
+                        include_era=True)
+                    if (_added > 0
+                            and iteration == _oracle._last_trigger_iter + 1):
+                        print(f"  [BO AFPO iter {iteration} | Out {o_idx}] "
+                              f"Escape oracle injected {_added} "
+                              f"interplay-targeted seed(s) "
+                              f"({_oracle.summary_str()}).")
 
                 # Cross-output sibling mining for one-hot class groups.
                 # See ``run_bayesian_qd`` for the full rationale.
@@ -18229,7 +19220,13 @@ def run_bayesian_afpo(X, Y, n_features, n_outputs, feat_names, out_types,
                 total_evals += len(screen_results)
 
                 screen_results.sort(key=lambda x: x[1].loss)
-                top_indices = set(ci for ci, _ in screen_results[:BAYESIAN_BATCH_SIZE])
+                # Tempered Stage-2 selection inside escape mode (see
+                # ``_bo_tempered_top_indices``).
+                _temper_T = (_oracle.temper_temperature()
+                             if _oracle is not None else 0.0)
+                top_indices = _bo_tempered_top_indices(
+                    screen_results, BAYESIAN_BATCH_SIZE,
+                    temper_temp_mult=_temper_T)
 
                 # Track this iteration's best loss BEFORE evaluations so the
                 # trust-region xi adaptation can detect genuine improvement.
@@ -18258,10 +19255,30 @@ def run_bayesian_afpo(X, Y, n_features, n_outputs, feat_names, out_types,
                         _bo_improved = True
 
                     opt.add_observation(child, child.tree)
+                    if _oracle is not None:
+                        _oracle.observe(child)
                     if child.loss < _bo_prev_best - 1e-9:
                         _bo_improved = True
 
                 opt.record_iteration_outcome(_bo_improved)
+
+                # Tick the escape oracle AFTER record_iteration_outcome.
+                if _oracle is not None:
+                    _oracle.tick(iteration, improved=_bo_improved)
+                    if _oracle.should_escape():
+                        try:
+                            if opt._portfolio is not None:
+                                opt._portfolio.escape_boost(strength=1.2)
+                        except Exception:
+                            pass
+                        try:
+                            _hof_best = hofs[o_idx].get_best_overall()
+                            _oracle.remember_era_champion(_hof_best)
+                        except Exception:
+                            pass
+                        print(f"  [BO AFPO iter {iteration} | Out {o_idx}] "
+                              f"Interplay escape ACTIVATED — "
+                              f"{_oracle.summary_str()}.")
 
                 # Trim Pareto front
                 afpo_pops[o_idx] = _trim_to_pareto_front_3obj(pop, AFPO_POP_SIZE)
@@ -18410,6 +19427,12 @@ def run_bayesian_islands(X, Y, n_features, n_outputs, feat_names, out_types,
     ]
 
     islands_pop = [[[] for _ in range(n_outputs)] for _ in range(NUM_ISLANDS)]
+    # Per-output Interplay Escape Oracle.  Islands share one oracle
+    # per output (the optimiser is per-output too); aggregated
+    # observations across islands feed the inbreeding detector.
+    oracles = ([_InterplayEscapeOracle(n_features, CGP_NODES)
+                for _ in range(n_outputs)]
+               if BAYESIAN_ESCAPE_ENABLED else [None] * n_outputs)
 
     # ── Phase 1: Initial random sampling ────────────────────────────────
     print(f"Phase 1: Evaluating {BAYESIAN_INITIAL_SAMPLES} random individuals per island…")
@@ -18454,6 +19477,8 @@ def run_bayesian_islands(X, Y, n_features, n_outputs, feat_names, out_types,
                                                       init_idx if N_train > _INIT_SUBSAMPLE_CAP else None))
                 hofs[o_idx].update(ind)
                 optimizers[o_idx].add_observation(ind, ind.tree)
+                if oracles[o_idx] is not None:
+                    oracles[o_idx].observe(ind)
 
             # Take top ISLAND_SIZE individuals to initialize this island's pop
             seeds.sort(key=lambda x: x.loss)
@@ -18645,9 +19670,45 @@ def run_bayesian_islands(X, Y, n_features, n_outputs, feat_names, out_types,
                         for _ in range(n_hof_cross):
                             candidate_trees.append(random_cgp(n_features, CGP_NODES, feat_names))
 
+                    # Random injection (with optional escape-oracle seeds).
+                    # Oracle is per-output; every island consults the same
+                    # oracle so the search across islands gets coordinated
+                    # interplay coverage instead of N independent oracles
+                    # all guessing the same missing atoms.
+                    _oracle = oracles[o_idx]
+                    _in_escape = bool(_oracle is not None and _oracle.in_escape_mode())
                     n_random = BAYESIAN_N_CANDIDATES - n_exploit - n_cross - n_macro - n_hof_cross
+                    n_oracle_seeds = 0
+                    if _in_escape:
+                        # Per-island budget — divide by NUM_ISLANDS so the
+                        # PER-OUTPUT injection rate matches the non-island
+                        # variants on average.
+                        per_island_oracle = max(0, int(round(
+                            BAYESIAN_N_CANDIDATES * BAYESIAN_ESCAPE_SEED_FRAC
+                            / max(1, NUM_ISLANDS))))
+                        n_oracle_seeds = per_island_oracle
+                        take_from_random = min(n_random, n_oracle_seeds)
+                        n_random -= take_from_random
+                        short = n_oracle_seeds - take_from_random
+                        if short > 0:
+                            n_oracle_seeds -= short
                     for _ in range(max(0, n_random)):
                         candidate_trees.append(random_cgp(n_features, CGP_NODES, feat_names))
+                    if _in_escape and n_oracle_seeds > 0:
+                        _escape_parents = top_inds if top_inds else \
+                            list(hofs[o_idx].best_by_complexity.values())
+                        _added = _bo_inject_oracle_escape_seeds(
+                            candidate_trees, _oracle,
+                            parents=_escape_parents,
+                            n_features=n_features, feat_names=feat_names,
+                            target_count=n_oracle_seeds,
+                            include_era=True)
+                        if (_added > 0 and island_idx == 0
+                                and iteration == _oracle._last_trigger_iter + 1):
+                            print(f"  [BO Islands iter {iteration} | Out {o_idx}] "
+                                  f"Escape oracle injecting {_added} "
+                                  f"interplay-targeted seed(s) per island "
+                                  f"({_oracle.summary_str()}).")
 
                     # Cross-output sibling mining for one-hot class groups.
                     # See ``run_bayesian_qd`` for the full rationale.
@@ -18694,7 +19755,12 @@ def run_bayesian_islands(X, Y, n_features, n_outputs, feat_names, out_types,
                     total_evals += len(screen_results)
 
                     screen_results.sort(key=lambda x: x[1].loss)
-                    top_indices = set(ci for ci, _ in screen_results[:BAYESIAN_BATCH_SIZE])
+                    # Tempered Stage-2 selection inside escape mode.
+                    _temper_T = (_oracle.temper_temperature()
+                                 if _oracle is not None else 0.0)
+                    top_indices = _bo_tempered_top_indices(
+                        screen_results, BAYESIAN_BATCH_SIZE,
+                        temper_temp_mult=_temper_T)
 
                     _bo_prev_best = min((ind.loss for ind in opt.individuals),
                                         default=float('inf'))
@@ -18720,6 +19786,8 @@ def run_bayesian_islands(X, Y, n_features, n_outputs, feat_names, out_types,
                             _bo_improved = True
 
                         opt.add_observation(child, child.tree)
+                        if _oracle is not None:
+                            _oracle.observe(child)
                         if child.loss < _bo_prev_best - 1e-9:
                             _bo_improved = True
 
@@ -18740,6 +19808,26 @@ def run_bayesian_islands(X, Y, n_features, n_outputs, feat_names, out_types,
                 # per output — matching the cadence the thresholds in
                 # ``tick_trust_region`` were calibrated for.
                 opt.tick_trust_region(_bo_any_improved)
+
+                # Tick the escape oracle ONCE per output (after all
+                # islands have contributed observations this iteration).
+                _oracle_o = oracles[o_idx]
+                if _oracle_o is not None:
+                    _oracle_o.tick(iteration, improved=_bo_any_improved)
+                    if _oracle_o.should_escape():
+                        try:
+                            if opt._portfolio is not None:
+                                opt._portfolio.escape_boost(strength=1.2)
+                        except Exception:
+                            pass
+                        try:
+                            _hof_best = hofs[o_idx].get_best_overall()
+                            _oracle_o.remember_era_champion(_hof_best)
+                        except Exception:
+                            pass
+                        print(f"  [BO Islands iter {iteration} | Out {o_idx}] "
+                              f"Interplay escape ACTIVATED — "
+                              f"{_oracle_o.summary_str()}.")
 
                 # Migration (every 5 iterations).  IMPORTANT: snapshot
                 # the source-pop reference for every island BEFORE any
@@ -18909,6 +19997,11 @@ def run_bayesian_islanded_afpo(X, Y, n_features, n_outputs, feat_names, out_type
     ]
 
     islands_pop = [[[] for _ in range(n_outputs)] for _ in range(NUM_ISLANDS)]
+    # Per-output Interplay Escape Oracle (see module-level
+    # "INTERPLAY ESCAPE ORACLE").
+    oracles = ([_InterplayEscapeOracle(n_features, CGP_NODES)
+                for _ in range(n_outputs)]
+               if BAYESIAN_ESCAPE_ENABLED else [None] * n_outputs)
 
     # ── Phase 1: Initial random sampling ────────────────────────────────
     print(f"Phase 1: Evaluating {BAYESIAN_INITIAL_SAMPLES} random individuals per island…")
@@ -18951,6 +20044,8 @@ def run_bayesian_islanded_afpo(X, Y, n_features, n_outputs, feat_names, out_type
                                                       init_idx if N_train > _INIT_SUBSAMPLE_CAP else None))
                 hofs[o_idx].update(ind)
                 optimizers[o_idx].add_observation(ind, ind.tree)
+                if oracles[o_idx] is not None:
+                    oracles[o_idx].observe(ind)
 
             islands_pop[island_idx][o_idx] = _trim_to_pareto_front_3obj(seeds, AFPO_POP_SIZE)
 
@@ -19137,9 +20232,38 @@ def run_bayesian_islanded_afpo(X, Y, n_features, n_outputs, feat_names, out_type
                         for _ in range(n_hof_cross):
                             candidate_trees.append(random_cgp(n_features, CGP_NODES, feat_names))
 
+                    # Random injection + optional escape-oracle seeds
+                    # (see run_bayesian_islands for the rationale).
+                    _oracle = oracles[o_idx]
+                    _in_escape = bool(_oracle is not None and _oracle.in_escape_mode())
                     n_random = BAYESIAN_N_CANDIDATES - n_exploit - n_cross - n_macro - n_hof_cross
+                    n_oracle_seeds = 0
+                    if _in_escape:
+                        per_island_oracle = max(0, int(round(
+                            BAYESIAN_N_CANDIDATES * BAYESIAN_ESCAPE_SEED_FRAC
+                            / max(1, NUM_ISLANDS))))
+                        n_oracle_seeds = per_island_oracle
+                        take_from_random = min(n_random, n_oracle_seeds)
+                        n_random -= take_from_random
+                        short = n_oracle_seeds - take_from_random
+                        if short > 0:
+                            n_oracle_seeds -= short
                     for _ in range(max(0, n_random)):
                         candidate_trees.append(random_cgp(n_features, CGP_NODES, feat_names))
+                    if _in_escape and n_oracle_seeds > 0:
+                        _escape_parents = pop if pop else hof_inds_bo
+                        _added = _bo_inject_oracle_escape_seeds(
+                            candidate_trees, _oracle,
+                            parents=_escape_parents,
+                            n_features=n_features, feat_names=feat_names,
+                            target_count=n_oracle_seeds,
+                            include_era=True)
+                        if (_added > 0 and island_idx == 0
+                                and iteration == _oracle._last_trigger_iter + 1):
+                            print(f"  [BO Isl-AFPO iter {iteration} | Out {o_idx}] "
+                                  f"Escape oracle injecting {_added} "
+                                  f"interplay-targeted seed(s) per island "
+                                  f"({_oracle.summary_str()}).")
 
                     # Cross-output sibling mining for one-hot class groups.
                     # See ``run_bayesian_qd`` for the full rationale.
@@ -19186,7 +20310,12 @@ def run_bayesian_islanded_afpo(X, Y, n_features, n_outputs, feat_names, out_type
                     total_evals += len(screen_results)
 
                     screen_results.sort(key=lambda x: x[1].loss)
-                    top_indices = set(ci for ci, _ in screen_results[:BAYESIAN_BATCH_SIZE])
+                    # Tempered Stage-2 selection inside escape mode.
+                    _temper_T = (_oracle.temper_temperature()
+                                 if _oracle is not None else 0.0)
+                    top_indices = _bo_tempered_top_indices(
+                        screen_results, BAYESIAN_BATCH_SIZE,
+                        temper_temp_mult=_temper_T)
 
                     _bo_prev_best = min((ind.loss for ind in opt.individuals),
                                         default=float('inf'))
@@ -19213,6 +20342,8 @@ def run_bayesian_islanded_afpo(X, Y, n_features, n_outputs, feat_names, out_type
                             _bo_improved = True
 
                         opt.add_observation(child, child.tree)
+                        if _oracle is not None:
+                            _oracle.observe(child)
                         if child.loss < _bo_prev_best - 1e-9:
                             _bo_improved = True
 
@@ -19230,6 +20361,25 @@ def run_bayesian_islanded_afpo(X, Y, n_features, n_outputs, feat_names, out_type
                 # restart bookkeeper ticks at one event per BO iteration
                 # per output.
                 opt.tick_trust_region(_bo_any_improved)
+
+                # Tick the escape oracle ONCE per output (post-islands).
+                _oracle_o = oracles[o_idx]
+                if _oracle_o is not None:
+                    _oracle_o.tick(iteration, improved=_bo_any_improved)
+                    if _oracle_o.should_escape():
+                        try:
+                            if opt._portfolio is not None:
+                                opt._portfolio.escape_boost(strength=1.2)
+                        except Exception:
+                            pass
+                        try:
+                            _hof_best = hofs[o_idx].get_best_overall()
+                            _oracle_o.remember_era_champion(_hof_best)
+                        except Exception:
+                            pass
+                        print(f"  [BO Isl-AFPO iter {iteration} | Out {o_idx}] "
+                              f"Interplay escape ACTIVATED — "
+                              f"{_oracle_o.summary_str()}.")
 
                 # Migration (every 5 iterations).  Snapshot all source
                 # pops before any migration writes so the ring shift
@@ -19396,6 +20546,13 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
         for o_idx in range(n_outputs)
     ]
 
+    # Per-output Interplay Escape Oracle (see the module-level
+    # "INTERPLAY ESCAPE ORACLE" comment).  Disabled via the
+    # BAYESIAN_ESCAPE_ENABLED flag.
+    oracles = ([_InterplayEscapeOracle(n_features, CGP_NODES)
+                for _ in range(n_outputs)]
+               if BAYESIAN_ESCAPE_ENABLED else [None] * n_outputs)
+
     # ── Phase 1: Initial random sampling ────────────────────────────────
     print(f"Phase 1: Evaluating {BAYESIAN_INITIAL_SAMPLES} random individuals…")
     _INIT_PHASE = True
@@ -19445,6 +20602,8 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
                                                   init_idx if N_train > _INIT_SUBSAMPLE_CAP else None))
             hofs[o_idx].update(ind)
             optimizers[o_idx].add_observation(ind, ind.tree)
+            if oracles[o_idx] is not None:
+                oracles[o_idx].observe(ind)
 
         print(f"  Output {o_idx}: {len(seeds)} initial samples evaluated, "
               f"best loss = {min(ind.loss for ind in seeds):.5f}")
@@ -19715,10 +20874,44 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
                 # Diversity injection (random).  Restart mode pushes this up
                 # to ~25% so the trust-region collapse genuinely re-seeds
                 # instead of just taking bigger mutations of the same basin.
+                # Inside an escape window the oracle claims a fraction of
+                # the random budget for interplay-targeted seeds (see the
+                # equivalent block in ``run_bayesian_qd`` for the full
+                # rationale on why oracle seeds replace random rather
+                # than adding on top).
+                _oracle = oracles[o_idx]
+                _in_escape = bool(_oracle is not None and _oracle.in_escape_mode())
                 n_random = BAYESIAN_N_CANDIDATES - n_exploit - n_cross - n_macro - n_hof_cross
+                n_oracle_seeds = 0
+                if _in_escape:
+                    n_oracle_seeds = max(0, int(round(
+                        BAYESIAN_N_CANDIDATES * BAYESIAN_ESCAPE_SEED_FRAC)))
+                    take_from_random = min(n_random, n_oracle_seeds)
+                    n_random -= take_from_random
+                    short = n_oracle_seeds - take_from_random
+                    if short > 0:
+                        n_oracle_seeds -= short
                 for _ in range(max(0, n_random)):
                     candidate_trees.append(
                         random_cgp(n_features, CGP_NODES, feat_names))
+                if _in_escape and n_oracle_seeds > 0:
+                    _added = _bo_inject_oracle_escape_seeds(
+                        candidate_trees, _oracle,
+                        parents=top_inds, n_features=n_features,
+                        feat_names=feat_names,
+                        target_count=n_oracle_seeds,
+                        include_era=True)
+                    if (_added > 0
+                            and iteration == _oracle._last_trigger_iter + 1):
+                        # Log only on the FIRST iteration after a fresh
+                        # trigger so the noise doesn't flood the BO log
+                        # during a multi-iter escape window.  The
+                        # trigger itself was already printed by
+                        # ``tick()`` at the end of the previous iter.
+                        print(f"  [BO iter {iteration} | Out {o_idx}] "
+                              f"Escape oracle injected {_added} "
+                              f"interplay-targeted seed(s) "
+                              f"({_oracle.summary_str()}).")
 
                 # ── Residual-aware reseed (every 25 iters, regression only) ──
                 # The evolutionary path injects residual-targeted seeds on
@@ -19812,7 +21005,14 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
 
                 # Stage 2: pick best B from screening, evaluate on full data.
                 screen_results.sort(key=lambda x: x[1].loss)
-                top_indices = set(ci for ci, _ in screen_results[:BAYESIAN_BATCH_SIZE])
+                # Greedy top-K outside escape mode; Boltzmann (softmax
+                # over loss) inside, with the screen winner locked in.
+                # See ``_bo_tempered_top_indices`` for the rationale.
+                _temper_T = (_oracle.temper_temperature()
+                             if _oracle is not None else 0.0)
+                top_indices = _bo_tempered_top_indices(
+                    screen_results, BAYESIAN_BATCH_SIZE,
+                    temper_temp_mult=_temper_T)
 
                 # Do NOT add screen-fidelity observations to the GP.  The
                 # surrogate models full-data loss; mixing row-subset losses into
@@ -19851,12 +21051,33 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
 
                     # Update GP with full-fidelity evaluation
                     opt.add_observation(child, child.tree)
+                    if _oracle is not None:
+                        _oracle.observe(child)
                     if child.loss < _bo_prev_best - 1e-9:
                         _bo_improved = True
 
                 # Adaptive trust-region xi: bump exploration after a few
                 # iterations with no improvement; relax it once wins resume.
                 opt.record_iteration_outcome(_bo_improved)
+
+                # Tick the escape oracle AFTER record_iteration_outcome
+                # so a fresh escape boost lands on a clean reward state.
+                if _oracle is not None:
+                    _oracle.tick(iteration, improved=_bo_improved)
+                    if _oracle.should_escape():
+                        try:
+                            if opt._portfolio is not None:
+                                opt._portfolio.escape_boost(strength=1.2)
+                        except Exception:
+                            pass
+                        try:
+                            _hof_best = hofs[o_idx].get_best_overall()
+                            _oracle.remember_era_champion(_hof_best)
+                        except Exception:
+                            pass
+                        print(f"  [BO iter {iteration} | Out {o_idx}] "
+                              f"Interplay escape ACTIVATED — "
+                              f"{_oracle.summary_str()}.")
 
                 # ── Refit GP surrogate periodically ─────────────────────────
                 if opt.should_refit_now(iteration):
@@ -20100,6 +21321,14 @@ def run_bayesian_qd(X, Y, n_features, n_outputs, feat_names, out_types,
 
     archives = [QualityDiversityArchive(n_features, CGP_NODES)
                 for _ in range(n_outputs)]
+    # Per-output Interplay Escape Oracle — the "Bayesian master" that
+    # detects when the search has been refining variants of one
+    # template for too long and intervenes by injecting interplay-
+    # targeted candidates and dialling up exploration knobs.  Disabled
+    # via the BAYESIAN_ESCAPE_ENABLED flag.
+    oracles = ([_InterplayEscapeOracle(n_features, CGP_NODES)
+                for _ in range(n_outputs)]
+               if BAYESIAN_ESCAPE_ENABLED else [None] * n_outputs)
 
     # ── Phase 1: Seed the archive ───────────────────────────────────────
     print(f"Phase 1: Seeding QD archive with {BAYESIAN_INITIAL_SAMPLES} individuals…")
@@ -20144,6 +21373,8 @@ def run_bayesian_qd(X, Y, n_features, n_outputs, feat_names, out_types,
             hofs[o_idx].update(ind)
             optimizers[o_idx].add_observation(ind, ind.tree)
             archives[o_idx].add(ind, iteration=0)
+            if oracles[o_idx] is not None:
+                oracles[o_idx].observe(ind)
 
         print(f"  Output {o_idx}: {archives[o_idx].coverage()} cells filled "
               f"({len(seeds)} seeds), best loss = "
@@ -20407,10 +21638,49 @@ def run_bayesian_qd(X, Y, n_features, n_outputs, feat_names, out_types,
                 # Random injection.  Whatever's left of BAYESIAN_N_CANDIDATES
                 # is filled with pure-random trees — restart mode pushes the
                 # remaining fraction up to ~25% by shrinking the QD-mutation
-                # share above.
+                # share above.  Inside an escape window the oracle claims
+                # ``BAYESIAN_ESCAPE_SEED_FRAC`` of the candidate budget for
+                # interplay-targeted seeds — those replace random injections
+                # because both serve the same "structurally different from
+                # the current basin" role and random seeds rarely hit the
+                # specific missing-interplay atoms the oracle has detected.
+                _oracle = oracles[o_idx]
+                _in_escape = bool(_oracle is not None and _oracle.in_escape_mode())
                 n_random = BAYESIAN_N_CANDIDATES - n_qd_mut - n_cross_cell - n_macro - n_hof_cross
+                n_oracle_seeds = 0
+                if _in_escape:
+                    n_oracle_seeds = max(0, int(round(
+                        BAYESIAN_N_CANDIDATES * BAYESIAN_ESCAPE_SEED_FRAC)))
+                    # Drain from random first, then steal a bit from
+                    # qd_mut if random alone is insufficient.  We want
+                    # oracle seeds to be ADDITIVE structural pressure,
+                    # not to wipe out HoF crossover or macro paths the
+                    # restart logic already widened.
+                    take_from_random = min(n_random, n_oracle_seeds)
+                    n_random -= take_from_random
+                    short = n_oracle_seeds - take_from_random
+                    if short > 0:
+                        steal = min(short, max(0, n_qd_mut - 5))
+                        # Already-built qd_mut candidates aren't removed
+                        # — we just shrink the BUDGET so the oracle's
+                        # additional seeds don't overflow the per-iter
+                        # candidate count downstream.
+                        n_oracle_seeds -= short - steal
                 for _ in range(max(0, n_random)):
                     candidate_trees.append(random_cgp(n_features, CGP_NODES, feat_names))
+                if _in_escape and n_oracle_seeds > 0:
+                    _added = _bo_inject_oracle_escape_seeds(
+                        candidate_trees, _oracle,
+                        parents=top_inds, n_features=n_features,
+                        feat_names=feat_names,
+                        target_count=n_oracle_seeds,
+                        include_era=True)
+                    if (_added > 0
+                            and iteration == _oracle._last_trigger_iter + 1):
+                        print(f"  [BO QD iter {iteration} | Out {o_idx}] "
+                              f"Escape oracle injected {_added} "
+                              f"interplay-targeted seed(s) "
+                              f"({_oracle.summary_str()}).")
 
                 # Residual-aware reseed (every 25 iters, regression only)
                 _bo_is_cls = (out_types[o_idx] == 6)
@@ -20499,7 +21769,18 @@ def run_bayesian_qd(X, Y, n_features, n_outputs, feat_names, out_types,
                 total_evals += len(screen_results)
 
                 screen_results.sort(key=lambda x: x[1].loss)
-                top_indices = set(ci for ci, _ in screen_results[:BAYESIAN_BATCH_SIZE])
+                # Stage-2 acceptance: greedy top-K outside escape mode,
+                # Boltzmann (softmax-over-loss) sampling when the
+                # oracle is intervening.  The tempered branch always
+                # locks in the screen winner so we never regress the
+                # hot basin's polish budget; the remaining slots may
+                # admit screen-losers — the explicit "be less afraid
+                # to try worse formulas to escape a basin" lever.
+                _temper_T = (_oracle.temper_temperature()
+                             if _oracle is not None else 0.0)
+                top_indices = _bo_tempered_top_indices(
+                    screen_results, BAYESIAN_BATCH_SIZE,
+                    temper_temp_mult=_temper_T)
 
                 _bo_prev_best = min((ind.loss for ind in opt.individuals),
                                     default=float('inf'))
@@ -20524,6 +21805,8 @@ def run_bayesian_qd(X, Y, n_features, n_outputs, feat_names, out_types,
                         _bo_improved = True
 
                     opt.add_observation(child, child.tree)
+                    if _oracle is not None:
+                        _oracle.observe(child)
                     if child.loss < _bo_prev_best - 1e-9:
                         _bo_improved = True
                     if new_cell:
@@ -20534,6 +21817,33 @@ def run_bayesian_qd(X, Y, n_features, n_outputs, feat_names, out_types,
                         _bo_improved = True
 
                 opt.record_iteration_outcome(_bo_improved)
+
+                # Tick the escape oracle AFTER record_iteration_outcome
+                # (which has already updated the GP-Hedge portfolio with
+                # this iteration's bonus), so a fresh escape trigger's
+                # boost call lands on a clean reward state rather than
+                # being immediately decayed by the iteration update.
+                if _oracle is not None:
+                    _oracle.tick(iteration, improved=_bo_improved)
+                    if _oracle.should_escape():
+                        # First iteration of a new escape window —
+                        # boost the GP-Hedge portfolio's exploration
+                        # arms AND snapshot the current HoF best so
+                        # the oracle remembers this era's champion
+                        # for later escape windows.
+                        try:
+                            if opt._portfolio is not None:
+                                opt._portfolio.escape_boost(strength=1.2)
+                        except Exception:
+                            pass
+                        try:
+                            _hof_best = hofs[o_idx].get_best_overall()
+                            _oracle.remember_era_champion(_hof_best)
+                        except Exception:
+                            pass
+                        print(f"  [BO QD iter {iteration} | Out {o_idx}] "
+                              f"Interplay escape ACTIVATED — "
+                              f"{_oracle.summary_str()}.")
 
                 if opt.should_refit_now(iteration):
                     if opt.has_mc_context and opt.mc_full is not None:
