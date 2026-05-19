@@ -13403,8 +13403,13 @@ def evolve_afpo(population, X, y_target, type_code,
 
     # ── IMPROVEMENT (B7): diversity-driven structural boost ──────────────
     _DIVERSITY_CHECK_FREQ   = 50
+    # Window extended from 50 → 80 gens.  At MIGRATION_FREQ=50 the previous
+    # window expired in roughly the same chunk it was activated, so the
+    # structural-mutation push barely propagated across chunk boundaries.
+    # The extra 30 gens let collapsed populations spend at least one full
+    # additional chunk under boosted weights.
     _DIVERSITY_THRESHOLD    = 1e-3
-    _DIVERSITY_BOOST_WINDOW = 50          # gens of boost after a collapse
+    _DIVERSITY_BOOST_WINDOW = 80
     _DIVERSITY_BOOST_MULT   = 2.0
     _diversity_boost_until  = -1
 
@@ -13412,8 +13417,27 @@ def evolve_afpo(population, X, y_target, type_code,
     # Single-stage AFPO can become overly conservative once the Pareto front
     # is crowded by age-young near-clones.  Injecting a tiny amount of truly
     # random age-0 blood helps escape local basins without disrupting the run.
-    _IMMIGRANT_CHECK_FREQ = 30
-    _IMMIGRANT_RATE = 0.03   # share of target_size
+    # ``_IMMIGRANT_RATE`` scales up with stagnation depth — the deeper we
+    # plateau, the larger the injection burst (capped at 8 %).  Frequencies
+    # are derived from ``n_generations`` so they reliably fire at least once
+    # per chunk even when the outer loop halves chunk size on stagnation.
+    _IMMIGRANT_CHECK_FREQ = max(15, n_generations // 2)
+    _IMMIGRANT_RATE_BASE  = 0.03
+    _IMMIGRANT_RATE_MAX   = 0.08
+
+    # ── AFPO hardening: Pareto-front shrinkage guard ───────────────────────
+    # The 3-objective Pareto trim never grows the population — only trims.
+    # When the front is small (a handful of mutually non-dominated members
+    # dominate everything else), parent selection collapses to choosing from
+    # those few individuals and the search stalls.  Every _POP_GUARD_FREQ
+    # gens, if the population has dropped below _POP_GUARD_FLOOR of target,
+    # we refill with mutated HoF-by-complexity entries (each at a distinct
+    # complexity bucket so they are mutually non-dominated when injected at
+    # age 0) and random_cgp pad.  ``_POP_GUARD_FREQ`` is scaled to ensure
+    # at least one fire per chunk for both regular and stagnation-shortened
+    # chunk lengths.
+    _POP_GUARD_FREQ   = max(10, n_generations // 3)
+    _POP_GUARD_FLOOR  = 0.6
 
     local_stag = stag_counter
     # Track the best individual seen inside this chunk for champion protection
@@ -13731,12 +13755,42 @@ def evolve_afpo(population, X, y_target, type_code,
                 pass
 
         # ── AFPO hardening: stagnation-aware immigrant pulse ─────────────────
+        # Scale the injection rate linearly with stagnation depth so deep
+        # plateaus get a larger burst.  Also draw from residual-aware seeds
+        # whenever the HoF has a usable best (skipping classification +
+        # joint-softmax outputs where residuals don't decompose), giving the
+        # immigrants a head start at correcting the current champion's errors
+        # rather than relying on the lucky shape of a random v5 template.
         if (gen > 0 and gen % _IMMIGRANT_CHECK_FREQ == 0
                 and local_stag > max(15, ext_patience // 3)):
-            n_imm = max(1, int(round(target_size * _IMMIGRANT_RATE)))
-            for _ in range(n_imm):
+            _stag_depth = min(
+                1.0, (local_stag - max(15, ext_patience // 3))
+                     / max(1.0, ext_patience - max(15, ext_patience // 3)))
+            _imm_rate = _IMMIGRANT_RATE_BASE + (
+                _IMMIGRANT_RATE_MAX - _IMMIGRANT_RATE_BASE) * _stag_depth
+            n_imm = max(1, int(round(target_size * _imm_rate)))
+            _v5_pool = generate_seeds_v5(n_features, feat_names)
+            _res_pool: list = []
+            _hof_best_imm = hof.get_best_overall()
+            if (_hof_best_imm is not None and type_code != 6
+                    and bg_logits is None):
                 try:
-                    imm = random.choice(generate_seeds_v5(n_features, feat_names))
+                    _res_pool = generate_residual_aware_seeds(
+                        n_features, feat_names, X, y_target, _hof_best_imm,
+                        max_seeds=max(2, n_imm))
+                except Exception:
+                    _res_pool = []
+            for _k in range(n_imm):
+                try:
+                    # Alternate between residual-aware and v5 seeds when both
+                    # pools are available, falling back to the other when one
+                    # is empty.
+                    if _res_pool and (not _v5_pool or _k % 2 == 0):
+                        imm = random.choice(_res_pool)
+                    elif _v5_pool:
+                        imm = random.choice(_v5_pool)
+                    else:
+                        continue
                     imm.age = 0
                     imm.calculate_fitness(
                         X, y_target, type_code,
@@ -13747,6 +13801,47 @@ def evolve_afpo(population, X, y_target, type_code,
                     population.append(imm)
                 except Exception:
                     continue
+            population = _trim_to_pareto_front_3obj(population, target_size)
+
+        # ── AFPO hardening: Pareto-front shrinkage guard ──────────────────
+        # If the trim has driven the population well below target_size, refill
+        # with mutated HoF-by-complexity entries at age 0.  Each entry sits
+        # at a distinct complexity bucket so it is mutually non-dominated
+        # against the others on the (age, fitness, complexity) front and will
+        # survive the next trim, restoring parent-selection diversity.
+        if (gen > 0 and gen % _POP_GUARD_FREQ == 0
+                and len(population) < int(target_size * _POP_GUARD_FLOOR)):
+            n_needed = target_size - len(population)
+            _hof_pool = list(hof.best_by_complexity.values()) if hof.best_by_complexity else []
+            random.shuffle(_hof_pool)
+            for k in range(n_needed):
+                if k < len(_hof_pool):
+                    base = _hof_pool[k]
+                    # Light mutation so we don't inject N exact copies.
+                    try:
+                        tree = mutate(base.tree, n_features, feat_names,
+                                      mut_rate=max(1, CGP_MUT_RATE))
+                    except Exception:
+                        tree = random_cgp(n_features, CGP_NODES, feat_names)
+                    ni = Individual(tree)
+                    ni.sigma = float(np.clip(
+                        getattr(base, 'sigma', CGP_MUT_RATE)
+                        * random.uniform(0.7, 1.5),
+                        SIGMA_MIN, SIGMA_MAX))
+                else:
+                    ni = Individual(random_cgp(n_features, CGP_NODES, feat_names))
+                ni.age = 0
+                try:
+                    ni.calculate_fitness(
+                        X, y_target, type_code,
+                        bg_logits=bg_logits,
+                        class_idx_in_group=class_idx_in_group,
+                        Y_group=Y_group,
+                        target_grads=target_grads)
+                except Exception:
+                    ni.fitness = 1e10
+                    ni.loss = 1e10
+                population.append(ni)
             population = _trim_to_pareto_front_3obj(population, target_size)
 
         # HoF update uses .loss (not .fitness), so no need to re-evaluate
@@ -13762,6 +13857,15 @@ def evolve_afpo(population, X, y_target, type_code,
             keep_n    = max(1, int(target_size * 0.10))
             survivors = population[:keep_n]
             new_blood = list(generate_seeds_v5(n_features, feat_names))
+
+            # Post-extinction diversity makes most cached entries stale
+            # misses anyway — mirror the island worker and clear the cache
+            # so a fresh basin can build up its own short-term hit rate
+            # without paying for evictions of obsolete entries.
+            try:
+                _FITNESS_CACHE.clear()
+            except Exception:
+                pass
 
             # ── Semantic diversity check ──────────────────────────────────────
             # If the population has collapsed semantically (all individuals
@@ -24831,12 +24935,33 @@ def train_mode():
 
         for i in range(n_outputs):
             pop = generate_seeds_v5(n_features, feat_names)
+            # Importance-biased seeds: closed-form OLS / log-OLS templates
+            # over the most-correlated features and rational/composite forms.
+            # The single-stage AFPO previously initialised from v5 + random
+            # only, which left it strictly weaker than the island model on
+            # multi-feature linear / monomial / Buckingham-Π targets where
+            # OLS solves the coefficients outright on first evaluation.
+            try:
+                imp_seeds = generate_importance_biased_seeds(
+                    n_features, feat_names, X_init, Y_init[:, i])
+                if imp_seeds:
+                    pop.extend(imp_seeds)
+                    if i == 0:
+                        print(f"    [Importance] {len(imp_seeds)} data-driven seeds "
+                              f"for output {i}")
+            except Exception:
+                pass
             while len(pop) < AFPO_POP_SIZE:
                 pop.append(Individual(random_cgp(n_features, CGP_NODES, feat_names)))
             for ind in pop:
                 ind.calculate_fitness(X_init, Y_init[:, i], out_types[i],
                                       target_grads=target_grads_list[i])
                 hofs[i].update(ind)
+            # Trim the (possibly oversized) initial pool to AFPO_POP_SIZE
+            # using the 3-objective Pareto front — this preserves a balanced
+            # frontier across complexity buckets rather than truncating by
+            # arrival order.
+            pop = _trim_to_pareto_front_3obj(pop, AFPO_POP_SIZE)
             afpo_pops.append(pop)
 
         if N_train > _INIT_SUBSAMPLE_CAP:
@@ -24865,6 +24990,19 @@ def train_mode():
 
         gen = 0
         perfect_outputs = set()
+        # Plateau-driven meta-extinction bookkeeping (mirrors the island
+        # model): track the smallest current HoF loss across non-perfect
+        # outputs as a global progress proxy.  If it fails to drop by more
+        # than META_PLATEAU_REL in META_PLATEAU_GENS generations, fire
+        # `_meta_extinction` to wipe-and-reseed the AFPO pool with fresh
+        # v5 + importance-biased + residual-aware seeds and a tiny global
+        # elite.  Capped by META_MAX_FIRES.  Without this hook AFPO had
+        # only per-chunk extinction (lifted by HoF stagnation) — fine for
+        # short stalls, but no escape mechanism once every chunk's local
+        # extinction starts redrawing the same basin.
+        _meta_best_loss   = float('inf')
+        _meta_last_imp_gen = 0
+        _meta_fires       = 0
         try:
             while True:
                 batch_idx = (np.random.choice(X.shape[0], BATCH_SIZE, replace=False)
@@ -24876,6 +25014,19 @@ def train_mode():
                 bg_logits_cache_a = {}
                 for col_name, group_idxs in class_groups_a.items():
                     bg_logits_cache_a[col_name] = build_bg_logits(hofs, group_idxs, X_b)
+
+                # ── Stagnation-aware chunk frequency ────────────────────────
+                # When any output's per-chunk stagnation counter passes the
+                # half-way mark to extinction patience, halve the chunk size.
+                # This makes the elitist-HoF re-injection and global plateau
+                # check fire twice as often during long plateaus, which is
+                # the regime where they matter most.  Identical philosophy
+                # to the island model's `chunk_freq` adaptation.
+                _max_stag_a = max(stag_cntrs) if stag_cntrs else 0
+                if _max_stag_a > EXTINCTION_PATIENCE // 2:
+                    chunk_freq_a = max(10, MIGRATION_FREQ // 2)
+                else:
+                    chunk_freq_a = MIGRATION_FREQ
 
                 for i in range(n_outputs):
                     if i in perfect_outputs:
@@ -24912,7 +25063,7 @@ def train_mode():
                     afpo_pops[i], stag_cntrs[i] = evolve_afpo(
                         afpo_pops[i], X_b, Y_b[:, i], out_types[i],
                         n_features, feat_names, AFPO_POP_SIZE,
-                        MIGRATION_FREQ,          # generations per chunk
+                        chunk_freq_a,            # generations per chunk
                         hofs[i], stag_cntrs[i], EXTINCTION_PATIENCE,
                         bg_logits=col_bg_a, class_idx_in_group=local_k_a, Y_group=Y_group_a,
                         target_grads=target_grads_list[i],
@@ -24927,8 +25078,86 @@ def train_mode():
                                   f"New Best (Comp {ind.complexity:.0f}): "
                                   f"loss={ind.loss:.4f}  {metric}")
 
-                gen += MIGRATION_FREQ
+                gen += chunk_freq_a
                 print(f"--- Generation {gen} ---")
+
+                # ── Plateau-driven meta-extinction ─────────────────────────
+                # Pool current HoF bests across active outputs; if the global
+                # minimum hasn't improved by > META_PLATEAU_REL within
+                # META_PLATEAU_GENS, fire a single rebuild.  The pseudo-
+                # islands wrapper lets `_meta_extinction` operate on the
+                # single AFPO pool without changing its signature.
+                _meta_losses = [hofs[mi].get_best_overall().loss
+                                for mi in range(n_outputs)
+                                if mi not in perfect_outputs
+                                and hofs[mi].get_best_overall() is not None]
+                if _meta_losses:
+                    _cur_loss = float(min(_meta_losses))
+                    if (np.isfinite(_cur_loss)
+                            and _cur_loss < _meta_best_loss
+                            * (1.0 - META_PLATEAU_REL)):
+                        _meta_best_loss   = _cur_loss
+                        _meta_last_imp_gen = gen
+                    elif (_meta_fires < META_MAX_FIRES
+                            and gen - _meta_last_imp_gen >= META_PLATEAU_GENS):
+                        _meta_fires += 1
+                        print(f"\n  ⟂ Plateau detected (no >"
+                              f"{META_PLATEAU_REL:.0e} relative "
+                              f"improvement in {META_PLATEAU_GENS} gens) — "
+                              f"firing AFPO meta-extinction "
+                              f"{_meta_fires}/{META_MAX_FIRES}")
+                        # Wrap the AFPO pool as a single pseudo-island so
+                        # `_meta_extinction` can rebuild it in place.  After
+                        # the rebuild, re-score every member's fitness with
+                        # age=0 (the AFPO invariant) on the full data so the
+                        # next chunk starts from a clean, comparable state.
+                        # Pre-pad: `_meta_extinction` uses
+                        # ``target_n = len(isl[o_idx])`` to size the rebuild,
+                        # so a Pareto-trimmed pool that shrank below
+                        # AFPO_POP_SIZE would rebuild only to its trimmed
+                        # size.  Pad each pop with placeholder Individuals
+                        # so the rebuild lands at the configured pool size.
+                        for _oi in range(n_outputs):
+                            while len(afpo_pops[_oi]) < AFPO_POP_SIZE:
+                                afpo_pops[_oi].append(Individual(
+                                    random_cgp(n_features, CGP_NODES, feat_names)))
+                        _pseudo_isl = [afpo_pops]
+                        _meta_extinction(_pseudo_isl, hofs, X, Y, out_types,
+                                         n_features, feat_names,
+                                         target_grads_list)
+                        for _oi in range(n_outputs):
+                            # The `_meta_extinction` helper only scores the
+                            # seed pool; random_cgp pad members come back with
+                            # the Individual defaults (loss=fitness=1e10).  If
+                            # we left those in, the next Pareto trim would
+                            # cull them en masse, undoing most of the rebuild.
+                            # Score everyone with age=0 so the post-rebuild
+                            # pool starts on equal, fully-evaluated footing.
+                            for _ind in afpo_pops[_oi]:
+                                _ind.age = 0
+                                if (not np.isfinite(getattr(_ind, 'fitness', np.inf))
+                                        or _ind.fitness >= 1e9):
+                                    try:
+                                        _ind.calculate_fitness(
+                                            X, Y[:, _oi], out_types[_oi],
+                                            target_grads=target_grads_list[_oi])
+                                    except Exception:
+                                        _ind.fitness = 1e10
+                                        _ind.loss = 1e10
+                            # Trim back to the Pareto front so the post-rebuild
+                            # pool already obeys the AFPO invariant before the
+                            # next chunk runs.
+                            afpo_pops[_oi] = _trim_to_pareto_front_3obj(
+                                afpo_pops[_oi], AFPO_POP_SIZE)
+                            stag_cntrs[_oi] = 0
+                        # Clear the fitness cache: most entries belong to
+                        # individuals that no longer exist in the pool.
+                        try:
+                            _FITNESS_CACHE.clear()
+                        except Exception:
+                            pass
+                        _meta_last_imp_gen = gen
+                        _meta_best_loss   = _cur_loss
 
                 # ---- Perfect output detection & early stopping ----
                 for o_idx in range(n_outputs):
@@ -25023,6 +25252,22 @@ def train_mode():
                                 update_affine=True,
                                 target_grads=target_grads_list[o_idx])
 
+                # ---- Periodic HoF re-scoring on full data (non-batch mode) ----
+                # Even without minibatching, the constant-optimiser, boost
+                # stages and adaptive parsimony silently drift affine_a/b
+                # away from their unbiased fit over a long run.  Every 500
+                # generations we re-fit the affine on the FULL training set
+                # so HoF entries stay correctly ranked and downstream
+                # validation / plotting reflects the true predictor.
+                if BATCH_SIZE <= 0 and gen > 0 and gen % 500 == 0:
+                    for o_idx, hof in enumerate(hofs):
+                        for ind in hof.best_by_complexity.values():
+                            ind.affine_fitted = False
+                            ind.calculate_fitness(
+                                X, Y[:, o_idx], out_types[o_idx],
+                                update_affine=True,
+                                target_grads=target_grads_list[o_idx])
+
                 # ---- Deep constant optimisation ----
                 if gen > 0 and gen % 1000 == 0:
                     _deep_optimize_hofs(hofs, X, Y, out_types)
@@ -25063,6 +25308,29 @@ def train_mode():
         for s in range(N_STAGES):
             for i in range(n_outputs):
                 pop = generate_seeds_v5(n_features, feat_names)
+                # Importance-biased seeds: closed-form OLS / log-OLS templates
+                # over the most-correlated features.  Mirrors the island
+                # model so staged AFPO doesn't start strictly weaker on
+                # linear / monomial targets where these seeds solve outright.
+                # Only stage 0 gets the data-driven seeds; later stages
+                # receive a smaller importance-biased injection so they
+                # don't out-compete the graduation flow with strong seeds
+                # they wouldn't normally see from younger tiers.
+                try:
+                    imp_seeds = generate_importance_biased_seeds(
+                        n_features, feat_names, X_init, Y_init[:, i])
+                    if imp_seeds:
+                        if s == 0:
+                            pop.extend(imp_seeds)
+                        else:
+                            # Later stages: cap the influx so the graduation
+                            # mechanism still drives stage-to-stage promotion.
+                            pop.extend(imp_seeds[:max(1, len(imp_seeds) // 3)])
+                        if s == 0 and i == 0:
+                            print(f"    [Importance] {len(imp_seeds)} data-driven seeds "
+                                  f"for stage 0 output {i}")
+                except Exception:
+                    pass
                 while len(pop) < AFPO_POP_SIZE:
                     pop.append(Individual(random_cgp(n_features, CGP_NODES, feat_names)))
                 for ind in pop:
@@ -25070,6 +25338,10 @@ def train_mode():
                     ind.calculate_fitness(X_init, Y_init[:, i], out_types[i],
                                           target_grads=target_grads_list[i])
                     hofs[i].update(ind)
+                # Trim oversized initial pool (importance-biased seeds may
+                # push beyond AFPO_POP_SIZE) using the 3-objective Pareto
+                # front to keep complexity diversity in stage 0.
+                pop = _trim_to_pareto_front_3obj(pop, AFPO_POP_SIZE)
                 stage_pops[s].append(pop)
             print(f"  Stage {s+1}/{N_STAGES} initialized.")
 
