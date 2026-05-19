@@ -12614,6 +12614,13 @@ def evolve_island_chunk(args):
     _DIVERSITY_BOOST_MULT   = 2.0
     _diversity_boost_until  = -1
 
+    # ── AFPO hardening: stagnation-triggered random immigrant injection ────
+    # Single-stage AFPO can become overly conservative once the Pareto front
+    # is crowded by age-young near-clones.  Injecting a tiny amount of truly
+    # random age-0 blood helps escape local basins without disrupting the run.
+    _IMMIGRANT_CHECK_FREQ = 30
+    _IMMIGRANT_RATE = 0.03   # share of target_size
+
     for gen in range(generations):
         for ind in island_pop:
             ind.age += 1
@@ -13401,6 +13408,13 @@ def evolve_afpo(population, X, y_target, type_code,
     _DIVERSITY_BOOST_MULT   = 2.0
     _diversity_boost_until  = -1
 
+    # ── AFPO hardening: stagnation-triggered random immigrant injection ────
+    # Single-stage AFPO can become overly conservative once the Pareto front
+    # is crowded by age-young near-clones.  Injecting a tiny amount of truly
+    # random age-0 blood helps escape local basins without disrupting the run.
+    _IMMIGRANT_CHECK_FREQ = 30
+    _IMMIGRANT_RATE = 0.03   # share of target_size
+
     local_stag = stag_counter
     # Track the best individual seen inside this chunk for champion protection
     _chunk_champion = min(population, key=lambda x: x.loss) if population else None
@@ -13489,6 +13503,20 @@ def evolve_afpo(population, X, y_target, type_code,
                                                   bg_logits=bg_logits,
                                                   class_idx_in_group=class_idx_in_group,
                                                   Y_group=Y_group)
+        # Defensive parent fallback: if lexicase returns a numerically broken
+        # individual, draw from the best finite-fitness cohort to keep AFPO's
+        # reproductive signal stable instead of amplifying NaN lineages.
+        if (parent is None or not np.isfinite(getattr(parent, 'fitness', np.inf))
+                or getattr(parent, 'loss', np.inf) >= 1e10):
+            finite_pool = [ind for ind in population
+                           if np.isfinite(ind.fitness) and np.isfinite(ind.loss)
+                           and ind.loss < 1e10]
+            if finite_pool:
+                top_k = max(2, min(8, len(finite_pool)))
+                finite_pool.sort(key=lambda x: x.fitness)
+                parent = random.choice(finite_pool[:top_k])
+            else:
+                parent = min(population, key=lambda x: x.fitness)
         parent_sigma = getattr(parent, 'sigma', float(CGP_MUT_RATE))
         child_sigma  = float(np.clip(
             parent_sigma * np.exp(random.gauss(0, SIGMA_TAU)),
@@ -13701,6 +13729,25 @@ def evolve_afpo(population, X, y_target, type_code,
                     _diversity_boost_until = gen + _DIVERSITY_BOOST_WINDOW
             except Exception:
                 pass
+
+        # ── AFPO hardening: stagnation-aware immigrant pulse ─────────────────
+        if (gen > 0 and gen % _IMMIGRANT_CHECK_FREQ == 0
+                and local_stag > max(15, ext_patience // 3)):
+            n_imm = max(1, int(round(target_size * _IMMIGRANT_RATE)))
+            for _ in range(n_imm):
+                try:
+                    imm = random.choice(generate_seeds_v5(n_features, feat_names))
+                    imm.age = 0
+                    imm.calculate_fitness(
+                        X, y_target, type_code,
+                        bg_logits=bg_logits,
+                        class_idx_in_group=class_idx_in_group,
+                        Y_group=Y_group,
+                        target_grads=target_grads)
+                    population.append(imm)
+                except Exception:
+                    continue
+            population = _trim_to_pareto_front_3obj(population, target_size)
 
         # HoF update uses .loss (not .fitness), so no need to re-evaluate
         # with freq_parsimony_adj — the loss is already correct from above.
