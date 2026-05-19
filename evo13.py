@@ -13368,6 +13368,39 @@ def evolve_afpo(population, X, y_target, type_code,
     _repro_weights_base = [2.0, 1.6, 1.4, 1.0, 0.6, 1.0, 1.2, 0.5, 0.2, 0.5, 0.8, 0.3, 1.5 if IF_ELSE_ENABLED else 0.0, 1.4, 1.4]
     _mut_tracker = AdaptiveMutationTracker(_repro_ops_base, _repro_weights_base, alpha=0.07)
 
+    # ── IMPROVEMENT: Operator affinity (updated every 200 gens) ───────────
+    _op_affinity: dict = {}
+    _AFFINITY_UPDATE_FREQ = 200
+
+    # ── IMPROVEMENT: Scheduled light const-opt (every N gens, top-10%) ───
+    _LIGHT_CONST_OPT_FREQ  = 75   # run every 75 generations
+    _LIGHT_CONST_OPT_TOP_N = max(1, len(population) // 10)
+
+    # ── IMPROVEMENT (B8): cheap behavioural-novelty bonus on fitness ─────
+    _NOVELTY_PROBE_K = 16
+    _NOVELTY_BONUS   = 0.005
+    if X.shape[0] > 0:
+        _novelty_idx = np.random.choice(
+            X.shape[0], min(_NOVELTY_PROBE_K, X.shape[0]), replace=False)
+        _X_novelty   = X[_novelty_idx]
+    else:
+        _X_novelty   = None
+
+    def _novelty_fp(tree):
+        try:
+            p = tree.evaluate(_X_novelty)
+            p = np.nan_to_num(p, nan=0.0, posinf=1e9, neginf=-1e9)
+            return tuple(float(f"{v:.3g}") for v in p)
+        except Exception:
+            return None
+
+    # ── IMPROVEMENT (B7): diversity-driven structural boost ──────────────
+    _DIVERSITY_CHECK_FREQ   = 50
+    _DIVERSITY_THRESHOLD    = 1e-3
+    _DIVERSITY_BOOST_WINDOW = 50          # gens of boost after a collapse
+    _DIVERSITY_BOOST_MULT   = 2.0
+    _diversity_boost_until  = -1
+
     local_stag = stag_counter
     # Track the best individual seen inside this chunk for champion protection
     _chunk_champion = min(population, key=lambda x: x.loss) if population else None
@@ -13472,8 +13505,10 @@ def evolve_afpo(population, X, y_target, type_code,
         #   with stagnation-aware structural exploration boost
         # ------------------------------------------------------------------ #
         repro_weights = list(_mut_tracker.get_weights())
-        if stag_frac > 0.3:
-            structural_boost = 1.0 + 2.0 * min(1.0, (stag_frac - 0.3) / 0.5)
+        if stag_frac > 0.3 or gen < _diversity_boost_until:
+            structural_boost = 1.0 + 2.0 * min(1.0, (max(0.0, stag_frac) - 0.3) / 0.5)
+            if gen < _diversity_boost_until:
+                structural_boost = max(structural_boost, _DIVERSITY_BOOST_MULT)
             _structural_ops = {'grow', 'graft', 'nest', 'inject', 'trig', 'div',
                                'crossover', 'semantic_xover'}
             if IF_ELSE_ENABLED:
@@ -13492,11 +13527,15 @@ def evolve_afpo(population, X, y_target, type_code,
             action, parent, population, n_features, feat_names,
             eff_rate, sa_temp, parent_sigma, X,
             y_residuals=y_target,
-            tournament_k=_tk)
+            tournament_k=_tk,
+            op_affinity=_op_affinity if _op_affinity else None)
 
         child       = Individual(child_tree)
         child.sigma = child_sigma
         child.age   = 0    # AFPO invariant
+        fp = _novelty_fp(child.tree)
+        if fp is not None:
+            child._novelty_fp = fp
         # Inherit boost stages only when child's tree is structurally
         # identical to parent's — see evolve_island_chunk for rationale.
         if (action == 'do_nothing'
@@ -13571,6 +13610,16 @@ def evolve_afpo(population, X, y_target, type_code,
                                     freq_parsimony_adj=child_freq_adj,
                                     target_grads=target_grads)
 
+        # ── Novelty Bonus ──
+        if getattr(child, '_novelty_fp', None) is not None:
+            _is_novel = True
+            for _other in population:
+                if getattr(_other, '_novelty_fp', None) == child._novelty_fp:
+                    _is_novel = False
+                    break
+            if _is_novel:
+                child.fitness -= _NOVELTY_BONUS
+
         population.append(child)
         population = _trim_to_pareto_front_3obj(population, target_size)
         # Reward operators that genuinely improved fitness over the parent.
@@ -13594,6 +13643,64 @@ def evolve_afpo(population, X, y_target, type_code,
             while (len(population) > max(2, target_size // 2)
                    and sum(ind.complexity for ind in population) > _COMPLEXITY_BUDGET):
                 population.pop(0)  # remove most complex
+
+        # ── IMPROVEMENT: Periodic light constant optimisation ─────────────────
+        if gen > 0 and gen % _LIGHT_CONST_OPT_FREQ == 0:
+            top_inds = sorted(population, key=lambda x: x.loss)[:_LIGHT_CONST_OPT_TOP_N]
+            for _ind in top_inds:
+                if get_constants_shared(_ind.tree):
+                    _old_loss = _ind.loss
+                    _ind.optimize_constants(
+                        X, y_target, type_code,
+                        max_rows=min(300, X.shape[0]),
+                        n_restarts=1, max_iter=20,
+                        bg_logits=bg_logits,
+                        class_idx_in_group=class_idx_in_group,
+                        Y_group=Y_group,
+                        target_grads=target_grads)
+                    if _ind.loss < _old_loss - 1e-8:
+                        _FITNESS_CACHE.put(_ind.tree, y_target, {
+                            'loss':       _ind.loss,
+                            'r2':         _ind.r2,
+                            'accuracy':   _ind.accuracy,
+                            'modularity': _ind.modularity,
+                            'complexity': _ind.complexity,
+                            'affine_a':   _ind.affine_a,
+                            'affine_b':   _ind.affine_b,
+                        })
+
+        # ── IMPROVEMENT: Periodic intra-individual boosting ──────────────────
+        _BOOST_FREQ = 150
+        if (gen > 0 and gen % _BOOST_FREQ == 0
+                and type_code != 6 and bg_logits is None):
+            top_boost = sorted(population, key=lambda x: x.loss)[:3]
+            for _ind in top_boost:
+                if _ind.affine_fitted and len(getattr(_ind, 'boost_stages', [])) < getattr(_ind, 'boost_max_stages', 3):
+                    _old_loss = _ind.loss
+                    _ind.boost_on_residuals(X, y_target, type_code,
+                                            n_features, feat_names,
+                                            max_boost_gens=30, boost_lr=0.3)
+                    if len(_ind.boost_stages) > 0 and _ind.boost_stages != getattr(_ind, '_prev_boost_stages', None):
+                        _ind.calculate_fitness(X, y_target, type_code,
+                                               update_affine=False,
+                                               target_grads=target_grads)
+                        if _ind.loss < _old_loss - 1e-8:
+                            hof.update(_ind)
+
+        # ── IMPROVEMENT: Periodic operator affinity update ────────────────────
+        if gen % _AFFINITY_UPDATE_FREQ == 0 and hof.best_by_complexity:
+            _op_affinity = compute_hof_operator_affinity([hof])
+
+        # ── IMPROVEMENT (B7): periodic diversity check ───────────────────────
+        if gen > 0 and gen % _DIVERSITY_CHECK_FREQ == 0 and X.shape[0] > 0:
+            try:
+                _div_idx = np.random.choice(
+                    X.shape[0], min(16, X.shape[0]), replace=False)
+                _div_score = _compute_island_diversity(population, X[_div_idx])
+                if _div_score < _DIVERSITY_THRESHOLD:
+                    _diversity_boost_until = gen + _DIVERSITY_BOOST_WINDOW
+            except Exception:
+                pass
 
         # HoF update uses .loss (not .fitness), so no need to re-evaluate
         # with freq_parsimony_adj — the loss is already correct from above.
