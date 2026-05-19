@@ -23781,12 +23781,12 @@ def train_mode():
         elif em_in == '2':
             EVOLUTION_MODEL = "afpo"
             NUM_ISLANDS_GLOBAL = 1   # not used, but keep consistent
-            n_stg_in = input(f"  Number of AFPO stages [default 1]: ").strip()
+            n_stg_in = input(f"  Number of AFPO stages [default 2]: ").strip()
             try:
-                AFPO_N_STAGES = int(n_stg_in) if n_stg_in else 1
+                AFPO_N_STAGES = int(n_stg_in) if n_stg_in else 2
                 AFPO_N_STAGES = max(1, AFPO_N_STAGES)
             except ValueError:
-                AFPO_N_STAGES = 1
+                AFPO_N_STAGES = 2
             if AFPO_N_STAGES > 1:
                 grad_in = input(
                     f"  Graduation frequency (gens) [default {AFPO_STAGE_GRAD_FREQ}]: "
