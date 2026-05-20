@@ -3739,18 +3739,18 @@ class CGPEquation:
             else:
                 result = np.zeros(batch_size)
 
+            if i == self.out_idx:
+                # Check the FINAL OUTPUT only — intermediate blowups are fine as long
+                # as the output is well-behaved (affine rescaling handles magnitude).
+                nan_frac = np.mean(np.isnan(result) | np.isinf(result))
+                clamp_frac = np.mean((result >= 1e9) | (result <= -1e9))
+                if nan_frac > 0.1 or clamp_frac > 0.5:
+                    self.last_eval_clipped = True
+
             # Sanitize per-node to prevent NaN/Inf cascade
             buffer[:, i] = np.nan_to_num(result, nan=0.0, posinf=1e9, neginf=-1e9)
 
-        # Check the FINAL OUTPUT only — intermediate blowups are fine as long
-        # as the output is well-behaved (affine rescaling handles magnitude).
-        out = buffer[:, self.out_idx]
-        nan_frac = np.mean(np.isnan(out) | np.isinf(out))
-        clamp_frac = np.mean((out >= 1e9) | (out <= -1e9))
-        if nan_frac > 0.1 or clamp_frac > 0.5:
-            self.last_eval_clipped = True
-
-        return out
+        return buffer[:, self.out_idx]
 
 
     def update_active_nodes(self):
