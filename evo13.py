@@ -10478,7 +10478,11 @@ def _adf_to_sympy(adf_dict, input_exprs, safe=True):
             sbuf[slot] = v1 * v2
         elif op == '/':
             if safe:
-                sbuf[slot] = v1 / (sympy.Abs(v2) + sympy.Float(1e-8))
+                v2_safe = sympy.Piecewise(
+                    (v2, sympy.Abs(v2) > 1e-8),
+                    (sympy.sign(v2 + sympy.Float(1e-18)) * sympy.Float(1e-8), True)
+                )
+                sbuf[slot] = v1 / v2_safe
             else:
                 sbuf[slot] = v1 / v2
         elif op == 'pow':
@@ -10513,7 +10517,11 @@ def _adf_to_sympy(adf_dict, input_exprs, safe=True):
             sbuf[slot] = sympy.floor(v1 + sympy.Rational(1, 2))
         elif op == 'floordiv':
             if safe:
-                sbuf[slot] = sympy.floor(v1 / (sympy.Abs(v2) + sympy.Float(1e-8)))
+                v2_safe = sympy.Piecewise(
+                    (v2, sympy.Abs(v2) > 1e-8),
+                    (sympy.sign(v2 + sympy.Float(1e-18)) * sympy.Float(1e-8), True)
+                )
+                sbuf[slot] = sympy.floor(v1 / v2_safe)
             else:
                 sbuf[slot] = sympy.floor(v1 / v2)
         elif op == 'exp':
@@ -10612,9 +10620,11 @@ def tree_to_sympy(cgp_eq, feature_vars, safe=None):
             elif node.op == '/':
                 if safe:
                     # guard: denominator nudged away from zero
-                    buf[idx] = v1 / (v2 + sympy.Piecewise(
-                        (sympy.Float(1e-8),  sympy.Abs(v2) <= 1e-8),
-                        (sympy.Float(0),     True)))
+                    v2_safe = sympy.Piecewise(
+                        (v2, sympy.Abs(v2) > 1e-8),
+                        (sympy.sign(v2 + sympy.Float(1e-18)) * sympy.Float(1e-8), True)
+                    )
+                    buf[idx] = v1 / v2_safe
                 else:
                     buf[idx] = v1 / v2
 
@@ -10661,7 +10671,11 @@ def tree_to_sympy(cgp_eq, feature_vars, safe=None):
 
             elif node.op == 'mod':
                 if safe:
-                    buf[idx] = sympy.Mod(v1, sympy.Abs(v2) + sympy.Float(1e-8))
+                    v2_safe = sympy.Piecewise(
+                        (v2, sympy.Abs(v2) > 1e-8),
+                        (sympy.Float(1.0), True)
+                    )
+                    buf[idx] = sympy.Mod(v1, v2_safe)
                 else:
                     buf[idx] = sympy.Mod(v1, v2)
 
@@ -10669,9 +10683,11 @@ def tree_to_sympy(cgp_eq, feature_vars, safe=None):
                 buf[idx] = sympy.Abs(v1) * sympy.sign(v2)
             elif node.op == 'floordiv':
                 if safe:
-                    buf[idx] = sympy.floor(v1 / (v2 + sympy.Piecewise(
-                        (sympy.Float(1e-8),  sympy.Abs(v2) <= 1e-8),
-                        (sympy.Float(0),     True))))
+                    v2_safe = sympy.Piecewise(
+                        (v2, sympy.Abs(v2) > 1e-8),
+                        (sympy.sign(v2 + sympy.Float(1e-18)) * sympy.Float(1e-8), True)
+                    )
+                    buf[idx] = sympy.floor(v1 / v2_safe)
                 else:
                     buf[idx] = sympy.floor(v1 / v2)
             # Comparison operators → Piecewise(1, cond, 0)
