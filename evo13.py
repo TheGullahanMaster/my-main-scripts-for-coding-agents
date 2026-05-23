@@ -11825,6 +11825,21 @@ def epsilon_lexicase_selection(population, X, y_target, type_code, n_cases=20,
 
 
 import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor
+
+def _parallel_fit_surrogate(opt):
+    opt.fit_surrogate()
+    return opt
+
+def _parallel_refit_surrogate_with_mc(args):
+    opt, X, Y_col, out_type, target_grads = args
+    if opt.has_mc_context and opt.mc_full is not None:
+        opt.reeval_buffer_for_mc(
+            X, Y_col, out_type,
+            target_grads=target_grads,
+            max_reeval=max(50, BAYESIAN_MAX_GP_POINTS // 4))
+    opt.fit_surrogate()
+    return opt
 
 def macro_rational_grow(cgp_eq, n_features):
     """
@@ -19266,8 +19281,9 @@ def run_bayesian_afpo(X, Y, n_features, n_outputs, feat_names, out_types,
             afpo_pops[o_idx] = _trim_to_pareto_front_3obj(afpo_pops[o_idx], AFPO_POP_SIZE)
 
     print("\nFitting initial GP surrogates…")
+    with ThreadPoolExecutor(max_workers=min(len(optimizers), 8)) as executor:
+        list(executor.map(_parallel_fit_surrogate, optimizers))
     for opt in optimizers:
-        opt.fit_surrogate()
         print(f"  {opt.summary_str()}")
 
     # ── Phase 2: Bayesian AFPO loop ─────────────────────────────
@@ -19558,12 +19574,24 @@ def run_bayesian_afpo(X, Y, n_features, n_outputs, feat_names, out_types,
                 afpo_pops[o_idx] = _trim_to_pareto_front_3obj(pop, AFPO_POP_SIZE)
 
                 if opt.should_refit_now(iteration):
-                    if opt.has_mc_context and opt.mc_full is not None:
-                        opt.reeval_buffer_for_mc(
-                            X, Y[:, o_idx], out_types[o_idx],
-                            target_grads=target_grads_list[o_idx],
-                            max_reeval=max(50, BAYESIAN_MAX_GP_POINTS // 4))
-                    opt.fit_surrogate()
+                    opt._needs_refit = True
+                else:
+                    opt._needs_refit = False
+
+            # --- Parallel refit surrogates ---
+            opts_to_refit = []
+            for o_idx in range(n_outputs):
+                if o_idx in perfect_outputs: continue
+                opt = optimizers[o_idx]
+                if getattr(opt, '_needs_refit', False):
+                    # collect arguments needed for refit and mc evaluation
+                    opts_to_refit.append((opt, X, Y[:, o_idx], out_types[o_idx], target_grads_list[o_idx]))
+
+            if opts_to_refit:
+                with ThreadPoolExecutor(max_workers=min(len(opts_to_refit), 8)) as executor:
+                    list(executor.map(_parallel_refit_surrogate_with_mc, opts_to_refit))
+                for opt, _, _, _, _ in opts_to_refit:
+                    opt._needs_refit = False
 
             print(f"--- BO AFPO Iteration {iteration}  (total evals: {total_evals}) ---")
 
@@ -19788,8 +19816,8 @@ def run_bayesian_islands(X, Y, n_features, n_outputs, feat_names, out_types,
                 islands_pop[island_idx][o_idx] = islands_pop[island_idx][o_idx][:ISLAND_SIZE]
 
     print("\nFitting initial GP surrogates…")
-    for opt in optimizers:
-        opt.fit_surrogate()
+    with ThreadPoolExecutor(max_workers=min(len(optimizers), 8)) as executor:
+        list(executor.map(_parallel_fit_surrogate, optimizers))
 
     # ── Phase 2: Bayesian Islands loop ─────────────────────────────
     print("\nPhase 2: Bayesian Islands optimisation. Ctrl+C to stop.\n")
@@ -20138,12 +20166,24 @@ def run_bayesian_islands(X, Y, n_features, n_outputs, feat_names, out_types,
                             target_pop.append(mig)
 
                 if opt.should_refit_now(iteration):
-                    if opt.has_mc_context and opt.mc_full is not None:
-                        opt.reeval_buffer_for_mc(
-                            X, Y[:, o_idx], out_types[o_idx],
-                            target_grads=target_grads_list[o_idx],
-                            max_reeval=max(50, BAYESIAN_MAX_GP_POINTS // 4))
-                    opt.fit_surrogate()
+                    opt._needs_refit = True
+                else:
+                    opt._needs_refit = False
+
+            # --- Parallel refit surrogates ---
+            opts_to_refit = []
+            for o_idx in range(n_outputs):
+                if o_idx in perfect_outputs: continue
+                opt = optimizers[o_idx]
+                if getattr(opt, '_needs_refit', False):
+                    # collect arguments needed for refit and mc evaluation
+                    opts_to_refit.append((opt, X, Y[:, o_idx], out_types[o_idx], target_grads_list[o_idx]))
+
+            if opts_to_refit:
+                with ThreadPoolExecutor(max_workers=min(len(opts_to_refit), 8)) as executor:
+                    list(executor.map(_parallel_refit_surrogate_with_mc, opts_to_refit))
+                for opt, _, _, _, _ in opts_to_refit:
+                    opt._needs_refit = False
 
             print(f"--- BO Islands Iteration {iteration}  (total evals: {total_evals}) ---")
 
@@ -20349,8 +20389,8 @@ def run_bayesian_islanded_afpo(X, Y, n_features, n_outputs, feat_names, out_type
                 islands_pop[island_idx][o_idx] = _trim_to_pareto_front_3obj(islands_pop[island_idx][o_idx], AFPO_POP_SIZE)
 
     print("\nFitting initial GP surrogates…")
-    for opt in optimizers:
-        opt.fit_surrogate()
+    with ThreadPoolExecutor(max_workers=min(len(optimizers), 8)) as executor:
+        list(executor.map(_parallel_fit_surrogate, optimizers))
 
     # ── Phase 2: Bayesian Islanded AFPO loop ─────────────────────────────
     print("\nPhase 2: Bayesian Islanded AFPO optimisation. Ctrl+C to stop.\n")
@@ -20684,12 +20724,24 @@ def run_bayesian_islanded_afpo(X, Y, n_features, n_outputs, feat_names, out_type
                             target_pop.append(mig)
 
                 if opt.should_refit_now(iteration):
-                    if opt.has_mc_context and opt.mc_full is not None:
-                        opt.reeval_buffer_for_mc(
-                            X, Y[:, o_idx], out_types[o_idx],
-                            target_grads=target_grads_list[o_idx],
-                            max_reeval=max(50, BAYESIAN_MAX_GP_POINTS // 4))
-                    opt.fit_surrogate()
+                    opt._needs_refit = True
+                else:
+                    opt._needs_refit = False
+
+            # --- Parallel refit surrogates ---
+            opts_to_refit = []
+            for o_idx in range(n_outputs):
+                if o_idx in perfect_outputs: continue
+                opt = optimizers[o_idx]
+                if getattr(opt, '_needs_refit', False):
+                    # collect arguments needed for refit and mc evaluation
+                    opts_to_refit.append((opt, X, Y[:, o_idx], out_types[o_idx], target_grads_list[o_idx]))
+
+            if opts_to_refit:
+                with ThreadPoolExecutor(max_workers=min(len(opts_to_refit), 8)) as executor:
+                    list(executor.map(_parallel_refit_surrogate_with_mc, opts_to_refit))
+                for opt, _, _, _, _ in opts_to_refit:
+                    opt._needs_refit = False
 
             print(f"--- BO Islanded AFPO Iteration {iteration}  (total evals: {total_evals}) ---")
 
@@ -20935,8 +20987,9 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
 
     # Fit initial surrogates
     print("\nFitting initial GP surrogates…")
+    with ThreadPoolExecutor(max_workers=min(len(optimizers), 8)) as executor:
+        list(executor.map(_parallel_fit_surrogate, optimizers))
     for opt in optimizers:
-        opt.fit_surrogate()
         print(f"  {opt.summary_str()}")
 
     # ── Phase 2: Bayesian optimisation loop ─────────────────────────────
@@ -21355,16 +21408,24 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
 
                 # ── Refit GP surrogate periodically ─────────────────────────
                 if opt.should_refit_now(iteration):
-                    # Refresh stale buffer entries to the latest bg_logits
-                    # FIRST so the GP fits on a single, current loss surface
-                    # instead of mixing epochs.  Cap re-evals so the cost
-                    # stays bounded for big buffers.
-                    if opt.has_mc_context and opt.mc_full is not None:
-                        opt.reeval_buffer_for_mc(
-                            X, Y[:, o_idx], out_types[o_idx],
-                            target_grads=target_grads_list[o_idx],
-                            max_reeval=max(50, BAYESIAN_MAX_GP_POINTS // 4))
-                    opt.fit_surrogate()
+                    opt._needs_refit = True
+                else:
+                    opt._needs_refit = False
+
+            # --- Parallel refit surrogates ---
+            opts_to_refit = []
+            for o_idx in range(n_outputs):
+                if o_idx in perfect_outputs: continue
+                opt = optimizers[o_idx]
+                if getattr(opt, '_needs_refit', False):
+                    # collect arguments needed for refit and mc evaluation
+                    opts_to_refit.append((opt, X, Y[:, o_idx], out_types[o_idx], target_grads_list[o_idx]))
+
+            if opts_to_refit:
+                with ThreadPoolExecutor(max_workers=min(len(opts_to_refit), 8)) as executor:
+                    list(executor.map(_parallel_refit_surrogate_with_mc, opts_to_refit))
+                for opt, _, _, _, _ in opts_to_refit:
+                    opt._needs_refit = False
 
                 # ── Light constant optimisation on HoF ──────────────────────
                 # ``optimize_constants`` mutates ``ind.tree`` in place and may
@@ -21680,8 +21741,9 @@ def run_bayesian_qd(X, Y, n_features, n_outputs, feat_names, out_types,
                 archives[o_idx].add(ind, iteration=0)
 
     print("\nFitting initial GP surrogates…")
+    with ThreadPoolExecutor(max_workers=min(len(optimizers), 8)) as executor:
+        list(executor.map(_parallel_fit_surrogate, optimizers))
     for opt in optimizers:
-        opt.fit_surrogate()
         print(f"  {opt.summary_str()}")
 
     # ── Phase 2: QD loop ────────────────────────────────────────────────
@@ -22120,12 +22182,24 @@ def run_bayesian_qd(X, Y, n_features, n_outputs, feat_names, out_types,
                               f"{_oracle.summary_str()}.")
 
                 if opt.should_refit_now(iteration):
-                    if opt.has_mc_context and opt.mc_full is not None:
-                        opt.reeval_buffer_for_mc(
-                            X, Y[:, o_idx], out_types[o_idx],
-                            target_grads=target_grads_list[o_idx],
-                            max_reeval=max(50, BAYESIAN_MAX_GP_POINTS // 4))
-                    opt.fit_surrogate()
+                    opt._needs_refit = True
+                else:
+                    opt._needs_refit = False
+
+            # --- Parallel refit surrogates ---
+            opts_to_refit = []
+            for o_idx in range(n_outputs):
+                if o_idx in perfect_outputs: continue
+                opt = optimizers[o_idx]
+                if getattr(opt, '_needs_refit', False):
+                    # collect arguments needed for refit and mc evaluation
+                    opts_to_refit.append((opt, X, Y[:, o_idx], out_types[o_idx], target_grads_list[o_idx]))
+
+            if opts_to_refit:
+                with ThreadPoolExecutor(max_workers=min(len(opts_to_refit), 8)) as executor:
+                    list(executor.map(_parallel_refit_surrogate_with_mc, opts_to_refit))
+                for opt, _, _, _, _ in opts_to_refit:
+                    opt._needs_refit = False
 
                 if iteration % BAYESIAN_CONST_OPT_FREQ == 0:
                     # Joint-softmax context through to const-opt so it
