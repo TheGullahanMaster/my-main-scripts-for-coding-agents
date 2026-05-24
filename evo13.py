@@ -1051,6 +1051,7 @@ _BINARY_SAFE = {
     'lt':        lambda v1, v2: np.where(v1 < v2, 1.0, 0.0),
     'gte':       lambda v1, v2: np.where(v1 >= v2, 1.0, 0.0),
     'lte':       lambda v1, v2: np.where(v1 <= v2, 1.0, 0.0),
+    'eq':        lambda v1, v2: np.where(v1 == v2, 1.0, 0.0),
 }
 _BINARY_UNSAFE = {
     '+':         lambda v1, v2: v1 + v2,
@@ -1078,6 +1079,7 @@ _BINARY_UNSAFE = {
     'lt':        lambda v1, v2: np.where(v1 < v2, 1.0, 0.0),
     'gte':       lambda v1, v2: np.where(v1 >= v2, 1.0, 0.0),
     'lte':       lambda v1, v2: np.where(v1 <= v2, 1.0, 0.0),
+    'eq':        lambda v1, v2: np.where(v1 == v2, 1.0, 0.0),
 }
 _UNARY_SAFE = {
     'sin':        np.sin,
@@ -1193,6 +1195,9 @@ def _soft_gt(v1, v2):
     return 1.0 / (1.0 + np.exp(-np.clip(20.0 * (v1 - v2), -50.0, 50.0)))
 def _soft_lt(v1, v2):
     return 1.0 / (1.0 + np.exp(-np.clip(20.0 * (v2 - v1), -50.0, 50.0)))
+def _soft_eq(v1, v2):
+    # A symmetric narrow bump function for soft equality.
+    return np.exp(-np.clip(100.0 * (v1 - v2)**2, 0.0, 50.0))
 
 
 def _apply_diff_branching_overrides():
@@ -1205,6 +1210,7 @@ def _apply_diff_branching_overrides():
         BINARY_OPS_EVAL['lt']  = _soft_lt
         BINARY_OPS_EVAL['gte'] = _soft_gt   # >= treated like > in the soft regime
         BINARY_OPS_EVAL['lte'] = _soft_lt
+        BINARY_OPS_EVAL['eq']  = _soft_eq
 
 
 def set_ops_mode(safe: bool):
@@ -1318,6 +1324,7 @@ OP_COSTS = {
     # Comparison operators (for if_else conditions)
     'gt': COST_COMPARISON, 'lt': COST_COMPARISON,
     'gte': COST_COMPARISON, 'lte': COST_COMPARISON,
+    'eq': COST_COMPARISON,
     # Ternary if_else
     'if_else': COST_IF,
     # Unary
@@ -1364,6 +1371,8 @@ def _binary_str(op, s1, s2):
         return f"({s1} >= {s2})"
     elif op == 'lte':
         return f"({s1} <= {s2})"
+    elif op == 'eq':
+        return f"({s1} == {s2})"
     elif op.startswith('adf_'):
         return f"{op}({s1}, {s2})"
     else:
@@ -1415,6 +1424,7 @@ ALL_OP_DESCRIPTIONS = {
     'lt':        "Less than            (x < y)→0/1 — comparison for branching",
     'gte':       "Greater or equal     (x >= y)→0/1 — comparison for branching",
     'lte':       "Less or equal        (x <= y)→0/1 — comparison for branching",
+    'eq':        "Equal                (x == y)→0/1 — comparison for branching",
     # Ternary operator
     'if_else':   "If-Else branch       IF(cond THEN a ELSE b) — piecewise branching",
     # Unary
@@ -1647,14 +1657,14 @@ def _select_if_else_mode():
 
     # Detect whether the user's op set already contains conditional ops; if so
     # default the prompt to YES.
-    _COND_OPS = {'if_else', 'gt', 'lt', 'gte', 'lte'}
+    _COND_OPS = {'if_else', 'gt', 'lt', 'gte', 'lte', 'eq'}
     has_cond_ops = bool(_COND_OPS.intersection(ALLOWED_OPS))
 
     print("\n" + "─" * 70)
     print("IF/ELSE BRANCHING — CGP + Decision Tree Hybrid")
     print("─" * 70)
     print("  When enabled, adds:")
-    print("    • Comparison ops: gt (>), lt (<), gte (>=), lte (<=)")
+    print("    • Comparison ops: gt (>), lt (<), gte (>=), lte (<=), eq (==)")
     print("      These return 0.0 or 1.0 and can compare:")
     print("        - constants to variables      (e.g. x > 3.5)")
     print("        - variables to variables       (e.g. x > y)")
@@ -1689,7 +1699,7 @@ def _select_if_else_mode():
     if accept:
         IF_ELSE_ENABLED = True
         # Add comparison ops to ALLOWED_OPS if not already there
-        comparison_ops = ['gt', 'lt', 'gte', 'lte']
+        comparison_ops = ['gt', 'lt', 'gte', 'lte', 'eq']
         for op in comparison_ops:
             if op not in ALLOWED_OPS:
                 ALLOWED_OPS.append(op)
@@ -4161,7 +4171,7 @@ def random_cgp(n_features, max_nodes, feature_names):
             max_connect = max(0, n_features + i - 1)
             core = [o for o in ['+', '-', '*', '/', 'const']
                     if o in CGPEquation.OPS_ALL]
-            cond = [o for o in ['gt', 'lt', 'gte', 'lte', 'if_else']
+            cond = [o for o in ['gt', 'lt', 'gte', 'lte', 'eq', 'if_else']
                     if o in CGPEquation.OPS_ALL]
             roll = random.random()
             if core and roll < 0.40:
@@ -8386,7 +8396,7 @@ def mutate(parent_eq, n_features, feature_names, mut_rate=None, temperature=0.0,
                 # almost never explores piecewise structures.
                 core = [o for o in ['+', '-', '*', '/', 'const']
                         if o in CGPEquation.OPS_ALL]
-                cond = [o for o in ['gt', 'lt', 'gte', 'lte', 'if_else']
+                cond = [o for o in ['gt', 'lt', 'gte', 'lte', 'eq', 'if_else']
                         if o in CGPEquation.OPS_ALL]
                 roll = random.random()
                 if core and roll < 0.40:
@@ -10699,6 +10709,8 @@ def tree_to_sympy(cgp_eq, feature_vars, safe=None):
                 buf[idx] = sympy.Piecewise((sympy.Float(1), v1 >= v2), (sympy.Float(0), True))
             elif node.op == 'lte':
                 buf[idx] = sympy.Piecewise((sympy.Float(1), v1 <= v2), (sympy.Float(0), True))
+            elif node.op == 'eq':
+                buf[idx] = sympy.Piecewise((sympy.Float(1), sympy.Eq(v1, v2)), (sympy.Float(0), True))
             elif node.op.startswith('adf_'):
                 # ADF binary operator — expand sub-graph inline into SymPy.
                 adf_d = next((d for d in _ADF_REGISTRY if d['name'] == node.op), None)
@@ -10907,6 +10919,7 @@ def _binary_python_expr(op, v1, v2, safe):
     if op == 'lt':  return f"np.where(({v1}) < ({v2}), 1.0, 0.0)"
     if op == 'gte': return f"np.where(({v1}) >= ({v2}), 1.0, 0.0)"
     if op == 'lte': return f"np.where(({v1}) <= ({v2}), 1.0, 0.0)"
+    if op == 'eq':  return f"np.where(({v1}) == ({v2}), 1.0, 0.0)"
     if op.startswith('adf_'):
         return f"{op}({v1}, {v2})"
     return "0.0"
@@ -14759,7 +14772,7 @@ _BO_OP_CATEGORIES = {
     'bounded': {'tanh', 'sigmoid', 'erf', 'sinc'},
     'expon':   {'exp', '10^x', 'pow'},
     'log':     {'log', 'log10', 'sqrt'},
-    'cond':    {'gt', 'lt', 'gte', 'lte', 'if_else', 'min', 'max', 'sign'},
+    'cond':    {'gt', 'lt', 'gte', 'lte', 'eq', 'if_else', 'min', 'max', 'sign'},
     'const':   {'const'},
 }
 _BO_OP_CATEGORY_LIST = ['arith', 'trig', 'bounded', 'expon',
@@ -18792,7 +18805,7 @@ _BO_ATOM_OP_CHOICES = {
     'log':     {1: ['log', 'log10', 'sqrt'],
                  2: []},
     'cond':    {1: ['sign'],
-                 2: ['gt', 'lt', 'min', 'max']},
+                 2: ['gt', 'lt', 'min', 'max', 'eq']},
 }
 
 
