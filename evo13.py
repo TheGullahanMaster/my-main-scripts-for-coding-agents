@@ -11825,6 +11825,21 @@ def epsilon_lexicase_selection(population, X, y_target, type_code, n_cases=20,
 
 
 import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor
+
+def _parallel_fit_surrogate(opt):
+    opt.fit_surrogate()
+    return opt
+
+def _parallel_refit_surrogate_with_mc(args):
+    opt, X, Y_col, out_type, target_grads = args
+    if opt.has_mc_context and opt.mc_full is not None:
+        opt.reeval_buffer_for_mc(
+            X, Y_col, out_type,
+            target_grads=target_grads,
+            max_reeval=max(50, BAYESIAN_MAX_GP_POINTS // 4))
+    opt.fit_surrogate()
+    return opt
 
 def macro_rational_grow(cgp_eq, n_features):
     """
@@ -13991,6 +14006,52 @@ def evolve_afpo(population, X, y_target, type_code,
             local_stag = 0
 
     return population, local_stag
+
+
+def evolve_afpo_stage_worker(args_bundle):
+    args, s, i, adf_registry = args_bundle
+    global _ADF_REGISTRY
+    _ADF_REGISTRY = list(adf_registry)
+
+    local_hof = HallOfFame()
+
+    (pop, X_b, Y_b, out_type,
+     n_features, feat_names, AFPO_POP_SIZE,
+     chunk_freq_a, stag_cntrs, EXTINCTION_PATIENCE,
+     col_bg_a, local_k_a, Y_group_a, target_grads) = args
+
+    ret_pop, stag = evolve_afpo(
+        pop, X_b, Y_b, out_type,
+        n_features, feat_names, AFPO_POP_SIZE,
+        chunk_freq_a,            # generations per chunk
+        local_hof, stag_cntrs, EXTINCTION_PATIENCE,
+        bg_logits=col_bg_a, class_idx_in_group=local_k_a, Y_group=Y_group_a,
+        target_grads=target_grads
+    )
+    return ret_pop, stag, s, i, local_hof
+
+
+def evolve_afpo_stage_worker(args_bundle):
+    args, s, i, adf_registry = args_bundle
+    global _ADF_REGISTRY
+    _ADF_REGISTRY = list(adf_registry)
+
+    local_hof = HallOfFame()
+
+    (pop, X_b, Y_b, out_type,
+     n_features, feat_names, AFPO_POP_SIZE,
+     chunk_freq_a, stag_cntrs, EXTINCTION_PATIENCE,
+     col_bg_a, local_k_a, Y_group_a, target_grads) = args
+
+    ret_pop, stag = evolve_afpo(
+        pop, X_b, Y_b, out_type,
+        n_features, feat_names, AFPO_POP_SIZE,
+        chunk_freq_a,            # generations per chunk
+        local_hof, stag_cntrs, EXTINCTION_PATIENCE,
+        bg_logits=col_bg_a, class_idx_in_group=local_k_a, Y_group=Y_group_a,
+        target_grads=target_grads
+    )
+    return ret_pop, stag, s, i, local_hof
 
 
 def evolve_afpo_island_chunk(args):
@@ -19266,8 +19327,9 @@ def run_bayesian_afpo(X, Y, n_features, n_outputs, feat_names, out_types,
             afpo_pops[o_idx] = _trim_to_pareto_front_3obj(afpo_pops[o_idx], AFPO_POP_SIZE)
 
     print("\nFitting initial GP surrogates…")
+    with ThreadPoolExecutor(max_workers=min(len(optimizers), 8)) as executor:
+        list(executor.map(_parallel_fit_surrogate, optimizers))
     for opt in optimizers:
-        opt.fit_surrogate()
         print(f"  {opt.summary_str()}")
 
     # ── Phase 2: Bayesian AFPO loop ─────────────────────────────
@@ -19558,12 +19620,24 @@ def run_bayesian_afpo(X, Y, n_features, n_outputs, feat_names, out_types,
                 afpo_pops[o_idx] = _trim_to_pareto_front_3obj(pop, AFPO_POP_SIZE)
 
                 if opt.should_refit_now(iteration):
-                    if opt.has_mc_context and opt.mc_full is not None:
-                        opt.reeval_buffer_for_mc(
-                            X, Y[:, o_idx], out_types[o_idx],
-                            target_grads=target_grads_list[o_idx],
-                            max_reeval=max(50, BAYESIAN_MAX_GP_POINTS // 4))
-                    opt.fit_surrogate()
+                    opt._needs_refit = True
+                else:
+                    opt._needs_refit = False
+
+            # --- Parallel refit surrogates ---
+            opts_to_refit = []
+            for o_idx in range(n_outputs):
+                if o_idx in perfect_outputs: continue
+                opt = optimizers[o_idx]
+                if getattr(opt, '_needs_refit', False):
+                    # collect arguments needed for refit and mc evaluation
+                    opts_to_refit.append((opt, X, Y[:, o_idx], out_types[o_idx], target_grads_list[o_idx]))
+
+            if opts_to_refit:
+                with ThreadPoolExecutor(max_workers=min(len(opts_to_refit), 8)) as executor:
+                    list(executor.map(_parallel_refit_surrogate_with_mc, opts_to_refit))
+                for opt, _, _, _, _ in opts_to_refit:
+                    opt._needs_refit = False
 
             print(f"--- BO AFPO Iteration {iteration}  (total evals: {total_evals}) ---")
 
@@ -19788,8 +19862,8 @@ def run_bayesian_islands(X, Y, n_features, n_outputs, feat_names, out_types,
                 islands_pop[island_idx][o_idx] = islands_pop[island_idx][o_idx][:ISLAND_SIZE]
 
     print("\nFitting initial GP surrogates…")
-    for opt in optimizers:
-        opt.fit_surrogate()
+    with ThreadPoolExecutor(max_workers=min(len(optimizers), 8)) as executor:
+        list(executor.map(_parallel_fit_surrogate, optimizers))
 
     # ── Phase 2: Bayesian Islands loop ─────────────────────────────
     print("\nPhase 2: Bayesian Islands optimisation. Ctrl+C to stop.\n")
@@ -20138,12 +20212,24 @@ def run_bayesian_islands(X, Y, n_features, n_outputs, feat_names, out_types,
                             target_pop.append(mig)
 
                 if opt.should_refit_now(iteration):
-                    if opt.has_mc_context and opt.mc_full is not None:
-                        opt.reeval_buffer_for_mc(
-                            X, Y[:, o_idx], out_types[o_idx],
-                            target_grads=target_grads_list[o_idx],
-                            max_reeval=max(50, BAYESIAN_MAX_GP_POINTS // 4))
-                    opt.fit_surrogate()
+                    opt._needs_refit = True
+                else:
+                    opt._needs_refit = False
+
+            # --- Parallel refit surrogates ---
+            opts_to_refit = []
+            for o_idx in range(n_outputs):
+                if o_idx in perfect_outputs: continue
+                opt = optimizers[o_idx]
+                if getattr(opt, '_needs_refit', False):
+                    # collect arguments needed for refit and mc evaluation
+                    opts_to_refit.append((opt, X, Y[:, o_idx], out_types[o_idx], target_grads_list[o_idx]))
+
+            if opts_to_refit:
+                with ThreadPoolExecutor(max_workers=min(len(opts_to_refit), 8)) as executor:
+                    list(executor.map(_parallel_refit_surrogate_with_mc, opts_to_refit))
+                for opt, _, _, _, _ in opts_to_refit:
+                    opt._needs_refit = False
 
             print(f"--- BO Islands Iteration {iteration}  (total evals: {total_evals}) ---")
 
@@ -20349,8 +20435,8 @@ def run_bayesian_islanded_afpo(X, Y, n_features, n_outputs, feat_names, out_type
                 islands_pop[island_idx][o_idx] = _trim_to_pareto_front_3obj(islands_pop[island_idx][o_idx], AFPO_POP_SIZE)
 
     print("\nFitting initial GP surrogates…")
-    for opt in optimizers:
-        opt.fit_surrogate()
+    with ThreadPoolExecutor(max_workers=min(len(optimizers), 8)) as executor:
+        list(executor.map(_parallel_fit_surrogate, optimizers))
 
     # ── Phase 2: Bayesian Islanded AFPO loop ─────────────────────────────
     print("\nPhase 2: Bayesian Islanded AFPO optimisation. Ctrl+C to stop.\n")
@@ -20684,12 +20770,24 @@ def run_bayesian_islanded_afpo(X, Y, n_features, n_outputs, feat_names, out_type
                             target_pop.append(mig)
 
                 if opt.should_refit_now(iteration):
-                    if opt.has_mc_context and opt.mc_full is not None:
-                        opt.reeval_buffer_for_mc(
-                            X, Y[:, o_idx], out_types[o_idx],
-                            target_grads=target_grads_list[o_idx],
-                            max_reeval=max(50, BAYESIAN_MAX_GP_POINTS // 4))
-                    opt.fit_surrogate()
+                    opt._needs_refit = True
+                else:
+                    opt._needs_refit = False
+
+            # --- Parallel refit surrogates ---
+            opts_to_refit = []
+            for o_idx in range(n_outputs):
+                if o_idx in perfect_outputs: continue
+                opt = optimizers[o_idx]
+                if getattr(opt, '_needs_refit', False):
+                    # collect arguments needed for refit and mc evaluation
+                    opts_to_refit.append((opt, X, Y[:, o_idx], out_types[o_idx], target_grads_list[o_idx]))
+
+            if opts_to_refit:
+                with ThreadPoolExecutor(max_workers=min(len(opts_to_refit), 8)) as executor:
+                    list(executor.map(_parallel_refit_surrogate_with_mc, opts_to_refit))
+                for opt, _, _, _, _ in opts_to_refit:
+                    opt._needs_refit = False
 
             print(f"--- BO Islanded AFPO Iteration {iteration}  (total evals: {total_evals}) ---")
 
@@ -20935,8 +21033,9 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
 
     # Fit initial surrogates
     print("\nFitting initial GP surrogates…")
+    with ThreadPoolExecutor(max_workers=min(len(optimizers), 8)) as executor:
+        list(executor.map(_parallel_fit_surrogate, optimizers))
     for opt in optimizers:
-        opt.fit_surrogate()
         print(f"  {opt.summary_str()}")
 
     # ── Phase 2: Bayesian optimisation loop ─────────────────────────────
@@ -21355,16 +21454,24 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
 
                 # ── Refit GP surrogate periodically ─────────────────────────
                 if opt.should_refit_now(iteration):
-                    # Refresh stale buffer entries to the latest bg_logits
-                    # FIRST so the GP fits on a single, current loss surface
-                    # instead of mixing epochs.  Cap re-evals so the cost
-                    # stays bounded for big buffers.
-                    if opt.has_mc_context and opt.mc_full is not None:
-                        opt.reeval_buffer_for_mc(
-                            X, Y[:, o_idx], out_types[o_idx],
-                            target_grads=target_grads_list[o_idx],
-                            max_reeval=max(50, BAYESIAN_MAX_GP_POINTS // 4))
-                    opt.fit_surrogate()
+                    opt._needs_refit = True
+                else:
+                    opt._needs_refit = False
+
+            # --- Parallel refit surrogates ---
+            opts_to_refit = []
+            for o_idx in range(n_outputs):
+                if o_idx in perfect_outputs: continue
+                opt = optimizers[o_idx]
+                if getattr(opt, '_needs_refit', False):
+                    # collect arguments needed for refit and mc evaluation
+                    opts_to_refit.append((opt, X, Y[:, o_idx], out_types[o_idx], target_grads_list[o_idx]))
+
+            if opts_to_refit:
+                with ThreadPoolExecutor(max_workers=min(len(opts_to_refit), 8)) as executor:
+                    list(executor.map(_parallel_refit_surrogate_with_mc, opts_to_refit))
+                for opt, _, _, _, _ in opts_to_refit:
+                    opt._needs_refit = False
 
                 # ── Light constant optimisation on HoF ──────────────────────
                 # ``optimize_constants`` mutates ``ind.tree`` in place and may
@@ -21680,8 +21787,9 @@ def run_bayesian_qd(X, Y, n_features, n_outputs, feat_names, out_types,
                 archives[o_idx].add(ind, iteration=0)
 
     print("\nFitting initial GP surrogates…")
+    with ThreadPoolExecutor(max_workers=min(len(optimizers), 8)) as executor:
+        list(executor.map(_parallel_fit_surrogate, optimizers))
     for opt in optimizers:
-        opt.fit_surrogate()
         print(f"  {opt.summary_str()}")
 
     # ── Phase 2: QD loop ────────────────────────────────────────────────
@@ -22120,12 +22228,24 @@ def run_bayesian_qd(X, Y, n_features, n_outputs, feat_names, out_types,
                               f"{_oracle.summary_str()}.")
 
                 if opt.should_refit_now(iteration):
-                    if opt.has_mc_context and opt.mc_full is not None:
-                        opt.reeval_buffer_for_mc(
-                            X, Y[:, o_idx], out_types[o_idx],
-                            target_grads=target_grads_list[o_idx],
-                            max_reeval=max(50, BAYESIAN_MAX_GP_POINTS // 4))
-                    opt.fit_surrogate()
+                    opt._needs_refit = True
+                else:
+                    opt._needs_refit = False
+
+            # --- Parallel refit surrogates ---
+            opts_to_refit = []
+            for o_idx in range(n_outputs):
+                if o_idx in perfect_outputs: continue
+                opt = optimizers[o_idx]
+                if getattr(opt, '_needs_refit', False):
+                    # collect arguments needed for refit and mc evaluation
+                    opts_to_refit.append((opt, X, Y[:, o_idx], out_types[o_idx], target_grads_list[o_idx]))
+
+            if opts_to_refit:
+                with ThreadPoolExecutor(max_workers=min(len(opts_to_refit), 8)) as executor:
+                    list(executor.map(_parallel_refit_surrogate_with_mc, opts_to_refit))
+                for opt, _, _, _, _ in opts_to_refit:
+                    opt._needs_refit = False
 
                 if iteration % BAYESIAN_CONST_OPT_FREQ == 0:
                     # Joint-softmax context through to const-opt so it
@@ -25020,273 +25140,274 @@ def train_mode():
         _meta_last_imp_gen = 0
         _meta_fires       = 0
         try:
-            while True:
-                batch_idx = (np.random.choice(X.shape[0], BATCH_SIZE, replace=False)
-                             if BATCH_SIZE > 0 else None)
-                X_b = X[batch_idx] if batch_idx is not None else X
-                Y_b = Y[batch_idx] if batch_idx is not None else Y
+            with ThreadPoolExecutor(max_workers=min(n_outputs, 8)) as executor:
+                while True:
+                    batch_idx = (np.random.choice(X.shape[0], BATCH_SIZE, replace=False) if BATCH_SIZE > 0 else None)
+                    X_b = X[batch_idx] if batch_idx is not None else X
+                    Y_b = Y[batch_idx] if batch_idx is not None else Y
 
-                # ── Build background logits for class groups ────────────────
-                bg_logits_cache_a = {}
-                for col_name, group_idxs in class_groups_a.items():
-                    bg_logits_cache_a[col_name] = build_bg_logits(hofs, group_idxs, X_b)
+                    # ── Build background logits for class groups ────────────────
+                    bg_logits_cache_a = {}
+                    for col_name, group_idxs in class_groups_a.items():
+                        bg_logits_cache_a[col_name] = build_bg_logits(hofs, group_idxs, X_b)
 
-                # ── Stagnation-aware chunk frequency ────────────────────────
-                # When any output's per-chunk stagnation counter passes the
-                # half-way mark to extinction patience, halve the chunk size.
-                # This makes the elitist-HoF re-injection and global plateau
-                # check fire twice as often during long plateaus, which is
-                # the regime where they matter most.  Identical philosophy
-                # to the island model's `chunk_freq` adaptation.
-                _max_stag_a = max(stag_cntrs) if stag_cntrs else 0
-                if _max_stag_a > EXTINCTION_PATIENCE // 2:
-                    chunk_freq_a = max(10, MIGRATION_FREQ // 2)
-                else:
-                    chunk_freq_a = MIGRATION_FREQ
-
-                for i in range(n_outputs):
-                    if i in perfect_outputs:
-                        continue  # skip training on perfect outputs
-
-                    g_info_a = out_group_info_a.get(i)
-                    if g_info_a is not None:
-                        group_idxs_a, local_k_a = g_info_a
-                        col_bg_a = next(
-                            bg_logits_cache_a[cn]
-                            for cn, idxs in class_groups_a.items()
-                            if group_idxs_a == idxs)
-                        Y_group_a = Y_b[:, group_idxs_a[0]:group_idxs_a[-1]+1]
+                    # ── Stagnation-aware chunk frequency ────────────────────────
+                    # When any output's per-chunk stagnation counter passes the
+                    # half-way mark to extinction patience, halve the chunk size.
+                    # This makes the elitist-HoF re-injection and global plateau
+                    # check fire twice as often during long plateaus, which is
+                    # the regime where they matter most.  Identical philosophy
+                    # to the island model's `chunk_freq` adaptation.
+                    _max_stag_a = max(stag_cntrs) if stag_cntrs else 0
+                    if _max_stag_a > EXTINCTION_PATIENCE // 2:
+                        chunk_freq_a = max(10, MIGRATION_FREQ // 2)
                     else:
-                        col_bg_a, local_k_a, Y_group_a = None, None, None
+                        chunk_freq_a = MIGRATION_FREQ
 
-                    # ── Elitist HoF injection ─────────────────────────────────
-                    # AFPO's age mechanism is lethal to good solutions: every
-                    # generation ind.age += 1, so even the best individual
-                    # eventually gets Pareto-dominated by any age=0 child with
-                    # slightly better fitness and gets trimmed from the population.
-                    # Fix: before each evolve call, guarantee the global HoF best
-                    # is present at age=0, replacing only the population's worst.
-                    hof_best_i = hofs[i].get_best_overall()
-                    if hof_best_i is not None and afpo_pops[i]:
-                        pop_best_loss = min(ind.loss for ind in afpo_pops[i])
-                        if hof_best_i.loss < pop_best_loss - 1e-9:
-                            worst = max(afpo_pops[i], key=lambda x: x.fitness)
-                            afpo_pops[i].remove(worst)
-                            elite = copy.deepcopy(hof_best_i)
-                            elite.age = 0   # reset so AFPO Pareto trim won't kill it immediately
-                            afpo_pops[i].append(elite)
-
-                    afpo_pops[i], stag_cntrs[i] = evolve_afpo(
-                        afpo_pops[i], X_b, Y_b[:, i], out_types[i],
-                        n_features, feat_names, AFPO_POP_SIZE,
-                        chunk_freq_a,            # generations per chunk
-                        hofs[i], stag_cntrs[i], EXTINCTION_PATIENCE,
-                        bg_logits=col_bg_a, class_idx_in_group=local_k_a, Y_group=Y_group_a,
-                        target_grads=target_grads_list[i],
-                    )
-                    # Update global HoF with any new discoveries
-                    for ind in afpo_pops[i]:
-                        if hofs[i].update(ind):
-                            is_cls = (out_types[i] == 6)
-                            metric = (f"Acc={getattr(ind,'accuracy',0):.4f}"
-                                      if is_cls else f"R²={getattr(ind,'r2',0):.4f}")
-                            print(f"[Out {i} | AFPO] "
-                                  f"New Best (Comp {ind.complexity:.0f}): "
-                                  f"loss={ind.loss:.4f}  {metric}")
-
-                gen += chunk_freq_a
-                print(f"--- Generation {gen} ---")
-
-                # ── Plateau-driven meta-extinction ─────────────────────────
-                # Pool current HoF bests across active outputs; if the global
-                # minimum hasn't improved by > META_PLATEAU_REL within
-                # META_PLATEAU_GENS, fire a single rebuild.  The pseudo-
-                # islands wrapper lets `_meta_extinction` operate on the
-                # single AFPO pool without changing its signature.
-                _meta_losses = [hofs[mi].get_best_overall().loss
-                                for mi in range(n_outputs)
-                                if mi not in perfect_outputs
-                                and hofs[mi].get_best_overall() is not None]
-                if _meta_losses:
-                    _cur_loss = float(min(_meta_losses))
-                    if (np.isfinite(_cur_loss)
-                            and _cur_loss < _meta_best_loss
-                            * (1.0 - META_PLATEAU_REL)):
-                        _meta_best_loss   = _cur_loss
-                        _meta_last_imp_gen = gen
-                    elif (_meta_fires < META_MAX_FIRES
-                            and gen - _meta_last_imp_gen >= META_PLATEAU_GENS):
-                        _meta_fires += 1
-                        print(f"\n  ⟂ Plateau detected (no >"
-                              f"{META_PLATEAU_REL:.0e} relative "
-                              f"improvement in {META_PLATEAU_GENS} gens) — "
-                              f"firing AFPO meta-extinction "
-                              f"{_meta_fires}/{META_MAX_FIRES}")
-                        # Wrap the AFPO pool as a single pseudo-island so
-                        # `_meta_extinction` can rebuild it in place.  After
-                        # the rebuild, re-score every member's fitness with
-                        # age=0 (the AFPO invariant) on the full data so the
-                        # next chunk starts from a clean, comparable state.
-                        # Pre-pad: `_meta_extinction` uses
-                        # ``target_n = len(isl[o_idx])`` to size the rebuild,
-                        # so a Pareto-trimmed pool that shrank below
-                        # AFPO_POP_SIZE would rebuild only to its trimmed
-                        # size.  Pad each pop with placeholder Individuals
-                        # so the rebuild lands at the configured pool size.
-                        for _oi in range(n_outputs):
-                            while len(afpo_pops[_oi]) < AFPO_POP_SIZE:
-                                afpo_pops[_oi].append(Individual(
-                                    random_cgp(n_features, CGP_NODES, feat_names)))
-                        _pseudo_isl = [afpo_pops]
-                        _meta_extinction(_pseudo_isl, hofs, X, Y, out_types,
-                                         n_features, feat_names,
-                                         target_grads_list)
-                        for _oi in range(n_outputs):
-                            # The `_meta_extinction` helper only scores the
-                            # seed pool; random_cgp pad members come back with
-                            # the Individual defaults (loss=fitness=1e10).  If
-                            # we left those in, the next Pareto trim would
-                            # cull them en masse, undoing most of the rebuild.
-                            # Score everyone with age=0 so the post-rebuild
-                            # pool starts on equal, fully-evaluated footing.
-                            for _ind in afpo_pops[_oi]:
-                                _ind.age = 0
-                                if (not np.isfinite(getattr(_ind, 'fitness', np.inf))
-                                        or _ind.fitness >= 1e9):
-                                    try:
-                                        _ind.calculate_fitness(
-                                            X, Y[:, _oi], out_types[_oi],
-                                            target_grads=target_grads_list[_oi])
-                                    except Exception:
-                                        _ind.fitness = 1e10
-                                        _ind.loss = 1e10
-                            # Trim back to the Pareto front so the post-rebuild
-                            # pool already obeys the AFPO invariant before the
-                            # next chunk runs.
-                            afpo_pops[_oi] = _trim_to_pareto_front_3obj(
-                                afpo_pops[_oi], AFPO_POP_SIZE)
-                            stag_cntrs[_oi] = 0
-                        # Clear the fitness cache: most entries belong to
-                        # individuals that no longer exist in the pool.
-                        try:
-                            _FITNESS_CACHE.clear()
-                        except Exception:
-                            pass
-                        _meta_last_imp_gen = gen
-                        _meta_best_loss   = _cur_loss
-
-                # ---- Perfect output detection & early stopping ----
-                for o_idx in range(n_outputs):
-                    if o_idx in perfect_outputs:
-                        continue
-                    is_perf, best_ind = _check_output_perfect(
-                        hofs[o_idx], X, Y[:, o_idx], out_types[o_idx])
-                    if is_perf:
-                        out_label = dp.output_map[o_idx] if o_idx < len(dp.output_map) else f"Out{o_idx}"
-                        print(f"\n  ★ Output {o_idx} ({out_label}) reached PERFECT performance!")
-                        print(f"    Running simplification pass on perfect output...")
-                        _simplify_perfect_output(
-                            hofs[o_idx], X, Y[:, o_idx], out_types[o_idx],
-                            target_grads=target_grads_list[o_idx])
-                        perfect_outputs.add(o_idx)
-                        best_models_snapshot = [h.get_best_overall() for h in hofs]
-                        _save_backup_model(best_models_snapshot, dp, o_idx, X_data=X)
-
-                if len(perfect_outputs) == n_outputs:
-                    print("\n  ★★★ ALL outputs reached perfect performance! Stopping evolution.")
-                    break
-
-                # ---- Periodic frontier display ----
-                if gen % 500 == 0:
-                    for o_idx, hof in enumerate(hofs):
-                        out_label = dp.output_map[o_idx] if o_idx < len(dp.output_map) else f"Out{o_idx}"
-                        pf_tag = " [PERFECT]" if o_idx in perfect_outputs else ""
-                        hof.print_frontier(out_type=out_types[o_idx],
-                                           label=f"Output {o_idx} ({out_label}){pf_tag}")
-                    if X_val is not None and Y_val is not None:
-                        _print_validation_metrics(hofs, X_val, Y_val, out_types, dp)
-
-                    # ── Fitness cache stats ──────────────────────────────────
-                    if _FITNESS_CACHE.hits + _FITNESS_CACHE.misses > 0:
-                        print(f"  [Cache] {_FITNESS_CACHE.stats_str()}")
-
-                # ---- Interval stability culling (Interval mode only) ----
-                if INTERVAL_MODE and gen % INTERVAL_CHECK_FREQ == 0:
-                    n_pen = 0
+                    # ── Submit AFPO chunks ────────────────────────────────────
+                    futures = []
                     for i in range(n_outputs):
-                        for ind in afpo_pops[i]:
+                        if i in perfect_outputs:
+                            continue  # skip training on perfect outputs
+
+                        g_info_a = out_group_info_a.get(i)
+                        if g_info_a is not None:
+                            group_idxs_a, local_k_a = g_info_a
+                            col_bg_a = next(
+                                bg_logits_cache_a[cn]
+                                for cn, idxs in class_groups_a.items()
+                                if group_idxs_a == idxs)
+                            Y_group_a = Y_b[:, group_idxs_a[0]:group_idxs_a[-1]+1]
+                        else:
+                            col_bg_a, local_k_a, Y_group_a = None, None, None
+
+                        # ── Elitist HoF injection ─────────────────────────────────
+                        hof_best_i = hofs[i].get_best_overall()
+                        if hof_best_i is not None and afpo_pops[i]:
+                            pop_best_loss = min(ind.loss for ind in afpo_pops[i])
+                            if hof_best_i.loss < pop_best_loss - 1e-9:
+                                worst = max(afpo_pops[i], key=lambda x: x.fitness)
+                                afpo_pops[i].remove(worst)
+                                elite = copy.deepcopy(hof_best_i)
+                                elite.age = 0   # reset so AFPO Pareto trim won't kill it immediately
+                                afpo_pops[i].append(elite)
+
+                        args = (
+                            afpo_pops[i], X_b, Y_b[:, i], out_types[i],
+                            n_features, feat_names, AFPO_POP_SIZE,
+                            chunk_freq_a,            # generations per chunk
+                            stag_cntrs[i], EXTINCTION_PATIENCE,
+                            col_bg_a, local_k_a, Y_group_a, target_grads_list[i]
+                        )
+                        futures.append(executor.submit(evolve_afpo_stage_worker, (args, 0, i, list(_ADF_REGISTRY))))
+
+                    for future in concurrent.futures.as_completed(futures):
+                        ret_pop, stag, _, i, local_hof = future.result()
+                        afpo_pops[i] = ret_pop
+                        stag_cntrs[i] = stag
+                        # Update global HoF with any new discoveries
+                        for c, ind in local_hof.best_by_complexity.items():
+                            if hofs[i].update(ind):
+                                is_cls = (out_types[i] == 6)
+                                metric = (f"Acc={getattr(ind,'accuracy',0):.4f}"
+                                          if is_cls else f"R²={getattr(ind,'r2',0):.4f}")
+                                print(f"[Out {i} | AFPO] "
+                                      f"New Best (Comp {ind.complexity:.0f}): "
+                                      f"loss={ind.loss:.4f}  {metric}")
+
+                    gen += chunk_freq_a
+                    print(f"--- Generation {gen} ---")
+
+                    # ── Plateau-driven meta-extinction ─────────────────────────
+                    # Pool current HoF bests across active outputs; if the global
+                    # minimum hasn't improved by > META_PLATEAU_REL within
+                    # META_PLATEAU_GENS, fire a single rebuild.  The pseudo-
+                    # islands wrapper lets `_meta_extinction` operate on the
+                    # single AFPO pool without changing its signature.
+                    _meta_losses = [hofs[mi].get_best_overall().loss
+                                    for mi in range(n_outputs)
+                                    if mi not in perfect_outputs
+                                    and hofs[mi].get_best_overall() is not None]
+                    if _meta_losses:
+                        _cur_loss = float(min(_meta_losses))
+                        if (np.isfinite(_cur_loss)
+                                and _cur_loss < _meta_best_loss
+                                * (1.0 - META_PLATEAU_REL)):
+                            _meta_best_loss   = _cur_loss
+                            _meta_last_imp_gen = gen
+                        elif (_meta_fires < META_MAX_FIRES
+                                and gen - _meta_last_imp_gen >= META_PLATEAU_GENS):
+                            _meta_fires += 1
+                            print(f"\n  ⟂ Plateau detected (no >"
+                                  f"{META_PLATEAU_REL:.0e} relative "
+                                  f"improvement in {META_PLATEAU_GENS} gens) — "
+                                  f"firing AFPO meta-extinction "
+                                  f"{_meta_fires}/{META_MAX_FIRES}")
+                            # Wrap the AFPO pool as a single pseudo-island so
+                            # `_meta_extinction` can rebuild it in place.  After
+                            # the rebuild, re-score every member's fitness with
+                            # age=0 (the AFPO invariant) on the full data so the
+                            # next chunk starts from a clean, comparable state.
+                            # Pre-pad: `_meta_extinction` uses
+                            # ``target_n = len(isl[o_idx])`` to size the rebuild,
+                            # so a Pareto-trimmed pool that shrank below
+                            # AFPO_POP_SIZE would rebuild only to its trimmed
+                            # size.  Pad each pop with placeholder Individuals
+                            # so the rebuild lands at the configured pool size.
+                            for _oi in range(n_outputs):
+                                while len(afpo_pops[_oi]) < AFPO_POP_SIZE:
+                                    afpo_pops[_oi].append(Individual(
+                                        random_cgp(n_features, CGP_NODES, feat_names)))
+                            _pseudo_isl = [afpo_pops]
+                            _meta_extinction(_pseudo_isl, hofs, X, Y, out_types,
+                                             n_features, feat_names,
+                                             target_grads_list)
+                            for _oi in range(n_outputs):
+                                # The `_meta_extinction` helper only scores the
+                                # seed pool; random_cgp pad members come back with
+                                # the Individual defaults (loss=fitness=1e10).  If
+                                # we left those in, the next Pareto trim would
+                                # cull them en masse, undoing most of the rebuild.
+                                # Score everyone with age=0 so the post-rebuild
+                                # pool starts on equal, fully-evaluated footing.
+                                for _ind in afpo_pops[_oi]:
+                                    _ind.age = 0
+                                    if (not np.isfinite(getattr(_ind, 'fitness', np.inf))
+                                            or _ind.fitness >= 1e9):
+                                        try:
+                                            _ind.calculate_fitness(
+                                                X, Y[:, _oi], out_types[_oi],
+                                                target_grads=target_grads_list[_oi])
+                                        except Exception:
+                                            _ind.fitness = 1e10
+                                            _ind.loss = 1e10
+                                # Trim back to the Pareto front so the post-rebuild
+                                # pool already obeys the AFPO invariant before the
+                                # next chunk runs.
+                                afpo_pops[_oi] = _trim_to_pareto_front_3obj(
+                                    afpo_pops[_oi], AFPO_POP_SIZE)
+                                stag_cntrs[_oi] = 0
+                            # Clear the fitness cache: most entries belong to
+                            # individuals that no longer exist in the pool.
                             try:
-                                preds = ind.tree.evaluate(X)
-                                if not np.all(np.isfinite(preds)):
-                                    ind.loss = 1e10; ind.fitness = 1e10; n_pen += 1
+                                _FITNESS_CACHE.clear()
                             except Exception:
-                                ind.loss = 1e10; ind.fitness = 1e10; n_pen += 1
-                    if n_pen:
-                        print(f"  [Interval] {n_pen} numerically unstable "
-                              f"individual(s) penalised.")
+                                pass
+                            _meta_last_imp_gen = gen
+                            _meta_best_loss   = _cur_loss
 
-                # ---- ADF extraction (immediate, single-process) ----
-                if ADF_ENABLED and gen % ADF_EXTRACT_FREQ == 0:
-                    print(f"\n[Gen {gen}] ADF extraction scan…")
-                    for i in range(n_outputs):
-                        new_adfs = try_extract_adfs_from_population(
-                            afpo_pops[i], X, Y[:, i], out_types[i])
-                        if new_adfs:
-                            print(f"  [ADF] {len(new_adfs)} new operator(s) added "
-                                  f"({len(_ADF_REGISTRY)} total).  "
-                                  f"Active immediately for all future mutations.")
-                    # ---- ADF retirement ----
-                    retired = _retire_unused_adfs(afpo_pops)
-                    if retired:
-                        print(f"  [ADF] Retired {len(retired)} idle operator(s): "
-                              f"{retired}")
+                    # ---- Perfect output detection & early stopping ----
+                    for o_idx in range(n_outputs):
+                        if o_idx in perfect_outputs:
+                            continue
+                        is_perf, best_ind = _check_output_perfect(
+                            hofs[o_idx], X, Y[:, o_idx], out_types[o_idx])
+                        if is_perf:
+                            out_label = dp.output_map[o_idx] if o_idx < len(dp.output_map) else f"Out{o_idx}"
+                            print(f"\n  ★ Output {o_idx} ({out_label}) reached PERFECT performance!")
+                            print(f"    Running simplification pass on perfect output...")
+                            _simplify_perfect_output(
+                                hofs[o_idx], X, Y[:, o_idx], out_types[o_idx],
+                                target_grads=target_grads_list[o_idx])
+                            perfect_outputs.add(o_idx)
+                            best_models_snapshot = [h.get_best_overall() for h in hofs]
+                            _save_backup_model(best_models_snapshot, dp, o_idx, X_data=X)
 
-                # ---- Periodic simplification pass ----
-                if SIMPLIFICATION_FREQ > 0 and gen % SIMPLIFICATION_FREQ == 0:
-                    print(f"\n[Gen {gen}] Running algebraic simplification pass…")
-                    # Wrap afpo_pops as if they were islands (list of [pop])
-                    pseudo_islands = [[pop] for pop in afpo_pops]
-                    apply_simplification_pass(pseudo_islands, hofs, X, Y, out_types)
-                    # Unwrap back
-                    for i in range(n_outputs):
-                        afpo_pops[i] = pseudo_islands[i][0]
+                    if len(perfect_outputs) == n_outputs:
+                        print("\n  ★★★ ALL outputs reached perfect performance! Stopping evolution.")
+                        break
 
-                # ---- Extra simplification for perfect outputs ----
-                if perfect_outputs and gen % max(100, SIMPLIFICATION_FREQ if SIMPLIFICATION_FREQ > 0 else 100) == 0:
-                    for o_idx in perfect_outputs:
-                        _simplify_perfect_output(
-                            hofs[o_idx], X, Y[:, o_idx], out_types[o_idx],
-                            target_grads=target_grads_list[o_idx])
+                    # ---- Periodic frontier display ----
+                    if gen % 500 == 0:
+                        for o_idx, hof in enumerate(hofs):
+                            out_label = dp.output_map[o_idx] if o_idx < len(dp.output_map) else f"Out{o_idx}"
+                            pf_tag = " [PERFECT]" if o_idx in perfect_outputs else ""
+                            hof.print_frontier(out_type=out_types[o_idx],
+                                               label=f"Output {o_idx} ({out_label}){pf_tag}")
+                        if X_val is not None and Y_val is not None:
+                            _print_validation_metrics(hofs, X_val, Y_val, out_types, dp)
 
-                # ---- Periodic HoF re-scoring on full data (batch mode) ----
-                if BATCH_SIZE > 0 and gen > 0 and gen % 200 == 0:
-                    for o_idx, hof in enumerate(hofs):
-                        for ind in hof.best_by_complexity.values():
-                            ind.affine_fitted = False
-                            ind.calculate_fitness(
-                                X, Y[:, o_idx], out_types[o_idx],
-                                update_affine=True,
+                        # ── Fitness cache stats ──────────────────────────────────
+                        if _FITNESS_CACHE.hits + _FITNESS_CACHE.misses > 0:
+                            print(f"  [Cache] {_FITNESS_CACHE.stats_str()}")
+
+                    # ---- Interval stability culling (Interval mode only) ----
+                    if INTERVAL_MODE and gen % INTERVAL_CHECK_FREQ == 0:
+                        n_pen = 0
+                        for i in range(n_outputs):
+                            for ind in afpo_pops[i]:
+                                try:
+                                    preds = ind.tree.evaluate(X)
+                                    if not np.all(np.isfinite(preds)):
+                                        ind.loss = 1e10; ind.fitness = 1e10; n_pen += 1
+                                except Exception:
+                                    ind.loss = 1e10; ind.fitness = 1e10; n_pen += 1
+                        if n_pen:
+                            print(f"  [Interval] {n_pen} numerically unstable "
+                                  f"individual(s) penalised.")
+
+                    # ---- ADF extraction (immediate, single-process) ----
+                    if ADF_ENABLED and gen % ADF_EXTRACT_FREQ == 0:
+                        print(f"\n[Gen {gen}] ADF extraction scan…")
+                        for i in range(n_outputs):
+                            new_adfs = try_extract_adfs_from_population(
+                                afpo_pops[i], X, Y[:, i], out_types[i])
+                            if new_adfs:
+                                print(f"  [ADF] {len(new_adfs)} new operator(s) added "
+                                      f"({len(_ADF_REGISTRY)} total).  "
+                                      f"Active immediately for all future mutations.")
+                        # ---- ADF retirement ----
+                        retired = _retire_unused_adfs(afpo_pops)
+                        if retired:
+                            print(f"  [ADF] Retired {len(retired)} idle operator(s): "
+                                  f"{retired}")
+
+                    # ---- Periodic simplification pass ----
+                    if SIMPLIFICATION_FREQ > 0 and gen % SIMPLIFICATION_FREQ == 0:
+                        print(f"\n[Gen {gen}] Running algebraic simplification pass…")
+                        # Wrap afpo_pops as if they were islands (list of [pop])
+                        pseudo_islands = [[pop] for pop in afpo_pops]
+                        apply_simplification_pass(pseudo_islands, hofs, X, Y, out_types)
+                        # Unwrap back
+                        for i in range(n_outputs):
+                            afpo_pops[i] = pseudo_islands[i][0]
+
+                    # ---- Extra simplification for perfect outputs ----
+                    if perfect_outputs and gen % max(100, SIMPLIFICATION_FREQ if SIMPLIFICATION_FREQ > 0 else 100) == 0:
+                        for o_idx in perfect_outputs:
+                            _simplify_perfect_output(
+                                hofs[o_idx], X, Y[:, o_idx], out_types[o_idx],
                                 target_grads=target_grads_list[o_idx])
 
-                # ---- Periodic HoF re-scoring on full data (non-batch mode) ----
-                # Even without minibatching, the constant-optimiser, boost
-                # stages and adaptive parsimony silently drift affine_a/b
-                # away from their unbiased fit over a long run.  Every 500
-                # generations we re-fit the affine on the FULL training set
-                # so HoF entries stay correctly ranked and downstream
-                # validation / plotting reflects the true predictor.
-                if BATCH_SIZE <= 0 and gen > 0 and gen % 500 == 0:
-                    for o_idx, hof in enumerate(hofs):
-                        for ind in hof.best_by_complexity.values():
-                            ind.affine_fitted = False
-                            ind.calculate_fitness(
-                                X, Y[:, o_idx], out_types[o_idx],
-                                update_affine=True,
-                                target_grads=target_grads_list[o_idx])
+                    # ---- Periodic HoF re-scoring on full data (batch mode) ----
+                    if BATCH_SIZE > 0 and gen > 0 and gen % 200 == 0:
+                        for o_idx, hof in enumerate(hofs):
+                            for ind in hof.best_by_complexity.values():
+                                ind.affine_fitted = False
+                                ind.calculate_fitness(
+                                    X, Y[:, o_idx], out_types[o_idx],
+                                    update_affine=True,
+                                    target_grads=target_grads_list[o_idx])
 
-                # ---- Deep constant optimisation ----
-                if gen > 0 and gen % 1000 == 0:
-                    _deep_optimize_hofs(hofs, X, Y, out_types)
+                    # ---- Periodic HoF re-scoring on full data (non-batch mode) ----
+                    # Even without minibatching, the constant-optimiser, boost
+                    # stages and adaptive parsimony silently drift affine_a/b
+                    # away from their unbiased fit over a long run.  Every 500
+                    # generations we re-fit the affine on the FULL training set
+                    # so HoF entries stay correctly ranked and downstream
+                    # validation / plotting reflects the true predictor.
+                    if BATCH_SIZE <= 0 and gen > 0 and gen % 500 == 0:
+                        for o_idx, hof in enumerate(hofs):
+                            for ind in hof.best_by_complexity.values():
+                                ind.affine_fitted = False
+                                ind.calculate_fitness(
+                                    X, Y[:, o_idx], out_types[o_idx],
+                                    update_affine=True,
+                                    target_grads=target_grads_list[o_idx])
+
+                    # ---- Deep constant optimisation ----
+                    if gen > 0 and gen % 1000 == 0:
+                        _deep_optimize_hofs(hofs, X, Y, out_types)
 
         except KeyboardInterrupt:
             print("\nStopping Evolution…")
@@ -25390,54 +25511,57 @@ def train_mode():
         gen = 0
         perfect_outputs = set()
         try:
-            while True:
-                batch_idx = (np.random.choice(X.shape[0], BATCH_SIZE, replace=False)
-                             if BATCH_SIZE > 0 else None)
-                X_b = X[batch_idx] if batch_idx is not None else X
-                Y_b = Y[batch_idx] if batch_idx is not None else Y
+            with ThreadPoolExecutor(max_workers=min(N_STAGES * n_outputs, 8)) as executor:
+                while True:
+                    batch_idx = (np.random.choice(X.shape[0], BATCH_SIZE, replace=False) if BATCH_SIZE > 0 else None)
+                    X_b = X[batch_idx] if batch_idx is not None else X
+                    Y_b = Y[batch_idx] if batch_idx is not None else Y
 
-                bg_logits_cache_sa = {}
-                for col_name, group_idxs in class_groups_sa.items():
-                    bg_logits_cache_sa[col_name] = build_bg_logits(
-                        hofs, group_idxs, X_b)
+                    bg_logits_cache_sa = {}
+                    for col_name, group_idxs in class_groups_sa.items():
+                        bg_logits_cache_sa[col_name] = build_bg_logits(
+                            hofs, group_idxs, X_b)
 
-                for s in range(N_STAGES):
-                    for i in range(n_outputs):
-                        if i in perfect_outputs:
-                            continue
+                    futures = []
+                    for s in range(N_STAGES):
+                        for i in range(n_outputs):
+                            if i in perfect_outputs:
+                                continue
 
-                        g_info_sa = out_group_info_sa.get(i)
-                        if g_info_sa is not None:
-                            grp_idxs_sa, local_k_sa = g_info_sa
-                            col_bg_sa = next(
-                                bg_logits_cache_sa[cn]
-                                for cn, idxs in class_groups_sa.items()
-                                if grp_idxs_sa == idxs)
-                            Y_group_sa = Y_b[:, grp_idxs_sa[0]:grp_idxs_sa[-1]+1]
-                        else:
-                            col_bg_sa, local_k_sa, Y_group_sa = None, None, None
+                            g_info_sa = out_group_info_sa.get(i)
+                            if g_info_sa is not None:
+                                grp_idxs_sa, local_k_sa = g_info_sa
+                                col_bg_sa = next(
+                                    bg_logits_cache_sa[cn]
+                                    for cn, idxs in class_groups_sa.items()
+                                    if grp_idxs_sa == idxs)
+                                Y_group_sa = Y_b[:, grp_idxs_sa[0]:grp_idxs_sa[-1]+1]
+                            else:
+                                col_bg_sa, local_k_sa, Y_group_sa = None, None, None
 
-                        hof_best_i = hofs[i].get_best_overall()
-                        if hof_best_i is not None and stage_pops[s][i]:
-                            pop_best = min(ind.loss for ind in stage_pops[s][i])
-                            if hof_best_i.loss < pop_best - 1e-9:
-                                worst = max(stage_pops[s][i], key=lambda x: x.fitness)
-                                stage_pops[s][i].remove(worst)
-                                elite = copy.deepcopy(hof_best_i)
-                                elite.age = 0
-                                stage_pops[s][i].append(elite)
+                            hof_best_i = hofs[i].get_best_overall()
+                            if hof_best_i is not None and stage_pops[s][i]:
+                                pop_best = min(ind.loss for ind in stage_pops[s][i])
+                                if hof_best_i.loss < pop_best - 1e-9:
+                                    worst = max(stage_pops[s][i], key=lambda x: x.fitness)
+                                    stage_pops[s][i].remove(worst)
+                                    elite = copy.deepcopy(hof_best_i)
+                                    elite.age = 0
+                                    stage_pops[s][i].append(elite)
 
-                        stage_pops[s][i], stag_cntrs[s][i] = evolve_afpo(
-                            stage_pops[s][i], X_b, Y_b[:, i], out_types[i],
-                            n_features, feat_names, AFPO_POP_SIZE,
-                            MIGRATION_FREQ,
-                            hofs[i], stag_cntrs[s][i], EXTINCTION_PATIENCE,
-                            bg_logits=col_bg_sa,
-                            class_idx_in_group=local_k_sa,
-                            Y_group=Y_group_sa,
-                            target_grads=target_grads_list[i],
-                        )
-                        for ind in stage_pops[s][i]:
+                            args = (
+                                stage_pops[s][i], X_b, Y_b[:, i], out_types[i],
+                                n_features, feat_names, AFPO_POP_SIZE,
+                                MIGRATION_FREQ, stag_cntrs[s][i], EXTINCTION_PATIENCE,
+                                col_bg_sa, local_k_sa, Y_group_sa, target_grads_list[i]
+                            )
+                            futures.append(executor.submit(evolve_afpo_stage_worker, (args, s, i, list(_ADF_REGISTRY))))
+
+                    for future in concurrent.futures.as_completed(futures):
+                        ret_pop, stag, s, i, local_hof = future.result()
+                        stage_pops[s][i] = ret_pop
+                        stag_cntrs[s][i] = stag
+                        for c, ind in local_hof.best_by_complexity.items():
                             if hofs[i].update(ind):
                                 is_cls = (out_types[i] == 6)
                                 metric = (f"Acc={getattr(ind,'accuracy',0):.4f}"
@@ -25447,106 +25571,106 @@ def train_mode():
                                       f"New Best (Comp {ind.complexity:.0f}): "
                                       f"loss={ind.loss:.4f}  {metric}")
 
-                gen += MIGRATION_FREQ
+                    gen += MIGRATION_FREQ
 
-                # Graduation: best of stage s → stage s+1
-                if gen % GRAD_FREQ_SA == 0:
-                    for s in range(N_STAGES - 1):
-                        ns = s + 1
-                        for i in range(n_outputs):
-                            src = stage_pops[s][i]
-                            dst = stage_pops[ns][i]
-                            if not src or not dst:
-                                continue
-                            champion = min(src, key=lambda x: x.fitness)
-                            graduate = copy.deepcopy(champion)
-                            graduate.age = 0
-                            worst = max(dst, key=lambda x: x.fitness)
-                            dst.remove(worst)
-                            dst.append(graduate)
-                            hof_best = hofs[i].get_best_overall()
-                            if hof_best is not None:
-                                tree = mutate(hof_best.tree, n_features,
-                                              feat_names, mut_rate=CGP_MUT_RATE)
-                                new_ind = Individual(tree)
-                            else:
-                                new_ind = Individual(
-                                    random_cgp(n_features, CGP_NODES, feat_names))
-                            new_ind.age = 0
-                            new_ind.calculate_fitness(
-                                X_b, Y_b[:, i], out_types[i],
-                                target_grads=target_grads_list[i])
-                            if src:
-                                weak = max(src, key=lambda x: x.fitness)
-                                src.remove(weak)
-                            src.append(new_ind)
-                    print(f"  [Gen {gen}] Stage graduation cycle complete.")
+                    # Graduation: best of stage s → stage s+1
+                    if gen % GRAD_FREQ_SA == 0:
+                        for s in range(N_STAGES - 1):
+                            ns = s + 1
+                            for i in range(n_outputs):
+                                src = stage_pops[s][i]
+                                dst = stage_pops[ns][i]
+                                if not src or not dst:
+                                    continue
+                                champion = min(src, key=lambda x: x.fitness)
+                                graduate = copy.deepcopy(champion)
+                                graduate.age = 0
+                                worst = max(dst, key=lambda x: x.fitness)
+                                dst.remove(worst)
+                                dst.append(graduate)
+                                hof_best = hofs[i].get_best_overall()
+                                if hof_best is not None:
+                                    tree = mutate(hof_best.tree, n_features,
+                                                  feat_names, mut_rate=CGP_MUT_RATE)
+                                    new_ind = Individual(tree)
+                                else:
+                                    new_ind = Individual(
+                                        random_cgp(n_features, CGP_NODES, feat_names))
+                                new_ind.age = 0
+                                new_ind.calculate_fitness(
+                                    X_b, Y_b[:, i], out_types[i],
+                                    target_grads=target_grads_list[i])
+                                if src:
+                                    weak = max(src, key=lambda x: x.fitness)
+                                    src.remove(weak)
+                                src.append(new_ind)
+                        print(f"  [Gen {gen}] Stage graduation cycle complete.")
 
-                print(f"--- Generation {gen} ---")
+                    print(f"--- Generation {gen} ---")
 
-                for o_idx in range(n_outputs):
-                    if o_idx in perfect_outputs:
-                        continue
-                    is_perf, best_ind = _check_output_perfect(
-                        hofs[o_idx], X, Y[:, o_idx], out_types[o_idx])
-                    if is_perf:
-                        out_label = (dp.output_map[o_idx]
-                                     if o_idx < len(dp.output_map) else f"Out{o_idx}")
-                        print(f"\n  ★ Output {o_idx} ({out_label}) "
-                              f"reached PERFECT performance!")
-                        print(f"    Running simplification pass on perfect output...")
-                        _simplify_perfect_output(
-                            hofs[o_idx], X, Y[:, o_idx], out_types[o_idx],
-                            target_grads=target_grads_list[o_idx])
-                        perfect_outputs.add(o_idx)
-                        best_models_snapshot = [h.get_best_overall() for h in hofs]
-                        _save_backup_model(best_models_snapshot, dp, o_idx, X_data=X)
+                    for o_idx in range(n_outputs):
+                        if o_idx in perfect_outputs:
+                            continue
+                        is_perf, best_ind = _check_output_perfect(
+                            hofs[o_idx], X, Y[:, o_idx], out_types[o_idx])
+                        if is_perf:
+                            out_label = (dp.output_map[o_idx]
+                                         if o_idx < len(dp.output_map) else f"Out{o_idx}")
+                            print(f"\n  ★ Output {o_idx} ({out_label}) "
+                                  f"reached PERFECT performance!")
+                            print(f"    Running simplification pass on perfect output...")
+                            _simplify_perfect_output(
+                                hofs[o_idx], X, Y[:, o_idx], out_types[o_idx],
+                                target_grads=target_grads_list[o_idx])
+                            perfect_outputs.add(o_idx)
+                            best_models_snapshot = [h.get_best_overall() for h in hofs]
+                            _save_backup_model(best_models_snapshot, dp, o_idx, X_data=X)
 
-                if len(perfect_outputs) == n_outputs:
-                    print("\n  ★★★ ALL outputs reached perfect performance! "
-                          "Stopping evolution.")
-                    break
+                    if len(perfect_outputs) == n_outputs:
+                        print("\n  ★★★ ALL outputs reached perfect performance! "
+                              "Stopping evolution.")
+                        break
 
-                if gen % 500 == 0:
-                    for o_idx, hof in enumerate(hofs):
-                        out_label = (dp.output_map[o_idx]
-                                     if o_idx < len(dp.output_map) else f"Out{o_idx}")
-                        pf_tag = " [PERFECT]" if o_idx in perfect_outputs else ""
-                        hof.print_frontier(
-                            out_type=out_types[o_idx],
-                            label=f"Output {o_idx} ({out_label}){pf_tag}")
-                    if X_val is not None and Y_val is not None:
-                        _print_validation_metrics(hofs, X_val, Y_val, out_types, dp)
-                    if _FITNESS_CACHE.hits + _FITNESS_CACHE.misses > 0:
-                        print(f"  [Cache] {_FITNESS_CACHE.stats_str()}")
+                    if gen % 500 == 0:
+                        for o_idx, hof in enumerate(hofs):
+                            out_label = (dp.output_map[o_idx]
+                                         if o_idx < len(dp.output_map) else f"Out{o_idx}")
+                            pf_tag = " [PERFECT]" if o_idx in perfect_outputs else ""
+                            hof.print_frontier(
+                                out_type=out_types[o_idx],
+                                label=f"Output {o_idx} ({out_label}){pf_tag}")
+                        if X_val is not None and Y_val is not None:
+                            _print_validation_metrics(hofs, X_val, Y_val, out_types, dp)
+                        if _FITNESS_CACHE.hits + _FITNESS_CACHE.misses > 0:
+                            print(f"  [Cache] {_FITNESS_CACHE.stats_str()}")
 
-                if SIMPLIFICATION_FREQ > 0 and gen % SIMPLIFICATION_FREQ == 0:
-                    print(f"\n[Gen {gen}] Running algebraic simplification pass…")
-                    for s in range(N_STAGES):
-                        pseudo_isl = [[stage_pops[s][j]] for j in range(n_outputs)]
-                        apply_simplification_pass(pseudo_isl, hofs, X, Y, out_types)
-                        for j in range(n_outputs):
-                            stage_pops[s][j] = pseudo_isl[j][0]
+                    if SIMPLIFICATION_FREQ > 0 and gen % SIMPLIFICATION_FREQ == 0:
+                        print(f"\n[Gen {gen}] Running algebraic simplification pass…")
+                        for s in range(N_STAGES):
+                            pseudo_isl = [[stage_pops[s][j]] for j in range(n_outputs)]
+                            apply_simplification_pass(pseudo_isl, hofs, X, Y, out_types)
+                            for j in range(n_outputs):
+                                stage_pops[s][j] = pseudo_isl[j][0]
 
-                if perfect_outputs and gen % max(
-                        100,
-                        SIMPLIFICATION_FREQ if SIMPLIFICATION_FREQ > 0 else 100) == 0:
-                    for o_idx in perfect_outputs:
-                        _simplify_perfect_output(
-                            hofs[o_idx], X, Y[:, o_idx], out_types[o_idx],
-                            target_grads=target_grads_list[o_idx])
-
-                if BATCH_SIZE > 0 and gen > 0 and gen % 200 == 0:
-                    for o_idx, hof in enumerate(hofs):
-                        for ind in hof.best_by_complexity.values():
-                            ind.affine_fitted = False
-                            ind.calculate_fitness(
-                                X, Y[:, o_idx], out_types[o_idx],
-                                update_affine=True,
+                    if perfect_outputs and gen % max(
+                            100,
+                            SIMPLIFICATION_FREQ if SIMPLIFICATION_FREQ > 0 else 100) == 0:
+                        for o_idx in perfect_outputs:
+                            _simplify_perfect_output(
+                                hofs[o_idx], X, Y[:, o_idx], out_types[o_idx],
                                 target_grads=target_grads_list[o_idx])
 
-                if gen > 0 and gen % 1000 == 0:
-                    _deep_optimize_hofs(hofs, X, Y, out_types)
+                    if BATCH_SIZE > 0 and gen > 0 and gen % 200 == 0:
+                        for o_idx, hof in enumerate(hofs):
+                            for ind in hof.best_by_complexity.values():
+                                ind.affine_fitted = False
+                                ind.calculate_fitness(
+                                    X, Y[:, o_idx], out_types[o_idx],
+                                    update_affine=True,
+                                    target_grads=target_grads_list[o_idx])
+
+                    if gen > 0 and gen % 1000 == 0:
+                        _deep_optimize_hofs(hofs, X, Y, out_types)
 
         except KeyboardInterrupt:
             print("\nStopping Evolution…")
