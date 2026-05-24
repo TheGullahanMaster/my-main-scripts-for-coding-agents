@@ -14020,8 +14020,12 @@ def evolve_afpo(population, X, y_target, type_code,
 
 def evolve_afpo_stage_worker(args_bundle):
     args, s, i, adf_registry = args_bundle
+
+    # Sync ADF registry into this worker process
     global _ADF_REGISTRY
     _ADF_REGISTRY = list(adf_registry)
+    for d in _ADF_REGISTRY:
+        _register_adf_from_dict(d)
 
     local_hof = HallOfFame()
 
@@ -14089,6 +14093,8 @@ def evolve_afpo_island_chunk(args):
     # Sync ADF registry into this worker process
     global _ADF_REGISTRY
     _ADF_REGISTRY = list(adf_registry)
+    for d in _ADF_REGISTRY:
+        _register_adf_from_dict(d)
 
     local_hof = HallOfFame()
     population, local_stag = evolve_afpo(
@@ -25150,7 +25156,7 @@ def train_mode():
         _meta_last_imp_gen = 0
         _meta_fires       = 0
         try:
-            with ThreadPoolExecutor(max_workers=min(n_outputs, 8)) as executor:
+            with concurrent.futures.ProcessPoolExecutor(max_workers=min(n_outputs, 8)) as executor:
                 while True:
                     batch_idx = (np.random.choice(X.shape[0], BATCH_SIZE, replace=False) if BATCH_SIZE > 0 else None)
                     X_b = X[batch_idx] if batch_idx is not None else X
@@ -25521,7 +25527,7 @@ def train_mode():
         gen = 0
         perfect_outputs = set()
         try:
-            with ThreadPoolExecutor(max_workers=min(N_STAGES * n_outputs, 8)) as executor:
+            with concurrent.futures.ProcessPoolExecutor(max_workers=min(N_STAGES * n_outputs, 8)) as executor:
                 while True:
                     batch_idx = (np.random.choice(X.shape[0], BATCH_SIZE, replace=False) if BATCH_SIZE > 0 else None)
                     X_b = X[batch_idx] if batch_idx is not None else X
