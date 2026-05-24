@@ -13478,6 +13478,16 @@ def evolve_afpo(population, X, y_target, type_code,
         for ind in population:
             ind.age += 1
 
+        # ── AFPO Invariant: Inject one pure random age=0 individual per generation ──
+        try:
+            _rand_imm = Individual(random_cgp(n_features, CGP_NODES, feat_names))
+            _rand_imm.age = 0
+            _rand_imm.calculate_fitness(X, y_target, type_code, bg_logits=bg_logits, class_idx_in_group=class_idx_in_group, Y_group=Y_group, target_grads=target_grads)
+            population.append(_rand_imm)
+            population = _trim_to_pareto_front_3obj(population, target_size)
+        except (ValueError, FloatingPointError, ArithmeticError, RuntimeError, OverflowError):
+            pass
+
         # ── Mid-chunk champion re-injection ──────────────────────────────────
         # The Pareto trim now protects the current champion, but if a better
         # child dethrones it mid-chunk the old champion may age out before the
