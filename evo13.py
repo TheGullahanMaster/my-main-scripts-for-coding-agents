@@ -13430,7 +13430,7 @@ def evolve_afpo(population, X, y_target, type_code,
                 n_features, feat_names, target_size,
                 n_generations, hof, stag_counter, ext_patience,
                 bg_logits=None, class_idx_in_group=None, Y_group=None,
-                target_grads=None):
+                target_grads=None, stage_frac=None):
     """
     Age-Fitness Pareto Optimisation (AFPO) — single-process evolution loop.
 
@@ -13447,6 +13447,15 @@ def evolve_afpo(population, X, y_target, type_code,
 
     bg_logits / class_idx_in_group / Y_group: forwarded to all fitness calls
     for joint softmax CE when this output belongs to a multi-class group.
+
+    stage_frac: when running inside a multi-stage AFPO pipeline, the
+    caller passes the stage's position in [0.0, 1.0] (0 = earliest stage,
+    1 = latest).  We then tilt the base reproductive-operator weights
+    along an explore→exploit gradient so earlier stages structurally
+    diversify (grow / graft / crossover / semantic_xover) and later
+    stages exploit the inherited material (mutate / optimize / boost).
+    ``None`` (default) leaves the weights untilted — used by single-stage
+    AFPO and the islanded-AFPO path.
     """
     MACRO_P_GROW  = 0.07    # was 0.05
     MACRO_P_PRUNE = 0.04    # was 0.05
@@ -13459,6 +13468,25 @@ def evolve_afpo(population, X, y_target, type_code,
     # the comment there for why mutate dropped from 3.5 to 2.0 and structural
     # ops are bumped.
     _repro_weights_base = [2.0, 1.6, 1.4, 1.0, 0.6, 1.0, 1.2, 0.5, 0.2, 0.5, 0.8, 0.3, 1.5 if IF_ELSE_ENABLED else 0.0, 1.4, 1.4]
+
+    # ── Stage-aware tilt for multi-stage AFPO ────────────────────────────
+    # Apply BEFORE constructing the AdaptiveMutationTracker so its base
+    # weights reflect the stage role from generation 0.  Multipliers are
+    # symmetric around 1.0 so the geometric mean of explore_mult and
+    # exploit_mult stays ≈ 1, keeping total reproductive volume stable.
+    if stage_frac is not None:
+        sf = float(np.clip(stage_frac, 0.0, 1.0))
+        explore_mult = 1.7 - 1.1 * sf   # 1.7 (early) → 0.6 (late)
+        exploit_mult = 0.6 + 1.1 * sf   # 0.6 (early) → 1.7 (late)
+        _explore_ops = {'grow', 'graft', 'nest', 'inject',
+                        'semantic_xover', 'crossover', 'div', 'trig'}
+        _exploit_ops = {'mutate', 'optimize', 'boost', 'ablate'}
+        _repro_weights_base = [
+            (w * explore_mult if op in _explore_ops else
+             w * exploit_mult if op in _exploit_ops else w)
+            for w, op in zip(_repro_weights_base, _repro_ops_base)
+        ]
+
     _mut_tracker = AdaptiveMutationTracker(_repro_ops_base, _repro_weights_base, alpha=0.07)
 
     # ── IMPROVEMENT: Operator affinity (updated every 200 gens) ───────────
@@ -14094,10 +14122,19 @@ def evolve_afpo_stage_worker(args_bundle):
 
     local_hof = HallOfFame()
 
-    (pop, X_b, Y_b, out_type,
-     n_features, feat_names, AFPO_POP_SIZE,
-     chunk_freq_a, stag_cntrs, EXTINCTION_PATIENCE,
-     col_bg_a, local_k_a, Y_group_a, target_grads) = args
+    # Backward-compatible unpack: pre-stage-tilt callers passed a 14-tuple,
+    # current callers append `stage_frac` for staged AFPO operator tilt.
+    if len(args) == 15:
+        (pop, X_b, Y_b, out_type,
+         n_features, feat_names, AFPO_POP_SIZE,
+         chunk_freq_a, stag_cntrs, EXTINCTION_PATIENCE,
+         col_bg_a, local_k_a, Y_group_a, target_grads, stage_frac) = args
+    else:
+        (pop, X_b, Y_b, out_type,
+         n_features, feat_names, AFPO_POP_SIZE,
+         chunk_freq_a, stag_cntrs, EXTINCTION_PATIENCE,
+         col_bg_a, local_k_a, Y_group_a, target_grads) = args
+        stage_frac = None
 
     ret_pop, stag = evolve_afpo(
         pop, X_b, Y_b, out_type,
@@ -14105,7 +14142,7 @@ def evolve_afpo_stage_worker(args_bundle):
         chunk_freq_a,            # generations per chunk
         local_hof, stag_cntrs, EXTINCTION_PATIENCE,
         bg_logits=col_bg_a, class_idx_in_group=local_k_a, Y_group=Y_group_a,
-        target_grads=target_grads
+        target_grads=target_grads, stage_frac=stage_frac,
     )
     return ret_pop, stag, s, i, local_hof
 
@@ -25388,7 +25425,8 @@ def train_mode():
                             n_features, feat_names, AFPO_POP_SIZE,
                             chunk_freq_a,            # generations per chunk
                             stag_cntrs[i], EXTINCTION_PATIENCE,
-                            col_bg_a, local_k_a, Y_group_a, target_grads_list[i]
+                            col_bg_a, local_k_a, Y_group_a, target_grads_list[i],
+                            None,                    # stage_frac: single-stage = neutral weights
                         )
                         futures.append(executor.submit(evolve_afpo_stage_worker, (args, 0, i, list(_ADF_REGISTRY))))
 
@@ -25736,11 +25774,15 @@ def train_mode():
                                     elite.age = 0
                                     stage_pops[s][i].append(elite)
 
+                            # Stage-aware operator tilt: 0.0 (earliest stage =
+                            # exploration-biased) → 1.0 (latest = exploitation).
+                            stage_frac_si = (s / max(1, N_STAGES - 1)) if N_STAGES > 1 else None
                             args = (
                                 stage_pops[s][i], X_b, Y_b[:, i], out_types[i],
                                 n_features, feat_names, AFPO_POP_SIZE,
                                 MIGRATION_FREQ, stag_cntrs[s][i], EXTINCTION_PATIENCE,
-                                col_bg_sa, local_k_sa, Y_group_sa, target_grads_list[i]
+                                col_bg_sa, local_k_sa, Y_group_sa, target_grads_list[i],
+                                stage_frac_si,
                             )
                             futures.append(executor.submit(evolve_afpo_stage_worker, (args, s, i, list(_ADF_REGISTRY))))
 
@@ -25760,38 +25802,95 @@ def train_mode():
 
                     gen += MIGRATION_FREQ
 
-                    # Graduation: best of stage s → stage s+1
+                    # ── Diversity-aware graduation: best-of-stage s → stage s+1 ──
+                    # The earlier version promoted only the single fitness
+                    # champion per (stage, output) pair and refilled the
+                    # vacated source slot with one mutated HoF entry.  That
+                    # repeatedly delivered the same high-fitness specialist
+                    # to later stages, which tended to collapse them into
+                    # the source stage's basin and waste the pipeline's
+                    # diversification potential.  We now promote a small
+                    # Pareto-diverse migrant set (fitness champion + low-
+                    # complexity viable + phenotypically novel) and refill
+                    # the source with a matching diverse pulse — HoF mutant
+                    # plus residual-aware seeds (where additive
+                    # decomposition is valid) plus random_cgp pad — letting
+                    # the 3-objective Pareto trim decide who survives in
+                    # both stages.  ``N_GRADUATES`` scales modestly with
+                    # pool size so very small pools still graduate one.
                     if gen % GRAD_FREQ_SA == 0:
+                        N_GRADUATES = max(1, min(3, AFPO_POP_SIZE // 50))
+                        _probe = X_b[:min(32, X_b.shape[0])] if X_b.shape[0] > 0 else None
+                        n_grad_total = 0
                         for s in range(N_STAGES - 1):
                             ns = s + 1
                             for i in range(n_outputs):
+                                if i in perfect_outputs:
+                                    continue
                                 src = stage_pops[s][i]
                                 dst = stage_pops[ns][i]
                                 if not src or not dst:
                                     continue
-                                champion = min(src, key=lambda x: x.fitness)
-                                graduate = copy.deepcopy(champion)
-                                graduate.age = 0
-                                worst = max(dst, key=lambda x: x.fitness)
-                                dst.remove(worst)
-                                dst.append(graduate)
+
+                                # ── Promote diverse migrants ──────────────
+                                graduates = _select_diverse_migrants(
+                                    src, n_migrants=N_GRADUATES, X_probe=_probe)
+                                if not graduates:
+                                    continue
+                                for g in graduates:
+                                    dst.append(g)
+                                stage_pops[ns][i] = _trim_to_pareto_front_3obj(
+                                    dst, AFPO_POP_SIZE)
+                                n_grad_total += len(graduates)
+
+                                # ── Replenish source with a diverse pulse ──
+                                n_repl   = len(graduates)
+                                replenish: list = []
                                 hof_best = hofs[i].get_best_overall()
                                 if hof_best is not None:
-                                    tree = mutate(hof_best.tree, n_features,
-                                                  feat_names, mut_rate=CGP_MUT_RATE)
-                                    new_ind = Individual(tree)
-                                else:
-                                    new_ind = Individual(
-                                        random_cgp(n_features, CGP_NODES, feat_names))
-                                new_ind.age = 0
-                                new_ind.calculate_fitness(
-                                    X_b, Y_b[:, i], out_types[i],
-                                    target_grads=target_grads_list[i])
-                                if src:
-                                    weak = max(src, key=lambda x: x.fitness)
-                                    src.remove(weak)
-                                src.append(new_ind)
-                        print(f"  [Gen {gen}] Stage graduation cycle complete.")
+                                    try:
+                                        tree = mutate(hof_best.tree, n_features,
+                                                      feat_names,
+                                                      mut_rate=CGP_MUT_RATE)
+                                        replenish.append(Individual(tree))
+                                    except Exception:
+                                        pass
+                                # Residual-aware seeds only when additive
+                                # residual decomposition is meaningful — skip
+                                # classification + joint-softmax outputs.
+                                is_cls_i  = (out_types[i] == 6)
+                                in_grp_i  = (i in out_group_info_sa)
+                                if (hof_best is not None and not is_cls_i
+                                        and not in_grp_i
+                                        and len(replenish) < n_repl):
+                                    try:
+                                        res_seeds = generate_residual_aware_seeds(
+                                            n_features, feat_names,
+                                            X_b, Y_b[:, i], hof_best,
+                                            max_seeds=max(2, n_repl - len(replenish)))
+                                        replenish.extend(
+                                            res_seeds[:n_repl - len(replenish)])
+                                    except Exception:
+                                        pass
+                                while len(replenish) < n_repl:
+                                    replenish.append(Individual(random_cgp(
+                                        n_features, CGP_NODES, feat_names)))
+
+                                for r in replenish[:n_repl]:
+                                    r.age = 0
+                                    try:
+                                        r.calculate_fitness(
+                                            X_b, Y_b[:, i], out_types[i],
+                                            target_grads=target_grads_list[i])
+                                    except Exception:
+                                        r.fitness = 1e10
+                                        r.loss = 1e10
+                                    src.append(r)
+                                stage_pops[s][i] = _trim_to_pareto_front_3obj(
+                                    src, AFPO_POP_SIZE)
+                        print(f"  [Gen {gen}] Stage graduation cycle complete  "
+                              f"({n_grad_total} migrant(s) promoted across "
+                              f"{N_STAGES - 1} transition(s)).")
 
                     print(f"--- Generation {gen} ---")
 
