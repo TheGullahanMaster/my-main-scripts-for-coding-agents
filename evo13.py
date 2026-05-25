@@ -4,11 +4,13 @@ import random
 import copy
 import time
 import sys
+import os
 import pickle
 import base64
 import warnings
 import re
 import hashlib
+import threading
 from collections import Counter
 import networkx as nx
 from networkx.algorithms.community import greedy_modularity_communities
@@ -695,6 +697,13 @@ class _FitnessCache:
         self._maxsize = maxsize
         self.hits = 0
         self.misses = 0
+        # Guard the eviction loop + (_cache, _order) pair against torn updates
+        # when re-scoring HoFs is parallelised across outputs with threads.
+        # Dict get and single put are atomic in CPython, but the size-check
+        # → evict → insert sequence is not — under contention the _order list
+        # and _cache dict could disagree on which keys are tracked, causing
+        # KeyErrors on later eviction.
+        self._lock = threading.Lock()
 
     def _fingerprint(self, tree) -> tuple:
         """
@@ -751,21 +760,23 @@ class _FitnessCache:
         """Store result dict for this tree's fingerprint AND target."""
         fp = (self._fingerprint(tree), self._target_sig(y_target))
 
-        if fp in self._cache:
+        with self._lock:
+            if fp in self._cache:
+                self._cache[fp] = result
+                return
+            if len(self._cache) >= self._maxsize:
+                # FIFO eviction: drop oldest 20 % by insertion order.
+                evict_n = max(1, self._maxsize // 5)
+                for old_fp in self._order[:evict_n]:
+                    self._cache.pop(old_fp, None)
+                self._order = self._order[evict_n:]
             self._cache[fp] = result
-            return
-        if len(self._cache) >= self._maxsize:
-            # FIFO eviction: drop oldest 20 % by insertion order.
-            evict_n = max(1, self._maxsize // 5)
-            for old_fp in self._order[:evict_n]:
-                self._cache.pop(old_fp, None)
-            self._order = self._order[evict_n:]
-        self._cache[fp] = result
-        self._order.append(fp)
+            self._order.append(fp)
 
     def clear(self):
-        self._cache.clear()
-        self._order.clear()
+        with self._lock:
+            self._cache.clear()
+            self._order.clear()
 
     def stats_str(self) -> str:
         total = self.hits + self.misses
@@ -2406,6 +2417,7 @@ def apply_simplification_pass(islands_pop, hofs, X, Y, out_types, target_grads_l
             if nc not in new_dict or ind.loss < new_dict[nc].loss:
                 new_dict[nc] = ind
         hof.best_by_complexity = new_dict
+        hof._bump_version()
         # Purge zombies exposed by new complexities / losses after simplification
         hof.sanitize()
 
@@ -3899,6 +3911,20 @@ class CGPEquation:
 class HallOfFame:
     def __init__(self):
         self.best_by_complexity = {}
+        # Version counter and one-slot cache for `get_best_overall`.  The
+        # PySR-scored "best" depends only on the contents of
+        # `best_by_complexity`; recomputing it on every elitist injection,
+        # `_check_output_perfect`, `build_bg_logits` and meta-extinction
+        # check costs an avoidable sort + iter per call.  Bumping the
+        # version on every mutating op (`update`, `_evict_dominated_by`,
+        # `sanitize`, direct `best_by_complexity` rebinding via `clear`)
+        # invalidates the cache exactly when it should.
+        self._version = 0
+        self._best_cache_version = -1
+        self._best_cache = None
+
+    def _bump_version(self):
+        self._version += 1
 
     def update(self, individual):
         c = individual.complexity
@@ -3910,10 +3936,12 @@ class HallOfFame:
         if c not in self.best_by_complexity:
             self.best_by_complexity[c] = copy.deepcopy(individual)
             self._evict_dominated_by(c)
+            self._bump_version()
             return True
         elif individual.loss < self.best_by_complexity[c].loss:
             self.best_by_complexity[c] = copy.deepcopy(individual)
             self._evict_dominated_by(c)
+            self._bump_version()
             return True
         return False
 
@@ -3945,8 +3973,10 @@ class HallOfFame:
                 # ref is dominated — but we just put it there, so don't remove ref.
                 # Instead, note it won't survive but keep it since it was just placed.
                 pass
-        for c in to_remove:
-            del self.best_by_complexity[c]
+        if to_remove:
+            for c in to_remove:
+                del self.best_by_complexity[c]
+            self._bump_version()
 
     def sanitize(self):
         """
@@ -3989,6 +4019,8 @@ class HallOfFame:
 
         self.best_by_complexity = clean
         removed = before - len(self.best_by_complexity)
+        if removed:
+            self._bump_version()
         return removed
     def compute_pysr_scores(self):
         """Calculate PySR's -d(log(loss)) / d(complexity) score for the Pareto front."""
@@ -4023,6 +4055,13 @@ class HallOfFame:
         return scores
     def get_best_overall(self):
         if not self.best_by_complexity: return None
+        # Single-slot memoization: get_best_overall is called many times per
+        # chunk (elitist injection, perfect-check, bg-logits, meta-extinction
+        # plateau check, ...) but its result only depends on
+        # `best_by_complexity`, which we track via `_version`.
+        if self._best_cache_version == self._version and self._best_cache is not None:
+            return self._best_cache
+
         scores = self.compute_pysr_scores()
 
         min_loss = min(ind.loss for ind in self.best_by_complexity.values())
@@ -4030,10 +4069,13 @@ class HallOfFame:
 
         valid_complexities = [c for c, ind in self.best_by_complexity.items() if ind.loss <= threshold]
         if not valid_complexities:
-            return min(self.best_by_complexity.values(), key=lambda x: x.loss)
-
-        best_c = max(valid_complexities, key=lambda c: scores[c])
-        return self.best_by_complexity[best_c]
+            best = min(self.best_by_complexity.values(), key=lambda x: x.loss)
+        else:
+            best_c = max(valid_complexities, key=lambda c: scores[c])
+            best = self.best_by_complexity[best_c]
+        self._best_cache = best
+        self._best_cache_version = self._version
+        return best
 
     def print_frontier(self, out_type=5, label=""):
         is_cls = (out_type == 6)
@@ -14032,6 +14074,16 @@ def evolve_afpo(population, X, y_target, type_code,
 
 
 def evolve_afpo_stage_worker(args_bundle):
+    """ProcessPoolExecutor wrapper for one (stage, output) chunk of staged AFPO.
+
+    Mirrors `evolve_afpo_island_chunk`: sync the ADF registry into this
+    worker process, run one chunk of `evolve_afpo`, return enough metadata
+    for the parent to merge state back.  The ADF-registration loop is
+    essential — without it, extracted operators are present in
+    `_ADF_REGISTRY` but never inserted into the op tables, so any tree
+    referencing one of them fails to evaluate and the worker silently
+    falls back to NaN losses.
+    """
     args, s, i, adf_registry = args_bundle
 
     # Sync ADF registry into this worker process
@@ -14039,29 +14091,6 @@ def evolve_afpo_stage_worker(args_bundle):
     _ADF_REGISTRY = list(adf_registry)
     for d in _ADF_REGISTRY:
         _register_adf_from_dict(d)
-
-    local_hof = HallOfFame()
-
-    (pop, X_b, Y_b, out_type,
-     n_features, feat_names, AFPO_POP_SIZE,
-     chunk_freq_a, stag_cntrs, EXTINCTION_PATIENCE,
-     col_bg_a, local_k_a, Y_group_a, target_grads) = args
-
-    ret_pop, stag = evolve_afpo(
-        pop, X_b, Y_b, out_type,
-        n_features, feat_names, AFPO_POP_SIZE,
-        chunk_freq_a,            # generations per chunk
-        local_hof, stag_cntrs, EXTINCTION_PATIENCE,
-        bg_logits=col_bg_a, class_idx_in_group=local_k_a, Y_group=Y_group_a,
-        target_grads=target_grads
-    )
-    return ret_pop, stag, s, i, local_hof
-
-
-def evolve_afpo_stage_worker(args_bundle):
-    args, s, i, adf_registry = args_bundle
-    global _ADF_REGISTRY
-    _ADF_REGISTRY = list(adf_registry)
 
     local_hof = HallOfFame()
 
@@ -14218,6 +14247,75 @@ def _meta_extinction(islands_pop, hofs, X, Y, out_types,
         pass
 
 
+def _hof_executor_workers(active_count, cap=8):
+    """Pick a sensible ThreadPoolExecutor width for per-output HoF work.
+
+    The hot loops are numpy-bound (most of `calculate_fitness` /
+    `optimize_constants` is BLAS) so threads get real parallelism by
+    releasing the GIL.  Width caps at `cap` because beyond ~8 the per-task
+    overhead and contention on the fitness cache eat the wins on typical
+    workstation CPUs.
+    """
+    if active_count <= 1:
+        return 1
+    return min(active_count, max(1, os.cpu_count() or cap), cap)
+
+
+def _parallel_rescore_hofs(hofs, X, Y, out_types, target_grads_list,
+                           perfect_outputs=None, refit_affine=True,
+                           label=None):
+    """Re-score every HoF entry on the full dataset, parallelised per-output.
+
+    Used in five places — init (post-subsample) and the periodic full-data
+    rescoring inside the main loop of every evolution mode.  Each output owns
+    an independent HoF and target column so the per-output work is fully
+    parallel; we use a ThreadPoolExecutor because `calculate_fitness` is
+    almost entirely numpy (GIL-released BLAS) and threads avoid the
+    process-fork / pickle round-trip cost of `ProcessPoolExecutor`.
+
+    `refit_affine=True` clears `affine_fitted` on every HoF entry so the
+    affine snaps to the current full-data fit.  Init paths need this to
+    correct the subsample-biased affine; periodic re-scoring needs it
+    because const-opt, boost stages and adaptive parsimony silently drift
+    the affine over a long run.
+
+    `perfect_outputs` (set of indices) is skipped — those HoFs are locked
+    in and don't need further work.
+    """
+    n_outputs = len(hofs)
+    if n_outputs == 0:
+        return
+    perfect_outputs = perfect_outputs or set()
+    active_outs = [i for i in range(n_outputs) if i not in perfect_outputs]
+    if not active_outs:
+        return
+
+    def _rescore_one(o_idx):
+        hof = hofs[o_idx]
+        if not hof.best_by_complexity:
+            return
+        y_col = Y[:, o_idx]
+        otype = out_types[o_idx]
+        tg    = target_grads_list[o_idx] if target_grads_list is not None else None
+        for ind in hof.best_by_complexity.values():
+            if refit_affine:
+                ind.affine_fitted = False
+            ind.calculate_fitness(X, y_col, otype,
+                                  update_affine=refit_affine,
+                                  target_grads=tg)
+        # Loss / affine were mutated in place on the HoF entries; bump the
+        # version so cached `get_best_overall` results reflect new losses.
+        hof._bump_version()
+
+    n_workers = _hof_executor_workers(len(active_outs))
+    if n_workers <= 1:
+        for o in active_outs:
+            _rescore_one(o)
+        return
+    with ThreadPoolExecutor(max_workers=n_workers) as ex:
+        list(ex.map(_rescore_one, active_outs))
+
+
 def _deep_optimize_hofs(hofs, X, Y, out_types,
                         max_rows=1000, top_k=5,
                         n_restarts=3, max_iter=150):
@@ -14234,16 +14332,25 @@ def _deep_optimize_hofs(hofs, X, Y, out_types,
       n_restarts — fewer restarts than the in-loop 10% chance pass.
       max_iter   — tighter iteration budget per restart.
 
+    Per-output work is parallelised across a ThreadPoolExecutor — each
+    output's Nelder-Mead restarts are independent (different target column,
+    different HoF) and `optimize_constants` releases the GIL inside its
+    numpy/scipy primitives, so threads give near-linear speedup.
+
     Prints a one-line summary per output instead of per-individual chatter.
     """
+    n_outputs = len(hofs)
+    if n_outputs == 0:
+        return
     N = X.shape[0]
     cap = min(max_rows, N)
     print(f"\n[Deep-Opt] Optimizing top-{top_k} HoF entries "
           f"(dataset cap={cap}/{N} rows, {n_restarts} restarts × {max_iter} iters)…")
 
-    for out_idx, h in enumerate(hofs):
+    def _opt_one(out_idx):
+        h = hofs[out_idx]
         if not h.best_by_complexity:
-            continue
+            return (out_idx, 0, 0, None, 0)
 
         # Rank entries by loss, take top-k
         ranked = sorted(h.best_by_complexity.values(), key=lambda x: x.loss)
@@ -14266,13 +14373,25 @@ def _deep_optimize_hofs(hofs, X, Y, out_types,
             if c not in new_dict or ind.loss < new_dict[c].loss:
                 new_dict[c] = ind
         h.best_by_complexity = new_dict
+        h._bump_version()  # dict rebind invalidates `get_best_overall` cache
 
         # Purge zombie entries: ceiling violations + cross-complexity dominated slots
         n_removed = h.sanitize()
-
         best = h.get_best_overall()
-        if best:
-            print(f"  Out {out_idx}: {len(targets)} optimized, "
+        return (out_idx, len(targets), improved, best, n_removed)
+
+    n_workers = _hof_executor_workers(n_outputs)
+    if n_workers <= 1:
+        results = [_opt_one(i) for i in range(n_outputs)]
+    else:
+        with ThreadPoolExecutor(max_workers=n_workers) as ex:
+            results = list(ex.map(_opt_one, range(n_outputs)))
+
+    # Sequential, ordered prints so log output stays deterministic regardless
+    # of completion order.
+    for (out_idx, n_targets, improved, best, n_removed) in results:
+        if best is not None:
+            print(f"  Out {out_idx}: {n_targets} optimized, "
                   f"{improved} improved | best loss={best.loss:.5f}"
                   + (f" | evicted {n_removed} zombie(s)" if n_removed else ""))
 
@@ -14401,6 +14520,16 @@ def detect_class_groups(dp, out_types):
     return groups
 
 
+# Build-bg cache for non-batch mode: in non-batch runs `X_b is X` (the full
+# training matrix, same object every chunk), and each class's HoF best tree
+# changes only when `hofs[k].update(...)` produces a new entry.  Caching by
+# `(id(X), tuple of best-tree id per class)` lets us skip the per-class
+# tree.evaluate(X) on chunks where nothing relevant changed.  In batch mode
+# X is a fresh slice each chunk so id(X) differs and the cache stays cold —
+# no overhead, no stale logits.
+_BG_LOGITS_CACHE: dict = {}
+_BG_LOGITS_CACHE_MAX = 8
+
 def build_bg_logits(hofs, group_indices, X):
     """
     Build a background logits matrix (N, n_classes) for a class group.
@@ -14412,12 +14541,21 @@ def build_bg_logits(hofs, group_indices, X):
 
     Returns: numpy array shape (N, n_classes), dtype float64.
     """
+    # Cache key uses id(X) and per-class best-tree identity.  When any HoF
+    # `update` lands a new tree at the best slot, its deepcopy produces a new
+    # tree id, so the entry naturally invalidates without an explicit signal.
+    bests = [hofs[gk].get_best_overall() for gk in group_indices]
+    cache_key = (id(X),
+                 tuple(id(b.tree) if b is not None else None for b in bests))
+    cached = _BG_LOGITS_CACHE.get(cache_key)
+    if cached is not None and cached.shape[0] == X.shape[0]:
+        return cached
+
     N        = X.shape[0]
     n_cls    = len(group_indices)
     bg       = np.zeros((N, n_cls), dtype=np.float64)
 
-    for local_k, global_k in enumerate(group_indices):
-        best = hofs[global_k].get_best_overall()
+    for local_k, best in enumerate(bests):
         if best is not None:
             try:
                 preds = best.tree.evaluate(X)
@@ -14444,6 +14582,15 @@ def build_bg_logits(hofs, group_indices, X):
             except Exception:
                 pass  # leave column as 0.0
 
+    # Bounded FIFO insert.  Eight slots is enough for the small number of
+    # distinct X arrays in flight (typically just the training X and maybe
+    # the validation X); larger would just keep stale ids around.
+    if len(_BG_LOGITS_CACHE) >= _BG_LOGITS_CACHE_MAX:
+        try:
+            _BG_LOGITS_CACHE.pop(next(iter(_BG_LOGITS_CACHE)))
+        except StopIteration:
+            pass
+    _BG_LOGITS_CACHE[cache_key] = bg
     return bg
 
 
@@ -19727,6 +19874,7 @@ def run_bayesian_afpo(X, Y, n_features, n_outputs, feat_names, out_types,
                         if nc not in new_dict or ind.loss < new_dict[nc].loss:
                             new_dict[nc] = ind
                     hof.best_by_complexity = new_dict
+                    hof._bump_version()
                     hof.sanitize()
 
     except KeyboardInterrupt:
@@ -20314,6 +20462,7 @@ def run_bayesian_islands(X, Y, n_features, n_outputs, feat_names, out_types,
                         if nc not in new_dict or ind.loss < new_dict[nc].loss:
                             new_dict[nc] = ind
                     hof.best_by_complexity = new_dict
+                    hof._bump_version()
                     hof.sanitize()
 
     except KeyboardInterrupt:
@@ -20872,6 +21021,7 @@ def run_bayesian_islanded_afpo(X, Y, n_features, n_outputs, feat_names, out_type
                         if nc not in new_dict or ind.loss < new_dict[nc].loss:
                             new_dict[nc] = ind
                     hof.best_by_complexity = new_dict
+                    hof._bump_version()
                     hof.sanitize()
 
     except KeyboardInterrupt:
@@ -21620,6 +21770,7 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
                         if nc not in new_dict or ind.loss < new_dict[nc].loss:
                             new_dict[nc] = ind
                     hof.best_by_complexity = new_dict
+                    hof._bump_version()
                     hof.sanitize()
 
             # ── Deep constant optimisation ────────────────────────────────
@@ -22439,6 +22590,7 @@ def run_bayesian_qd(X, Y, n_features, n_outputs, feat_names, out_types,
                         if nc not in new_dict or ind.loss < new_dict[nc].loss:
                             new_dict[nc] = ind
                     hof.best_by_complexity = new_dict
+                    hof._bump_version()
                     hof.sanitize()
 
             if iteration > 0 and iteration % 50 == 0:
@@ -24781,11 +24933,7 @@ def train_mode():
         # Re-evaluate HoF on full data for accurate scoring
         if N_train > _INIT_SUBSAMPLE_CAP:
             print("  Re-scoring Hall of Fame on full dataset…")
-            for i in range(n_outputs):
-                for ind in hofs[i].best_by_complexity.values():
-                    ind.affine_fitted = False   # allow re-fitting on full data
-                    ind.calculate_fitness(X, Y[:, i], out_types[i],
-                                          target_grads=target_grads_list[i])
+            _parallel_rescore_hofs(hofs, X, Y, out_types, target_grads_list)
         _INIT_PHASE = False
 
         # ── Detect multi-class groups for joint softmax CE ──────────────────
@@ -24815,8 +24963,17 @@ def train_mode():
         _meta_best_loss   = float('inf')
         _meta_last_imp_gen = 0
         _meta_fires       = 0
+        # Worker pool sized to the total parallel task count.  Each chunk
+        # submits NUM_ISLANDS × n_outputs futures (every (island, output)
+        # pair is an independent population), so capping max_workers at
+        # NUM_ISLANDS leaves up to (n_outputs-1)× futures queued behind the
+        # first batch — a multi-output run with one worker per island
+        # is effectively single-output-throughput.  Cap at the host CPU
+        # count (or 8 if unknown) to avoid pickling/scheduling overhead.
+        _island_workers = min(NUM_ISLANDS * max(1, n_outputs),
+                              max(1, os.cpu_count() or 8))
         try:
-            with concurrent.futures.ProcessPoolExecutor(max_workers=NUM_ISLANDS) as executor:
+            with concurrent.futures.ProcessPoolExecutor(max_workers=_island_workers) as executor:
                 while True:
                     batch_idx = (np.random.choice(X.shape[0], BATCH_SIZE, replace=False)
                                  if BATCH_SIZE > 0 else None)
@@ -25060,13 +25217,19 @@ def train_mode():
                     # all HoF entries on the true full dataset so affine parameters
                     # are accurate and entries are correctly ranked.
                     if BATCH_SIZE > 0 and gen > 0 and gen % 200 == 0:
-                        for o_idx, hof in enumerate(hofs):
-                            for ind in hof.best_by_complexity.values():
-                                ind.affine_fitted = False
-                                ind.calculate_fitness(
-                                    X, Y[:, o_idx], out_types[o_idx],
-                                    update_affine=True,
-                                    target_grads=target_grads_list[o_idx])
+                        _parallel_rescore_hofs(hofs, X, Y, out_types,
+                                               target_grads_list,
+                                               perfect_outputs=perfect_outputs)
+
+                    # ---- Periodic HoF re-scoring on full data (non-batch mode) ----
+                    # Even without minibatching the constant-optimiser, boost
+                    # stages and adaptive parsimony silently drift affine_a/b
+                    # away from their unbiased fit over a long run, which makes
+                    # cross-complexity ranking unreliable.  Re-fit every 500 gens.
+                    if BATCH_SIZE <= 0 and gen > 0 and gen % 500 == 0:
+                        _parallel_rescore_hofs(hofs, X, Y, out_types,
+                                               target_grads_list,
+                                               perfect_outputs=perfect_outputs)
 
                     # ---- Deep constant optimisation ----
                     if gen > 0 and gen % 1000 == 0:
@@ -25131,11 +25294,7 @@ def train_mode():
 
         if N_train > _INIT_SUBSAMPLE_CAP:
             print("  Re-scoring Hall of Fame on full dataset…")
-            for i in range(n_outputs):
-                for ind in hofs[i].best_by_complexity.values():
-                    ind.affine_fitted = False
-                    ind.calculate_fitness(X, Y[:, i], out_types[i],
-                                          target_grads=target_grads_list[i])
+            _parallel_rescore_hofs(hofs, X, Y, out_types, target_grads_list)
         _INIT_PHASE = False
 
         # ── Detect multi-class groups for joint softmax CE ──────────────────
@@ -25168,8 +25327,11 @@ def train_mode():
         _meta_best_loss   = float('inf')
         _meta_last_imp_gen = 0
         _meta_fires       = 0
+        # n_outputs futures per chunk; cap at host CPU count so machines with
+        # more than 8 cores get full parallelism on multi-output runs.
+        _afpo_workers = min(max(1, n_outputs), max(1, os.cpu_count() or 8))
         try:
-            with concurrent.futures.ProcessPoolExecutor(max_workers=min(n_outputs, 8)) as executor:
+            with concurrent.futures.ProcessPoolExecutor(max_workers=_afpo_workers) as executor:
                 while True:
                     batch_idx = (np.random.choice(X.shape[0], BATCH_SIZE, replace=False) if BATCH_SIZE > 0 else None)
                     X_b = X[batch_idx] if batch_idx is not None else X
@@ -25409,14 +25571,15 @@ def train_mode():
                                 target_grads=target_grads_list[o_idx])
 
                     # ---- Periodic HoF re-scoring on full data (batch mode) ----
+                    # When BATCH_SIZE > 0 the workers see X_b as their full
+                    # dataset, so affine_a/b are fitted to the batch.  Every
+                    # 200 gens we re-score every HoF entry on the true X so
+                    # rankings stay correct and downstream validation/plot
+                    # output reflects the real predictor.
                     if BATCH_SIZE > 0 and gen > 0 and gen % 200 == 0:
-                        for o_idx, hof in enumerate(hofs):
-                            for ind in hof.best_by_complexity.values():
-                                ind.affine_fitted = False
-                                ind.calculate_fitness(
-                                    X, Y[:, o_idx], out_types[o_idx],
-                                    update_affine=True,
-                                    target_grads=target_grads_list[o_idx])
+                        _parallel_rescore_hofs(hofs, X, Y, out_types,
+                                               target_grads_list,
+                                               perfect_outputs=perfect_outputs)
 
                     # ---- Periodic HoF re-scoring on full data (non-batch mode) ----
                     # Even without minibatching, the constant-optimiser, boost
@@ -25426,13 +25589,9 @@ def train_mode():
                     # so HoF entries stay correctly ranked and downstream
                     # validation / plotting reflects the true predictor.
                     if BATCH_SIZE <= 0 and gen > 0 and gen % 500 == 0:
-                        for o_idx, hof in enumerate(hofs):
-                            for ind in hof.best_by_complexity.values():
-                                ind.affine_fitted = False
-                                ind.calculate_fitness(
-                                    X, Y[:, o_idx], out_types[o_idx],
-                                    update_affine=True,
-                                    target_grads=target_grads_list[o_idx])
+                        _parallel_rescore_hofs(hofs, X, Y, out_types,
+                                               target_grads_list,
+                                               perfect_outputs=perfect_outputs)
 
                     # ---- Deep constant optimisation ----
                     if gen > 0 and gen % 1000 == 0:
@@ -25513,11 +25672,7 @@ def train_mode():
 
         if N_train > _INIT_SUBSAMPLE_CAP:
             print("  Re-scoring Hall of Fame on full dataset…")
-            for i in range(n_outputs):
-                for ind in hofs[i].best_by_complexity.values():
-                    ind.affine_fitted = False
-                    ind.calculate_fitness(X, Y[:, i], out_types[i],
-                                          target_grads=target_grads_list[i])
+            _parallel_rescore_hofs(hofs, X, Y, out_types, target_grads_list)
         _INIT_PHASE = False
 
         class_groups_sa   = detect_class_groups(dp, out_types)
@@ -25539,8 +25694,11 @@ def train_mode():
 
         gen = 0
         perfect_outputs = set()
+        # N_STAGES × n_outputs futures per chunk; cap at host CPU count.
+        _staged_afpo_workers = min(N_STAGES * max(1, n_outputs),
+                                   max(1, os.cpu_count() or 8))
         try:
-            with concurrent.futures.ProcessPoolExecutor(max_workers=min(N_STAGES * n_outputs, 8)) as executor:
+            with concurrent.futures.ProcessPoolExecutor(max_workers=_staged_afpo_workers) as executor:
                 while True:
                     batch_idx = (np.random.choice(X.shape[0], BATCH_SIZE, replace=False) if BATCH_SIZE > 0 else None)
                     X_b = X[batch_idx] if batch_idx is not None else X
@@ -25689,14 +25847,21 @@ def train_mode():
                                 hofs[o_idx], X, Y[:, o_idx], out_types[o_idx],
                                 target_grads=target_grads_list[o_idx])
 
+                    # ---- Periodic HoF re-scoring on full data (batch mode) ----
                     if BATCH_SIZE > 0 and gen > 0 and gen % 200 == 0:
-                        for o_idx, hof in enumerate(hofs):
-                            for ind in hof.best_by_complexity.values():
-                                ind.affine_fitted = False
-                                ind.calculate_fitness(
-                                    X, Y[:, o_idx], out_types[o_idx],
-                                    update_affine=True,
-                                    target_grads=target_grads_list[o_idx])
+                        _parallel_rescore_hofs(hofs, X, Y, out_types,
+                                               target_grads_list,
+                                               perfect_outputs=perfect_outputs)
+
+                    # ---- Periodic HoF re-scoring on full data (non-batch mode) ----
+                    # Even without minibatching the constant-optimiser, boost
+                    # stages and adaptive parsimony silently drift affine_a/b
+                    # away from their unbiased fit over a long run, which makes
+                    # cross-complexity ranking unreliable.  Re-fit every 500 gens.
+                    if BATCH_SIZE <= 0 and gen > 0 and gen % 500 == 0:
+                        _parallel_rescore_hofs(hofs, X, Y, out_types,
+                                               target_grads_list,
+                                               perfect_outputs=perfect_outputs)
 
                     if gen > 0 and gen % 1000 == 0:
                         _deep_optimize_hofs(hofs, X, Y, out_types)
@@ -25762,11 +25927,7 @@ def train_mode():
 
         if N_train > _INIT_SUBSAMPLE_CAP:
             print("  Re-scoring Hall of Fame on full dataset…")
-            for i in range(n_outputs):
-                for ind in hofs[i].best_by_complexity.values():
-                    ind.affine_fitted = False
-                    ind.calculate_fitness(X, Y[:, i], out_types[i],
-                                          target_grads=target_grads_list[i])
+            _parallel_rescore_hofs(hofs, X, Y, out_types, target_grads_list)
         _INIT_PHASE = False
 
         ds_label  = (f"DS-Lexicase {DS_LEXICASE_FRAC*100:.0f}%"
@@ -25776,8 +25937,14 @@ def train_mode():
 
         gen = 0
         perfect_outputs = set()
+        # Same task-count sizing as the plain island mode — `island_afpo`
+        # submits NUM_ISLANDS × n_outputs futures per chunk, one per
+        # (island, output) AFPO population.  Cap at CPU count to avoid
+        # over-subscription on machines with fewer cores than tasks.
+        _isl_afpo_workers = min(NUM_ISLANDS * max(1, n_outputs),
+                                max(1, os.cpu_count() or 8))
         try:
-            with concurrent.futures.ProcessPoolExecutor(max_workers=NUM_ISLANDS) as executor:
+            with concurrent.futures.ProcessPoolExecutor(max_workers=_isl_afpo_workers) as executor:
                 while True:
                     batch_idx = (np.random.choice(X.shape[0], BATCH_SIZE, replace=False)
                                  if BATCH_SIZE > 0 else None)
@@ -26017,14 +26184,25 @@ def train_mode():
                                 target_grads=target_grads_list[o_idx])
 
                     # ---- Periodic HoF re-scoring on full data (batch mode) ----
+                    # When BATCH_SIZE > 0 the workers see X_b as their full
+                    # dataset, so affine_a/b are fitted to the batch.  Every
+                    # 200 gens we re-score every HoF entry on the true X so
+                    # rankings stay correct and downstream validation/plot
+                    # output reflects the real predictor.
                     if BATCH_SIZE > 0 and gen > 0 and gen % 200 == 0:
-                        for o_idx, hof in enumerate(hofs):
-                            for ind in hof.best_by_complexity.values():
-                                ind.affine_fitted = False
-                                ind.calculate_fitness(
-                                    X, Y[:, o_idx], out_types[o_idx],
-                                    update_affine=True,
-                                    target_grads=target_grads_list[o_idx])
+                        _parallel_rescore_hofs(hofs, X, Y, out_types,
+                                               target_grads_list,
+                                               perfect_outputs=perfect_outputs)
+
+                    # ---- Periodic HoF re-scoring on full data (non-batch mode) ----
+                    # Even without minibatching the constant-optimiser, boost
+                    # stages and adaptive parsimony silently drift affine_a/b
+                    # away from their unbiased fit over a long run, which makes
+                    # cross-complexity ranking unreliable.  Re-fit every 500 gens.
+                    if BATCH_SIZE <= 0 and gen > 0 and gen % 500 == 0:
+                        _parallel_rescore_hofs(hofs, X, Y, out_types,
+                                               target_grads_list,
+                                               perfect_outputs=perfect_outputs)
 
                     # ---- Deep constant optimisation ----
                     if gen > 0 and gen % 1000 == 0:
@@ -26100,11 +26278,7 @@ def train_mode():
 
         if N_train > _INIT_SUBSAMPLE_CAP:
             print("  Re-scoring Hall of Fame on full dataset…")
-            for i in range(n_outputs):
-                for ind in hofs[i].best_by_complexity.values():
-                    ind.affine_fitted = False
-                    ind.calculate_fitness(X, Y[:, i], out_types[i],
-                                          target_grads=target_grads_list[i])
+            _parallel_rescore_hofs(hofs, X, Y, out_types, target_grads_list)
         _INIT_PHASE = False
 
         ds_label  = (f"DS-Lexicase {DS_LEXICASE_FRAC*100:.0f}%"
@@ -26121,9 +26295,14 @@ def train_mode():
                         for s in range(N_STAGES)
                         for isl in range(N_ISL)]
 
+        # Per-chunk tasks = N_STAGES × N_ISL × n_outputs.  Workers cap at the
+        # smaller of that total and host CPUs so multi-output runs are no
+        # longer throttled at the (stage × island) count.
+        _staged_isl_workers = min(total_pops_si * max(1, n_outputs),
+                                  max(1, os.cpu_count() or 8))
         try:
             with concurrent.futures.ProcessPoolExecutor(
-                    max_workers=min(total_pops_si, 8)) as executor:
+                    max_workers=_staged_isl_workers) as executor:
                 while True:
                     batch_idx = (np.random.choice(X.shape[0], BATCH_SIZE, replace=False)
                                  if BATCH_SIZE > 0 else None)
@@ -26343,14 +26522,21 @@ def train_mode():
                                 hofs[o_idx], X, Y[:, o_idx], out_types[o_idx],
                                 target_grads=target_grads_list[o_idx])
 
+                    # ---- Periodic HoF re-scoring on full data (batch mode) ----
                     if BATCH_SIZE > 0 and gen > 0 and gen % 200 == 0:
-                        for o_idx, hof in enumerate(hofs):
-                            for ind in hof.best_by_complexity.values():
-                                ind.affine_fitted = False
-                                ind.calculate_fitness(
-                                    X, Y[:, o_idx], out_types[o_idx],
-                                    update_affine=True,
-                                    target_grads=target_grads_list[o_idx])
+                        _parallel_rescore_hofs(hofs, X, Y, out_types,
+                                               target_grads_list,
+                                               perfect_outputs=perfect_outputs)
+
+                    # ---- Periodic HoF re-scoring on full data (non-batch mode) ----
+                    # Even without minibatching the constant-optimiser, boost
+                    # stages and adaptive parsimony silently drift affine_a/b
+                    # away from their unbiased fit over a long run, which makes
+                    # cross-complexity ranking unreliable.  Re-fit every 500 gens.
+                    if BATCH_SIZE <= 0 and gen > 0 and gen % 500 == 0:
+                        _parallel_rescore_hofs(hofs, X, Y, out_types,
+                                               target_grads_list,
+                                               perfect_outputs=perfect_outputs)
 
                     if gen > 0 and gen % 1000 == 0:
                         _deep_optimize_hofs(hofs, X, Y, out_types)
@@ -26429,11 +26615,7 @@ def train_mode():
 
         if N_train > _INIT_SUBSAMPLE_CAP:
             print("  Re-scoring Hall of Fame on full dataset…")
-            for i in range(n_outputs):
-                for ind in hofs[i].best_by_complexity.values():
-                    ind.affine_fitted = False
-                    ind.calculate_fitness(X, Y[:, i], out_types[i],
-                                          target_grads=target_grads_list[i])
+            _parallel_rescore_hofs(hofs, X, Y, out_types, target_grads_list)
         _INIT_PHASE = False
 
         ds_label  = (f"DS-Lexicase {DS_LEXICASE_FRAC*100:.0f}%"
@@ -26453,8 +26635,12 @@ def train_mode():
             # flat_idx = tier * N_ISL_PER_G + isl
             FLAT_COUNT = total_islands
 
+            # Per-chunk tasks = FLAT_COUNT × n_outputs.  Cap at host CPU count
+            # so the worker pool fully covers tasks for multi-output runs.
+            _age_grp_workers = min(FLAT_COUNT * max(1, n_outputs),
+                                   max(1, os.cpu_count() or 8))
             with concurrent.futures.ProcessPoolExecutor(
-                    max_workers=min(FLAT_COUNT, 8)) as executor:
+                    max_workers=_age_grp_workers) as executor:
                 while True:
                     batch_idx = (np.random.choice(X.shape[0], BATCH_SIZE, replace=False)
                                  if BATCH_SIZE > 0 else None)
@@ -26687,14 +26873,25 @@ def train_mode():
                                 target_grads=target_grads_list[o_idx])
 
                     # ---- Periodic HoF re-scoring on full data (batch mode) ----
+                    # When BATCH_SIZE > 0 the workers see X_b as their full
+                    # dataset, so affine_a/b are fitted to the batch.  Every
+                    # 200 gens we re-score every HoF entry on the true X so
+                    # rankings stay correct and downstream validation/plot
+                    # output reflects the real predictor.
                     if BATCH_SIZE > 0 and gen > 0 and gen % 200 == 0:
-                        for o_idx, hof in enumerate(hofs):
-                            for ind in hof.best_by_complexity.values():
-                                ind.affine_fitted = False
-                                ind.calculate_fitness(
-                                    X, Y[:, o_idx], out_types[o_idx],
-                                    update_affine=True,
-                                    target_grads=target_grads_list[o_idx])
+                        _parallel_rescore_hofs(hofs, X, Y, out_types,
+                                               target_grads_list,
+                                               perfect_outputs=perfect_outputs)
+
+                    # ---- Periodic HoF re-scoring on full data (non-batch mode) ----
+                    # Even without minibatching the constant-optimiser, boost
+                    # stages and adaptive parsimony silently drift affine_a/b
+                    # away from their unbiased fit over a long run, which makes
+                    # cross-complexity ranking unreliable.  Re-fit every 500 gens.
+                    if BATCH_SIZE <= 0 and gen > 0 and gen % 500 == 0:
+                        _parallel_rescore_hofs(hofs, X, Y, out_types,
+                                               target_grads_list,
+                                               perfect_outputs=perfect_outputs)
 
                     # ---- Deep constant optimisation ----
                     if gen > 0 and gen % 1000 == 0:
