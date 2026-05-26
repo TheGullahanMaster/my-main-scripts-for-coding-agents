@@ -11,7 +11,7 @@ import warnings
 import re
 import hashlib
 import threading
-from collections import Counter
+from collections import Counter, OrderedDict, deque
 import networkx as nx
 from networkx.algorithms.community import greedy_modularity_communities
 from networkx.algorithms.community.quality import modularity
@@ -13205,6 +13205,112 @@ def evolve_island_chunk(args):
 # AGE-FITNESS PARETO OPTIMISATION (AFPO)
 # ==========================================
 
+class _RuggedLandscapeArchive:
+    """
+    Lightweight, run-local archive that helps AFPO handle discontinuous and
+    rugged loss landscapes.
+
+    Three jobs:
+      1. Persistent behavioural-novelty memory — fingerprints encountered
+         across all generations of this chunk, so the novelty bonus rewards
+         genuinely new behaviour (not just per-generation uniqueness).
+      2. Tabu/cycling detection on the champion fingerprint — if the same
+         best-loss behaviour persists for many gens, the search is sitting
+         on a plateau/basin; a 'discontinuity escape' burst is triggered.
+      3. Anti-cycling on re-injection — the immigrant / pop-guard pipelines
+         can consult ``is_novel`` before paying to re-evaluate a recently-
+         seen behaviour.
+
+    Bounded LRU (``capacity`` entries) so it never explodes on long runs.
+    """
+    __slots__ = ('capacity', 'tabu_window', 'tabu_threshold',
+                 '_fps', '_champion_history', '_escape_until_gen')
+
+    def __init__(self, capacity=512, tabu_window=24, tabu_threshold=16):
+        self.capacity = int(capacity)
+        self.tabu_window = int(tabu_window)
+        self.tabu_threshold = int(tabu_threshold)
+        self._fps = OrderedDict()           # fp -> True  (LRU eviction)
+        self._champion_history = deque(maxlen=self.tabu_window)
+        self._escape_until_gen = -1
+
+    def is_novel(self, fp):
+        return fp is not None and fp not in self._fps
+
+    def add(self, fp):
+        if fp is None:
+            return
+        if fp in self._fps:
+            self._fps.move_to_end(fp)
+        else:
+            self._fps[fp] = True
+            while len(self._fps) > self.capacity:
+                self._fps.popitem(last=False)
+
+    def __len__(self):
+        return len(self._fps)
+
+    def update_champion(self, fp):
+        if fp is not None:
+            self._champion_history.append(fp)
+
+    def is_cycling(self):
+        """True iff the most recent champion fp dominates the tabu window."""
+        n = len(self._champion_history)
+        if n < self.tabu_threshold:
+            return False
+        recent = self._champion_history[-1]
+        n_recent = sum(1 for f in self._champion_history if f == recent)
+        return n_recent >= self.tabu_threshold
+
+    def reset_cycle(self):
+        self._champion_history.clear()
+
+    def in_escape_window(self, gen):
+        return gen < self._escape_until_gen
+
+    def arm_escape(self, gen, window=60):
+        self._escape_until_gen = max(self._escape_until_gen, gen + int(window))
+
+
+def _heavy_tail_eff_rate(base_rate, max_rate, scale=1.0, dist='pareto'):
+    """
+    Sample a heavy-tailed mutation rate, suitable for escaping rugged
+    basins / cliffs in the loss landscape.
+
+    ``base_rate`` is the Poisson mean the caller would otherwise have used;
+    we use it to set the scale of the heavy-tailed draw so the typical
+    sample is comparable to the Poisson draw but the tail extends much
+    further (occasional very large jumps that act as 'Lévy flights' on
+    the structural search space).
+
+    Returns an int clamped to [1, max_rate].
+    """
+    base_rate = max(1.0, float(base_rate))
+    if dist == 'cauchy':
+        # Half-Cauchy: |X| with scale set so median ~ base_rate
+        x = abs(np.random.standard_cauchy()) * base_rate * scale
+    else:
+        # Pareto (a=1.5) — heavy tail; mean undefined but typical small
+        x = (np.random.pareto(1.5) + 1.0) * base_rate * scale
+    return max(1, min(int(round(x)), max(1, int(max_rate))))
+
+
+def _heavy_tail_sigma(parent_sigma, sigma_tau=0.15, scale=2.0):
+    """
+    Cauchy-step proposal for the self-adaptive mutation strength σ.
+    Compared with the default log-normal proposal this allows occasional
+    order-of-magnitude jumps in σ, which is exactly what you want to
+    escape a discontinuity / cliff in the loss landscape (where the
+    locally-effective sigma may be 100× the current value).
+    """
+    step = float(np.random.standard_cauchy()) * sigma_tau * scale
+    # Clip the exponent to keep numerical bounds sane — the SIGMA_MIN/MAX
+    # clamp the caller already applies will still pull this into range.
+    step = float(np.clip(step, -6.0, 6.0))
+    return float(parent_sigma * np.exp(step))
+
+
 def _pareto_dominates(a, b):
     """
     Return True if individual `a` Pareto-dominates `b` on
@@ -13515,6 +13621,31 @@ def evolve_afpo(population, X, y_target, type_code,
         except Exception:
             return None
 
+    # ── Rugged-landscape hardening: persistent behavioural archive ──────
+    # Behavioural fingerprints seen across the whole chunk, so the novelty
+    # bonus rewards genuinely new behaviour rather than mere uniqueness
+    # against the current 3-objective-trimmed snapshot.  The same archive
+    # also tracks champion fingerprints to spot tabu-style cycling on the
+    # leader, which is the canonical symptom of a discontinuity / plateau
+    # in the loss landscape (best loss stays put, mutations of the current
+    # champion all map back to its own neighbourhood).
+    _rugged_archive = _RuggedLandscapeArchive(
+        capacity=512,
+        tabu_window=max(12, min(40, n_generations // 5 + 8)),
+        tabu_threshold=max(8, min(28, n_generations // 8 + 6)))
+    _ARCHIVE_NOVELTY_BONUS = 0.015   # 3× per-pop novelty bonus
+    # Probability of using heavy-tailed (Pareto/Cauchy) step distributions
+    # for eff_rate and σ proposals — scales up with stagnation.  These are
+    # 'Lévy-flight'-style jumps that occasionally produce order-of-magnitude
+    # larger structural changes than the Poisson/log-normal baseline, which
+    # is the textbook escape mechanism for rugged multimodal landscapes.
+    _HEAVY_TAIL_P_BASE = 0.08
+    _HEAVY_TAIL_P_MAX  = 0.45
+    # Width of the 'discontinuity-escape' burst window: when the champion
+    # fingerprint dominates the tabu window we tilt the search toward
+    # structural mutation for this many generations.
+    _ESCAPE_WINDOW     = max(40, min(120, n_generations // 4 + 20))
+
     # ── IMPROVEMENT (B7): diversity-driven structural boost ──────────────
     _DIVERSITY_CHECK_FREQ   = 50
     # Window extended from 50 → 80 gens.  At MIGRATION_FREQ=50 the previous
@@ -13666,25 +13797,57 @@ def evolve_afpo(population, X, y_target, type_code,
             else:
                 parent = min(population, key=lambda x: x.fitness)
         parent_sigma = getattr(parent, 'sigma', float(CGP_MUT_RATE))
-        child_sigma  = float(np.clip(
-            parent_sigma * np.exp(random.gauss(0, SIGMA_TAU)),
-            SIGMA_MIN, SIGMA_MAX))
+        # Heavy-tail probability rises with stagnation depth and during an
+        # active 'discontinuity-escape' window.  This is the key knob for
+        # rugged / multimodal loss landscapes: most steps stay local
+        # (log-normal σ + Poisson rate) but a tunable minority sample from
+        # Cauchy / Pareto, which permits the rare-but-decisive big jumps
+        # required to cross fitness cliffs.
+        _ht_p = min(_HEAVY_TAIL_P_MAX,
+                    _HEAVY_TAIL_P_BASE + 0.4 * stag_frac
+                    + (0.25 if _rugged_archive.in_escape_window(gen) else 0.0))
+        if random.random() < _ht_p:
+            child_sigma = float(np.clip(
+                _heavy_tail_sigma(parent_sigma, sigma_tau=SIGMA_TAU, scale=2.0),
+                SIGMA_MIN, SIGMA_MAX))
+        else:
+            child_sigma = float(np.clip(
+                parent_sigma * np.exp(random.gauss(0, SIGMA_TAU)),
+                SIGMA_MIN, SIGMA_MAX))
         # See evolve_island_chunk for rationale: λ floor 1.0 (was 0.1) and
         # eff_rate clamp to max_nodes//4 to keep mutation magnitude meaningful
         # without shredding entire genomes.
         _max_nodes = getattr(getattr(parent, 'tree', None), 'max_nodes', CGP_NODES)
-        eff_rate = int(round(np.random.poisson(max(1.0, child_sigma * stag_mul))))
-        eff_rate = max(1, min(eff_rate, max(1, _max_nodes // 4)))
+        if random.random() < _ht_p:
+            # Heavy-tailed (Pareto) Lévy-flight rate.  We loosen the cap to
+            # max_nodes // 2 here so the rare big jumps can actually be big —
+            # the local-step branch keeps the conservative max_nodes // 4 cap.
+            eff_rate = _heavy_tail_eff_rate(
+                base_rate=max(1.0, child_sigma * stag_mul),
+                max_rate=max(1, _max_nodes // 2),
+                scale=1.0,
+                dist='pareto')
+        else:
+            eff_rate = int(round(np.random.poisson(max(1.0, child_sigma * stag_mul))))
+            eff_rate = max(1, min(eff_rate, max(1, _max_nodes // 4)))
 
         # ------------------------------------------------------------------ #
         # PySR-Style Top-Level Operator Action Selection (adaptive weights)
         #   with stagnation-aware structural exploration boost
         # ------------------------------------------------------------------ #
         repro_weights = list(_mut_tracker.get_weights())
-        if stag_frac > 0.3 or gen < _diversity_boost_until:
+        _in_escape = _rugged_archive.in_escape_window(gen)
+        if stag_frac > 0.3 or gen < _diversity_boost_until or _in_escape:
             structural_boost = 1.0 + 2.0 * min(1.0, (max(0.0, stag_frac) - 0.3) / 0.5)
             if gen < _diversity_boost_until:
                 structural_boost = max(structural_boost, _DIVERSITY_BOOST_MULT)
+            if _in_escape:
+                # Discontinuity-escape window: the champion is cycling so the
+                # search is wedged on a plateau / inside a basin separated
+                # from any better one by a fitness cliff.  Push the structural
+                # ops harder than ordinary stagnation would, since pure
+                # parameter polishing cannot cross the discontinuity.
+                structural_boost = max(structural_boost, 3.0)
             _structural_ops = {'grow', 'graft', 'nest', 'inject', 'trig', 'div',
                                'crossover', 'semantic_xover'}
             if IF_ELSE_ENABLED:
@@ -13787,14 +13950,24 @@ def evolve_afpo(population, X, y_target, type_code,
                                     target_grads=target_grads)
 
         # ── Novelty Bonus ──
-        if getattr(child, '_novelty_fp', None) is not None:
+        # Two-tier: a small per-population uniqueness bonus PLUS a larger
+        # archive-novelty bonus (vs. all fingerprints seen this chunk).  The
+        # archive bonus is what actually rewards escape attempts on rugged
+        # landscapes — without it the search is biased toward producing the
+        # same handful of behavioural clusters even when several mutually
+        # distant basins exist.
+        _child_fp = getattr(child, '_novelty_fp', None)
+        if _child_fp is not None:
             _is_novel = True
             for _other in population:
-                if getattr(_other, '_novelty_fp', None) == child._novelty_fp:
+                if getattr(_other, '_novelty_fp', None) == _child_fp:
                     _is_novel = False
                     break
             if _is_novel:
                 child.fitness -= _NOVELTY_BONUS
+            if _rugged_archive.is_novel(_child_fp):
+                child.fitness -= _ARCHIVE_NOVELTY_BONUS
+            _rugged_archive.add(_child_fp)
 
         population.append(child)
         population = _trim_to_pareto_front_3obj(population, target_size)
@@ -13975,6 +14148,81 @@ def evolve_afpo(population, X, y_target, type_code,
         else:
             local_stag += 1
 
+        # ── Rugged-landscape tabu detection on the current champion ──────
+        # Push the current best's behavioural fingerprint into the archive
+        # and check if the search has been cycling on it.  When the same
+        # fingerprint dominates the tabu window we arm a 'discontinuity
+        # escape' burst: structural-op weights are tilted (see top of loop)
+        # and we inject a wave of macro-mutated variants of the champion
+        # plus a fan-out across HoF complexity buckets, giving the search
+        # the structural perturbation needed to clear a fitness cliff.
+        try:
+            _curr_best = min(population, key=lambda x: x.loss)
+            _best_fp = getattr(_curr_best, '_novelty_fp', None) \
+                or _novelty_fp(_curr_best.tree)
+            _rugged_archive.update_champion(_best_fp)
+        except (ValueError, AttributeError):
+            _best_fp = None
+
+        if (_best_fp is not None
+                and not _rugged_archive.in_escape_window(gen)
+                and _rugged_archive.is_cycling()):
+            _rugged_archive.arm_escape(gen, window=_ESCAPE_WINDOW)
+            _rugged_archive.reset_cycle()
+            # Discontinuity-escape injection: fan out structurally distinct
+            # variants of the champion across several mutation magnitudes,
+            # plus a graft and a subtree-inject (which builds a coherent
+            # new sub-expression from scratch).  Each lands at age 0 so
+            # the Pareto trim decides what to keep.
+            _escape_n = max(3, target_size // 8)
+            _hof_bucket_pool = list(hof.best_by_complexity.values()) \
+                if hof.best_by_complexity else [_curr_best]
+            random.shuffle(_hof_bucket_pool)
+            for k in range(_escape_n):
+                try:
+                    _seed = _hof_bucket_pool[k % len(_hof_bucket_pool)]
+                    _mode = k % 3
+                    if _mode == 0:
+                        # Heavy mutation — Lévy-flight scale
+                        _tree = mutate(
+                            _seed.tree, n_features, feat_names,
+                            mut_rate=_heavy_tail_eff_rate(
+                                base_rate=max(2.0, CGP_MUT_RATE * 3.0),
+                                max_rate=max(2, _max_nodes // 2),
+                                scale=1.2, dist='pareto'),
+                            temperature=sa_temp * 2.0)
+                    elif _mode == 1:
+                        _tree = macro_inject_subtree(
+                            _seed.tree, n_features, feat_names,
+                            op_affinity=_op_affinity if _op_affinity else None)
+                    else:
+                        _tree = macro_graft_feature(
+                            _seed.tree, n_features, feat_names)
+                        _tree = mutate(
+                            _tree, n_features, feat_names,
+                            mut_rate=max(2, CGP_MUT_RATE * 2))
+                    _esc = Individual(_tree)
+                    _esc.age = 0
+                    _esc.sigma = float(np.clip(
+                        getattr(_seed, 'sigma', CGP_MUT_RATE)
+                        * random.uniform(1.2, 3.0),
+                        SIGMA_MIN, SIGMA_MAX))
+                    _esc.calculate_fitness(
+                        X, y_target, type_code,
+                        bg_logits=bg_logits,
+                        class_idx_in_group=class_idx_in_group,
+                        Y_group=Y_group,
+                        target_grads=target_grads)
+                    _esc_fp = _novelty_fp(_esc.tree)
+                    if _esc_fp is not None:
+                        _esc._novelty_fp = _esc_fp
+                        _rugged_archive.add(_esc_fp)
+                    population.append(_esc)
+                except (ValueError, FloatingPointError, ArithmeticError,
+                        RuntimeError, OverflowError, IndexError, KeyError):
+                    continue
+            population = _trim_to_pareto_front_3obj(population, target_size)
+
         # Directed extinction
         if local_stag > ext_patience:
             population.sort(key=lambda x: x.fitness)
@@ -14037,33 +14285,85 @@ def evolve_afpo(population, X, y_target, type_code,
                 except Exception:
                     pass
 
-                # Normal case: inject diversity cloud around the best solution
+                # Multi-basin restart fan-out (rugged-landscape hardening):
+                # rather than cloning only `hof_best`, sample restart points
+                # from every Pareto complexity bucket in the HoF.  Different
+                # complexity buckets represent structurally different
+                # solutions, so mutated copies of each spawn search from
+                # several basins of the loss landscape simultaneously
+                # instead of just the one the current global best inhabits.
+                _restart_pool = list(hof.best_by_complexity.values())
+                if not _restart_pool:
+                    _restart_pool = [hof_best]
+                random.shuffle(_restart_pool)
+
+                # Normal case: inject diversity cloud around several seeds
                 n_directed = max(3, int(target_size * 0.20))
                 for k in range(n_directed):
-                    rate = [max(1, CGP_MUT_RATE),
-                            max(2, CGP_MUT_RATE * 2),
-                            max(3, CGP_MUT_RATE * 4)][k % 3]
-                    tree = mutate(hof_best.tree, n_features, feat_names,
+                    seed = _restart_pool[k % len(_restart_pool)]
+                    # 4-tier mutation magnitude — added a heavy-tailed Lévy
+                    # rate as the 4th option so even at extinction time we
+                    # occasionally try a structural jump much larger than
+                    # the largest fixed rate could produce.
+                    tier = k % 4
+                    if tier == 3:
+                        rate = _heavy_tail_eff_rate(
+                            base_rate=max(3.0, CGP_MUT_RATE * 4.0),
+                            max_rate=max(3, CGP_NODES // 2),
+                            scale=1.0, dist='pareto')
+                    else:
+                        rate = [max(1, CGP_MUT_RATE),
+                                max(2, CGP_MUT_RATE * 2),
+                                max(3, CGP_MUT_RATE * 4)][tier]
+                    tree = mutate(seed.tree, n_features, feat_names,
                                   mut_rate=int(rate))
                     ni       = Individual(tree)
                     ni.age   = 0
                     ni.sigma = float(np.clip(
-                        hof_best.sigma * random.uniform(0.5, 2.0),
+                        getattr(seed, 'sigma', CGP_MUT_RATE)
+                        * random.uniform(0.5, 2.0),
                         SIGMA_MIN, SIGMA_MAX))
                     new_blood.append(ni)
 
-                # Feature-graft variants: wire unused features into the champion
+                # Feature-graft variants: wire unused features into seeds
+                # drawn from across the HoF complexity buckets (same multi-
+                # basin rationale as above).
                 n_grafts = max(2, int(target_size * 0.10))
-                for _ in range(n_grafts):
-                    tree = macro_graft_feature(hof_best.tree, n_features, feat_names)
+                for k in range(n_grafts):
+                    seed = _restart_pool[k % len(_restart_pool)]
+                    tree = macro_graft_feature(seed.tree, n_features, feat_names)
                     tree = mutate(tree, n_features, feat_names,
                                   mut_rate=max(1, CGP_MUT_RATE))
                     ni       = Individual(tree)
                     ni.age   = 0
                     ni.sigma = float(np.clip(
-                        hof_best.sigma * random.uniform(0.8, 1.5),
+                        getattr(seed, 'sigma', CGP_MUT_RATE)
+                        * random.uniform(0.8, 1.5),
                         SIGMA_MIN, SIGMA_MAX))
                     new_blood.append(ni)
+
+                # Subtree-inject variants: build coherent new sub-expressions
+                # on top of HoF seeds.  This is the structural mutation most
+                # capable of crossing a discontinuity, since it produces a
+                # genuinely new functional form rather than perturbing the
+                # existing one.
+                n_inject = max(2, int(target_size * 0.08))
+                for k in range(n_inject):
+                    try:
+                        seed = _restart_pool[k % len(_restart_pool)]
+                        tree = macro_inject_subtree(
+                            seed.tree, n_features, feat_names,
+                            op_affinity=_op_affinity if _op_affinity else None)
+                        ni       = Individual(tree)
+                        ni.age   = 0
+                        ni.sigma = float(np.clip(
+                            getattr(seed, 'sigma', CGP_MUT_RATE)
+                            * random.uniform(0.8, 2.0),
+                            SIGMA_MIN, SIGMA_MAX))
+                        new_blood.append(ni)
+                    except (ValueError, FloatingPointError, ArithmeticError,
+                            RuntimeError, OverflowError, IndexError, KeyError):
+                        continue
             elif _semantic_collapsed:
                 # Semantic collapse: the HoF best dominates so completely that
                 # mutations of it all land in the same basin.  Skip HoF injection
@@ -14095,8 +14395,18 @@ def evolve_afpo(population, X, y_target, type_code,
                                       class_idx_in_group=class_idx_in_group,
                                       Y_group=Y_group,
                                       target_grads=target_grads)
+                # Stamp behavioural fingerprints so the archive's novelty
+                # accounting tracks the new basin we just opened, and so the
+                # in-loop novelty bonus has something to compare against.
+                _nfp = _novelty_fp(ind.tree)
+                if _nfp is not None:
+                    ind._novelty_fp = _nfp
+                    _rugged_archive.add(_nfp)
             population = survivors + new_blood
             local_stag = 0
+            # Fresh population — clear cycle history so the next champion
+            # gets a clean window before the tabu detector can re-fire.
+            _rugged_archive.reset_cycle()
 
     return population, local_stag
 
