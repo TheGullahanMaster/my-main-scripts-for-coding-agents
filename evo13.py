@@ -1032,6 +1032,176 @@ def _erf_fn(v):
         return scipy_special.erf(v)
     return np.tanh(np.clip(1.2 * v, -20, 20))
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers for newer operators (bitwise, RNG, noise, digit ops, perceptrons …)
+# ─────────────────────────────────────────────────────────────────────────────
+# Floats are converted to bounded int64 first so the bit operations do not
+# overflow or produce NaN.  All helpers are pure functions; vectorised over
+# numpy arrays so they slot straight into BINARY_OPS_EVAL / UNARY_OPS_EVAL.
+
+_INT_OP_CLAMP = 1e15  # cap before int conversion — keeps bitwise ops in int64 range
+
+
+def _to_int(v):
+    """Clamp + floor + cast to int64 for bitwise / digit operations."""
+    return np.floor(np.clip(np.nan_to_num(v, nan=0.0, posinf=_INT_OP_CLAMP,
+                                          neginf=-_INT_OP_CLAMP),
+                            -_INT_OP_CLAMP, _INT_OP_CLAMP)).astype(np.int64)
+
+
+def _bitwise_and(v1, v2):  return np.bitwise_and(_to_int(v1), _to_int(v2)).astype(np.float64)
+def _bitwise_or(v1, v2):   return np.bitwise_or (_to_int(v1), _to_int(v2)).astype(np.float64)
+def _bitwise_xor(v1, v2):  return np.bitwise_xor(_to_int(v1), _to_int(v2)).astype(np.float64)
+def _bitwise_not(v):       return np.bitwise_not(_to_int(v)).astype(np.float64)
+def _lshift(v1, v2):
+    a = _to_int(v1)
+    s = np.clip(_to_int(v2), 0, 62)
+    return np.left_shift(a, s).astype(np.float64)
+def _rshift(v1, v2):
+    a = _to_int(v1)
+    s = np.clip(_to_int(v2), 0, 62)
+    return np.right_shift(a, s).astype(np.float64)
+
+
+def _ne(v1, v2):           return np.where(v1 != v2, 1.0, 0.0)
+
+
+def _round2(v1, v2):
+    # round to n decimals; cap n to a sane range
+    n = np.clip(_to_int(v2), -15, 15)
+    f = np.power(10.0, n.astype(np.float64))
+    return np.round(v1 * f) / f
+def _floor2(v1, v2):
+    n = np.clip(_to_int(v2), -15, 15)
+    f = np.power(10.0, n.astype(np.float64))
+    return np.floor(v1 * f) / f
+def _ceil2(v1, v2):
+    n = np.clip(_to_int(v2), -15, 15)
+    f = np.power(10.0, n.astype(np.float64))
+    return np.ceil(v1 * f) / f
+
+
+def _quantize(v1, v2):
+    # round(v1 / step) * step, with step guarded against zero
+    step = np.where(np.abs(v2) > 1e-12, v2, 1.0)
+    return np.round(v1 / step) * step
+
+
+def _gcd(v1, v2):
+    a = np.abs(_to_int(v1))
+    b = np.abs(_to_int(v2))
+    return np.gcd(a, b).astype(np.float64)
+
+
+def _lcm(v1, v2):
+    a = np.abs(_to_int(v1))
+    b = np.abs(_to_int(v2))
+    g = np.gcd(a, b)
+    g_safe = np.where(g == 0, 1, g)
+    return (np.abs(a // g_safe * b)).astype(np.float64)
+
+
+def _cat(v1, v2):
+    """Concatenate two values as decimal digits: cat(12, 34) → 1234."""
+    a = np.abs(_to_int(v1))
+    b = np.abs(_to_int(v2))
+    b_safe = np.maximum(b, 1)
+    digits = np.minimum(
+        9,
+        (np.floor(np.log10(b_safe.astype(np.float64) + 1e-30)) + 1).astype(np.int64))
+    digits = np.where(b == 0, 1, digits)
+    factor = np.power(10.0, digits.astype(np.float64))
+    return a.astype(np.float64) * factor + b.astype(np.float64)
+
+
+def _x_at_pos_y_scalar(x, y):
+    if not np.isfinite(x) or not np.isfinite(y):
+        return -1.0
+    text = repr(float(x))
+    pos = int(y)
+    if pos < 0 or pos >= len(text):
+        return -1.0
+    ch = text[pos]
+    return float(ch) if ch.isdigit() else -1.0
+
+
+_x_at_pos_y_vec = np.vectorize(_x_at_pos_y_scalar, otypes=[np.float64])
+def _x_at_pos_y(v1, v2): return _x_at_pos_y_vec(v1, v2)
+
+
+def _python_rng_scalar(x):
+    if not np.isfinite(x):
+        return 0.0
+    try:
+        return random.Random(int(x)).random()
+    except (OverflowError, ValueError):
+        return 0.0
+
+
+_python_rng_vec = np.vectorize(_python_rng_scalar, otypes=[np.float64])
+def _python_rng(v): return _python_rng_vec(v)
+
+
+def _signbit(v):
+    return np.where(np.signbit(np.nan_to_num(v, nan=0.0)), 1.0, 0.0)
+
+
+def _deg2rad(v): return v * (np.pi / 180.0)
+def _rad2deg(v): return v * (180.0 / np.pi)
+
+
+def _pow_k_factory(k):
+    """Return a fast lambda implementing v**k (cheap, no overflow guards)."""
+    return lambda v: np.power(v, k)
+
+
+def _perlin_noise_1d(v):
+    """1-D value noise with smoothstep — Perlin-like aesthetic, no scipy dep."""
+    v_clip = np.clip(np.nan_to_num(v, nan=0.0), -1e6, 1e6)
+    floor_v = np.floor(v_clip).astype(np.int64)
+    frac = v_clip - floor_v
+
+    def _hash01(n):
+        n_u = (n.astype(np.int64) & np.int64(0xFFFFFFFF))
+        n_u = (n_u * np.int64(0x27d4eb2d)) & np.int64(0xFFFFFFFF)
+        n_u = (n_u ^ (n_u >> 13)) & np.int64(0xFFFFFFFF)
+        n_u = (n_u * np.int64(0x85ebca6b)) & np.int64(0xFFFFFFFF)
+        return n_u.astype(np.float64) / float(0xFFFFFFFF) * 2.0 - 1.0
+
+    g0 = _hash01(floor_v)
+    g1 = _hash01(floor_v + 1)
+    t = frac * frac * (3.0 - 2.0 * frac)
+    return g0 * (1.0 - t) + g1 * t
+
+
+# ---- Perceptron-style activations (gated behind an interactive prompt) ----
+def _perc_sigma1(v):
+    return 1.0 / (1.0 + np.exp(-np.clip(v, -50.0, 50.0)))
+def _perc_relu1(v):
+    return np.maximum(0.0, v)
+def _perc_custom1(v):
+    # Swish: x * sigmoid(x) — smooth, non-monotonic, "novel" activation.
+    return v / (1.0 + np.exp(-np.clip(v, -50.0, 50.0)))
+def _perc_sigma2(v1, v2):
+    s = v1 + v2
+    return 1.0 / (1.0 + np.exp(-np.clip(s, -50.0, 50.0)))
+def _perc_relu2(v1, v2):
+    return np.maximum(0.0, v1 + v2)
+def _perc_custom2(v1, v2):
+    s = v1 + v2
+    return s / (1.0 + np.exp(-np.clip(s, -50.0, 50.0)))
+
+
+# Names registry — used by `_select_perceptron_mode()` to add/remove from
+# ALL_OP_DESCRIPTIONS without touching the dispatch tables (the dispatch
+# tables always know how to evaluate them; the prompt only controls whether
+# evolution is allowed to PICK them).
+PERCEPTRON_UNARY_OPS  = ('perceptronSigma1', 'perceptronReLU1', 'perceptronCustom1')
+PERCEPTRON_BINARY_OPS = ('perceptronSigma2', 'perceptronReLU2', 'perceptronCustom2')
+PERCEPTRON_ALL_OPS    = PERCEPTRON_UNARY_OPS + PERCEPTRON_BINARY_OPS
+PERCEPTRON_ENABLED    = False   # flipped by `_select_perceptron_mode()`
+
 # ---- SAFE binary ----
 _BINARY_SAFE = {
     '+':         lambda v1, v2: v1 + v2,
@@ -1063,6 +1233,29 @@ _BINARY_SAFE = {
     'gte':       lambda v1, v2: np.where(v1 >= v2, 1.0, 0.0),
     'lte':       lambda v1, v2: np.where(v1 <= v2, 1.0, 0.0),
     'eq':        lambda v1, v2: np.where(v1 == v2, 1.0, 0.0),
+    'ne':        _ne,
+    # Bitwise (integer-coerced) — useful for RNG / hash-style equations
+    'bitwise_and': _bitwise_and,
+    'bitwise_or':  _bitwise_or,
+    'bitwise_xor': _bitwise_xor,
+    'lshift':      _lshift,
+    'rshift':      _rshift,
+    # Decimal-precision rounding family
+    'round2':    _round2,
+    'floor2':    _floor2,
+    'ceil2':     _ceil2,
+    # Quantisation: round(v1 / step) * step
+    'quantize':  _quantize,
+    # Number-theory
+    'gcd':       _gcd,
+    'lcm':       _lcm,
+    # Misc
+    'cat':         _cat,
+    'x_at_pos_y':  _x_at_pos_y,
+    # Perceptron 2-input variants (gated behind PERCEPTRON_ENABLED in the menu)
+    'perceptronSigma2':  _perc_sigma2,
+    'perceptronReLU2':   _perc_relu2,
+    'perceptronCustom2': _perc_custom2,
 }
 _BINARY_UNSAFE = {
     '+':         lambda v1, v2: v1 + v2,
@@ -1091,6 +1284,24 @@ _BINARY_UNSAFE = {
     'gte':       lambda v1, v2: np.where(v1 >= v2, 1.0, 0.0),
     'lte':       lambda v1, v2: np.where(v1 <= v2, 1.0, 0.0),
     'eq':        lambda v1, v2: np.where(v1 == v2, 1.0, 0.0),
+    'ne':        _ne,
+    # Bitwise / digit ops — identical in SAFE and UNSAFE (always-defined integers)
+    'bitwise_and': _bitwise_and,
+    'bitwise_or':  _bitwise_or,
+    'bitwise_xor': _bitwise_xor,
+    'lshift':      _lshift,
+    'rshift':      _rshift,
+    'round2':    _round2,
+    'floor2':    _floor2,
+    'ceil2':     _ceil2,
+    'quantize':  _quantize,
+    'gcd':       _gcd,
+    'lcm':       _lcm,
+    'cat':         _cat,
+    'x_at_pos_y':  _x_at_pos_y,
+    'perceptronSigma2':  _perc_sigma2,
+    'perceptronReLU2':   _perc_relu2,
+    'perceptronCustom2': _perc_custom2,
 }
 _UNARY_SAFE = {
     'sin':        np.sin,
@@ -1137,6 +1348,24 @@ _UNARY_SAFE = {
     'erf':        _erf_fn,
     # Abs prevents reciprocal of negative; epsilon prevents 1/0
     'inv':        lambda v: 1.0 / (np.abs(v) + 1e-30),
+    # Bitwise NOT, sign-bit, RNG, noise, degree/radian conversion, native pow_k
+    'bitwise_not': _bitwise_not,
+    'signbit':     _signbit,
+    'python_rng':  _python_rng,
+    'perlin_noise': _perlin_noise_1d,
+    'deg2rad':    _deg2rad,
+    'rad2deg':    _rad2deg,
+    'pow4':       lambda v: np.power(v, 4),
+    'pow5':       lambda v: np.power(v, 5),
+    'pow6':       lambda v: np.power(v, 6),
+    'pow7':       lambda v: np.power(v, 7),
+    'pow8':       lambda v: np.power(v, 8),
+    'pow9':       lambda v: np.power(v, 9),
+    'pow10':      lambda v: np.power(v, 10),
+    # Perceptron 1-input variants (gated behind PERCEPTRON_ENABLED in the menu)
+    'perceptronSigma1':  _perc_sigma1,
+    'perceptronReLU1':   _perc_relu1,
+    'perceptronCustom1': _perc_custom1,
 }
 
 # ---- UNSAFE unary ----
@@ -1184,11 +1413,58 @@ _UNARY_UNSAFE = {
     'erf':        _erf_fn,
     # NaN at v=0, negative for v<0
     'inv':        lambda v: 1.0 / v,
+    # Bitwise NOT, sign-bit, RNG, noise, degree/radian conversion, native pow_k
+    'bitwise_not': _bitwise_not,
+    'signbit':     _signbit,
+    'python_rng':  _python_rng,
+    'perlin_noise': _perlin_noise_1d,
+    'deg2rad':    _deg2rad,
+    'rad2deg':    _rad2deg,
+    'pow4':       lambda v: np.power(v, 4),
+    'pow5':       lambda v: np.power(v, 5),
+    'pow6':       lambda v: np.power(v, 6),
+    'pow7':       lambda v: np.power(v, 7),
+    'pow8':       lambda v: np.power(v, 8),
+    'pow9':       lambda v: np.power(v, 9),
+    'pow10':      lambda v: np.power(v, 10),
+    'perceptronSigma1':  _perc_sigma1,
+    'perceptronReLU1':   _perc_relu1,
+    'perceptronCustom1': _perc_custom1,
 }
 
+
+# ---- TERNARY ops (always-defined; SAFE == UNSAFE except where noted) ----
+def _if_else_hard(c, a, b):
+    return np.where(c > 0.5, a, b)
+def _if_in_range(x, lo, hi):
+    """Clamp-style: max(min(x, hi), lo). Pass-through inside [lo, hi], saturate at limits."""
+    lo_eff = np.minimum(lo, hi)
+    hi_eff = np.maximum(lo, hi)
+    return np.minimum(np.maximum(x, lo_eff), hi_eff)
+def _if_out_of_range(x, lo, hi):
+    """Anti-clamp: pass through outside [lo, hi]; inside the range, push to nearest boundary."""
+    lo_eff = np.minimum(lo, hi)
+    hi_eff = np.maximum(lo, hi)
+    outside = (x < lo_eff) | (x > hi_eff)
+    mid = 0.5 * (lo_eff + hi_eff)
+    nearest = np.where(x < mid, lo_eff, hi_eff)
+    return np.where(outside, x, nearest)
+def _lerp(a, b, t):
+    return a + (b - a) * t
+
+_TERNARY_SAFE = {
+    'if_else':         _if_else_hard,
+    'if_in_range':     _if_in_range,
+    'if_out_of_range': _if_out_of_range,
+    'lerp':            _lerp,
+}
+_TERNARY_UNSAFE = dict(_TERNARY_SAFE)
+
+
 # Active dispatch tables — updated in-place by set_ops_mode()
-BINARY_OPS_EVAL = dict(_BINARY_SAFE)
-UNARY_OPS_EVAL  = dict(_UNARY_SAFE)
+BINARY_OPS_EVAL  = dict(_BINARY_SAFE)
+UNARY_OPS_EVAL   = dict(_UNARY_SAFE)
+TERNARY_OPS_EVAL = dict(_TERNARY_SAFE)
 
 
 # ---- Soft comparison ops for differentiable branching ----------------------
@@ -1226,18 +1502,21 @@ def _apply_diff_branching_overrides():
 
 def set_ops_mode(safe: bool):
     """
-    Switch the active BINARY_OPS_EVAL / UNARY_OPS_EVAL tables in-place
-    between SAFE and UNSAFE implementations.
+    Switch the active BINARY_OPS_EVAL / UNARY_OPS_EVAL / TERNARY_OPS_EVAL
+    tables in-place between SAFE and UNSAFE implementations.
     Also updates SAFE_OPS_MODE so the rest of the code can query it.
     """
     global SAFE_OPS_MODE
     SAFE_OPS_MODE = safe
     src_bin = _BINARY_SAFE  if safe else _BINARY_UNSAFE
     src_un  = _UNARY_SAFE   if safe else _UNARY_UNSAFE
+    src_ter = _TERNARY_SAFE if safe else _TERNARY_UNSAFE
     BINARY_OPS_EVAL.clear()
     BINARY_OPS_EVAL.update(src_bin)
     UNARY_OPS_EVAL.clear()
     UNARY_OPS_EVAL.update(src_un)
+    TERNARY_OPS_EVAL.clear()
+    TERNARY_OPS_EVAL.update(src_ter)
     _apply_diff_branching_overrides()
 
 
@@ -1335,9 +1614,34 @@ OP_COSTS = {
     # Comparison operators (for if_else conditions)
     'gt': COST_COMPARISON, 'lt': COST_COMPARISON,
     'gte': COST_COMPARISON, 'lte': COST_COMPARISON,
-    'eq': COST_COMPARISON,
-    # Ternary if_else
-    'if_else': COST_IF,
+    'eq': COST_COMPARISON, 'ne': COST_COMPARISON,
+    # Ternary if_else and family
+    'if_else':         COST_IF,
+    'if_in_range':     COST_IF,
+    'if_out_of_range': COST_IF,
+    'lerp':            COST_OP_COMPLEX,
+    # Bitwise / digit ops
+    'bitwise_and': COST_OP_COMPLEX, 'bitwise_or': COST_OP_COMPLEX,
+    'bitwise_xor': COST_OP_COMPLEX, 'bitwise_not': COST_OP_SIMPLE,
+    'lshift': COST_OP_COMPLEX,      'rshift': COST_OP_COMPLEX,
+    'round2': COST_OP_COMPLEX, 'floor2': COST_OP_COMPLEX, 'ceil2': COST_OP_COMPLEX,
+    'quantize': COST_OP_COMPLEX,
+    'gcd': COST_OP_COMPLEX, 'lcm': COST_OP_COMPLEX,
+    'cat': COST_OP_COMPLEX, 'x_at_pos_y': COST_OP_COMPLEX,
+    'python_rng': COST_UNARY_RISK, 'perlin_noise': COST_UNARY_RISK,
+    'signbit': COST_UNARY_CHEAP,
+    'deg2rad': COST_UNARY_CHEAP, 'rad2deg': COST_UNARY_CHEAP,
+    # Native higher powers
+    'pow4': COST_OP_SIMPLE, 'pow5': COST_OP_SIMPLE, 'pow6': COST_OP_SIMPLE,
+    'pow7': COST_OP_SIMPLE, 'pow8': COST_OP_SIMPLE, 'pow9': COST_OP_SIMPLE,
+    'pow10': COST_OP_SIMPLE,
+    # Perceptron variants — expressive, so a moderate cost keeps parsimony fair
+    'perceptronSigma1':  COST_UNARY_SAFE,
+    'perceptronReLU1':   COST_UNARY_SAFE,
+    'perceptronCustom1': COST_UNARY_SAFE,
+    'perceptronSigma2':  COST_OP_COMPLEX,
+    'perceptronReLU2':   COST_OP_COMPLEX,
+    'perceptronCustom2': COST_OP_COMPLEX,
     # Unary
     'sin': COST_UNARY_SAFE, 'cos': COST_UNARY_SAFE,
     'tan': COST_UNARY_SAFE,
@@ -1384,15 +1688,33 @@ def _binary_str(op, s1, s2):
         return f"({s1} <= {s2})"
     elif op == 'eq':
         return f"({s1} == {s2})"
+    elif op == 'ne':
+        return f"({s1} != {s2})"
+    elif op == 'bitwise_and':
+        return f"({s1} & {s2})"
+    elif op == 'bitwise_or':
+        return f"({s1} | {s2})"
+    elif op == 'bitwise_xor':
+        return f"({s1} ^ {s2})"
+    elif op == 'lshift':
+        return f"({s1} << {s2})"
+    elif op == 'rshift':
+        return f"({s1} >> {s2})"
     elif op.startswith('adf_'):
         return f"{op}({s1}, {s2})"
     else:
         return f"{op}({s1}, {s2})"
 
 def _ternary_str(op, s1, s2, s3):
-    """String representation for ternary operators (if_else)."""
+    """String representation for ternary operators (if_else, if_in_range, …)."""
     if op == 'if_else':
         return f"IF({s1} THEN {s2} ELSE {s3})"
+    if op == 'if_in_range':
+        return f"clamp({s1}, {s2}, {s3})"
+    if op == 'if_out_of_range':
+        return f"if_out_of_range({s1}, {s2}, {s3})"
+    if op == 'lerp':
+        return f"lerp({s1}, {s2}, {s3})"
     return f"{op}({s1}, {s2}, {s3})"
 
 def _unary_str(op, s1):
@@ -1406,6 +1728,10 @@ def _unary_str(op, s1):
         return f"frac({s1})"
     if op == 'round':
         return f"round({s1})"
+    if op == 'bitwise_not':
+        return f"(~{s1})"
+    if op in ('pow4', 'pow5', 'pow6', 'pow7', 'pow8', 'pow9', 'pow10'):
+        return f"({s1})^{op[3:]}"
     return f"{op}({s1})"
 
 
@@ -1436,8 +1762,44 @@ ALL_OP_DESCRIPTIONS = {
     'gte':       "Greater or equal     (x >= y)→0/1 — comparison for branching",
     'lte':       "Less or equal        (x <= y)→0/1 — comparison for branching",
     'eq':        "Equal                (x == y)→0/1 — comparison for branching",
-    # Ternary operator
-    'if_else':   "If-Else branch       IF(cond THEN a ELSE b) — piecewise branching",
+    'ne':        "Not equal            (x != y)→0/1 — inequality for branching",
+    # Ternary operators
+    'if_else':         "If-Else branch       IF(cond THEN a ELSE b) — piecewise branching",
+    'if_in_range':     "Clamp to range       clamp(x, lo, hi)   — pass-through inside, saturate at limits",
+    'if_out_of_range': "Anti-clamp           push out of [lo, hi] — passes through outside the range",
+    'lerp':            "Linear interpolation a + (b-a)·t   — blend between two values",
+    # Bitwise / integer ops (auto-coerce floats to int64 via floor)
+    'bitwise_and': "Bitwise AND         (int(x) & int(y))  — RNG / hashing building block",
+    'bitwise_or':  "Bitwise OR          (int(x) | int(y))  — RNG / hashing building block",
+    'bitwise_xor': "Bitwise XOR         (int(x) ^ int(y))  — RNG / hashing building block",
+    'lshift':      "Left shift          (int(x) << int(y)) — power-of-two multiply",
+    'rshift':      "Right shift         (int(x) >> int(y)) — power-of-two integer divide",
+    'bitwise_not': "Bitwise NOT         (~int(x))          — flips all integer bits",
+    # Decimal-precision rounding
+    'round2':  "Round to decimals    round(x · 10^n)/10^n — round x to n decimals",
+    'floor2':  "Floor to decimals    floor(x · 10^n)/10^n — floor x to n decimals",
+    'ceil2':   "Ceil to decimals     ceil(x · 10^n)/10^n  — ceil x to n decimals",
+    'quantize': "Quantize             round(x/step)·step  — snap to multiples of step",
+    # Number theory
+    'gcd':     "GCD                  gcd(int(x), int(y)) — greatest common divisor",
+    'lcm':     "LCM                  lcm(int(x), int(y)) — least common multiple",
+    # Digit / text manipulation
+    'cat':         "Concatenate digits   cat(12, 34) = 1234 — integer digit concat",
+    'x_at_pos_y':  "Digit at position    digit at position y of x (or -1 if not a digit)",
+    # RNG / noise / sign / unit conversions
+    'python_rng':   "Python RNG          random.Random(int(x)).random()   — deterministic seed→[0,1)",
+    'perlin_noise': "1-D Perlin-ish noise smoothstep value-noise on x ∈ ℝ",
+    'signbit':      "Sign bit             1 if x < 0 else 0",
+    'deg2rad':      "Degrees → radians    x · π / 180",
+    'rad2deg':      "Radians → degrees    x · 180 / π",
+    # Native higher powers (cheaper than chaining pow/square/cube)
+    'pow4':   "x⁴                   v**4  — quartic, cheap",
+    'pow5':   "x⁵                   v**5  — quintic, cheap",
+    'pow6':   "x⁶                   v**6  — sextic, cheap",
+    'pow7':   "x⁷                   v**7  — septic, cheap",
+    'pow8':   "x⁸                   v**8  — octic,  cheap",
+    'pow9':   "x⁹                   v**9  — nonic,  cheap",
+    'pow10':  "x¹⁰                  v**10 — decic,  cheap",
     # Unary
     'sin':       "Sine                 sin(x)   — oscillation, periodicity",
     'cos':       "Cosine               cos(x)   — oscillation (phase-shifted)",
@@ -1468,6 +1830,15 @@ ALL_OP_DESCRIPTIONS = {
     'erf':       "Error function       erf(x)   — S-curve from statistics",
     'inv':       "Inverse              1/|x|    — reciprocal, singularity-safe",
     'const':     "Constant             c        — learnable scalar constant",
+    # Perceptron variants (hidden from menus until enabled via
+    # _select_perceptron_mode — but kept here so the dispatch system always
+    # knows their cost / description if old populations contain them).
+    'perceptronSigma1':  "Perceptron σ(x)      sigmoid(x)         — single-input sigmoid neuron",
+    'perceptronReLU1':   "Perceptron ReLU(x)   max(0, x)          — single-input rectifier neuron",
+    'perceptronCustom1': "Perceptron Custom    x·σ(x) (Swish)     — single-input evolvable AF",
+    'perceptronSigma2':  "Perceptron σ(x+y)    sigmoid(x+y)       — two-input sigmoid neuron",
+    'perceptronReLU2':   "Perceptron ReLU(x+y) max(0, x+y)        — two-input rectifier neuron",
+    'perceptronCustom2': "Perceptron Custom2   (x+y)·σ(x+y)        — two-input evolvable AF",
 }
 
 OP_PRESETS = {
@@ -1501,7 +1872,9 @@ OP_PRESETS = {
     "6": {
         "name": "Full  (all ops)",
         "desc": "Every available operator. Widest search space; slowest convergence.",
-        "ops": list(ALL_OP_DESCRIPTIONS.keys()),
+        # Resolved at selection time so perceptron ops can be excluded when
+        # PERCEPTRON_ENABLED is False — see select_allowed_ops().
+        "ops": None,
     },
     "7": {
         "name": "Custom",
@@ -1509,6 +1882,36 @@ OP_PRESETS = {
         "ops": None,  # filled interactively
     },
 }
+
+
+def _visible_op_list():
+    """Return the list of ALL_OP_DESCRIPTIONS keys filtered by the current
+    PERCEPTRON_ENABLED gate.  Used by both the Full preset and the Custom
+    selection menu so perceptron ops never appear unless explicitly enabled.
+    """
+    if PERCEPTRON_ENABLED:
+        return list(ALL_OP_DESCRIPTIONS.keys())
+    return [op for op in ALL_OP_DESCRIPTIONS.keys()
+            if op not in PERCEPTRON_ALL_OPS]
+
+
+def _build_ternary_ops_list():
+    """Compute the CGPEquation.OPS_TERNARY list for the currently selected
+    ALLOWED_OPS and IF_ELSE_ENABLED flag.
+
+    'if_else' is gated by IF_ELSE_ENABLED (legacy contract); the newer
+    ternary ops (if_in_range, if_out_of_range, lerp) are simply taken from
+    ALLOWED_OPS like any other primitive.
+    """
+    ops = []
+    if IF_ELSE_ENABLED:
+        ops.append('if_else')
+    for op in TERNARY_OPS_EVAL:
+        if op == 'if_else':
+            continue
+        if op in ALLOWED_OPS:
+            ops.append(op)
+    return ops
 
 
 def select_allowed_ops():
@@ -1534,7 +1937,8 @@ def select_allowed_ops():
     if choice == "7":
         # Custom selection
         print("\n--- Available operations (enter numbers separated by spaces or commas) ---")
-        op_list = list(ALL_OP_DESCRIPTIONS.keys())
+        # Hide perceptron ops from the menu unless they were explicitly enabled.
+        op_list = _visible_op_list()
         for idx, op in enumerate(op_list, 1):
             print(f"  [{idx:2d}] {ALL_OP_DESCRIPTIONS[op]}")
         print()
@@ -1556,13 +1960,16 @@ def select_allowed_ops():
                 break
             except (ValueError, IndexError):
                 print("  Invalid selection. Try again.")
+    elif choice == "6":
+        # Full preset — resolved dynamically so the perceptron gating applies.
+        ALLOWED_OPS = _visible_op_list()
     else:
         ALLOWED_OPS = list(OP_PRESETS[choice]["ops"])
 
     # Rebuild CGPEquation class-level op lists from new ALLOWED_OPS
     CGPEquation.OPS_BINARY    = [op for op in BINARY_OPS_EVAL if op in ALLOWED_OPS]
     CGPEquation.OPS_UNARY     = [op for op in UNARY_OPS_EVAL  if op in ALLOWED_OPS]
-    CGPEquation.OPS_TERNARY   = ['if_else'] if IF_ELSE_ENABLED else []
+    CGPEquation.OPS_TERNARY   = _build_ternary_ops_list()
     CGPEquation.OPS_ALL       = (CGPEquation.OPS_BINARY + CGPEquation.OPS_UNARY
                                  + CGPEquation.OPS_TERNARY
                                  + (['const'] if 'const' in ALLOWED_OPS else []))
@@ -1651,6 +2058,45 @@ def _select_adf_mode():
           f"check every {ADF_EXTRACT_FREQ} gens, retire after {ADF_RETIRE_PATIENCE} idle cycles)")
 
 
+def _select_perceptron_mode():
+    """Ask whether to enable the perceptron operator family.
+
+    Perceptron variants (sigma/ReLU/custom × 1- or 2-input fan-in) are
+    expressive enough that, on many datasets, they outcompete every other
+    primitive once parsimony has settled — so they are hidden from the operator
+    menu by default and must be explicitly enabled here.  Enabling them adds
+    the six perceptron ops to the pool visible to `Full` and `Custom` presets;
+    leaving them disabled keeps them out even when the user picks "Full".
+    """
+    global PERCEPTRON_ENABLED
+
+    print("\n" + "─" * 70)
+    print("PERCEPTRON OPERATORS")
+    print("─" * 70)
+    print("  When enabled, adds these operators to the menu:")
+    print("    • perceptronSigma1(x)    = sigmoid(x)")
+    print("    • perceptronReLU1(x)     = relu(x)")
+    print("    • perceptronCustom1(x)   = x · sigmoid(x)        (Swish — evolvable AF)")
+    print("    • perceptronSigma2(x,y)  = sigmoid(x + y)")
+    print("    • perceptronReLU2(x,y)   = relu(x + y)")
+    print("    • perceptronCustom2(x,y) = (x+y) · sigmoid(x+y)")
+    print()
+    print("  Each one combines a sum + activation in a single CGP node.  They")
+    print("  are highly expressive and can dominate evolutionary search unless")
+    print("  parsimony pressure is set high enough — that's why they're gated")
+    print("  behind this opt-in prompt and excluded from the Full / Custom")
+    print("  presets by default.")
+    print("─" * 70)
+    choice = input("Enable perceptron operators? [y/N]: ").strip().lower()
+    if choice.startswith('y'):
+        PERCEPTRON_ENABLED = True
+        print(f"  ✓  Perceptron operators ENABLED  ({len(PERCEPTRON_ALL_OPS)} ops "
+              f"available in Full / Custom menus).")
+    else:
+        PERCEPTRON_ENABLED = False
+        print("  Perceptron operators DISABLED (hidden from menus).")
+
+
 def _select_if_else_mode():
     """
     Ask the user whether to enable IF/ELSE branching.
@@ -1717,7 +2163,7 @@ def _select_if_else_mode():
         # Rebuild CGPEquation op lists
         CGPEquation.OPS_BINARY    = [op for op in BINARY_OPS_EVAL if op in ALLOWED_OPS]
         CGPEquation.OPS_UNARY     = [op for op in UNARY_OPS_EVAL  if op in ALLOWED_OPS]
-        CGPEquation.OPS_TERNARY   = ['if_else']
+        CGPEquation.OPS_TERNARY   = _build_ternary_ops_list()
         CGPEquation.OPS_ALL       = (CGPEquation.OPS_BINARY + CGPEquation.OPS_UNARY
                                      + CGPEquation.OPS_TERNARY
                                      + (['const'] if 'const' in ALLOWED_OPS else []))
@@ -1763,10 +2209,13 @@ def _select_if_else_mode():
         _apply_diff_branching_overrides()
     else:
         IF_ELSE_ENABLED = False
-        CGPEquation.OPS_TERNARY     = []
-        CGPEquation.OPS_TERNARY_SET = set()
-        # Rebuild OPS_ALL without ternary
+        # Keep the non-if_else ternary ops (if_in_range, lerp, …) if the user
+        # chose them — they don't depend on the comparison-op machinery.
+        CGPEquation.OPS_TERNARY     = _build_ternary_ops_list()
+        CGPEquation.OPS_TERNARY_SET = set(CGPEquation.OPS_TERNARY)
+        # Rebuild OPS_ALL — keep any surviving ternary ops in the list
         CGPEquation.OPS_ALL = (CGPEquation.OPS_BINARY + CGPEquation.OPS_UNARY
+                               + CGPEquation.OPS_TERNARY
                                + (['const'] if 'const' in ALLOWED_OPS else []))
         print("  IF/ELSE disabled.")
 
@@ -3699,10 +4148,15 @@ class CGPNode:
 
 
 class CGPEquation:
-    # Dynamically filter operations based on the ALLOWED_OPS whitelist
+    # Dynamically filter operations based on the ALLOWED_OPS whitelist.
+    # if_else is still gated by IF_ELSE_ENABLED; other ternary ops
+    # (if_in_range, if_out_of_range, lerp) are taken straight from ALLOWED_OPS.
     OPS_BINARY = [op for op in BINARY_OPS_EVAL.keys() if op in ALLOWED_OPS]
     OPS_UNARY  = [op for op in UNARY_OPS_EVAL.keys() if op in ALLOWED_OPS]
-    OPS_TERNARY = ['if_else'] if IF_ELSE_ENABLED else []
+    OPS_TERNARY = (
+        (['if_else'] if IF_ELSE_ENABLED else [])
+        + [op for op in TERNARY_OPS_EVAL
+           if op != 'if_else' and op in ALLOWED_OPS])
     OPS_ALL    = OPS_BINARY + OPS_UNARY + OPS_TERNARY + (['const'] if 'const' in ALLOWED_OPS else [])
 
     OPS_BINARY_SET  = set(OPS_BINARY)
@@ -3741,18 +4195,16 @@ class CGPEquation:
                 v2 = buffer[:, node.in2]
                 result = BINARY_OPS_EVAL[node.op](v1, v2)
             elif node.op in self.OPS_TERNARY_SET:
-                # if_else(condition, true_val, false_val)
-                # condition = in1, true_branch = in2, false_branch = in3
+                # Ternary node — in1, in2, in3 each feed an operand.
                 v2 = buffer[:, node.in2]
                 v3 = buffer[:, node.in3]
-                if DIFFERENTIABLE_BRANCHING:
-                    # Smooth sigmoid blend: σ(k*(c-0.5))*T + (1-σ(k*(c-0.5)))*F
-                    # Differentiable w.r.t. condition → helps const-opt & boosting
+                if node.op == 'if_else' and DIFFERENTIABLE_BRANCHING:
+                    # Smooth sigmoid blend so const-opt can gradient-tune the threshold.
                     k = DIFF_BRANCH_STEEPNESS
                     gate = 1.0 / (1.0 + np.exp(-np.clip(k * (v1 - 0.5), -50, 50)))
                     result = gate * v2 + (1.0 - gate) * v3
                 else:
-                    result = np.where(v1 > 0.5, v2, v3)
+                    result = TERNARY_OPS_EVAL[node.op](v1, v2, v3)
             elif node.op in self.OPS_UNARY_SET:
                 result = UNARY_OPS_EVAL[node.op](v1)
             elif node.op == 'const':
@@ -10753,6 +11205,18 @@ def tree_to_sympy(cgp_eq, feature_vars, safe=None):
                 buf[idx] = sympy.Piecewise((sympy.Float(1), v1 <= v2), (sympy.Float(0), True))
             elif node.op == 'eq':
                 buf[idx] = sympy.Piecewise((sympy.Float(1), sympy.Eq(v1, v2)), (sympy.Float(0), True))
+            elif node.op == 'ne':
+                buf[idx] = sympy.Piecewise((sympy.Float(1), sympy.Ne(v1, v2)), (sympy.Float(0), True))
+            # Bitwise / integer-coerced ops — represent as opaque Function calls
+            # so the export round-trips correctly (the generated NumPy module
+            # supplies matching implementations).
+            elif node.op in ('bitwise_and', 'bitwise_or', 'bitwise_xor',
+                             'lshift', 'rshift',
+                             'gcd', 'lcm', 'cat', 'x_at_pos_y',
+                             'round2', 'floor2', 'ceil2', 'quantize',
+                             'perceptronSigma2', 'perceptronReLU2',
+                             'perceptronCustom2'):
+                buf[idx] = sympy.Function(node.op)(v1, v2)
             elif node.op.startswith('adf_'):
                 # ADF binary operator — expand sub-graph inline into SymPy.
                 adf_d = next((d for d in _ADF_REGISTRY if d['name'] == node.op), None)
@@ -10764,7 +11228,7 @@ def tree_to_sympy(cgp_eq, feature_vars, safe=None):
                 buf[idx] = sympy.Float(0)
 
         # ------------------------------------------------------------------ #
-        #  TERNARY OPS (if_else)
+        #  TERNARY OPS (if_else, if_in_range, if_out_of_range, lerp)
         # ------------------------------------------------------------------ #
         elif node.op in cgp_eq.OPS_TERNARY_SET:
             v2 = buf.get(node.in2, sympy.Float(0))
@@ -10773,6 +11237,20 @@ def tree_to_sympy(cgp_eq, feature_vars, safe=None):
                 # if_else(condition, true_val, false_val)
                 # condition > 0.5 → true_val, else false_val
                 buf[idx] = sympy.Piecewise((v2, v1 > 0.5), (v3, True))
+            elif node.op == 'if_in_range':
+                # Clamp x into [min(lo,hi), max(lo,hi)]
+                lo_eff = sympy.Min(v2, v3)
+                hi_eff = sympy.Max(v2, v3)
+                buf[idx] = sympy.Min(sympy.Max(v1, lo_eff), hi_eff)
+            elif node.op == 'if_out_of_range':
+                lo_eff = sympy.Min(v2, v3)
+                hi_eff = sympy.Max(v2, v3)
+                mid = (lo_eff + hi_eff) / 2
+                nearest = sympy.Piecewise((lo_eff, v1 < mid), (hi_eff, True))
+                outside = sympy.Or(v1 < lo_eff, v1 > hi_eff)
+                buf[idx] = sympy.Piecewise((v1, outside), (nearest, True))
+            elif node.op == 'lerp':
+                buf[idx] = v1 + (v2 - v1) * v3
             else:
                 buf[idx] = sympy.Float(0)
 
@@ -10886,6 +11364,38 @@ def tree_to_sympy(cgp_eq, feature_vars, safe=None):
                 else:
                     buf[idx] = 1 / v1
 
+            # New cheap polynomial powers
+            elif node.op == 'pow4':
+                buf[idx] = v1 ** 4
+            elif node.op == 'pow5':
+                buf[idx] = v1 ** 5
+            elif node.op == 'pow6':
+                buf[idx] = v1 ** 6
+            elif node.op == 'pow7':
+                buf[idx] = v1 ** 7
+            elif node.op == 'pow8':
+                buf[idx] = v1 ** 8
+            elif node.op == 'pow9':
+                buf[idx] = v1 ** 9
+            elif node.op == 'pow10':
+                buf[idx] = v1 ** 10
+            elif node.op == 'deg2rad':
+                buf[idx] = v1 * sympy.pi / 180
+            elif node.op == 'rad2deg':
+                buf[idx] = v1 * 180 / sympy.pi
+            elif node.op == 'signbit':
+                buf[idx] = sympy.Piecewise((sympy.Float(1), v1 < 0), (sympy.Float(0), True))
+            elif node.op == 'perceptronSigma1':
+                buf[idx] = 1 / (1 + sympy.exp(-v1))
+            elif node.op == 'perceptronReLU1':
+                buf[idx] = sympy.Piecewise((v1, v1 > 0), (sympy.Integer(0), True))
+            elif node.op == 'perceptronCustom1':
+                # Swish: x * sigmoid(x)
+                buf[idx] = v1 / (1 + sympy.exp(-v1))
+            elif node.op in ('bitwise_not', 'python_rng', 'perlin_noise'):
+                # Opaque: rely on the generated NumPy helper module for the impl
+                buf[idx] = sympy.Function(node.op)(v1)
+
             elif node.op.startswith('adf_'):
                 # ADF unary operator — expand sub-graph inline into SymPy.
                 adf_d = next((d for d in _ADF_REGISTRY if d['name'] == node.op), None)
@@ -10962,6 +11472,14 @@ def _binary_python_expr(op, v1, v2, safe):
     if op == 'gte': return f"np.where(({v1}) >= ({v2}), 1.0, 0.0)"
     if op == 'lte': return f"np.where(({v1}) <= ({v2}), 1.0, 0.0)"
     if op == 'eq':  return f"np.where(({v1}) == ({v2}), 1.0, 0.0)"
+    if op == 'ne':  return f"np.where(({v1}) != ({v2}), 1.0, 0.0)"
+    # Bitwise / digit / number-theory / perceptron-binary ops — delegate to
+    # the matching helper emitted in the generated script's header.
+    if op in ('bitwise_and', 'bitwise_or', 'bitwise_xor', 'lshift', 'rshift',
+              'round2', 'floor2', 'ceil2', 'quantize',
+              'gcd', 'lcm', 'cat', 'x_at_pos_y',
+              'perceptronSigma2', 'perceptronReLU2', 'perceptronCustom2'):
+        return f"_op_{op}({v1}, {v2})"
     if op.startswith('adf_'):
         return f"{op}({v1}, {v2})"
     return "0.0"
@@ -10971,6 +11489,14 @@ def _ternary_python_expr(op, v1, v2, v3):
     if op == 'if_else':
         # Match the runtime if_else: condition > 0.5 selects the true branch.
         return f"np.where(({v1}) > 0.5, {v2}, {v3})"
+    if op == 'if_in_range':
+        # clamp(x, lo, hi) with lo/hi auto-ordered
+        return (f"np.minimum(np.maximum(({v1}), np.minimum(({v2}), ({v3}))), "
+                f"np.maximum(({v2}), ({v3})))")
+    if op == 'if_out_of_range':
+        return f"_op_if_out_of_range({v1}, {v2}, {v3})"
+    if op == 'lerp':
+        return f"(({v1}) + (({v2}) - ({v1})) * ({v3}))"
     return "0.0"
 
 
@@ -11029,6 +11555,19 @@ def _unary_python_expr(op, v1, safe):
     if op == 'inv':
         if safe: return f"(1.0 / (np.abs({v1}) + 1e-30))"
         return f"(1.0 / ({v1}))"
+    if op in ('pow4', 'pow5', 'pow6', 'pow7', 'pow8', 'pow9', 'pow10'):
+        return f"(({v1}) ** {op[3:]})"
+    if op == 'deg2rad': return f"(({v1}) * (np.pi / 180.0))"
+    if op == 'rad2deg': return f"(({v1}) * (180.0 / np.pi))"
+    if op == 'signbit': return f"np.where(np.signbit(np.nan_to_num({v1}, nan=0.0)), 1.0, 0.0)"
+    if op == 'perceptronSigma1':
+        return f"(1.0 / (1.0 + np.exp(-np.clip({v1}, -50.0, 50.0))))"
+    if op == 'perceptronReLU1':
+        return f"np.maximum(0.0, {v1})"
+    if op == 'perceptronCustom1':
+        return f"(({v1}) / (1.0 + np.exp(-np.clip({v1}, -50.0, 50.0))))"
+    if op in ('bitwise_not', 'python_rng', 'perlin_noise'):
+        return f"_op_{op}({v1})"
     if op.startswith('adf_'):
         return f"{op}({v1})"
     return "0.0"
@@ -11421,6 +11960,84 @@ def _erf_vec(x):
         return np.vectorize(math.erf)(x)
 # Monkey-patch so that SymPy-generated math.erf(…) calls work on arrays
 math.erf = _erf_vec
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Operator helpers used by exported expressions ───────────────────────────
+import random as _random
+_INT_OP_CLAMP = 1e15
+def _to_int(v):
+    return np.floor(np.clip(np.nan_to_num(v, nan=0.0, posinf=_INT_OP_CLAMP,
+                                          neginf=-_INT_OP_CLAMP),
+                            -_INT_OP_CLAMP, _INT_OP_CLAMP)).astype(np.int64)
+def _op_bitwise_and(v1, v2): return np.bitwise_and(_to_int(v1), _to_int(v2)).astype(np.float64)
+def _op_bitwise_or(v1, v2):  return np.bitwise_or (_to_int(v1), _to_int(v2)).astype(np.float64)
+def _op_bitwise_xor(v1, v2): return np.bitwise_xor(_to_int(v1), _to_int(v2)).astype(np.float64)
+def _op_bitwise_not(v):      return np.bitwise_not(_to_int(v)).astype(np.float64)
+def _op_lshift(v1, v2):
+    return np.left_shift(_to_int(v1), np.clip(_to_int(v2), 0, 62)).astype(np.float64)
+def _op_rshift(v1, v2):
+    return np.right_shift(_to_int(v1), np.clip(_to_int(v2), 0, 62)).astype(np.float64)
+def _op_round2(v1, v2):
+    n = np.clip(_to_int(v2), -15, 15); f = np.power(10.0, n.astype(np.float64))
+    return np.round(v1 * f) / f
+def _op_floor2(v1, v2):
+    n = np.clip(_to_int(v2), -15, 15); f = np.power(10.0, n.astype(np.float64))
+    return np.floor(v1 * f) / f
+def _op_ceil2(v1, v2):
+    n = np.clip(_to_int(v2), -15, 15); f = np.power(10.0, n.astype(np.float64))
+    return np.ceil(v1 * f) / f
+def _op_quantize(v1, v2):
+    step = np.where(np.abs(v2) > 1e-12, v2, 1.0)
+    return np.round(v1 / step) * step
+def _op_gcd(v1, v2):
+    return np.gcd(np.abs(_to_int(v1)), np.abs(_to_int(v2))).astype(np.float64)
+def _op_lcm(v1, v2):
+    a = np.abs(_to_int(v1)); b = np.abs(_to_int(v2)); g = np.gcd(a, b)
+    return (np.abs(a // np.where(g == 0, 1, g) * b)).astype(np.float64)
+def _op_cat(v1, v2):
+    a = np.abs(_to_int(v1)); b = np.abs(_to_int(v2))
+    b_safe = np.maximum(b, 1)
+    digits = np.minimum(9, (np.floor(np.log10(b_safe.astype(np.float64) + 1e-30)) + 1).astype(np.int64))
+    digits = np.where(b == 0, 1, digits)
+    return a.astype(np.float64) * np.power(10.0, digits.astype(np.float64)) + b.astype(np.float64)
+def _op_x_at_pos_y_scalar(x, y):
+    if not np.isfinite(x) or not np.isfinite(y): return -1.0
+    text = repr(float(x)); pos = int(y)
+    if pos < 0 or pos >= len(text): return -1.0
+    ch = text[pos]
+    return float(ch) if ch.isdigit() else -1.0
+def _op_x_at_pos_y(v1, v2):
+    return np.vectorize(_op_x_at_pos_y_scalar, otypes=[np.float64])(v1, v2)
+def _op_python_rng_scalar(x):
+    if not np.isfinite(x): return 0.0
+    try: return _random.Random(int(x)).random()
+    except (OverflowError, ValueError): return 0.0
+def _op_python_rng(v):
+    return np.vectorize(_op_python_rng_scalar, otypes=[np.float64])(v)
+def _op_perlin_noise(v):
+    v_clip = np.clip(np.nan_to_num(v, nan=0.0), -1e6, 1e6)
+    fv = np.floor(v_clip).astype(np.int64); frac = v_clip - fv
+    def _h(n):
+        n = (n.astype(np.int64) & np.int64(0xFFFFFFFF))
+        n = (n * np.int64(0x27d4eb2d)) & np.int64(0xFFFFFFFF)
+        n = (n ^ (n >> 13)) & np.int64(0xFFFFFFFF)
+        n = (n * np.int64(0x85ebca6b)) & np.int64(0xFFFFFFFF)
+        return n.astype(np.float64) / float(0xFFFFFFFF) * 2.0 - 1.0
+    g0 = _h(fv); g1 = _h(fv + 1); t = frac * frac * (3.0 - 2.0 * frac)
+    return g0 * (1.0 - t) + g1 * t
+def _op_if_out_of_range(v1, v2, v3):
+    lo = np.minimum(v2, v3); hi = np.maximum(v2, v3)
+    outside = (v1 < lo) | (v1 > hi); mid = 0.5 * (lo + hi)
+    nearest = np.where(v1 < mid, lo, hi)
+    return np.where(outside, v1, nearest)
+def _op_perceptronSigma2(v1, v2):
+    s = v1 + v2
+    return 1.0 / (1.0 + np.exp(-np.clip(s, -50.0, 50.0)))
+def _op_perceptronReLU2(v1, v2):
+    return np.maximum(0.0, v1 + v2)
+def _op_perceptronCustom2(v1, v2):
+    s = v1 + v2
+    return s / (1.0 + np.exp(-np.clip(s, -50.0, 50.0)))
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── DataProcessor constants & helpers (needed by class body and methods) ────
@@ -15273,9 +15890,9 @@ _BO_OP_CATEGORY_LIST = ['arith', 'trig', 'bounded', 'expon',
                         'log', 'cond', 'const', 'other']
 _BO_NUM_OP_CATEGORIES = len(_BO_OP_CATEGORY_LIST)
 _BO_OP_TO_CATEGORY = {}
-for _cat, _ops in _BO_OP_CATEGORIES.items():
-    for _op in _ops:
-        _BO_OP_TO_CATEGORY[_op] = _cat
+for _bo_cat_name, _bo_cat_ops in _BO_OP_CATEGORIES.items():
+    for _bo_cat_op in _bo_cat_ops:
+        _BO_OP_TO_CATEGORY[_bo_cat_op] = _bo_cat_name
 
 
 def _bo_op_category(op_name: str) -> str:
@@ -24139,6 +24756,84 @@ def _erf_vec(x):
 math.erf = _erf_vec
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ── Operator helpers used by exported expressions ───────────────────────────
+import random as _random
+_INT_OP_CLAMP = 1e15
+def _to_int(v):
+    return np.floor(np.clip(np.nan_to_num(v, nan=0.0, posinf=_INT_OP_CLAMP,
+                                          neginf=-_INT_OP_CLAMP),
+                            -_INT_OP_CLAMP, _INT_OP_CLAMP)).astype(np.int64)
+def _op_bitwise_and(v1, v2): return np.bitwise_and(_to_int(v1), _to_int(v2)).astype(np.float64)
+def _op_bitwise_or(v1, v2):  return np.bitwise_or (_to_int(v1), _to_int(v2)).astype(np.float64)
+def _op_bitwise_xor(v1, v2): return np.bitwise_xor(_to_int(v1), _to_int(v2)).astype(np.float64)
+def _op_bitwise_not(v):      return np.bitwise_not(_to_int(v)).astype(np.float64)
+def _op_lshift(v1, v2):
+    return np.left_shift(_to_int(v1), np.clip(_to_int(v2), 0, 62)).astype(np.float64)
+def _op_rshift(v1, v2):
+    return np.right_shift(_to_int(v1), np.clip(_to_int(v2), 0, 62)).astype(np.float64)
+def _op_round2(v1, v2):
+    n = np.clip(_to_int(v2), -15, 15); f = np.power(10.0, n.astype(np.float64))
+    return np.round(v1 * f) / f
+def _op_floor2(v1, v2):
+    n = np.clip(_to_int(v2), -15, 15); f = np.power(10.0, n.astype(np.float64))
+    return np.floor(v1 * f) / f
+def _op_ceil2(v1, v2):
+    n = np.clip(_to_int(v2), -15, 15); f = np.power(10.0, n.astype(np.float64))
+    return np.ceil(v1 * f) / f
+def _op_quantize(v1, v2):
+    step = np.where(np.abs(v2) > 1e-12, v2, 1.0)
+    return np.round(v1 / step) * step
+def _op_gcd(v1, v2):
+    return np.gcd(np.abs(_to_int(v1)), np.abs(_to_int(v2))).astype(np.float64)
+def _op_lcm(v1, v2):
+    a = np.abs(_to_int(v1)); b = np.abs(_to_int(v2)); g = np.gcd(a, b)
+    return (np.abs(a // np.where(g == 0, 1, g) * b)).astype(np.float64)
+def _op_cat(v1, v2):
+    a = np.abs(_to_int(v1)); b = np.abs(_to_int(v2))
+    b_safe = np.maximum(b, 1)
+    digits = np.minimum(9, (np.floor(np.log10(b_safe.astype(np.float64) + 1e-30)) + 1).astype(np.int64))
+    digits = np.where(b == 0, 1, digits)
+    return a.astype(np.float64) * np.power(10.0, digits.astype(np.float64)) + b.astype(np.float64)
+def _op_x_at_pos_y_scalar(x, y):
+    if not np.isfinite(x) or not np.isfinite(y): return -1.0
+    text = repr(float(x)); pos = int(y)
+    if pos < 0 or pos >= len(text): return -1.0
+    ch = text[pos]
+    return float(ch) if ch.isdigit() else -1.0
+def _op_x_at_pos_y(v1, v2):
+    return np.vectorize(_op_x_at_pos_y_scalar, otypes=[np.float64])(v1, v2)
+def _op_python_rng_scalar(x):
+    if not np.isfinite(x): return 0.0
+    try: return _random.Random(int(x)).random()
+    except (OverflowError, ValueError): return 0.0
+def _op_python_rng(v):
+    return np.vectorize(_op_python_rng_scalar, otypes=[np.float64])(v)
+def _op_perlin_noise(v):
+    v_clip = np.clip(np.nan_to_num(v, nan=0.0), -1e6, 1e6)
+    fv = np.floor(v_clip).astype(np.int64); frac = v_clip - fv
+    def _h(n):
+        n = (n.astype(np.int64) & np.int64(0xFFFFFFFF))
+        n = (n * np.int64(0x27d4eb2d)) & np.int64(0xFFFFFFFF)
+        n = (n ^ (n >> 13)) & np.int64(0xFFFFFFFF)
+        n = (n * np.int64(0x85ebca6b)) & np.int64(0xFFFFFFFF)
+        return n.astype(np.float64) / float(0xFFFFFFFF) * 2.0 - 1.0
+    g0 = _h(fv); g1 = _h(fv + 1); t = frac * frac * (3.0 - 2.0 * frac)
+    return g0 * (1.0 - t) + g1 * t
+def _op_if_out_of_range(v1, v2, v3):
+    lo = np.minimum(v2, v3); hi = np.maximum(v2, v3)
+    outside = (v1 < lo) | (v1 > hi); mid = 0.5 * (lo + hi)
+    nearest = np.where(v1 < mid, lo, hi)
+    return np.where(outside, v1, nearest)
+def _op_perceptronSigma2(v1, v2):
+    s = v1 + v2
+    return 1.0 / (1.0 + np.exp(-np.clip(s, -50.0, 50.0)))
+def _op_perceptronReLU2(v1, v2):
+    return np.maximum(0.0, v1 + v2)
+def _op_perceptronCustom2(v1, v2):
+    s = v1 + v2
+    return s / (1.0 + np.exp(-np.clip(s, -50.0, 50.0)))
+# ─────────────────────────────────────────────────────────────────────────────
+
 # ── DataProcessor constants & helpers (needed by class body and methods) ────
 {dp_constants_src}
 
@@ -24456,6 +25151,10 @@ def train_mode():
         BATCH_SIZE = int(batch_input) if batch_input else 0
     except ValueError:
         BATCH_SIZE = 0
+
+    # ---- Perceptron gate (must run BEFORE operator selection so the
+    # Full / Custom menus reflect the chosen visibility) ----
+    _select_perceptron_mode()
 
     # ---- Operator selection ----
     select_allowed_ops()
