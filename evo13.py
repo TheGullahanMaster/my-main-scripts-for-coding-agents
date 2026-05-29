@@ -26741,6 +26741,19 @@ def train_mode():
 
         gen = 0
         perfect_outputs = set()
+        # Accumulator-driven graduation cadence: decoupling graduation from
+        # `gen % GRAD_FREQ_SA == 0` makes it fire reliably even when
+        # GRAD_FREQ_SA is not an exact multiple of the chunk size.
+        _grad_accum = 0
+        # Plateau-driven meta-extinction bookkeeping (mirrors single-stage
+        # AFPO): track the smallest current HoF loss across non-perfect
+        # outputs.  If it fails to drop by > META_PLATEAU_REL within
+        # META_PLATEAU_GENS gens, wipe-and-reseed every stage (each stage is
+        # treated as an island, keeping its local elite + the global HoF) so
+        # the pipeline can escape a basin every stage has converged into.
+        _meta_best_loss_sa    = float('inf')
+        _meta_last_imp_gen_sa = 0
+        _meta_fires_sa        = 0
         # N_STAGES × n_outputs futures per chunk; cap at host CPU count.
         _staged_afpo_workers = min(N_STAGES * max(1, n_outputs),
                                    max(1, os.cpu_count() or 8))
@@ -26755,6 +26768,21 @@ def train_mode():
                     for col_name, group_idxs in class_groups_sa.items():
                         bg_logits_cache_sa[col_name] = build_bg_logits(
                             hofs, group_idxs, X_b)
+
+                    # Per-output joint-softmax args for this batch.  Reused when
+                    # scoring graduation-replenishment and stage-0 refresh
+                    # individuals so class-group outputs get the same CE
+                    # background logits the worker used — without this their
+                    # fitness would be inconsistent with the rest of the pool.
+                    def _grp_args_sa(o):
+                        gi = out_group_info_sa.get(o)
+                        if gi is None:
+                            return None, None, None
+                        gidx, lk = gi
+                        cbg = next(bg_logits_cache_sa[cn]
+                                   for cn, idxs in class_groups_sa.items()
+                                   if gidx == idxs)
+                        return cbg, lk, Y_b[:, gidx[0]:gidx[-1] + 1]
 
                     futures = []
                     for s in range(N_STAGES):
@@ -26810,6 +26838,7 @@ def train_mode():
                                       f"loss={ind.loss:.4f}  {metric}")
 
                     gen += MIGRATION_FREQ
+                    _grad_accum += MIGRATION_FREQ
 
                     # ── Diversity-aware graduation: best-of-stage s → stage s+1 ──
                     # The earlier version promoted only the single fitness
@@ -26825,10 +26854,22 @@ def train_mode():
                     # plus residual-aware seeds (where additive
                     # decomposition is valid) plus random_cgp pad — letting
                     # the 3-objective Pareto trim decide who survives in
-                    # both stages.  ``N_GRADUATES`` scales modestly with
-                    # pool size so very small pools still graduate one.
-                    if gen % GRAD_FREQ_SA == 0:
-                        N_GRADUATES = max(1, min(3, AFPO_POP_SIZE // 50))
+                    # both stages.  The promotion count is now adaptive: it
+                    # scales with pool size for a baseline and is amplified by
+                    # the destination stage's stagnation (see below).  Each
+                    # cycle also refreshes stage 0 with fresh blood (ALPS
+                    # youngest-layer renewal) so the pipeline never starves of
+                    # new structures to promote.  Graduation is driven by an
+                    # accumulator rather than ``gen % GRAD_FREQ_SA`` so it
+                    # fires reliably for any GRAD_FREQ_SA / chunk-size ratio.
+                    if _grad_accum >= GRAD_FREQ_SA:
+                        _grad_accum -= GRAD_FREQ_SA
+                        # Base promotion volume scales with pool size; per
+                        # transition it is amplified by the *destination*
+                        # stage's stagnation so a stalled exploit stage pulls
+                        # more fresh material from the explorer feeding it.
+                        _base_grad = max(1, min(3, AFPO_POP_SIZE // 50))
+                        _grad_cap  = max(2, AFPO_POP_SIZE // 12)
                         _probe = X_b[:min(32, X_b.shape[0])] if X_b.shape[0] > 0 else None
                         n_grad_total = 0
                         for s in range(N_STAGES - 1):
@@ -26841,9 +26882,37 @@ def train_mode():
                                 if not src or not dst:
                                     continue
 
+                                # Adaptive volume: deeper destination
+                                # stagnation → promote more (up to ~3×).
+                                _dst_depth = min(
+                                    1.0,
+                                    stag_cntrs[ns][i] / max(1, EXTINCTION_PATIENCE))
+                                n_grad = _base_grad + int(round(
+                                    _base_grad * 2.0 * _dst_depth))
+                                n_grad = max(1, min(n_grad, _grad_cap))
+
                                 # ── Promote diverse migrants ──────────────
                                 graduates = _select_diverse_migrants(
-                                    src, n_migrants=N_GRADUATES, X_probe=_probe)
+                                    src, n_migrants=min(3, n_grad), X_probe=_probe)
+                                # The diversity selector caps at three picks
+                                # (best / simplest / novel); pad with the next
+                                # distinct best-fitness members when the
+                                # adaptive volume asks for more.
+                                if (n_grad > len(graduates)
+                                        and len(src) > len(graduates)):
+                                    _seen = {(round(g.loss, 9), round(g.complexity, 3))
+                                             for g in graduates}
+                                    for _cand in sorted(src, key=lambda x: x.fitness):
+                                        if len(graduates) >= n_grad:
+                                            break
+                                        _sig = (round(_cand.loss, 9),
+                                                round(_cand.complexity, 3))
+                                        if _sig in _seen:
+                                            continue
+                                        _seen.add(_sig)
+                                        _gc = copy.deepcopy(_cand)
+                                        _gc.age = 0
+                                        graduates.append(_gc)
                                 if not graduates:
                                     continue
                                 for g in graduates:
@@ -26854,6 +26923,7 @@ def train_mode():
 
                                 # ── Replenish source with a diverse pulse ──
                                 n_repl   = len(graduates)
+                                _cbg, _lk, _yg = _grp_args_sa(i)
                                 replenish: list = []
                                 hof_best = hofs[i].get_best_overall()
                                 if hof_best is not None:
@@ -26890,6 +26960,9 @@ def train_mode():
                                     try:
                                         r.calculate_fitness(
                                             X_b, Y_b[:, i], out_types[i],
+                                            bg_logits=_cbg,
+                                            class_idx_in_group=_lk,
+                                            Y_group=_yg,
                                             target_grads=target_grads_list[i])
                                     except Exception:
                                         r.fitness = 1e10
@@ -26897,11 +26970,114 @@ def train_mode():
                                     src.append(r)
                                 stage_pops[s][i] = _trim_to_pareto_front_3obj(
                                     src, AFPO_POP_SIZE)
+
+                        # ── ALPS-style bottom-layer refresh ──────────────────
+                        # Inject fresh genetic material into stage 0 (the
+                        # explorer) every graduation cycle so the pipeline
+                        # always has new structures to carry upward.  Without a
+                        # steady supply at the bottom, HoF re-injection
+                        # homogenises the stages and the explore→exploit
+                        # pipeline collapses into a single basin.  Mirrors the
+                        # youngest-layer renewal in Age-Layered Population
+                        # Structure (ALPS).
+                        _n_fresh0 = max(2, AFPO_POP_SIZE // 20)
+                        for i in range(n_outputs):
+                            if i in perfect_outputs:
+                                continue
+                            s0 = stage_pops[0][i]
+                            if not s0:
+                                continue
+                            _cbg, _lk, _yg = _grp_args_sa(i)
+                            fresh0: list = []
+                            try:
+                                fresh0.extend(
+                                    generate_seeds_v5(n_features, feat_names))
+                            except Exception:
+                                pass
+                            while len(fresh0) < _n_fresh0:
+                                fresh0.append(Individual(random_cgp(
+                                    n_features, CGP_NODES, feat_names)))
+                            random.shuffle(fresh0)
+                            for _ni in fresh0[:_n_fresh0]:
+                                _ni.age = 0
+                                try:
+                                    _ni.calculate_fitness(
+                                        X_b, Y_b[:, i], out_types[i],
+                                        bg_logits=_cbg,
+                                        class_idx_in_group=_lk,
+                                        Y_group=_yg,
+                                        target_grads=target_grads_list[i])
+                                except Exception:
+                                    _ni.fitness = 1e10
+                                    _ni.loss = 1e10
+                                s0.append(_ni)
+                            stage_pops[0][i] = _trim_to_pareto_front_3obj(
+                                s0, AFPO_POP_SIZE)
+
                         print(f"  [Gen {gen}] Stage graduation cycle complete  "
                               f"({n_grad_total} migrant(s) promoted across "
-                              f"{N_STAGES - 1} transition(s)).")
+                              f"{N_STAGES - 1} transition(s); stage-0 refreshed).")
 
                     print(f"--- Generation {gen} ---")
+
+                    # ── Plateau-driven meta-extinction (stages-as-islands) ──
+                    _meta_losses_sa = [
+                        hofs[mi].get_best_overall().loss
+                        for mi in range(n_outputs)
+                        if mi not in perfect_outputs
+                        and hofs[mi].get_best_overall() is not None]
+                    if _meta_losses_sa:
+                        _cur_loss_sa = float(min(_meta_losses_sa))
+                        if (np.isfinite(_cur_loss_sa)
+                                and _cur_loss_sa < _meta_best_loss_sa
+                                * (1.0 - META_PLATEAU_REL)):
+                            _meta_best_loss_sa    = _cur_loss_sa
+                            _meta_last_imp_gen_sa = gen
+                        elif (_meta_fires_sa < META_MAX_FIRES
+                                and gen - _meta_last_imp_gen_sa >= META_PLATEAU_GENS):
+                            _meta_fires_sa += 1
+                            print(f"\n  ⟂ Plateau detected (no >"
+                                  f"{META_PLATEAU_REL:.0e} relative improvement "
+                                  f"in {META_PLATEAU_GENS} gens) — firing staged "
+                                  f"AFPO meta-extinction "
+                                  f"{_meta_fires_sa}/{META_MAX_FIRES}")
+                            # Pad every (stage, output) so the rebuild lands at
+                            # AFPO_POP_SIZE (the helper sizes each rebuild to
+                            # the current, possibly Pareto-trimmed, length).
+                            for _s in range(N_STAGES):
+                                for _oi in range(n_outputs):
+                                    while len(stage_pops[_s][_oi]) < AFPO_POP_SIZE:
+                                        stage_pops[_s][_oi].append(Individual(
+                                            random_cgp(n_features, CGP_NODES,
+                                                       feat_names)))
+                            # Treat each stage as an island: keeps the global
+                            # elite + fresh seeds per stage.  The stage-aware
+                            # operator tilt re-differentiates them next chunk.
+                            _meta_extinction(stage_pops, hofs, X, Y, out_types,
+                                             n_features, feat_names,
+                                             target_grads_list)
+                            for _s in range(N_STAGES):
+                                for _oi in range(n_outputs):
+                                    for _ind in stage_pops[_s][_oi]:
+                                        _ind.age = 0
+                                        if (not np.isfinite(getattr(_ind, 'fitness', np.inf))
+                                                or _ind.fitness >= 1e9):
+                                            try:
+                                                _ind.calculate_fitness(
+                                                    X, Y[:, _oi], out_types[_oi],
+                                                    target_grads=target_grads_list[_oi])
+                                            except Exception:
+                                                _ind.fitness = 1e10
+                                                _ind.loss = 1e10
+                                    stage_pops[_s][_oi] = _trim_to_pareto_front_3obj(
+                                        stage_pops[_s][_oi], AFPO_POP_SIZE)
+                                    stag_cntrs[_s][_oi] = 0
+                            try:
+                                _FITNESS_CACHE.clear()
+                            except Exception:
+                                pass
+                            _meta_last_imp_gen_sa = gen
+                            _meta_best_loss_sa    = _cur_loss_sa
 
                     for o_idx in range(n_outputs):
                         if o_idx in perfect_outputs:
@@ -26938,6 +27114,43 @@ def train_mode():
                             _print_validation_metrics(hofs, X_val, Y_val, out_types, dp)
                         if _FITNESS_CACHE.hits + _FITNESS_CACHE.misses > 0:
                             print(f"  [Cache] {_FITNESS_CACHE.stats_str()}")
+
+                    # ---- Interval stability culling (Interval mode only) ----
+                    if INTERVAL_MODE and gen % INTERVAL_CHECK_FREQ == 0:
+                        n_pen = 0
+                        for s in range(N_STAGES):
+                            for i in range(n_outputs):
+                                for ind in stage_pops[s][i]:
+                                    try:
+                                        preds = ind.tree.evaluate(X)
+                                        if not np.all(np.isfinite(preds)):
+                                            ind.loss = 1e10; ind.fitness = 1e10
+                                            n_pen += 1
+                                    except Exception:
+                                        ind.loss = 1e10; ind.fitness = 1e10
+                                        n_pen += 1
+                        if n_pen:
+                            print(f"  [Interval] {n_pen} numerically unstable "
+                                  f"individual(s) penalised.")
+
+                    # ---- ADF extraction (immediate, single-process) ----
+                    if ADF_ENABLED and gen % ADF_EXTRACT_FREQ == 0:
+                        print(f"\n[Gen {gen}] ADF extraction scan…")
+                        _all_stage_pops = []
+                        for s in range(N_STAGES):
+                            for i in range(n_outputs):
+                                new_adfs = try_extract_adfs_from_population(
+                                    stage_pops[s][i], X, Y[:, i], out_types[i])
+                                if new_adfs:
+                                    print(f"  [ADF] {len(new_adfs)} new operator(s) "
+                                          f"added ({len(_ADF_REGISTRY)} total).  "
+                                          f"Active immediately for all future "
+                                          f"mutations.")
+                                _all_stage_pops.append(stage_pops[s][i])
+                        retired = _retire_unused_adfs(_all_stage_pops)
+                        if retired:
+                            print(f"  [ADF] Retired {len(retired)} idle "
+                                  f"operator(s): {retired}")
 
                     if SIMPLIFICATION_FREQ > 0 and gen % SIMPLIFICATION_FREQ == 0:
                         print(f"\n[Gen {gen}] Running algebraic simplification pass…")
