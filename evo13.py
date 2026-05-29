@@ -1695,7 +1695,7 @@ def _binary_str(op, s1, s2):
     elif op == 'bitwise_or':
         return f"({s1} | {s2})"
     elif op == 'bitwise_xor':
-        return f"({s1} ^ {s2})"
+        return f"({s1} bit_XOR {s2})"
     elif op == 'lshift':
         return f"({s1} << {s2})"
     elif op == 'rshift':
@@ -1771,7 +1771,7 @@ ALL_OP_DESCRIPTIONS = {
     # Bitwise / integer ops (auto-coerce floats to int64 via floor)
     'bitwise_and': "Bitwise AND         (int(x) & int(y))  — RNG / hashing building block",
     'bitwise_or':  "Bitwise OR          (int(x) | int(y))  — RNG / hashing building block",
-    'bitwise_xor': "Bitwise XOR         (int(x) ^ int(y))  — RNG / hashing building block",
+    'bitwise_xor': "Bitwise XOR         (int(x) bit_XOR int(y))  — RNG / hashing building block",
     'lshift':      "Left shift          (int(x) << int(y)) — power-of-two multiply",
     'rshift':      "Right shift         (int(x) >> int(y)) — power-of-two integer divide",
     'bitwise_not': "Bitwise NOT         (~int(x))          — flips all integer bits",
