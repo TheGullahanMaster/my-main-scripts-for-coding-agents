@@ -442,6 +442,16 @@ META_MAX_FIRES     = 5
 # catastrophic blow-up territory.
 HOF_LOSS_CEILING = 5.0
 
+# ── Classification best-model selection margin ───────────────────────────────
+# For classification outputs the Hall-of-Fame Pareto frontier is ranked on
+# ACCURACY (the metric of interest) rather than cross-entropy loss.  When two
+# frontier models differ in accuracy by less than this margin they are treated
+# as effectively tied and the SIMPLER (lower-complexity) one is chosen as the
+# "best overall" model.  This prevents the selector from preferring a bloated,
+# marginally-lower-CE model over a much simpler model with equal-or-higher
+# accuracy.  0.005 == half a percentage point of accuracy.
+BEST_MODEL_ACC_MARGIN = 0.005
+
 # How often (in generations) to run the periodic algebraic simplification pass
 # across the entire population and Hall of Fame.
 SIMPLIFICATION_FREQ = 500
@@ -4361,7 +4371,16 @@ class CGPEquation:
 # ==========================================
 
 class HallOfFame:
-    def __init__(self):
+    def __init__(self, out_type=None):
+        # out_type lets the frontier rank models on the right metric:
+        #   • out_type == 6  → CLASSIFICATION: the Pareto frontier and the
+        #     "best overall" pick are driven by ACCURACY (higher is better),
+        #     with cross-entropy loss as a tie-breaker only.  This is what
+        #     stops a bloated, marginally-lower-CE model from displacing a
+        #     simpler, equal-or-more-accurate one.
+        #   • anything else (None / 5) → REGRESSION: loss-driven frontier,
+        #     identical to the historical behaviour.
+        self.out_type = out_type
         self.best_by_complexity = {}
         # Version counter and one-slot cache for `get_best_overall`.  The
         # PySR-scored "best" depends only on the contents of
@@ -4378,19 +4397,52 @@ class HallOfFame:
     def _bump_version(self):
         self._version += 1
 
+    # ── Metric helpers (classification ranks on accuracy, regression on loss) ──
+    def _perf(self, ind):
+        """Performance coordinate for Pareto domination — LOWER is better.
+
+        Regression uses the loss directly.  Classification uses negative
+        accuracy, so the cross-complexity domination / sanitize logic (which
+        is written for a 'lower-is-better' performance axis) automatically
+        keeps the more-accurate model and evicts the less-accurate one,
+        regardless of cross-entropy.
+        """
+        if self.out_type == 6:
+            return -float(getattr(ind, 'accuracy', 0.0))
+        return float(ind.loss)
+
+    def _slot_improves(self, cand, cur):
+        """Should `cand` replace `cur` in the same complexity slot?
+
+        Classification: strictly higher accuracy wins; an accuracy tie is
+        broken by lower cross-entropy (better-calibrated model of equal
+        accuracy).  Regression: strictly lower loss wins.
+        """
+        if self.out_type == 6:
+            ca = float(getattr(cand, 'accuracy', 0.0))
+            ua = float(getattr(cur,  'accuracy', 0.0))
+            if ca > ua + 1e-12:
+                return True
+            if ca >= ua - 1e-12 and cand.loss < cur.loss:
+                return True
+            return False
+        return cand.loss < cur.loss
+
     def update(self, individual):
         c = individual.complexity
         if c > MAX_COMPLEXITY: return False
         # Reject catastrophically bad individuals — billion-scale losses from
         # abs(x)^feature blowups would otherwise occupy every high-complexity
         # slot and permanently block good expressions from those positions.
+        # The cross-entropy ceiling still applies for classification: a model
+        # ranked on accuracy must still be a finite, non-exploding predictor.
         if individual.loss > HOF_LOSS_CEILING: return False
         if c not in self.best_by_complexity:
             self.best_by_complexity[c] = copy.deepcopy(individual)
             self._evict_dominated_by(c)
             self._bump_version()
             return True
-        elif individual.loss < self.best_by_complexity[c].loss:
+        elif self._slot_improves(individual, self.best_by_complexity[c]):
             self.best_by_complexity[c] = copy.deepcopy(individual)
             self._evict_dominated_by(c)
             self._bump_version()
@@ -4403,25 +4455,31 @@ class HallOfFame:
         are now cross-complexity Pareto-dominated.
 
         A slot at complexity C2 is dominated if there EXISTS a slot at C1 where:
-            C1 < C2  AND  loss(C1) <= loss(C2)   (strictly simpler AND at least as good)
-         OR C1 <= C2 AND  loss(C1) <  loss(C2)   (at most as complex AND strictly better)
+            C1 < C2  AND  perf(C1) <= perf(C2)   (strictly simpler AND at least as good)
+         OR C1 <= C2 AND  perf(C1) <  perf(C2)   (at most as complex AND strictly better)
+
+        ``perf`` is the lower-is-better performance axis (loss for regression,
+        negative accuracy for classification — see ``_perf``).  Ranking
+        classification on accuracy here is what stops a simpler model with a
+        marginally lower cross-entropy from evicting a more-accurate one.
 
         Using strict inequality on at least one axis prevents wiping entries
-        that tie on loss but differ in complexity — those represent distinct
-        Pareto-front points that evolution may build on later.
+        that tie on performance but differ in complexity — those represent
+        distinct Pareto-front points that evolution may build on later.
         """
-        ref_loss = self.best_by_complexity[ref_complexity].loss
+        ref_loss = self._perf(self.best_by_complexity[ref_complexity])
         to_remove = []
         for c, ind in self.best_by_complexity.items():
             if c == ref_complexity:
                 continue
+            ind_perf = self._perf(ind)
             # Can ref evict c?  Require strictly better on at least one axis.
-            if ref_complexity < c and ref_loss <= ind.loss:
+            if ref_complexity < c and ref_loss <= ind_perf:
                 to_remove.append(c)
-            elif ref_complexity <= c and ref_loss < ind.loss:
+            elif ref_complexity <= c and ref_loss < ind_perf:
                 to_remove.append(c)
             # Can c evict ref? (c is simpler and strictly better)
-            elif c < ref_complexity and ind.loss < ref_loss:
+            elif c < ref_complexity and ind_perf < ref_loss:
                 # ref is dominated — but we just put it there, so don't remove ref.
                 # Instead, note it won't survive but keep it since it was just placed.
                 pass
@@ -4455,18 +4513,21 @@ class HallOfFame:
         }
 
         # Pass 2: build a clean Pareto front (simpler-is-better on complexity,
-        # lower-is-better on loss).  Walk complexity in ascending order;
-        # track the running minimum loss seen so far.  Any entry whose loss
-        # is strictly greater than that minimum is dominated and gets dropped.
-        # Entries with EQUAL loss at higher complexity are kept — they represent
-        # structurally different solutions that may improve independently later.
+        # lower-is-better on the performance axis — loss for regression,
+        # negative accuracy for classification).  Walk complexity in ascending
+        # order; track the running best (minimum perf) seen so far.  Any entry
+        # whose perf is strictly worse than that running best is dominated and
+        # gets dropped.  Entries that TIE on perf at higher complexity are kept
+        # — they represent structurally different solutions that may improve
+        # independently later.
         sorted_entries = sorted(self.best_by_complexity.items())   # by complexity asc
         clean = {}
-        best_loss_seen = float('inf')
+        best_perf_seen = float('inf')
         for c, ind in sorted_entries:
-            if ind.loss <= best_loss_seen:
+            perf = self._perf(ind)
+            if perf <= best_perf_seen:
                 clean[c] = ind
-                best_loss_seen = ind.loss
+                best_perf_seen = perf
             # else: this slot is strictly dominated — skip it
 
         self.best_by_complexity = clean
@@ -4475,34 +4536,57 @@ class HallOfFame:
             self._bump_version()
         return removed
     def compute_pysr_scores(self):
-        """Calculate PySR's -d(log(loss)) / d(complexity) score for the Pareto front."""
+        """PySR-style score: -d(log metric) / d(complexity) along the frontier.
+
+        The 'metric' is loss for regression and ERROR RATE (1 - accuracy) for
+        classification, so each model's score measures how much it cuts the
+        *task-relevant* error per unit of added complexity — the same knee
+        detection PySR uses, but on the axis we actually care about.  Without
+        this, a classification frontier scored on cross-entropy can hand its
+        highest score to a bloated model whose accuracy is no better (or
+        worse) than a simpler neighbour's.
+
+        Robustness: each entry is scored against the BEST (lowest) metric seen
+        at any strictly-simpler complexity, not merely the immediately
+        preceding entry.  The raw frontier is only periodically sanitized, so
+        a transiently non-monotonic neighbour used to let a point claim credit
+        for 'recovering' from a dominated predecessor — inflating the scores
+        of bloated models.  On a clean monotonic front this is identical to
+        the classic consecutive-pairs formula.
+        """
+        is_cls = (self.out_type == 6)
+
+        def _metric(ind):
+            if is_cls:
+                # Error rate, floored so a perfect classifier yields a finite
+                # (large) score instead of -log(0) = +inf.
+                return max(1.0 - float(getattr(ind, 'accuracy', 0.0)), 1e-6)
+            return max(float(ind.loss), 1e-15)
+
         sorted_complexities = sorted(self.best_by_complexity.keys())
         scores = {}
-        last_loss = None
-        last_complexity = 0
-        
+        best_metric_seen = None      # running min metric over simpler entries
+        best_complexity  = 0
+
         for c in sorted_complexities:
             ind = self.best_by_complexity[c]
-            cur_loss = ind.loss
-            cur_complexity = ind.complexity
+            cur_metric = _metric(ind)
 
-            if last_loss is None:
-                cur_score = 0.0
+            if best_metric_seen is None:
+                cur_score = 0.0      # simplest point has no simpler reference
             else:
-                if cur_loss > 0.0:
-                    delta_c = cur_complexity - last_complexity
-                    if delta_c > 0:
-                        safe_cur = max(cur_loss, 1e-15)
-                        safe_last = max(last_loss, 1e-15)
-                        cur_score = -np.log(safe_cur / safe_last) / delta_c
-                    else:
-                        cur_score = 0.0
+                delta_c = c - best_complexity
+                if delta_c > 0:
+                    cur_score = -np.log(cur_metric / best_metric_seen) / delta_c
                 else:
-                    cur_score = np.inf
+                    cur_score = 0.0
 
             scores[c] = cur_score
-            last_loss = cur_loss
-            last_complexity = cur_complexity
+            # Advance the running-best reference only on a genuine improvement,
+            # so dominated points never become the baseline for later ones.
+            if best_metric_seen is None or cur_metric < best_metric_seen:
+                best_metric_seen = cur_metric
+                best_complexity  = c
 
         return scores
     def get_best_overall(self):
@@ -4514,20 +4598,59 @@ class HallOfFame:
         if self._best_cache_version == self._version and self._best_cache is not None:
             return self._best_cache
 
-        scores = self.compute_pysr_scores()
-
-        min_loss = min(ind.loss for ind in self.best_by_complexity.values())
-        threshold = 1.5 * min_loss
-
-        valid_complexities = [c for c, ind in self.best_by_complexity.items() if ind.loss <= threshold]
-        if not valid_complexities:
-            best = min(self.best_by_complexity.values(), key=lambda x: x.loss)
+        if self.out_type == 6:
+            best = self._best_overall_classification()
         else:
-            best_c = max(valid_complexities, key=lambda c: scores[c])
-            best = self.best_by_complexity[best_c]
+            best = self._best_overall_regression()
+
         self._best_cache = best
         self._best_cache_version = self._version
         return best
+
+    def _best_overall_regression(self):
+        """PySR knee pick: among models within 1.5× of the best loss, take the
+        one with the highest score, breaking ties toward LOWER complexity so a
+        bloated model never wins a score tie against a simpler equal-score one.
+        """
+        scores = self.compute_pysr_scores()
+        min_loss = min(ind.loss for ind in self.best_by_complexity.values())
+        threshold = 1.5 * min_loss
+
+        valid_complexities = [c for c, ind in self.best_by_complexity.items()
+                              if ind.loss <= threshold]
+        if not valid_complexities:
+            return min(self.best_by_complexity.values(), key=lambda x: x.loss)
+        # Tie-break: highest score first, then simplest (smallest complexity).
+        best_c = max(valid_complexities, key=lambda c: (scores[c], -c))
+        return self.best_by_complexity[best_c]
+
+    def _best_overall_classification(self):
+        """Accuracy-first pick for classification.
+
+        The frontier is already an accuracy/complexity Pareto staircase (see
+        ``_evict_dominated_by`` / ``sanitize``).  We find the highest accuracy
+        on it, then return the SIMPLEST model whose accuracy is within
+        ``BEST_MODEL_ACC_MARGIN`` of that best.  This guarantees the selected
+        model is never Pareto-dominated (a more complex AND less accurate model
+        can never win) and that simpler models are preferred whenever accuracy
+        is effectively tied — directly fixing the 'bloated low-accuracy model
+        chosen over a simpler high-accuracy one' failure mode.  Cross-entropy
+        is used only as a final tie-breaker between models of equal accuracy
+        and equal complexity (which is essentially never reached).
+        """
+        items = list(self.best_by_complexity.items())   # (complexity, ind)
+        best_acc = max(float(getattr(ind, 'accuracy', 0.0)) for _, ind in items)
+        cutoff = best_acc - BEST_MODEL_ACC_MARGIN
+        near_best = [(c, ind) for c, ind in items
+                     if float(getattr(ind, 'accuracy', 0.0)) >= cutoff]
+        # Simplest within the accuracy band; ties broken by higher accuracy
+        # then lower cross-entropy.
+        best_c, best_ind = min(
+            near_best,
+            key=lambda t: (t[0],
+                           -float(getattr(t[1], 'accuracy', 0.0)),
+                           float(getattr(t[1], 'loss', 0.0))))
+        return best_ind
 
     def print_frontier(self, out_type=5, label=""):
         is_cls = (out_type == 6)
@@ -4571,7 +4694,10 @@ class HallOfFame:
                 best_eq_str = f"({a:.4g} * ({best.tree}) {sign} {abs(b):.4g})"
 
             print("-" * 100)
-            print("🏆 BEST OVERALL MODEL (Score + R² Balanced) 🏆")
+            sel_desc = ("Accuracy-Pareto: simplest within "
+                        f"{BEST_MODEL_ACC_MARGIN:.3f} acc of best"
+                        if is_cls else "Score + R² Balanced")
+            print(f"🏆 BEST OVERALL MODEL ({sel_desc}) 🏆")
             print(f"  Complexity: {best.complexity:.1f}  |  Score: {best_score:.4f}  |  Loss: {best.loss:.5f}  |  {metric_label}: {metric_val:.4f}")
             print(f"  Expression: {best_eq_str}")
         print("=" * 100 + "\n")
@@ -12460,17 +12586,30 @@ def tournament_select(population, k=3):
 def epsilon_lexicase_selection(population, X, y_target, type_code, n_cases=20,
                                bg_logits=None, class_idx_in_group=None, Y_group=None):
     """
-    Down-Sampled epsilon-lexicase selection with MAD-based adaptive epsilon.
+    Down-Sampled epsilon-lexicase selection with the canonical MAD epsilon.
 
-    Uses the Median Absolute Deviation (MAD) of per-case errors across the
-    population to set epsilon, following Helmuth et al.'s recommendation for
-    automatic epsilon scaling.  This adapts to the population's actual error
-    distribution rather than using a fixed 5% relative threshold:
-      - Early evolution (large error spread): epsilon is large → more diversity
-      - Late evolution (tight error spread): epsilon is small → sharper selection
+    Implements the *semi-dynamic* ε-lexicase variant of La Cava, Spector &
+    Helmuth (2016) / La Cava et al. (2019), which is the recommended,
+    best-performing formulation:
+
+      • ε_j (the per-case threshold) is the Median Absolute Deviation of case
+        j's errors taken across the ENTIRE population, computed ONCE:
+            ε_j = median_i( | e_ij − median_i(e_ij) | )
+        This is the literature's "automatic epsilon"; no consistency rescaling
+        (1.4826) is applied — canonical ε-lexicase uses the raw MAD.
+      • The elite error e*_j is recomputed on the CURRENT surviving pool each
+        case (this is what makes it *semi*-dynamic), and individual i survives
+        case j iff  e_ij ≤ e*_j + ε_j.
+
+    When ε_j is 0 (every individual shares case j's error) all elite-tied
+    individuals pass, so diversity is preserved naturally — no artificial
+    additive floor or relative fallback is needed (and the previous versions'
+    5%-relative / 1e-3 floor were both non-canonical and biased selection on
+    near-converged populations).
 
     If DS_LEXICASE_FRAC > 0, each call randomly sub-samples that fraction of
-    the dataset (minimum 20 cases) as the case pool for this generation.
+    the dataset (minimum 20 cases) as the case pool for this generation
+    (down-sampled ε-lexicase, Hernandez et al. 2019).
 
     bg_logits / class_idx_in_group / Y_group are forwarded to get_case_errors
     for joint softmax mode.
@@ -12509,6 +12648,21 @@ def epsilon_lexicase_selection(population, X, y_target, type_code, n_cases=20,
         err_rows.append(row)
     err_matrix = np.vstack(err_rows) if err_rows else np.empty((0, n_cols))
 
+    # ── Canonical per-case MAD epsilon (computed ONCE over the whole pop) ──
+    # ε_j = median_i(|e_ij − median_i(e_ij)|).  Only finite errors contribute
+    # so that a handful of broken (inf) individuals can't poison the median /
+    # produce a NaN band; an all-broken case keeps ε_j = 0 (everyone is
+    # equally bad on it, so it simply won't discriminate).  Vectorised over
+    # cases via nanmedian (inf → nan so it is excluded from both medians).
+    epsilon_per_case = np.zeros(n_cols, dtype=np.float64)
+    if err_matrix.size:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            finite_err = np.where(np.isfinite(err_matrix), err_matrix, np.nan)
+            med = np.nanmedian(finite_err, axis=0)
+            epsilon_per_case = np.nanmedian(np.abs(finite_err - med), axis=0)
+        epsilon_per_case = np.nan_to_num(epsilon_per_case, nan=0.0)
+
     # Shuffle case order (standard lexicase randomises the case sequence).
     # Permuting COLUMN indices reproduces the exact case sequence the old
     # per-case loop walked (`subsample_idx[permutation]`).
@@ -12517,19 +12671,10 @@ def epsilon_lexicase_selection(population, X, y_target, type_code, n_cases=20,
     active = list(range(len(pool)))     # row indices still in contention
     for col in col_order:
         errors = err_matrix[active, col]
+        # Semi-dynamic: elite recomputed on the surviving pool, ε_j fixed from
+        # the population-wide MAD.  Survive iff e_ij ≤ e*_j + ε_j.
         best_err = float(errors.min())
-        # MAD-based adaptive epsilon: median absolute deviation of errors
-        # across the current survivor pool for this case.  Falls back to 5%
-        # relative if the MAD is degenerate (all survivors share an error).
-        mad = float(np.median(np.abs(errors - np.median(errors))))
-        if mad > 1e-10:
-            epsilon_band = mad
-        else:
-            epsilon_band = abs(best_err) * 0.05 + 1e-6
-        # Always keep an additive floor on the band so even a near-degenerate
-        # population preserves more than one survivor per case — otherwise
-        # lexicase collapses to single-case greedy on near-perfect pops.
-        epsilon = best_err + max(epsilon_band, 1e-3)
+        epsilon = best_err + epsilon_per_case[col]
         active = [a for a, err in zip(active, errors) if err <= epsilon]
         if len(active) == 1:
             break
@@ -13289,7 +13434,7 @@ def evolve_island_chunk(args):
     for d in adf_registry:
         _register_adf_from_dict(d)
 
-    local_hof  = HallOfFame()
+    local_hof  = HallOfFame(out_type=type_code)
     local_stag = current_stag
 
     # ── Meta-learning rate for self-adaptive sigma ────────────────────────
@@ -14207,7 +14352,12 @@ def evolve_afpo(population, X, y_target, type_code,
       semantic novelty check, crowding-distance death, directed extinction.
 
     Additional AFPO-specific behaviour:
-      • Every child starts at age 0 (the AFPO invariant).
+      • Genotypic age inheritance (canonical AFPO): a child inherits its
+        parent's age, so "age" measures how long a lineage's genetic material
+        has lived in the population.  Only genuinely fresh material — the
+        per-generation random immigrant, HoF re-seeds and new blood — enters
+        at age 0, and the age objective shields those young entrants from the
+        elite lineage long enough to develop.
       • Population is Pareto-trimmed on (age, fitness, complexity) after each
         birth via `_trim_to_pareto_front_3obj`.  The third objective
         (complexity) was added to keep parsimony pressure inside the trim
@@ -14533,7 +14683,22 @@ def evolve_afpo(population, X, y_target, type_code,
 
         child       = Individual(child_tree)
         child.sigma = child_sigma
-        child.age   = 0    # AFPO invariant
+        # ── Canonical AFPO genotypic-age inheritance ──────────────────────
+        # AFPO's whole point is that "age" tracks how long a *lineage's*
+        # genetic material has been in the population, not how long this exact
+        # individual has personally survived.  A child therefore inherits its
+        # parent's age (canonical AFPO uses max(parent ages); the crossover
+        # partner is chosen inside `_create_offspring`, so we inherit the
+        # primary parent's age — the standard single-parent simplification).
+        # Fresh genetic material (the per-generation random immigrant, HoF
+        # re-seeds, new blood) still enters at age 0; only those un-dominated
+        # young entrants get the age-axis protection that lets genuinely new
+        # ideas mature before the elite lineage can out-compete them.
+        # Resetting every child to 0 (the previous behaviour) made the elite
+        # lineage's offspring indistinguishable from true newcomers, so the
+        # age objective collapsed and AFPO degenerated toward plain fitness
+        # selection.
+        child.age   = int(getattr(parent, 'age', 0))
         fp = _novelty_fp(child.tree)
         if fp is not None:
             child._novelty_fp = fp
@@ -15097,8 +15262,6 @@ def evolve_afpo_stage_worker(args_bundle):
     for d in _ADF_REGISTRY:
         _register_adf_from_dict(d)
 
-    local_hof = HallOfFame()
-
     # Backward-compatible unpack: pre-stage-tilt callers passed a 14-tuple,
     # current callers append `stage_frac` for staged AFPO operator tilt.
     if len(args) == 15:
@@ -15112,6 +15275,10 @@ def evolve_afpo_stage_worker(args_bundle):
          chunk_freq_a, stag_cntrs, EXTINCTION_PATIENCE,
          col_bg_a, local_k_a, Y_group_a, target_grads) = args
         stage_frac = None
+
+    # Created after the unpack so the frontier ranks on the right metric
+    # (accuracy for classification, loss for regression).
+    local_hof = HallOfFame(out_type=out_type)
 
     ret_pop, stag = evolve_afpo(
         pop, X_b, Y_b, out_type,
@@ -15152,7 +15319,7 @@ def evolve_afpo_island_chunk(args):
     for d in _ADF_REGISTRY:
         _register_adf_from_dict(d)
 
-    local_hof = HallOfFame()
+    local_hof = HallOfFame(out_type=type_code)
     population, local_stag = evolve_afpo(
         population, X, y_target, type_code,
         n_features, feat_names, target_size,
@@ -25985,7 +26152,7 @@ def train_mode():
         ISLAND_SIZE = POP_SIZE
 
         islands_pop         = [[] for _ in range(NUM_ISLANDS)]
-        hofs                = [HallOfFame() for _ in range(n_outputs)]
+        hofs                = [HallOfFame(out_type=out_types[_oi]) for _oi in range(n_outputs)]
         stagnation_counters = [[0] * n_outputs for _ in range(NUM_ISLANDS)]
 
         print(f"\nInitializing {NUM_ISLANDS} islands × {ISLAND_SIZE} individuals "
@@ -26341,7 +26508,7 @@ def train_mode():
         AFPO_POP_SIZE = POP_SIZE * 2   # AFPO typically runs a larger pool
 
         afpo_pops = []
-        hofs      = [HallOfFame() for _ in range(n_outputs)]
+        hofs      = [HallOfFame(out_type=out_types[_oi]) for _oi in range(n_outputs)]
         stag_cntrs = [0] * n_outputs
 
         print(f"\nInitializing AFPO population ({AFPO_POP_SIZE} individuals "
@@ -26713,7 +26880,7 @@ def train_mode():
         # stage_pops[s][out_idx] = list of Individuals
         stage_pops  = [[] for _ in range(N_STAGES)]
         stag_cntrs  = [[0] * n_outputs for _ in range(N_STAGES)]
-        hofs        = [HallOfFame() for _ in range(n_outputs)]
+        hofs        = [HallOfFame(out_type=out_types[_oi]) for _oi in range(n_outputs)]
 
         print(f"\nInitializing Staged AFPO  ({N_STAGES} stages, "
               f"{AFPO_POP_SIZE} individuals × {n_outputs} output(s))…")
@@ -27251,7 +27418,7 @@ def train_mode():
 
         # islands_pop[island_idx][out_idx] = list of Individuals
         islands_pop         = [[] for _ in range(NUM_ISLANDS)]
-        hofs                = [HallOfFame() for _ in range(n_outputs)]
+        hofs                = [HallOfFame(out_type=out_types[_oi]) for _oi in range(n_outputs)]
         stagnation_counters = [[0] * n_outputs for _ in range(NUM_ISLANDS)]
 
         # ── Detect multi-class groups ────────────────────────────────────────
@@ -27598,7 +27765,7 @@ def train_mode():
 
         # stage_islands[stage][island_idx][out_idx] = list of Individuals
         stage_islands = [[[] for _ in range(N_ISL)] for _ in range(N_STAGES)]
-        hofs          = [HallOfFame() for _ in range(n_outputs)]
+        hofs          = [HallOfFame(out_type=out_types[_oi]) for _oi in range(n_outputs)]
         stag_counters = [[[0] * n_outputs for _ in range(N_ISL)]
                          for _ in range(N_STAGES)]
 
@@ -27934,7 +28101,7 @@ def train_mode():
 
         # tier_islands[tier][island_idx][out_idx] = list of Individuals
         tier_islands = [[[] for _ in range(N_ISL_PER_G)] for _ in range(N_GROUPS)]
-        hofs         = [HallOfFame() for _ in range(n_outputs)]
+        hofs         = [HallOfFame(out_type=out_types[_oi]) for _oi in range(n_outputs)]
         # stag_counters[tier][island_idx][out_idx]
         stag_counters = [[[0] * n_outputs for _ in range(N_ISL_PER_G)]
                          for _ in range(N_GROUPS)]
@@ -28275,7 +28442,7 @@ def train_mode():
     # BAYESIAN CGP
     # ════════════════════════════════════════════════════════════════
     elif EVOLUTION_MODEL == "bayesian_cgp":
-        hofs = [HallOfFame() for _ in range(n_outputs)]
+        hofs = [HallOfFame(out_type=out_types[_oi]) for _oi in range(n_outputs)]
 
         # Dispatch to the requested Bayesian variant.  When QD is also
         # globally enabled (``QUALITY_DIVERSITY_ENABLED``) we route to the
