@@ -10324,7 +10324,11 @@ class Individual:
                 self.affine_a   = cached['affine_a']
                 self.affine_b   = cached['affine_b']
                 self.affine_fitted = True
-                self.fitness = self.loss + PARSIMONY_STRENGTH * self.complexity
+                # Adaptive parsimony is applied here too (see the main-path
+                # comment below) so cached lookups stay consistent with freshly
+                # evaluated individuals under the same complexity-frequency map.
+                _eff_parsimony = max(0.0, PARSIMONY_STRENGTH + freq_parsimony_adj)
+                self.fitness = self.loss + _eff_parsimony * self.complexity
                 return self.fitness
         try:
             X_eval = X[batch_indices] if batch_indices is not None else X
@@ -10573,7 +10577,25 @@ class Individual:
             # gradient for selection during evolution.
             self.loss = min(self.loss, HOF_LOSS_CEILING + 25.0)
 
-            self.fitness = self.loss + PARSIMONY_STRENGTH * self.complexity
+            # ── Adaptive (PySR-style) complexity-frequency parsimony ─────────
+            # `freq_parsimony_adj` is the per-complexity adjustment produced by
+            # `compute_complexity_frequency_adjustment`: positive for over-
+            # represented complexities (discourage more of that size), negative
+            # for under-represented ones (encourage them).  It modulates the
+            # effective parsimony coefficient exactly as that function's
+            # docstring prescribes (`effective_parsimony = PARSIMONY_STRENGTH +
+            # adj`).  Previously this value was computed every generation and
+            # threaded through every fitness call but never actually applied —
+            # the adaptive-parsimony feature (enabled by default) was a no-op.
+            # The coefficient is clamped to >= 0 so it can never go negative,
+            # which would reward unbounded complexity growth and destabilise
+            # selection.  Only `.fitness` (parent selection / Pareto trim) is
+            # affected; the Hall of Fame is keyed on `.loss`, so final outputs
+            # are unchanged.  When ADAPTIVE_PARSIMONY_ENABLED is False the
+            # adjustment dict is empty, `freq_parsimony_adj` stays 0.0, and this
+            # reduces exactly to the previous `PARSIMONY_STRENGTH * complexity`.
+            _eff_parsimony = max(0.0, PARSIMONY_STRENGTH + freq_parsimony_adj)
+            self.fitness = self.loss + _eff_parsimony * self.complexity
 
             # ── Populate fitness cache ───────────────────────────────────────
             if _cacheable and batch_indices is None and bg_logits is None:
@@ -12462,21 +12484,44 @@ def epsilon_lexicase_selection(population, X, y_target, type_code, n_cases=20,
     else:
         subsample_idx = np.random.choice(N, min(N, n_cases), replace=False)
 
-    # Shuffle case order (standard lexicase randomises the case sequence)
-    case_order = subsample_idx[np.random.permutation(len(subsample_idx))]
+    # ── Precompute the full per-case error matrix ONCE ───────────────────
+    # The previous implementation re-evaluated every surviving individual's
+    # tree on a SINGLE case per inner-loop step — i.e. O(n_cases) separate
+    # one-point `tree.evaluate` calls per individual.  Evaluating each tree
+    # once over the whole case subsample (vectorised) and slicing columns out
+    # of the resulting matrix is mathematically identical but does O(1) tree
+    # evaluations per individual, which matters because parent selection runs
+    # every generation.  A failed evaluation yields an all-inf row so a single
+    # broken individual can no longer crash the entire selection (the old
+    # list-comprehension would propagate the exception).
+    n_cols = len(subsample_idx)
+    err_rows = []
+    for ind in pool:
+        try:
+            row = np.asarray(
+                ind.get_case_errors(X, y_target, type_code, subsample_idx,
+                                    bg_logits=bg_logits,
+                                    class_idx_in_group=class_idx_in_group,
+                                    Y_group=Y_group),
+                dtype=np.float64)
+        except Exception:
+            row = np.full(n_cols, np.inf, dtype=np.float64)
+        err_rows.append(row)
+    err_matrix = np.vstack(err_rows) if err_rows else np.empty((0, n_cols))
 
-    for case_idx in case_order:
-        errors = [ind.get_case_errors(X, y_target, type_code, [case_idx],
-                                      bg_logits=bg_logits,
-                                      class_idx_in_group=class_idx_in_group,
-                                      Y_group=Y_group)[0]
-                  for ind in pool]
-        best_err = min(errors)
+    # Shuffle case order (standard lexicase randomises the case sequence).
+    # Permuting COLUMN indices reproduces the exact case sequence the old
+    # per-case loop walked (`subsample_idx[permutation]`).
+    col_order = np.random.permutation(n_cols)
+
+    active = list(range(len(pool)))     # row indices still in contention
+    for col in col_order:
+        errors = err_matrix[active, col]
+        best_err = float(errors.min())
         # MAD-based adaptive epsilon: median absolute deviation of errors
-        # across the population for this case.  Falls back to 5% relative
-        # if the MAD is degenerate (all individuals have the same error).
-        err_arr = np.array(errors)
-        mad = float(np.median(np.abs(err_arr - np.median(err_arr))))
+        # across the current survivor pool for this case.  Falls back to 5%
+        # relative if the MAD is degenerate (all survivors share an error).
+        mad = float(np.median(np.abs(errors - np.median(errors))))
         if mad > 1e-10:
             epsilon_band = mad
         else:
@@ -12485,15 +12530,15 @@ def epsilon_lexicase_selection(population, X, y_target, type_code, n_cases=20,
         # population preserves more than one survivor per case — otherwise
         # lexicase collapses to single-case greedy on near-perfect pops.
         epsilon = best_err + max(epsilon_band, 1e-3)
-        pool = [ind for ind, err in zip(pool, errors) if err <= epsilon]
-        if len(pool) == 1:
+        active = [a for a, err in zip(active, errors) if err <= epsilon]
+        if len(active) == 1:
             break
 
     # Canonical ε-lexicase breaks final ties uniformly at random; the prior
     # `min(...key=complexity)` deterministically picked the simplest survivor
     # every call, hard-biasing the search toward small expressions and
     # preventing structurally-rich individuals from ever reproducing.
-    return random.choice(pool)
+    return pool[random.choice(active)] if active else random.choice(pool)
 
 
 import concurrent.futures
@@ -14698,11 +14743,16 @@ def evolve_afpo(population, X, y_target, type_code,
                 try:
                     # Alternate between residual-aware and v5 seeds when both
                     # pools are available, falling back to the other when one
-                    # is empty.
+                    # is empty.  Deep-copy the drawn seed: `random.choice` can
+                    # return the same pool element on different iterations, and
+                    # appending that shared reference would put the *same*
+                    # Individual object into the population multiple times
+                    # (mutually non-dominated clones that waste front slots and
+                    # alias each other under in-place const-opt / boost).
                     if _res_pool and (not _v5_pool or _k % 2 == 0):
-                        imm = random.choice(_res_pool)
+                        imm = copy.deepcopy(random.choice(_res_pool))
                     elif _v5_pool:
-                        imm = random.choice(_v5_pool)
+                        imm = copy.deepcopy(random.choice(_v5_pool))
                     else:
                         continue
                     imm.age = 0
