@@ -126,16 +126,21 @@ class DropPath(nn.Module):
 # ==========================================
 
 class SinusoidalPosEmb(nn.Module):
-    def __init__(self, dim):
+    def __init__(self, dim, scale=1.0, theta=10000):
         super().__init__()
         self.dim = dim
+        # `scale` lifts a continuous flow-time t in [0, 1] into a wider range
+        # (e.g. ~[0, 1000]) so the high-frequency sinusoids carry real signal,
+        # matching the effective resolution of DiT-style timestep embeddings.
+        self.scale = scale
+        self.theta = theta
 
     def forward(self, x):
         device = x.device
         half_dim = self.dim // 2
-        emb = math.log(10000) / (half_dim - 1)
+        emb = math.log(self.theta) / (half_dim - 1)
         emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
-        emb = x[:, None] * emb[None, :]
+        emb = (x * self.scale)[:, None] * emb[None, :]
         return torch.cat((emb.sin(), emb.cos()), dim=-1)
 
 
@@ -364,7 +369,7 @@ class ChannelAttention(nn.Module):
 # ==========================================
 
 class Attention(nn.Module):
-    def __init__(self, dim, heads=8, dim_head=64, h_patches=None, w_patches=None):
+    def __init__(self, dim, heads=8, dim_head=64, h_patches=None, w_patches=None, qk_norm=False):
         super().__init__()
         inner_dim = dim_head * heads
         self.heads = heads
@@ -373,6 +378,13 @@ class Attention(nn.Module):
         self.norm = RMSNorm(dim)
         self.to_qkv = nn.Linear(dim, inner_dim * 3, bias=False)
         self.to_out = nn.Linear(inner_dim, dim, bias=False)
+
+        # qk-norm (one of the "Just Advanced" Transformer ingredients in JiT):
+        # RMS-normalize the per-head query/key vectors before attention.
+        self.qk_norm = qk_norm
+        if qk_norm:
+            self.q_norm = RMSNorm(dim_head)
+            self.k_norm = RMSNorm(dim_head)
 
         if h_patches is not None and w_patches is not None:
             self.rope = RotaryEmbedding2D(dim_head, h_patches, w_patches)
@@ -387,6 +399,10 @@ class Attention(nn.Module):
 
         qkv = self.to_qkv(x_norm).chunk(3, dim=-1)
         q, k, v = map(lambda t: t.reshape(b, n, self.heads, -1).permute(0, 2, 1, 3), qkv)
+
+        if self.qk_norm:
+            q = self.q_norm(q).type_as(v)
+            k = self.k_norm(k).type_as(v)
 
         if self.rope is not None:
             q, k = self.rope(q, k)
@@ -764,11 +780,12 @@ def _make_adaln(dim, n_params):
 
 class TransformerBlock(nn.Module):
     def __init__(self, dim, heads, mlp_dim, h_patches, w_patches,
-                 use_adaln=False, use_conv_mlp=False, use_swiglu=True):
+                 use_adaln=False, use_conv_mlp=False, use_swiglu=True, qk_norm=False,
+                 dropout=0.0):
         super().__init__()
         self.use_adaln = use_adaln
         self.norm1 = RMSNorm(dim)
-        self.attn = Attention(dim, heads=heads, dim_head=64, h_patches=h_patches, w_patches=w_patches)
+        self.attn = Attention(dim, heads=heads, dim_head=64, h_patches=h_patches, w_patches=w_patches, qk_norm=qk_norm)
         self.norm2 = RMSNorm(dim)
 
         if use_conv_mlp:
@@ -778,6 +795,11 @@ class TransformerBlock(nn.Module):
         else:
             self.mlp = nn.Sequential(nn.Linear(dim, mlp_dim), nn.Mish(), nn.Linear(mlp_dim, dim))
 
+        # Dropout on the attention/MLP residual branches (paper applies this to
+        # the middle half of blocks for the largest H/G models). nn.Dropout has
+        # no parameters, so enabling it never changes the state_dict layout.
+        self.drop = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+
         if use_adaln:
             self.adaLN_modulation = _make_adaln(dim, 6)
 
@@ -785,19 +807,19 @@ class TransformerBlock(nn.Module):
         if self.use_adaln and t_emb is not None:
             shifts_scales = self.adaLN_modulation(t_emb).chunk(6, dim=1)
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = shifts_scales
-            x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
-            x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+            x = x + gate_msa.unsqueeze(1) * self.drop(self.attn(modulate(self.norm1(x), shift_msa, scale_msa)))
+            x = x + gate_mlp.unsqueeze(1) * self.drop(self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp)))
         else:
-            x = x + self.attn(self.norm1(x))
-            x = x + self.mlp(self.norm2(x))
+            x = x + self.drop(self.attn(self.norm1(x)))
+            x = x + self.drop(self.mlp(self.norm2(x)))
         return x
 
 
 class FullAttentionBlock(nn.Module):
-    def __init__(self, dim, h, w, heads, use_adaln=False):
+    def __init__(self, dim, h, w, heads, use_adaln=False, qk_norm=False):
         super().__init__()
         self.use_adaln = use_adaln
-        self.attn = Attention(dim, heads=heads, dim_head=64, h_patches=h, w_patches=w)
+        self.attn = Attention(dim, heads=heads, dim_head=64, h_patches=h, w_patches=w, qk_norm=qk_norm)
         self.norm = RMSNorm(dim)
         if use_adaln:
             self.adaLN_modulation = _make_adaln(dim, 3)
@@ -2309,13 +2331,19 @@ class JiTModel(nn.Module):
                  model_type="jit", self_cond=False,
                  use_adaln=False, use_2d_pos_emb=False, use_conv_mlp=False,
                  bottleneck_dim=None, overlap_h=0, overlap_w=0, axial=False,
-                 use_gradient_checkpointing=False):
+                 use_gradient_checkpointing=False,
+                 use_qk_norm=False, use_final_adaln=False, time_scale=1.0,
+                 bottleneck_act="none", dropout=0.0):
         super().__init__()
         self.channels = channels
         self.self_cond = self_cond
         self.patch_size = patch_size
+        self.depth = depth
+        self.dropout = dropout
         self.use_adaln = use_adaln
         self.use_2d_pos_emb = use_2d_pos_emb
+        self.use_conv_mlp = use_conv_mlp
+        self.use_qk_norm = use_qk_norm
         self.model_type = model_type
         self.axial = axial
         self.use_gradient_checkpointing = use_gradient_checkpointing
@@ -2347,11 +2375,17 @@ class JiTModel(nn.Module):
         in_channels = patch_dim * 2 if self_cond else patch_dim
 
         if bottleneck_dim is not None and bottleneck_dim < dim:
-            self.to_patch_embedding = nn.Sequential(
-                nn.Linear(in_channels, bottleneck_dim),
-                nn.Mish(),  # Added activation between bottleneck layers
-                nn.Linear(bottleneck_dim, dim)
-            )
+            # Paper (Sec. 4.2 / Fig. 4): the bottleneck embedding is a pair of
+            # *linear* layers -- a low-rank reparameterization, with no
+            # nonlinearity between them. `bottleneck_act="mish"` is kept only for
+            # backward compatibility with checkpoints trained with the older
+            # nonlinear bottleneck (it also shifts the second Linear's index,
+            # so the two variants have distinct, self-consistent state_dicts).
+            embed = [nn.Linear(in_channels, bottleneck_dim)]
+            if bottleneck_act == "mish":
+                embed.append(nn.Mish())
+            embed.append(nn.Linear(bottleneck_dim, dim))
+            self.to_patch_embedding = nn.Sequential(*embed)
         else:
             self.to_patch_embedding = nn.Linear(in_channels, dim)
 
@@ -2362,7 +2396,7 @@ class JiTModel(nn.Module):
             self.pos_embedding = nn.Parameter(torch.randn(1, self.num_patches, dim) * 0.02)
 
         self.time_mlp = nn.Sequential(
-            SinusoidalPosEmb(dim),
+            SinusoidalPosEmb(dim, scale=time_scale),
             nn.Linear(dim, dim * 4),
             nn.Mish(),
             nn.Linear(dim * 4, dim)
@@ -2381,15 +2415,27 @@ class JiTModel(nn.Module):
             self.layers.append(self._make_block(model_type, dim, heads, i))
 
         self.norm = RMSNorm(dim)
+        # DiT-style final layer: optionally modulate the output head with
+        # adaLN-Zero before projecting back to pixels (zero-init => identity
+        # at start, so it never disrupts early training).
+        self.use_final_adaln_active = use_final_adaln and use_adaln
+        if self.use_final_adaln_active:
+            self.final_adaLN = nn.Sequential(nn.Mish(), nn.Linear(dim, 2 * dim, bias=True))
+            nn.init.constant_(self.final_adaLN[-1].weight, 0)
+            nn.init.constant_(self.final_adaLN[-1].bias, 0)
         self.to_pixels = nn.Linear(dim, patch_dim)
 
     def _make_block(self, model_type, dim, heads, layer_idx):
         hp, wp, np_ = self.h_patches, self.w_patches, self.num_patches
         adaln = self.use_adaln
-        conv_mlp = hasattr(self, 'use_conv_mlp') if False else False  # handled per-type
 
         if model_type == "jit":
-            return TransformerBlock(dim, heads, dim * 4, hp, wp, use_adaln=adaln, use_conv_mlp=False)
+            # Paper applies dropout to the middle half of the blocks.
+            mid_lo, mid_hi = self.depth // 4, self.depth - self.depth // 4
+            drop = self.dropout if (mid_lo <= layer_idx < mid_hi) else 0.0
+            return TransformerBlock(dim, heads, dim * 4, hp, wp, use_adaln=adaln,
+                                    use_conv_mlp=self.use_conv_mlp, qk_norm=self.use_qk_norm,
+                                    dropout=drop)
         elif model_type == "oggmlp":
             if self.axial:
                 return AxialgMLPBlock(dim, hp, wp, expansion_factor=4, use_adaln=adaln)
@@ -2415,7 +2461,7 @@ class JiTModel(nn.Module):
         elif model_type == "convnext":
             return ConvNeXtBlock(dim, hp, wp, drop_path=0.0)
         elif model_type == "fullattn":
-            return FullAttentionBlock(dim, hp, wp, heads=heads, use_adaln=adaln)
+            return FullAttentionBlock(dim, hp, wp, heads=heads, use_adaln=adaln, qk_norm=self.use_qk_norm)
         elif model_type == "pool":
             return ConvFormerBlock(dim, dim * 4, hp, wp)
         elif model_type == "fourier":
@@ -2521,6 +2567,9 @@ class JiTModel(nn.Module):
         # 6. Output
         if self.model_type != "basemlp":
             x = self.norm(x)
+            if self.use_final_adaln_active:
+                shift, scale = self.final_adaLN(t).chunk(2, dim=1)
+                x = modulate(x, shift, scale)
         x = self.to_pixels(x)
 
         # 7. Fold back with overlap normalization
@@ -2552,7 +2601,7 @@ class ResnetBlock(nn.Module):
 
 class ConvNetModel(nn.Module):
     def __init__(self, img_size, channels, dim, fmap_max, bottleneck_res,
-                 model_type="unet", num_res_blocks=1):
+                 model_type="unet", num_res_blocks=1, time_scale=1.0):
         super().__init__()
         self.model_type = model_type
         self.num_res_blocks = num_res_blocks
@@ -2560,7 +2609,7 @@ class ConvNetModel(nn.Module):
 
         time_dim = dim * 4
         self.time_mlp = nn.Sequential(
-            SinusoidalPosEmb(dim), nn.Linear(dim, time_dim), nn.Mish(), nn.Linear(time_dim, time_dim))
+            SinusoidalPosEmb(dim, scale=time_scale), nn.Linear(dim, time_dim), nn.Mish(), nn.Linear(time_dim, time_dim))
 
         self.init_conv = nn.Conv2d(channels, dim, 3, padding=1)
         self.downs = nn.ModuleList()
@@ -2640,16 +2689,74 @@ class ConvNetModel(nn.Module):
 # ==========================================
 
 class FlowMatchingWrapper(nn.Module):
-    def __init__(self, model, pred_mode="x"):
+    """Rectified-flow / flow-matching wrapper for the JiT formulation.
+
+    Implements all nine (prediction-space x loss-space) combinations of Tab. 1
+    in "Back to Basics: Let Denoising Generative Models Denoise". The default
+    (pred_mode="x", loss_mode="v") is the paper's final algorithm: predict the
+    clean image directly and train it under a v-loss (Alg. 1 / Tab. 1(3)(a)).
+
+    Faithfulness notes:
+      * Linear schedule z_t = t*x + (1-t)*eps, with t ~ logit-Normal(mu, sigma).
+      * The network's direct output is interpreted as x, eps, or v; the other
+        two quantities are recovered analytically (Tab. 1). (1-t) and t are
+        clamped by `t_clip` (paper default 0.05) wherever they sit in a
+        denominator, so the loss stays 0 at a perfect prediction even near the
+        endpoints.
+      * Noise magnitude scales with H/256 at higher resolution to roughly hold
+        the SNR fixed (paper: eps ~ N(0, (H/256)^2 I) at 512 / 1024).
+      * Sampling integrates dz/dt = v -- the paper's "generator space": whatever
+        the network predicts is first mapped to a velocity, then stepped.
+    """
+
+    def __init__(self, model, pred_mode="x", loss_mode="v",
+                 t_loc=-0.8, t_scale=0.8, t_clip=0.05, x_clip="none"):
         super().__init__()
+        assert pred_mode in ("x", "eps", "v"), f"bad pred_mode {pred_mode!r}"
+        assert loss_mode in ("x", "eps", "v"), f"bad loss_mode {loss_mode!r}"
+        assert x_clip in ("none", "static", "dynamic"), f"bad x_clip {x_clip!r}"
         self.model = model
         self.pred_mode = pred_mode
-        self.loc = -0.8
-        self.scale = 0.8
-        self.t_clip = 0.05
+        self.loss_mode = loss_mode
+        self.loc = t_loc
+        self.scale = t_scale
+        self.t_clip = t_clip
+        self.x_clip = x_clip
 
     def get_noise_scale(self, h):
         return h / 256.0 if h > 256 else 1.0
+
+    def _convert(self, src, z_t, t_img, clip=None):
+        """Interpret `src` as the quantity named by self.pred_mode and return the
+        triple (x, eps, v) via the relations of Tab. 1, clamping (1-t)/t by
+        `clip` (default self.t_clip) wherever they appear in a denominator."""
+        clip = self.t_clip if clip is None else clip
+        omt = (1.0 - t_img).clamp(min=clip)   # (1 - t), clamped
+        t_s = t_img.clamp(min=clip)           # t, clamped
+        if self.pred_mode == "x":
+            x = src
+            eps = (z_t - t_img * x) / omt
+            v = (x - z_t) / omt
+        elif self.pred_mode == "eps":
+            eps = src
+            x = (z_t - (1.0 - t_img) * eps) / t_s
+            v = (z_t - eps) / t_s
+        else:  # "v"
+            v = src
+            x = z_t + (1.0 - t_img) * v
+            eps = z_t - t_img * v
+        return x, eps, v
+
+    def _clip_x(self, x):
+        """Optional clipping of the predicted clean image (off by default)."""
+        if self.x_clip == "static":
+            return x.clamp(-1.0, 1.0)
+        if self.x_clip == "dynamic":
+            b = x.shape[0]
+            s = torch.quantile(x.detach().abs().flatten(1), 0.995, dim=1).clamp(min=1.0)
+            s = s.view(b, *([1] * (x.dim() - 1)))
+            return x.clamp(-s, s) / s
+        return x
 
     def p_losses(self, x_start):
         b, c, h, w = x_start.shape
@@ -2658,59 +2765,58 @@ class FlowMatchingWrapper(nn.Module):
         noise_scale = self.get_noise_scale(h)
         epsilon = torch.randn_like(x_start) * noise_scale
 
-        # Logit-normal time sampling
+        # Logit-normal time sampling: logit(t) ~ N(loc, scale^2)
         s = torch.randn(b, device=device) * self.scale + self.loc
         t = torch.sigmoid(s)
         t_img = t.view(b, 1, 1, 1)
 
-        # Flow interpolation: z_t = t*x + (1-t)*eps
-        z_t = t_img * x_start + (1 - t_img) * epsilon
+        # Linear (rectified-flow) interpolation
+        z_t = t_img * x_start + (1.0 - t_img) * epsilon
 
-        model_output = self.model(z_t, t)
-        v_target = x_start - epsilon
+        net_out = self.model(z_t, t)
 
-        if self.pred_mode == "x":
-            x_pred = model_output
-            denom = (1 - t_img).clamp(min=self.t_clip)
-            v_pred = (x_pred - z_t) / denom
-            loss = F.mse_loss(v_pred, v_target)
-        else:
-            loss = F.mse_loss(model_output, v_target)
+        # Derive the predicted triple and the ground-truth triple with the SAME
+        # clamped transforms. Sharing the transform guarantees the loss is 0 at a
+        # perfect prediction in every space, including inside the clamped region
+        # (the source of the original v-target mismatch near t -> 1).
+        true_src = {"x": x_start, "eps": epsilon, "v": x_start - epsilon}[self.pred_mode]
+        px, pe, pv = self._convert(net_out, z_t, t_img)
+        tx, te, tv = self._convert(true_src, z_t, t_img)
+        pred, target = {"x": (px, tx), "eps": (pe, te), "v": (pv, tv)}[self.loss_mode]
 
-        return loss
+        return F.mse_loss(pred, target)
 
     @torch.no_grad()
-    def sample(self, shape, steps=50):
+    def sample(self, shape, steps=50, solver="heun"):
         b, c, h, w = shape
         device = next(self.model.parameters()).device
 
         z = torch.randn(shape, device=device) * self.get_noise_scale(h)
-        timesteps = torch.linspace(0, 1, steps + 1, device=device)
-        dt = 1.0 / steps
+        timesteps = torch.linspace(0.0, 1.0, steps + 1, device=device)
 
-        def get_velocity(z_in, t_scalar):
+        def velocity(z_in, t_scalar):
             t_vec = torch.full((b,), t_scalar, device=device)
-            model_out = self.model(z_in, t_vec)
-            if self.pred_mode == "x":
-                x_pred = model_out
-                # Dynamic thresholding
-                s = torch.quantile(x_pred.abs().flatten(1), 0.995, dim=1).clamp(min=1.0)
-                s = s.view(b, 1, 1, 1)
-                x_pred = x_pred.clamp(-s, s) / s
-                denom = max(1 - t_scalar, 1e-5)
-                return (x_pred - z_in) / denom
-            return model_out
+            t_img = t_vec.view(b, 1, 1, 1)
+            net_out = self.model(z_in, t_vec)
+            # Use a tiny clamp at inference so the final step fully denoises
+            # (training's larger t_clip only exists to bound the loss weight).
+            x_pred, _, v_pred = self._convert(net_out, z_in, t_img, clip=1e-5)
+            if self.x_clip != "none":
+                x_pred = self._clip_x(x_pred)
+                v_pred = (x_pred - z_in) / (1.0 - t_img).clamp(min=1e-5)
+            return v_pred
 
-        # Heun solver
+        # Heun (default) or Euler integration of dz/dt = v from t=0 to t=1.
         for i in range(steps):
-            t_curr = timesteps[i].item()
-            d_i = get_velocity(z, t_curr)
-            if i == steps - 1:
-                z = z + d_i * dt
+            t0 = timesteps[i].item()
+            t1 = timesteps[i + 1].item()
+            dt = t1 - t0
+            d0 = velocity(z, t0)
+            if solver == "euler" or i == steps - 1:
+                z = z + dt * d0
             else:
-                z_guess = z + d_i * dt
-                d_next = get_velocity(z_guess, timesteps[i + 1].item())
-                z = z + (d_i + d_next) * 0.5 * dt
+                d1 = velocity(z + dt * d0, t1)
+                z = z + dt * 0.5 * (d0 + d1)
 
         return z
 
@@ -2765,20 +2871,23 @@ class ImageDataset(Dataset):
 # ==========================================
 
 class CosineWarmupScheduler:
-    """Cosine decay with linear warmup."""
-    def __init__(self, optimizer, warmup_steps, total_steps, min_lr_ratio=0.1):
+    """Linear warmup, then either hold constant (paper default) or cosine-decay."""
+    def __init__(self, optimizer, warmup_steps, total_steps, min_lr_ratio=0.1, mode="constant"):
         self.optimizer = optimizer
         self.warmup_steps = warmup_steps
         self.total_steps = total_steps
         self.min_lr_ratio = min_lr_ratio
+        self.mode = mode
         self.base_lrs = [pg['lr'] for pg in optimizer.param_groups]
 
     def step(self, current_step):
         if current_step < self.warmup_steps:
             scale = current_step / max(1, self.warmup_steps)
-        else:
+        elif self.mode == "cosine":
             progress = (current_step - self.warmup_steps) / max(1, self.total_steps - self.warmup_steps)
             scale = self.min_lr_ratio + 0.5 * (1 - self.min_lr_ratio) * (1 + math.cos(math.pi * progress))
+        else:  # "constant" (paper: constant LR after warmup)
+            scale = 1.0
         for pg, base_lr in zip(self.optimizer.param_groups, self.base_lrs):
             pg['lr'] = base_lr * scale
 
@@ -2822,7 +2931,13 @@ def save_checkpoint(model, optimizer, ema, step, path, max_keep=3):
 def get_input(prompt, default=None, cast_type=str):
     user_val = input(f"{prompt} (default: {default}): ").strip()
     if user_val == "":
-        return default
+        # Fall through to casting the default too, so that e.g. a bool prompt
+        # with default "0" yields False (not the truthy string "0"). Without
+        # this, accepting the displayed default silently enabled every
+        # off-by-default toggle (self-cond, grad-ckpt, conv-mlp, ...).
+        if default is None:
+            return None
+        user_val = str(default)
     if cast_type == bool:
         return user_val.lower() in ['1', 'yes', 'true', 'y', 'on']
     return cast_type(user_val)
@@ -2953,8 +3068,16 @@ def main():
 
                 cfg['use_adaln'] = get_input("Use AdaLN-Zero?", "1", bool)
                 cfg['use_2d_pos_emb'] = get_input("Use 2D Sinusoidal Pos Emb?", "1", bool)
-                cfg['use_conv_mlp'] = get_input("Use Conv-MLP?", "1", bool)
+                # Paper's JiT uses a SwiGLU MLP; Conv-MLP is an optional non-paper
+                # token-mixing variant, so default it off.
+                cfg['use_conv_mlp'] = get_input("Use Conv-MLP (off = paper SwiGLU)?", "0", bool)
                 cfg['self_cond'] = get_input("Self-conditioning?", "0", bool)
+
+                # "Just Advanced" Transformer ingredients (paper Sec. 4.4 / Tab. 4).
+                cfg['use_qk_norm'] = get_input("Use QK-Norm (Just-Advanced)?", "1", bool)
+                cfg['use_final_adaln'] = get_input("Use final adaLN-Zero head (DiT)?", "1", bool)
+                # Dropout on the middle-half of blocks (paper: 0 for B/L, 0.2 for H/G).
+                cfg['dropout'] = get_input("Dropout (middle-half blocks, 0=off)", 0.0, float)
 
                 use_bn = get_input("Use Bottleneck Patch Embed?", "1", bool)
                 cfg['bottleneck_dim'] = get_input("Bottleneck dim", 128, int) if use_bn else None
@@ -2970,11 +3093,31 @@ def main():
                 cfg['bottleneck_res'] = get_input("Bottleneck Resolution", 8, int)
                 for k in ['p_width', 'p_height', 'depth', 'heads']:
                     cfg[k] = 0
-                for k in ['use_adaln', 'use_2d_pos_emb', 'use_conv_mlp', 'self_cond', 'axial']:
+                for k in ['use_adaln', 'use_2d_pos_emb', 'use_conv_mlp', 'self_cond', 'axial',
+                          'use_qk_norm', 'use_final_adaln']:
                     cfg[k] = False
                 cfg['bottleneck_dim'] = None
                 cfg['overlap_h'] = 0
                 cfg['overlap_w'] = 0
+                cfg['dropout'] = 0.0
+
+            # --- Diffusion objective (applies to every model type) ---
+            # Paper's final algorithm = x-prediction trained with a v-loss
+            # (Tab. 1(3)(a)). Other spaces are exposed to reproduce Tab. 1/2/3.
+            print("\n--- Diffusion objective (Tab. 1 of the JiT paper) ---")
+            pm = get_input("Network prediction space [x/eps/v]", "x", str).lower()
+            cfg['pred_mode'] = pm if pm in ("x", "eps", "v") else "x"
+            lm = get_input("Loss space [x/eps/v]", "v", str).lower()
+            cfg['loss_mode'] = lm if lm in ("x", "eps", "v") else "v"
+            cfg['t_mu'] = get_input("Logit-normal time mean mu (more negative = more noise)", -0.8, float)
+            cfg['t_sigma'] = get_input("Logit-normal time std sigma", 0.8, float)
+            xc = get_input("Predicted-x clipping at sampling [none/static/dynamic]", "none", str).lower()
+            cfg['x_clip'] = xc if xc in ("none", "static", "dynamic") else "none"
+            ls = get_input("LR schedule after warmup [constant/cosine]", "constant", str).lower()
+            cfg['lr_schedule'] = ls if ls in ("constant", "cosine") else "constant"
+            cfg['time_scale'] = get_input("Time-embedding scale (t in [0,1] -> [0,scale])", 1000.0, float)
+            # Paper's bottleneck is a purely-linear low-rank reparameterization.
+            cfg['bottleneck_act'] = "none"
 
             cfg['sampling_steps'] = get_input("Heun Sampling steps", 50, int)
             cfg['batch_size'] = get_input("Batch size", 16, int)
@@ -3029,6 +3172,10 @@ def main():
             torch.save(cfg, config_path)
 
         # --- Apply defaults for legacy configs ---
+        # NOTE: architecture-changing additions (qk_norm, final adaLN, time
+        # scaling) default to their LEGACY (off / 1.0) values here so that
+        # resuming an old checkpoint rebuilds the exact original architecture.
+        # New configs created above already carry the paper-faithful values.
         defaults = {
             'use_adaln': False, 'use_ema': False, 'use_flip': False,
             'use_2d_pos_emb': False, 'use_conv_mlp': False, 'self_cond': False,
@@ -3037,6 +3184,10 @@ def main():
             'use_amp': True, 'grad_clip': 1.0, 'use_grad_ckpt': False,
             'warmup_steps': 1000, 'seed': 42, 'sample_every': 250,
             'save_every': 5000, 'num_sample_images': 4,
+            'pred_mode': 'x', 'loss_mode': 'v', 'x_clip': 'none',
+            't_mu': -0.8, 't_sigma': 0.8, 'lr_schedule': 'constant',
+            'use_qk_norm': False, 'use_final_adaln': False, 'time_scale': 1.0,
+            'bottleneck_act': 'mish', 'dropout': 0.0,
         }
         for k, v in defaults.items():
             cfg.setdefault(k, v)
@@ -3051,7 +3202,7 @@ def main():
                 img_size=(cfg['height'], cfg['width']),
                 channels=cfg['channels'], dim=cfg['dim'],
                 fmap_max=cfg['fmap_max'], bottleneck_res=cfg['bottleneck_res'],
-                model_type=cfg['model_type']
+                model_type=cfg['model_type'], time_scale=cfg['time_scale'],
             ).to(device)
         else:
             model = JiTModel(
@@ -3068,17 +3219,27 @@ def main():
                 overlap_h=cfg['overlap_h'], overlap_w=cfg['overlap_w'],
                 axial=cfg['axial'],
                 use_gradient_checkpointing=cfg['use_grad_ckpt'],
+                use_qk_norm=cfg['use_qk_norm'],
+                use_final_adaln=cfg['use_final_adaln'],
+                time_scale=cfg['time_scale'],
+                bottleneck_act=cfg['bottleneck_act'],
+                dropout=cfg['dropout'],
             ).to(device)
 
         print(f"📊 Model: {cfg['model_type']} | Parameters: {count_parameters(model):,}")
+        print(f"🎯 Objective: {cfg['pred_mode']}-pred / {cfg['loss_mode']}-loss | "
+              f"t~logitN(mu={cfg['t_mu']}, sigma={cfg['t_sigma']}) | x_clip={cfg['x_clip']}")
 
         ema = EMA(model) if cfg['use_ema'] else None
-        flow_model = FlowMatchingWrapper(model, pred_mode="x").to(device)
+        flow_model = FlowMatchingWrapper(
+            model, pred_mode=cfg['pred_mode'], loss_mode=cfg['loss_mode'],
+            t_loc=cfg['t_mu'], t_scale=cfg['t_sigma'], x_clip=cfg['x_clip'],
+        ).to(device)
         optimizer = Adan(model.parameters(), lr=cfg['lr'])#Prodigy(model.parameters(), lr=cfg['lr'], weight_decay=0.0, betas=(0.9, 0.95), slice_p=11)#CAdamax(model.parameters(), lr=cfg['lr'], weight_decay=0.05, betas=(0.9, 0.95))
 
         scheduler = CosineWarmupScheduler(
             optimizer, warmup_steps=cfg['warmup_steps'],
-            total_steps=cfg['steps'], min_lr_ratio=0.1
+            total_steps=cfg['steps'], min_lr_ratio=0.1, mode=cfg['lr_schedule'],
         )
 
         start_step = 0
@@ -3118,8 +3279,9 @@ def main():
 
             data = next(dl_iter).to(device)
 
-            # LR schedule
-            #scheduler.step(step)
+            # LR schedule (linear warmup, then constant per the paper unless
+            # cfg['lr_schedule'] == 'cosine')
+            scheduler.step(step)
 
             # Forward pass with optional AMP
             with torch.amp.autocast('cuda', enabled=cfg['use_amp']):
@@ -3150,7 +3312,10 @@ def main():
             if step > 0 and step % cfg['sample_every'] == 0:
                 inference_model = ema.shadow if ema else model
                 inference_model.eval()
-                temp_flow = FlowMatchingWrapper(inference_model, pred_mode="x").to(device)
+                temp_flow = FlowMatchingWrapper(
+                    inference_model, pred_mode=cfg['pred_mode'], loss_mode=cfg['loss_mode'],
+                    t_loc=cfg['t_mu'], t_scale=cfg['t_sigma'], x_clip=cfg['x_clip'],
+                ).to(device)
                 n_samples = cfg['num_sample_images']
                 samples = temp_flow.sample(
                     (n_samples, cfg['channels'], cfg['height'], cfg['width']),
@@ -3180,6 +3345,10 @@ def main():
             'use_2d_pos_emb': False, 'use_conv_mlp': False, 'self_cond': False,
             'bottleneck_dim': None, 'fmap_max': 512, 'bottleneck_res': 8,
             'overlap_h': 0, 'overlap_w': 0, 'axial': False,
+            'pred_mode': 'x', 'loss_mode': 'v', 'x_clip': 'none',
+            't_mu': -0.8, 't_sigma': 0.8, 'use_qk_norm': False,
+            'use_final_adaln': False, 'time_scale': 1.0, 'bottleneck_act': 'mish',
+            'dropout': 0.0,
         }
         for k, v in defaults.items():
             cfg.setdefault(k, v)
@@ -3188,6 +3357,9 @@ def main():
         steps = get_input("Heun Steps", cfg.get('sampling_steps', 50), int)
         seed = get_input("Seed (0=random)", 0, int)
         batch_size = get_input("Batch size for sampling", min(count, 4), int)
+        # Allow overriding predicted-x clipping at inference without retraining.
+        xc = get_input("Predicted-x clipping [none/static/dynamic]", cfg['x_clip'], str).lower()
+        cfg['x_clip'] = xc if xc in ("none", "static", "dynamic") else cfg['x_clip']
 
         #for f in glob.glob(os.path.join(SAVE_DIR, "generated_*.png")):
         #    os.remove(f)
@@ -3201,7 +3373,7 @@ def main():
                 img_size=(cfg['height'], cfg['width']),
                 channels=cfg['channels'], dim=cfg['dim'],
                 fmap_max=cfg['fmap_max'], bottleneck_res=cfg['bottleneck_res'],
-                model_type=cfg['model_type']
+                model_type=cfg['model_type'], time_scale=cfg['time_scale'],
             ).to(device)
         else:
             model = JiTModel(
@@ -3218,6 +3390,10 @@ def main():
                 overlap_h=cfg['overlap_h'],
                 overlap_w=cfg['overlap_w'],
                 axial=cfg['axial'],
+                use_qk_norm=cfg['use_qk_norm'],
+                use_final_adaln=cfg['use_final_adaln'],
+                time_scale=cfg['time_scale'],
+                bottleneck_act=cfg['bottleneck_act'],
             ).to(device)
 
         ckpt = torch.load(model_path, weights_only=False)
@@ -3228,7 +3404,10 @@ def main():
             model.load_state_dict(ckpt['model'])
 
         model.eval()
-        flow_model = FlowMatchingWrapper(model, pred_mode="x").to(device)
+        flow_model = FlowMatchingWrapper(
+            model, pred_mode=cfg['pred_mode'], loss_mode=cfg['loss_mode'],
+            t_loc=cfg['t_mu'], t_scale=cfg['t_sigma'], x_clip=cfg['x_clip'],
+        ).to(device)
 
         generated = 0
         while generated < count:
