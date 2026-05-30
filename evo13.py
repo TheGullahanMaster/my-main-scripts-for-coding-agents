@@ -12675,9 +12675,19 @@ def get_configs(df):
 
 
 def tournament_select(population, k=3):
-    """Simple fitness-based tournament selection."""
+    """Simple fitness-based tournament selection (lower fitness == better).
+
+    NaN-safe: an individual whose fitness failed to evaluate (NaN) is treated
+    as worst-possible.  ``min`` with a raw NaN key is order-dependent in CPython
+    (NaN compares False both ways), so a broken tree could previously win a
+    tournament and propagate into the next generation purely as an artefact of
+    where it landed in the random sample.
+    """
+    if not population:
+        raise ValueError("tournament_select() called on an empty population")
     candidates = random.sample(population, min(len(population), k))
-    return min(candidates, key=lambda x: x.fitness)
+    return min(candidates,
+               key=lambda x: x.fitness if x.fitness == x.fitness else float('inf'))
 
 
 def epsilon_lexicase_selection(population, X, y_target, type_code, n_cases=20,
@@ -12744,6 +12754,16 @@ def epsilon_lexicase_selection(population, X, y_target, type_code, n_cases=20,
             row = np.full(n_cols, np.inf, dtype=np.float64)
         err_rows.append(row)
     err_matrix = np.vstack(err_rows) if err_rows else np.empty((0, n_cols))
+    # NaN-proofing: get_case_errors can return NaN *without raising* (e.g. a NaN
+    # affine scale surviving the nan_to_num applied only to raw preds), so the
+    # except-branch above does not catch it.  A single NaN poisons the per-case
+    # filter — np.min returns NaN, every `err <= NaN` test is False, the survivor
+    # pool empties, and the next case's errors.min() raises on a zero-size array,
+    # crashing the worker.  Treat NaN as +inf (worst, exactly as a broken
+    # individual is treated) so the per-case argmin always survives and `active`
+    # is never emptied.
+    if err_matrix.size:
+        err_matrix[np.isnan(err_matrix)] = np.inf
 
     # ── Canonical per-case MAD epsilon (computed ONCE over the whole pop) ──
     # ε_j = median_i(|e_ij − median_i(e_ij)|).  Only finite errors contribute
@@ -13393,7 +13413,7 @@ def macro_inject_subtree(cgp_eq, n_features, feature_names, op_affinity=None):
 def _create_offspring(action, parent, population, n_features, feat_names,
                       eff_rate, sa_temp, parent_sigma, X,
                       op_affinity=None, y_residuals=None,
-                      tournament_k=3):
+                      tournament_k=3, child_sigma=None):
     """Shared offspring creation logic for both island evolution and AFPO.
 
     Returns (child_tree, child_sigma) after applying the chosen reproductive
@@ -13406,10 +13426,22 @@ def _create_offspring(action, parent, population, n_features, feat_names,
     tournament_k : tournament size used when picking the second parent for
                   crossover.  Callers may scale this with a cosine schedule
                   (low k early for exploration, high k late for exploitation).
+
+    child_sigma : the self-adaptive σ the caller already drew from parent_sigma
+                  and used to size ``eff_rate``.  Threading it through keeps the
+                  σ the child inherits identical to the σ that actually
+                  generated it — canonical ES self-adaptation.  Previously this
+                  function always re-drew σ from a *fresh* log-normal sample, so
+                  the inherited σ was statistically independent of the mutation
+                  magnitude actually applied and selection could not adapt σ at
+                  all.  ``None`` (legacy callers) falls back to an internal draw.
+                  The crossover branches still override σ with a two-parent
+                  blend, so only the mutation / macro paths are affected.
     """
-    child_sigma = float(np.clip(
-        parent_sigma * np.exp(random.gauss(0, SIGMA_TAU)),
-        SIGMA_MIN, SIGMA_MAX))
+    if child_sigma is None:
+        child_sigma = float(np.clip(
+            parent_sigma * np.exp(random.gauss(0, SIGMA_TAU)),
+            SIGMA_MIN, SIGMA_MAX))
 
     if action == 'crossover' and len(population) >= 2:
         parent2    = tournament_select(population, k=tournament_k)
@@ -13418,7 +13450,8 @@ def _create_offspring(action, parent, population, n_features, feat_names,
             # Crossover collapsed back into a copy of one parent — apply a
             # disruptive mutation so we don't waste an evaluation on a clone.
             child_tree = mutate(child_tree, n_features, feat_names,
-                                mut_rate=max(2, eff_rate), temperature=sa_temp)
+                                mut_rate=max(2, eff_rate), temperature=sa_temp,
+                                op_affinity=op_affinity)
         # else: novel crossover child — keep it intact.  A post-mutation pass
         # here re-randomizes the recombination we just produced (especially
         # because `mutate`'s 'operator' weight is 2.0 and frequently flips
@@ -13434,7 +13467,8 @@ def _create_offspring(action, parent, population, n_features, feat_names,
                                           y_residuals)
         # Light mutation to explore around the semantic combination
         child_tree = mutate(child_tree, n_features, feat_names,
-                            mut_rate=max(1, eff_rate // 2), temperature=sa_temp)
+                            mut_rate=max(1, eff_rate // 2), temperature=sa_temp,
+                            op_affinity=op_affinity)
         p2_sigma = getattr(parent2, 'sigma', float(CGP_MUT_RATE))
         child_sigma = float(np.clip(
             (parent_sigma + p2_sigma) / 2.0 * np.exp(random.gauss(0, SIGMA_TAU * 0.5)),
@@ -13831,7 +13865,8 @@ def evolve_island_chunk(args):
             eff_rate, sa_temp, parent_sigma, X,
             op_affinity=_op_affinity if _op_affinity else None,
             y_residuals=y_target,
-            tournament_k=_tk)
+            tournament_k=_tk,
+            child_sigma=child_sigma)
 
         child       = Individual(child_tree)
         child.sigma = child_sigma
@@ -14776,7 +14811,8 @@ def evolve_afpo(population, X, y_target, type_code,
             eff_rate, sa_temp, parent_sigma, X,
             y_residuals=y_target,
             tournament_k=_tk,
-            op_affinity=_op_affinity if _op_affinity else None)
+            op_affinity=_op_affinity if _op_affinity else None,
+            child_sigma=child_sigma)
 
         child       = Individual(child_tree)
         child.sigma = child_sigma
