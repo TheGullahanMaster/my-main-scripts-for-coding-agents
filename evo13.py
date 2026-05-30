@@ -12675,9 +12675,19 @@ def get_configs(df):
 
 
 def tournament_select(population, k=3):
-    """Simple fitness-based tournament selection."""
+    """Simple fitness-based tournament selection (lower fitness == better).
+
+    NaN-safe: an individual whose fitness failed to evaluate (NaN) is treated
+    as worst-possible.  ``min`` with a raw NaN key is order-dependent in CPython
+    (NaN compares False both ways), so a broken tree could previously win a
+    tournament and propagate into the next generation purely as an artefact of
+    where it landed in the random sample.
+    """
+    if not population:
+        raise ValueError("tournament_select() called on an empty population")
     candidates = random.sample(population, min(len(population), k))
-    return min(candidates, key=lambda x: x.fitness)
+    return min(candidates,
+               key=lambda x: x.fitness if x.fitness == x.fitness else float('inf'))
 
 
 def epsilon_lexicase_selection(population, X, y_target, type_code, n_cases=20,
@@ -13418,7 +13428,8 @@ def _create_offspring(action, parent, population, n_features, feat_names,
             # Crossover collapsed back into a copy of one parent — apply a
             # disruptive mutation so we don't waste an evaluation on a clone.
             child_tree = mutate(child_tree, n_features, feat_names,
-                                mut_rate=max(2, eff_rate), temperature=sa_temp)
+                                mut_rate=max(2, eff_rate), temperature=sa_temp,
+                                op_affinity=op_affinity)
         # else: novel crossover child — keep it intact.  A post-mutation pass
         # here re-randomizes the recombination we just produced (especially
         # because `mutate`'s 'operator' weight is 2.0 and frequently flips
@@ -13434,7 +13445,8 @@ def _create_offspring(action, parent, population, n_features, feat_names,
                                           y_residuals)
         # Light mutation to explore around the semantic combination
         child_tree = mutate(child_tree, n_features, feat_names,
-                            mut_rate=max(1, eff_rate // 2), temperature=sa_temp)
+                            mut_rate=max(1, eff_rate // 2), temperature=sa_temp,
+                            op_affinity=op_affinity)
         p2_sigma = getattr(parent2, 'sigma', float(CGP_MUT_RATE))
         child_sigma = float(np.clip(
             (parent_sigma + p2_sigma) / 2.0 * np.exp(random.gauss(0, SIGMA_TAU * 0.5)),
