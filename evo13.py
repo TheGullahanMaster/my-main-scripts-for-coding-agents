@@ -506,12 +506,12 @@ ADAPTIVE_PARSIMONY_WEIGHT  = 0.03
 ADAPTIVE_PARSIMONY_ENABLED = True
 
 # ---- Evolution model ----
-# "island"          = Island Model (default, multi-process)
-# "afpo"            = Age-Fitness Pareto Optimisation (single-process)
+# "island"          = Island Model (multi-process)
+# "afpo"            = Age-Fitness Pareto Optimisation (default, single-process)
 # "island_afpo"     = Islanded AFPOs: N islands each running their own AFPO (parallel)
 # "age_group_islands" = Age Group Islands: tiered AFPO where best individuals
 #                      graduate from younger to older age-group island pools
-EVOLUTION_MODEL = "island"
+EVOLUTION_MODEL = "afpo"
 
 # Number of islands for Island and Islanded-AFPO models (set interactively)
 NUM_ISLANDS_GLOBAL = 4
@@ -1880,13 +1880,43 @@ OP_PRESETS = {
                 'sin', 'cos', 'tan', 'tanh', 'sigmoid', 'square', 'const'],
     },
     "6": {
+        "name": "Pure Logic",
+        "desc": "Bitwise ops, if/else, comparisons, basic arithmetic and constants. "
+                "Discrete / logical relationships and piecewise rules.",
+        "ops": ['+', '-', '*', '/', 'const',
+                'gt', 'lt', 'gte', 'lte', 'eq', 'ne',
+                'if_else',
+                'bitwise_and', 'bitwise_or', 'bitwise_xor',
+                'lshift', 'rshift', 'bitwise_not'],
+    },
+    "7": {
+        "name": "Pseudo-NAS",
+        "desc": "Perceptron neurons + standard activations (ReLU/Sigmoid/Tanh/Softplus) "
+                "with +, * and constants. Evolves small neural-net-like graphs; "
+                "force-enables the perceptron operators.",
+        # Perceptrons are the whole point of this preset, so selecting it
+        # force-enables the perceptron family even if the user disabled it at
+        # the earlier prompt — see select_allowed_ops().
+        "ops": ['+', '*', 'const',
+                'relu', 'sigmoid', 'tanh', 'softplus',
+                'perceptronSigma1', 'perceptronReLU1', 'perceptronCustom1',
+                'perceptronSigma2', 'perceptronReLU2', 'perceptronCustom2'],
+    },
+    "8": {
+        "name": "Bitwise-only",
+        "desc": "Only bitwise operators and constants (plus variables) — nothing else. "
+                "Integer / bit-twiddling, hashing and RNG-style expressions.",
+        "ops": ['bitwise_and', 'bitwise_or', 'bitwise_xor',
+                'lshift', 'rshift', 'bitwise_not', 'const'],
+    },
+    "9": {
         "name": "Full  (all ops)",
         "desc": "Every available operator. Widest search space; slowest convergence.",
         # Resolved at selection time so perceptron ops can be excluded when
         # PERCEPTRON_ENABLED is False — see select_allowed_ops().
         "ops": None,
     },
-    "7": {
+    "10": {
         "name": "Custom",
         "desc": "Choose individual operations from the full list.",
         "ops": None,  # filled interactively
@@ -1926,7 +1956,7 @@ def _build_ternary_ops_list():
 
 def select_allowed_ops():
     """Interactive prompt that returns a list of allowed ops."""
-    global ALLOWED_OPS
+    global ALLOWED_OPS, PERCEPTRON_ENABLED
 
     print("\n" + "=" * 70)
     print("OPERATOR SELECTION")
@@ -1939,12 +1969,12 @@ def select_allowed_ops():
     while True:
         choice = input("\nPreset number [default 3]: ").strip()
         if not choice:
-            choice = "6"
+            choice = "9"
         if choice in OP_PRESETS:
             break
-        print("  Please enter a number from 1–7.")
+        print("  Please enter a number from 1–10.")
 
-    if choice == "7":
+    if choice == "10":
         # Custom selection
         print("\n--- Available operations (enter numbers separated by spaces or commas) ---")
         # Hide perceptron ops from the menu unless they were explicitly enabled.
@@ -1970,10 +2000,17 @@ def select_allowed_ops():
                 break
             except (ValueError, IndexError):
                 print("  Invalid selection. Try again.")
-    elif choice == "6":
+    elif choice == "9":
         # Full preset — resolved dynamically so the perceptron gating applies.
         ALLOWED_OPS = _visible_op_list()
     else:
+        if choice == "7" and not PERCEPTRON_ENABLED:
+            # Pseudo-NAS is built around the perceptron family, so selecting it
+            # force-enables perceptrons even if they were disabled at the
+            # earlier prompt (otherwise the preset would be self-defeating).
+            PERCEPTRON_ENABLED = True
+            print("  Note: Pseudo-NAS requires perceptron operators — "
+                  "force-enabling them.")
         ALLOWED_OPS = list(OP_PRESETS[choice]["ops"])
 
     # Rebuild CGPEquation class-level op lists from new ALLOWED_OPS
@@ -25596,12 +25633,12 @@ def train_mode():
     print("\n" + "═" * 70)
     print("EVOLUTION MODEL")
     print("═" * 70)
-    print("  [1] Island Model  (default)")
+    print("  [1] Island Model")
     print("      N isolated sub-populations evolve in parallel (multi-process).")
     print("      Best individuals migrate between islands periodically.")
     print("      Fastest wall-clock time on multi-core machines.")
     print()
-    print("  [2] Age-Fitness Pareto Optimisation (AFPO)")
+    print("  [2] Age-Fitness Pareto Optimisation (AFPO)  (default)")
     print("      Single population.  Each individual has an 'age' counter.")
     print("      After every birth the population is trimmed to its Pareto")
     print("      front on (age, fitness) — both minimised.  Younger fitter")
@@ -25630,8 +25667,8 @@ def train_mode():
     print("      Requires scikit-learn.")
     print("═" * 70)
     while True:
-        em_in = input("Evolution model [1/2/3/4/5, default 1]: ").strip()
-        if not em_in or em_in == '1':
+        em_in = input("Evolution model [1/2/3/4/5, default 2]: ").strip()
+        if em_in == '1':
             EVOLUTION_MODEL = "island"
             # Ask for island count
             n_isl_in = input("  Number of islands [default 4]: ").strip()
@@ -25642,7 +25679,7 @@ def train_mode():
                 NUM_ISLANDS_GLOBAL = 4
             print(f"  ✓  Island Model selected  ({NUM_ISLANDS_GLOBAL} islands).")
             break
-        elif em_in == '2':
+        elif not em_in or em_in == '2':
             EVOLUTION_MODEL = "afpo"
             NUM_ISLANDS_GLOBAL = 1   # not used, but keep consistent
             n_stg_in = input(f"  Number of AFPO stages [default 2]: ").strip()
