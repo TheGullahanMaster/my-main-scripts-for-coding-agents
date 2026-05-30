@@ -12754,6 +12754,16 @@ def epsilon_lexicase_selection(population, X, y_target, type_code, n_cases=20,
             row = np.full(n_cols, np.inf, dtype=np.float64)
         err_rows.append(row)
     err_matrix = np.vstack(err_rows) if err_rows else np.empty((0, n_cols))
+    # NaN-proofing: get_case_errors can return NaN *without raising* (e.g. a NaN
+    # affine scale surviving the nan_to_num applied only to raw preds), so the
+    # except-branch above does not catch it.  A single NaN poisons the per-case
+    # filter — np.min returns NaN, every `err <= NaN` test is False, the survivor
+    # pool empties, and the next case's errors.min() raises on a zero-size array,
+    # crashing the worker.  Treat NaN as +inf (worst, exactly as a broken
+    # individual is treated) so the per-case argmin always survives and `active`
+    # is never emptied.
+    if err_matrix.size:
+        err_matrix[np.isnan(err_matrix)] = np.inf
 
     # ── Canonical per-case MAD epsilon (computed ONCE over the whole pop) ──
     # ε_j = median_i(|e_ij − median_i(e_ij)|).  Only finite errors contribute
