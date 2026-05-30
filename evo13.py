@@ -13413,7 +13413,7 @@ def macro_inject_subtree(cgp_eq, n_features, feature_names, op_affinity=None):
 def _create_offspring(action, parent, population, n_features, feat_names,
                       eff_rate, sa_temp, parent_sigma, X,
                       op_affinity=None, y_residuals=None,
-                      tournament_k=3):
+                      tournament_k=3, child_sigma=None):
     """Shared offspring creation logic for both island evolution and AFPO.
 
     Returns (child_tree, child_sigma) after applying the chosen reproductive
@@ -13426,10 +13426,22 @@ def _create_offspring(action, parent, population, n_features, feat_names,
     tournament_k : tournament size used when picking the second parent for
                   crossover.  Callers may scale this with a cosine schedule
                   (low k early for exploration, high k late for exploitation).
+
+    child_sigma : the self-adaptive σ the caller already drew from parent_sigma
+                  and used to size ``eff_rate``.  Threading it through keeps the
+                  σ the child inherits identical to the σ that actually
+                  generated it — canonical ES self-adaptation.  Previously this
+                  function always re-drew σ from a *fresh* log-normal sample, so
+                  the inherited σ was statistically independent of the mutation
+                  magnitude actually applied and selection could not adapt σ at
+                  all.  ``None`` (legacy callers) falls back to an internal draw.
+                  The crossover branches still override σ with a two-parent
+                  blend, so only the mutation / macro paths are affected.
     """
-    child_sigma = float(np.clip(
-        parent_sigma * np.exp(random.gauss(0, SIGMA_TAU)),
-        SIGMA_MIN, SIGMA_MAX))
+    if child_sigma is None:
+        child_sigma = float(np.clip(
+            parent_sigma * np.exp(random.gauss(0, SIGMA_TAU)),
+            SIGMA_MIN, SIGMA_MAX))
 
     if action == 'crossover' and len(population) >= 2:
         parent2    = tournament_select(population, k=tournament_k)
@@ -13853,7 +13865,8 @@ def evolve_island_chunk(args):
             eff_rate, sa_temp, parent_sigma, X,
             op_affinity=_op_affinity if _op_affinity else None,
             y_residuals=y_target,
-            tournament_k=_tk)
+            tournament_k=_tk,
+            child_sigma=child_sigma)
 
         child       = Individual(child_tree)
         child.sigma = child_sigma
@@ -14798,7 +14811,8 @@ def evolve_afpo(population, X, y_target, type_code,
             eff_rate, sa_temp, parent_sigma, X,
             y_residuals=y_target,
             tournament_k=_tk,
-            op_affinity=_op_affinity if _op_affinity else None)
+            op_affinity=_op_affinity if _op_affinity else None,
+            child_sigma=child_sigma)
 
         child       = Individual(child_tree)
         child.sigma = child_sigma
