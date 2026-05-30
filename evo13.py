@@ -424,6 +424,16 @@ PARSIMONY_STRENGTH = 0.01
 RESEED_PERIOD = 250
 RESEED_INJECT_N = 5     # how many fresh seeds to splice into each island
 
+# Master switch for population seeding.  When True (default) the search is given
+# a head start: hand-crafted template individuals plus closed-form seeds
+# (OLS / log-OLS / monomial / rational / residual-targeted fits) are transcribed
+# straight into the initial population and re-injected periodically — these often
+# solve linear / polynomial / power-law targets outright on generation 0.
+# When False, every seed generator returns nothing and evolution must discover
+# all structure on its own from a purely random initial population.  Set
+# interactively in train_mode() via _select_use_seeds().
+USE_SEEDS = True
+
 # Plateau-driven meta-extinction: when global best loss has not improved by
 # more than META_PLATEAU_REL in META_PLATEAU_GENS generations, wipe all
 # islands except the global elite (`META_KEEP_FRAC`) and rebuild from fresh
@@ -1051,6 +1061,19 @@ def _erf_fn(v):
 # numpy arrays so they slot straight into BINARY_OPS_EVAL / UNARY_OPS_EVAL.
 
 _INT_OP_CLAMP = 1e15  # cap before int conversion — keeps bitwise ops in int64 range
+_FLOAT_BITS_CLAMP = 1e9   # NaN/±Inf clamp for raw-float bitwise results; matches the
+                          # per-node sanitiser in CGPEquation.evaluate() so a model
+                          # evolved in float-bitwise mode exports bit-for-bit identically
+
+# How bitwise / shift operators (bitwise_and/or/xor/not, lshift, rshift) treat
+# their operands.  Set interactively in train_mode() via _select_bitwise_mode():
+#   'int'   — floor + clip each operand to a bounded int64, then bit-twiddle
+#             (RNG / hashing / digit-style equations).  This is the default and
+#             preserves the original behaviour.
+#   'float' — apply the bit operation directly to the raw 8 bytes (IEEE-754 bit
+#             pattern) of each float64 operand, reinterpreting the result bytes
+#             back as a float64 (no value→int rounding).
+BITWISE_MODE = 'int'
 
 
 def _to_int(v):
@@ -1060,18 +1083,105 @@ def _to_int(v):
                             -_INT_OP_CLAMP, _INT_OP_CLAMP)).astype(np.int64)
 
 
-def _bitwise_and(v1, v2):  return np.bitwise_and(_to_int(v1), _to_int(v2)).astype(np.float64)
-def _bitwise_or(v1, v2):   return np.bitwise_or (_to_int(v1), _to_int(v2)).astype(np.float64)
-def _bitwise_xor(v1, v2):  return np.bitwise_xor(_to_int(v1), _to_int(v2)).astype(np.float64)
-def _bitwise_not(v):       return np.bitwise_not(_to_int(v)).astype(np.float64)
+def _float_to_bits(v):
+    """Reinterpret float64 values as their raw uint64 IEEE-754 bit-pattern.
+
+    This is a pure type-pun (a ``view``), not a value conversion: 1.0 becomes
+    0x3FF0000000000000, not 1.  Used by the 'float' bitwise mode so the bit
+    operators scramble the actual exponent/mantissa bytes of the operands.
+    """
+    return np.ascontiguousarray(v, dtype=np.float64).view(np.uint64)
+
+
+def _bits_to_float(b):
+    """Reinterpret a uint64 bit-pattern back to float64, then sanitise NaN/±Inf
+    to 0.0 / ±_FLOAT_BITS_CLAMP.  Many bit patterns decode to NaN/Inf, so this
+    mirrors the per-node clamp applied in CGPEquation.evaluate() — keeping live
+    evaluation and the exported script numerically identical.
+    """
+    out = np.ascontiguousarray(b, dtype=np.uint64).view(np.float64)
+    return np.nan_to_num(out, nan=0.0, posinf=_FLOAT_BITS_CLAMP,
+                         neginf=-_FLOAT_BITS_CLAMP)
+
+
+def _bitwise_and(v1, v2):
+    if BITWISE_MODE == 'float':
+        return _bits_to_float(np.bitwise_and(_float_to_bits(v1), _float_to_bits(v2)))
+    return np.bitwise_and(_to_int(v1), _to_int(v2)).astype(np.float64)
+def _bitwise_or(v1, v2):
+    if BITWISE_MODE == 'float':
+        return _bits_to_float(np.bitwise_or(_float_to_bits(v1), _float_to_bits(v2)))
+    return np.bitwise_or(_to_int(v1), _to_int(v2)).astype(np.float64)
+def _bitwise_xor(v1, v2):
+    if BITWISE_MODE == 'float':
+        return _bits_to_float(np.bitwise_xor(_float_to_bits(v1), _float_to_bits(v2)))
+    return np.bitwise_xor(_to_int(v1), _to_int(v2)).astype(np.float64)
+def _bitwise_not(v):
+    if BITWISE_MODE == 'float':
+        return _bits_to_float(np.bitwise_not(_float_to_bits(v)))
+    return np.bitwise_not(_to_int(v)).astype(np.float64)
 def _lshift(v1, v2):
+    if BITWISE_MODE == 'float':
+        s = np.clip(_to_int(v2), 0, 63).astype(np.uint64)
+        return _bits_to_float(np.left_shift(_float_to_bits(v1), s))
     a = _to_int(v1)
     s = np.clip(_to_int(v2), 0, 62)
     return np.left_shift(a, s).astype(np.float64)
 def _rshift(v1, v2):
+    if BITWISE_MODE == 'float':
+        s = np.clip(_to_int(v2), 0, 63).astype(np.uint64)
+        return _bits_to_float(np.right_shift(_float_to_bits(v1), s))
     a = _to_int(v1)
     s = np.clip(_to_int(v2), 0, 62)
     return np.right_shift(a, s).astype(np.float64)
+
+
+def _bitwise_ops_source(mode):
+    """Return Python source (as text) for the bitwise / shift operator helpers
+    used by *exported* model scripts — the ``_op_*`` names emitted by
+    tree_to_python_expr.  ``mode`` ('int' or 'float') is baked into the generated
+    file as a module constant so an exported model computes bit-for-bit
+    identically to the live evolver that produced it.  The bodies are deliberately
+    the same logic as the live ``_bitwise_*`` helpers above.
+    """
+    return f'''_INT_OP_CLAMP = 1e15
+_FLOAT_BITS_CLAMP = 1e9
+BITWISE_MODE = {mode!r}
+def _to_int(v):
+    return np.floor(np.clip(np.nan_to_num(v, nan=0.0, posinf=_INT_OP_CLAMP,
+                                          neginf=-_INT_OP_CLAMP),
+                            -_INT_OP_CLAMP, _INT_OP_CLAMP)).astype(np.int64)
+def _float_to_bits(v):
+    return np.ascontiguousarray(v, dtype=np.float64).view(np.uint64)
+def _bits_to_float(b):
+    out = np.ascontiguousarray(b, dtype=np.uint64).view(np.float64)
+    return np.nan_to_num(out, nan=0.0, posinf=_FLOAT_BITS_CLAMP, neginf=-_FLOAT_BITS_CLAMP)
+def _op_bitwise_and(v1, v2):
+    if BITWISE_MODE == 'float':
+        return _bits_to_float(np.bitwise_and(_float_to_bits(v1), _float_to_bits(v2)))
+    return np.bitwise_and(_to_int(v1), _to_int(v2)).astype(np.float64)
+def _op_bitwise_or(v1, v2):
+    if BITWISE_MODE == 'float':
+        return _bits_to_float(np.bitwise_or(_float_to_bits(v1), _float_to_bits(v2)))
+    return np.bitwise_or(_to_int(v1), _to_int(v2)).astype(np.float64)
+def _op_bitwise_xor(v1, v2):
+    if BITWISE_MODE == 'float':
+        return _bits_to_float(np.bitwise_xor(_float_to_bits(v1), _float_to_bits(v2)))
+    return np.bitwise_xor(_to_int(v1), _to_int(v2)).astype(np.float64)
+def _op_bitwise_not(v):
+    if BITWISE_MODE == 'float':
+        return _bits_to_float(np.bitwise_not(_float_to_bits(v)))
+    return np.bitwise_not(_to_int(v)).astype(np.float64)
+def _op_lshift(v1, v2):
+    if BITWISE_MODE == 'float':
+        s = np.clip(_to_int(v2), 0, 63).astype(np.uint64)
+        return _bits_to_float(np.left_shift(_float_to_bits(v1), s))
+    return np.left_shift(_to_int(v1), np.clip(_to_int(v2), 0, 62)).astype(np.float64)
+def _op_rshift(v1, v2):
+    if BITWISE_MODE == 'float':
+        s = np.clip(_to_int(v2), 0, 63).astype(np.uint64)
+        return _bits_to_float(np.right_shift(_float_to_bits(v1), s))
+    return np.right_shift(_to_int(v1), np.clip(_to_int(v2), 0, 62)).astype(np.float64)'''
 
 
 def _ne(v1, v2):           return np.where(v1 != v2, 1.0, 0.0)
@@ -2377,6 +2487,76 @@ def _select_gradient_boosting():
         extras.append(f"L2={GRADIENT_BOOSTING_L2_LEAF}")
     if extras:
         print(f"     {', '.join(extras)}")
+
+
+def _select_use_seeds():
+    """Ask whether to seed the initial population (and the periodic re-injections)
+    with closed-form / hand-crafted starting individuals.  Disabling forces
+    evolution to discover every equation from a purely random start."""
+    global USE_SEEDS
+
+    print("\n" + "─" * 70)
+    print("POPULATION SEEDING")
+    print("─" * 70)
+    print("  By default the search is given a head start: hand-crafted template")
+    print("  individuals plus closed-form seeds (OLS / log-OLS / monomial /")
+    print("  rational / residual-targeted fits) are transcribed straight into the")
+    print("  initial population and re-injected periodically.  These often solve")
+    print("  linear / polynomial / power-law targets outright on generation 0.")
+    print()
+    print("  Disable seeding to make evolution discover every equation purely on")
+    print("  its own, starting from a fully random population.  Slower and less")
+    print("  reliable on structured targets, but a cleaner test of the search —")
+    print("  and the only honest mode when you want emergent (not transcribed)")
+    print("  results.")
+    print("─" * 70)
+    choice = input("Use seeds? [Y/n]: ").strip().lower()
+    if choice.startswith('n'):
+        USE_SEEDS = False
+        print("  ✓  Seeding DISABLED — evolution starts from a random population.")
+    else:
+        USE_SEEDS = True
+        print("  ✓  Seeding ENABLED (default).")
+
+
+def _select_bitwise_mode():
+    """Ask whether bitwise / shift operators coerce their operands to integers or
+    operate directly on the raw IEEE-754 bytes of the float64 operands.
+
+    Only prompts when at least one bitwise / shift operator is actually in the
+    active operator set — otherwise the choice has no effect and we silently
+    leave the default (integer-coerced) mode in place."""
+    global BITWISE_MODE
+
+    _bit_ops = {'bitwise_and', 'bitwise_or', 'bitwise_xor', 'bitwise_not',
+                'lshift', 'rshift'}
+    if not (_bit_ops & set(CGPEquation.OPS_ALL)):
+        BITWISE_MODE = 'int'
+        return
+
+    print("\n" + "─" * 70)
+    print("BITWISE OPERAND MODE")
+    print("─" * 70)
+    print("  Bitwise / shift operators (and, or, xor, not, <<, >>) can treat")
+    print("  their operands in two different ways:")
+    print()
+    print("  [I] Integers (default) — each operand is floored and clipped to a")
+    print("      bounded int64, then the bit operation runs on that integer.")
+    print("      Best for RNG / hashing / digit-style equations.")
+    print()
+    print("  [F] Floats — the operation is applied directly to the raw 8 bytes")
+    print("      (IEEE-754 bit pattern) of each float64 operand, and the result")
+    print("      bytes are reinterpreted back as a float64.  No value→int")
+    print("      rounding happens; you are scrambling the sign/exponent/mantissa")
+    print("      bits themselves (e.g. xor(x, x) == 0.0, and(3.0, 5.0) == 2.0).")
+    print("─" * 70)
+    choice = input("Bitwise operand mode [I=integers / F=floats, default I]: ").strip().lower()
+    if choice.startswith('f'):
+        BITWISE_MODE = 'float'
+        print("  ✓  Bitwise mode: FLOAT (raw IEEE-754 byte operations).")
+    else:
+        BITWISE_MODE = 'int'
+        print("  ✓  Bitwise mode: INTEGER (floor-to-int64 operations, default).")
 
 
 def _select_class_weight_mode():
@@ -6258,7 +6438,7 @@ def generate_importance_biased_seeds(n_features, feature_names, X, y,
     """
     seeds = []
     allowed = set(CGPEquation.OPS_ALL)
-    if n_features < 1:
+    if not USE_SEEDS or n_features < 1:
         if return_priority_count:
             return seeds, 0
         return seeds
@@ -7215,7 +7395,7 @@ def generate_residual_aware_seeds(n_features, feature_names, X, y_target,
     """
     seeds = []
     allowed = set(CGPEquation.OPS_ALL)
-    if hof_best is None or n_features < 1:
+    if not USE_SEEDS or hof_best is None or n_features < 1:
         return seeds
 
     try:
@@ -7452,6 +7632,8 @@ def generate_residual_aware_seeds(n_features, feature_names, X, y_target,
 
 def generate_seeds_v5(n_features, feature_names):
     """Generate a diverse population of hand-crafted seed individuals."""
+    if not USE_SEEDS:
+        return []
     seeds = []
     feat = lambda: random.randint(0, n_features - 1)
     
@@ -12220,6 +12402,8 @@ def generate_script(models, dp, filename="best_model.py", X_data=None):
 
     output_names_list = [dp.output_map[i] if i < len(dp.output_map) else f"Out{i}" for i in range(len(models))]
 
+    _bitwise_src = _bitwise_ops_source(BITWISE_MODE)
+
     script_content = f'''import numpy as np
 import pandas as pd
 import pickle
@@ -12246,19 +12430,7 @@ math.erf = _erf_vec
 
 # ── Operator helpers used by exported expressions ───────────────────────────
 import random as _random
-_INT_OP_CLAMP = 1e15
-def _to_int(v):
-    return np.floor(np.clip(np.nan_to_num(v, nan=0.0, posinf=_INT_OP_CLAMP,
-                                          neginf=-_INT_OP_CLAMP),
-                            -_INT_OP_CLAMP, _INT_OP_CLAMP)).astype(np.int64)
-def _op_bitwise_and(v1, v2): return np.bitwise_and(_to_int(v1), _to_int(v2)).astype(np.float64)
-def _op_bitwise_or(v1, v2):  return np.bitwise_or (_to_int(v1), _to_int(v2)).astype(np.float64)
-def _op_bitwise_xor(v1, v2): return np.bitwise_xor(_to_int(v1), _to_int(v2)).astype(np.float64)
-def _op_bitwise_not(v):      return np.bitwise_not(_to_int(v)).astype(np.float64)
-def _op_lshift(v1, v2):
-    return np.left_shift(_to_int(v1), np.clip(_to_int(v2), 0, 62)).astype(np.float64)
-def _op_rshift(v1, v2):
-    return np.right_shift(_to_int(v1), np.clip(_to_int(v2), 0, 62)).astype(np.float64)
+{_bitwise_src}
 def _op_round2(v1, v2):
     n = np.clip(_to_int(v2), -15, 15); f = np.power(10.0, n.astype(np.float64))
     return np.round(v1 * f) / f
@@ -20524,7 +20696,7 @@ def _bo_inject_oracle_escape_seeds(candidate_trees, oracle, parents,
     ``target_count`` when the oracle has no missing atoms left or
     none of the synthesis paths succeed).
     """
-    if oracle is None or target_count <= 0:
+    if not USE_SEEDS or oracle is None or target_count <= 0:
         return 0
     missing = oracle.missing_atoms(max_atoms=max(8, target_count * 2))
     if not missing:
@@ -24200,8 +24372,10 @@ def _run_boosting_stage_evolution(X, residuals, n_features, feat_names,
         # Residual-correlated seeds: for each feature that correlates with
         # the residuals, inject a targeted linear seed.  This dramatically
         # accelerates boosting convergence on structured residual patterns.
+        # Skipped when the user disabled seeding (USE_SEEDS) so the boosting
+        # stage discovers its residual structure from a purely random start.
         try:
-            for fi in range(min(n_features, 8)):
+            for fi in range(min(n_features, 8) if USE_SEEDS else 0):
                 xi = X_stage[:, fi]
                 if np.std(xi) < 1e-10:
                     continue
@@ -25119,6 +25293,8 @@ def _generate_boosted_script(boosted_models, dp, X_data=None):
 
     output_names_list = [dp.output_map[i] if i < len(dp.output_map) else f"Out{i}" for i in range(len(boosted_models))]
 
+    _bitwise_src = _bitwise_ops_source(BITWISE_MODE)
+
     script_content = f'''import numpy as np
 import pandas as pd
 import pickle
@@ -25145,19 +25321,7 @@ math.erf = _erf_vec
 
 # ── Operator helpers used by exported expressions ───────────────────────────
 import random as _random
-_INT_OP_CLAMP = 1e15
-def _to_int(v):
-    return np.floor(np.clip(np.nan_to_num(v, nan=0.0, posinf=_INT_OP_CLAMP,
-                                          neginf=-_INT_OP_CLAMP),
-                            -_INT_OP_CLAMP, _INT_OP_CLAMP)).astype(np.int64)
-def _op_bitwise_and(v1, v2): return np.bitwise_and(_to_int(v1), _to_int(v2)).astype(np.float64)
-def _op_bitwise_or(v1, v2):  return np.bitwise_or (_to_int(v1), _to_int(v2)).astype(np.float64)
-def _op_bitwise_xor(v1, v2): return np.bitwise_xor(_to_int(v1), _to_int(v2)).astype(np.float64)
-def _op_bitwise_not(v):      return np.bitwise_not(_to_int(v)).astype(np.float64)
-def _op_lshift(v1, v2):
-    return np.left_shift(_to_int(v1), np.clip(_to_int(v2), 0, 62)).astype(np.float64)
-def _op_rshift(v1, v2):
-    return np.right_shift(_to_int(v1), np.clip(_to_int(v2), 0, 62)).astype(np.float64)
+{_bitwise_src}
 def _op_round2(v1, v2):
     n = np.clip(_to_int(v2), -15, 15); f = np.power(10.0, n.astype(np.float64))
     return np.round(v1 * f) / f
@@ -25546,6 +25710,9 @@ def train_mode():
     # ---- Operator selection ----
     select_allowed_ops()
 
+    # ---- Bitwise operand mode (int-coerced vs raw float bytes) ----
+    _select_bitwise_mode()
+
     # ---- IF/ELSE branching (separate from operator selection) ----
     _select_if_else_mode()
 
@@ -25578,6 +25745,9 @@ def train_mode():
     else:
         AFFINE_SCALING_ENABLED = True
         print("  ✓  Affine scaling ENABLED (default).")
+
+    # ---- Population seeding toggle ----
+    _select_use_seeds()
 
     # ---- CGP node count ----
     print("\n─" * 30)
