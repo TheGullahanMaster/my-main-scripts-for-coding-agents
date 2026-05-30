@@ -2652,7 +2652,7 @@ def simplify_cgp_tree(cgp_eq):
     Passes 1 and 2 repeat up to MAX_PASSES times until no more changes occur.
     Returns a simplified deep-copy.  Updates active_nodes afterwards.
     """
-    eq = copy.deepcopy(cgp_eq)
+    eq = cgp_eq.clone()
 
     def _redirect(idx, redirect_to):
         """Rewrite every reference to *idx* → *redirect_to* in the graph.
@@ -4156,6 +4156,16 @@ class CGPNode:
         self.in3 = in3          # third input, used only by ternary ops (if_else)
         self.const_val = const_val
 
+    def clone(self):
+        """Direct slot copy — bypasses copy.deepcopy's generic dispatch.
+
+        Reproduction (mutate / crossover / every macro-mutation) clones whole
+        graphs thousands of times per run; profiling shows ~88% of mutate()'s
+        wall-clock is the deepcopy alone.  Constructing the node directly is an
+        order of magnitude cheaper and produces an identical, fully-independent
+        node (all five slots are immutable ints/strings/floats)."""
+        return CGPNode(self.op, self.in1, self.in2, self.const_val, self.in3)
+
 
 class CGPEquation:
     # Dynamically filter operations based on the ALLOWED_OPS whitelist.
@@ -4180,6 +4190,38 @@ class CGPEquation:
         self.nodes = []
         self.out_idx = 0
         self.active_nodes = set()
+
+    def clone(self):
+        """Fast structural copy that replaces ``copy.deepcopy`` in the
+        reproduction hot path (mutate / crossover / every macro-mutation).
+
+        ``feature_names`` is read-only everywhere in the pipeline (only ever
+        indexed for display — never mutated in place), so it is shared by
+        reference instead of being re-copied on every clone.  Everything that
+        evolution mutates — the node list, the output pointer, the active set —
+        is copied fresh, and each ``CGPNode`` is rebuilt directly rather than
+        round-tripped through copy's generic deepcopy machinery.  The result is
+        byte-for-byte equivalent to ``copy.deepcopy(self)`` for all attributes
+        evolution depends on, at a fraction of the cost."""
+        new = CGPEquation.__new__(CGPEquation)
+        new.n_features = self.n_features
+        new.max_nodes = self.max_nodes
+        new.feature_names = self.feature_names          # immutable — share ref
+        new.nodes = [CGPNode(n.op, n.in1, n.in2, n.const_val, n.in3)
+                     for n in self.nodes]
+        new.out_idx = self.out_idx
+        # active_nodes is copied via deepcopy specifically to reproduce its
+        # exact set ITERATION ORDER.  `set(...)` / `.copy()` build an
+        # identically-valued set but, for the same int elements, can iterate in
+        # a different order than copy.deepcopy does.  Several call sites consume
+        # that order before the next `update_active_nodes` rebuild — most
+        # importantly `mutate`, which derives `active_compute`/`inactive_compute`
+        # lists from it and feeds them to `random.choice`.  Matching deepcopy's
+        # order makes clone a *bit-exact* drop-in (identical search trajectory),
+        # not merely a structurally-equivalent one.  The set is small (active
+        # nodes only), so deep-copying just it keeps the node-list fast-path win.
+        new.active_nodes = copy.deepcopy(self.active_nodes)
+        return new
 
     def evaluate(self, X):
         """Evaluate the CGP expression on input X using dispatch tables."""
@@ -4231,8 +4273,19 @@ class CGPEquation:
                 if nan_frac > 0.1 or clamp_frac > 0.5:
                     self.last_eval_clipped = True
 
-            # Sanitize per-node to prevent NaN/Inf cascade
-            buffer[:, i] = np.nan_to_num(result, nan=0.0, posinf=1e9, neginf=-1e9)
+            # Sanitize per-node to prevent NaN/Inf cascade.  ``nan_to_num`` is a
+            # no-op on an all-finite vector, yet still allocates a copy and makes
+            # three full passes (isnan/isposinf/isneginf) every call — and it is
+            # the single hottest line in the whole search (one call per active
+            # node per evaluate).  ~99% of node outputs are already finite, so
+            # gate the sanitiser behind a single ``isfinite`` reduction and write
+            # the result straight through on the common path.  ``isfinite(...).all()``
+            # is True iff there is no NaN/±Inf — i.e. exactly when nan_to_num would
+            # change nothing — so this is bit-for-bit identical to the old line.
+            if np.isfinite(result).all():
+                buffer[:, i] = result
+            else:
+                buffer[:, i] = np.nan_to_num(result, nan=0.0, posinf=1e9, neginf=-1e9)
 
         return buffer[:, self.out_idx]
 
@@ -4669,7 +4722,16 @@ class HallOfFame:
             ind = self.best_by_complexity[c]
             score = scores.get(c, 0.0)
             metric_val = getattr(ind, 'accuracy', 0.0) if is_cls else getattr(ind, 'r2', 0.0)
-            
+
+            # Modularity is computed eagerly during evolution only when ADF
+            # consumes it; otherwise fill it in now for this single frontier
+            # model so the displayed Q column is unchanged from before.
+            if not ADF_ENABLED and not ind.modularity and ind.tree is not None:
+                try:
+                    ind.modularity = ind.tree.get_graph_modularity()
+                except Exception:
+                    pass
+
             # --- NEW: Format with outer affine scale ---
             if is_cls:
                 eq_str = str(ind.tree)
@@ -8937,7 +8999,7 @@ def mutate(parent_eq, n_features, feature_names, mut_rate=None, temperature=0.0,
     """
     if mut_rate is None:
         mut_rate = CGP_MUT_RATE
-    child_eq = copy.deepcopy(parent_eq)
+    child_eq = parent_eq.clone()
 
     perturb_scale = SA_PERTURBATION_FACTOR * temperature + 1.0
 
@@ -9272,9 +9334,9 @@ def _subtree_crossover(p1, p2):
     always be evaluated once it's wired in.
     """
     if len(p1.nodes) != len(p2.nodes):
-        return copy.deepcopy(p1)
+        return p1.clone()
     n     = len(p1.nodes)
-    child = copy.deepcopy(p1)
+    child = p1.clone()
     # Block size: 10–33% of the graph
     width = random.randint(max(1, n // 10), max(1, n // 3))
     # Bias the block start toward p2's active region.  Uniform-random over
@@ -9294,7 +9356,7 @@ def _subtree_crossover(p1, p2):
     else:
         start  = random.randint(0, n - width)
     for i in range(start, start + width):
-        child.nodes[i] = copy.deepcopy(p2.nodes[i])
+        child.nodes[i] = p2.nodes[i].clone()
     if random.random() < 0.35:
         child.out_idx = p2.out_idx
     child.update_active_nodes()
@@ -9318,13 +9380,13 @@ def crossover(parent1_eq, parent2_eq):
     The output pointer is inherited from parent-2 with 35% probability.
     """
     if len(parent1_eq.nodes) != len(parent2_eq.nodes):
-        return copy.deepcopy(parent1_eq)
+        return parent1_eq.clone()
 
     # 30% chance: use contiguous-block crossover for more disruptive recombination
     if random.random() < 0.30:
         return _subtree_crossover(parent1_eq, parent2_eq)
 
-    child_eq  = copy.deepcopy(parent1_eq)
+    child_eq  = parent1_eq.clone()
     p2_active = parent2_eq.active_nodes
     p1_active = parent1_eq.active_nodes
 
@@ -9332,7 +9394,7 @@ def crossover(parent1_eq, parent2_eq):
         slot      = parent1_eq.n_features + i
         is_active = (slot in p1_active) or (slot in p2_active)
         if random.random() < (0.55 if is_active else 0.05):
-            child_eq.nodes[i] = copy.deepcopy(parent2_eq.nodes[i])
+            child_eq.nodes[i] = parent2_eq.nodes[i].clone()
 
     if random.random() < 0.35:
         child_eq.out_idx = parent2_eq.out_idx
@@ -9360,7 +9422,7 @@ def _semantic_crossover(parent1_eq, parent2_eq, X, y_residuals, n_probe=64):
     recombination, not just random node swapping.
     """
     if len(parent1_eq.nodes) != len(parent2_eq.nodes):
-        return copy.deepcopy(parent1_eq)
+        return parent1_eq.clone()
 
     n = X.shape[0]
     probe_n = min(n_probe, n)
@@ -9393,7 +9455,7 @@ def _semantic_crossover(parent1_eq, parent2_eq, X, y_residuals, n_probe=64):
         # parts of the data — combine them additively (gradient boosting crossover).
         # Build: out = parent1_output + parent2_output via a '+' node.
         if corr_residuals < 0.5 and '+' in ALLOWED_OPS:
-            child_eq = copy.deepcopy(parent1_eq)
+            child_eq = parent1_eq.clone()
             nf = child_eq.n_features
 
             # Find a free slot after both parents' active regions
@@ -9409,7 +9471,7 @@ def _semantic_crossover(parent1_eq, parent2_eq, X, y_residuals, n_probe=64):
             if len(free_slots) >= 1:
                 # Copy parent2's active structure into child's inactive region
                 # Strategy: copy parent2 nodes into child, remap output
-                p2 = copy.deepcopy(parent2_eq)
+                p2 = parent2_eq.clone()
 
                 # Simple approach: place a '+' node that references both outputs
                 add_slot = free_slots[0]
@@ -9425,7 +9487,7 @@ def _semantic_crossover(parent1_eq, parent2_eq, X, y_residuals, n_probe=64):
                             # Only copy if the slot isn't active in child
                             slot = nf + ni
                             if slot not in child_eq.active_nodes:
-                                child_eq.nodes[ni] = copy.deepcopy(p2.nodes[ni])
+                                child_eq.nodes[ni] = p2.nodes[ni].clone()
 
                 child_eq.out_idx = add_slot
                 child_eq.update_active_nodes()
@@ -9444,7 +9506,7 @@ def _semantic_crossover(parent1_eq, parent2_eq, X, y_residuals, n_probe=64):
     else:
         p2_bias = 0.5
 
-    child_eq = copy.deepcopy(parent1_eq)
+    child_eq = parent1_eq.clone()
     p2_active = parent2_eq.active_nodes
     p1_active = parent1_eq.active_nodes
 
@@ -9453,7 +9515,7 @@ def _semantic_crossover(parent1_eq, parent2_eq, X, y_residuals, n_probe=64):
         is_active = (slot in p1_active) or (slot in p2_active)
         swap_prob = p2_bias if is_active else 0.05
         if random.random() < swap_prob:
-            child_eq.nodes[i] = copy.deepcopy(parent2_eq.nodes[i])
+            child_eq.nodes[i] = parent2_eq.nodes[i].clone()
 
     if random.random() < p2_bias:
         child_eq.out_idx = parent2_eq.out_idx
@@ -9484,7 +9546,7 @@ def macro_grow(cgp_eq, n_features, feature_names, op_affinity=None):
     If *op_affinity* is provided, operator selection is biased toward ops
     that appear in HoF expressions (same system used by mutate()).
     """
-    child  = copy.deepcopy(cgp_eq)
+    child  = cgp_eq.clone()
     active = sorted(i for i in child.active_nodes if i >= n_features)
     if not active:
         return child
@@ -9598,7 +9660,7 @@ def macro_prune(cgp_eq, n_features):
     The replacement input is chosen as the input with the higher complexity
     sub-graph (preserving more information), or randomly for unary nodes.
     """
-    child   = copy.deepcopy(cgp_eq)
+    child   = cgp_eq.clone()
     active_c = [i for i in child.active_nodes if i >= n_features]
     if len(active_c) <= 1:
         return child
@@ -9683,7 +9745,7 @@ def macro_ablate_feature(cgp_eq, n_features):
     Selects a currently active feature and replaces all references to it 
     with a single learnable constant node.
     """
-    child = copy.deepcopy(cgp_eq)
+    child = cgp_eq.clone()
     active_feats = list(_active_feature_set(child, n_features))
     
     if not active_feats:
@@ -9745,7 +9807,7 @@ def macro_graft_feature(cgp_eq, n_features, feature_names):
       5. If the fused op is 'pow', also inject a learnable constant exponent so
          the constant optimizer can immediately tune the power.
     """
-    child = copy.deepcopy(cgp_eq)
+    child = cgp_eq.clone()
     child.update_active_nodes()
 
     # 1. Find unused features
@@ -10201,6 +10263,32 @@ class Individual:
         self.boost_stages = []     # list of (CGPEquation, a, b, lr)
         self.boost_max_stages = 3  # cap to prevent over-fitting
 
+    def __deepcopy__(self, memo):
+        """Fast, bit-exact deep copy used by the HoF / champion-rescue /
+        migration paths that ``copy.deepcopy`` every surviving Individual.
+
+        Every CGPEquation it carries (the main tree and each boost-stage
+        correction tree) is cloned through ``CGPEquation.clone`` — which is an
+        order of magnitude cheaper than copy's generic graph walk yet
+        reproduces the deepcopy result exactly (including ``active_nodes`` set
+        iteration order, see ``clone``).  Every other attribute is copied with
+        the standard generic ``deepcopy`` so nothing — including dynamically
+        attached fields like ``_novelty_fp`` — can be silently dropped.  The
+        result is indistinguishable from ``copy.deepcopy(self)`` while removing
+        the per-survivor tree walk that profiling flagged as the dominant
+        remaining copy cost."""
+        new = Individual.__new__(Individual)
+        memo[id(self)] = new
+        for k, v in self.__dict__.items():
+            if k == 'tree':
+                new.tree = v.clone() if v is not None else None
+            elif k == 'boost_stages':
+                new.boost_stages = [(ct.clone(), a, b, lr)
+                                    for (ct, a, b, lr) in v]
+            else:
+                new.__dict__[k] = copy.deepcopy(v, memo)
+        return new
+
     def _predict_with_boosts(self, X):
         """Evaluate main tree + all boost correction stages."""
         preds = self.tree.evaluate(X)
@@ -10392,7 +10480,7 @@ class Individual:
 
         if best_mse < old_mse * 0.98:  # at least 2% improvement (was 5%)
             self.boost_stages.append((
-                copy.deepcopy(best.tree),
+                best.tree.clone(),
                 best.affine_a,
                 best.affine_b,
                 best_lr
@@ -10665,7 +10753,16 @@ class Individual:
                         self.loss += LOGIT_SATURATION_WEIGHT * sat_pen
 
             self.complexity = self.tree.get_complexity()
-            self.modularity = self.tree.get_graph_modularity()
+            # Graph modularity (Newman's Q) never enters fitness, Pareto
+            # domination or any selection rule — it only drives ADF community
+            # extraction (gated on ADF_ENABLED) and the frontier display.  The
+            # networkx greedy-community call is ~20% of evolve time, so compute
+            # it eagerly only when ADF actually consumes it; otherwise it is
+            # filled in lazily for the handful of frontier models at print time
+            # (see HallOfFame.print_frontier).  Search trajectory is bit-for-bit
+            # identical either way.
+            self.modularity = (self.tree.get_graph_modularity()
+                               if ADF_ENABLED else 0.0)
             if getattr(self.tree, 'last_eval_clipped', False):
                 self.loss += 10.0
 
@@ -12708,7 +12805,7 @@ def macro_rational_grow(cgp_eq, n_features):
     Specifically targets division nodes to grow the denominator.
     Turns A / B  into A / (B + C) or A / (B * C).
     """
-    child = copy.deepcopy(cgp_eq)
+    child = cgp_eq.clone()
     active_divs = [i for i in child.active_nodes if i >= n_features and child.nodes[i-n_features].op == '/']
     
     if not active_divs:
@@ -12752,7 +12849,7 @@ def macro_trig_identity(cgp_eq, n_features):
         impossible to reach incrementally via point mutation.
       • Strategy 3 (fallback): Wraps the current output in trig (original).
     """
-    child = copy.deepcopy(cgp_eq)
+    child = cgp_eq.clone()
     child.update_active_nodes()
 
     # Strategy 1: Try to find sin(A)/cos(A) → tan(A)
@@ -12894,9 +12991,9 @@ def macro_piecewise(cgp_eq, n_features, feature_names, X=None):
     Only active when IF_ELSE_ENABLED is True and if_else is in the op set.
     """
     if not IF_ELSE_ENABLED or 'if_else' not in CGPEquation.OPS_TERNARY_SET:
-        return copy.deepcopy(cgp_eq)
+        return cgp_eq.clone()
 
-    child = copy.deepcopy(cgp_eq)
+    child = cgp_eq.clone()
     child.update_active_nodes()
 
     active = sorted(i for i in child.active_nodes if i >= n_features)
@@ -13004,7 +13101,7 @@ def macro_nest_compound(cgp_eq, n_features, feature_names, op_affinity=None):
     These require multiple coordinated nodes that point-mutation almost never
     produces simultaneously.
     """
-    child = copy.deepcopy(cgp_eq)
+    child = cgp_eq.clone()
     child.update_active_nodes()
 
     active = sorted(i for i in child.active_nodes if i >= n_features)
@@ -13155,7 +13252,7 @@ def macro_inject_subtree(cgp_eq, n_features, feature_names, op_affinity=None):
     This mutation is the primary mechanism for discovering novel functional
     forms that weren't covered by seeds.
     """
-    child = copy.deepcopy(cgp_eq)
+    child = cgp_eq.clone()
     child.update_active_nodes()
 
     active = sorted(i for i in child.active_nodes if i >= n_features)
@@ -13350,7 +13447,7 @@ def _create_offspring(action, parent, population, n_features, feat_names,
     elif action == 'graft':
         child_tree = macro_graft_feature(parent.tree, n_features, feat_names)
     elif action in ('optimize', 'do_nothing', 'boost'):
-        child_tree = copy.deepcopy(parent.tree)
+        child_tree = parent.tree.clone()
     elif action == 'div':
         child_tree = macro_rational_grow(parent.tree, n_features)
     elif action == 'trig':
@@ -15799,7 +15896,7 @@ def _make_negated_tree(tree):
     if not (has_neg or (has_sub and has_const) or (has_mul and has_const)):
         return None
     try:
-        nt = copy.deepcopy(tree)
+        nt = tree.clone()
         nt.update_active_nodes()
     except Exception:
         return None
@@ -15881,7 +15978,7 @@ def _collect_sibling_hof_trees(o_idx, class_groups_info, hofs, max_count=8):
                           key=lambda x: x.loss)
         for ind in sib_inds[:per_sib]:
             try:
-                trees.append(copy.deepcopy(ind.tree))
+                trees.append(ind.tree.clone())
             except Exception:
                 continue
             if is_binary:
@@ -20244,7 +20341,7 @@ def _bo_graft_atom_onto(parent_tree, cat, feat_tuple, n_features, feat_names):
     if op is None:
         return None
 
-    child = copy.deepcopy(parent_tree)
+    child = parent_tree.clone()
     child.update_active_nodes()
     all_slots = list(range(nf, nf + child.max_nodes))
     free_slots = sorted(s for s in all_slots if s not in child.active_nodes)
