@@ -1005,6 +1005,227 @@ def affinity_biased_op_choice(affinity: dict, ops: list | None = None) -> str:
     weights = [max(affinity.get(op, 0.3), 0.10) for op in ops]
     return random.choices(ops, weights=weights, k=1)[0]
 
+
+# ==========================================
+# DATA-DRIVEN OPERATOR PRIOR (de-novo discovery aid)
+# ==========================================
+# `compute_hof_operator_affinity` learns which operators *worked* — but it
+# needs a populated Hall of Fame to say anything, so for the first chunks of a
+# fresh run it is silent.  The data-driven prior below is its complement: it
+# guesses which operators *should* work straight from (X, y), before any
+# evolution has happened.  This is what keeps AFPO productive when it cannot
+# lean on seed templates — seeds disabled, a bitwise-only op set, or a dataset
+# whose shape matches no hand-crafted seed.  evolve_afpo computes the prior once
+# from its (X, y) and threads it explicitly into the random_cgp immigrant/pad
+# calls and (via _blend_op_affinity) into mutation's operator choice, so
+# genuinely novel structure is steered toward the function families the data
+# actually exhibits instead of a hard-coded arithmetic backbone.
+
+
+def _blend_op_affinity(data_prior, hof_affinity):
+    """Combine the data-driven prior with the HoF-learned affinity by taking
+    the element-wise max.  Semantics: an operator is favoured if *either* the
+    data suggests it (prior) *or* the HoF has found it useful (affinity).  This
+    keeps data-relevant operators alive during exploration even before the HoF
+    discovers them, while never suppressing an operator the HoF already relies
+    on.  Either argument may be empty/None."""
+    if not data_prior:
+        return dict(hof_affinity) if hof_affinity else {}
+    if not hof_affinity:
+        return dict(data_prior)
+    out = {}
+    for op in set(data_prior) | set(hof_affinity):
+        out[op] = max(float(data_prior.get(op, 0.0)),
+                      float(hof_affinity.get(op, 0.0)))
+    return out
+
+
+def compute_data_operator_prior(X, y, type_code=5, max_rows=512):
+    """Cheap, one-shot operator prior derived directly from the data.
+
+    Returns a dict mapping every operator in ``CGPEquation.OPS_ALL`` to a
+    weight in (0, 1], normalised so the strongest-signal family ≈ 1.0 and the
+    baseline floors at 0.3 (matching ``affinity_biased_op_choice``'s default
+    for unseen ops).  Returns ``{}`` when there is no usable signal or no
+    differentiation is possible (e.g. a pure bitwise-only op set, where the
+    constant/mask machinery — not the operator mix — carries the signal).
+
+    Signals (all O(N·D) on a ≤``max_rows`` subsample, robust to subsampling):
+      • per-feature transform correlations — the |corr(f(x_i), y)| of each
+        candidate transform becomes evidence for the operator(s) it implies
+        (square/cube/sqrt/log/inv/exp/sin/cos/tanh/abs/gauss/sign);
+      • pairwise product / ratio correlations reinforce ``*`` and ``/``;
+      • global target-shape cues — integer-valued targets favour bit/integer
+        ops (only when arithmetic ops coexist, so the steer is informative),
+        bounded targets favour sigmoid / tanh, sign-changing targets favour
+        the odd/signed families.
+    """
+    ops_all = list(getattr(CGPEquation, 'OPS_ALL', []) or [])
+    if not ops_all:
+        return {}
+    allowed = set(ops_all)
+    # A pure bit-twiddling op set offers no operator-level signal to exploit
+    # (all families are bitwise); de-novo gains there come from the mask/const
+    # machinery instead, so skip and leave operator selection uniform.
+    _non_bitwise = allowed - {'bitwise_and', 'bitwise_or', 'bitwise_xor',
+                              'bitwise_not', 'lshift', 'rshift', 'const'}
+    if not _non_bitwise:
+        return {}
+    try:
+        y = np.asarray(y, dtype=np.float64).ravel()
+        X = np.asarray(X, dtype=np.float64)
+        if X.ndim == 1:
+            X = X.reshape(-1, 1)
+    except Exception:
+        return {}
+    N = y.shape[0]
+    if N < 8 or X.shape[0] != N:
+        return {}
+    if N > max_rows:
+        # With-replacement subsample: cheaper than a replace=False permutation
+        # for large N, and a few duplicate rows don't change a correlation
+        # estimate.  This keeps the per-chunk prior recompute negligible even
+        # on big datasets.
+        idx = np.random.randint(0, N, size=max_rows)
+        Xs, ys = X[idx], y[idx]
+    else:
+        Xs, ys = X, y
+    finite_y = np.isfinite(ys)
+    if int(np.sum(finite_y)) < 8:
+        return {}
+    ys = np.where(finite_y, ys, 0.0)
+    if float(np.std(ys)) < 1e-12:
+        return {}
+
+    score: dict = {}
+
+    def bump(op, amt):
+        # Record the *strongest* evidence seen for an op (max, not sum) so a
+        # family that correlates well through one transform isn't diluted by
+        # weaker transforms that happen to map to the same op.
+        if op in allowed and amt > 0.0 and np.isfinite(amt):
+            score[op] = max(score.get(op, 0.0), float(amt))
+
+    def _safe_corr(a, b):
+        try:
+            if np.std(a) < 1e-10:
+                return 0.0
+            r = float(np.corrcoef(a, b)[0, 1])
+            return abs(r) if np.isfinite(r) else 0.0
+        except Exception:
+            return 0.0
+
+    # ── Global target-shape cues ─────────────────────────────────────────
+    y_min, y_max = float(np.min(ys)), float(np.max(ys))
+    has_neg = y_min < -1e-9
+    has_pos = y_max > 1e-9
+    sign_change = has_neg and has_pos
+
+    # Integer target + arithmetic ops present → discrete / bit operators.
+    if detect_integer_target(ys):
+        for op in ('bitwise_and', 'bitwise_or', 'bitwise_xor', 'bitwise_not',
+                   'lshift', 'rshift', 'mod', 'floor', 'round', 'gcd',
+                   'digit_sum'):
+            bump(op, 0.85)
+
+    # Bounded targets → squashing nonlinearities.
+    if -1e-6 <= y_min and y_max <= 1.0 + 1e-6 and (y_max - y_min) > 0.2:
+        bump('sigmoid', 0.8)
+    if -1.0 - 1e-6 <= y_min and y_max <= 1.0 + 1e-6 and sign_change:
+        bump('tanh', 0.8)
+        bump('erf', 0.6)
+
+    if sign_change:
+        bump('neg', 0.45)
+        bump('sign', 0.45)
+        bump('cube', 0.45)
+    else:
+        if has_pos and not has_neg:
+            bump('relu', 0.45)
+            bump('abs', 0.4)
+            bump('square', 0.4)
+
+    # ── Per-feature transform correlations (richest signal) ──────────────
+    transforms = [
+        ('square', lambda v: v * v,                       ('square', 'pow')),
+        ('cube',   lambda v: v * v * v,                   ('cube', 'pow')),
+        ('sqrt',   lambda v: np.sqrt(np.abs(v)),          ('sqrt',)),
+        ('log',    lambda v: np.log(np.abs(v) + 1e-30),   ('log',)),
+        ('inv',    lambda v: 1.0 / (np.abs(v) + 1e-8),    ('/',)),
+        ('exp',    lambda v: np.exp(np.clip(v, -30, 30)), ('exp',)),
+        ('sin',    lambda v: np.sin(v),                   ('sin', 'cos')),
+        ('cos',    lambda v: np.cos(v),                   ('cos', 'sin')),
+        ('tanh',   lambda v: np.tanh(v),                  ('tanh', 'sigmoid')),
+        ('abs',    lambda v: np.abs(v),                   ('abs',)),
+        ('gauss',  lambda v: np.exp(-np.clip(v * v, 0, 60)), ('gaussian',)),
+        ('sign',   lambda v: np.sign(v),                  ('sign',)),
+    ]
+    n_feat = Xs.shape[1]
+    for i in range(n_feat):
+        xi = Xs[:, i]
+        if np.std(xi) < 1e-10:
+            continue
+        rl = _safe_corr(xi, ys)
+        if rl > 0:
+            # Linear correlation feeds the additive/scaling backbone.
+            bump('+', 0.3 + 0.5 * rl)
+            bump('-', 0.3 + 0.5 * rl)
+            bump('*', 0.3 + 0.4 * rl)
+        for _name, fn, mapped in transforms:
+            try:
+                xf = np.nan_to_num(fn(xi), nan=0.0, posinf=0.0, neginf=0.0)
+            except Exception:
+                continue
+            r = _safe_corr(xf, ys)
+            if r > 0:
+                for op in mapped:
+                    bump(op, r)
+
+    # ── Pairwise product / ratio → reinforce * and / ─────────────────────
+    if n_feat >= 2:
+        cols = list(range(n_feat))
+        random.shuffle(cols)
+        cols = cols[:min(6, n_feat)]
+        for a in cols:
+            xa = Xs[:, a]
+            if np.std(xa) < 1e-10:
+                continue
+            for b in cols:
+                if b <= a:
+                    continue
+                xb = Xs[:, b]
+                if np.std(xb) < 1e-10:
+                    continue
+                try:
+                    pr = np.nan_to_num(xa * xb, nan=0.0, posinf=0.0, neginf=0.0)
+                    bump('*', _safe_corr(pr, ys))
+                    rt = np.nan_to_num(xa / (np.abs(xb) + 1e-8),
+                                       nan=0.0, posinf=0.0, neginf=0.0)
+                    bump('/', _safe_corr(rt, ys))
+                except Exception:
+                    pass
+
+    if not score:
+        return {}
+    mx = max(score.values())
+    if mx <= 0:
+        return {}
+
+    prior = {}
+    for op in ops_all:
+        prior[op] = max(0.3, min(1.0, score.get(op, 0.0) / mx))
+    # Constants are needed by almost every expression (coefficients, masks,
+    # thresholds) but rarely correlate with the target on their own, so the
+    # transform scan never votes for them — give them a fixed floor.  The
+    # additive/multiplicative staples are deliberately *not* floored: doing so
+    # dilutes the prior's emphasis on the target's actual nonlinearities (which
+    # is the whole signal), and the 0.3 baseline plus the max-blend with the
+    # HoF affinity already keep them comfortably in play.
+    if 'const' in allowed:
+        prior['const'] = max(prior.get('const', 0.0), 0.55)
+    return prior
+
+
 # ==========================================
 # MODULE-LEVEL OP DISPATCH TABLES
 # Centralizes all operation logic; evaluate(), __str__,
@@ -4988,7 +5209,7 @@ class HallOfFame:
 # PART 4: CGP SEEDING, MUTATION & CROSSOVER
 # ==========================================
 
-def random_cgp(n_features, max_nodes, feature_names):
+def random_cgp(n_features, max_nodes, feature_names, op_prior=None):
     """Generate a random CGP individual.
 
     50% of the time uses "structured random" generation that builds a coherent
@@ -4998,8 +5219,39 @@ def random_cgp(n_features, max_nodes, feature_names):
     The structured approach solves the problem where random CGP individuals
     have tiny or degenerate active graphs that contribute nothing useful to
     the population.
+
+    op_prior : optional dict op->weight (see compute_data_operator_prior).
+               When provided, operator selection is biased toward the function
+               families the data actually exhibits, replacing the legacy
+               hard-coded arithmetic-backbone bias.  This is what lets *fresh,
+               seedless* material start out shaped like the target instead of a
+               generic polynomial soup.
     """
     eq = CGPEquation(n_features, max_nodes, feature_names)
+
+    _op_prior = op_prior
+
+    def _pick_op(pool):
+        """Operator pick from *pool*, data-prior-biased when a prior is active."""
+        if not pool:
+            return None
+        if _op_prior:
+            return affinity_biased_op_choice(_op_prior, pool)
+        return random.choice(pool)
+
+    # Bit-mask constant ladder — only materially useful when bitwise/shift
+    # operators are in play, where bitwise_and/or/xor want byte masks
+    # (0x0F, 0xF0, 0x55 …) and (2^k − 1) run-of-ones masks that the
+    # power-of-2 ladder alone can't express.  Cheap to include; harmless on
+    # non-bit problems because the constant optimiser re-tunes any unhelpful
+    # mask straight away.
+    _BIT_OPS = ('bitwise_and', 'bitwise_or', 'bitwise_xor', 'bitwise_not',
+                'lshift', 'rshift')
+    _has_bit_ops = any(o in CGPEquation.OPS_ALL for o in _BIT_OPS)
+    _BIT_MASKS = [1.0, 3.0, 7.0, 15.0, 31.0, 63.0, 127.0, 255.0, 511.0,
+                  1023.0, 4095.0, 65535.0,            # (2^k − 1) run-of-ones
+                  85.0, 170.0, 51.0, 204.0, 240.0,    # 0x55 0xAA 0x33 0xCC 0xF0
+                  3855.0, 65280.0]                    # 0x0F0F 0xFF00
 
     def _random_const():
         roll = random.random()
@@ -5008,6 +5260,10 @@ def random_cgp(n_features, max_nodes, feature_names):
         # so initial populations can find big coefficients without needing
         # 10+ generations of doubling mutations.
         ds = max(1.0, float(_DATA_SCALE_HINT))
+        if _has_bit_ops and roll < 0.18:
+            # Bit-mask draw (only when bit ops exist) — sign included so
+            # bitwise_not / two's-complement masks are reachable too.
+            return random.choice([1.0, -1.0]) * random.choice(_BIT_MASKS)
         if roll < 0.15:
             return random.choice([0.0, 1.0, -1.0, 2.0, -2.0, 0.5, -0.5,
                                     np.pi, 2*np.pi, np.e, 10.0, 100.0,
@@ -5068,17 +5324,22 @@ def random_cgp(n_features, max_nodes, feature_names):
         # Fill all nodes with random junk first (for neutral drift)
         for i in range(max_nodes):
             max_connect = max(0, n_features + i - 1)
-            core = [o for o in ['+', '-', '*', '/', 'const']
-                    if o in CGPEquation.OPS_ALL]
-            cond = [o for o in ['gt', 'lt', 'gte', 'lte', 'eq', 'if_else']
-                    if o in CGPEquation.OPS_ALL]
-            roll = random.random()
-            if core and roll < 0.40:
-                op = random.choice(core)
-            elif cond and roll < 0.55:
-                op = random.choice(cond)
+            if _op_prior:
+                # Data prior is active: let it shape the operator mix directly
+                # rather than forcing the legacy arithmetic-backbone bias.
+                op = _pick_op(CGPEquation.OPS_ALL)
             else:
-                op = random.choice(CGPEquation.OPS_ALL)
+                core = [o for o in ['+', '-', '*', '/', 'const']
+                        if o in CGPEquation.OPS_ALL]
+                cond = [o for o in ['gt', 'lt', 'gte', 'lte', 'eq', 'if_else']
+                        if o in CGPEquation.OPS_ALL]
+                roll = random.random()
+                if core and roll < 0.40:
+                    op = random.choice(core)
+                elif cond and roll < 0.55:
+                    op = random.choice(cond)
+                else:
+                    op = random.choice(CGPEquation.OPS_ALL)
             in1 = _pick_input(max_connect)
             in2 = _pick_input(max_connect)
             in3 = _pick_input(max_connect)
@@ -5119,7 +5380,7 @@ def random_cgp(n_features, max_nodes, feature_names):
 
             # Bias toward operations that reference previous layer outputs
             if binary_ops and (len(layer_outputs) >= 2 or random.random() < 0.4):
-                op = random.choice(binary_ops)
+                op = _pick_op(binary_ops)
                 in1 = random.choice(layer_outputs)
                 # For binary: sometimes pick a feature, sometimes a layer output
                 if random.random() < 0.5 and n_features > 0:
@@ -5131,7 +5392,7 @@ def random_cgp(n_features, max_nodes, feature_names):
                 in2 = min(in2, max_connect)
                 eq.nodes[slot] = CGPNode(op, in1, in2, _random_const())
             elif unary_ops:
-                op = random.choice(unary_ops)
+                op = _pick_op(unary_ops)
                 in1 = random.choice(layer_outputs)
                 in1 = min(in1, max_connect)
                 eq.nodes[slot] = CGPNode(op, in1, 0, _random_const())
@@ -5150,11 +5411,14 @@ def random_cgp(n_features, max_nodes, feature_names):
         # --- Traditional fully-random CGP ---
         for i in range(max_nodes):
             max_connect = max(0, n_features + i - 1)
-            core = [o for o in ['+', '-', '*', '/', 'const'] if o in CGPEquation.OPS_ALL]
-            if core and random.random() < 0.5:
-                op = random.choice(core)
+            if _op_prior:
+                op = _pick_op(CGPEquation.OPS_ALL)
             else:
-                op = random.choice(CGPEquation.OPS_ALL)
+                core = [o for o in ['+', '-', '*', '/', 'const'] if o in CGPEquation.OPS_ALL]
+                if core and random.random() < 0.5:
+                    op = random.choice(core)
+                else:
+                    op = random.choice(CGPEquation.OPS_ALL)
             in1 = _pick_input(max_connect)
             in2 = _pick_input(max_connect)
             in3 = _pick_input(max_connect)
@@ -14749,7 +15013,15 @@ def evolve_afpo(population, X, y_target, type_code,
     _mut_tracker = AdaptiveMutationTracker(_repro_ops_base, _repro_weights_base, alpha=0.07)
 
     # ── IMPROVEMENT: Operator affinity (updated every 200 gens) ───────────
-    _op_affinity: dict = {}
+    # Data-driven operator prior, computed once from (X, y).  This is the
+    # de-novo engine's compass: it biases mutation, immigrants and pop-guard
+    # padding toward the operator families the data exhibits, from generation
+    # 0 — long before the HoF-learned affinity has anything to say.  It matters
+    # most exactly when seeds can't help (seeds off, bitwise-only, or a dataset
+    # matching no seed template).  Blended (element-wise max) with the HoF
+    # affinity once that becomes available so proven operators are never lost.
+    _data_op_prior = compute_data_operator_prior(X, y_target, type_code)
+    _op_affinity: dict = dict(_data_op_prior)
     _AFFINITY_UPDATE_FREQ = 200
 
     # ── IMPROVEMENT: Scheduled light const-opt (every N gens, top-10%) ───
@@ -14846,8 +15118,17 @@ def evolve_afpo(population, X, y_target, type_code,
             ind.age += 1
 
         # ── AFPO Invariant: Inject one pure random age=0 individual per generation ──
+        # Half the time this immigrant is shaped by the data-driven prior (a
+        # head start toward the target's function families); the other half it
+        # stays *fully* random.  Keeping a genuine-random share is the
+        # exploration safety valve: a prior is only a heuristic, and biasing
+        # every fresh individual toward it lets the search over-commit and
+        # collapse into a wrong basin it can't leave.  The unbiased blood keeps
+        # alternative structures continuously in play.
         try:
-            _rand_imm = Individual(random_cgp(n_features, CGP_NODES, feat_names))
+            _imm_prior = _data_op_prior if (_data_op_prior and random.random() < 0.5) else None
+            _rand_imm = Individual(random_cgp(n_features, CGP_NODES, feat_names,
+                                              op_prior=_imm_prior))
             _rand_imm.age = 0
             _rand_imm.calculate_fitness(X, y_target, type_code, bg_logits=bg_logits, class_idx_in_group=class_idx_in_group, Y_group=Y_group, target_grads=target_grads)
             population.append(_rand_imm)
@@ -15207,7 +15488,8 @@ def evolve_afpo(population, X, y_target, type_code,
 
         # ── IMPROVEMENT: Periodic operator affinity update ────────────────────
         if gen % _AFFINITY_UPDATE_FREQ == 0 and hof.best_by_complexity:
-            _op_affinity = compute_hof_operator_affinity([hof])
+            _op_affinity = _blend_op_affinity(
+                _data_op_prior, compute_hof_operator_affinity([hof]))
 
         # ── IMPROVEMENT (B7): periodic diversity check ───────────────────────
         if gen > 0 and gen % _DIVERSITY_CHECK_FREQ == 0 and X.shape[0] > 0:
@@ -15246,6 +15528,17 @@ def evolve_afpo(population, X, y_target, type_code,
                         max_seeds=max(2, n_imm))
                 except Exception:
                     _res_pool = []
+            # Seed-independent fallback material.  When seeds are disabled, the
+            # op set matches no seed template (e.g. bitwise-only), or residuals
+            # don't decompose (classification / joint-softmax), both pools above
+            # come back empty — and this burst, which fires precisely when
+            # escape pressure is highest, would degenerate into a no-op.  Mirror
+            # the island model's extinction: keep the burst alive with mutated
+            # HoF champions, cross-complexity HoF crossover, and fresh
+            # data-prior-shaped random_cgp blood so stagnation still injects
+            # genuine structural novelty rather than nothing.
+            _hof_inds = (list(hof.best_by_complexity.values())
+                         if hof.best_by_complexity else [])
             for _k in range(n_imm):
                 try:
                     # Alternate between residual-aware and v5 seeds when both
@@ -15261,7 +15554,32 @@ def evolve_afpo(population, X, y_target, type_code,
                     elif _v5_pool:
                         imm = copy.deepcopy(random.choice(_v5_pool))
                     else:
-                        continue
+                        # No seed material — build structural diversity instead.
+                        _r = random.random()
+                        if _hof_inds and _r < 0.55:
+                            _base = random.choice(_hof_inds)
+                            _rate = random.choice(
+                                [max(1, CGP_MUT_RATE), max(2, CGP_MUT_RATE * 2),
+                                 max(3, CGP_MUT_RATE * 4)])
+                            _tree = mutate(_base.tree, n_features, feat_names,
+                                           mut_rate=int(_rate),
+                                           op_affinity=_op_affinity)
+                            imm = Individual(_tree)
+                            imm.sigma = float(np.clip(
+                                getattr(_base, 'sigma', CGP_MUT_RATE)
+                                * random.uniform(0.5, 2.0),
+                                SIGMA_MIN, SIGMA_MAX))
+                        elif len(_hof_inds) >= 2 and _r < 0.75:
+                            _p1, _p2 = random.sample(_hof_inds, 2)
+                            _tree = crossover(_p1.tree, _p2.tree)
+                            _tree = mutate(_tree, n_features, feat_names,
+                                           mut_rate=max(1, CGP_MUT_RATE),
+                                           op_affinity=_op_affinity)
+                            imm = Individual(_tree)
+                        else:
+                            imm = Individual(random_cgp(
+                                n_features, CGP_NODES, feat_names,
+                                op_prior=_data_op_prior))
                     imm.age = 0
                     imm.calculate_fitness(
                         X, y_target, type_code,
@@ -15291,16 +15609,19 @@ def evolve_afpo(population, X, y_target, type_code,
                     # Light mutation so we don't inject N exact copies.
                     try:
                         tree = mutate(base.tree, n_features, feat_names,
-                                      mut_rate=max(1, CGP_MUT_RATE))
+                                      mut_rate=max(1, CGP_MUT_RATE),
+                                      op_affinity=_op_affinity)
                     except Exception:
-                        tree = random_cgp(n_features, CGP_NODES, feat_names)
+                        tree = random_cgp(n_features, CGP_NODES, feat_names,
+                                          op_prior=_data_op_prior)
                     ni = Individual(tree)
                     ni.sigma = float(np.clip(
                         getattr(base, 'sigma', CGP_MUT_RATE)
                         * random.uniform(0.7, 1.5),
                         SIGMA_MIN, SIGMA_MAX))
                 else:
-                    ni = Individual(random_cgp(n_features, CGP_NODES, feat_names))
+                    ni = Individual(random_cgp(n_features, CGP_NODES, feat_names,
+                                               op_prior=_data_op_prior))
                 ni.age = 0
                 try:
                     ni.calculate_fitness(
@@ -15557,11 +15878,13 @@ def evolve_afpo(population, X, y_target, type_code,
                 extra = max(3, int(target_size * 0.15))
                 for _ in range(extra):
                     new_blood.append(Individual(
-                        random_cgp(n_features, CGP_NODES, feat_names)))
+                        random_cgp(n_features, CGP_NODES, feat_names,
+                                   op_prior=_data_op_prior)))
 
             while len(survivors) + len(new_blood) < target_size:
                 new_blood.append(Individual(
-                    random_cgp(n_features, CGP_NODES, feat_names)))
+                    random_cgp(n_features, CGP_NODES, feat_names,
+                               op_prior=_data_op_prior)))
             for ind in new_blood:
                 ind.age = 0   # AFPO invariant
                 ind.calculate_fitness(X, y_target, type_code,
