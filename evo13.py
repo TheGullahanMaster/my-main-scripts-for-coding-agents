@@ -13054,7 +13054,7 @@ def plot_model():
     # 2D plots: each pair of features vs each output
     if n_feat >= 2:
         print("Generating 2D plots (each input pair vs each output)...")
-        res2d = 80
+        res2d = 256
         for i in range(n_feat):
             for j in range(i + 1, n_feat):
                 fmin_i, fmax_i = feat_mins.get(i, 0.0), feat_maxs.get(i, 1.0)
