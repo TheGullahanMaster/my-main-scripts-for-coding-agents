@@ -413,7 +413,60 @@ SIGMA_MAX = 20.0
 # Parsimony pressure coefficient: multiplied by complexity and added to fitness.
 # Higher values favour simpler (shorter) expressions more aggressively.
 # 0.0 = no parsimony; 0.01 = gentle; 0.05 = moderate; 0.2+ = strong.
+# In the "linear" parsimony model this is the additive coefficient; in the
+# "mdl" model it is unused (MDL_COMPLEXITY_BITS plays its role instead).
 PARSIMONY_STRENGTH = 0.01
+
+# ---- Parsimony model ----
+# Chooses HOW complexity is traded against fit to form the *selection* fitness
+# used by parent selection, simulated-annealing acceptance and the AFPO
+# Pareto-trim.  Crucially this only shapes which structures evolution explores:
+# the Hall of Fame is keyed on raw loss / accuracy and the final model is picked
+# by the PySR knee score (`compute_pysr_scores` / `get_best_overall`), so the
+# parsimony model can never make the *reported* model worse than the frontier
+# already contains — it only steers the search.
+#
+#   "linear" : fitness = loss + (PARSIMONY_STRENGTH + freq_adj)·complexity   [legacy]
+#       The classic additive penalty.  This engine's loss is already
+#       variance-normalised (≈1 for the mean predictor, →0 for a perfect fit),
+#       so the coefficient is roughly problem-independent — but the *shape* is
+#       wrong: once the loss is small the k·complexity term dominates, so a
+#       near-perfect but slightly larger model can score WORSE than a terrible
+#       tiny one.  This is the well-known linear-parsimony pathology.
+#
+#   "mdl"    : fitness = ½·MDL_DATA_WEIGHT·log2(loss)
+#                       + (MDL_COMPLEXITY_BITS + freq_adj)·complexity        [default]
+#       Minimum Description Length (information-theoretic Occam).  The data term
+#       is the Gaussian code length of the residuals, so each *relative* halving
+#       of the loss is worth a fixed number of bits regardless of absolute
+#       scale.  Added complexity is paid for in bits and only wins if it buys at
+#       least that many bits of fit, which removes the small-loss pathology: a
+#       model many halvings better in loss can always justify a few extra
+#       complexity-bits.  This is the trade-off AIFeynman 2.0 and the Bayesian
+#       Machine Scientist use, and is the recommended default.
+PARSIMONY_MODE = "mdl"
+
+# MDL data-term weight — acts like an effective (soft) sample size on the
+# residual code length ½·w·log2(loss).  Larger ⇒ fit matters more relative to
+# complexity (the "more data ⇒ complexity is cheaper" regime); smaller ⇒
+# stronger Occam pressure.  Because the selection fitness also drives the
+# simulated-annealing acceptance test (exp(-Δfitness/T)), w sets BOTH the
+# accuracy↔complexity trade (via the bits/w ratio) AND how greedy annealing is
+# (via the absolute magnitude).  Too small (w≈1) over-prunes early exploration
+# on structure-building targets (sin/cos frequencies collapse to a flat fit);
+# 3.0 keeps enough fit-pull to grow real structure while still simplifying.
+# Chosen for robustness on bench_denovo: across two independent 5-seed sweeps
+# of the regression suite, w=3.0 with the bits below matched-or-beat the legacy
+# linear penalty on median R² on BOTH sweeps at comparable median complexity
+# (a higher-w/lower-bits setting reached a better peak but dipped below linear
+# on one sweep, so the steadier setting is the default).
+MDL_DATA_WEIGHT     = 3.0
+# MDL model-term cost in *bits per unit of the existing complexity measure*.
+# This is the "mdl" analogue of PARSIMONY_STRENGTH.  With MDL_DATA_WEIGHT=3.0
+# the bits/w ratio (~0.0083) makes one halving of the loss worth ~60 complexity
+# units — gentle Occam pressure that, unlike the linear penalty, stays constant
+# as the loss shrinks instead of swamping it.
+MDL_COMPLEXITY_BITS = 0.025
 
 # How often (in generations) to retarget the residual-aware seed generator at
 # the *current* HoF-best's residuals and inject the new seeds into each
@@ -10516,6 +10569,68 @@ def compute_complexity_frequency_adjustment(population):
     return adjustments
 
 
+# Floor for the loss inside the MDL data term's log2, so a perfect-on-batch fit
+# (loss == 0) yields a large-but-finite reward (log2(1e-12) ≈ -39.9) instead of
+# -inf.  Bounds the data term symmetrically with the loss ceiling on the other
+# side, keeping `.fitness` finite for the SA / Pareto machinery.
+_MDL_LOSS_FLOOR = 1e-12
+
+
+def parsimony_fitness(loss, complexity, freq_adj=0.0):
+    """
+    Combine a model's raw loss and complexity into the scalar SELECTION fitness
+    (lower = better) according to the active ``PARSIMONY_MODE``.
+
+    This is the single source of truth for the fitness formula.  Every site that
+    previously inlined ``loss + parsimony·complexity`` now routes through here,
+    so the fitness-cache fast path, the main evaluation path, and the post-hoc
+    penalty passes can never drift apart — and switching the parsimony model is
+    a one-line global change rather than an edit in three places.
+
+    Parameters
+    ----------
+    loss : float
+        The individual's raw (variance-normalised) loss.  For regression this is
+        ``mse/var(y) + mae/sqrt(var(y))``; for classification it is the
+        cross-entropy.  Lower is better in both cases.
+    complexity : float
+        The weighted operator-cost complexity (``CGPEquation.get_complexity``),
+        the same measure used for the Hall-of-Fame slots and the Pareto axis.
+    freq_adj : float, default 0.0
+        PySR-style per-complexity frequency adjustment from
+        ``compute_complexity_frequency_adjustment`` — positive for
+        over-represented complexities (discourage more of that size), negative
+        for under-represented ones (actively encourage them).  It modulates the
+        *complexity* coefficient in EVERY mode, so the dynamic "spread the
+        population across the complexity axis" behaviour is preserved regardless
+        of which parsimony model is active.
+
+    Notes
+    -----
+    The complexity coefficient is clamped to ``>= 0`` so an over-encouraged
+    (strongly negative ``freq_adj``) complexity can never be handed a *negative*
+    marginal cost, which would reward unbounded growth and destabilise
+    selection — matching the historical clamp on the linear coefficient.
+    """
+    if PARSIMONY_MODE == "mdl":
+        # ── Residual code length: ½·w·log2(loss) ────────────────────────────
+        # Up to an additive constant identical for every model (and therefore
+        # irrelevant to argmin), this is the per-sample Gaussian code length of
+        # the residuals.  Because it is a log, each *relative* halving of the
+        # loss lowers the data term by a fixed ½·w bits no matter the absolute
+        # scale — so a much-better fit can always out-vote a handful of extra
+        # complexity-bits, unlike the linear penalty which the small-loss regime
+        # lets the complexity term dominate.
+        data_bits = 0.5 * MDL_DATA_WEIGHT * float(
+            np.log2(max(float(loss), _MDL_LOSS_FLOOR)))
+        bit_cost  = max(0.0, MDL_COMPLEXITY_BITS + freq_adj)
+        return float(data_bits + bit_cost * complexity)
+
+    # ── "linear" (legacy additive parsimony) ────────────────────────────────
+    eff = max(0.0, PARSIMONY_STRENGTH + freq_adj)
+    return float(loss + eff * complexity)
+
+
 # ==========================================
 # PART 4b: CONSTANTS HELPERS
 # ==========================================
@@ -11024,8 +11139,8 @@ class Individual:
                 # Adaptive parsimony is applied here too (see the main-path
                 # comment below) so cached lookups stay consistent with freshly
                 # evaluated individuals under the same complexity-frequency map.
-                _eff_parsimony = max(0.0, PARSIMONY_STRENGTH + freq_parsimony_adj)
-                self.fitness = self.loss + _eff_parsimony * self.complexity
+                self.fitness = parsimony_fitness(
+                    self.loss, self.complexity, freq_parsimony_adj)
                 return self.fitness
         try:
             X_eval = X[batch_indices] if batch_indices is not None else X
@@ -11283,25 +11398,23 @@ class Individual:
             # gradient for selection during evolution.
             self.loss = min(self.loss, HOF_LOSS_CEILING + 25.0)
 
-            # ── Adaptive (PySR-style) complexity-frequency parsimony ─────────
-            # `freq_parsimony_adj` is the per-complexity adjustment produced by
-            # `compute_complexity_frequency_adjustment`: positive for over-
-            # represented complexities (discourage more of that size), negative
-            # for under-represented ones (encourage them).  It modulates the
-            # effective parsimony coefficient exactly as that function's
-            # docstring prescribes (`effective_parsimony = PARSIMONY_STRENGTH +
-            # adj`).  Previously this value was computed every generation and
-            # threaded through every fitness call but never actually applied —
-            # the adaptive-parsimony feature (enabled by default) was a no-op.
-            # The coefficient is clamped to >= 0 so it can never go negative,
-            # which would reward unbounded complexity growth and destabilise
-            # selection.  Only `.fitness` (parent selection / Pareto trim) is
-            # affected; the Hall of Fame is keyed on `.loss`, so final outputs
-            # are unchanged.  When ADAPTIVE_PARSIMONY_ENABLED is False the
-            # adjustment dict is empty, `freq_parsimony_adj` stays 0.0, and this
-            # reduces exactly to the previous `PARSIMONY_STRENGTH * complexity`.
-            _eff_parsimony = max(0.0, PARSIMONY_STRENGTH + freq_parsimony_adj)
-            self.fitness = self.loss + _eff_parsimony * self.complexity
+            # ── Parsimony-aware selection fitness ────────────────────────────
+            # `parsimony_fitness` folds the loss, the complexity, and the
+            # PySR-style complexity-frequency adjustment (`freq_parsimony_adj`)
+            # into the scalar `.fitness` used for parent selection / Pareto trim
+            # according to the active PARSIMONY_MODE ("linear" or "mdl").  The
+            # frequency adjustment is positive for over-represented complexities
+            # (discourage more of that size) and negative for under-represented
+            # ones (encourage them); it modulates the complexity coefficient in
+            # either mode and is clamped so the coefficient never goes negative.
+            # Only `.fitness` is affected — the Hall of Fame is keyed on `.loss`
+            # (regression) / `.accuracy` (classification), so the final reported
+            # model is unchanged by the parsimony model.  When
+            # ADAPTIVE_PARSIMONY_ENABLED is False the adjustment dict is empty,
+            # `freq_parsimony_adj` stays 0.0, and "linear" reduces exactly to
+            # the historical `loss + PARSIMONY_STRENGTH * complexity`.
+            self.fitness = parsimony_fitness(
+                self.loss, self.complexity, freq_parsimony_adj)
 
             # ── Populate fitness cache ───────────────────────────────────────
             if _cacheable and batch_indices is None and bg_logits is None:
@@ -14001,6 +14114,15 @@ def evolve_island_chunk(args):
         receive a positive parsimony increment; under-represented ones receive
         a negative increment.  This naturally maintains a spread across the
         complexity axis without manual tuning (PySR: use_frequency=True).
+      • MDL Parsimony model (PARSIMONY_MODE="mdl", default) — the selection
+        fitness is a Minimum Description Length: ½·w·log2(loss) + bits·complexity.
+        Because the data term is logarithmic, each relative halving of the loss
+        is worth a fixed number of bits regardless of scale, so added complexity
+        only wins when it buys at least that many bits of fit.  This removes the
+        linear-parsimony pathology where the complexity term swamps a small loss
+        (AIFeynman / Bayesian Machine Scientist style).  The frequency increment
+        above still modulates the complexity-bit cost; PARSIMONY_MODE="linear"
+        restores the classic additive penalty.
       • PySR Temperature-scaled constant perturbation — Gaussian noise for
         constant mutations is multiplied by (SA_PERTURBATION_FACTOR × T + 1),
         enabling broad constant exploration early and precise refinement late.
@@ -16330,7 +16452,7 @@ def _interval_cull_population(islands_pop, X_full, out_types=None):
                         sat_pen = float(np.mean(excess ** 2))
                         if sat_pen > 0.5:  # only penalise severely saturated
                             ind.loss   += LOGIT_SATURATION_WEIGHT * sat_pen
-                            ind.fitness = ind.loss + PARSIMONY_STRENGTH * ind.complexity
+                            ind.fitness = parsimony_fitness(ind.loss, ind.complexity)
                             penalised  += 1
                 except Exception:
                     ind.loss    = 1e10
@@ -25973,6 +26095,7 @@ if __name__ == "__main__":
 
 def train_mode():
     global CGP_NODES, CGP_MUT_RATE, PARSIMONY_STRENGTH, SIMPLIFICATION_FREQ
+    global PARSIMONY_MODE, MDL_DATA_WEIGHT, MDL_COMPLEXITY_BITS
     global EVOLUTION_MODEL, DS_LEXICASE_FRAC
     global NUM_ISLANDS_GLOBAL
     global AGE_GROUP_N_GROUPS, AGE_GROUP_ISLANDS_PER_GROUP, AGE_GROUP_GRAD_FREQ
@@ -26092,20 +26215,64 @@ def train_mode():
     if cgp_mut_in:
         CGP_MUT_RATE = int(cgp_mut_in)
 
-    # ---- Parsimony strength ----
-    print("\nPARSIMONY STRENGTH")
-    print(f"  Controls how heavily expression complexity is penalised in fitness.")
-    print(f"  formula:  fitness = loss + PARSIMONY * complexity")
-    print(f"  0.00 = no penalty (fastest, but expressions bloat).")
-    print(f"  0.01 = very gentle — only prunes runaway bloat.")
-    print(f"  0.05 = moderate  (default) — balanced size/accuracy.")
-    print(f"  0.20 = strong — prefers very compact expressions.")
-    pars_in = input(f"Parsimony Strength [default {PARSIMONY_STRENGTH}]: ").strip()
-    if pars_in:
-        try:
-            PARSIMONY_STRENGTH = float(pars_in)
-        except ValueError:
-            print("  Invalid value; keeping default.")
+    # ---- Parsimony model ----
+    print("\nPARSIMONY MODEL")
+    print(f"  How expression complexity is traded against fit in the SELECTION")
+    print(f"  fitness (parent selection / annealing / Pareto-trim).  The Hall of")
+    print(f"  Fame and final model pick are unaffected — this only steers search.")
+    print(f"  [1] mdl    (default) — Minimum Description Length / information")
+    print(f"             theory.  fitness = ½·w·log2(loss) + bits·complexity.")
+    print(f"             Scale-free Occam: every halving of the loss is worth a")
+    print(f"             fixed number of bits, so a much better fit can always")
+    print(f"             out-vote a few extra complexity-bits.  No small-loss")
+    print(f"             pathology.  (AIFeynman / Bayesian Machine Scientist.)")
+    print(f"  [2] linear (legacy)  — fitness = loss + strength·complexity.")
+    print(f"             Simple additive penalty; the complexity term can swamp")
+    print(f"             the loss once the fit is good.")
+    pm_in = input(f"Parsimony model [1=mdl / 2=linear, default {PARSIMONY_MODE}]: ").strip().lower()
+    if pm_in in ("1", "mdl"):
+        PARSIMONY_MODE = "mdl"
+    elif pm_in in ("2", "linear"):
+        PARSIMONY_MODE = "linear"
+    elif pm_in:
+        print("  Unrecognised; keeping default.")
+    print(f"  ✓  Parsimony model: {PARSIMONY_MODE}")
+
+    if PARSIMONY_MODE == "mdl":
+        # ---- MDL knobs ----
+        print("\nMDL PARSIMONY STRENGTH (bits per complexity unit)")
+        print(f"  Higher = stronger Occam pressure toward compact expressions.")
+        print(f"  0.00 = no penalty (bloat); 0.02 = gentle (default); 0.10 = strong.")
+        mdlb_in = input(f"MDL complexity bits [default {MDL_COMPLEXITY_BITS}]: ").strip()
+        if mdlb_in:
+            try:
+                MDL_COMPLEXITY_BITS = float(mdlb_in)
+            except ValueError:
+                print("  Invalid value; keeping default.")
+        print("\nMDL DATA WEIGHT (effective sample size on the fit term)")
+        print(f"  Higher = fit matters more relative to complexity; lower = more")
+        print(f"  aggressive simplification.  1.0 is a balanced default.")
+        mdlw_in = input(f"MDL data weight [default {MDL_DATA_WEIGHT}]: ").strip()
+        if mdlw_in:
+            try:
+                MDL_DATA_WEIGHT = float(mdlw_in)
+            except ValueError:
+                print("  Invalid value; keeping default.")
+    else:
+        # ---- Linear parsimony strength ----
+        print("\nPARSIMONY STRENGTH")
+        print(f"  Controls how heavily expression complexity is penalised in fitness.")
+        print(f"  formula:  fitness = loss + PARSIMONY * complexity")
+        print(f"  0.00 = no penalty (fastest, but expressions bloat).")
+        print(f"  0.01 = very gentle — only prunes runaway bloat.")
+        print(f"  0.05 = moderate  (default) — balanced size/accuracy.")
+        print(f"  0.20 = strong — prefers very compact expressions.")
+        pars_in = input(f"Parsimony Strength [default {PARSIMONY_STRENGTH}]: ").strip()
+        if pars_in:
+            try:
+                PARSIMONY_STRENGTH = float(pars_in)
+            except ValueError:
+                print("  Invalid value; keeping default.")
 
     # ---- Simplification frequency ----
     print("\nSIMPLIFICATION FREQUENCY")
