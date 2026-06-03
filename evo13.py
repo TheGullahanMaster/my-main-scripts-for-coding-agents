@@ -12904,6 +12904,97 @@ def _simplify_perfect_output(hof, X, Y_col, out_type, target_grads=None):
     return improved
 
 
+def _derived_input_feature_names(col_name, type_code, stat):
+    """Exact list of feature names a column contributes to ``dp.input_map``.
+
+    Mirrors the naming used by ``DataProcessor._encode_categorical`` /
+    ``fit_transform`` so the export layer can map active feature indices back to
+    their *raw* source column.  Crucially this understands **compact** encoding
+    for high-cardinality categoricals (``{col}_freq`` / ``{col}_target_mean`` /
+    ``{col}_ordinal_tm``), not just classic one-hot (``{col}_{cls}``) — the
+    former silently dropped out of the exported model's prompt list before.
+    """
+    if type_code == 1:                       # Numeric input → single column
+        return [col_name]
+    if type_code == 2:                       # Categorical input
+        encoding = stat.get('encoding', 'one_hot')
+        if encoding == 'one_hot':
+            return [f"{col_name}_{cls}" for cls in stat.get('classes', [])]
+        # Compact encoding: frequency, then (optionally) target-mean + ordinal,
+        # emitted only when a target was available at fit time.
+        names = [f"{col_name}_freq"]
+        if stat.get('target_mean_map') is not None:
+            names.append(f"{col_name}_target_mean")
+            names.append(f"{col_name}_ordinal_tm")
+        return names
+    if type_code == 3:                       # Char-encoded input
+        char_map = stat.get('char_map', {})
+        max_len = stat.get('max_len', 1)
+        chars = sorted(char_map.keys())
+        return [f"{col_name}_pos{j}_{c}" for j in range(max_len) for c in chars]
+    return []
+
+
+def _input_feature_owner_columns(dp):
+    """List parallel to ``dp.input_map``: the raw source column for each feature.
+
+    Uses ``effective_configs`` (post auto-promotion) so columns that were
+    silently switched from numeric to categorical (e.g. an object column marked
+    "Numeric Input") are attributed to the right raw column rather than dropped.
+    """
+    configs_iter = getattr(dp, 'effective_configs', None) or dp.col_configs
+    owners = []
+    for col, type_c in configs_iter:
+        if type_c in (0, 5, 6, 7):
+            continue
+        # A column contributes to input_map iff it was actually encoded at fit
+        # time (fit_transform skips columns missing from the dataframe and never
+        # records stats for them) — skip otherwise so owners stays index-aligned.
+        if col not in dp.stats:
+            continue
+        stat = dp.stats[col]
+        owners.extend([col] * len(_derived_input_feature_names(col, type_c, stat)))
+    return owners
+
+
+def _used_input_columns(dp, used_feature_indices):
+    """Raw input columns (in config order) that own ≥1 active feature.
+
+    Replaces the old logic that reconstructed one-hot names as ``f"{col}_{cls}"``
+    — which silently dropped compact-encoded high-cardinality categoricals and
+    auto-promoted columns from the exported model's interactive prompt, so the
+    user was never asked for them and they defaulted to all-zeros.
+    """
+    configs_iter = getattr(dp, 'effective_configs', None) or dp.col_configs
+    owners = _input_feature_owner_columns(dp)
+    if len(owners) == len(dp.input_map):
+        # Direct index → owning-column mapping (handles every encoding exactly).
+        used_owner_cols = {owners[idx] for idx in used_feature_indices
+                           if 0 <= idx < len(owners)}
+    else:
+        # Defensive fallback: match by exact feature-name membership, which does
+        # not require positional alignment with input_map.
+        used_names = {dp.input_map[idx] for idx in used_feature_indices
+                      if 0 <= idx < len(dp.input_map)}
+        used_owner_cols = set()
+        for col, type_c in configs_iter:
+            if type_c in (0, 5, 6, 7):
+                continue
+            stat = dp.stats.get(col, {})
+            if any(n in used_names
+                   for n in _derived_input_feature_names(col, type_c, stat)):
+                used_owner_cols.add(col)
+    # Preserve config order; one entry per raw input column.
+    seen, used_cols = set(), []
+    for col, type_c in configs_iter:
+        if type_c in (0, 5, 6, 7):
+            continue
+        if col in used_owner_cols and col not in seen:
+            seen.add(col)
+            used_cols.append(col)
+    return used_cols
+
+
 def generate_script(models, dp, filename="best_model.py", X_data=None):
     import inspect
 
@@ -12919,33 +13010,12 @@ def generate_script(models, dp, filename="best_model.py", X_data=None):
         for idx in ind.tree.active_nodes:
             if idx < ind.tree.n_features:
                 used_feature_indices.add(idx)
-                
-    used_input_map_names = set(dp.input_map[idx] for idx in used_feature_indices)
-    
-    used_cols = []
-    for col, type_c in dp.col_configs:
-        if type_c in [0, 5, 6, 7]: continue
-        if type_c == 1:
-            if col in used_input_map_names:
-                used_cols.append(col)
-        elif type_c == 2:
-            stat = dp.stats.get(col, {})
-            for cls in stat.get('classes', []):
-                if f"{col}_{cls}" in used_input_map_names:
-                    used_cols.append(col)
-                    break
-        elif type_c == 3:
-            stat = dp.stats.get(col, {})
-            chars = stat.get('char_map', {}).keys()
-            max_len = stat.get('max_len', 1)
-            found = False
-            for j in range(max_len):
-                for c in chars:
-                    if f"{col}_pos{j}_{c}" in used_input_map_names:
-                        used_cols.append(col)
-                        found = True
-                        break
-                if found: break
+
+    # Map active feature indices back to their *raw* source columns.  Handles
+    # one-hot, compact (high-cardinality) and auto-promoted categoricals so the
+    # exported model prompts for every categorical input instead of silently
+    # defaulting it to zero.
+    used_cols = _used_input_columns(dp, used_feature_indices)
 
 
     # 1. Resolve clean variable names (deduplicated)
@@ -13513,11 +13583,32 @@ def plot_model():
     print(f"Saved {{plot_count}} plots to {{plot_dir}}")
 
 
+def _describe_input(col):
+    """Short hint listing the valid values for a categorical input prompt.
+
+    For categorical columns the raw label (e.g. 'g') is what should be typed —
+    the DataProcessor one-hot/compact-encodes it internally.  Showing the
+    options stops typos from silently encoding to an all-zero vector.
+    """
+    try:
+        stat = dp.stats.get(col, {{}})
+        if stat.get('type') != 2:
+            return ""
+        classes = [str(c) for c in stat.get('classes', []) if c != '__MISSING__']
+        if not classes:
+            return ""
+        if len(classes) <= 12:
+            return " [" + "/".join(classes) + "]"
+        return f" [categorical, {{len(classes)}} options e.g. " + ", ".join(classes[:8]) + ", ...]"
+    except Exception:
+        return ""
+
+
 def main():
     print("--- MODEL INTERFACE ---")
     print("Required Inputs (unused features omitted):")
     for col in USED_COLS:
-        print(f" - {{col}}")
+        print(f" - {{col}}{{_describe_input(col)}}")
 
     # Ask if user wants to plot
     try:
@@ -13532,7 +13623,7 @@ def main():
         while True:
             inp = {{}}
             for col in USED_COLS:
-                val = input(f"{{col}}: ")
+                val = input(f"{{col}}{{_describe_input(col)}}: ")
                 inp[col] = val
             result = predict(inp)
             print(result)
@@ -25918,34 +26009,11 @@ def _generate_boosted_script(boosted_models, dp, X_data=None):
                 if idx < ind.tree.n_features:
                     used_feature_indices.add(idx)
 
-    used_input_map_names = set(dp.input_map[idx] for idx in used_feature_indices)
-
-    used_cols = []
-    for col, type_c in dp.col_configs:
-        if type_c in [0, 5, 6, 7]:
-            continue
-        if type_c == 1:
-            if col in used_input_map_names:
-                used_cols.append(col)
-        elif type_c == 2:
-            stat = dp.stats.get(col, {})
-            for cls in stat.get('classes', []):
-                if f"{col}_{cls}" in used_input_map_names:
-                    used_cols.append(col)
-                    break
-        elif type_c == 3:
-            stat = dp.stats.get(col, {})
-            chars = stat.get('char_map', {}).keys()
-            max_len = stat.get('max_len', 1)
-            found = False
-            for j in range(max_len):
-                for c in chars:
-                    if f"{col}_pos{j}_{c}" in used_input_map_names:
-                        used_cols.append(col)
-                        found = True
-                        break
-                if found:
-                    break
+    # Map active feature indices back to their *raw* source columns.  Handles
+    # one-hot, compact (high-cardinality) and auto-promoted categoricals so the
+    # exported model prompts for every categorical input instead of silently
+    # defaulting it to zero.
+    used_cols = _used_input_columns(dp, used_feature_indices)
 
     # 1. Resolve clean variable names (deduplicated)
     clean_names = [clean_var_name(n) for n in dp.input_map]
@@ -26560,11 +26628,32 @@ def plot_model():
     print(f"Saved {{plot_count}} plots to {{plot_dir}}")
 
 
+def _describe_input(col):
+    """Short hint listing the valid values for a categorical input prompt.
+
+    For categorical columns the raw label (e.g. 'g') is what should be typed —
+    the DataProcessor one-hot/compact-encodes it internally.  Showing the
+    options stops typos from silently encoding to an all-zero vector.
+    """
+    try:
+        stat = dp.stats.get(col, {{}})
+        if stat.get('type') != 2:
+            return ""
+        classes = [str(c) for c in stat.get('classes', []) if c != '__MISSING__']
+        if not classes:
+            return ""
+        if len(classes) <= 12:
+            return " [" + "/".join(classes) + "]"
+        return f" [categorical, {{len(classes)}} options e.g. " + ", ".join(classes[:8]) + ", ...]"
+    except Exception:
+        return ""
+
+
 def main():
     print("--- GRADIENT-BOOSTED MODEL INTERFACE ---")
     print("Required Inputs (unused features omitted):")
     for col in USED_COLS:
-        print(f" - {{col}}")
+        print(f" - {{col}}{{_describe_input(col)}}")
 
     # Ask if user wants to plot
     try:
@@ -26579,7 +26668,7 @@ def main():
         while True:
             inp = {{}}
             for col in USED_COLS:
-                val = input(f"{{col}}: ")
+                val = input(f"{{col}}{{_describe_input(col)}}: ")
                 inp[col] = val
             result = predict(inp)
             print(result)
