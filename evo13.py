@@ -5151,22 +5151,92 @@ class HallOfFame:
         self._best_cache_version = self._version
         return best
 
-    def _best_overall_regression(self):
-        """PySR knee pick: among models within 1.5× of the best loss, take the
-        one with the highest score, breaking ties toward LOWER complexity so a
-        bloated model never wins a score tie against a simpler equal-score one.
-        """
-        scores = self.compute_pysr_scores()
-        min_loss = min(ind.loss for ind in self.best_by_complexity.values())
-        threshold = 1.5 * min_loss
+    def _knee_frontier(self):
+        """Shared geometry for the improved (Kneedle) knee selection.
 
-        valid_complexities = [c for c, ind in self.best_by_complexity.items()
-                              if ind.loss <= threshold]
-        if not valid_complexities:
+        Returns ``(kept, dist, has_elbow)`` where:
+
+          • ``kept``      — the frontier reduced to a clean Pareto-monotone
+            staircase: ``[(complexity, individual), …]`` sorted by ascending
+            complexity, keeping only the running-minimum-loss points so the
+            loss curve is non-increasing (raw HoF states can be transiently
+            non-monotonic between sanitize passes).
+          • ``dist``      — numpy array of the *Kneedle distance* of each kept
+            point: its normalised height above the straight chord joining the
+            simplest and most-accurate models in (complexity, log-loss) space.
+            Larger = a better accuracy-per-unit-complexity tradeoff.
+          • ``has_elbow`` — True when an interior point rises above the chord
+            (a genuine diminishing-returns elbow exists); False for a convex or
+            linear frontier where extra complexity keeps buying accuracy.
+
+        Loss is taken in log space because accuracy gains across a symbolic
+        frontier are multiplicative and span many orders of magnitude — a
+        linear-loss chord would otherwise be dominated by the single largest
+        drop and ignore everything below it.  Both ``_best_overall_regression``
+        and ``get_top_models`` build on this so the menu and the default pick
+        always agree on the ranking.
+        """
+        items = sorted(self.best_by_complexity.items())   # (complexity, ind) asc
+        kept = []
+        best_loss = float('inf')
+        for c, ind in items:
+            l = float(ind.loss)
+            if l <= best_loss + 1e-15:        # running-min ⇒ monotone staircase
+                kept.append((c, ind))
+                best_loss = l
+        if len(kept) <= 1:
+            return kept, np.zeros(len(kept)), False
+
+        comps  = np.array([c for c, _ in kept], dtype=float)
+        losses = np.array([max(float(ind.loss), 1e-300) for _, ind in kept],
+                          dtype=float)
+        logl   = np.log(losses)
+
+        dx = comps[-1] - comps[0]
+        dy = logl[0] - logl[-1]               # logl non-increasing ⇒ dy >= 0
+        if dx < 1e-12 or dy < 1e-12:
+            # All-equal complexity or all-equal loss: no meaningful curve.
+            return kept, np.zeros(len(kept)), False
+
+        x_norm = (comps - comps[0]) / dx       # 0 → 1, increasing
+        gain   = (logl[0] - logl) / dy         # 0 → 1, increasing (1 = best loss)
+        dist   = gain - x_norm                 # height above the (0,0)-(1,1) chord
+        has_elbow = bool(np.max(dist) > 1e-9)
+        return kept, dist, has_elbow
+
+    def _best_overall_regression(self):
+        """Improved knee selection — a Kneedle-style global elbow detector.
+
+        The legacy rule was PySR's pairwise score: ``-Δlog(loss)/Δcomplexity``,
+        picking the maximum among models within 1.5× of the best loss.  That
+        score is a *local* derivative (one noisy frontier pair can spike it),
+        and the 1.5× loss gate is scale-fragile near zero loss.
+
+        This replacement finds the knee geometrically (Satopaa et al.'s
+        Kneedle): on the normalised (complexity, log-loss) frontier the knee is
+        the point lying furthest above the straight chord joining the simplest
+        and most-accurate models — the global point of diminishing returns.  It
+        needs no magic threshold and is robust to local non-monotonicity.
+
+        Fallback: when the frontier is convex/linear (``has_elbow`` is False, no
+        point rises above the chord) there is no diminishing-returns knee — every
+        added unit of complexity keeps buying accuracy — so we return the most
+        accurate (lowest-loss) model, tie-broken toward lower complexity.  In
+        every branch ties favour the SIMPLER model, so a bloated equal-merit
+        model can never win.
+        """
+        kept, dist, has_elbow = self._knee_frontier()
+        if not kept:
             return min(self.best_by_complexity.values(), key=lambda x: x.loss)
-        # Tie-break: highest score first, then simplest (smallest complexity).
-        best_c = max(valid_complexities, key=lambda c: (scores[c], -c))
-        return self.best_by_complexity[best_c]
+        if len(kept) == 1:
+            return kept[0][1]
+        if has_elbow:
+            # Highest Kneedle distance; ties broken toward lower complexity.
+            best_i = max(range(len(kept)),
+                         key=lambda i: (dist[i], -kept[i][0]))
+            return kept[best_i][1]
+        # No elbow: accuracy keeps paying off ⇒ most accurate, simplest on ties.
+        return min(kept, key=lambda t: (float(t[1].loss), t[0]))[1]
 
     def _best_overall_classification(self):
         """Accuracy-first pick for classification.
@@ -5195,6 +5265,57 @@ class HallOfFame:
                            -float(getattr(t[1], 'accuracy', 0.0)),
                            float(getattr(t[1], 'loss', 0.0))))
         return best_ind
+
+    def get_top_models(self, n=5):
+        """Up to *n* strong, distinct candidate models, best-overall first.
+
+        Powers the interactive 'choose a model' menu shown when evolution
+        stops.  Element 0 is always ``get_best_overall()`` (the menu default),
+        and the remaining slots are chosen to SPAN the accuracy/complexity
+        tradeoff — the most-accurate model and the simplest frontier model are
+        guaranteed a slot, then the next-best knees fill the rest — so the menu
+        offers genuinely different options instead of near-duplicates clustered
+        around the knee.  Models are de-duplicated by identity.
+        """
+        if not self.best_by_complexity:
+            return []
+        best = self.get_best_overall()
+        is_cls = (self.out_type == 6)
+
+        if is_cls:
+            items = list(self.best_by_complexity.items())     # (complexity, ind)
+            # Most accurate first, then simplest, then lower cross-entropy.
+            ranked = [ind for _, ind in sorted(
+                items, key=lambda t: (-float(getattr(t[1], 'accuracy', 0.0)),
+                                      t[0], float(getattr(t[1], 'loss', 0.0))))]
+        else:
+            kept, dist, _ = self._knee_frontier()
+            if not kept:
+                ranked = sorted(self.best_by_complexity.values(),
+                                key=lambda x: x.loss)
+            else:
+                # Knee order (best tradeoff first) …
+                order = sorted(range(len(kept)),
+                               key=lambda i: (-dist[i], kept[i][0]))
+                knee_order = [kept[i][1] for i in order]
+                # … but anchor the extremes first so they survive the top-n
+                # trim: most accurate (lowest loss = last on the monotone
+                # frontier) and simplest (first).
+                ranked = []
+                for anchor in (kept[-1][1], kept[0][1]):
+                    if all(anchor is not r for r in ranked):
+                        ranked.append(anchor)
+                for ind in knee_order:
+                    if all(ind is not r for r in ranked):
+                        ranked.append(ind)
+
+        result = []
+        for ind in [best] + ranked:
+            if ind is not None and all(ind is not r for r in result):
+                result.append(ind)
+            if len(result) >= n:
+                break
+        return result
 
     def print_frontier(self, out_type=5, label=""):
         is_cls = (out_type == 6)
@@ -13017,13 +13138,77 @@ def plot_model():
                 except ValueError:
                     pass
 
+    # -- Plot configuration: mode, resolution, per-input range --
+    def _ask(prompt):
+        try:
+            return input(prompt).strip()
+        except (EOFError, KeyboardInterrupt):
+            return ""
+
+    print("\\nPlot mode:")
+    print("  [1] 1D  - each input vs each output")
+    print("  [2] 2D  - each input pair vs each output (needs >= 2 inputs)")
+    print("  [3] both (default)")
+    _mode = _ask("Select plot mode [1/2/3, default 3]: ")
+    do_1d = _mode in ("1", "3", "")
+    do_2d = _mode in ("2", "3", "")
+    if n_feat < 2:
+        do_2d = False
+    if not do_1d and not do_2d:
+        # Unrecognised entry, or 2D requested on 1-D data: fall back sensibly.
+        do_1d = True
+        do_2d = (n_feat >= 2)
+
+    # Resolution (only asked for the modes that will actually run)
+    if do_1d:
+        _r = _ask(f"1D resolution (points per curve) [default {{resolution}}]: ")
+        if _r:
+            try:
+                _rv = int(float(_r))
+                if _rv >= 2:
+                    resolution = _rv
+            except ValueError:
+                print("    (not a number - keeping default)")
+    res2d_override = None
+    if do_2d:
+        _r = _ask("2D grid resolution (points per axis) [Enter = default]: ")
+        if _r:
+            try:
+                _rv = int(float(_r))
+                if _rv >= 2:
+                    res2d_override = _rv
+            except ValueError:
+                print("    (not a number - keeping default)")
+
+    # Per-input plot range (defaults to the training range)
+    plot_mins = dict(feat_mins)
+    plot_maxs = dict(feat_maxs)
+    print("\\nPlot range per input (Enter = training range; format: MIN MAX or MIN,MAX):")
+    for _idx in range(n_feat):
+        _lo = plot_mins.get(_idx, 0.0)
+        _hi = plot_maxs.get(_idx, 1.0)
+        _r = _ask(f"  {{FEATURE_NAMES[_idx]}} [{{_lo:.4g}} to {{_hi:.4g}}]: ")
+        if _r:
+            _parts = _r.replace(",", " ").split()
+            if len(_parts) == 2:
+                try:
+                    _a, _b = float(_parts[0]), float(_parts[1])
+                    if _b < _a:
+                        _a, _b = _b, _a
+                    plot_mins[_idx], plot_maxs[_idx] = _a, _b
+                except ValueError:
+                    print("    (could not parse - keeping training range)")
+            else:
+                print("    (need two numbers - keeping training range)")
+
     plot_count = 0
 
     # 1D plots: each feature vs each output
-    print("\\nGenerating 1D plots (each input vs each output)...")
-    for feat_idx in range(n_feat):
-        fmin = feat_mins.get(feat_idx, 0.0)
-        fmax = feat_maxs.get(feat_idx, 1.0)
+    if do_1d:
+        print("\\nGenerating 1D plots (each input vs each output)...")
+    for feat_idx in (range(n_feat) if do_1d else ()):
+        fmin = plot_mins.get(feat_idx, 0.0)
+        fmax = plot_maxs.get(feat_idx, 1.0)
         if abs(fmax - fmin) < 1e-12:
             continue  # skip constant features
         x_range = np.linspace(fmin, fmax, resolution)
@@ -13052,13 +13237,15 @@ def plot_model():
             plot_count += 1
 
     # 2D plots: each pair of features vs each output
-    if n_feat >= 2:
+    if do_2d and n_feat >= 2:
         print("Generating 2D plots (each input pair vs each output)...")
         res2d = 256
+        if res2d_override is not None:
+            res2d = res2d_override
         for i in range(n_feat):
             for j in range(i + 1, n_feat):
-                fmin_i, fmax_i = feat_mins.get(i, 0.0), feat_maxs.get(i, 1.0)
-                fmin_j, fmax_j = feat_mins.get(j, 0.0), feat_maxs.get(j, 1.0)
+                fmin_i, fmax_i = plot_mins.get(i, 0.0), plot_maxs.get(i, 1.0)
+                fmin_j, fmax_j = plot_mins.get(j, 0.0), plot_maxs.get(j, 1.0)
                 if abs(fmax_i - fmin_i) < 1e-12 or abs(fmax_j - fmin_j) < 1e-12:
                     continue
                 xi = np.linspace(fmin_i, fmax_i, res2d)
@@ -25978,13 +26165,77 @@ def plot_model():
                 except ValueError:
                     pass
 
+    # -- Plot configuration: mode, resolution, per-input range --
+    def _ask(prompt):
+        try:
+            return input(prompt).strip()
+        except (EOFError, KeyboardInterrupt):
+            return ""
+
+    print("\\nPlot mode:")
+    print("  [1] 1D  - each input vs each output")
+    print("  [2] 2D  - each input pair vs each output (needs >= 2 inputs)")
+    print("  [3] both (default)")
+    _mode = _ask("Select plot mode [1/2/3, default 3]: ")
+    do_1d = _mode in ("1", "3", "")
+    do_2d = _mode in ("2", "3", "")
+    if n_feat < 2:
+        do_2d = False
+    if not do_1d and not do_2d:
+        # Unrecognised entry, or 2D requested on 1-D data: fall back sensibly.
+        do_1d = True
+        do_2d = (n_feat >= 2)
+
+    # Resolution (only asked for the modes that will actually run)
+    if do_1d:
+        _r = _ask(f"1D resolution (points per curve) [default {{resolution}}]: ")
+        if _r:
+            try:
+                _rv = int(float(_r))
+                if _rv >= 2:
+                    resolution = _rv
+            except ValueError:
+                print("    (not a number - keeping default)")
+    res2d_override = None
+    if do_2d:
+        _r = _ask("2D grid resolution (points per axis) [Enter = default]: ")
+        if _r:
+            try:
+                _rv = int(float(_r))
+                if _rv >= 2:
+                    res2d_override = _rv
+            except ValueError:
+                print("    (not a number - keeping default)")
+
+    # Per-input plot range (defaults to the training range)
+    plot_mins = dict(feat_mins)
+    plot_maxs = dict(feat_maxs)
+    print("\\nPlot range per input (Enter = training range; format: MIN MAX or MIN,MAX):")
+    for _idx in range(n_feat):
+        _lo = plot_mins.get(_idx, 0.0)
+        _hi = plot_maxs.get(_idx, 1.0)
+        _r = _ask(f"  {{FEATURE_NAMES[_idx]}} [{{_lo:.4g}} to {{_hi:.4g}}]: ")
+        if _r:
+            _parts = _r.replace(",", " ").split()
+            if len(_parts) == 2:
+                try:
+                    _a, _b = float(_parts[0]), float(_parts[1])
+                    if _b < _a:
+                        _a, _b = _b, _a
+                    plot_mins[_idx], plot_maxs[_idx] = _a, _b
+                except ValueError:
+                    print("    (could not parse - keeping training range)")
+            else:
+                print("    (need two numbers - keeping training range)")
+
     plot_count = 0
 
     # 1D plots: each feature vs each output
-    print("\\nGenerating 1D plots (each input vs each output)...")
-    for feat_idx in range(n_feat):
-        fmin = feat_mins.get(feat_idx, 0.0)
-        fmax = feat_maxs.get(feat_idx, 1.0)
+    if do_1d:
+        print("\\nGenerating 1D plots (each input vs each output)...")
+    for feat_idx in (range(n_feat) if do_1d else ()):
+        fmin = plot_mins.get(feat_idx, 0.0)
+        fmax = plot_maxs.get(feat_idx, 1.0)
         if abs(fmax - fmin) < 1e-12:
             continue
         x_range = np.linspace(fmin, fmax, resolution)
@@ -26013,13 +26264,15 @@ def plot_model():
             plot_count += 1
 
     # 2D plots: each pair of features vs each output
-    if n_feat >= 2:
+    if do_2d and n_feat >= 2:
         print("Generating 2D plots (each input pair vs each output)...")
         res2d = 80
+        if res2d_override is not None:
+            res2d = res2d_override
         for i in range(n_feat):
             for j in range(i + 1, n_feat):
-                fmin_i, fmax_i = feat_mins.get(i, 0.0), feat_maxs.get(i, 1.0)
-                fmin_j, fmax_j = feat_mins.get(j, 0.0), feat_maxs.get(j, 1.0)
+                fmin_i, fmax_i = plot_mins.get(i, 0.0), plot_maxs.get(i, 1.0)
+                fmin_j, fmax_j = plot_mins.get(j, 0.0), plot_maxs.get(j, 1.0)
                 if abs(fmax_i - fmin_i) < 1e-12 or abs(fmax_j - fmin_j) < 1e-12:
                     continue
                 xi = np.linspace(fmin_i, fmax_i, res2d)
@@ -26091,6 +26344,107 @@ if __name__ == "__main__":
         f.write(script_content)
     print(f"\n  Boosted prediction script saved to: {filename}")
 
+
+
+def _format_model_expr(ind, is_cls):
+    """Compact one-line expression string for menus / reports.
+
+    Regression strings fold in the outer affine transform (``affine_a`` /
+    ``affine_b``) exactly like ``print_frontier`` and the final report, so the
+    expression shown in the picker is the predictor that will actually be
+    exported.  Classification has no affine wrapper.
+    """
+    if ind is None:
+        return "(none)"
+    if is_cls:
+        return str(ind.tree)
+    a = getattr(ind, 'affine_a', 1.0)
+    b = getattr(ind, 'affine_b', 0.0)
+    sign = "+" if b >= 0 else "-"
+    return f"({a:.4g} * ({ind.tree}) {sign} {abs(b):.4g})"
+
+
+def select_final_models(hofs, dp, out_types):
+    """Interactive top-N model picker shown when evolution stops.
+
+    For each output we present the strongest candidate models — the knee pick
+    (``get_best_overall``) plus a spread across the accuracy/complexity
+    tradeoff (see ``HallOfFame.get_top_models``) — and let the user choose
+    which one to report and export.  The default (a bare Enter) is always the
+    'best overall' knee model, so the historical one-shot behaviour is
+    reproduced by pressing Enter.
+
+    Robust to non-interactive use: if a prompt hits EOF / Ctrl-C (piped stdin,
+    CI, no TTY) we silently fall back to the best-overall pick for the
+    remaining outputs, so automated runs are unaffected.
+    """
+    n_outputs = len(hofs)
+    chosen = []
+    auto = False        # latches once stdin is exhausted ⇒ default the rest
+
+    print("\n" + "=" * 100)
+    print("MODEL SELECTION — pick a model per output (Enter = best overall)")
+    print("=" * 100)
+
+    for i, hof in enumerate(hofs):
+        best = hof.get_best_overall()
+        out_label = dp.output_map[i] if i < len(dp.output_map) else f"Output {i}"
+        is_cls = (out_types[i] == 6)
+
+        if best is None:
+            chosen.append(None)
+            continue
+
+        candidates = hof.get_top_models(5)
+        if not candidates:
+            chosen.append(best)
+            continue
+        if auto or len(candidates) == 1:
+            chosen.append(best)
+            continue
+
+        scores = hof.compute_pysr_scores()
+        metric_name = "Acc" if is_cls else "R²"
+        print(f"\nOutput {i} ({out_label})  "
+              f"[{'Classification' if is_cls else 'Regression'}] — "
+              f"{len(candidates)} candidates:")
+        print(f"  {'#':<3} {'Comp':<7} {'Score':<9} {'Loss':<13} {metric_name:<8} Expression")
+        print("  " + "-" * 96)
+        for k, ind in enumerate(candidates, 1):
+            metric_val = (getattr(ind, 'accuracy', 0.0) if is_cls
+                          else getattr(ind, 'r2', 0.0))
+            sc = scores.get(ind.complexity, 0.0)
+            expr = _format_model_expr(ind, is_cls)
+            if len(expr) > 58:
+                expr = expr[:55] + "..."
+            tag = "  ← best overall (default)" if ind is best else ""
+            print(f"  {k:<3} {ind.complexity:<7.1f} {sc:<9.4f} {ind.loss:<13.5f} "
+                  f"{metric_val:<8.4f} {expr}{tag}")
+
+        sel = best
+        try:
+            raw = input(f"  Choose 1-{len(candidates)} for output {i} "
+                        f"[default: best overall]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("  (no input — using best overall for all remaining outputs)")
+            auto = True
+            raw = ""
+
+        if raw:
+            try:
+                pick = int(raw)
+                if 1 <= pick <= len(candidates):
+                    sel = candidates[pick - 1]
+                    print(f"  → selected model {pick} "
+                          f"(complexity {sel.complexity:.1f}, loss {sel.loss:.5f})")
+                else:
+                    print("  Out of range — using best overall.")
+            except ValueError:
+                print("  Not a number — using best overall.")
+        chosen.append(sel)
+
+    print("=" * 100)
+    return chosen
 
 
 def train_mode():
@@ -29321,10 +29675,12 @@ def train_mode():
                 hofs, target_grads_list, dp,
                 X_val=X_val, Y_val=Y_val, BATCH_SIZE=BATCH_SIZE)
 
-    best_models = [h.get_best_overall() for h in hofs]
+    # Interactive top-5 picker (default = best overall). Falls back to the
+    # automatic best-overall pick per output under non-interactive stdin.
+    best_models = select_final_models(hofs, dp, out_types)
 
     print("\n" + "=" * 80)
-    print("FINAL BEST MODELS PER OUTPUT")
+    print("FINAL SELECTED MODELS PER OUTPUT")
     print("=" * 80)
     for i, best in enumerate(best_models):
         out_label = dp.output_map[i] if i < len(dp.output_map) else f"Unknown"
