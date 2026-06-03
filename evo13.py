@@ -536,6 +536,86 @@ SA_ENABLED = True
 # explore widely; as T → 0 (good population) they are refined precisely.
 SA_PERTURBATION_FACTOR = 1.0
 
+# ---- Regression Loss Function ----
+# Selects how a regression individual's raw `.loss` is computed (lower = better,
+# 0 = perfect fit, ~mean-predictor = O(1)).  Both modes are variance-relative so
+# the loss is unit-free and the downstream calibration (HOF_LOSS_CEILING, the
+# MDL log2(loss) term, the SA temperature ∝ mean loss) is preserved.
+#
+#   "mse_mae"  (legacy) : (mse/var) + (mae/sqrt(var)).  Adequate on clean,
+#       single-scale problems, but it has three well-known failure modes:
+#         • one chaotic/discontinuous blow-up row dominates the squared term;
+#         • the squared term is owned by the largest-MAGNITUDE samples, so when
+#           the target spans several orders of magnitude the search fits the big
+#           outputs and never bothers with the small ones (it can get STUCK
+#           there — the small residuals are simply invisible to MSE);
+#         • "predict the mean" is only weakly discouraged.
+#
+#   "robust"  (default) : the legacy two terms, made robust, PLUS two new terms.
+#       It is purely ADDITIVE over the legacy loss, so on clean single-scale data
+#       it behaves almost exactly like "mse_mae" (and is therefore just as stable),
+#       while gaining outlier-robustness, a multi-scale term, and an anti-collapse
+#       term that switch on only when they are actually needed:
+#         L_mse  = 2·mean(pseudo_huber(r/s, δ))   ROBUST MSE.  Identical to
+#                  mse/var for |r| ≲ δ·s (same gradient + curvature as the legacy
+#                  squared term where it matters) but its tail is LINEAR, so a
+#                  single chaotic / discontinuous (mod, floor, bitwise) blow-up
+#                  row is counted once, not squared — robust to heavy tails.
+#         L_mae  = mae / sqrt(var)                 the EXACT legacy MAE term.  Its
+#                  constant near-0 gradient is what forces an EXACT fit late
+#                  (vital for integer / bit / step targets) and keeps the search
+#                  as well-anchored / low-variance as the legacy loss.
+#         L_ms   = w·gate·mean(min(|asinh(p/c) − asinh(y/c)|, clip))   the new
+#                  MULTI-SCALE term, in asinh (symlog) space.  asinh(·/c) is
+#                  linear below the crossover scale c and logarithmic above it,
+#                  and is defined for zeros / negatives (unlike log), so a y≈1e−3
+#                  row contributes as much as a y≈1e6 row and the search can no
+#                  longer ignore the small-magnitude outputs.  c = the SCALE_PCT-th
+#                  percentile of the non-zero |y|.  `gate` (see below) keeps this
+#                  term silent unless the target genuinely spans decades, and `w`
+#                  is deliberately small so L_mse stays the dominant, smoothly
+#                  convex driver of the search (a large w destabilises it).
+#         L_coll = k·(1 − min(spread_p/spread_y, 1))²   graduated ANTI-COLLAPSE
+#                  penalty.  Uses a robust (mean-absolute-deviation) spread ratio
+#                  so an equation whose output has collapsed toward a constant /
+#                  the dataset mean gets a stronger-than-averaged push out of that
+#                  local optimum, smoothly (no hard step) and without misfiring on
+#                  a lone outlier.
+#       loss = L_mse + L_mae + L_ms + L_coll
+# Set REGRESSION_LOSS_MODE = "mse_mae" to restore the exact legacy behaviour.
+REGRESSION_LOSS_MODE        = "robust"   # "robust" | "mse_mae"
+ROBUST_LOSS_HUBER_DELTA     = 3.0   # pseudo-Huber knee, in units of std(y); the
+                                    # tail is linear beyond this (outlier robustness)
+ROBUST_LOSS_MAE_WEIGHT      = 1.0   # weight of the legacy mae/sqrt(var) term (1.0
+                                    # == legacy; this is the late exact-fit anchor)
+ROBUST_LOSS_MULTISCALE_WEIGHT = 0.2 # weight of the gated asinh multi-scale term.
+                                    # Kept small on purpose: L_mse must remain the
+                                    # dominant driver of the search.  Empirically
+                                    # the search degrades sharply once this rivals
+                                    # L_mse (≈0.3+ on heavily skewed targets), while
+                                    # 0.2 matches/beats the legacy loss everywhere
+                                    # tested and still fully preserves the multi-
+                                    # scale ranking (it is linear in this weight, so
+                                    # the good-vs-bad gap stays the same multiple).
+                                    # Raise it for a stronger pull onto the small
+                                    # outputs if your target is comfortably
+                                    # representable by the op set.
+ROBUST_LOSS_MAE_CLIP        = 4.0   # per-row cap on |Δasinh| (asinh units ≈ log
+                                    # relative error); 0 disables the cap
+ROBUST_LOSS_COLLAPSE_WEIGHT = 0.5   # strength of the graduated anti-collapse push
+ROBUST_LOSS_SCALE_PCT       = 25.0  # percentile of non-zero |y| used as the
+                                    # absolute↔relative crossover scale c
+# The multi-scale (asinh) term is only beneficial when the target genuinely spans
+# orders of magnitude; on single-scale / zero-centred data it needlessly over-
+# weights the near-zero rows and adds search variance.  So it is GATED by the
+# data's dynamic range, measured once as log10(p90/p10) of the non-zero |y| (≈ the
+# number of decades the bulk of the target spans).  The term ramps (smoothstep)
+# from fully OFF below LO to fully ON at/above HI.  Empirically every single-scale
+# target sits ≤ ~1.3 decades and every multi-scale one ≥ ~2.8, so [1.5, 2.5]
+# cleanly separates them.  When the gate is 0 the asinh work is skipped entirely.
+ROBUST_LOSS_MULTISCALE_LO   = 1.5   # decades of |y| spread below which L_ms is OFF
+ROBUST_LOSS_MULTISCALE_HI   = 2.5   # decades at/above which L_ms is fully ON
+
 # ---- Sobolev Training ----
 # Adds a gradient-matching penalty to the regression loss.
 # Target gradients dy/dX are estimated once from the training data before
@@ -10697,6 +10777,149 @@ def compute_complexity_frequency_adjustment(population):
 _MDL_LOSS_FLOOR = 1e-12
 
 
+# ==========================================
+# ROBUST MULTI-SCALE REGRESSION LOSS
+# ==========================================
+# See the REGRESSION_LOSS_MODE config block for the full rationale.  This is the
+# single source of truth for the regression loss: calculate_fitness, the
+# constant-optimiser objective and the constant-snapping objective all route
+# through regression_loss(), so the main evaluation path and the inner
+# optimisation objectives can never drift apart.
+
+# Cache of target-derived statistics keyed on the identity of the target array.
+# The target vector y is FIXED for the whole of one output's search and is reused
+# by every individual and by every (often hundreds of) constant-optimisation
+# objective calls, so caching turns the per-call cost from "a percentile sort +
+# an asinh over N" into just "one asinh over N (of the predictions)".
+# Identity-checked (entry is (y, stats); we confirm `cached_y is y`) so a
+# recycled id() can never return stale stats, and capped (OrderedDict LRU) so the
+# transient sub-sampled targets created inside optimize_constants cannot leak.
+_LOSS_YSTATS_CACHE = OrderedDict()
+_LOSS_YSTATS_MAX   = 16
+
+
+def _loss_ystats(y):
+    """Return (s, c, v, mad_y, ym, dr) for target `y`, cached on the array identity.
+
+    s     : sqrt(var(y) + 1e-8)                  — RMS scale used to standardise residuals
+    c     : SCALE_PCT-th percentile of |y|>0     — absolute↔relative asinh crossover scale
+    v     : arcsinh(y / c)                        — precomputed transformed target
+    mad_y : mean(|y - mean(y)|)                   — robust target spread (anti-collapse ref)
+    ym    : mean(y)
+    dr    : log10(p90/p10 of |y|>0)               — dynamic range in decades (multi-scale gate)
+    """
+    key = id(y)
+    ent = _LOSS_YSTATS_CACHE.get(key)
+    if ent is not None and ent[0] is y:
+        _LOSS_YSTATS_CACHE.move_to_end(key)
+        return ent[1]
+
+    ym = float(np.mean(y))
+    s  = float(np.sqrt(np.mean((y - ym) ** 2) + 1e-8))
+    a  = np.abs(y)
+    a_nz = a[a > 0]
+    if a_nz.size:
+        c = float(np.percentile(a_nz, ROBUST_LOSS_SCALE_PCT))
+    else:
+        c = s
+    if not np.isfinite(c) or c <= 0.0:
+        c = s if (np.isfinite(s) and s > 0.0) else 1.0
+    v = np.arcsinh(y / c)
+    mad_y = float(np.mean(np.abs(y - ym)))
+    # Dynamic range (decades the bulk of |y| spans) → multi-scale gate.
+    if a_nz.size >= 2:
+        p10, p90 = np.percentile(a_nz, [10.0, 90.0])
+        dr = float(np.log10((p90 + 1e-30) / (p10 + 1e-30)))
+        if not np.isfinite(dr) or dr < 0.0:
+            dr = 0.0
+    else:
+        dr = 0.0
+    stats = (s, c, v, mad_y, ym, dr)
+
+    _LOSS_YSTATS_CACHE[key] = (y, stats)
+    _LOSS_YSTATS_CACHE.move_to_end(key)
+    if len(_LOSS_YSTATS_CACHE) > _LOSS_YSTATS_MAX:
+        _LOSS_YSTATS_CACHE.popitem(last=False)
+    return stats
+
+
+def regression_loss(preds, y, sample_weights=None):
+    """Scalar regression loss (lower = better, 0 = perfect, mean-predictor ≈ O(1)).
+
+    Dispatches on REGRESSION_LOSS_MODE.  `preds` is the FINAL prediction (affine
+    and any boosting corrections already applied by the caller) and `y` is the
+    matching target slice.  `sample_weights`, when given, are the per-row weights
+    from 2nd-order Hessian boosting; they are normalised internally to sum to N so
+    the loss scale is unchanged.  The variance/percentile normalisers are always
+    the UNWEIGHTED target statistics (matching the legacy weighted path, which
+    also divided by the unweighted var(y)).
+    """
+    if sample_weights is not None:
+        w = sample_weights * (len(sample_weights) / (float(np.sum(sample_weights)) + 1e-30))
+    else:
+        w = None
+
+    # ── Legacy variance-normalised MSE + MAE ────────────────────────────────
+    if REGRESSION_LOSS_MODE == "mse_mae":
+        diff  = preds - y
+        y_var = float(np.var(y)) + 1e-8
+        if w is not None:
+            return float(np.mean(w * diff ** 2) / y_var
+                         + np.mean(w * np.abs(diff)) / np.sqrt(y_var))
+        return float(np.mean(diff ** 2) / y_var
+                     + np.mean(np.abs(diff)) / np.sqrt(y_var))
+
+    # ── Robust loss = L_mse + L_mae + L_ms + L_collapse ─────────────────────
+    s, c, v, mad_y, ym, dr = _loss_ystats(y)
+
+    # L_mse: robust (pseudo-Huber) standardised residual.  The leading 2 makes
+    # it coincide with mse/var in the small-residual regime, so a fit that is
+    # already good keeps exactly the legacy quadratic pull; the tail is linear.
+    delta = ROBUST_LOSS_HUBER_DELTA
+    r  = preds - y
+    z  = r / s
+    ph = (delta * delta) * (np.sqrt(1.0 + (z / delta) ** 2) - 1.0)
+    abs_r = np.abs(r)
+
+    if w is not None:
+        L_mse    = 2.0 * float(np.mean(w * ph))
+        L_mae    = ROBUST_LOSS_MAE_WEIGHT * float(np.mean(w * abs_r)) / s
+        pm       = float(np.mean(w * preds))                  # weighted mean (w sums to N)
+        spread_p = float(np.mean(w * np.abs(preds - pm)))
+    else:
+        L_mse    = 2.0 * float(np.mean(ph))
+        L_mae    = ROBUST_LOSS_MAE_WEIGHT * float(np.mean(abs_r)) / s
+        spread_p = float(np.mean(np.abs(preds - np.mean(preds))))
+
+    loss = L_mse + L_mae
+
+    # L_ms: the new MULTI-SCALE term in asinh (symlog) space.  GATED by the
+    # target's dynamic range so it is silent on single-scale data (where it would
+    # merely over-weight near-zero rows and add search variance) and full strength
+    # on genuinely multi-scale data.  When the gate is 0 the asinh work is skipped.
+    lo, hi = ROBUST_LOSS_MULTISCALE_LO, ROBUST_LOSS_MULTISCALE_HI
+    t = (dr - lo) / (hi - lo) if hi > lo else (1.0 if dr >= hi else 0.0)
+    t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
+    ms_gate = t * t * (3.0 - 2.0 * t)                         # smoothstep
+    eff_ms = ROBUST_LOSS_MULTISCALE_WEIGHT * ms_gate
+    if eff_ms > 0.0:
+        u = np.abs(np.arcsinh(preds / c) - v)
+        if ROBUST_LOSS_MAE_CLIP > 0.0:
+            u = np.minimum(u, ROBUST_LOSS_MAE_CLIP)
+        loss += eff_ms * (float(np.mean(w * u)) if w is not None
+                          else float(np.mean(u)))
+
+    # L_collapse: graduated anti-constant push.  Guarded so it is silent on a
+    # genuinely constant target (where every model is a constant and the var
+    # normaliser is degenerate anyway).
+    if ROBUST_LOSS_COLLAPSE_WEIGHT > 0.0 and mad_y > 1e-9 * (abs(ym) + 1.0):
+        ratio = spread_p / (mad_y + 1e-30)
+        if ratio < 1.0:
+            loss += ROBUST_LOSS_COLLAPSE_WEIGHT * (1.0 - ratio) ** 2
+
+    return float(loss)
+
+
 def parsimony_fitness(loss, complexity, freq_adj=0.0):
     """
     Combine a model's raw loss and complexity into the scalar SELECTION fitness
@@ -11406,26 +11629,16 @@ class Individual:
                 y_mean = float(np.mean(y_eval))
                 diff   = preds - y_eval
 
-                y_var = float(np.var(y_eval)) + 1e-8
-
-                # ── 2nd-order Hessian-weighted loss for boosting ─────────────
-                # When sample_weights are provided (from Hessian boosting),
-                # use weighted MSE/MAE.  Weights are normalised to sum to N
-                # so the loss scale stays consistent with unweighted mode.
+                # ── Regression loss (robust multi-scale, or legacy MSE+MAE) ──
+                # regression_loss() dispatches on REGRESSION_LOSS_MODE; see its
+                # definition and the config block for the rationale.  sample_weights
+                # carries the 2nd-order Hessian-boosting per-row weights (None on
+                # the normal path) and is normalised to sum to N internally so the
+                # loss scale is unchanged.
                 w_eval = (sample_weights[batch_indices]
                           if sample_weights is not None and batch_indices is not None
                           else sample_weights)
-                if w_eval is not None:
-                    w_norm = w_eval * (len(w_eval) / (np.sum(w_eval) + 1e-30))
-                    mse = float(np.mean(w_norm * diff ** 2))
-                    mae = float(np.mean(w_norm * np.abs(diff)))
-                else:
-                    mse   = float(np.mean(diff ** 2))
-                    mae   = float(np.mean(np.abs(diff)))
-
-                # Combine MSE and MAE: MSE handles large residuals early,
-                # MAE forces convergence to exact fit late.
-                self.loss = (mse / y_var) + (mae / np.sqrt(y_var))
+                self.loss = regression_loss(preds, y_eval, sample_weights=w_eval)
 
                 # ── Sobolev gradient-matching penalty ────────────────────────
                 # Penalise expressions whose partial derivatives ∂f/∂x_j diverge
@@ -11627,17 +11840,12 @@ class Individual:
                     return float(np.mean(cls_w * bce))
                 return float(np.mean(bce))
             else:
-                # Use LOCKED affine — do not refit during constant optimisation
+                # Use LOCKED affine — do not refit during constant optimisation.
+                # Route through regression_loss() so the inner objective matches
+                # the outer fitness exactly (same REGRESSION_LOSS_MODE, same
+                # robust/multi-scale terms, same Hessian-boosting weighting).
                 p = self.affine_a * p + self.affine_b
-                diff  = p - y_opt
-                y_var = float(np.var(y_opt)) + 1e-8
-                if sw_opt is not None:
-                    w_norm = sw_opt * (len(sw_opt) / (np.sum(sw_opt) + 1e-30))
-                    loss = float(np.mean(w_norm * diff**2) / y_var
-                                 + np.mean(w_norm * np.abs(diff)) / np.sqrt(y_var))
-                else:
-                    loss = float(np.mean(diff**2) / y_var
-                                 + np.mean(np.abs(diff)) / np.sqrt(y_var))
+                loss = regression_loss(p, y_opt, sample_weights=sw_opt)
                 if tg_opt is not None and SOBOLEV_ENABLED:
                     tree_grads = evaluate_tree_gradients(self.tree, X_opt, self.affine_a)
                     grad_var   = np.var(target_grads, axis=0) + 1e-8
@@ -11795,16 +12003,15 @@ class Individual:
                 else:
                     a, b = 1.0, ym
                 p_scaled = a * p + b
-                diff = p_scaled - y_opt
-                y_var = float(np.var(y_opt)) + 1e-8
                 if tg_opt is not None and SOBOLEV_ENABLED:
                     tree_grads = evaluate_tree_gradients(self.tree, X_opt, a)
                     grad_var   = np.var(target_grads, axis=0) + 1e-8
                     sob = float(np.mean((tree_grads - tg_opt) ** 2 / grad_var))
                 else:
                     sob = 0.0
-                return float(np.mean(diff ** 2) / y_var
-                             + np.mean(np.abs(diff)) / np.sqrt(y_var)
+                # Scale-invariant: judge the snapped tree on its own merits via
+                # the active regression loss after the online affine refit.
+                return float(regression_loss(p_scaled, y_opt)
                              + (SOBOLEV_WEIGHT if SOBOLEV_ENABLED else 0.0) * sob)
             try:
                 snap_baseline = float(snap_objective(best_params))
