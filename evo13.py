@@ -1279,6 +1279,10 @@ def compute_data_operator_prior(X, y, type_code=5, max_rows=512):
             bump('square', 0.4)
 
     # ── Per-feature transform correlations (richest signal) ──────────────
+    # NOTE: sin/cos are handled by a dedicated frequency sweep below, not here.
+    # A single-frequency sin(x) probe is near-orthogonal to a sin(2x)/cos(3x)
+    # target, so it scored genuinely periodic data at the 0.3 baseline and the
+    # search got no steer toward the trig family at all.
     transforms = [
         ('square', lambda v: v * v,                       ('square', 'pow')),
         ('cube',   lambda v: v * v * v,                   ('cube', 'pow')),
@@ -1286,13 +1290,17 @@ def compute_data_operator_prior(X, y, type_code=5, max_rows=512):
         ('log',    lambda v: np.log(np.abs(v) + 1e-30),   ('log',)),
         ('inv',    lambda v: 1.0 / (np.abs(v) + 1e-8),    ('/',)),
         ('exp',    lambda v: np.exp(np.clip(v, -30, 30)), ('exp',)),
-        ('sin',    lambda v: np.sin(v),                   ('sin', 'cos')),
-        ('cos',    lambda v: np.cos(v),                   ('cos', 'sin')),
         ('tanh',   lambda v: np.tanh(v),                  ('tanh', 'sigmoid')),
         ('abs',    lambda v: np.abs(v),                   ('abs',)),
         ('gauss',  lambda v: np.exp(-np.clip(v * v, 0, 60)), ('gaussian',)),
         ('sign',   lambda v: np.sign(v),                  ('sign',)),
     ]
+    # Angular frequencies swept for periodic detection (see note above the
+    # transforms list).  Includes ω=1, so this is a strict superset of the
+    # legacy single-frequency probe — it never weakens sin/cos detection on a
+    # target the baseline already caught, it only ADDS detection for higher-
+    # frequency periodicity (sin(2x), cos(3x), …) the ω=1 probe was blind to.
+    _trig_omegas = (0.5, 1.0, 1.5, 2.0, 3.0)
     n_feat = Xs.shape[1]
     for i in range(n_feat):
         xi = Xs[:, i]
@@ -1313,6 +1321,22 @@ def compute_data_operator_prior(X, y, type_code=5, max_rows=512):
             if r > 0:
                 for op in mapped:
                     bump(op, r)
+        # Frequency-swept periodic probe → sin/cos (see note above).  Keep the
+        # strongest correlation across the sweep and bump on any positive
+        # signal, exactly mirroring how every other transform votes — so a
+        # genuinely periodic target (at any of the swept frequencies) gets the
+        # trig steer it was previously denied, while non-periodic data behaves
+        # as it did under the legacy ω=1 sin/cos transform.
+        _rp = 0.0
+        for _w in _trig_omegas:
+            try:
+                _rp = max(_rp, _safe_corr(np.sin(_w * xi), ys),
+                          _safe_corr(np.cos(_w * xi), ys))
+            except Exception:
+                continue
+        if _rp > 0:
+            bump('sin', _rp)
+            bump('cos', _rp)
 
     # ── Pairwise product / ratio → reinforce * and / ─────────────────────
     if n_feat >= 2:
@@ -15526,6 +15550,22 @@ def evolve_afpo(population, X, y_target, type_code,
             for w, op in zip(_repro_weights_base, _repro_ops_base)
         ]
 
+    # ── Affine-off robustness: lean harder on constant optimisation ───────
+    # When AFFINE_SCALING_ENABLED is False the analytic y = a·f(x) + b wrapper
+    # is locked to identity, so the *constants inside the tree* are the only
+    # thing that can carry the target's scale and offset.  A structurally
+    # correct expression with mis-scaled constants then has a poor (large)
+    # loss and is at risk of being Pareto-evicted at age 0 before it can be
+    # polished — exactly the failure mode on high-magnitude targets with the
+    # affine off.  Counter it by structurally up-weighting the `optimize`
+    # operator (tiered constant DE/L-BFGS) so freshly-built shapes get their
+    # scale dialled in promptly.  Gated on the flag, so affine-on runs (the
+    # common case) are bit-for-bit unchanged.
+    _affine_off = not AFFINE_SCALING_ENABLED
+    if _affine_off:
+        _opt_idx = _repro_ops_base.index('optimize')
+        _repro_weights_base[_opt_idx] *= 2.5
+
     _mut_tracker = AdaptiveMutationTracker(_repro_ops_base, _repro_weights_base, alpha=0.07)
 
     # ── IMPROVEMENT: Operator affinity (updated every 200 gens) ───────────
@@ -15541,8 +15581,12 @@ def evolve_afpo(population, X, y_target, type_code,
     _AFFINITY_UPDATE_FREQ = 200
 
     # ── IMPROVEMENT: Scheduled light const-opt (every N gens, top-10%) ───
-    _LIGHT_CONST_OPT_FREQ  = 75   # run every 75 generations
-    _LIGHT_CONST_OPT_TOP_N = max(1, len(population) // 10)
+    # When the affine wrapper is off (constants carry the scale, see above)
+    # run the scheduled polish about twice as often and over the top ~25% so
+    # the population's scale-bearing constants are continually re-tuned, not
+    # just the rare individual that happens to draw the `optimize` action.
+    _LIGHT_CONST_OPT_FREQ  = 40 if _affine_off else 75
+    _LIGHT_CONST_OPT_TOP_N = max(1, len(population) // (4 if _affine_off else 10))
 
     # ── IMPROVEMENT (B8): cheap behavioural-novelty bonus on fitness ─────
     _NOVELTY_PROBE_K = 16

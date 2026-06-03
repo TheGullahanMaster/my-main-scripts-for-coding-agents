@@ -170,12 +170,74 @@ def case_trig(seed, generations=1500, pop_size=80):
     return best
 
 
+def case_highmag_affineoff(seed, generations=1500, pop_size=80):
+    """Target: y = 5000*x0^2 + 1500*x1 - 800, AFFINE SCALING OFF, seeds OFF.
+
+    The hardest scale regime: with the affine wrapper disabled the CGP must
+    grow the large multiplicative/offset constants itself (a=1, b=0 are locked),
+    and with seeds off it cannot transcribe them from an OLS fit.  Exercises
+    whether evolve_afpo dials in big constants via its constant-optimiser before
+    structurally-correct-but-wrong-scale individuals are Pareto-evicted."""
+    _configure(seed, use_seeds=False,
+               ops_list=['+', '-', '*', '/', 'square', 'sqrt', 'const'])
+    evo13.AFFINE_SCALING_ENABLED = False
+    rng = np.random.RandomState(seed)
+    X = rng.uniform(-2.0, 2.0, size=(500, 2))
+    y = 5000.0 * X[:, 0] ** 2 + 1500.0 * X[:, 1] - 800.0
+    best = run(X, y, generations=generations, pop_size=pop_size,
+               feat_names=["x0", "x1"], type_code=5, seed=seed)
+    return best
+
+
+def case_seedsoff_periodic(seed, generations=1500, pop_size=80):
+    """Target: y = sin(2*x0) + 0.5*cos(3*x1), seeds OFF.
+
+    The periodic regime where seeds cannot help: with seeding disabled the
+    data-driven operator prior is the *only* thing that can steer the search
+    toward the trig family, so this case directly exercises the frequency-swept
+    periodic detection in compute_data_operator_prior.  A single-frequency
+    sin(x) probe is near-orthogonal to a sin(2x)/cos(3x) target and used to
+    leave the prior with no trig signal at all."""
+    _configure(seed, use_seeds=False,
+               ops_list=['+', '-', '*', '/', 'sin', 'cos', 'tanh', 'square',
+                         'const'])
+    rng = np.random.RandomState(seed)
+    X = rng.uniform(-3.0, 3.0, size=(500, 2))
+    y = np.sin(2.0 * X[:, 0]) + 0.5 * np.cos(3.0 * X[:, 1])
+    best = run(X, y, generations=generations, pop_size=pop_size,
+               feat_names=["x0", "x1"], type_code=5, seed=seed)
+    return best
+
+
+def case_discontinuous(seed, generations=1500, pop_size=80):
+    """Target: y = sign(sin(3*x0)) + 0.5*floor(x1) + 0.3*x0 — heavily
+    discontinuous (square wave + staircase + ramp), seeds ON.
+
+    A rugged/cliffy loss landscape: most parameter polishing cannot cross the
+    flat steps, so progress depends on the discontinuity-escape / heavy-tail
+    structural machinery rather than smooth gradient-like refinement."""
+    _configure(seed, use_seeds=True,
+               ops_list=['+', '-', '*', '/', 'sin', 'cos', 'sign', 'floor',
+                         'round', 'abs', 'const'])
+    rng = np.random.RandomState(seed)
+    X = rng.uniform(-3.0, 3.0, size=(500, 2))
+    y = (np.sign(np.sin(3.0 * X[:, 0]))
+         + 0.5 * np.floor(X[:, 1])
+         + 0.3 * X[:, 0])
+    best = run(X, y, generations=generations, pop_size=pop_size,
+               feat_names=["x0", "x1"], type_code=5, seed=seed)
+    return best
+
+
 CASES = {
     "bitwise": case_bitwise,
     "seedsoff_poly": case_seedsoff_poly,
     "seedmismatch": case_seedmismatch,
     "rational": case_rational,
     "trig": case_trig,
+    "highmag_affineoff": case_highmag_affineoff,
+    "discontinuous": case_discontinuous,
+    "seedsoff_periodic": case_seedsoff_periodic,
 }
 
 
