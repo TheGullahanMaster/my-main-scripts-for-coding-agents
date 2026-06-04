@@ -125,6 +125,58 @@ def test_freq_adj_modulates_complexity_cost():
         _with_mode(mode, check, **knobs)
 
 
+# ───────────────────────────── MDL constant cost ────────────────────────────
+
+def test_const_cost_basic_shape_cap_and_scale_free():
+    """compute_const_cost: 0 with no constants, grows with count, adds a
+    magnitude surcharge, is capped per constant, and is scale-free in std(y)."""
+    saved = (evo13.MDL_CONST_BITS_ENABLED, evo13.MDL_CONST_BASE_COST,
+             evo13.MDL_CONST_SCALE, evo13.MDL_CONST_MAX_COST)
+    try:
+        evo13.MDL_CONST_BITS_ENABLED = True
+        evo13.MDL_CONST_BASE_COST = 2.0
+        evo13.MDL_CONST_SCALE = 1.0
+        evo13.MDL_CONST_MAX_COST = 8.0
+        assert evo13.compute_const_cost([]) == 0.0
+        assert abs(evo13.compute_const_cost([0.0]) - 2.0) < 1e-9
+        assert abs(evo13.compute_const_cost([0.0, 0.0]) - 4.0) < 1e-9   # per constant
+        assert evo13.compute_const_cost([1000.0], 1.0) > 2.0           # surcharge
+        assert abs(evo13.compute_const_cost([1e12], 1.0) - 8.0) < 1e-9  # capped
+        # scale-free: same constant relative to a ×1000-larger target pays the same
+        a = evo13.compute_const_cost([5.0], 1.0)
+        b = evo13.compute_const_cost([5000.0], 1000.0)
+        assert abs(a - b) < 1e-9, (a, b)
+    finally:
+        (evo13.MDL_CONST_BITS_ENABLED, evo13.MDL_CONST_BASE_COST,
+         evo13.MDL_CONST_SCALE, evo13.MDL_CONST_MAX_COST) = saved
+
+
+def test_const_cost_disabled_is_zero():
+    """The master flag fully disables the term (legacy: constants are free)."""
+    saved = evo13.MDL_CONST_BITS_ENABLED
+    try:
+        evo13.MDL_CONST_BITS_ENABLED = False
+        assert evo13.compute_const_cost([1.0, 2.0, 3.0], 1.0) == 0.0
+    finally:
+        evo13.MDL_CONST_BITS_ENABLED = saved
+
+
+def test_const_cost_prices_like_complexity_and_default_is_noop():
+    """In BOTH modes const_cost is priced exactly like that many extra units of
+    complexity, and the default const_cost=0.0 leaves legacy call sites intact."""
+    for mode, knobs in [("mdl", {"MDL_COMPLEXITY_BITS": 0.02}), ("linear", {})]:
+        def check():
+            if mode == "linear":
+                evo13.PARSIMONY_STRENGTH = 0.01
+            f0 = evo13.parsimony_fitness(0.3, 40.0, 0.0, push=0.0, const_cost=0.0)
+            assert f0 == evo13.parsimony_fitness(0.3, 40.0, 0.0)   # default no-op
+            f1 = evo13.parsimony_fitness(0.3, 40.0, 0.0, push=0.0, const_cost=6.0)
+            assert f1 > f0                                          # constants cost
+            # identical to folding the 6 units straight into the complexity axis
+            assert abs(f1 - evo13.parsimony_fitness(0.3, 46.0, 0.0)) < 1e-9
+        _with_mode(mode, check, **knobs)
+
+
 _TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 if __name__ == "__main__":

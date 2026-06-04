@@ -34,6 +34,8 @@ def _with_push(fn, **knobs):
     keys = ("PUSH_ENABLED", "PUSH_SHAPE_WEIGHT", "PUSH_SMOOTH_WEIGHT",
             "PUSH_NOVELTY_WEIGHT", "PUSH_INTRINSIC_MAX", "PUSH_SHAPE_MAX_ROWS",
             "PUSH_SMOOTH_PROBE_K", "PUSH_SMOOTH_EXPAND",
+            "PUSH_TAILS_WEIGHT", "PUSH_TAILS_FRAC",
+            "PUSH_ANNEAL_ENABLED", "PUSH_ANNEAL_FLOOR", "PUSH_NOVELTY_GRADED",
             "PARSIMONY_MODE", "PARSIMONY_STRENGTH",
             "MDL_DATA_WEIGHT", "MDL_COMPLEXITY_BITS")
     saved = {k: getattr(evo13, k) for k in keys}
@@ -179,7 +181,7 @@ def test_smooth_linear_is_only_mildly_penalised():
 # ──────────────────────────── compute_push_intrinsic ─────────────────────────
 
 def test_intrinsic_bonus_capped_positive_and_gated():
-    """The combined shape+smooth bonus is positive for a good model, never
+    """The combined shape+smooth+tails bonus is positive for a good model, never
     exceeds PUSH_INTRINSIC_MAX, and collapses to 0 when disabled / zero-weight."""
     def check():
         X = np.linspace(-3.0, 3.0, 800).reshape(-1, 1)
@@ -189,7 +191,7 @@ def test_intrinsic_bonus_capped_positive_and_gated():
 
         b = evo13.compute_push_intrinsic(preds, y, identity, X, 1.0, 0.0)
         assert 0.0 < b <= evo13.PUSH_INTRINSIC_MAX + 1e-12, b
-        # shape≈1 and smooth high ⇒ raw sum exceeds the cap ⇒ must be capped.
+        # shape≈1, tails≈1 and smooth high ⇒ raw sum exceeds the cap ⇒ capped.
         assert abs(b - evo13.PUSH_INTRINSIC_MAX) < 1e-9, b
 
         # Disabled master switch ⇒ no bonus.
@@ -197,12 +199,14 @@ def test_intrinsic_bonus_capped_positive_and_gated():
         assert evo13.compute_push_intrinsic(preds, y, identity, X, 1.0, 0.0) == 0.0
         evo13.PUSH_ENABLED = True
 
-        # Zero weights ⇒ no bonus.
+        # Zero ALL intrinsic weights ⇒ no bonus (the gating contract now spans
+        # the third, TAILS, weight too).
         evo13.PUSH_SHAPE_WEIGHT = 0.0
         evo13.PUSH_SMOOTH_WEIGHT = 0.0
+        evo13.PUSH_TAILS_WEIGHT = 0.0
         assert evo13.compute_push_intrinsic(preds, y, identity, X, 1.0, 0.0) == 0.0
     _with_push(check, PUSH_SHAPE_WEIGHT=0.02, PUSH_SMOOTH_WEIGHT=0.01,
-              PUSH_INTRINSIC_MAX=0.025)
+              PUSH_TAILS_WEIGHT=0.008, PUSH_INTRINSIC_MAX=0.025)
 
 
 def test_intrinsic_orders_good_shape_above_bad_at_equal_loss():
@@ -229,6 +233,80 @@ def test_novelty_weight_defaults_preserve_legacy_magnitude():
     """The unified novelty knob must default to the historical 0.005 / 0.015."""
     assert evo13.PUSH_NOVELTY_WEIGHT == 0.005
     assert 3.0 * evo13.PUSH_NOVELTY_WEIGHT == 0.015
+
+
+# ─────────────────────────────── TAILS signal ───────────────────────────────
+
+def test_tails_rewards_extreme_ordering_and_is_robust():
+    """TAILS scores perfect ordering 1, a degenerate input 0, and — the point of
+    the signal — collapses for a model that tracks the dense bulk but loses the
+    ordering of the informative extremes (a saturating / clipped tail), a loss
+    full-sample SHAPE largely dilutes away."""
+    n = 1000
+    y = np.sort(rng.uniform(-4.0, 4.0, n))
+
+    # Perfect ⇒ 1; constant / too-few ⇒ 0 (reuses the shape-scorer guards).
+    assert evo13._push_tails_score(y.copy(), y, 0.2) > 0.999
+    assert evo13._push_tails_score(np.full(n, 2.0), y, 0.2) == 0.0
+    assert evo13._push_tails_score(y[:8], y[:8], 0.2) == 0.0
+
+    # A model perfect in the central bulk but SATURATED (collapsed to the median)
+    # on the top + bottom 5%: full-sample SHAPE stays high (the dense middle is
+    # still perfectly ordered), but TAILS — looking only at the extremes —
+    # collapses to 0, because the saturated extremes carry no ordering at all.
+    k = int(0.05 * n)
+    sat = y.copy()
+    sat[:k] = np.median(y)
+    sat[-k:] = np.median(y)
+    s_shape = evo13._push_shape_score(sat, y)
+    s_tails = evo13._push_tails_score(sat, y, 0.05)
+    assert s_shape > 0.7, s_shape                       # bulk still ordered
+    assert s_tails == 0.0, s_tails                      # extremes carry no order
+    assert s_tails < s_shape - 0.3, (s_tails, s_shape)  # TAILS sees what SHAPE hides
+
+
+# ───────────────────────────── push annealing ───────────────────────────────
+
+def test_push_anneal_scale_shape():
+    """push_anneal_scale rides 1.0 → floor monotonically, clamps its argument,
+    and is a flat 1.0 when disabled."""
+    def check():
+        s0 = evo13.push_anneal_scale(0.0)
+        s1 = evo13.push_anneal_scale(1.0)
+        assert abs(s0 - 1.0) < 1e-12, s0
+        assert abs(s1 - evo13.PUSH_ANNEAL_FLOOR) < 1e-12, s1
+        prev = None
+        for f in np.linspace(0.0, 1.0, 11):
+            v = evo13.push_anneal_scale(f)
+            if prev is not None:
+                assert v <= prev + 1e-12, (f, v, prev)   # non-increasing
+            prev = v
+        assert evo13.push_anneal_scale(-5.0) == s0       # clamped
+        assert evo13.push_anneal_scale(5.0) == s1
+    _with_push(check, PUSH_ANNEAL_ENABLED=True, PUSH_ANNEAL_FLOOR=0.15)
+
+    def off():
+        assert evo13.push_anneal_scale(0.0) == 1.0
+        assert evo13.push_anneal_scale(1.0) == 1.0
+    _with_push(off, PUSH_ANNEAL_ENABLED=False)
+
+
+def test_push_anneal_scales_the_fitness_bonus():
+    """The live _PUSH_ANNEAL_SCALE multiplies the push inside parsimony_fitness,
+    so a late-epoch (small-scale) push perturbs the ranking less than an early
+    one — and the default scale of 1.0 leaves legacy behaviour unchanged."""
+    saved = evo13._PUSH_ANNEAL_SCALE
+    try:
+        base = evo13.parsimony_fitness(0.3, 40.0, 0.0, push=0.0)
+        evo13._PUSH_ANNEAL_SCALE = 1.0
+        full = base - evo13.parsimony_fitness(0.3, 40.0, 0.0, push=0.02)
+        evo13._PUSH_ANNEAL_SCALE = 0.25
+        faded = base - evo13.parsimony_fitness(0.3, 40.0, 0.0, push=0.02)
+        assert abs(full - 0.02) < 1e-12, full           # scale 1.0 ⇒ legacy
+        assert abs(faded - 0.25 * 0.02) < 1e-12, faded   # scale 0.25 ⇒ ¼ effect
+        assert 0.0 < faded < full
+    finally:
+        evo13._PUSH_ANNEAL_SCALE = saved
 
 
 _TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

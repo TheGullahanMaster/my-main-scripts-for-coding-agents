@@ -468,6 +468,34 @@ MDL_DATA_WEIGHT     = 3.0
 # as the loss shrinks instead of swamping it.
 MDL_COMPLEXITY_BITS = 0.025
 
+# ---- MDL constant cost (description length of the fitted constants) ----
+# The complexity measure above prices OPERATORS (COST_CONST is 0.0, so constants
+# are structurally free).  But a model that threads the data with a fistful of
+# high-precision magic numbers is *not* parsimonious — those constants are real
+# parameters that have to be described, exactly the term BIC / AIFeynman / the
+# Bayesian Machine Scientist add on top of the structural cost.  This charges
+# each active constant a cost on the SAME operator-cost currency as the
+# structural complexity, so it is automatically priced by the same per-unit
+# coefficient (bit_cost in MDL mode, PARSIMONY_STRENGTH in linear mode) and
+# stays on-scale with the existing, deliberately-gentle complexity axis instead
+# of swamping it the way a textbook ½·log2(N) BIC term would:
+#
+#     cost(c) = MDL_CONST_BASE_COST + log2(1 + (c / scale)**2) / 2
+#
+# — a fixed cost per parameter (≈ a simple operator) plus a gentle, magnitude-
+# aware precision surcharge (~free near the target's own scale, a few units for
+# a wild outlier), capped per constant at MDL_CONST_MAX_COST.  It is folded into
+# the complexity term INSIDE parsimony_fitness only, never into the HoF-keyed
+# raw loss or the Pareto `complexity` axis, so it is purely selection-only: the
+# reported frontier is unchanged and it merely nudges the search toward
+# equivalent forms that lean on fewer / rounder constants.  ENABLED=False
+# recovers the exact prior behaviour (constants free).
+MDL_CONST_BITS_ENABLED = True
+MDL_CONST_BASE_COST    = 2.0    # per-constant cost in operator-cost units (≈ COST_OP_SIMPLE)
+MDL_CONST_SCALE        = 1.0    # value scale (× std(y)) below which a constant's
+                                # precision surcharge is ~free
+MDL_CONST_MAX_COST     = 8.0    # per-constant cap so one outlier can't dominate
+
 # ---- Adaptive operator costs (dynamic OP_COSTS) ----
 # Turn the hand-authored OP_COSTS table (defined further below) from fixed magic
 # numbers into a *learned* table that re-prices each operator from how useful it
@@ -501,6 +529,40 @@ ADAPTIVE_COST_ELITE_FRAC     = 0.5    # top fraction (by fitness) counted as "th
 ADAPTIVE_COST_MIN_RATIO      = 0.34   # price floor as a fraction of the prior price
 ADAPTIVE_COST_MAX_RATIO      = 3.0    # price ceiling as a multiple of the prior price
 ADAPTIVE_COST_MIN_POP        = 8      # need at least this many finite-fitness inds to update
+
+# ---- Adaptive-cost refinements (sharper / steadier / more representative) ----
+# Four composable upgrades to the re-pricing above, each prior-anchored and
+# guarded so it degrades to the previous behaviour when switched off:
+#
+#  • FITNESS-WEIGHTED usage — the elite are not equal.  Instead of counting each
+#    elite occurrence as 1, weight it by how GOOD the carrier is (softmax over
+#    fitness), so the very best individuals drive the economy harder than the
+#    median elite.  Sharper signal, same prior-centring (uniform weights ⇒ the
+#    old plain counts exactly).
+#  • MARGINAL-UTILITY (lift) — frequency alone can't tell a load-bearing rare
+#    operator from a common-but-redundant one.  Add a bounded correction from the
+#    merit GAP between elite that use an operator and elite that don't: ops whose
+#    users out-perform the non-users get an extra discount, ops whose users
+#    under-perform get a surcharge — on top of the frequency term, before the
+#    same clamp + mean-preservation.
+#  • BAND ANNEALING — early in a chunk prices may roam the full band to find the
+#    right economy; late in a chunk the band narrows toward the prior so the
+#    complexity axis stops drifting under final selection (mirrors the SA cosine
+#    schedule, which is likewise per-chunk).  No progress signal ⇒ full band.
+#  • GLOBAL CONSENSUS — each island re-prices from only the elite it sees, a
+#    high-variance sample on small islands.  Aggregate operator usage across ALL
+#    islands into one consensus table each round (the parent has every island in
+#    scope between chunks) and broadcast it to the workers via a fail-safe env-
+#    pointed file, so the whole archipelago shares one low-variance economy.
+ADAPTIVE_COST_FITNESS_WEIGHTED = True
+ADAPTIVE_COST_FITNESS_TEMP     = 1.0    # softmax temperature in units of the elite
+                                        # fitness spread (IQR); ↑ ⇒ flatter weights
+ADAPTIVE_COST_MARGINAL_WEIGHT  = 0.5    # strength of the users-vs-non-users lift
+                                        # correction (0 ⇒ pure frequency pricing)
+ADAPTIVE_COST_ANNEAL_BAND      = True   # narrow the clamp band over a chunk
+ADAPTIVE_COST_BAND_FLOOR       = 0.30   # late-chunk band width as a fraction of full
+ADAPTIVE_COST_GLOBAL_CONSENSUS = True   # archipelago-wide consensus table
+ADAPTIVE_COST_CONSENSUS_ENV    = "EVO13_COST_CONSENSUS_FILE"  # worker handshake var
 
 # How often (in generations) to retarget the residual-aware seed generator at
 # the *current* HoF-best's residuals and inject the new seeds into each
@@ -734,6 +796,32 @@ PUSH_INTRINSIC_MAX  = 0.025   # hard cap on the summed SHAPE + SMOOTH bonus
 PUSH_SHAPE_MAX_ROWS = 2048    # subsample cap for the O(M·logM) rank computation
 PUSH_SMOOTH_PROBE_K = 32      # held-out probe rows for the smoothness signal
 PUSH_SMOOTH_EXPAND  = 0.25    # fraction beyond the data the probes extrapolate
+
+# ---- Discovery Push refinements (4th signal + annealing + graded novelty) ----
+# • TAILS — a 4th orthogonal intrinsic signal: rank (Spearman) agreement on just
+#   the EXTREME rows (top + bottom PUSH_TAILS_FRAC of the target).  Full-sample
+#   SHAPE is dominated by the dense bulk, so a model that tracks the middle but
+#   saturates / flips on the extremes (a pole, a clipped exp, a missed tail)
+#   still scores high on SHAPE; TAILS rewards getting the *informative* extremes
+#   ordered right, which is exactly where promising structure is usually still
+#   incomplete.  Shares the PUSH_INTRINSIC_MAX cap with SHAPE + SMOOTH, so it
+#   can never invert a genuine loss ranking.  Weight 0 ⇒ signal off (legacy).
+# • ANNEALING — the push is exploration pressure; it should fade as a search
+#   epoch matures so it never perturbs the near-converged frontier.  The whole
+#   push (intrinsic + novelty) is scaled by a per-chunk cosine that rides from
+#   1.0 down to PUSH_ANNEAL_FLOOR, mirroring the SA temperature schedule already
+#   used here (which is likewise per-chunk — the run has no global gen budget).
+#   ENABLED=False pins the scale at 1.0 (legacy fixed-magnitude push).
+# • GRADED NOVELTY — the legacy novelty bonus is binary (unique ⇒ full bonus,
+#   else 0).  Grade it by behavioural local DENSITY instead: a child sharing its
+#   fingerprint with many peers gets little, a behaviourally rare one gets the
+#   full bonus, smoothly — proper implicit fitness sharing.  GRADED=False
+#   restores the binary peer-match bonus exactly.
+PUSH_TAILS_WEIGHT   = 0.008   # max fitness bonus from perfect extreme-row ordering
+PUSH_TAILS_FRAC     = 0.2     # top+bottom fraction of the target defining "extremes"
+PUSH_ANNEAL_ENABLED = True
+PUSH_ANNEAL_FLOOR   = 0.15    # push scale floor at the end of a chunk (0 ⇒ fully off late)
+PUSH_NOVELTY_GRADED = True    # graded density novelty vs the legacy binary bonus
 
 # ---- Evolution model ----
 # "island"          = Island Model (multi-process)
@@ -2297,6 +2385,8 @@ class AdaptiveOperatorCosts:
         self._prior = {op: float(c) for op, c in OP_COSTS.items()}
         self._cost  = dict(self._prior)
         self.n_updates = 0
+        # mtime of the last consensus file adopted (global-consensus handshake).
+        self._consensus_mtime = 0.0
 
     # -- prior bookkeeping ----------------------------------------------------
     def _capture(self, op):
@@ -2316,6 +2406,7 @@ class AdaptiveOperatorCosts:
         """Restore the authored prices (used by tests / on a fresh phase)."""
         self._cost = dict(self._prior)
         self.n_updates = 0
+        self._consensus_mtime = 0.0
 
     def forget(self, op):
         """Drop an operator (e.g. a retired ADF) so that if its name is later
@@ -2325,45 +2416,102 @@ class AdaptiveOperatorCosts:
         self._cost.pop(op, None)
 
     # -- the adaptive update --------------------------------------------------
-    def observe_and_update(self, population):
-        """Re-price operators from the current elite.
-
-        Returns True iff the table actually moved (i.e. there were enough
-        finite-fitness individuals carrying real operators to learn from).
-        A no-op returning False when ADAPTIVE_COSTS_ENABLED is False.
-        """
-        if not ADAPTIVE_COSTS_ENABLED:
-            return False
-
+    def _elite_of(self, population):
+        """Top-fraction (by fitness) of ONE population's finite-fitness members,
+        or [] when fewer than ADAPTIVE_COST_MIN_POP qualify (so a too-small
+        population contributes nothing — the historical no-op guard)."""
         elite = [ind for ind in population
                  if getattr(ind, 'fitness', None) is not None
                  and np.isfinite(ind.fitness)]
         if len(elite) < ADAPTIVE_COST_MIN_POP:
-            return False
+            return []
         elite.sort(key=lambda ind: ind.fitness)               # lower = better
         k = max(1, int(round(len(elite) * ADAPTIVE_COST_ELITE_FRAC)))
-        elite = elite[:k]
+        return elite[:k]
 
-        # 1. Operator-occurrence counts over the elite's ACTIVE, non-leaf nodes
-        #    (each occurrence is one unit of complexity, so we count occurrences,
-        #    not mere presence).  `const` is a free leaf and never re-priced.
+    def _weighted_elite(self, populations):
+        """Pool the per-population elite and tag each member with a softmax-by-
+        fitness WEIGHT (rescaled to mean 1, so the unweighted occurrence total —
+        and hence the Dirichlet prior's relative strength — is preserved) and a
+        standardised MERIT (higher = better, used by the marginal-utility lift).
+
+        Selecting the elite WITHIN each population first keeps every island
+        represented in a global-consensus update; the global softmax then leans
+        the economy toward the genuinely better individuals.  Uniform weights
+        (FITNESS_WEIGHTED off, or a flat elite) reproduce the old plain counts.
+        """
+        elite = []
+        for pop in populations:
+            elite.extend(self._elite_of(pop))
+        if not elite:
+            return []
+        fits = np.array([float(ind.fitness) for ind in elite], dtype=np.float64)
+        fmin = float(fits.min())
+        # Fitness spread sets the softmax/merit temperature: the IQR (robust),
+        # falling back to the std and then an absolute floor for a degenerate
+        # (near-constant-fitness) elite.
+        spread = (float(np.subtract(*np.percentile(fits, [75, 25])))
+                  if fits.size >= 4 else float(fits.std()))
+        if not np.isfinite(spread) or spread <= 1e-12:
+            spread = float(fits.std())
+            if not np.isfinite(spread) or spread <= 1e-12:
+                spread = abs(float(fits.mean())) + 1.0
+        tau = max(1e-12, float(ADAPTIVE_COST_FITNESS_TEMP) * spread)
+        merit = -(fits - fmin) / tau                          # ≤ 0, higher = better
+        if ADAPTIVE_COST_FITNESS_WEIGHTED:
+            w = np.exp(np.clip(merit, -50.0, 0.0))
+            w *= len(elite) / (float(w.sum()) + 1e-30)        # mean 1 ⇒ total preserved
+        else:
+            w = np.ones(len(elite), dtype=np.float64)
+        return list(zip(elite, w.tolist(), merit.tolist()))
+
+    def observe_and_update(self, population, progress=None):
+        """Re-price operators from the current elite.
+
+        ``population`` is either one population (list of individuals) or, for a
+        global-consensus update, a list of populations (the parent pooling every
+        island).  ``progress`` ∈ [0, 1] is the within-chunk position used to
+        anneal the clamp band (None ⇒ the full, un-annealed band — the historical
+        behaviour the tests pin).
+
+        Returns True iff the table actually moved (enough finite-fitness
+        individuals carrying real operators to learn from).  No-op returning
+        False when ADAPTIVE_COSTS_ENABLED is False.
+        """
+        if not ADAPTIVE_COSTS_ENABLED:
+            return False
+
+        populations = (list(population)
+                       if (population and isinstance(population[0], (list, tuple)))
+                       else [population])
+        weighted = self._weighted_elite(populations)
+        if not weighted:
+            return False
+
+        # 1. WEIGHTED operator-occurrence counts over the elite's ACTIVE, non-leaf
+        #    nodes, plus each individual's op-SET and merit (for the lift below).
+        #    `const` is a free leaf and never re-priced.
         counts = {}
-        for ind in elite:
+        records = []        # (set_of_ops_used, merit)
+        for ind, w, m in weighted:
             tree = getattr(ind, 'tree', None)
             if tree is None:
                 continue
             try:
                 tree.update_active_nodes()
                 nf = tree.n_features
+                ops_here = set()
                 for idx in tree.active_nodes:
                     if idx >= nf:
                         op = tree.nodes[idx - nf].op
                         if op != 'const':
-                            counts[op] = counts.get(op, 0) + 1
+                            counts[op] = counts.get(op, 0.0) + w
+                            ops_here.add(op)
+                records.append((ops_here, m))
             except Exception:
                 continue
-        total = sum(counts.values())
-        if total <= 0:
+        total = float(sum(counts.values()))
+        if total <= 0.0:
             return False
 
         # 2. Vocabulary = priced (>0) operators that are in play this run.
@@ -2372,7 +2520,7 @@ class AdaptiveOperatorCosts:
             if op not in self._prior:
                 self._capture(op)
         vocab = [op for op, c0 in self._prior.items()
-                 if c0 > 0.0 and (op in allowed or counts.get(op, 0) > 0)]
+                 if c0 > 0.0 and (op in allowed or counts.get(op, 0.0) > 0.0)]
         if not vocab:
             return False
 
@@ -2383,18 +2531,41 @@ class AdaptiveOperatorCosts:
         for o in vocab:
             q[o] /= zq
 
-        # 4. Dirichlet-smoothed observed usage → prior-centred multiplicative
-        #    target → EMA step → clamp to a band around the prior.
+        # 3b. MARGINAL-UTILITY lift: per-op merit GAP between elite that use the
+        #     op and elite that don't.  tanh-bounded; 0 when one side is empty
+        #     (no contrast — e.g. an op every elite uses, or none do), so it
+        #     never fires in those degenerate cases and only ever sharpens the
+        #     frequency signal, never replaces it.
+        mw = float(ADAPTIVE_COST_MARGINAL_WEIGHT)
+        lift = {o: 0.0 for o in vocab}
+        if mw > 0.0 and records:
+            for o in vocab:
+                users  = [m for ops_here, m in records if o in ops_here]
+                others = [m for ops_here, m in records if o not in ops_here]
+                if users and others:
+                    lift[o] = float(np.tanh(np.mean(users) - np.mean(others)))
+
+        # 4. Band (optionally annealed over the chunk: full early → narrow late
+        #    toward the prior, so the complexity axis settles for final
+        #    selection).  progress=None keeps the full static band.
         alpha = max(0.0, float(ADAPTIVE_COST_PRIOR_STRENGTH))
         beta  = float(ADAPTIVE_COST_BETA)
         eta   = min(1.0, max(0.0, float(ADAPTIVE_COST_EMA)))
-        lo    = float(ADAPTIVE_COST_MIN_RATIO)
-        hi    = float(ADAPTIVE_COST_MAX_RATIO)
+        lo, hi = float(ADAPTIVE_COST_MIN_RATIO), float(ADAPTIVE_COST_MAX_RATIO)
+        if ADAPTIVE_COST_ANNEAL_BAND and progress is not None:
+            p = 0.0 if progress < 0.0 else (1.0 if progress > 1.0 else float(progress))
+            floor = float(ADAPTIVE_COST_BAND_FLOOR)
+            width = floor + (1.0 - floor) * (1.0 - p)         # 1 early → floor late
+            lo = 1.0 - (1.0 - float(ADAPTIVE_COST_MIN_RATIO)) * width
+            hi = 1.0 + (float(ADAPTIVE_COST_MAX_RATIO) - 1.0) * width
+
+        # 4b. Dirichlet-smoothed observed usage → prior-centred multiplicative
+        #     target (× the bounded marginal-lift factor) → EMA step → clamp.
         denom = total + alpha
         for o in vocab:
-            p_hat  = max((counts.get(o, 0) + alpha * q[o]) / denom, 1e-12)
-            ratio  = q[o] / p_hat                       # >1 ⇒ under-used ⇒ pricier
-            target = self._prior[o] * (ratio ** beta)
+            p_hat   = max((counts.get(o, 0.0) + alpha * q[o]) / denom, 1e-12)
+            ratio   = q[o] / p_hat                  # >1 ⇒ under-used ⇒ pricier
+            target  = self._prior[o] * (ratio ** beta) * float(np.exp(-mw * lift[o]))
             blended = (1.0 - eta) * self._cost[o] + eta * target
             self._cost[o] = float(min(hi * self._prior[o],
                                       max(lo * self._prior[o], blended)))
@@ -2413,6 +2584,70 @@ class AdaptiveOperatorCosts:
 
         self.n_updates += 1
         return True
+
+    # -- global consensus (cross-island broadcast) ----------------------------
+    # The island model runs each migration epoch in separate worker processes,
+    # so a process-local table re-prices from only the elite of the single
+    # island that worker holds — a high-variance sample on small islands.  When
+    # ADAPTIVE_COST_GLOBAL_CONSENSUS is on, the PARENT (which has every island in
+    # scope between epochs) pools them into one consensus table and writes it to
+    # a small JSON file named by the ADAPTIVE_COST_CONSENSUS_ENV environment
+    # variable; each worker adopts it at the start of its next chunk.  The whole
+    # handshake is FAIL-SAFE — any missing file / IO / parse error is swallowed
+    # and the search simply falls back to per-process adaptation, so it can
+    # never break a run — and every adopted price is re-clamped into the band
+    # around its prior, so a stale or corrupt file can never unsettle the scale.
+    def _consensus_path(self):
+        try:
+            return os.environ.get(ADAPTIVE_COST_CONSENSUS_ENV) or None
+        except Exception:
+            return None
+
+    def save_consensus(self):
+        """Atomically publish the live table to the consensus file (parent side)."""
+        if not (ADAPTIVE_COSTS_ENABLED and ADAPTIVE_COST_GLOBAL_CONSENSUS):
+            return False
+        path = self._consensus_path()
+        if not path:
+            return False
+        try:
+            import json, tempfile
+            d = os.path.dirname(path) or "."
+            fd, tmp = tempfile.mkstemp(dir=d, prefix=".cost_", suffix=".json")
+            with os.fdopen(fd, "w") as fh:
+                json.dump({op: float(c) for op, c in self._cost.items()}, fh)
+            os.replace(tmp, path)                              # atomic on POSIX
+            return True
+        except Exception:
+            return False
+
+    def maybe_load_consensus(self):
+        """Adopt the shared consensus table if present and newer than the last
+        load (worker side, called at chunk start).  Fail-safe no-op otherwise."""
+        if not (ADAPTIVE_COSTS_ENABLED and ADAPTIVE_COST_GLOBAL_CONSENSUS):
+            return False
+        path = self._consensus_path()
+        if not path:
+            return False
+        try:
+            mtime = os.path.getmtime(path)
+            if mtime <= self._consensus_mtime:
+                return False
+            import json
+            with open(path) as fh:
+                d = json.load(fh)
+            lo = float(ADAPTIVE_COST_MIN_RATIO)
+            hi = float(ADAPTIVE_COST_MAX_RATIO)
+            for op, c in d.items():
+                c0 = self._prior.get(op)
+                if c0 is None:
+                    c0 = self._capture(op)
+                if c0 > 0.0:
+                    self._cost[op] = float(min(hi * c0, max(lo * c0, float(c))))
+            self._consensus_mtime = mtime
+            return True
+        except Exception:
+            return False
 
     # -- introspection --------------------------------------------------------
     def summary(self, n=8):
@@ -11360,18 +11595,57 @@ def _push_smooth_score(tree, X_probe, affine_a, affine_b, in_lo, in_hi):
     return float(np.exp(-e))
 
 
-def compute_push_intrinsic(preds, y, tree, X, affine_a, affine_b):
-    """Combine the two INTRINSIC push components into a single bonus (≥ 0).
+def _push_tails_score(preds, y, frac=0.2, max_rows=None):
+    """Rank (Spearman) agreement |ρ| ∈ [0, 1] restricted to the EXTREME rows —
+    the union of the lowest- and highest-``frac`` of the target.
 
-    Returns ``min(PUSH_INTRINSIC_MAX, w_shape·shape + w_smooth·smooth)`` — the
-    value passed as ``push=`` to :func:`parsimony_fitness`, which subtracts it
-    from the selection fitness.  Regression-only; cheap (a capped rank sort plus
-    one ~32-point probe evaluation) and fully deterministic given (tree, X, y).
+    Full-sample SHAPE (:func:`_push_shape_score`) weights every rank equally, so
+    it is dominated by the dense middle of the distribution: a model can track
+    the bulk yet saturate, clip or flip on the tails and still score ≈1.  The
+    extremes, though, are where most partially-correct structures are still
+    wrong (a missed exp tail, a pole, a clipped step) AND where the target
+    carries the most information, so getting their ORDER right is a strong
+    "this form is genuinely going somewhere" signal that is largely orthogonal
+    to the bulk-dominated full-sample score.  Computed by reusing the robust
+    shape scorer on just the extreme subset, so all of its guards (degenerate /
+    too-few-points / non-finite ⇒ 0.0, sign-invariance, bounded subsample)
+    carry over unchanged.  O(N) to select the extremes + the capped rank sort.
+    """
+    n = int(np.size(y))
+    if n < 16 or int(np.size(preds)) != n:
+        return 0.0
+    t = np.asarray(y, dtype=np.float64)
+    p = np.asarray(preds, dtype=np.float64)
+    if not (np.all(np.isfinite(t)) and np.all(np.isfinite(p))):
+        return 0.0
+    frac = float(frac)
+    if not (0.0 < frac < 0.5):
+        frac = 0.2
+    k = max(4, int(round(n * frac)))
+    if 2 * k > n:               # never overlap the two tails
+        k = n // 2
+    order = np.argsort(t, kind="quicksort")
+    idx = np.concatenate([order[:k], order[-k:]])
+    return _push_shape_score(p[idx], t[idx], max_rows)
+
+
+def compute_push_intrinsic(preds, y, tree, X, affine_a, affine_b):
+    """Combine the INTRINSIC push components into a single bonus (≥ 0).
+
+    Returns ``min(PUSH_INTRINSIC_MAX, w_shape·shape + w_smooth·smooth +
+    w_tails·tails)`` — the value passed as ``push=`` to :func:`parsimony_fitness`,
+    which subtracts it from the selection fitness.  Regression-only; cheap (two
+    capped rank sorts plus one ~32-point probe evaluation) and fully
+    deterministic given (tree, X, y).  The summed bonus is hard-capped, so the
+    extra TAILS term shares the same budget as SHAPE + SMOOTH and can never
+    invert a genuine loss ranking.
     """
     if not PUSH_ENABLED:
         return 0.0
     shape = (_push_shape_score(preds, y, PUSH_SHAPE_MAX_ROWS)
              if PUSH_SHAPE_WEIGHT > 0.0 else 0.0)
+    tails = (_push_tails_score(preds, y, PUSH_TAILS_FRAC, PUSH_SHAPE_MAX_ROWS)
+             if PUSH_TAILS_WEIGHT > 0.0 else 0.0)
     smooth = 0.0
     if PUSH_SMOOTH_WEIGHT > 0.0:
         Xp = _push_probe_inputs(X)
@@ -11379,13 +11653,68 @@ def compute_push_intrinsic(preds, y, tree, X, affine_a, affine_b):
             in_lo = float(np.min(preds))
             in_hi = float(np.max(preds))
             smooth = _push_smooth_score(tree, Xp, affine_a, affine_b, in_lo, in_hi)
-    bonus = PUSH_SHAPE_WEIGHT * shape + PUSH_SMOOTH_WEIGHT * smooth
+    bonus = (PUSH_SHAPE_WEIGHT * shape + PUSH_SMOOTH_WEIGHT * smooth
+             + PUSH_TAILS_WEIGHT * tails)
     if not np.isfinite(bonus) or bonus <= 0.0:
         return 0.0
     return float(min(PUSH_INTRINSIC_MAX, bonus))
 
 
-def parsimony_fitness(loss, complexity, freq_adj=0.0, push=0.0):
+# Per-chunk Discovery-Push annealing scale (1.0 = full push).  Set by the
+# evolution loops at the top of every generation from the same cosine schedule
+# the SA temperature uses, and read at the single parsimony_fitness choke-point
+# (and the population-relative novelty subtraction) so the WHOLE push fades as a
+# search epoch matures.  Stays 1.0 — the legacy fixed-magnitude push — when
+# PUSH_ANNEAL_ENABLED is False or outside the evolution loops (e.g. tests).
+_PUSH_ANNEAL_SCALE = 1.0
+
+
+def push_anneal_scale(gen_frac):
+    """Discovery-Push multiplier for a within-chunk progress fraction in [0, 1].
+
+    Rides a cosine from 1.0 at the start of the chunk down to PUSH_ANNEAL_FLOOR
+    at its end (the same 1→floor cosine shape as the SA temperature), so the
+    push gives full exploration pressure on fresh migrants and fades to a tiny
+    tie-breaker as the epoch converges.  Returns 1.0 when annealing is disabled.
+    """
+    if not PUSH_ANNEAL_ENABLED:
+        return 1.0
+    f = 0.0 if gen_frac < 0.0 else (1.0 if gen_frac > 1.0 else float(gen_frac))
+    floor = float(PUSH_ANNEAL_FLOOR)
+    return floor + (1.0 - floor) * 0.5 * (1.0 + np.cos(np.pi * f))
+
+
+def compute_const_cost(const_vals, y_scale=1.0):
+    """Total selection-only cost (in operator-cost units) of a model's active
+    constants — the constant analogue of the structural operator complexity.
+
+    Each constant costs a fixed MDL_CONST_BASE_COST to *name* plus a gentle,
+    magnitude-aware precision surcharge ½·log2(1 + (c/scale)²) — ~free for a
+    constant near the target's own scale, a few units for a wild outlier —
+    capped per constant at MDL_CONST_MAX_COST so a single 1e6 magic number can
+    never swamp the complexity term.  ``y_scale`` (typically std(y)) makes the
+    surcharge scale-free, so the same model on a ×1000-rescaled target pays the
+    same.  Returns 0.0 when disabled or there are no constants, so the legacy
+    path passes a clean 0.0 into parsimony_fitness.
+    """
+    if not MDL_CONST_BITS_ENABLED or not const_vals:
+        return 0.0
+    scale = float(MDL_CONST_SCALE) * (abs(float(y_scale)) + 1e-12)
+    if scale <= 0.0:
+        scale = 1.0
+    base = float(MDL_CONST_BASE_COST)
+    cap = float(MDL_CONST_MAX_COST)
+    total = 0.0
+    for c in const_vals:
+        cv = float(c)
+        if not np.isfinite(cv):
+            cv = 0.0
+        prec = 0.5 * np.log2(1.0 + (cv / scale) ** 2)
+        total += min(cap, base + prec)
+    return float(total)
+
+
+def parsimony_fitness(loss, complexity, freq_adj=0.0, push=0.0, const_cost=0.0):
     """
     Combine a model's raw loss and complexity into the scalar SELECTION fitness
     (lower = better) according to the active ``PARSIMONY_MODE``.
@@ -11423,7 +11752,17 @@ def parsimony_fitness(loss, complexity, freq_adj=0.0, push=0.0):
         never invert a genuine ranking.  Defaults to 0.0 so every legacy
         three-argument call site is bit-for-bit unchanged.  Affects ``.fitness``
         only — the Hall of Fame is keyed on raw ``.loss`` / ``.accuracy``, so
-        the final reported model is never altered by the push.
+        the final reported model is never altered by the push.  It is multiplied
+        by the global per-chunk anneal scale (:func:`push_anneal_scale`) so the
+        push fades as a search epoch matures; the scale is 1.0 by default.
+    const_cost : float, default 0.0
+        Selection-only constant description-length cost (:func:`compute_const_cost`,
+        in operator-cost units).  It is ADDED to ``complexity`` here — so it is
+        priced by the same per-unit coefficient as the structural operators and
+        composes with the freq adjustment — but the caller's ``self.complexity``
+        (the HoF / Pareto axis) is left untouched, keeping it purely selective.
+        0.0 (the default / MDL_CONST_BITS_ENABLED=False) leaves legacy call
+        sites bit-for-bit unchanged.
 
     Notes
     -----
@@ -11434,7 +11773,13 @@ def parsimony_fitness(loss, complexity, freq_adj=0.0, push=0.0):
     push is clamped to ``>= 0`` for the same reason (a negative push would
     silently PENALISE rather than reward).
     """
-    push = max(0.0, float(push))
+    # Push fades over a chunk via the global anneal scale (1.0 outside the loops
+    # / when annealing is off, so legacy call sites are unchanged).  The constant
+    # cost rides the SAME coefficient as the structural complexity in both modes,
+    # so it is priced consistently and stays selection-only (the caller's
+    # self.complexity / HoF axis is never touched).
+    push = max(0.0, float(push)) * _PUSH_ANNEAL_SCALE
+    complexity = float(complexity) + max(0.0, float(const_cost))
     if PARSIMONY_MODE == "mdl":
         # ── Residual code length: ½·w·log2(loss) ────────────────────────────
         # Up to an additive constant identical for every model (and therefore
@@ -11670,6 +12015,9 @@ class Individual:
         # .fitness via parsimony_fitness.  Recomputed on every full-data
         # evaluation and cached; stays 0.0 for classification individuals.
         self.push_intrinsic = 0.0
+        # Selection-only MDL constant cost (set in calculate_fitness; see
+        # compute_const_cost).  0.0 until evaluated / when the feature is off.
+        self.const_cost = 0.0
         self.age       = 0
         # Self-adaptive mutation strength (Evolution Strategy style).
         # Each individual carries its own sigma; it evolves alongside the tree.
@@ -11970,6 +12318,11 @@ class Individual:
                 self.affine_a   = cached['affine_a']
                 self.affine_b   = cached['affine_b']
                 self.push_intrinsic = cached.get('push', 0.0)
+                # Constant cost is a pure function of the tree's constants and
+                # std(y) (both invariant for a cached tree+target), so the stored
+                # value is always valid; every entry written this process carries
+                # it, so the 0.0 default only ever applies to a stale entry.
+                self.const_cost = cached.get('const_cost', 0.0)
                 self.affine_fitted = True
                 # Adaptive parsimony AND the Discovery-Push bonus are applied
                 # here too (see the main-path comment below) so cached lookups
@@ -11977,7 +12330,7 @@ class Individual:
                 # same complexity-frequency map and push weights.
                 self.fitness = parsimony_fitness(
                     self.loss, self.complexity, freq_parsimony_adj,
-                    push=self.push_intrinsic)
+                    push=self.push_intrinsic, const_cost=self.const_cost)
                 return self.fitness
         try:
             X_eval = X[batch_indices] if batch_indices is not None else X
@@ -12224,6 +12577,19 @@ class Individual:
                 if max_abs > _CONST_THRESHOLD:
                     self.loss += _CONST_PENALTY * np.log10(max_abs / _CONST_THRESHOLD)
 
+            # ── MDL constant cost (selection-only) ────────────────────────────
+            # Description-length cost of the model's active constants, in
+            # operator-cost units (see compute_const_cost and the MDL constant-
+            # cost config).  Reuses the active_const_vals already gathered above
+            # and is made scale-free by std(y).  It is folded into `.fitness`
+            # through parsimony_fitness' const_cost argument — NEVER into
+            # self.complexity (the HoF / Pareto axis) — so it stays purely
+            # selective and leaves the reported frontier unchanged.  0.0 when
+            # MDL_CONST_BITS_ENABLED is False (legacy: constants free).
+            self.const_cost = (compute_const_cost(active_const_vals,
+                                                  float(np.std(y_eval)))
+                               if MDL_CONST_BITS_ENABLED else 0.0)
+
             # ── Hard loss ceiling ────────────────────────────────────────────
             # Clamp loss so catastrophically bad individuals (abs(x)^feature
             # explosions, etc.) don't appear as extreme outliers on the
@@ -12258,7 +12624,7 @@ class Individual:
             # only, so the HoF / reported model are likewise unaffected.
             self.fitness = parsimony_fitness(
                 self.loss, self.complexity, freq_parsimony_adj,
-                push=self.push_intrinsic)
+                push=self.push_intrinsic, const_cost=self.const_cost)
 
             # ── Populate fitness cache ───────────────────────────────────────
             if _cacheable and batch_indices is None and bg_logits is None:
@@ -12271,6 +12637,7 @@ class Individual:
                     'affine_a':   self.affine_a,
                     'affine_b':   self.affine_b,
                     'push':       self.push_intrinsic,
+                    'const_cost': self.const_cost,
                 })
 
         except Exception:
@@ -15126,6 +15493,7 @@ def evolve_island_chunk(args):
         to 45 % of point-mutations, reflecting PySR's weightMutateConstant=10
         philosophy: constants are cheap to tune and critical for fit quality.
     """
+    global _PUSH_ANNEAL_SCALE          # per-chunk Discovery-Push anneal scale
     # Support both the 16-tuple legacy form and a 17-tuple form that carries
     # per-sample fitness weights (boosting stages forward Hessian × class
     # weights here so rare-class rows survive the regression-on-residuals
@@ -15155,6 +15523,11 @@ def evolve_island_chunk(args):
 
     for d in adf_registry:
         _register_adf_from_dict(d)
+
+    # Adopt the archipelago-wide consensus operator costs (if the parent has
+    # published any) before this chunk starts re-pricing locally.  Fail-safe
+    # no-op when global consensus is off or no file has been written yet.
+    ADAPTIVE_OP_COST.maybe_load_consensus()
 
     local_hof  = HallOfFame(out_type=type_code)
     local_stag = current_stag
@@ -15253,6 +15626,14 @@ def evolve_island_chunk(args):
         mean_loss    = float(np.mean(valid_losses)) if valid_losses else 1.0
         gen_frac     = gen / max(1, generations - 1)
         cosine_decay = 0.1 + 0.9 * 0.5 * (1.0 + np.cos(np.pi * gen_frac))
+
+        # ── Discovery-Push annealing ─────────────────────────────────────────
+        # Fade the whole push (intrinsic + novelty) over the chunk on the same
+        # cosine shape as the SA temperature, so exploration pressure is full on
+        # fresh migrants and only a tiny tie-breaker as the epoch converges.
+        # Read at the parsimony_fitness choke-point and the novelty subtraction;
+        # 1.0 when PUSH_ANNEAL_ENABLED is False (legacy fixed-magnitude push).
+        _PUSH_ANNEAL_SCALE = push_anneal_scale(gen_frac)
         sa_temp      = SA_ALPHA * mean_loss * cosine_decay if SA_ENABLED else 0.0
 
         # ── PySR adaptive complexity frequency parsimony ──────────────────────
@@ -15267,7 +15648,8 @@ def evolve_island_chunk(args):
         # ADAPTIVE_COSTS_ENABLED is False.
         if (ADAPTIVE_COSTS_ENABLED and gen > 0
                 and gen % ADAPTIVE_COST_UPDATE_EVERY == 0
-                and ADAPTIVE_OP_COST.observe_and_update(island_pop)):
+                and ADAPTIVE_OP_COST.observe_and_update(island_pop,
+                                                        progress=gen_frac)):
             # Re-sync survivors onto the new prices so the complexity axis and
             # their fitness stay self-consistent (cheap: no re-evaluation, just
             # the complexity sum + the parsimony formula).
@@ -15276,7 +15658,8 @@ def evolve_island_chunk(args):
                 _fa = freq_adj.get(int(round(_ind.complexity)), 0.0)
                 _ind.fitness = parsimony_fitness(
                     _ind.loss, _ind.complexity, _fa,
-                    push=getattr(_ind, 'push_intrinsic', 0.0))
+                    push=getattr(_ind, 'push_intrinsic', 0.0),
+                    const_cost=getattr(_ind, 'const_cost', 0.0))
 
         # ── Adaptive stagnation multiplier ───────────────────────────────
         # Smooth sigmoid stagnation multiplier: ramps continuously from 1× to 4×
@@ -15597,24 +15980,30 @@ def evolve_island_chunk(args):
         victim = _crowding_death_select(death_sample, X_probe=_X_probe)
 
         # ── B8: behavioural-novelty bonus on child fitness ────────────────
-        # Quantised 16-row prediction fingerprint; if no current population
-        # member shares it, shave _NOVELTY_BONUS off the child's fitness so
-        # genuinely-different lineages are slightly preferred at otherwise-
-        # equal raw loss.  The bonus is small enough that it cannot invert
-        # rank against meaningful loss differences.
+        # Quantised 16-row prediction fingerprint compared against a small
+        # random sample (exact uniqueness across all members isn't worth the
+        # O(pop_size) cost).  GRADED (default): the bonus scales with the share
+        # of the sample that does NOT match the child's fingerprint, so a
+        # behaviourally rare child earns the full bonus and a common one earns
+        # little — proper implicit fitness sharing.  Legacy (GRADED=False): the
+        # binary "fully novel ⇒ full bonus, else none" rule.  Either way the
+        # bonus rides the per-chunk push anneal scale so it fades with the rest
+        # of the push as the epoch converges.  Small enough never to invert rank.
         if _X_novelty is not None and np.isfinite(child.fitness):
             _child_fp = _novelty_fp(child.tree)
             if _child_fp is not None:
-                _is_novel = True
-                # Compare against a small random sample to keep the check
-                # cheap — exact uniqueness across all members isn't worth
-                # the O(pop_size) cost.
-                for _peer in random.sample(island_pop, min(12, len(island_pop))):
+                _sample = random.sample(island_pop, min(12, len(island_pop)))
+                _matches = 0
+                for _peer in _sample:
                     if _novelty_fp(_peer.tree) == _child_fp:
-                        _is_novel = False
-                        break
-                if _is_novel:
-                    child.fitness -= _NOVELTY_BONUS
+                        _matches += 1
+                        if not PUSH_NOVELTY_GRADED:
+                            break
+                if PUSH_NOVELTY_GRADED:
+                    _share = 1.0 - _matches / max(1, len(_sample))
+                    child.fitness -= _NOVELTY_BONUS * _share * _PUSH_ANNEAL_SCALE
+                elif _matches == 0:
+                    child.fitness -= _NOVELTY_BONUS * _PUSH_ANNEAL_SCALE
 
         # ── PySR Simulated Annealing acceptance ──────────────────────────
         # Accept child even if it is worse than the victim with probability
@@ -16120,6 +16509,10 @@ def evolve_afpo(population, X, y_target, type_code,
     ``None`` (default) leaves the weights untilted — used by single-stage
     AFPO and the islanded-AFPO path.
     """
+    global _PUSH_ANNEAL_SCALE          # per-chunk Discovery-Push anneal scale
+    # Adopt any archipelago-wide consensus operator costs before this chunk
+    # re-prices locally (fail-safe no-op for the single-process AFPO path).
+    ADAPTIVE_OP_COST.maybe_load_consensus()
     MACRO_P_GROW  = 0.07    # was 0.05
     MACRO_P_PRUNE = 0.04    # was 0.05
     MACRO_P_GRAFT = 0.06    # feature-graft macro-mutation
@@ -16323,6 +16716,14 @@ def evolve_afpo(population, X, y_target, type_code,
         mean_loss    = float(np.mean(valid_losses)) if valid_losses else 1.0
         gen_frac     = gen / max(1, n_generations - 1)
         cosine_decay = 0.1 + 0.9 * 0.5 * (1.0 + np.cos(np.pi * gen_frac))
+
+        # ── Discovery-Push annealing ─────────────────────────────────────────
+        # Fade the whole push (intrinsic + novelty) over the chunk on the same
+        # cosine shape as the SA temperature, so exploration pressure is full on
+        # fresh migrants and only a tiny tie-breaker as the epoch converges.
+        # Read at the parsimony_fitness choke-point and the novelty subtraction;
+        # 1.0 when PUSH_ANNEAL_ENABLED is False (legacy fixed-magnitude push).
+        _PUSH_ANNEAL_SCALE = push_anneal_scale(gen_frac)
         sa_temp      = SA_ALPHA * mean_loss * cosine_decay if SA_ENABLED else 0.0
 
         # ── PySR adaptive complexity frequency parsimony ──────────────────────
@@ -16335,7 +16736,8 @@ def evolve_afpo(population, X, y_target, type_code,
         # No-op (static table) when ADAPTIVE_COSTS_ENABLED is False.
         if (ADAPTIVE_COSTS_ENABLED and gen > 0
                 and gen % ADAPTIVE_COST_UPDATE_EVERY == 0
-                and ADAPTIVE_OP_COST.observe_and_update(population)):
+                and ADAPTIVE_OP_COST.observe_and_update(population,
+                                                        progress=gen_frac)):
             # Re-sync survivors onto the new prices so the complexity (Pareto)
             # axis and their fitness stay self-consistent — cheap, no re-eval.
             for _ind in population:
@@ -16343,7 +16745,8 @@ def evolve_afpo(population, X, y_target, type_code,
                 _fa = freq_adj.get(int(round(_ind.complexity)), 0.0)
                 _ind.fitness = parsimony_fitness(
                     _ind.loss, _ind.complexity, _fa,
-                    push=getattr(_ind, 'push_intrinsic', 0.0))
+                    push=getattr(_ind, 'push_intrinsic', 0.0),
+                    const_cost=getattr(_ind, 'const_cost', 0.0))
 
         # Smooth sigmoid stagnation multiplier: ramps continuously from 1× to 4×
         # as stagnation progresses, avoiding the abrupt jumps of discrete levels.
@@ -16586,17 +16989,29 @@ def evolve_afpo(population, X, y_target, type_code,
         # landscapes — without it the search is biased toward producing the
         # same handful of behavioural clusters even when several mutually
         # distant basins exist.
+        # GRADED (default): grade the per-population bonus by behavioural local
+        # density — the share of the population NOT sharing the child's
+        # fingerprint — so a rare phenotype earns the full bonus and a common
+        # one little (implicit fitness sharing).  Counting matches is the same
+        # worst case as the legacy scan, which already traverses the whole
+        # population whenever no match exists (the common case in a diverse
+        # pop).  Legacy (GRADED=False): the binary unique-or-nothing bonus.  Both
+        # the per-pop and archive bonuses ride the per-chunk push anneal scale.
         _child_fp = getattr(child, '_novelty_fp', None)
         if _child_fp is not None:
-            _is_novel = True
+            _matches = 0
             for _other in population:
                 if getattr(_other, '_novelty_fp', None) == _child_fp:
-                    _is_novel = False
-                    break
-            if _is_novel:
-                child.fitness -= _NOVELTY_BONUS
+                    _matches += 1
+                    if not PUSH_NOVELTY_GRADED:
+                        break
+            if PUSH_NOVELTY_GRADED:
+                _share = 1.0 - _matches / max(1, len(population))
+                child.fitness -= _NOVELTY_BONUS * _share * _PUSH_ANNEAL_SCALE
+            elif _matches == 0:
+                child.fitness -= _NOVELTY_BONUS * _PUSH_ANNEAL_SCALE
             if _rugged_archive.is_novel(_child_fp):
-                child.fitness -= _ARCHIVE_NOVELTY_BONUS
+                child.fitness -= _ARCHIVE_NOVELTY_BONUS * _PUSH_ANNEAL_SCALE
             _rugged_archive.add(_child_fp)
 
         population.append(child)
@@ -17512,7 +17927,8 @@ def _interval_cull_population(islands_pop, X_full, out_types=None):
                             ind.loss   += LOGIT_SATURATION_WEIGHT * sat_pen
                             ind.fitness = parsimony_fitness(
                                 ind.loss, ind.complexity,
-                                push=getattr(ind, 'push_intrinsic', 0.0))
+                                push=getattr(ind, 'push_intrinsic', 0.0),
+                                const_cost=getattr(ind, 'const_cost', 0.0))
                             penalised  += 1
                 except Exception:
                     ind.loss    = 1e10
@@ -28311,6 +28727,18 @@ def train_mode():
         # count (or 8 if unknown) to avoid pickling/scheduling overhead.
         _island_workers = min(NUM_ISLANDS * max(1, n_outputs),
                               max(1, os.cpu_count() or 8))
+        # ── Global operator-cost consensus handshake ──────────────────────────
+        # Publish a per-run file path (inherited by the workers via the env)
+        # that the parent rewrites after every chunk from all islands pooled and
+        # each worker adopts at the start of its next chunk.  Fail-safe: any
+        # error just leaves consensus inactive (per-process adaptation).
+        if ADAPTIVE_COSTS_ENABLED and ADAPTIVE_COST_GLOBAL_CONSENSUS:
+            try:
+                import tempfile
+                os.environ[ADAPTIVE_COST_CONSENSUS_ENV] = os.path.join(
+                    tempfile.gettempdir(), f"evo13_cost_consensus_{os.getpid()}.json")
+            except Exception:
+                pass
         try:
             with concurrent.futures.ProcessPoolExecutor(max_workers=_island_workers) as executor:
                 while True:
@@ -28413,6 +28841,23 @@ def train_mode():
                                 print(f"[Out {o_idx} | Isl {isl_idx}] "
                                       f"New Best (Comp {ind.complexity:.0f}): "
                                       f"loss={ind.loss:.4f}  {metric}")
+
+                    # ── Rebuild + publish the global operator-cost consensus ──
+                    # Every island is in scope here between chunks, so pool them
+                    # into one low-variance consensus table and write it for the
+                    # next chunk's workers to adopt.  (Single global table shared
+                    # across outputs, as the per-process design already assumes;
+                    # exactly right for the common single-output run.)  Fail-safe.
+                    if ADAPTIVE_COSTS_ENABLED and ADAPTIVE_COST_GLOBAL_CONSENSUS:
+                        try:
+                            _all_pops = [islands_pop[_ii][_oo]
+                                         for _oo in range(n_outputs)
+                                         for _ii in range(NUM_ISLANDS)
+                                         if islands_pop[_ii][_oo]]
+                            if _all_pops and ADAPTIVE_OP_COST.observe_and_update(_all_pops):
+                                ADAPTIVE_OP_COST.save_consensus()
+                        except Exception:
+                            pass
 
                     gen += chunk_freq
 
