@@ -468,6 +468,40 @@ MDL_DATA_WEIGHT     = 3.0
 # as the loss shrinks instead of swamping it.
 MDL_COMPLEXITY_BITS = 0.025
 
+# ---- Adaptive operator costs (dynamic OP_COSTS) ----
+# Turn the hand-authored OP_COSTS table (defined further below) from fixed magic
+# numbers into a *learned* table that re-prices each operator from how useful it
+# proves on the current target as the run progresses (MDL operator code-length;
+# see the `AdaptiveOperatorCosts` class).  The intuition: the authored costs are
+# a good *prior*, but the right price for an operator is problem- and stage-
+# dependent — on a target that genuinely needs `sin`, charging `sin` a flat
+# premium for the whole run keeps fighting the search, while on a target that
+# never benefits from `exp`, a flat price lets `exp` keep bloating trees.  So
+# every few generations each operator is re-priced from the current elite:
+# operators the best individuals keep using get cheaper (a shorter code word),
+# operators they avoid get pricier.  This is the per-OPERATOR analogue of the
+# population-level PySR complexity-frequency adjustment already used here.
+#
+# The adaptation is deliberately conservative so it can be the default without
+# disturbing the finely-tuned complexity scale:
+#   • Prior-centred  — with no signal the target IS the authored cost exactly,
+#                      so generation-0 behaviour is identical to the static table.
+#   • Dirichlet- and EMA-smoothed — sparse/early evidence barely moves a price.
+#   • Clamped + mean-preserving — every price stays in a band around its prior
+#                      and the table's mean is pinned to the prior mean, so only
+#                      *relative* prices move and MAX_COMPLEXITY / the MDL bits
+#                      stay calibrated; no operator can collapse to 0 or explode.
+# Set ADAPTIVE_COSTS_ENABLED = False to recover the original static table exactly.
+ADAPTIVE_COSTS_ENABLED       = True
+ADAPTIVE_COST_UPDATE_EVERY   = 25     # generations between re-pricings (per island)
+ADAPTIVE_COST_PRIOR_STRENGTH = 50.0   # Dirichlet pseudo-counts (higher ⇒ slower drift from prior)
+ADAPTIVE_COST_EMA            = 0.25   # EMA step toward the new target each update
+ADAPTIVE_COST_BETA           = 1.0    # repricing exponent (1 = full MDL ratio; <1 = gentler)
+ADAPTIVE_COST_ELITE_FRAC     = 0.5    # top fraction (by fitness) counted as "the elite"
+ADAPTIVE_COST_MIN_RATIO      = 0.34   # price floor as a fraction of the prior price
+ADAPTIVE_COST_MAX_RATIO      = 3.0    # price ceiling as a multiple of the prior price
+ADAPTIVE_COST_MIN_POP        = 8      # need at least this many finite-fitness inds to update
+
 # How often (in generations) to retarget the residual-aware seed generator at
 # the *current* HoF-best's residuals and inject the new seeds into each
 # island's population.  Built-in seeds are otherwise consumed only at startup,
@@ -2215,6 +2249,201 @@ OP_COSTS = {
     # Other
     'const': COST_CONST,
 }
+
+
+# ============================================================================
+# ADAPTIVE OPERATOR COSTS  —  dynamic OP_COSTS (MDL operator code-length)
+# ============================================================================
+# `OP_COSTS` above is the hand-authored *prior*.  `AdaptiveOperatorCosts` keeps
+# that prior and, every few generations, re-prices each operator from the
+# evidence in the current elite, so the complexity measure stops being a frozen
+# guess and starts tracking what is actually earning its keep on THIS target.
+#
+# Mechanism (all four guards exist to keep the tuned complexity scale stable):
+#
+#   target(op) = c0(op) · ( q(op) / p̂(op) ) ** β
+#
+#   • c0(op)  — the authored prior cost.
+#   • q(op)   — the usage the *prior* predicts.  Cheap operators are expected
+#               more often, so q(op) ∝ 2^(−c0/scale): the authored cost is read
+#               as a prior code length, hence a prior probability.
+#   • p̂(op)   — Dirichlet-smoothed usage actually observed in the elite,
+#               p̂ = (count + α·q) / (total + α).  With no observations p̂ = q.
+#
+# Because the target is the prior cost times the ratio q/p̂, an operator used
+# *exactly* as often as the prior predicts (p̂ = q) is re-priced to c0 — so with
+# no signal the table is the authored one EXACTLY (generation-0 behaviour is
+# unchanged).  An operator used MORE than expected (p̂ > q) gets a ratio < 1 and
+# becomes cheaper; one the elite avoid (p̂ < q) gets a ratio > 1 and pricier.
+#
+# Stability:  Dirichlet smoothing (α = ADAPTIVE_COST_PRIOR_STRENGTH) keeps sparse
+# evidence near the prior; an EMA step (ADAPTIVE_COST_EMA) means prices drift
+# rather than jump; every price is clamped to [MIN_RATIO, MAX_RATIO]·c0; and
+# after each update the whole table is rescaled so its mean equals the prior
+# mean.  Only the *relative* prices move — the absolute complexity magnitude
+# (and the MAX_COMPLEXITY / MDL_COMPLEXITY_BITS calibration) is conserved, and
+# no operator can collapse to zero or run away.
+#
+# Every complexity computation reads prices through `op_cost(op)`, which returns
+# the live adapted price when ADAPTIVE_COSTS_ENABLED and the authored OP_COSTS
+# value otherwise — so the whole system is one global flag away from the
+# original static behaviour.
+class AdaptiveOperatorCosts:
+    """Self-calibrating operator costs; see the module comment above."""
+
+    def __init__(self):
+        # Prior == the authored OP_COSTS, captured once.  `_cost` is the LIVE
+        # table and starts identical to the prior (zero evidence == static).
+        self._prior = {op: float(c) for op, c in OP_COSTS.items()}
+        self._cost  = dict(self._prior)
+        self.n_updates = 0
+
+    # -- prior bookkeeping ----------------------------------------------------
+    def _capture(self, op):
+        """Adopt an operator first seen after construction (e.g. an ADF
+        registered mid-run): its current OP_COSTS value becomes its prior."""
+        c0 = float(OP_COSTS.get(op, COST_OP_COMPLEX))
+        self._prior[op] = c0
+        self._cost[op]  = c0
+        return c0
+
+    def effective_cost(self, op):
+        """Live (possibly adapted) price of one operator."""
+        c = self._cost.get(op)
+        return c if c is not None else self._capture(op)
+
+    def reset(self):
+        """Restore the authored prices (used by tests / on a fresh phase)."""
+        self._cost = dict(self._prior)
+        self.n_updates = 0
+
+    def forget(self, op):
+        """Drop an operator (e.g. a retired ADF) so that if its name is later
+        re-registered for a different body it is re-captured from the fresh
+        OP_COSTS price rather than keeping a stale prior."""
+        self._prior.pop(op, None)
+        self._cost.pop(op, None)
+
+    # -- the adaptive update --------------------------------------------------
+    def observe_and_update(self, population):
+        """Re-price operators from the current elite.
+
+        Returns True iff the table actually moved (i.e. there were enough
+        finite-fitness individuals carrying real operators to learn from).
+        A no-op returning False when ADAPTIVE_COSTS_ENABLED is False.
+        """
+        if not ADAPTIVE_COSTS_ENABLED:
+            return False
+
+        elite = [ind for ind in population
+                 if getattr(ind, 'fitness', None) is not None
+                 and np.isfinite(ind.fitness)]
+        if len(elite) < ADAPTIVE_COST_MIN_POP:
+            return False
+        elite.sort(key=lambda ind: ind.fitness)               # lower = better
+        k = max(1, int(round(len(elite) * ADAPTIVE_COST_ELITE_FRAC)))
+        elite = elite[:k]
+
+        # 1. Operator-occurrence counts over the elite's ACTIVE, non-leaf nodes
+        #    (each occurrence is one unit of complexity, so we count occurrences,
+        #    not mere presence).  `const` is a free leaf and never re-priced.
+        counts = {}
+        for ind in elite:
+            tree = getattr(ind, 'tree', None)
+            if tree is None:
+                continue
+            try:
+                tree.update_active_nodes()
+                nf = tree.n_features
+                for idx in tree.active_nodes:
+                    if idx >= nf:
+                        op = tree.nodes[idx - nf].op
+                        if op != 'const':
+                            counts[op] = counts.get(op, 0) + 1
+            except Exception:
+                continue
+        total = sum(counts.values())
+        if total <= 0:
+            return False
+
+        # 2. Vocabulary = priced (>0) operators that are in play this run.
+        allowed = set(ALLOWED_OPS)
+        for op in counts:                       # make sure new ops have a prior
+            if op not in self._prior:
+                self._capture(op)
+        vocab = [op for op, c0 in self._prior.items()
+                 if c0 > 0.0 and (op in allowed or counts.get(op, 0) > 0)]
+        if not vocab:
+            return False
+
+        # 3. Prior-expected usage  q(op) ∝ 2^(−c0/scale)  (cheap ops expected more)
+        scale = max(1e-9, float(np.mean([self._prior[o] for o in vocab])))
+        q = {o: 2.0 ** (-self._prior[o] / scale) for o in vocab}
+        zq = sum(q.values()) or 1.0
+        for o in vocab:
+            q[o] /= zq
+
+        # 4. Dirichlet-smoothed observed usage → prior-centred multiplicative
+        #    target → EMA step → clamp to a band around the prior.
+        alpha = max(0.0, float(ADAPTIVE_COST_PRIOR_STRENGTH))
+        beta  = float(ADAPTIVE_COST_BETA)
+        eta   = min(1.0, max(0.0, float(ADAPTIVE_COST_EMA)))
+        lo    = float(ADAPTIVE_COST_MIN_RATIO)
+        hi    = float(ADAPTIVE_COST_MAX_RATIO)
+        denom = total + alpha
+        for o in vocab:
+            p_hat  = max((counts.get(o, 0) + alpha * q[o]) / denom, 1e-12)
+            ratio  = q[o] / p_hat                       # >1 ⇒ under-used ⇒ pricier
+            target = self._prior[o] * (ratio ** beta)
+            blended = (1.0 - eta) * self._cost[o] + eta * target
+            self._cost[o] = float(min(hi * self._prior[o],
+                                      max(lo * self._prior[o], blended)))
+
+        # 5. Mean-preservation: pin the average price to the prior average so
+        #    only RELATIVE prices move (keeps the global complexity scale fixed).
+        #    Re-clamp afterwards so the rescale can never breach the band.
+        mean_now   = float(np.mean([self._cost[o]  for o in vocab]))
+        mean_prior = float(np.mean([self._prior[o] for o in vocab]))
+        if mean_now > 1e-12:
+            s = mean_prior / mean_now
+            for o in vocab:
+                self._cost[o] = float(min(hi * self._prior[o],
+                                          max(lo * self._prior[o],
+                                              self._cost[o] * s)))
+
+        self.n_updates += 1
+        return True
+
+    # -- introspection --------------------------------------------------------
+    def summary(self, n=8):
+        """Short 'op: c0→c' digest of the operators that moved the most."""
+        rows = [(o, self._prior[o], self._cost[o])
+                for o in self._prior if self._prior[o] > 0
+                and abs(self._cost[o] - self._prior[o]) > 1e-6]
+        rows.sort(key=lambda r: abs(r[2] - r[1]) / max(r[1], 1e-9), reverse=True)
+        if not rows:
+            return "(prices unchanged)"
+        return "  ".join(f"{o}:{c0:.1f}->{c:.1f}" for o, c0, c in rows[:n])
+
+
+# Process-local singleton — every worker process builds its own from the same
+# authored prior and adapts from the elite it sees.  Because all islands optimise
+# the same target their elites (and therefore their tables) converge, so the
+# per-process tables stay mutually coherent without any cross-process syncing.
+ADAPTIVE_OP_COST = AdaptiveOperatorCosts()
+
+
+def op_cost(op):
+    """Effective complexity price of an operator — the single choke-point for
+    every complexity computation.
+
+    Returns the live, adapted price when ADAPTIVE_COSTS_ENABLED, and the
+    authored ``OP_COSTS`` value (original behaviour, byte-for-byte) otherwise.
+    """
+    if ADAPTIVE_COSTS_ENABLED:
+        return ADAPTIVE_OP_COST.effective_cost(op)
+    return OP_COSTS.get(op, COST_OP_COMPLEX)
+
 
 # ----- STRING REPR TABLE -----
 def _binary_str(op, s1, s2):
@@ -4081,6 +4310,7 @@ def _retire_unused_adfs(all_pops_flat):
             if name in ALLOWED_OPS:
                 ALLOWED_OPS.remove(name)
             OP_COSTS.pop(name, None)
+            ADAPTIVE_OP_COST.forget(name)   # keep the adaptive table in sync
             _ADF_ZERO_USE_COUNT.pop(name, None)
             retired.append(name)
 
@@ -4994,7 +5224,7 @@ class CGPEquation:
         for idx in self.active_nodes:
             if idx >= self.n_features:
                 node = self.nodes[idx - self.n_features]
-                cost += OP_COSTS.get(node.op, COST_OP_COMPLEX)
+                cost += op_cost(node.op)
 
                 # Check nested constraints — graduated penalties
                 if node.op in nested_constraints:
@@ -10484,8 +10714,10 @@ def macro_prune(cgp_eq, n_features):
     if not candidates:
         return child
 
-    # Bias selection toward high-cost nodes
-    costs  = [OP_COSTS.get(child.nodes[i - n_features].op, COST_OP_COMPLEX)
+    # Bias selection toward high-cost nodes (uses the live adapted prices when
+    # adaptive costs are enabled, so mutation keeps targeting whatever the
+    # current economy deems expensive)
+    costs  = [op_cost(child.nodes[i - n_features].op)
               for i in candidates]
     total  = sum(costs)
     if total < 1e-10:
@@ -11727,7 +11959,14 @@ class Individual:
                 self.r2         = cached['r2']
                 self.accuracy   = cached['accuracy']
                 self.modularity = cached['modularity']
-                self.complexity = cached['complexity']
+                # Complexity is the ONLY cached field that depends on the cost
+                # table, so under adaptive costs it must be recomputed against the
+                # live prices (cheap — just re-sums the active nodes) rather than
+                # trusted from when this tree was first cached.  The static table
+                # makes this identical to the stored value.
+                self.complexity = (self.tree.get_complexity()
+                                   if ADAPTIVE_COSTS_ENABLED
+                                   else cached['complexity'])
                 self.affine_a   = cached['affine_a']
                 self.affine_b   = cached['affine_b']
                 self.push_intrinsic = cached.get('push', 0.0)
@@ -15020,6 +15259,25 @@ def evolve_island_chunk(args):
         # Penalise over-crowded complexities; reward under-represented ones.
         freq_adj = compute_complexity_frequency_adjustment(island_pop)
 
+        # ── Adaptive operator-cost re-pricing (dynamic OP_COSTS) ─────────────
+        # Sibling to the frequency adjustment above, but per-OPERATOR rather than
+        # per-complexity-bucket: every ADAPTIVE_COST_UPDATE_EVERY gens re-price
+        # each operator from the current elite so the complexity measure tracks
+        # what is earning its keep on THIS target.  No-op (static table) when
+        # ADAPTIVE_COSTS_ENABLED is False.
+        if (ADAPTIVE_COSTS_ENABLED and gen > 0
+                and gen % ADAPTIVE_COST_UPDATE_EVERY == 0
+                and ADAPTIVE_OP_COST.observe_and_update(island_pop)):
+            # Re-sync survivors onto the new prices so the complexity axis and
+            # their fitness stay self-consistent (cheap: no re-evaluation, just
+            # the complexity sum + the parsimony formula).
+            for _ind in island_pop:
+                _ind.complexity = _ind.tree.get_complexity()
+                _fa = freq_adj.get(int(round(_ind.complexity)), 0.0)
+                _ind.fitness = parsimony_fitness(
+                    _ind.loss, _ind.complexity, _fa,
+                    push=getattr(_ind, 'push_intrinsic', 0.0))
+
         # ── Adaptive stagnation multiplier ───────────────────────────────
         # Smooth sigmoid stagnation multiplier: ramps continuously from 1× to 4×
         # as stagnation progresses, avoiding the abrupt jumps of discrete levels.
@@ -16069,6 +16327,23 @@ def evolve_afpo(population, X, y_target, type_code,
 
         # ── PySR adaptive complexity frequency parsimony ──────────────────────
         freq_adj = compute_complexity_frequency_adjustment(population)
+
+        # ── Adaptive operator-cost re-pricing (dynamic OP_COSTS) ─────────────
+        # Per-OPERATOR companion to the per-complexity-bucket frequency
+        # adjustment above: re-price operators from the current elite so the
+        # complexity / Pareto axis tracks what earns its keep on THIS target.
+        # No-op (static table) when ADAPTIVE_COSTS_ENABLED is False.
+        if (ADAPTIVE_COSTS_ENABLED and gen > 0
+                and gen % ADAPTIVE_COST_UPDATE_EVERY == 0
+                and ADAPTIVE_OP_COST.observe_and_update(population)):
+            # Re-sync survivors onto the new prices so the complexity (Pareto)
+            # axis and their fitness stay self-consistent — cheap, no re-eval.
+            for _ind in population:
+                _ind.complexity = _ind.tree.get_complexity()
+                _fa = freq_adj.get(int(round(_ind.complexity)), 0.0)
+                _ind.fitness = parsimony_fitness(
+                    _ind.loss, _ind.complexity, _fa,
+                    push=getattr(_ind, 'push_intrinsic', 0.0))
 
         # Smooth sigmoid stagnation multiplier: ramps continuously from 1× to 4×
         # as stagnation progresses, avoiding the abrupt jumps of discrete levels.
@@ -27046,6 +27321,7 @@ def select_final_models(hofs, dp, out_types):
 def train_mode():
     global CGP_NODES, CGP_MUT_RATE, PARSIMONY_STRENGTH, SIMPLIFICATION_FREQ
     global PARSIMONY_MODE, MDL_DATA_WEIGHT, MDL_COMPLEXITY_BITS
+    global ADAPTIVE_COSTS_ENABLED
     global EVOLUTION_MODEL, DS_LEXICASE_FRAC
     global NUM_ISLANDS_GLOBAL
     global AGE_GROUP_N_GROUPS, AGE_GROUP_ISLANDS_PER_GROUP, AGE_GROUP_GRAD_FREQ
@@ -27223,6 +27499,26 @@ def train_mode():
                 PARSIMONY_STRENGTH = float(pars_in)
             except ValueError:
                 print("  Invalid value; keeping default.")
+
+    # ---- Adaptive operator costs (dynamic OP_COSTS) ----
+    print("\n" + "═" * 70)
+    print("ADAPTIVE OPERATOR COSTS  (dynamic OP_COSTS)")
+    print("═" * 70)
+    print("  Re-price each operator during the run from how useful it proves on")
+    print("  THIS target, instead of using the fixed hand-authored cost table.")
+    print("  Operators the best individuals keep using get cheaper; ones they")
+    print("  avoid get pricier.  Prior-centred, EMA-smoothed, clamped and mean-")
+    print("  preserving — so generation-0 behaviour is identical to the static")
+    print("  table and the overall complexity scale is conserved.")
+    _ac_def = "on" if ADAPTIVE_COSTS_ENABLED else "off"
+    ac_in = input(f"Adaptive operator costs [1=on / 2=off, default {_ac_def}]: ").strip().lower()
+    if ac_in in ("1", "on", "y", "yes"):
+        ADAPTIVE_COSTS_ENABLED = True
+    elif ac_in in ("2", "off", "n", "no"):
+        ADAPTIVE_COSTS_ENABLED = False
+    elif ac_in:
+        print("  Unrecognised; keeping default.")
+    print(f"  ✓  Adaptive operator costs: {'ON' if ADAPTIVE_COSTS_ENABLED else 'OFF'}")
 
     # ---- Simplification frequency ----
     print("\nSIMPLIFICATION FREQUENCY")
