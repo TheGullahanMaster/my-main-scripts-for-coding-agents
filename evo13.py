@@ -648,6 +648,59 @@ SOBOLEV_KNN_K    = 15
 ADAPTIVE_PARSIMONY_WEIGHT  = 0.03
 ADAPTIVE_PARSIMONY_ENABLED = True
 
+# ---- Discovery Push (selection-only "extra push" reward) ----
+# A small, bounded bonus SUBTRACTED from the selection fitness (lower = better)
+# to give promising-but-not-yet-optimal models an extra push up the rankings —
+# WITHOUT touching the raw loss / accuracy the Hall of Fame and the final
+# reported model are keyed on.  It rides the exact same channel as the PySR
+# frequency-parsimony adjustment and the legacy behavioural-novelty bonus
+# (which it now unifies), so it only ever STEERS the search; it can never make
+# the reported frontier worse than it already is.
+#
+# It blends three orthogonal "is this model actually going somewhere?" signals,
+# each normalised to [0, 1] and weighted independently:
+#
+#   • SHAPE   — rank (Spearman) agreement between prediction and target.
+#               Rewards models that capture the target's ORDERING / SHAPE even
+#               when the magnitude is still wrong (a monotone warp that the
+#               affine + constant-optimiser can still finish).  Because it is a
+#               RANK statistic it sees structure the affine-fitted MSE is blind
+#               to, so it pushes the search off the flat error-plateaus where
+#               many distinct structures share an almost-identical loss.
+#   • NOVELTY — behavioural distinctness vs the rest of the population (implicit
+#               fitness sharing).  Rewards lineages whose output fingerprint is
+#               rare, so structurally-different basins survive the death
+#               tournament at equal raw loss and the run resists premature
+#               convergence.  Supersedes the old hard-coded 0.005 / 0.015
+#               novelty bonuses (the defaults below reproduce them exactly).
+#   • SMOOTH  — extrapolation stability just OUTSIDE the training cloud.
+#               Probes each model a fraction PUSH_SMOOTH_EXPAND beyond the data
+#               (real rows pushed outward from their centroid) and rewards
+#               outputs that stay bounded near the in-sample range, pushing
+#               toward forms that GENERALISE rather than ones that thread the
+#               sampled rows with a brittle pole / blow-up just off the edge.
+#
+# SHAPE and SMOOTH are intrinsic to an individual (depend only on its
+# predictions and the data), so they are computed once in calculate_fitness,
+# cached, and folded into parsimony_fitness via its `push` argument.  NOVELTY
+# is population-relative, so it is applied in the evolution loop (where the
+# population is in scope), using PUSH_NOVELTY_WEIGHT.
+#
+# The SHAPE + SMOOTH contribution is hard-capped at PUSH_INTRINSIC_MAX so the
+# bonus can never invert a genuine loss ranking — it only breaks near-ties and
+# biases exploration, the same guard rail the legacy novelty bonus relied on.
+# Set PUSH_ENABLED = False (or all weights to 0.0) to disable entirely.
+PUSH_ENABLED        = True
+PUSH_SHAPE_WEIGHT   = 0.020   # max fitness bonus from perfect rank-agreement
+PUSH_SMOOTH_WEIGHT  = 0.010   # max fitness bonus from clean extrapolation
+PUSH_NOVELTY_WEIGHT = 0.005   # per-population behavioural-uniqueness bonus
+                              # (archive-novelty bonus is 3× this); 0.005 keeps
+                              # the historical tuned magnitude exactly.
+PUSH_INTRINSIC_MAX  = 0.025   # hard cap on the summed SHAPE + SMOOTH bonus
+PUSH_SHAPE_MAX_ROWS = 2048    # subsample cap for the O(M·logM) rank computation
+PUSH_SMOOTH_PROBE_K = 32      # held-out probe rows for the smoothness signal
+PUSH_SMOOTH_EXPAND  = 0.25    # fraction beyond the data the probes extrapolate
+
 # ---- Evolution model ----
 # "island"          = Island Model (multi-process)
 # "afpo"            = Age-Fitness Pareto Optimisation (default, single-process)
@@ -10944,7 +10997,163 @@ def regression_loss(preds, y, sample_weights=None):
     return float(loss)
 
 
-def parsimony_fitness(loss, complexity, freq_adj=0.0):
+# ==========================================
+# DISCOVERY PUSH — selection-only "extra push" metric
+# ==========================================
+# See the Discovery Push config block for the full rationale.  These compute the
+# two INTRINSIC push components (shape, smooth); the population-relative novelty
+# component lives in the evolution loop.  Everything here is a pure function of a
+# model's predictions / structure plus the (fixed) data, so the results are
+# cacheable alongside the rest of the fitness cache and identical on re-eval.
+
+
+def _push_shape_score(preds, y, max_rows=None):
+    """Rank (Spearman) agreement |ρ| ∈ [0, 1] between ``preds`` and ``y``.
+
+    Spearman = Pearson-on-ranks, so this measures whether the model has the
+    target's *ordering* right regardless of the value mapping — structure the
+    affine-fitted MSE cannot see.  A model that predicts a monotone WARP of the
+    target (right order, wrong shape) scores ≈1 here yet can still carry a large
+    loss, so rewarding it pushes the search toward structurally-correct forms
+    that const-opt / the affine can finish.  ``|ρ|`` (not ``max(0,ρ)``) because a
+    sign flip is free for the affine, so a perfectly anti-correlated model is
+    just as promising.  Returns 0.0 for a degenerate (constant) input/target or
+    fewer than 8 points.  O(M·logM) in the (capped) sample size M.
+    """
+    n = int(np.size(preds))
+    if n < 8 or int(np.size(y)) != n:
+        return 0.0
+    if max_rows is not None and n > max_rows:
+        # Deterministic evenly-spaced subsample: keeps the cost bounded and the
+        # score stable across re-evaluations of the same individual.
+        idx = np.linspace(0, n - 1, int(max_rows)).astype(np.intp)
+        p = np.asarray(preds, dtype=np.float64)[idx]
+        t = np.asarray(y, dtype=np.float64)[idx]
+    else:
+        p = np.asarray(preds, dtype=np.float64)
+        t = np.asarray(y, dtype=np.float64)
+    if not (np.all(np.isfinite(p)) and np.all(np.isfinite(t))):
+        return 0.0
+    # A constant prediction (or target) carries no ordering information, but
+    # ``argsort(argsort(const))`` would manufacture a spurious monotone ramp
+    # [0,1,2,…] and report a non-zero correlation — so reject no-spread inputs.
+    if (float(p.max()) - float(p.min())) <= 0.0 or \
+       (float(t.max()) - float(t.min())) <= 0.0:
+        return 0.0
+    # Ordinal ranks (ties broken arbitrarily — fine for an approximate Spearman).
+    pr = np.argsort(np.argsort(p)).astype(np.float64)
+    tr = np.argsort(np.argsort(t)).astype(np.float64)
+    pr -= pr.mean()
+    tr -= tr.mean()
+    denom = float(np.sqrt(float(np.dot(pr, pr)) * float(np.dot(tr, tr))))
+    if denom <= 1e-30:
+        return 0.0
+    rho = float(np.dot(pr, tr) / denom)
+    if not np.isfinite(rho):
+        return 0.0
+    return min(1.0, abs(rho))
+
+
+# Held-out extrapolation probes are a pure function of the (fixed) input matrix
+# X, so cache them on the array identity — exactly like _loss_ystats — to avoid
+# recomputing the centroid / subsample on every full-data evaluation.
+_PUSH_PROBE_CACHE = OrderedDict()
+_PUSH_PROBE_MAX   = 8
+
+
+def _push_probe_inputs(X):
+    """Return deterministic out-of-cloud probe inputs for ``X``, cached on id(X).
+
+    Each probe is a real training row pushed ``PUSH_SMOOTH_EXPAND`` of the way
+    further out from the data centroid, so the probes populate the shell just
+    OUTSIDE the sampled region along genuine data directions (the regime where
+    brittle over-fits — poles, exp() blow-ups — actually diverge).  Returns
+    ``None`` when there are too few rows to bother.
+    """
+    X = np.asarray(X)
+    if X.ndim != 2 or X.shape[0] < 4 or X.shape[1] < 1:
+        return None
+    key = id(X)
+    ent = _PUSH_PROBE_CACHE.get(key)
+    if ent is not None and ent[0] is X:
+        _PUSH_PROBE_CACHE.move_to_end(key)
+        return ent[1]
+
+    n = X.shape[0]
+    m = int(min(PUSH_SMOOTH_PROBE_K, n))
+    idx = np.linspace(0, n - 1, m).astype(np.intp)   # deterministic spread
+    centroid = X.mean(axis=0)
+    Xp = centroid + (1.0 + PUSH_SMOOTH_EXPAND) * (X[idx] - centroid)
+
+    _PUSH_PROBE_CACHE[key] = (X, Xp)
+    _PUSH_PROBE_CACHE.move_to_end(key)
+    if len(_PUSH_PROBE_CACHE) > _PUSH_PROBE_MAX:
+        _PUSH_PROBE_CACHE.popitem(last=False)
+    return Xp
+
+
+def _push_smooth_score(tree, X_probe, affine_a, affine_b, in_lo, in_hi):
+    """Extrapolation-stability ∈ [0, 1]: 1 = the model stays bounded near its
+    in-sample output range just outside the data cloud, →0 = it blows up.
+
+    The score is ``exp(-worst_excess / span)`` where ``worst_excess`` is how far
+    the MOST-divergent probe falls OUTSIDE the in-sample prediction band
+    ``[in_lo, in_hi]`` and ``span`` is that band's width.  The worst (not the
+    mean) probe is used because a single nearby pole / blow-up is exactly what
+    makes a model fail to generalise — averaging it over the well-behaved probes
+    would dilute the very signal we want.  A bounded model (even an oscillatory
+    one like sin) keeps every extrapolated output near the band ⇒ score ≈ 1; a
+    pole / exponential / high-degree-polynomial blow-up sends the worst probe far
+    beyond it ⇒ score → 0; a gentle linear trend is only mildly penalised.  A
+    non-finite extrapolation scores 0 (the strongest "this will not generalise").
+    """
+    if X_probe is None:
+        return 0.0
+    try:
+        q = tree.evaluate(X_probe)
+        q = affine_a * np.asarray(q, dtype=np.float64) + affine_b
+    except Exception:
+        return 0.0
+    if q.size == 0 or not np.all(np.isfinite(q)):
+        return 0.0
+    span = float(in_hi) - float(in_lo)
+    if not np.isfinite(span) or span <= 1e-12:
+        # Constant in-sample output: any equally-bounded extrapolation is smooth;
+        # use an absolute reference so a finite probe isn't spuriously penalised.
+        span = abs(float(in_hi)) + 1.0
+    excess = np.maximum(0.0, q - in_hi) + np.maximum(0.0, in_lo - q)
+    e = float(np.max(excess)) / span
+    if not np.isfinite(e) or e < 0.0:
+        return 0.0
+    return float(np.exp(-e))
+
+
+def compute_push_intrinsic(preds, y, tree, X, affine_a, affine_b):
+    """Combine the two INTRINSIC push components into a single bonus (≥ 0).
+
+    Returns ``min(PUSH_INTRINSIC_MAX, w_shape·shape + w_smooth·smooth)`` — the
+    value passed as ``push=`` to :func:`parsimony_fitness`, which subtracts it
+    from the selection fitness.  Regression-only; cheap (a capped rank sort plus
+    one ~32-point probe evaluation) and fully deterministic given (tree, X, y).
+    """
+    if not PUSH_ENABLED:
+        return 0.0
+    shape = (_push_shape_score(preds, y, PUSH_SHAPE_MAX_ROWS)
+             if PUSH_SHAPE_WEIGHT > 0.0 else 0.0)
+    smooth = 0.0
+    if PUSH_SMOOTH_WEIGHT > 0.0:
+        Xp = _push_probe_inputs(X)
+        if Xp is not None and preds.size:
+            in_lo = float(np.min(preds))
+            in_hi = float(np.max(preds))
+            smooth = _push_smooth_score(tree, Xp, affine_a, affine_b, in_lo, in_hi)
+    bonus = PUSH_SHAPE_WEIGHT * shape + PUSH_SMOOTH_WEIGHT * smooth
+    if not np.isfinite(bonus) or bonus <= 0.0:
+        return 0.0
+    return float(min(PUSH_INTRINSIC_MAX, bonus))
+
+
+def parsimony_fitness(loss, complexity, freq_adj=0.0, push=0.0):
     """
     Combine a model's raw loss and complexity into the scalar SELECTION fitness
     (lower = better) according to the active ``PARSIMONY_MODE``.
@@ -10972,14 +11181,28 @@ def parsimony_fitness(loss, complexity, freq_adj=0.0):
         *complexity* coefficient in EVERY mode, so the dynamic "spread the
         population across the complexity axis" behaviour is preserved regardless
         of which parsimony model is active.
+    push : float, default 0.0
+        Discovery-Push bonus from :func:`compute_push_intrinsic` (shape + smooth
+        components; see the Discovery Push config block).  It is SUBTRACTED from
+        the fitness in every mode, so a model that captures the target's shape
+        and extrapolates cleanly gets a small nudge UP the rankings.  It is
+        already capped (``PUSH_INTRINSIC_MAX``) far below a meaningful loss
+        difference, so it only breaks near-ties / steers exploration and can
+        never invert a genuine ranking.  Defaults to 0.0 so every legacy
+        three-argument call site is bit-for-bit unchanged.  Affects ``.fitness``
+        only — the Hall of Fame is keyed on raw ``.loss`` / ``.accuracy``, so
+        the final reported model is never altered by the push.
 
     Notes
     -----
     The complexity coefficient is clamped to ``>= 0`` so an over-encouraged
     (strongly negative ``freq_adj``) complexity can never be handed a *negative*
     marginal cost, which would reward unbounded growth and destabilise
-    selection — matching the historical clamp on the linear coefficient.
+    selection — matching the historical clamp on the linear coefficient.  The
+    push is clamped to ``>= 0`` for the same reason (a negative push would
+    silently PENALISE rather than reward).
     """
+    push = max(0.0, float(push))
     if PARSIMONY_MODE == "mdl":
         # ── Residual code length: ½·w·log2(loss) ────────────────────────────
         # Up to an additive constant identical for every model (and therefore
@@ -10992,11 +11215,11 @@ def parsimony_fitness(loss, complexity, freq_adj=0.0):
         data_bits = 0.5 * MDL_DATA_WEIGHT * float(
             np.log2(max(float(loss), _MDL_LOSS_FLOOR)))
         bit_cost  = max(0.0, MDL_COMPLEXITY_BITS + freq_adj)
-        return float(data_bits + bit_cost * complexity)
+        return float(data_bits + bit_cost * complexity - push)
 
     # ── "linear" (legacy additive parsimony) ────────────────────────────────
     eff = max(0.0, PARSIMONY_STRENGTH + freq_adj)
-    return float(loss + eff * complexity)
+    return float(loss + eff * complexity - push)
 
 
 # ==========================================
@@ -11211,6 +11434,10 @@ class Individual:
         self.r2        = 0.0
         self.accuracy  = 0.0
         self.modularity = 0.0
+        # Discovery-Push intrinsic bonus (shape + smooth), subtracted from
+        # .fitness via parsimony_fitness.  Recomputed on every full-data
+        # evaluation and cached; stays 0.0 for classification individuals.
+        self.push_intrinsic = 0.0
         self.age       = 0
         # Self-adaptive mutation strength (Evolution Strategy style).
         # Each individual carries its own sigma; it evolves alongside the tree.
@@ -11503,12 +11730,15 @@ class Individual:
                 self.complexity = cached['complexity']
                 self.affine_a   = cached['affine_a']
                 self.affine_b   = cached['affine_b']
+                self.push_intrinsic = cached.get('push', 0.0)
                 self.affine_fitted = True
-                # Adaptive parsimony is applied here too (see the main-path
-                # comment below) so cached lookups stay consistent with freshly
-                # evaluated individuals under the same complexity-frequency map.
+                # Adaptive parsimony AND the Discovery-Push bonus are applied
+                # here too (see the main-path comment below) so cached lookups
+                # stay consistent with freshly evaluated individuals under the
+                # same complexity-frequency map and push weights.
                 self.fitness = parsimony_fitness(
-                    self.loss, self.complexity, freq_parsimony_adj)
+                    self.loss, self.complexity, freq_parsimony_adj,
+                    push=self.push_intrinsic)
                 return self.fitness
         try:
             X_eval = X[batch_indices] if batch_indices is not None else X
@@ -11684,6 +11914,19 @@ class Individual:
                 self.r2       = 1.0 - ss_res / (ss_tot + 1e-8)
                 self.accuracy = float(self.r2)
 
+                # ── Discovery Push (intrinsic: shape + smooth) ────────────────
+                # A selection-only bonus rewarding models that already track the
+                # target's ordering (shape) and extrapolate cleanly (smooth);
+                # see compute_push_intrinsic and the config block.  Computed only
+                # on full-data evaluations (the cacheable path) — minibatch
+                # re-evaluations keep the last full-data value, so the cheap
+                # tie-breaker never adds per-minibatch cost.  `preds` here is the
+                # final affine/boost-applied prediction and `X_eval == X`.
+                if PUSH_ENABLED and batch_indices is None:
+                    self.push_intrinsic = compute_push_intrinsic(
+                        preds, y_eval, self.tree, X_eval,
+                        self.affine_a, self.affine_b)
+
                 # Clamp the BASE loss before adding flat/clipped penalties so
                 # those large additive penalties remain visible to selection.
                 # Without this pre-clamp the final hard ceiling would erase
@@ -11770,9 +12013,13 @@ class Individual:
             # model is unchanged by the parsimony model.  When
             # ADAPTIVE_PARSIMONY_ENABLED is False the adjustment dict is empty,
             # `freq_parsimony_adj` stays 0.0, and "linear" reduces exactly to
-            # the historical `loss + PARSIMONY_STRENGTH * complexity`.
+            # the historical `loss + PARSIMONY_STRENGTH * complexity`.  The
+            # Discovery-Push bonus (`self.push_intrinsic`, 0.0 for classification
+            # and on the no-push fast paths) is subtracted on top — selection
+            # only, so the HoF / reported model are likewise unaffected.
             self.fitness = parsimony_fitness(
-                self.loss, self.complexity, freq_parsimony_adj)
+                self.loss, self.complexity, freq_parsimony_adj,
+                push=self.push_intrinsic)
 
             # ── Populate fitness cache ───────────────────────────────────────
             if _cacheable and batch_indices is None and bg_logits is None:
@@ -11784,6 +12031,7 @@ class Individual:
                     'complexity': self.complexity,
                     'affine_a':   self.affine_a,
                     'affine_b':   self.affine_b,
+                    'push':       self.push_intrinsic,
                 })
 
         except Exception:
@@ -14712,7 +14960,10 @@ def evolve_island_chunk(args):
     # Bonus is small (1 % of an MSE-of-1 worth) so it never inverts genuine
     # rank.
     _NOVELTY_PROBE_K = 16
-    _NOVELTY_BONUS   = 0.005
+    # Discovery-Push NOVELTY component (population-relative; see the Discovery
+    # Push config block).  Driven by PUSH_NOVELTY_WEIGHT and gated by
+    # PUSH_ENABLED; the 0.005 default reproduces the historical tuned bonus.
+    _NOVELTY_BONUS   = (PUSH_NOVELTY_WEIGHT if PUSH_ENABLED else 0.0)
     if X.shape[0] > 0:
         _novelty_idx = np.random.choice(
             X.shape[0], min(_NOVELTY_PROBE_K, X.shape[0]), replace=False)
@@ -15681,7 +15932,10 @@ def evolve_afpo(population, X, y_target, type_code,
 
     # ── IMPROVEMENT (B8): cheap behavioural-novelty bonus on fitness ─────
     _NOVELTY_PROBE_K = 16
-    _NOVELTY_BONUS   = 0.005
+    # Discovery-Push NOVELTY component (population-relative; see the Discovery
+    # Push config block).  Driven by PUSH_NOVELTY_WEIGHT and gated by
+    # PUSH_ENABLED; the 0.005 default reproduces the historical tuned bonus.
+    _NOVELTY_BONUS   = (PUSH_NOVELTY_WEIGHT if PUSH_ENABLED else 0.0)
     if X.shape[0] > 0:
         _novelty_idx = np.random.choice(
             X.shape[0], min(_NOVELTY_PROBE_K, X.shape[0]), replace=False)
@@ -15709,7 +15963,7 @@ def evolve_afpo(population, X, y_target, type_code,
         capacity=512,
         tabu_window=max(12, min(40, n_generations // 5 + 8)),
         tabu_threshold=max(8, min(28, n_generations // 8 + 6)))
-    _ARCHIVE_NOVELTY_BONUS = 0.015   # 3× per-pop novelty bonus
+    _ARCHIVE_NOVELTY_BONUS = 3.0 * _NOVELTY_BONUS   # 3× per-pop novelty bonus
     # Probability of using heavy-tailed (Pareto/Cauchy) step distributions
     # for eff_rate and σ proposals — scales up with stagnation.  These are
     # 'Lévy-flight'-style jumps that occasionally produce order-of-magnitude
@@ -16981,7 +17235,9 @@ def _interval_cull_population(islands_pop, X_full, out_types=None):
                         sat_pen = float(np.mean(excess ** 2))
                         if sat_pen > 0.5:  # only penalise severely saturated
                             ind.loss   += LOGIT_SATURATION_WEIGHT * sat_pen
-                            ind.fitness = parsimony_fitness(ind.loss, ind.complexity)
+                            ind.fitness = parsimony_fitness(
+                                ind.loss, ind.complexity,
+                                push=getattr(ind, 'push_intrinsic', 0.0))
                             penalised  += 1
                 except Exception:
                     ind.loss    = 1e10
