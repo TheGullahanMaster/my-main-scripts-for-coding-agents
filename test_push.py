@@ -36,6 +36,7 @@ def _with_push(fn, **knobs):
             "PUSH_SMOOTH_PROBE_K", "PUSH_SMOOTH_EXPAND",
             "PUSH_TAILS_WEIGHT", "PUSH_TAILS_FRAC",
             "PUSH_ANNEAL_ENABLED", "PUSH_ANNEAL_FLOOR", "PUSH_NOVELTY_GRADED",
+            "PUSH_SHAPE_MAG_GATE",
             "PARSIMONY_MODE", "PARSIMONY_STRENGTH",
             "MDL_DATA_WEIGHT", "MDL_COMPLEXITY_BITS")
     saved = {k: getattr(evo13, k) for k in keys}
@@ -263,6 +264,56 @@ def test_tails_rewards_extreme_ordering_and_is_robust():
     assert s_shape > 0.7, s_shape                       # bulk still ordered
     assert s_tails == 0.0, s_tails                      # extremes carry no order
     assert s_tails < s_shape - 0.3, (s_tails, s_shape)  # TAILS sees what SHAPE hides
+
+
+# ─────────────────────── magnitude-gap gating (shape→magnitude) ──────────────
+
+def test_magnitude_gap_is_one_minus_clipped_r2():
+    """The gap is 0 for a perfect fit, 1 for a mean-predictor (R²=0), monotone in
+    fit quality, and 1.0 on degenerate inputs (no down-weighting)."""
+    y = np.linspace(-2.0, 3.0, 600)
+    assert evo13._magnitude_gap(y.copy(), y) < 1e-9                       # perfect ⇒ 0
+    assert abs(evo13._magnitude_gap(np.full_like(y, y.mean()), y) - 1.0) < 1e-9  # mean ⇒ 1
+    prev = None
+    for frac in [0.0, 0.3, 0.6, 0.9, 1.0]:        # increasing variance explained
+        g = evo13._magnitude_gap(y.mean() + (y - y.mean()) * frac, y)
+        assert 0.0 - 1e-12 <= g <= 1.0 + 1e-12, g
+        if prev is not None:
+            assert g <= prev + 1e-9, (frac, g, prev)   # better fit ⇒ smaller gap
+        prev = g
+    assert evo13._magnitude_gap(y, np.full_like(y, 4.0)) == 1.0           # constant target
+    assert evo13._magnitude_gap(y[:1], y[:1]) == 1.0                      # too few points
+
+
+def test_shape_mag_gate_focuses_push_on_unrealised_magnitude():
+    """With the gate ON, two models with the SAME ordering (so identical SHAPE/
+    TAILS) are no longer rewarded equally: the one whose magnitude is still wrong
+    keeps (most of) its push while the one the affine has already realised has its
+    shape/tails reward gated toward 0 — the literal 'shape first, then magnitude'
+    behaviour.  With the gate OFF they are identical (legacy)."""
+    def check():
+        X = np.linspace(0.0, 1.0, 800).reshape(-1, 1)
+        y = X[:, 0].copy()
+        tree = _StubTree(lambda Z: Z[:, 0])
+        realised   = y.copy()       # ρ=1, R²=1  → magnitude already there
+        unrealised = y ** 3         # ρ=1, R²<1  → right shape, wrong magnitude
+
+        # SMOOTH off so the (ungated) smooth term doesn't mask the contrast.
+        evo13.PUSH_SMOOTH_WEIGHT = 0.0
+
+        evo13.PUSH_SHAPE_MAG_GATE = False
+        off_real   = evo13.compute_push_intrinsic(realised,   y, tree, X, 1.0, 0.0)
+        off_unreal = evo13.compute_push_intrinsic(unrealised, y, tree, X, 1.0, 0.0)
+        assert abs(off_real - off_unreal) < 1e-9, (off_real, off_unreal)  # same ordering
+
+        evo13.PUSH_SHAPE_MAG_GATE = True
+        on_real   = evo13.compute_push_intrinsic(realised,   y, tree, X, 1.0, 0.0)
+        on_unreal = evo13.compute_push_intrinsic(unrealised, y, tree, X, 1.0, 0.0)
+        assert on_real < 1e-9, on_real                       # R²=1 ⇒ gated to ~0
+        assert on_unreal > on_real + 1e-6, (on_unreal, on_real)
+        assert on_real < off_real - 1e-6, (on_real, off_real)  # gate strictly reduced it
+    _with_push(check, PUSH_SHAPE_WEIGHT=0.02, PUSH_TAILS_WEIGHT=0.008,
+               PUSH_SMOOTH_WEIGHT=0.0, PUSH_INTRINSIC_MAX=0.05)
 
 
 # ───────────────────────────── push annealing ───────────────────────────────
