@@ -823,6 +823,23 @@ PUSH_ANNEAL_ENABLED = True
 PUSH_ANNEAL_FLOOR   = 0.15    # push scale floor at the end of a chunk (0 ⇒ fully off late)
 PUSH_NOVELTY_GRADED = True    # graded density novelty vs the legacy binary bonus
 
+# ---- Discovery Push: magnitude-gap gating of the SHAPE/TAILS reward ----
+# The shape/tails push exists to RESCUE models with the right ordering but a
+# not-yet-realised magnitude — the prime "finetune me into place" candidates.
+# Once the affine + constants have actually landed the magnitude the model wins
+# on raw loss and no longer needs the nudge.  With this enabled the SHAPE and
+# TAILS components are scaled per-individual by how much of the target magnitude
+# is still UNexplained AFTER the affine finetune — (1 − R²), clamped to [0, 1] —
+# so the bounded push concentrates on structurally-promising forms whose
+# magnitude is still wrong (e.g. a monotone NON-linear warp the linear affine
+# cannot finish: R² low, ρ≈1 ⇒ near-full push) and recedes for forms the affine
+# already nailed (R²→1 ⇒ push→0).  This is the literal "focus on shape, THEN
+# finetune the magnitude" curriculum expressed per-individual, complementing the
+# whole-search PUSH_ANNEAL_* time fade.  SMOOTH is a generalisation signal, not a
+# magnitude one, so it is deliberately left ungated.  Default False ⇒ the legacy
+# fixed-size bonus (so the existing capped-bonus contract is bit-for-bit intact).
+PUSH_SHAPE_MAG_GATE = False
+
 # ---- Evolution model ----
 # "island"          = Island Model (multi-process)
 # "afpo"            = Age-Fitness Pareto Optimisation (default, single-process)
@@ -1594,6 +1611,23 @@ SAFE_OPS_MODE = True  # default; changed interactively at startup
 # This lets the evolutionary search focus on shape rather than scale.
 # Disabling forces the CGP to learn scale/offset from constants alone.
 AFFINE_SCALING_ENABLED = True
+
+# When True, the locked affine (a, b) is refined past its ordinary-least-squares
+# seed with a few IRLS (iteratively-reweighted least-squares) passes whose
+# pseudo-Huber weights live in the SAME standardised residual units — r/std(y),
+# knee ROBUST_LOSS_HUBER_DELTA — as the robust regression_loss().  Rationale: the
+# affine is the "finetune the magnitude" half of the shape→magnitude split, but
+# plain OLS minimises SQUARED error while the model is SELECTED on the robust
+# loss, so on heavy-tailed targets (the chaotic mod/floor/bitwise outputs this
+# engine handles) a few rows drag the OLS slope/offset off and the magnitude
+# finetune ends up fighting the very score that ranks it.  The IRLS refit
+# down-weights those rows so the affine optimises the objective it is judged on.
+# The OLS result is the warm start and whichever of {OLS, IRLS} scores the lower
+# regression_loss is kept, so the robust fit can NEVER be worse than the legacy
+# one by its own objective.  No effect under REGRESSION_LOSS_MODE="mse_mae" (OLS
+# already minimises that pure-squared loss) or when affine scaling is off.
+AFFINE_ROBUST_FIT       = True
+AFFINE_ROBUST_FIT_ITERS = 3      # IRLS passes past the OLS seed (each O(N); 0 ⇒ OLS only)
 
 # ---- helpers used by SAFE variants ----
 def _sinc_fn(v):
@@ -11465,6 +11499,86 @@ def regression_loss(preds, y, sample_weights=None):
 
 
 # ==========================================
+# AFFINE MAGNITUDE FINETUNE (shape → magnitude)
+# ==========================================
+# Single source of truth for the rescaling y ≈ a·f(x) + b that lets the search
+# concentrate on SHAPE while a closed-form post-fit handles the MAGNITUDE.  Used
+# for the precompute-and-lock fit in calculate_fitness; the constant optimiser
+# then optimises with these (a, b) held fixed (so it cannot cheat by re-absorbing
+# fitting error through the affine).  See the AFFINE_ROBUST_FIT config block.
+def _fit_affine(preds, y):
+    """Fit the magnitude-finetuning affine ``y ≈ a·preds + b``.
+
+    Returns ``(a, b, fitted)``:
+      • ``fitted=True``  — a non-degenerate fit was found; the caller should LOCK it.
+      • ``fitted=False`` — ``preds`` is (near-)constant so no slope is identifiable;
+        returns the identity ``(1.0, 0.0)`` and the caller must leave the affine
+        UNLOCKED so it is refit once a structural mutation gives the tree variable
+        output (locking ``(0, ȳ)`` here would permanently freeze the individual).
+
+    Stage 1 is ordinary least squares (``a = cov/var``, ``b = ȳ − a·p̄``) — the exact
+    legacy fit and the global squared-error optimum.  Stage 2 (``AFFINE_ROBUST_FIT``,
+    robust-loss mode only) refines it with ``AFFINE_ROBUST_FIT_ITERS`` IRLS passes
+    whose pseudo-Huber weights ``wᵢ = 1/√(1 + (rᵢ/(δ·s))²)`` are the analytic
+    reweighting of the SAME pseudo-Huber term (knee ``ROBUST_LOSS_HUBER_DELTA``,
+    scale ``s = std(y)``) that dominates :func:`regression_loss`, so the magnitude
+    finetune optimises the objective the model is SELECTED on rather than plain
+    squared error.  Whichever of {OLS, IRLS} scores the lower ``regression_loss`` is
+    returned, so the robust fit can never be worse than the legacy one by its own
+    objective.  Cost is OLS-only on the legacy paths; the robust path adds a few
+    O(N) IRLS passes plus two loss evaluations, paid once at the first full-data
+    evaluation of each individual (the fit is then locked).
+    """
+    p  = np.asarray(preds, dtype=np.float64)
+    yv = np.asarray(y, dtype=np.float64)
+    p_mean = float(np.mean(p))
+    p_var  = float(np.var(p))
+    if not np.isfinite(p_var) or p_var <= 1e-10:
+        return 1.0, 0.0, False
+    y_mean = float(np.mean(yv))
+    cov    = float(np.mean((p - p_mean) * (yv - y_mean)))
+    a_ols  = cov / p_var
+    b_ols  = y_mean - a_ols * p_mean
+    if (not AFFINE_ROBUST_FIT) or REGRESSION_LOSS_MODE != "robust" \
+            or int(AFFINE_ROBUST_FIT_ITERS) <= 0:
+        return float(a_ols), float(b_ols), True
+
+    # IRLS: a handful of weighted-least-squares steps, pseudo-Huber weights in the
+    # loss's own r/std(y) units.  OLS is the warm start (iteration 0), so with no
+    # outliers the weights stay ≈1 and the result barely moves; with outliers the
+    # heavy-tail rows are smoothly down-weighted toward the robust optimum.
+    s = float(np.sqrt(np.mean((yv - y_mean) ** 2) + 1e-8))
+    knee = max(1e-6, float(ROBUST_LOSS_HUBER_DELTA)) * s
+    a, b = a_ols, b_ols
+    for _ in range(int(AFFINE_ROBUST_FIT_ITERS)):
+        z = ((a * p + b) - yv) / knee
+        w = 1.0 / np.sqrt(1.0 + z * z)            # pseudo-Huber IRLS weight ∈ (0, 1]
+        sw = float(np.sum(w))
+        if not np.isfinite(sw) or sw <= 1e-30:
+            break
+        pw = float(np.dot(w, p) / sw)             # weighted means
+        yw = float(np.dot(w, yv) / sw)
+        pc = p - pw
+        denom = float(np.dot(w * pc, pc))
+        if not np.isfinite(denom) or denom <= 1e-30:
+            break
+        a_new = float(np.dot(w * pc, yv - yw) / denom)
+        b_new = yw - a_new * pw
+        if not (np.isfinite(a_new) and np.isfinite(b_new)):
+            break
+        a, b = a_new, b_new
+
+    # Keep the robust fit only if it actually lowers the loss it is judged on, so
+    # the returned fit's regression_loss is min(OLS, IRLS) ≤ the legacy OLS loss.
+    try:
+        if regression_loss(a * p + b, yv) < regression_loss(a_ols * p + b_ols, yv):
+            return float(a), float(b), True
+    except Exception:
+        pass
+    return float(a_ols), float(b_ols), True
+
+
+# ==========================================
 # DISCOVERY PUSH — selection-only "extra push" metric
 # ==========================================
 # See the Discovery Push config block for the full rationale.  These compute the
@@ -11629,6 +11743,32 @@ def _push_tails_score(preds, y, frac=0.2, max_rows=None):
     return _push_shape_score(p[idx], t[idx], max_rows)
 
 
+def _magnitude_gap(preds, y):
+    """Fraction of the target's magnitude still UNexplained by ``preds`` ∈ [0, 1].
+
+    ``1 − clip(R², 0, 1)``: →0 when the magnitude is already realised (R²→1) and →1
+    when it is not (R²≤0).  ``preds`` is the FINAL prediction (affine already
+    applied), so this is the magnitude gap REMAINING after the linear finetune — a
+    monotone non-linear warp the affine cannot finish keeps a large gap, a form the
+    affine nailed has a tiny one.  Used (when PUSH_SHAPE_MAG_GATE is on) to gate the
+    shape/tails push toward the not-yet-finetuned models that most need it.
+    Degenerate (constant target / too few points) ⇒ 1.0 (no down-weighting).
+    """
+    p = np.asarray(preds, dtype=np.float64)
+    t = np.asarray(y, dtype=np.float64)
+    if p.size != t.size or p.size < 2:
+        return 1.0
+    ym = float(np.mean(t))
+    ss_tot = float(np.sum((t - ym) ** 2))
+    if not np.isfinite(ss_tot) or ss_tot <= 1e-30:
+        return 1.0
+    r2 = 1.0 - float(np.sum((p - t) ** 2)) / (ss_tot + 1e-30)
+    if not np.isfinite(r2):
+        return 1.0
+    r2c = 0.0 if r2 < 0.0 else (1.0 if r2 > 1.0 else r2)
+    return 1.0 - r2c
+
+
 def compute_push_intrinsic(preds, y, tree, X, affine_a, affine_b):
     """Combine the INTRINSIC push components into a single bonus (≥ 0).
 
@@ -11646,6 +11786,16 @@ def compute_push_intrinsic(preds, y, tree, X, affine_a, affine_b):
              if PUSH_SHAPE_WEIGHT > 0.0 else 0.0)
     tails = (_push_tails_score(preds, y, PUSH_TAILS_FRAC, PUSH_SHAPE_MAX_ROWS)
              if PUSH_TAILS_WEIGHT > 0.0 else 0.0)
+    # Magnitude-gap gate (opt-in): concentrate the bounded shape/tails reward on
+    # models whose magnitude is not yet realised — the prime "finetune me into
+    # place" candidates — and let it recede as the affine/constants land the
+    # magnitude (the raw loss then carries them).  SMOOTH is a generalisation
+    # signal, not a magnitude one, so it is deliberately left ungated.  Off by
+    # default (gate ≡ 1) ⇒ the legacy fixed-size bonus.  See PUSH_SHAPE_MAG_GATE.
+    if PUSH_SHAPE_MAG_GATE and (shape > 0.0 or tails > 0.0):
+        gate = _magnitude_gap(preds, y)
+        shape *= gate
+        tails *= gate
     smooth = 0.0
     if PUSH_SMOOTH_WEIGHT > 0.0:
         Xp = _push_probe_inputs(X)
@@ -12444,22 +12594,18 @@ class Individual:
                         preds_full = np.clip(
                             np.nan_to_num(preds_full, nan=0.0, posinf=1e9, neginf=-1e9),
                             -1e9, 1e9)
-                    p_mean      = float(np.mean(preds_full))
-                    y_mean_full = float(np.mean(y_target))
-                    p_var       = float(np.var(preds_full))
-                    if p_var > 1e-10:
-                        cov           = float(np.mean((preds_full - p_mean) * (y_target - y_mean_full)))
-                        self.affine_a = float(cov / p_var)
-                        self.affine_b = float(y_mean_full - self.affine_a * p_mean)
+                    # Single source of truth for the rescaling: OLS, optionally
+                    # refined to the robust loss via IRLS (see _fit_affine).  When
+                    # the tree output is near-constant _fit_affine returns the
+                    # identity UNLOCKED (fitted=False): after a structural mutation
+                    # gives variable output the affine is refit on the next
+                    # full-data evaluation — locking (0, mean_y) here would
+                    # permanently kill the individual even after that mutation.
+                    a_fit, b_fit, _fitted = _fit_affine(preds_full, y_target)
+                    self.affine_a = a_fit
+                    self.affine_b = b_fit
+                    if _fitted:
                         self.affine_fitted = True
-                    else:
-                        # Tree output is near-constant: use identity affine (a=1, b=0)
-                        # but do NOT lock — after mutation changes the tree to produce
-                        # variable output, the affine should be re-fitted on the next
-                        # full-data evaluation.  Locking (0, mean_y) here would
-                        # permanently kill the individual even after structural mutation.
-                        self.affine_a = 1.0
-                        self.affine_b = 0.0
 
                 # Apply the locked affine to the (possibly batched) predictions
                 preds  = self.affine_a * preds + self.affine_b
