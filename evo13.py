@@ -201,6 +201,169 @@ def _binary_sample_weights(y_eval, mode=None):
 
 
 # ==========================================
+# PER-EXAMPLE DIFFICULTY WEIGHTING (hard-example mining)
+# ==========================================
+# Process-local state for the optional INSTANCE_REWEIGHT_* feature (see the
+# config block for the full rationale).  Each evolution worker keeps its own
+# weight vectors, so on Linux fork the parent's config flags are inherited while
+# the weights accumulate independently inside every worker process:
+#   _DIFFICULTY_ACTIVE  : the (N,) weight vector for the chunk currently being
+#                         evaluated, or None when the feature is inactive.  Read
+#                         by calculate_fitness / get_case_errors.  Stays None in
+#                         the parent process, so parent-side evaluations (init,
+#                         HoF re-scoring, validation) always use the TRUE loss.
+#   _DIFFICULTY_BY_SIG  : target-fingerprint -> persistent (N,) weight vector,
+#                         so the weights a worker builds for one output survive
+#                         across the successive chunks it runs on that output.
+_DIFFICULTY_ACTIVE = None
+_DIFFICULTY_BY_SIG = {}
+
+
+def _difficulty_target_sig(y_target):
+    """Stable digest of a target vector, used to key its difficulty weights.
+
+    Same blake2b-over-bytes scheme as the fitness cache, so two different
+    outputs (or two gradient-boosting residual targets) never share a weight
+    vector while the same output across chunks always does.
+    """
+    arr = np.ascontiguousarray(y_target)
+    return (arr.shape, str(arr.dtype),
+            hashlib.blake2b(arr.tobytes(), digest_size=16).digest())
+
+
+def _difficulty_active_weights(n_rows, batch_indices=None):
+    """Raw per-row difficulty weights for the rows being evaluated, or None.
+
+    Returns ``_DIFFICULTY_ACTIVE`` sliced to the current evaluation when the
+    feature is active and the vector lines up with the data; otherwise None.
+    Weights are returned UN-normalised — callers fold them into the existing
+    class / sample weights and renormalise so the loss scale is preserved.
+    """
+    if not INSTANCE_REWEIGHT_ENABLED:
+        return None
+    w = _DIFFICULTY_ACTIVE
+    if w is None:
+        return None
+    try:
+        if batch_indices is not None:
+            bi = np.asarray(batch_indices)
+            if bi.size == 0 or int(bi.max()) >= len(w):
+                return None
+            return w[bi]
+        if len(w) != n_rows:
+            return None
+        return w
+    except Exception:
+        return None
+
+
+def _difficulty_sel_extra(per_row, base_w, dw):
+    """Selection-only loss delta contributed by the difficulty weights.
+
+    Given a per-row loss (e.g. BCE / softmax-CE), the existing per-row weight
+    ``base_w`` (class weights, or None) and the raw difficulty weights ``dw``,
+    return ``weighted_mean − base_mean``.  Adding this to the raw loss yields
+    the SELECTION loss while leaving the HoF-keyed raw loss untouched.  Both
+    means use mean-1-normalised weights so only the *relative* emphasis moves.
+    """
+    base = float(np.mean(per_row if base_w is None else base_w * per_row))
+    comb = dw if base_w is None else (base_w * dw)
+    m = float(np.mean(comb))
+    if m <= 1e-12:
+        return 0.0
+    comb = comb / m
+    return float(np.mean(comb * per_row)) - base
+
+
+def _difficulty_begin(y_target):
+    """Activate the difficulty-weight vector for one worker chunk.
+
+    Looks up (or lazily creates, initialised to 1.0) the persistent weight
+    vector for THIS target inside the current worker process and points
+    ``_DIFFICULTY_ACTIVE`` at it, so weights accumulate across the successive
+    chunks a worker runs on the same output.  Clears the pointer (so every
+    downstream evaluation no-ops) when the feature is off.
+    """
+    global _DIFFICULTY_ACTIVE
+    if not INSTANCE_REWEIGHT_ENABLED:
+        _DIFFICULTY_ACTIVE = None
+        return
+    try:
+        n = len(y_target)
+        sig = _difficulty_target_sig(y_target)
+        w = _DIFFICULTY_BY_SIG.get(sig)
+        if w is None or len(w) != n:
+            w = np.ones(n, dtype=np.float64)
+            _DIFFICULTY_BY_SIG[sig] = w
+        _DIFFICULTY_ACTIVE = w
+    except Exception:
+        _DIFFICULTY_ACTIVE = None
+
+
+def _difficulty_failures(ind, X, y_target, type_code,
+                         bg_logits=None, class_idx_in_group=None, Y_group=None):
+    """Boolean (N,) mask — True where ``ind`` currently mis-predicts the row.
+
+    Classification (binary / softmax group) → the predicted class is wrong.
+    Regression → the residual exceeds INSTANCE_REWEIGHT_REG_TOL × std(y), a
+    scale-free "not close enough".  Mirrors the prediction path used by
+    calculate_fitness so "failure" matches what is actually being optimised.
+    """
+    preds = ind.tree.evaluate(X)
+    preds = np.clip(np.nan_to_num(preds, nan=0.0, posinf=1e9, neginf=-1e9), -1e9, 1e9)
+    if bg_logits is not None:
+        logits = bg_logits.copy()
+        logits[:, class_idx_in_group] = preds
+        return np.argmax(logits, axis=1) != np.argmax(Y_group, axis=1)
+    if type_code == 6:
+        pred_pos = (1.0 / (1.0 + np.exp(-preds))) >= 0.5
+        return pred_pos != (y_target >= 0.5)
+    a = getattr(ind, 'affine_a', 1.0)
+    b = getattr(ind, 'affine_b', 0.0)
+    preds = a * preds + b
+    for corr_tree, ca, cb, lr in getattr(ind, 'boost_stages', []):
+        corr = corr_tree.evaluate(X)
+        corr = np.clip(np.nan_to_num(corr, nan=0.0, posinf=1e9, neginf=-1e9), -1e9, 1e9)
+        preds = preds + lr * (ca * corr + cb)
+    tol = INSTANCE_REWEIGHT_REG_TOL * (float(np.std(y_target)) + 1e-12)
+    return np.abs(preds - y_target) > tol
+
+
+def _difficulty_update(population, X, y_target, type_code, gen,
+                       bg_logits=None, class_idx_in_group=None, Y_group=None):
+    """Grow the difficulty weight of every example the champion fails.
+
+    Called once per generation from inside a worker's evolution loop.  "The
+    model" is the current lowest-TRUE-loss individual; each example it
+    mis-predicts has its weight multiplied by (1 + INSTANCE_REWEIGHT_INCREMENT)
+    and the whole vector is clamped to [1.0, INSTANCE_REWEIGHT_MAX] so a
+    permanent outlier can't grow without bound.  Fully guarded: a no-op when
+    the feature is off, the vector is misaligned, or anything goes wrong.
+    """
+    if not INSTANCE_REWEIGHT_ENABLED or _DIFFICULTY_ACTIVE is None:
+        return
+    if INSTANCE_REWEIGHT_UPDATE_EVERY > 1 and (gen % INSTANCE_REWEIGHT_UPDATE_EVERY) != 0:
+        return
+    w = _DIFFICULTY_ACTIVE
+    if len(w) != len(X):
+        return
+    try:
+        finite = [ind for ind in population
+                  if np.isfinite(ind.loss) and ind.loss < 1e9]
+        if not finite:
+            return
+        champ = min(finite, key=lambda x: x.loss)
+        fail = _difficulty_failures(champ, X, y_target, type_code,
+                                    bg_logits, class_idx_in_group, Y_group)
+        if fail.shape[0] != len(w):
+            return
+        w[fail] *= (1.0 + INSTANCE_REWEIGHT_INCREMENT)
+        np.clip(w, 1.0, INSTANCE_REWEIGHT_MAX, out=w)
+    except Exception:
+        pass
+
+
+# ==========================================
 # DATA-SCALE HINT & TYPE-COERCION HELPERS
 # ==========================================
 # Dataset-scale hint set once during train_mode after preprocessing.  Used by
@@ -932,6 +1095,44 @@ LOGIT_SATURATION_REG_ENABLE = False  # also apply to regression (extreme pred pe
 # Accuracy/argmax metrics remain unweighted so they stay comparable.
 CLASS_WEIGHT_MODE     = 'sqrt_balanced'  # 'none' | 'balanced' | 'sqrt_balanced'
 CLASS_WEIGHT_ENABLED  = True             # toggled interactively at startup
+
+# ---- Per-example difficulty weighting (hard-example mining / boosting) ----
+# OPTIONAL, OFF BY DEFAULT (toggled interactively at startup).  When enabled,
+# every training example is given a stable ID (its row index) and a "difficulty
+# weight" that starts at 1.0.  Once per generation the current champion (the
+# lowest TRUE-loss individual) is evaluated on the full training set, and every
+# example it mis-predicts has its weight multiplicatively increased (capped).
+# Those weights then reshape the per-example contribution to the SELECTION
+# objective, so the search spends progressively more effort on the handful of
+# examples it keeps getting wrong.  As the easy majority is learned their
+# weights stop growing while the persistent outliers keep climbing, so the
+# population is pulled toward fixing those last hard cases — exactly the
+# AdaBoost-style focusing dynamic.
+#
+# This is selection-only, mirroring parsimony / const-cost / class weighting:
+#   • `.fitness` (parent selection, AFPO Pareto trim, SA acceptance) and the
+#     epsilon-lexicase per-case errors see the re-weighted objective, so the
+#     SEARCH is steered toward the hard examples.
+#   • `.loss` / `.accuracy` (the Hall-of-Fame key, the protected champion, the
+#     reported metrics and the validation score) stay on the TRUE, unweighted
+#     objective, so the frontier and the model you finally get are reported
+#     honestly.
+#
+# WHY IT IS OPTIONAL: chasing the examples a model can't fit is exactly what you
+# want when those examples are genuine but under-represented structure — and
+# exactly what you DON'T want when they are label noise.  Up-weighting noisy
+# rows makes evolution contort the expression to memorise them, i.e. it
+# OVERFITS.  Leave it off unless you know your hardest rows are signal.
+#
+# A "failure" is: wrong class (classification) or a residual larger than
+# INSTANCE_REWEIGHT_REG_TOL × std(y) (regression — a scale-free "not close
+# enough").  Because stable per-example IDs are required, enabling this forces
+# full-dataset evaluation (mini-batching is disabled for the run).
+INSTANCE_REWEIGHT_ENABLED      = False   # toggled interactively at startup
+INSTANCE_REWEIGHT_INCREMENT    = 0.15    # weight *= (1 + this) per failed generation
+INSTANCE_REWEIGHT_MAX          = 8.0     # per-example weight ceiling (anti-runaway)
+INSTANCE_REWEIGHT_REG_TOL      = 0.25    # regression: |resid| > tol*std(y) counts as a miss
+INSTANCE_REWEIGHT_UPDATE_EVERY = 1       # re-score / re-weight every N generations
 
 # ---- Bayesian CGP Settings ----
 # Bayesian optimisation uses a Gaussian Process surrogate to model the
@@ -3535,6 +3736,83 @@ def _select_class_weight_mode():
         CLASS_WEIGHT_MODE = 'sqrt_balanced'
         CLASS_WEIGHT_ENABLED = True
         print("  ✓  Class weighting: sqrt_balanced.")
+
+
+def _select_difficulty_weighting():
+    """Ask whether to enable per-example difficulty weighting (hard-example mining).
+
+    OFF by default.  See the INSTANCE_REWEIGHT_* config block for the full
+    rationale and the overfitting caveat.  The primary prompt is a plain
+    1/yes vs 0/no toggle; if enabled, a few optional knobs follow (Enter keeps
+    the default).
+    """
+    global INSTANCE_REWEIGHT_ENABLED, INSTANCE_REWEIGHT_INCREMENT
+    global INSTANCE_REWEIGHT_MAX, INSTANCE_REWEIGHT_REG_TOL
+    global INSTANCE_REWEIGHT_UPDATE_EVERY
+
+    print("\n" + "─" * 70)
+    print("PER-EXAMPLE DIFFICULTY WEIGHTING  (hard-example mining / boosting)")
+    print("─" * 70)
+    print("  Give every training example an ID and a difficulty weight (start 1.0).")
+    print("  Each generation, every example the current best model still gets")
+    print("  wrong has its weight increased, so the search keeps shifting effort")
+    print("  onto the few stubborn outliers once the easy majority is learned.")
+    print()
+    print("  Selection-only: the Hall of Fame, the reported loss / accuracy and")
+    print("  the validation score stay on the TRUE, unweighted objective.")
+    print()
+    print("  ⚠  This OVERFITS when the hard rows are label noise (it will happily")
+    print("     memorise them).  Leave it OFF unless your outliers are real signal.")
+    print("     Enabling it also forces full-dataset evaluation (no mini-batches),")
+    print("     since stable per-example IDs are required.")
+    print("─" * 70)
+    choice = input(
+        "Enable per-example difficulty weighting? [1=yes / 0=no, default 0]: "
+    ).strip().lower()
+    if choice not in ('1', 'y', 'yes'):
+        INSTANCE_REWEIGHT_ENABLED = False
+        print("  Difficulty weighting disabled (default).")
+        return
+
+    INSTANCE_REWEIGHT_ENABLED = True
+
+    inc_in = input(f"  Weight increase per failed generation "
+                   f"[fraction, default {INSTANCE_REWEIGHT_INCREMENT}]: ").strip()
+    if inc_in:
+        try:
+            INSTANCE_REWEIGHT_INCREMENT = max(0.0, float(inc_in))
+        except ValueError:
+            pass
+
+    cap_in = input(f"  Maximum per-example weight (anti-runaway) "
+                   f"[default {INSTANCE_REWEIGHT_MAX}]: ").strip()
+    if cap_in:
+        try:
+            INSTANCE_REWEIGHT_MAX = max(1.0, float(cap_in))
+        except ValueError:
+            pass
+
+    tol_in = input(f"  Regression miss tolerance (×std(y); a row is 'failed' when "
+                   f"|resid| exceeds this) [default {INSTANCE_REWEIGHT_REG_TOL}]: ").strip()
+    if tol_in:
+        try:
+            INSTANCE_REWEIGHT_REG_TOL = max(0.0, float(tol_in))
+        except ValueError:
+            pass
+
+    every_in = input(f"  Re-weight every N generations "
+                     f"[default {INSTANCE_REWEIGHT_UPDATE_EVERY}]: ").strip()
+    if every_in:
+        try:
+            INSTANCE_REWEIGHT_UPDATE_EVERY = max(1, int(every_in))
+        except ValueError:
+            pass
+
+    print(f"  ✓  Difficulty weighting ENABLED  "
+          f"(×{1.0 + INSTANCE_REWEIGHT_INCREMENT:.3g}/miss, cap {INSTANCE_REWEIGHT_MAX:g}, "
+          f"reg-tol {INSTANCE_REWEIGHT_REG_TOL:g}·std, every "
+          f"{INSTANCE_REWEIGHT_UPDATE_EVERY} gen).")
+    print("     ⚠  Optional & overfitting-prone — see the notes above.")
 
 
 # ==========================================
@@ -12168,6 +12446,10 @@ class Individual:
         # Selection-only MDL constant cost (set in calculate_fitness; see
         # compute_const_cost).  0.0 until evaluated / when the feature is off.
         self.const_cost = 0.0
+        # Selection-only per-example difficulty-weight penalty (set in
+        # calculate_fitness; see the INSTANCE_REWEIGHT_* block).  0.0 until
+        # evaluated / whenever hard-example mining is disabled.
+        self.sel_extra = 0.0
         self.age       = 0
         # Self-adaptive mutation strength (Evolution Strategy style).
         # Each individual carries its own sigma; it evolves alongside the tree.
@@ -12448,7 +12730,8 @@ class Individual:
         # Batched calls, multi-class group calls, and const-opt sub-calls are
         # excluded because they either have extra context or mutate in-place.
         _cacheable = (use_cache and batch_indices is None and bg_logits is None
-                      and sample_weights is None)
+                      and sample_weights is None
+                      and not (INSTANCE_REWEIGHT_ENABLED and _DIFFICULTY_ACTIVE is not None))
 
         if _cacheable:
             cached = _FITNESS_CACHE.get(self.tree, y_target)
@@ -12474,6 +12757,10 @@ class Individual:
                 # it, so the 0.0 default only ever applies to a stale entry.
                 self.const_cost = cached.get('const_cost', 0.0)
                 self.affine_fitted = True
+                # The cache is bypassed while difficulty weighting is active
+                # (see _cacheable above), so a cache hit always means the true
+                # loss IS the selection loss here.
+                self.sel_extra = 0.0
                 # Adaptive parsimony AND the Discovery-Push bonus are applied
                 # here too (see the main-path comment below) so cached lookups
                 # stay consistent with freshly evaluated individuals under the
@@ -12488,6 +12775,13 @@ class Individual:
 
             preds = self.tree.evaluate(X_eval)
             preds = np.clip(np.nan_to_num(preds, nan=0.0, posinf=1e9, neginf=-1e9), -1e9, 1e9)
+
+            # Selection-only difficulty-weight penalty: 0.0 unless the optional
+            # hard-example-mining feature (INSTANCE_REWEIGHT_*) is active, in
+            # which case each branch below sets it to the extra loss the
+            # re-weighted objective sees.  Added into `.fitness` only — never
+            # into `.loss` (the HoF key / reported metric).
+            self.sel_extra = 0.0
 
             if bg_logits is not None:
                 # ── Joint softmax cross-entropy (multi-class group mode) ──────
@@ -12511,6 +12805,10 @@ class Individual:
                     self.loss = float(np.mean(cls_w * per_row_ce))
                 else:
                     self.loss = float(np.mean(per_row_ce))
+                # Hard-example mining: re-weight per-row CE for SELECTION only.
+                dw = _difficulty_active_weights(len(per_row_ce), batch_indices)
+                if dw is not None:
+                    self.sel_extra = _difficulty_sel_extra(per_row_ce, cls_w, dw)
                 self.r2       = 0.0
                 pred_cls      = np.argmax(logits, axis=1)
                 true_cls      = np.argmax(yg,     axis=1)
@@ -12548,6 +12846,10 @@ class Individual:
                     self.loss = float(np.mean(cls_w * bce))
                 else:
                     self.loss = float(np.mean(bce))
+                # Hard-example mining: re-weight per-row BCE for SELECTION only.
+                dw = _difficulty_active_weights(len(y_eval), batch_indices)
+                if dw is not None:
+                    self.sel_extra = _difficulty_sel_extra(bce, cls_w, dw)
                 # Accuracy: sigmoid threshold at 0.5
                 pred_class = (1.0 / (1.0 + np.exp(-preds))) >= 0.5
                 self.r2       = 0.0   # not meaningful for classification
@@ -12631,6 +12933,16 @@ class Individual:
                           if sample_weights is not None and batch_indices is not None
                           else sample_weights)
                 self.loss = regression_loss(preds, y_eval, sample_weights=w_eval)
+
+                # Hard-example mining: fold the per-example difficulty weights
+                # into a SELECTION-only loss delta (regression_loss renormalises
+                # the combined weights internally, so the scale is preserved).
+                # `.loss` above stays the TRUE objective for the HoF / report.
+                dw = _difficulty_active_weights(len(y_eval), batch_indices)
+                if dw is not None:
+                    comb = dw if w_eval is None else (w_eval * dw)
+                    self.sel_extra = (regression_loss(preds, y_eval, sample_weights=comb)
+                                      - self.loss)
 
                 # ── Sobolev gradient-matching penalty ────────────────────────
                 # Penalise expressions whose partial derivatives ∂f/∂x_j diverge
@@ -12768,8 +13080,11 @@ class Individual:
             # Discovery-Push bonus (`self.push_intrinsic`, 0.0 for classification
             # and on the no-push fast paths) is subtracted on top — selection
             # only, so the HoF / reported model are likewise unaffected.
+            # `self.sel_extra` (the optional hard-example-mining penalty) is
+            # added here for the same reason: it steers selection toward the
+            # hard examples without touching the HoF-keyed `self.loss`.
             self.fitness = parsimony_fitness(
-                self.loss, self.complexity, freq_parsimony_adj,
+                self.loss + self.sel_extra, self.complexity, freq_parsimony_adj,
                 push=self.push_intrinsic, const_cost=self.const_cost)
 
             # ── Populate fitness cache ───────────────────────────────────────
@@ -13092,16 +13407,12 @@ class Individual:
             # the per-row weighting must be applied here too — otherwise rare-
             # class cases are still effectively outvoted during case filtering.
             cls_w = _multiclass_sample_weights(yg)
-            if cls_w is not None:
-                return cls_w * per_row_ce
-            return per_row_ce
+            errs = cls_w * per_row_ce if cls_w is not None else per_row_ce
         elif type_code == 6:
             y_eval = y_target[indices]
             bce = np.logaddexp(0.0, preds) - preds * y_eval
             cls_w = _binary_sample_weights(y_eval)
-            if cls_w is not None:
-                return cls_w * bce
-            return bce
+            errs = cls_w * bce if cls_w is not None else bce
         else:
             # --- Apply locked affine scaling + boost corrections ---
             a = getattr(self, 'affine_a', 1.0)
@@ -13114,7 +13425,19 @@ class Individual:
                 preds += lr * (ca * corr + cb)
             # ----------------------------------------
             diff = preds - y_target[indices]
-            return np.where(np.abs(diff) > 100, np.abs(diff) - 0.6931, np.log(np.cosh(diff)))
+            errs = np.where(np.abs(diff) > 100, np.abs(diff) - 0.6931, np.log(np.cosh(diff)))
+
+        # Hard-example mining (optional): scale each case's error by its
+        # difficulty weight, mean-normalised so the lexicase MAD epsilon scale
+        # is preserved, so the rows the search keeps failing also carry more
+        # weight in case-by-case filtering.  No-op when the feature is off.
+        # Mirrors the class-weight application above.
+        dw = _difficulty_active_weights(len(indices), batch_indices=indices)
+        if dw is not None:
+            m = float(np.mean(dw))
+            if m > 1e-12:
+                errs = errs * (dw / m)
+        return errs
 
     def full_expr_string(self):
         """String representation including boost correction stages."""
@@ -15758,9 +16081,20 @@ def evolve_island_chunk(args):
     _IMMIGRANT_CHECK_FREQ = 30
     _IMMIGRANT_RATE = 0.03   # share of target_size
 
+    # Hard-example mining: bind (or create) this output's difficulty-weight
+    # vector for the duration of this chunk; no-op when the feature is off.
+    _difficulty_begin(y_target)
+
     for gen in range(generations):
         for ind in island_pop:
             ind.age += 1
+
+        # Re-weight the examples the current champion still gets wrong so the
+        # search keeps shifting toward the hard / outlier rows (no-op when off).
+        _difficulty_update(island_pop, X, y_target, type_code, gen,
+                           bg_logits=bg_logits,
+                           class_idx_in_group=class_idx_in_group,
+                           Y_group=Y_group)
 
         # ── PySR-style SA temperature with cosine annealing ─────────────────
         # Base temperature: T_base = SA_ALPHA × mean_population_loss.
@@ -15803,7 +16137,8 @@ def evolve_island_chunk(args):
                 _ind.complexity = _ind.tree.get_complexity()
                 _fa = freq_adj.get(int(round(_ind.complexity)), 0.0)
                 _ind.fitness = parsimony_fitness(
-                    _ind.loss, _ind.complexity, _fa,
+                    _ind.loss + getattr(_ind, 'sel_extra', 0.0),
+                    _ind.complexity, _fa,
                     push=getattr(_ind, 'push_intrinsic', 0.0),
                     const_cost=getattr(_ind, 'const_cost', 0.0))
 
@@ -16815,9 +17150,20 @@ def evolve_afpo(population, X, y_target, type_code,
     # Track the best individual seen inside this chunk for champion protection
     _chunk_champion = min(population, key=lambda x: x.loss) if population else None
 
+    # Hard-example mining: bind (or create) this output's difficulty-weight
+    # vector for the duration of this chunk; no-op when the feature is off.
+    _difficulty_begin(y_target)
+
     for gen in range(n_generations):
         for ind in population:
             ind.age += 1
+
+        # Re-weight the examples the current champion still gets wrong so the
+        # search keeps shifting toward the hard / outlier rows (no-op when off).
+        _difficulty_update(population, X, y_target, type_code, gen,
+                           bg_logits=bg_logits,
+                           class_idx_in_group=class_idx_in_group,
+                           Y_group=Y_group)
 
         # ── AFPO Invariant: Inject one pure random age=0 individual per generation ──
         # Half the time this immigrant is shaped by the data-driven prior (a
@@ -16890,7 +17236,8 @@ def evolve_afpo(population, X, y_target, type_code,
                 _ind.complexity = _ind.tree.get_complexity()
                 _fa = freq_adj.get(int(round(_ind.complexity)), 0.0)
                 _ind.fitness = parsimony_fitness(
-                    _ind.loss, _ind.complexity, _fa,
+                    _ind.loss + getattr(_ind, 'sel_extra', 0.0),
+                    _ind.complexity, _fa,
                     push=getattr(_ind, 'push_intrinsic', 0.0),
                     const_cost=getattr(_ind, 'const_cost', 0.0))
 
@@ -18072,7 +18419,8 @@ def _interval_cull_population(islands_pop, X_full, out_types=None):
                         if sat_pen > 0.5:  # only penalise severely saturated
                             ind.loss   += LOGIT_SATURATION_WEIGHT * sat_pen
                             ind.fitness = parsimony_fitness(
-                                ind.loss, ind.complexity,
+                                ind.loss + getattr(ind, 'sel_extra', 0.0),
+                                ind.complexity,
                                 push=getattr(ind, 'push_intrinsic', 0.0),
                                 const_cost=getattr(ind, 'const_cost', 0.0))
                             penalised  += 1
@@ -27956,6 +28304,13 @@ def train_mode():
     # ---- Class-imbalance handling ----
     _select_class_weight_mode()
 
+    # ---- Per-example difficulty weighting (optional hard-example mining) ----
+    _select_difficulty_weighting()
+    if INSTANCE_REWEIGHT_ENABLED and BATCH_SIZE > 0:
+        print("  [Difficulty Weighting] Mini-batching is incompatible with stable")
+        print("  per-example IDs — switching to full-dataset evaluation for this run.")
+        BATCH_SIZE = 0
+
     # ---- Safe vs Unsafe ops ----
     select_ops_safety()
 
@@ -28488,6 +28843,19 @@ def train_mode():
 
     if BATCH_SIZE > 0:
         print(f"Using random mini-batches of size {BATCH_SIZE}.")
+
+    if INSTANCE_REWEIGHT_ENABLED:
+        # Assign each training row a stable ID (its index) and an initial
+        # difficulty weight of 1.0.  The per-worker weight vectors are created
+        # lazily on first use (see _difficulty_begin); this just reports the
+        # assignment so the run log shows the feature is live.
+        _n_train = X.shape[0]
+        print(f"[Difficulty Weighting] Enabled — assigned IDs 0..{_n_train - 1} to "
+              f"{_n_train} training examples; all difficulty weights start at 1.0.")
+        print(f"  Examples the champion mis-predicts get up-weighted "
+              f"(×{1.0 + INSTANCE_REWEIGHT_INCREMENT:.3g}/gen, capped at "
+              f"{INSTANCE_REWEIGHT_MAX:g}); selection will focus on the hardest rows "
+              f"while the HoF / reported metrics stay on the true objective.")
 
     # ════════════════════════════════════════════════════════════════
     # DISCOVERY MACHINE: Feature importance pre-analysis
