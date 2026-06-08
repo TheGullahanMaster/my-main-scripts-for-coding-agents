@@ -17,3 +17,8 @@ Thumbs.db
 *.swp
 .idea/
 .vscode/
+
+# Generated model scripts (emitted by evo13.py train runs)
+best_model.py
+backup_perfect_*.py
+boosted_model.py

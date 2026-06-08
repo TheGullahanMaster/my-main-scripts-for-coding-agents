@@ -875,6 +875,22 @@ ROBUST_LOSS_SCALE_PCT       = 25.0  # percentile of non-zero |y| used as the
 ROBUST_LOSS_MULTISCALE_LO   = 1.5   # decades of |y| spread below which L_ms is OFF
 ROBUST_LOSS_MULTISCALE_HI   = 2.5   # decades at/above which L_ms is fully ON
 
+# ---- Degenerate-prediction guard ----
+# A model whose EXPORTED prediction is (near-)constant explains none of a varying
+# target, so it must be scored like a constant predictor — never near-perfect.
+# An expression can LOOK variable to the loss yet export to a constant:
+#   • a "dead" branch — IF(condition-always-false, expr, 0) hard-evaluates to the
+#     constant else-branch, but under DIFFERENTIABLE_BRANCHING the soft sigmoid
+#     if_else leaks a tiny, VARYING slice of `expr`, so the smooth output the loss
+#     sees is not constant even though the exported (hard) model is;
+#   • affine amplification of a prediction whose spread is only floating-point
+#     noise around a constant.
+# When the export-semantics prediction's spread falls below this fraction of the
+# target's spread, the loss is overridden to the median-constant-predictor loss
+# and R² to 0.0 (a constant accounts for none of the variance), replacing the old
+# absolute std<1e-6 → +10 penalty which left R² reading a spurious ≈1.0.
+DEGENERATE_PRED_REL_TOL     = 1e-4  # |std(export_pred)| / std(y) below this ⇒ degenerate
+
 # ---- Sobolev Training ----
 # Adds a gradient-matching penalty to the regression loss.
 # Target gradients dy/dX are estimated once from the training data before
@@ -906,6 +922,25 @@ SOBOLEV_KNN_K    = 15
 # • 0.10 → strong (pushes hard for diversity across complexity levels)
 ADAPTIVE_PARSIMONY_WEIGHT  = 0.03
 ADAPTIVE_PARSIMONY_ENABLED = True
+
+# ---- Stagnation-driven complexity-pressure relaxation ----
+# The common "throw everything at the problem" run can converge onto a
+# suboptimal-but-good-enough solution early; the parsimony pressure then pins the
+# population to that simplest plateau model, so the more-accurate (necessarily
+# more-complex) structure that would dominate it never survives selection long
+# enough to be discovered.  To break that lock-in WITHOUT permanently bloating
+# the frontier, the per-complexity-unit parsimony cost is temporarily relaxed in
+# proportion to how long an island/AFPO pool has stalled: the multiplier ramps
+# from 1.0 (no stagnation → full Occam pressure) down to COMPLEXITY_RELAX_MIN at
+# the extinction-patience horizon, then snaps back to 1.0 the instant a new best
+# resets the stagnation counter — so the search "spends complexity" only while
+# stuck and re-simplifies as soon as it finds a better basin.  The Hall of Fame
+# is keyed on RAW loss, so the reported frontier is never coarsened by this; it
+# only changes which parents survive during a stall.  Read at the
+# parsimony_fitness choke-point via the worker-local global
+# _COMPLEXITY_PRESSURE_SCALE (mirrors the Discovery-Push anneal scale).
+DYNAMIC_COMPLEXITY_RELAX_ENABLED = True
+COMPLEXITY_RELAX_MIN             = 0.30   # floor of the complexity-cost multiplier
 
 # ---- Discovery Push (selection-only "extra push" reward) ----
 # A small, bounded bonus SUBTRACTED from the selection fitness (lower = better)
@@ -5648,8 +5683,18 @@ class CGPEquation:
         new.active_nodes = copy.deepcopy(self.active_nodes)
         return new
 
-    def evaluate(self, X):
-        """Evaluate the CGP expression on input X using dispatch tables."""
+    def evaluate(self, X, force_hard=False):
+        """Evaluate the CGP expression on input X using dispatch tables.
+
+        ``force_hard=True`` evaluates the HARD (exported) semantics of every
+        if_else node even when DIFFERENTIABLE_BRANCHING is on — the soft sigmoid
+        blend is a training/gradient aid, but a hard ``np.where(cond>0.5, …)`` is
+        what a generated/exported model actually computes.  Used by the
+        degenerate-prediction guard to detect a "dead branch" whose smooth output
+        leaks variance while its exported output is constant.  ``np.where`` on the
+        same (possibly soft) condition recovers the exported decision because a
+        soft comparison crosses 0.5 exactly where its hard counterpart flips.
+        """
         batch_size = X.shape[0]
         buffer = np.zeros((batch_size, self.n_features + self.max_nodes))
         buffer[:, :self.n_features] = X
@@ -5675,7 +5720,7 @@ class CGPEquation:
                 # Ternary node — in1, in2, in3 each feed an operand.
                 v2 = buffer[:, node.in2]
                 v3 = buffer[:, node.in3]
-                if node.op == 'if_else' and DIFFERENTIABLE_BRANCHING:
+                if node.op == 'if_else' and DIFFERENTIABLE_BRANCHING and not force_hard:
                     # Smooth sigmoid blend so const-opt can gradient-tune the threshold.
                     k = DIFF_BRANCH_STEEPNESS
                     gate = 1.0 / (1.0 + np.exp(-np.clip(k * (v1 - 0.5), -50, 50)))
@@ -5713,6 +5758,21 @@ class CGPEquation:
                 buffer[:, i] = np.nan_to_num(result, nan=0.0, posinf=1e9, neginf=-1e9)
 
         return buffer[:, self.out_idx]
+
+    def has_conditional(self):
+        """True iff the ACTIVE graph contains an if_else node.
+
+        Used to decide whether a hard (export-semantics) re-evaluation can differ
+        from the smooth one under DIFFERENTIABLE_BRANCHING — if there is no
+        if_else, the smooth and hard evaluations are identical and the
+        degenerate-prediction guard can skip the extra evaluate() call.
+        """
+        self.update_active_nodes()
+        nf = self.n_features
+        for idx in self.active_nodes:
+            if idx >= nf and self.nodes[idx - nf].op == 'if_else':
+                return True
+        return False
 
 
     def update_active_nodes(self):
@@ -11811,7 +11871,14 @@ def _fit_affine(preds, y):
     yv = np.asarray(y, dtype=np.float64)
     p_mean = float(np.mean(p))
     p_var  = float(np.var(p))
-    if not np.isfinite(p_var) or p_var <= 1e-10:
+    # Treat the prediction as constant (no identifiable slope) when its spread is
+    # negligible either absolutely OR relative to its own magnitude.  The relative
+    # guard (var ≤ 1e-16·mean² ⇔ coefficient of variation ≲ 1e-8) stops a slope of
+    # a = cov/var from being manufactured by dividing the covariance by a
+    # floating-point-noise variance on a large-magnitude near-constant prediction
+    # — which would otherwise amplify rounding noise into a spurious "fit".
+    if (not np.isfinite(p_var) or p_var <= 1e-10
+            or p_var <= 1e-16 * (p_mean * p_mean)):
         return 1.0, 0.0, False
     y_mean = float(np.mean(yv))
     cov    = float(np.mean((p - p_mean) * (yv - y_mean)))
@@ -12096,6 +12163,14 @@ def compute_push_intrinsic(preds, y, tree, X, affine_a, affine_b):
 # PUSH_ANNEAL_ENABLED is False or outside the evolution loops (e.g. tests).
 _PUSH_ANNEAL_SCALE = 1.0
 
+# Worker-local multiplier on the per-complexity-unit parsimony cost, set each
+# generation from the island/AFPO stagnation fraction (see the
+# Stagnation-driven complexity-pressure relaxation config) and read at the
+# parsimony_fitness choke-point.  1.0 = full Occam pressure (default, and the
+# value seen in the main process / tests, which never set it); < 1.0 relaxes the
+# pressure so a stalled pool can grow out of a good-enough basin.
+_COMPLEXITY_PRESSURE_SCALE = 1.0
+
 
 def push_anneal_scale(gen_frac):
     """Discovery-Push multiplier for a within-chunk progress fraction in [0, 1].
@@ -12219,11 +12294,14 @@ def parsimony_fitness(loss, complexity, freq_adj=0.0, push=0.0, const_cost=0.0):
         # lets the complexity term dominate.
         data_bits = 0.5 * MDL_DATA_WEIGHT * float(
             np.log2(max(float(loss), _MDL_LOSS_FLOOR)))
-        bit_cost  = max(0.0, MDL_COMPLEXITY_BITS + freq_adj)
+        # _COMPLEXITY_PRESSURE_SCALE relaxes the BASE Occam cost while a pool is
+        # stalled (1.0 = full pressure); the frequency adjustment that spreads the
+        # population across complexity buckets is left intact.
+        bit_cost  = max(0.0, MDL_COMPLEXITY_BITS * _COMPLEXITY_PRESSURE_SCALE + freq_adj)
         return float(data_bits + bit_cost * complexity - push)
 
     # ── "linear" (legacy additive parsimony) ────────────────────────────────
-    eff = max(0.0, PARSIMONY_STRENGTH + freq_adj)
+    eff = max(0.0, PARSIMONY_STRENGTH * _COMPLEXITY_PRESSURE_SCALE + freq_adj)
     return float(loss + eff * complexity - push)
 
 
@@ -12985,8 +13063,45 @@ class Individual:
                 # so the penalty's signal collapses.
                 self.loss = min(self.loss, HOF_LOSS_CEILING)
 
-                if np.std(y_eval) > 1e-6 and np.std(preds) < 1e-6:
-                    self.loss += 10.0
+                # ── Degenerate-output guard ──────────────────────────────────
+                # A model whose EXPORTED prediction is (near-)constant explains
+                # none of a varying target, so it is scored as the best constant
+                # predictor (the median) with R²=0 — never a spurious ≈perfect
+                # fit.  This replaces the old absolute std(preds)<1e-6 → +10
+                # penalty, which (a) used an absolute threshold a prediction
+                # whose spread is tiny only RELATIVE to the target slips past,
+                # (b) left R² reading ≈1.0 for a constant, and (c) missed the
+                # DIFFERENTIABLE_BRANCHING "dead branch" whose soft if_else leaks
+                # a varying sliver of an always-skipped branch even though the
+                # exported (hard) model is constant — so we re-check on the hard
+                # evaluation whenever the tree actually contains an if_else.
+                y_std_d = float(np.std(y_eval))
+                if y_std_d > 1e-9:
+                    if DIFFERENTIABLE_BRANCHING and self.tree.has_conditional():
+                        ph = self.tree.evaluate(X_eval, force_hard=True)
+                        ph = np.clip(np.nan_to_num(ph, nan=0.0, posinf=1e9,
+                                                   neginf=-1e9), -1e9, 1e9)
+                        export_pred = self.affine_a * ph + self.affine_b
+                        for corr_tree, ca, cb, lr in self.boost_stages:
+                            corr = corr_tree.evaluate(X_eval, force_hard=True)
+                            corr = np.clip(np.nan_to_num(corr, nan=0.0,
+                                           posinf=1e9, neginf=-1e9), -1e9, 1e9)
+                            export_pred = export_pred + lr * (ca * corr + cb)
+                    else:
+                        export_pred = preds   # smooth == hard here
+                    if float(np.std(export_pred)) < DEGENERATE_PRED_REL_TOL * y_std_d:
+                        # Best constant predictor (median): "a loss consistent
+                        # with a median prediction", and R²=0 (a constant
+                        # accounts for none of the variance).  w_eval carries any
+                        # boosting weights so the baseline matches the scale the
+                        # model was judged on.  Zero the shape/smooth push too so
+                        # a leaky soft branch can't claw selection credit back.
+                        med = float(np.median(y_eval))
+                        self.loss = regression_loss(
+                            np.full_like(y_eval, med), y_eval, sample_weights=w_eval)
+                        self.r2             = 0.0
+                        self.accuracy       = 0.0
+                        self.push_intrinsic = 0.0
 
                 # ── Logit saturation penalty (Interval mode, regression) ─────
                 # Optional: penalise extreme prediction magnitudes even for
@@ -15224,6 +15339,85 @@ def epsilon_lexicase_selection(population, X, y_target, type_code, n_cases=20,
 import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor
 
+
+# ══════════════════════════════════════════════════════════════════════════
+# GRACEFUL SHUTDOWN — Ctrl-C while ProcessPoolExecutor workers run
+# ══════════════════════════════════════════════════════════════════════════
+def _pool_worker_init():
+    """ProcessPoolExecutor worker initialiser: ignore SIGINT in the worker so a
+    Ctrl-C reaches ONLY the main process.
+
+    Without this, the terminal delivers SIGINT to the whole process group; each
+    worker raises KeyboardInterrupt mid-task — frequently while unpickling the
+    dataset chunk it was just handed — and a worker dying inside that C-level
+    deserialisation leaves the pool's manager thread waiting on a result that
+    never arrives, so the parent's implicit ``shutdown(wait=True)`` hangs until a
+    SECOND Ctrl-C.  With SIGINT ignored here the workers stay alive and the
+    parent tears the pool down deterministically (see ``_InterruptiblePool``)."""
+    try:
+        import signal
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+    except Exception:
+        pass
+
+
+def _shutdown_pool_now(executor):
+    """Best-effort IMMEDIATE teardown of a ProcessPoolExecutor on Ctrl-C.
+
+    Cancels queued-but-unstarted work and force-terminates the worker processes
+    so the parent never blocks waiting for an in-flight chunk to finish.  Results
+    already collected from completed chunks (their HoF updates) are preserved in
+    the parent — only the interrupted chunk's partial progress is dropped."""
+    try:
+        executor.shutdown(wait=False, cancel_futures=True)
+    except TypeError:
+        try:                       # Python < 3.9: no cancel_futures kwarg
+            executor.shutdown(wait=False)
+        except Exception:
+            pass
+    except Exception:
+        pass
+    # Workers ignore SIGINT, so they would otherwise run their current chunk to
+    # completion before exiting — terminate them to make the stop responsive.
+    procs = getattr(executor, '_processes', None)
+    if procs:
+        for p in list(procs.values()):
+            try:
+                p.terminate()
+            except Exception:
+                pass
+
+
+class _InterruptiblePool:
+    """``ProcessPoolExecutor`` context-manager that shuts down gracefully.
+
+    Drop-in for ``concurrent.futures.ProcessPoolExecutor(max_workers=…)`` used as
+    ``with _InterruptiblePool(n) as executor:`` — ``executor`` is the real pool so
+    ``submit`` / ``map`` are unchanged.  Two behaviours differ from the bare
+    executor:
+      • workers ignore SIGINT (via ``_pool_worker_init``), and
+      • on a KeyboardInterrupt leaving the ``with`` block, ``__exit__`` force-
+        terminates the workers instead of the default blocking
+        ``shutdown(wait=True)`` — so a single Ctrl-C stops the run immediately
+        and the caller's ``except KeyboardInterrupt`` can save/report results.
+    """
+    __slots__ = ("_ex",)
+
+    def __init__(self, max_workers):
+        self._ex = concurrent.futures.ProcessPoolExecutor(
+            max_workers=max_workers, initializer=_pool_worker_init)
+
+    def __enter__(self):
+        return self._ex
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is not None and issubclass(exc_type, KeyboardInterrupt):
+            _shutdown_pool_now(self._ex)
+        else:
+            self._ex.shutdown(wait=True)
+        return False   # never suppress — let KeyboardInterrupt reach the handler
+
+
 def _parallel_fit_surrogate(opt):
     opt.fit_surrogate()
     return opt
@@ -15963,6 +16157,7 @@ def evolve_island_chunk(args):
         philosophy: constants are cheap to tune and critical for fit quality.
     """
     global _PUSH_ANNEAL_SCALE          # per-chunk Discovery-Push anneal scale
+    global _COMPLEXITY_PRESSURE_SCALE  # per-gen stagnation complexity relaxation
     # Support both the 16-tuple legacy form and a 17-tuple form that carries
     # per-sample fitness weights (boosting stages forward Hessian × class
     # weights here so rare-class rows survive the regression-on-residuals
@@ -16147,6 +16342,17 @@ def evolve_island_chunk(args):
         # as stagnation progresses, avoiding the abrupt jumps of discrete levels.
         stag_frac = local_stag / max(ext_patience, 1)
         stag_mul = 1.0 + 3.0 / (1.0 + np.exp(-10.0 * (stag_frac - 0.5)))
+
+        # ── Stagnation-driven complexity-pressure relaxation ───────────────
+        # Relax the per-complexity-unit parsimony cost as this pool stalls so a
+        # more-accurate but more-complex structure can survive selection and
+        # displace a good-enough plateau model; snaps back to full pressure the
+        # moment a new best resets local_stag (stag_frac → 0).  See the config.
+        if DYNAMIC_COMPLEXITY_RELAX_ENABLED:
+            _sf = 0.0 if stag_frac < 0.0 else (1.0 if stag_frac > 1.0 else stag_frac)
+            _COMPLEXITY_PRESSURE_SCALE = 1.0 - (1.0 - COMPLEXITY_RELAX_MIN) * _sf
+        else:
+            _COMPLEXITY_PRESSURE_SCALE = 1.0
 
         # ── IMPROVEMENT: Periodic light constant optimisation ─────────────────
         # Every _LIGHT_CONST_OPT_FREQ generations, run a quick L-BFGS-B polish
@@ -16991,6 +17197,7 @@ def evolve_afpo(population, X, y_target, type_code,
     AFPO and the islanded-AFPO path.
     """
     global _PUSH_ANNEAL_SCALE          # per-chunk Discovery-Push anneal scale
+    global _COMPLEXITY_PRESSURE_SCALE  # per-gen stagnation complexity relaxation
     # Adopt any archipelago-wide consensus operator costs before this chunk
     # re-prices locally (fail-safe no-op for the single-process AFPO path).
     ADAPTIVE_OP_COST.maybe_load_consensus()
@@ -17245,6 +17452,17 @@ def evolve_afpo(population, X, y_target, type_code,
         # as stagnation progresses, avoiding the abrupt jumps of discrete levels.
         stag_frac = local_stag / max(ext_patience, 1)
         stag_mul = 1.0 + 3.0 / (1.0 + np.exp(-10.0 * (stag_frac - 0.5)))
+
+        # ── Stagnation-driven complexity-pressure relaxation ───────────────
+        # Relax the per-complexity-unit parsimony cost as this pool stalls so a
+        # more-accurate but more-complex structure can survive selection and
+        # displace a good-enough plateau model; snaps back to full pressure the
+        # moment a new best resets local_stag (stag_frac → 0).  See the config.
+        if DYNAMIC_COMPLEXITY_RELAX_ENABLED:
+            _sf = 0.0 if stag_frac < 0.0 else (1.0 if stag_frac > 1.0 else stag_frac)
+            _COMPLEXITY_PRESSURE_SCALE = 1.0 - (1.0 - COMPLEXITY_RELAX_MIN) * _sf
+        else:
+            _COMPLEXITY_PRESSURE_SCALE = 1.0
 
         # ── Periodic HoF re-injection (mirrors evolve_island_chunk B4) ───────
         _HOF_REINJECT_FREQ = 100
@@ -26834,7 +27052,7 @@ def _run_boosting_stage_evolution(X, residuals, n_features, feat_names,
     MIGRATION_FREQ = 50
     gen = 0
     try:
-        with ProcessPoolExecutor(max_workers=NUM_ISLANDS_STAGE) as executor:
+        with _InterruptiblePool(max_workers=NUM_ISLANDS_STAGE) as executor:
             while gen < gens_per_stage:
                 batch_idx = (np.random.choice(X_stage.shape[0], BATCH_SIZE, replace=False)
                              if BATCH_SIZE > 0 else None)
@@ -29175,29 +29393,58 @@ def train_mode():
         else:
             X_init, Y_init = X, Y
 
-        for island_idx in range(NUM_ISLANDS):
-            for i in range(n_outputs):
-                pop = generate_seeds_v5(n_features, feat_names)
-                # Add feature-importance-biased seeds for every island (not
-                # just island 0) so all islands benefit from data-driven
-                # initialization rather than relying solely on generic templates.
-                try:
-                    imp_seeds = generate_importance_biased_seeds(
-                        n_features, feat_names, X_init, Y_init[:, i])
-                    pop.extend(imp_seeds)
-                    if imp_seeds and island_idx == 0:
-                        print(f"    [Importance] {len(imp_seeds)} data-driven seeds "
-                              f"for output {i}")
-                except Exception:
-                    pass
-                while len(pop) < ISLAND_SIZE:
-                    pop.append(Individual(random_cgp(n_features, CGP_NODES, feat_names)))
-                for ind in pop:
-                    ind.calculate_fitness(X_init, Y_init[:, i], out_types[i],
-                                          target_grads=target_grads_list[i])
+        # Per-output initialisation, parallelised across outputs (each output
+        # owns its own HoF, so there is no cross-thread contention — the same
+        # ownership model as _parallel_rescore_hofs).  The expensive importance-
+        # biased seeds (closed-form OLS / log-OLS templates) depend only on the
+        # OUTPUT, so they are built + scored ONCE per output and the scored seeds
+        # are deep-copied into every island — replacing the old nested loop that
+        # regenerated and re-evaluated them NUM_ISLANDS times per output, an
+        # O(NUM_ISLANDS·n_outputs·N·n_features⁴) redundancy that dominated
+        # start-up on many-input / multi-output problems.
+        def _init_island_output(i):
+            yi    = Y_init[:, i]
+            otype = out_types[i]
+            tg    = target_grads_list[i]
+            try:
+                shared_imp = generate_importance_biased_seeds(
+                    n_features, feat_names, X_init, yi)
+            except Exception:
+                shared_imp = []
+            for ind in shared_imp:
+                ind.calculate_fitness(X_init, yi, otype, target_grads=tg)
+                hofs[i].update(ind)
+            pops_i = []
+            for _isl in range(NUM_ISLANDS):
+                # Fresh per-island structural seeds (random feature/const picks)
+                # + random fills keep each island's starting diversity.
+                fresh = generate_seeds_v5(n_features, feat_names)
+                while len(fresh) + len(shared_imp) < ISLAND_SIZE:
+                    fresh.append(Individual(random_cgp(n_features, CGP_NODES, feat_names)))
+                for ind in fresh:
+                    ind.calculate_fitness(X_init, yi, otype, target_grads=tg)
                     hofs[i].update(ind)
-                islands_pop[island_idx].append(pop)
-            print(f"  Island {island_idx+1}/{NUM_ISLANDS} initialized.")
+                # Reuse the already-scored data-driven seeds (deep-copied so each
+                # island evolves an independent lineage).
+                pops_i.append(fresh + [copy.deepcopy(s) for s in shared_imp])
+            return i, len(shared_imp), pops_i
+
+        _init_workers = _hof_executor_workers(n_outputs)
+        _init_results = [None] * n_outputs
+        if _init_workers <= 1:
+            for i in range(n_outputs):
+                _init_results[i] = _init_island_output(i)
+        else:
+            with ThreadPoolExecutor(max_workers=_init_workers) as _ex:
+                for _res in _ex.map(_init_island_output, range(n_outputs)):
+                    _init_results[_res[0]] = _res
+        for i in range(n_outputs):
+            _, _n_imp, pops_i = _init_results[i]
+            if _n_imp:
+                print(f"    [Importance] {_n_imp} data-driven seeds for output {i}")
+            for island_idx in range(NUM_ISLANDS):
+                islands_pop[island_idx].append(pops_i[island_idx])
+        print(f"  {NUM_ISLANDS} islands × {n_outputs} output(s) initialized.")
 
         # Re-evaluate HoF on full data for accurate scoring
         if N_train > _INIT_SUBSAMPLE_CAP:
@@ -29254,7 +29501,7 @@ def train_mode():
             except Exception:
                 pass
         try:
-            with concurrent.futures.ProcessPoolExecutor(max_workers=_island_workers) as executor:
+            with _InterruptiblePool(max_workers=_island_workers) as executor:
                 while True:
                     batch_idx = (np.random.choice(X.shape[0], BATCH_SIZE, replace=False)
                                  if BATCH_SIZE > 0 else None)
@@ -29559,36 +29806,55 @@ def train_mode():
         else:
             X_init, Y_init = X, Y
 
-        for i in range(n_outputs):
+        # Importance-biased seeds: closed-form OLS / log-OLS templates over the
+        # most-correlated features and rational/composite forms.  The single-
+        # stage AFPO previously initialised from v5 + random only, which left it
+        # strictly weaker than the island model on multi-feature linear /
+        # monomial / Buckingham-Π targets where OLS solves the coefficients
+        # outright on first evaluation.  Each output is independent (its own HoF
+        # and target column), so the whole per-output build → score → Pareto-trim
+        # is parallelised across outputs (mirrors _parallel_rescore_hofs); multi-
+        # output start-up no longer pays each output's OLS + full-pool scoring
+        # serially.
+        def _init_afpo_output(i):
+            yi    = Y_init[:, i]
+            otype = out_types[i]
+            tg    = target_grads_list[i]
             pop = generate_seeds_v5(n_features, feat_names)
-            # Importance-biased seeds: closed-form OLS / log-OLS templates
-            # over the most-correlated features and rational/composite forms.
-            # The single-stage AFPO previously initialised from v5 + random
-            # only, which left it strictly weaker than the island model on
-            # multi-feature linear / monomial / Buckingham-Π targets where
-            # OLS solves the coefficients outright on first evaluation.
+            n_imp = 0
             try:
                 imp_seeds = generate_importance_biased_seeds(
-                    n_features, feat_names, X_init, Y_init[:, i])
+                    n_features, feat_names, X_init, yi)
                 if imp_seeds:
                     pop.extend(imp_seeds)
-                    if i == 0:
-                        print(f"    [Importance] {len(imp_seeds)} data-driven seeds "
-                              f"for output {i}")
+                    n_imp = len(imp_seeds)
             except Exception:
                 pass
             while len(pop) < AFPO_POP_SIZE:
                 pop.append(Individual(random_cgp(n_features, CGP_NODES, feat_names)))
             for ind in pop:
-                ind.calculate_fitness(X_init, Y_init[:, i], out_types[i],
-                                      target_grads=target_grads_list[i])
+                ind.calculate_fitness(X_init, yi, otype, target_grads=tg)
                 hofs[i].update(ind)
-            # Trim the (possibly oversized) initial pool to AFPO_POP_SIZE
-            # using the 3-objective Pareto front — this preserves a balanced
-            # frontier across complexity buckets rather than truncating by
-            # arrival order.
-            pop = _trim_to_pareto_front_3obj(pop, AFPO_POP_SIZE)
-            afpo_pops.append(pop)
+            # Trim the (possibly oversized) initial pool to AFPO_POP_SIZE using
+            # the 3-objective Pareto front — preserves a balanced frontier across
+            # complexity buckets rather than truncating by arrival order.
+            return i, n_imp, _trim_to_pareto_front_3obj(pop, AFPO_POP_SIZE)
+
+        _init_workers = _hof_executor_workers(n_outputs)
+        _init_results = [None] * n_outputs
+        if _init_workers <= 1:
+            for i in range(n_outputs):
+                _init_results[i] = _init_afpo_output(i)
+        else:
+            with ThreadPoolExecutor(max_workers=_init_workers) as _ex:
+                for _res in _ex.map(_init_afpo_output, range(n_outputs)):
+                    _init_results[_res[0]] = _res
+        afpo_pops = [None] * n_outputs
+        for i in range(n_outputs):
+            _, _n_imp, pop = _init_results[i]
+            if _n_imp:
+                print(f"    [Importance] {_n_imp} data-driven seeds for output {i}")
+            afpo_pops[i] = pop
 
         if N_train > _INIT_SUBSAMPLE_CAP:
             print("  Re-scoring Hall of Fame on full dataset…")
@@ -29629,7 +29895,7 @@ def train_mode():
         # more than 8 cores get full parallelism on multi-output runs.
         _afpo_workers = min(max(1, n_outputs), max(1, os.cpu_count() or 8))
         try:
-            with concurrent.futures.ProcessPoolExecutor(max_workers=_afpo_workers) as executor:
+            with _InterruptiblePool(max_workers=_afpo_workers) as executor:
                 while True:
                     batch_idx = (np.random.choice(X.shape[0], BATCH_SIZE, replace=False) if BATCH_SIZE > 0 else None)
                     X_b = X[batch_idx] if batch_idx is not None else X
@@ -29929,45 +30195,62 @@ def train_mode():
         else:
             X_init, Y_init = X, Y
 
-        for s in range(N_STAGES):
-            for i in range(n_outputs):
+        # Importance-biased seeds (closed-form OLS / log-OLS templates) depend
+        # only on the OUTPUT, so they are built + scored ONCE per output and
+        # shared across all stages — replacing the old loop that regenerated
+        # them N_STAGES times per output.  Stage 0 receives the full set; later
+        # stages a capped influx so the graduation flow still drives stage-to-
+        # stage promotion.  Outputs are independent (own HoF / target), so the
+        # whole per-output build → score → per-stage assembly is parallelised
+        # across outputs (mirrors _parallel_rescore_hofs).
+        def _init_staged_output(i):
+            yi    = Y_init[:, i]
+            otype = out_types[i]
+            tg    = target_grads_list[i]
+            try:
+                shared_imp = generate_importance_biased_seeds(
+                    n_features, feat_names, X_init, yi)
+            except Exception:
+                shared_imp = []
+            for ind in shared_imp:
+                ind.calculate_fitness(X_init, yi, otype, target_grads=tg)
+                hofs[i].update(ind)
+            pops_by_stage = []
+            for s in range(N_STAGES):
                 pop = generate_seeds_v5(n_features, feat_names)
-                # Importance-biased seeds: closed-form OLS / log-OLS templates
-                # over the most-correlated features.  Mirrors the island
-                # model so staged AFPO doesn't start strictly weaker on
-                # linear / monomial targets where these seeds solve outright.
-                # Only stage 0 gets the data-driven seeds; later stages
-                # receive a smaller importance-biased injection so they
-                # don't out-compete the graduation flow with strong seeds
-                # they wouldn't normally see from younger tiers.
-                try:
-                    imp_seeds = generate_importance_biased_seeds(
-                        n_features, feat_names, X_init, Y_init[:, i])
-                    if imp_seeds:
-                        if s == 0:
-                            pop.extend(imp_seeds)
-                        else:
-                            # Later stages: cap the influx so the graduation
-                            # mechanism still drives stage-to-stage promotion.
-                            pop.extend(imp_seeds[:max(1, len(imp_seeds) // 3)])
-                        if s == 0 and i == 0:
-                            print(f"    [Importance] {len(imp_seeds)} data-driven seeds "
-                                  f"for stage 0 output {i}")
-                except Exception:
-                    pass
+                imp_share = (shared_imp if s == 0
+                             else shared_imp[:max(1, len(shared_imp) // 3)])
+                pop.extend(copy.deepcopy(sd) for sd in imp_share)
                 while len(pop) < AFPO_POP_SIZE:
                     pop.append(Individual(random_cgp(n_features, CGP_NODES, feat_names)))
                 for ind in pop:
                     ind.age = 0
-                    ind.calculate_fitness(X_init, Y_init[:, i], out_types[i],
-                                          target_grads=target_grads_list[i])
+                    # Deep-copied importance seeds were already scored above, so
+                    # this re-eval is a fitness-cache hit; v5 + random fills are
+                    # scored for real.
+                    ind.calculate_fitness(X_init, yi, otype, target_grads=tg)
                     hofs[i].update(ind)
-                # Trim oversized initial pool (importance-biased seeds may
-                # push beyond AFPO_POP_SIZE) using the 3-objective Pareto
-                # front to keep complexity diversity in stage 0.
-                pop = _trim_to_pareto_front_3obj(pop, AFPO_POP_SIZE)
-                stage_pops[s].append(pop)
-            print(f"  Stage {s+1}/{N_STAGES} initialized.")
+                # Trim the (possibly oversized) pool with the 3-objective Pareto
+                # front to keep complexity diversity.
+                pops_by_stage.append(_trim_to_pareto_front_3obj(pop, AFPO_POP_SIZE))
+            return i, len(shared_imp), pops_by_stage
+
+        _init_workers = _hof_executor_workers(n_outputs)
+        _init_results = [None] * n_outputs
+        if _init_workers <= 1:
+            for i in range(n_outputs):
+                _init_results[i] = _init_staged_output(i)
+        else:
+            with ThreadPoolExecutor(max_workers=_init_workers) as _ex:
+                for _res in _ex.map(_init_staged_output, range(n_outputs)):
+                    _init_results[_res[0]] = _res
+        for i in range(n_outputs):
+            _, _n_imp, pops_by_stage = _init_results[i]
+            if _n_imp:
+                print(f"    [Importance] {_n_imp} data-driven seeds for output {i}")
+            for s in range(N_STAGES):
+                stage_pops[s].append(pops_by_stage[s])
+        print(f"  {N_STAGES} stage(s) × {n_outputs} output(s) initialized.")
 
         if N_train > _INIT_SUBSAMPLE_CAP:
             print("  Re-scoring Hall of Fame on full dataset…")
@@ -30010,7 +30293,7 @@ def train_mode():
         _staged_afpo_workers = min(N_STAGES * max(1, n_outputs),
                                    max(1, os.cpu_count() or 8))
         try:
-            with concurrent.futures.ProcessPoolExecutor(max_workers=_staged_afpo_workers) as executor:
+            with _InterruptiblePool(max_workers=_staged_afpo_workers) as executor:
                 while True:
                     batch_idx = (np.random.choice(X.shape[0], BATCH_SIZE, replace=False) if BATCH_SIZE > 0 else None)
                     X_b = X[batch_idx] if batch_idx is not None else X
@@ -30517,7 +30800,7 @@ def train_mode():
         _isl_afpo_workers = min(NUM_ISLANDS * max(1, n_outputs),
                                 max(1, os.cpu_count() or 8))
         try:
-            with concurrent.futures.ProcessPoolExecutor(max_workers=_isl_afpo_workers) as executor:
+            with _InterruptiblePool(max_workers=_isl_afpo_workers) as executor:
                 while True:
                     batch_idx = (np.random.choice(X.shape[0], BATCH_SIZE, replace=False)
                                  if BATCH_SIZE > 0 else None)
@@ -30874,8 +31157,7 @@ def train_mode():
         _staged_isl_workers = min(total_pops_si * max(1, n_outputs),
                                   max(1, os.cpu_count() or 8))
         try:
-            with concurrent.futures.ProcessPoolExecutor(
-                    max_workers=_staged_isl_workers) as executor:
+            with _InterruptiblePool(max_workers=_staged_isl_workers) as executor:
                 while True:
                     batch_idx = (np.random.choice(X.shape[0], BATCH_SIZE, replace=False)
                                  if BATCH_SIZE > 0 else None)
@@ -31212,8 +31494,7 @@ def train_mode():
             # so the worker pool fully covers tasks for multi-output runs.
             _age_grp_workers = min(FLAT_COUNT * max(1, n_outputs),
                                    max(1, os.cpu_count() or 8))
-            with concurrent.futures.ProcessPoolExecutor(
-                    max_workers=_age_grp_workers) as executor:
+            with _InterruptiblePool(max_workers=_age_grp_workers) as executor:
                 while True:
                     batch_idx = (np.random.choice(X.shape[0], BATCH_SIZE, replace=False)
                                  if BATCH_SIZE > 0 else None)
