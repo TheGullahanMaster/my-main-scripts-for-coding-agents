@@ -18931,6 +18931,23 @@ def _hof_executor_workers(active_count, cap=8):
     return min(active_count, max(1, os.cpu_count() or cap), cap)
 
 
+def _full_data_hof_candidate(individual, X, y_col, out_type, target_grads=None):
+    """Return a full-data-scored copy suitable for global HoF admission.
+
+    Island workers may evaluate candidates on a subset (random mini-batch or
+    co-evolved adversarial fitness cases).  Those subset metrics are useful for
+    search pressure, but the global HoF drives user-facing "New Best" prints,
+    elitist reinjection and the final report, so admissions must be ranked on
+    the true full dataset with a freshly refit affine.
+    """
+    scored = copy.deepcopy(individual)
+    scored.affine_fitted = False
+    scored.calculate_fitness(X, y_col, out_type,
+                             update_affine=True,
+                             target_grads=target_grads)
+    return scored
+
+
 def _parallel_rescore_hofs(hofs, X, Y, out_types, target_grads_list,
                            perfect_outputs=None, refit_affine=True,
                            label=None):
@@ -30138,13 +30155,19 @@ def train_mode():
                         islands_pop[isl_idx][o_idx] = ret_pop
                         stagnation_counters[isl_idx][o_idx] = stag
                         for c, ind in local_hof.best_by_complexity.items():
-                            if hofs[o_idx].update(ind):
+                            admit_ind = (
+                                _full_data_hof_candidate(
+                                    ind, X, Y[:, o_idx], out_types[o_idx],
+                                    target_grads_list[o_idx])
+                                if batch_idx is not None else ind
+                            )
+                            if hofs[o_idx].update(admit_ind):
                                 is_cls = (out_types[o_idx] == 6)
-                                metric = (f"Acc={getattr(ind,'accuracy',0):.4f}"
-                                          if is_cls else f"R²={getattr(ind,'r2',0):.4f}")
+                                metric = (f"Acc={getattr(admit_ind,'accuracy',0):.4f}"
+                                          if is_cls else f"R²={getattr(admit_ind,'r2',0):.4f}")
                                 print(f"[Out {o_idx} | Isl {isl_idx}] "
-                                      f"New Best (Comp {ind.complexity:.0f}): "
-                                      f"loss={ind.loss:.4f}  {metric}")
+                                      f"New Best (Comp {admit_ind.complexity:.0f}): "
+                                      f"loss={admit_ind.loss:.4f}  {metric}")
 
                     # ── Rebuild + publish the global operator-cost consensus ──
                     # Every island is in scope here between chunks, so pool them
@@ -30299,12 +30322,12 @@ def train_mode():
                                 hofs[o_idx], X, Y[:, o_idx], out_types[o_idx],
                                 target_grads=target_grads_list[o_idx])
 
-                    # ---- Periodic HoF re-scoring on full data (batch mode) ----
-                    # When BATCH_SIZE > 0, island workers fit affine on batch data
+                    # ---- Periodic HoF re-scoring on full data (subset mode) ----
+                    # In random batch or co-evolution mode, island workers fit affine on subset data
                     # (they see X_b as their "full" dataset).  Periodically re-score
                     # all HoF entries on the true full dataset so affine parameters
                     # are accurate and entries are correctly ranked.
-                    if BATCH_SIZE > 0 and gen > 0 and gen % 200 == 0:
+                    if (BATCH_SIZE > 0 or COEVOLUTION_ENABLED) and gen > 0 and gen % 200 == 0:
                         _parallel_rescore_hofs(hofs, X, Y, out_types,
                                                target_grads_list,
                                                perfect_outputs=perfect_outputs)
@@ -30314,7 +30337,7 @@ def train_mode():
                     # stages and adaptive parsimony silently drift affine_a/b
                     # away from their unbiased fit over a long run, which makes
                     # cross-complexity ranking unreliable.  Re-fit every 500 gens.
-                    if BATCH_SIZE <= 0 and gen > 0 and gen % 500 == 0:
+                    if BATCH_SIZE <= 0 and not COEVOLUTION_ENABLED and gen > 0 and gen % 500 == 0:
                         _parallel_rescore_hofs(hofs, X, Y, out_types,
                                                target_grads_list,
                                                perfect_outputs=perfect_outputs)
@@ -30506,13 +30529,19 @@ def train_mode():
                         stag_cntrs[i] = stag
                         # Update global HoF with any new discoveries
                         for c, ind in local_hof.best_by_complexity.items():
-                            if hofs[i].update(ind):
+                            admit_ind = (
+                                _full_data_hof_candidate(
+                                    ind, X, Y[:, i], out_types[i],
+                                    target_grads_list[i])
+                                if batch_idx is not None else ind
+                            )
+                            if hofs[i].update(admit_ind):
                                 is_cls = (out_types[i] == 6)
-                                metric = (f"Acc={getattr(ind,'accuracy',0):.4f}"
-                                          if is_cls else f"R²={getattr(ind,'r2',0):.4f}")
+                                metric = (f"Acc={getattr(admit_ind,'accuracy',0):.4f}"
+                                          if is_cls else f"R²={getattr(admit_ind,'r2',0):.4f}")
                                 print(f"[Out {i} | AFPO] "
-                                      f"New Best (Comp {ind.complexity:.0f}): "
-                                      f"loss={ind.loss:.4f}  {metric}")
+                                      f"New Best (Comp {admit_ind.complexity:.0f}): "
+                                      f"loss={admit_ind.loss:.4f}  {metric}")
 
                     gen += chunk_freq_a
                     print(f"--- Generation {gen} ---")
@@ -30678,13 +30707,13 @@ def train_mode():
                                 hofs[o_idx], X, Y[:, o_idx], out_types[o_idx],
                                 target_grads=target_grads_list[o_idx])
 
-                    # ---- Periodic HoF re-scoring on full data (batch mode) ----
-                    # When BATCH_SIZE > 0 the workers see X_b as their full
+                    # ---- Periodic HoF re-scoring on full data (subset mode) ----
+                    # In random batch or co-evolution mode, workers see X_b as their full
                     # dataset, so affine_a/b are fitted to the batch.  Every
                     # 200 gens we re-score every HoF entry on the true X so
                     # rankings stay correct and downstream validation/plot
                     # output reflects the real predictor.
-                    if BATCH_SIZE > 0 and gen > 0 and gen % 200 == 0:
+                    if (BATCH_SIZE > 0 or COEVOLUTION_ENABLED) and gen > 0 and gen % 200 == 0:
                         _parallel_rescore_hofs(hofs, X, Y, out_types,
                                                target_grads_list,
                                                perfect_outputs=perfect_outputs)
@@ -30696,7 +30725,7 @@ def train_mode():
                     # generations we re-fit the affine on the FULL training set
                     # so HoF entries stay correctly ranked and downstream
                     # validation / plotting reflects the true predictor.
-                    if BATCH_SIZE <= 0 and gen > 0 and gen % 500 == 0:
+                    if BATCH_SIZE <= 0 and not COEVOLUTION_ENABLED and gen > 0 and gen % 500 == 0:
                         _parallel_rescore_hofs(hofs, X, Y, out_types,
                                                target_grads_list,
                                                perfect_outputs=perfect_outputs)
@@ -30906,14 +30935,20 @@ def train_mode():
                         stage_pops[s][i] = ret_pop
                         stag_cntrs[s][i] = stag
                         for c, ind in local_hof.best_by_complexity.items():
-                            if hofs[i].update(ind):
+                            admit_ind = (
+                                _full_data_hof_candidate(
+                                    ind, X, Y[:, i], out_types[i],
+                                    target_grads_list[i])
+                                if batch_idx is not None else ind
+                            )
+                            if hofs[i].update(admit_ind):
                                 is_cls = (out_types[i] == 6)
-                                metric = (f"Acc={getattr(ind,'accuracy',0):.4f}"
+                                metric = (f"Acc={getattr(admit_ind,'accuracy',0):.4f}"
                                           if is_cls
-                                          else f"R²={getattr(ind,'r2',0):.4f}")
+                                          else f"R²={getattr(admit_ind,'r2',0):.4f}")
                                 print(f"[Out {i} | AFPO Stage {s}] "
-                                      f"New Best (Comp {ind.complexity:.0f}): "
-                                      f"loss={ind.loss:.4f}  {metric}")
+                                      f"New Best (Comp {admit_ind.complexity:.0f}): "
+                                      f"loss={admit_ind.loss:.4f}  {metric}")
 
                     gen += MIGRATION_FREQ
                     _grad_accum += MIGRATION_FREQ
@@ -31247,7 +31282,7 @@ def train_mode():
                                 target_grads=target_grads_list[o_idx])
 
                     # ---- Periodic HoF re-scoring on full data (batch mode) ----
-                    if BATCH_SIZE > 0 and gen > 0 and gen % 200 == 0:
+                    if (BATCH_SIZE > 0 or COEVOLUTION_ENABLED) and gen > 0 and gen % 200 == 0:
                         _parallel_rescore_hofs(hofs, X, Y, out_types,
                                                target_grads_list,
                                                perfect_outputs=perfect_outputs)
@@ -31257,7 +31292,7 @@ def train_mode():
                     # stages and adaptive parsimony silently drift affine_a/b
                     # away from their unbiased fit over a long run, which makes
                     # cross-complexity ranking unreliable.  Re-fit every 500 gens.
-                    if BATCH_SIZE <= 0 and gen > 0 and gen % 500 == 0:
+                    if BATCH_SIZE <= 0 and not COEVOLUTION_ENABLED and gen > 0 and gen % 500 == 0:
                         _parallel_rescore_hofs(hofs, X, Y, out_types,
                                                target_grads_list,
                                                perfect_outputs=perfect_outputs)
@@ -31406,13 +31441,19 @@ def train_mode():
                         islands_pop[isl_idx][o_idx] = ret_pop
                         stagnation_counters[isl_idx][o_idx] = stag
                         for c, ind in local_hof.best_by_complexity.items():
-                            if hofs[o_idx].update(ind):
+                            admit_ind = (
+                                _full_data_hof_candidate(
+                                    ind, X, Y[:, o_idx], out_types[o_idx],
+                                    target_grads_list[o_idx])
+                                if batch_idx is not None else ind
+                            )
+                            if hofs[o_idx].update(admit_ind):
                                 is_cls = (out_types[o_idx] == 6)
-                                metric = (f"Acc={getattr(ind,'accuracy',0):.4f}"
-                                          if is_cls else f"R²={getattr(ind,'r2',0):.4f}")
+                                metric = (f"Acc={getattr(admit_ind,'accuracy',0):.4f}"
+                                          if is_cls else f"R²={getattr(admit_ind,'r2',0):.4f}")
                                 print(f"[Out {o_idx} | AFPO-Isl {isl_idx}] "
-                                      f"New Best (Comp {ind.complexity:.0f}): "
-                                      f"loss={ind.loss:.4f}  {metric}")
+                                      f"New Best (Comp {admit_ind.complexity:.0f}): "
+                                      f"loss={admit_ind.loss:.4f}  {metric}")
 
                     gen += MIGRATION_FREQ
 
@@ -31581,13 +31622,13 @@ def train_mode():
                                 hofs[o_idx], X, Y[:, o_idx], out_types[o_idx],
                                 target_grads=target_grads_list[o_idx])
 
-                    # ---- Periodic HoF re-scoring on full data (batch mode) ----
-                    # When BATCH_SIZE > 0 the workers see X_b as their full
+                    # ---- Periodic HoF re-scoring on full data (subset mode) ----
+                    # In random batch or co-evolution mode, workers see X_b as their full
                     # dataset, so affine_a/b are fitted to the batch.  Every
                     # 200 gens we re-score every HoF entry on the true X so
                     # rankings stay correct and downstream validation/plot
                     # output reflects the real predictor.
-                    if BATCH_SIZE > 0 and gen > 0 and gen % 200 == 0:
+                    if (BATCH_SIZE > 0 or COEVOLUTION_ENABLED) and gen > 0 and gen % 200 == 0:
                         _parallel_rescore_hofs(hofs, X, Y, out_types,
                                                target_grads_list,
                                                perfect_outputs=perfect_outputs)
@@ -31597,7 +31638,7 @@ def train_mode():
                     # stages and adaptive parsimony silently drift affine_a/b
                     # away from their unbiased fit over a long run, which makes
                     # cross-complexity ranking unreliable.  Re-fit every 500 gens.
-                    if BATCH_SIZE <= 0 and gen > 0 and gen % 500 == 0:
+                    if BATCH_SIZE <= 0 and not COEVOLUTION_ENABLED and gen > 0 and gen % 500 == 0:
                         _parallel_rescore_hofs(hofs, X, Y, out_types,
                                                target_grads_list,
                                                perfect_outputs=perfect_outputs)
@@ -31766,14 +31807,20 @@ def train_mode():
                         stage_islands[s_r][isl_r][o_idx] = ret_pop
                         stag_counters[s_r][isl_r][o_idx] = stag
                         for c, ind in local_hof.best_by_complexity.items():
-                            if hofs[o_idx].update(ind):
+                            admit_ind = (
+                                _full_data_hof_candidate(
+                                    ind, X, Y[:, o_idx], out_types[o_idx],
+                                    target_grads_list[o_idx])
+                                if batch_idx is not None else ind
+                            )
+                            if hofs[o_idx].update(admit_ind):
                                 is_cls = (out_types[o_idx] == 6)
-                                metric = (f"Acc={getattr(ind,'accuracy',0):.4f}"
+                                metric = (f"Acc={getattr(admit_ind,'accuracy',0):.4f}"
                                           if is_cls
-                                          else f"R²={getattr(ind,'r2',0):.4f}")
+                                          else f"R²={getattr(admit_ind,'r2',0):.4f}")
                                 print(f"[Out {o_idx} | Stage {s_r} Isl {isl_r}] "
-                                      f"New Best (Comp {ind.complexity:.0f}): "
-                                      f"loss={ind.loss:.4f}  {metric}")
+                                      f"New Best (Comp {admit_ind.complexity:.0f}): "
+                                      f"loss={admit_ind.loss:.4f}  {metric}")
 
                     gen += MIGRATION_FREQ
 
@@ -31919,7 +31966,7 @@ def train_mode():
                                 target_grads=target_grads_list[o_idx])
 
                     # ---- Periodic HoF re-scoring on full data (batch mode) ----
-                    if BATCH_SIZE > 0 and gen > 0 and gen % 200 == 0:
+                    if (BATCH_SIZE > 0 or COEVOLUTION_ENABLED) and gen > 0 and gen % 200 == 0:
                         _parallel_rescore_hofs(hofs, X, Y, out_types,
                                                target_grads_list,
                                                perfect_outputs=perfect_outputs)
@@ -31929,7 +31976,7 @@ def train_mode():
                     # stages and adaptive parsimony silently drift affine_a/b
                     # away from their unbiased fit over a long run, which makes
                     # cross-complexity ranking unreliable.  Re-fit every 500 gens.
-                    if BATCH_SIZE <= 0 and gen > 0 and gen % 500 == 0:
+                    if BATCH_SIZE <= 0 and not COEVOLUTION_ENABLED and gen > 0 and gen % 500 == 0:
                         _parallel_rescore_hofs(hofs, X, Y, out_types,
                                                target_grads_list,
                                                perfect_outputs=perfect_outputs)
@@ -32103,13 +32150,19 @@ def train_mode():
                         tier_islands[tier_r][isl_r][o_idx] = ret_pop
                         stag_counters[tier_r][isl_r][o_idx] = stag
                         for c, ind in local_hof.best_by_complexity.items():
-                            if hofs[o_idx].update(ind):
+                            admit_ind = (
+                                _full_data_hof_candidate(
+                                    ind, X, Y[:, o_idx], out_types[o_idx],
+                                    target_grads_list[o_idx])
+                                if batch_idx is not None else ind
+                            )
+                            if hofs[o_idx].update(admit_ind):
                                 is_cls = (out_types[o_idx] == 6)
-                                metric = (f"Acc={getattr(ind,'accuracy',0):.4f}"
-                                          if is_cls else f"R²={getattr(ind,'r2',0):.4f}")
+                                metric = (f"Acc={getattr(admit_ind,'accuracy',0):.4f}"
+                                          if is_cls else f"R²={getattr(admit_ind,'r2',0):.4f}")
                                 print(f"[Out {o_idx} | Tier {tier_r} Isl {isl_r}] "
-                                      f"New Best (Comp {ind.complexity:.0f}): "
-                                      f"loss={ind.loss:.4f}  {metric}")
+                                      f"New Best (Comp {admit_ind.complexity:.0f}): "
+                                      f"loss={admit_ind.loss:.4f}  {metric}")
 
                     gen += MIGRATION_FREQ
 
@@ -32266,13 +32319,13 @@ def train_mode():
                                 hofs[o_idx], X, Y[:, o_idx], out_types[o_idx],
                                 target_grads=target_grads_list[o_idx])
 
-                    # ---- Periodic HoF re-scoring on full data (batch mode) ----
-                    # When BATCH_SIZE > 0 the workers see X_b as their full
+                    # ---- Periodic HoF re-scoring on full data (subset mode) ----
+                    # In random batch or co-evolution mode, workers see X_b as their full
                     # dataset, so affine_a/b are fitted to the batch.  Every
                     # 200 gens we re-score every HoF entry on the true X so
                     # rankings stay correct and downstream validation/plot
                     # output reflects the real predictor.
-                    if BATCH_SIZE > 0 and gen > 0 and gen % 200 == 0:
+                    if (BATCH_SIZE > 0 or COEVOLUTION_ENABLED) and gen > 0 and gen % 200 == 0:
                         _parallel_rescore_hofs(hofs, X, Y, out_types,
                                                target_grads_list,
                                                perfect_outputs=perfect_outputs)
@@ -32282,7 +32335,7 @@ def train_mode():
                     # stages and adaptive parsimony silently drift affine_a/b
                     # away from their unbiased fit over a long run, which makes
                     # cross-complexity ranking unreliable.  Re-fit every 500 gens.
-                    if BATCH_SIZE <= 0 and gen > 0 and gen % 500 == 0:
+                    if BATCH_SIZE <= 0 and not COEVOLUTION_ENABLED and gen > 0 and gen % 500 == 0:
                         _parallel_rescore_hofs(hofs, X, Y, out_types,
                                                target_grads_list,
                                                perfect_outputs=perfect_outputs)
