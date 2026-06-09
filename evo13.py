@@ -1169,6 +1169,30 @@ INSTANCE_REWEIGHT_MAX          = 8.0     # per-example weight ceiling (anti-runa
 INSTANCE_REWEIGHT_REG_TOL      = 0.25    # regression: |resid| > tol*std(y) counts as a miss
 INSTANCE_REWEIGHT_UPDATE_EVERY = 1       # re-score / re-weight every N generations
 
+# ---- Competitive Co-Evolution (Hillis Predator–Prey, adapted for SR) ----
+# Hillis (1990) co-evolved sorting networks (hosts) against an adversarial
+# population of test cases (parasites).  Adapted to symbolic regression: each
+# *parasite* encodes a fixed-size subset of the training rows ("fitness cases"),
+# and the parasite population evolves to surface the rows on which the current
+# best equations perform WORST.  The hosts (the equations, evolved by whichever
+# EVOLUTION_MODEL is chosen) are then trained on that adversarial subset each
+# chunk instead of on a random mini-batch, so the search is continually pushed
+# at its own weak points in an arms race.
+#
+# The size of a parasite's fitness-case subset is the co-evolution analogue of
+# the mini-batch size: it is how many rows the hosts see each generation.
+# Disengagement (parasites becoming so hard the hosts get no usable gradient
+# and the arms race stalls) is countered with Cartlidge & Bullock's (2004)
+# *reduced virulence* λ: a parasite's reward peaks at host-failure level λ
+# rather than at 1.0, keeping both populations engaged.  Toggled interactively
+# at startup (default OFF).
+COEVOLUTION_ENABLED = False   # master switch (asked just before batch size)
+COEVO_CASE_SUBSET   = 64      # rows per parasite — the mini-batch-size analogue
+COEVO_POP_SIZE      = 32      # number of parasites in the predator population
+COEVO_MUT_RATE      = 0.30    # fraction of a parasite's rows resampled per mutation
+COEVO_VIRULENCE     = 0.75    # reduced-virulence λ ∈ (0,1]  (1.0 = full virulence)
+_COEVO_RUNTIME      = None    # lazily-built _PredatorPreyCoevolution instance
+
 # ---- Bayesian CGP Settings ----
 # Bayesian optimisation uses a Gaussian Process surrogate to model the
 # fitness landscape over CGP genotype space, and Expected Improvement (EI)
@@ -3196,6 +3220,17 @@ OP_PRESETS = {
         "desc": "Choose individual operations from the full list.",
         "ops": None,  # filled interactively
     },
+    "11": {
+        "name": "ALL-NORNG  (all ops, no RNG/noise)",
+        "desc": "Every operator EXCEPT the RNG / noise primitives "
+                "(python_rng, perlin_noise).  Same widest search space as Full, "
+                "minus the two stochastic-looking ops — useful when you want a "
+                "fully smooth / closed-form vocabulary.",
+        # Resolved at selection time (exactly like Full) so the perceptron gate
+        # still applies; python_rng / perlin_noise are then stripped out —
+        # see select_allowed_ops().
+        "ops": None,
+    },
 }
 
 
@@ -3247,7 +3282,7 @@ def select_allowed_ops():
             choice = "9"
         if choice in OP_PRESETS:
             break
-        print("  Please enter a number from 1–10.")
+        print("  Please enter a number from 1–11.")
 
     if choice == "10":
         # Custom selection
@@ -3278,6 +3313,13 @@ def select_allowed_ops():
     elif choice == "9":
         # Full preset — resolved dynamically so the perceptron gating applies.
         ALLOWED_OPS = _visible_op_list()
+    elif choice == "11":
+        # ALL-NORNG — Full minus the RNG/noise primitives.  Resolved dynamically
+        # (just like Full) so the perceptron gate still applies, then python_rng
+        # and perlin_noise are stripped from the result.
+        _NORNG_EXCLUDE = ('python_rng', 'perlin_noise')
+        ALLOWED_OPS = [op for op in _visible_op_list()
+                       if op not in _NORNG_EXCLUDE]
     else:
         if choice == "7" and not PERCEPTRON_ENABLED:
             # Pseudo-NAS is built around the perceptron family, so selecting it
@@ -3848,6 +3890,296 @@ def _select_difficulty_weighting():
           f"reg-tol {INSTANCE_REWEIGHT_REG_TOL:g}·std, every "
           f"{INSTANCE_REWEIGHT_UPDATE_EVERY} gen).")
     print("     ⚠  Optional & overfitting-prone — see the notes above.")
+
+
+# ==========================================
+# COMPETITIVE CO-EVOLUTION  (Hillis Predator–Prey, adapted for SR)
+# ==========================================
+
+class _PredatorPreyCoevolution:
+    """Hillis-style predator–prey competitive co-evolution for symbolic regression.
+
+    Two populations co-evolve in an arms race:
+
+      • HOSTS (prey)          — the candidate equations.  They are evolved by the
+                                chosen EVOLUTION_MODEL exactly as usual; this
+                                class never touches them directly.
+      • PARASITES (predators) — each encodes a fixed-size subset of the training
+                                rows (the "fitness cases").  They evolve to
+                                expose the rows on which the current host
+                                champions do WORST, and hand that subset to the
+                                hosts as the chunk's training batch.
+
+    A parasite's subset size is the co-evolution analogue of the mini-batch
+    size.  Parasite fitness uses Cartlidge & Bullock (2004) *reduced virulence*
+    so the predators stay engaged instead of collapsing onto impossibly-hard
+    cases and starving the hosts of signal.
+
+    The whole mechanism lives in the main process (parasites are just row-index
+    arrays); the host workers receive the pre-sliced rows exactly as they do for
+    an ordinary mini-batch, so no worker-side change is needed.
+    """
+
+    def __init__(self, n_rows, subset, pop_size, mut_rate, virulence,
+                 tournament=3, seed=None):
+        self.n_rows     = int(n_rows)
+        self.subset     = max(1, min(int(subset), self.n_rows))
+        self.pop_size   = max(2, int(pop_size))
+        self.mut_rate   = float(min(max(mut_rate, 0.0), 1.0))
+        self.virulence  = float(min(max(virulence, 1e-3), 1.0))
+        self.tournament = max(2, min(int(tournament), self.pop_size))
+        self.rng        = np.random.default_rng(seed)
+        # Each parasite is an int array of distinct row indices, length `subset`.
+        self.parasites  = [self._random_parasite() for _ in range(self.pop_size)]
+        self.generation = 0
+
+    # ---- parasite genome helpers ------------------------------------------
+    def _random_parasite(self):
+        if self.subset >= self.n_rows:
+            return np.arange(self.n_rows, dtype=np.int64)
+        return self.rng.choice(self.n_rows, size=self.subset,
+                               replace=False).astype(np.int64)
+
+    def _draw_rows(self, count, exclude, hardness):
+        """Draw `count` distinct rows not already in `exclude`, biased toward the
+        currently-hard rows when a hardness signal is available (else uniform).
+        The hardness bias is what makes the predators chase host weaknesses."""
+        if count <= 0:
+            return np.empty(0, dtype=np.int64)
+        mask = np.ones(self.n_rows, dtype=bool)
+        if exclude:
+            mask[list(exclude)] = False
+        avail = np.nonzero(mask)[0]
+        if avail.size <= count:
+            return avail.astype(np.int64)
+        if hardness is not None:
+            w = np.clip(hardness[avail].astype(np.float64), 1e-12, None)
+            # Mix with uniform so exploration never fully stops (50/50).
+            w = 0.5 * (w / w.sum()) + 0.5 / w.size
+            w /= w.sum()
+            return self.rng.choice(avail, size=count, replace=False,
+                                   p=w).astype(np.int64)
+        return self.rng.choice(avail, size=count, replace=False).astype(np.int64)
+
+    def _mutate(self, parasite, hardness):
+        """Resample a `mut_rate` fraction of a parasite's rows."""
+        if self.subset >= self.n_rows:
+            return parasite.copy()
+        k = min(self.subset, max(1, int(round(self.mut_rate * self.subset))))
+        drop = self.rng.choice(self.subset, size=k, replace=False)
+        keep_mask = np.ones(self.subset, dtype=bool)
+        keep_mask[drop] = False
+        kept = parasite[keep_mask]
+        new_rows = self._draw_rows(self.subset - kept.size,
+                                   set(kept.tolist()), hardness)
+        return np.concatenate([kept, new_rows]).astype(np.int64)
+
+    # ---- host-failure signal ----------------------------------------------
+    def _row_hardness(self, X, Y, hofs, out_types):
+        """Per-row host-failure in [0,1]^n_rows from the current champions.
+
+        Each output's per-row error is normalised to [0,1] (so no single output
+        dominates by scale) and averaged over the outputs that have a champion.
+        Returns None during the cold start when no champion exists yet.
+
+        The metric mirrors the training loss closely enough to rank rows by
+        difficulty: squared residual (after the champion's locked affine) for
+        regression, per-row BCE for classification.  It is a hardness proxy, not
+        the exact selection loss — that is all the predators need."""
+        n = X.shape[0]
+        total = np.zeros(n, dtype=np.float64)
+        used  = 0
+        for i, hof in enumerate(hofs):
+            champ = hof.get_best_overall()
+            if champ is None or getattr(champ, 'tree', None) is None:
+                continue
+            try:
+                preds = champ.tree.evaluate(X)
+            except Exception:
+                continue
+            preds = np.clip(np.nan_to_num(preds, nan=0.0, posinf=1e9,
+                                          neginf=-1e9), -1e9, 1e9)
+            y = Y[:, i]
+            if i < len(out_types) and out_types[i] == 6:
+                # Classification: per-row BCE (logits used directly, no affine).
+                err = np.logaddexp(0.0, preds) - preds * y
+            else:
+                a = float(getattr(champ, 'affine_a', 1.0))
+                b = float(getattr(champ, 'affine_b', 0.0))
+                err = (a * preds + b - y) ** 2
+            err = np.nan_to_num(err, nan=0.0, posinf=1e18, neginf=0.0)
+            m = float(err.max())
+            if m > 0.0:
+                total += err / m
+                used  += 1
+        if used == 0:
+            return None
+        return total / used
+
+    # ---- parasite fitness + one GA generation ------------------------------
+    def _score(self, parasite, hardness):
+        """Cartlidge & Bullock reduced-virulence parasite fitness.
+
+        x = the parasite's mean host-failure ∈ [0,1].  At λ=1 the reward is the
+        monotone 2x − x² (full virulence: harder is always better).  At λ<1 the
+        reward peaks at x=λ then declines, so a parasite that makes the hosts
+        fail *completely* is no longer maximally fit — this is the standard fix
+        for co-evolutionary disengagement."""
+        x = float(np.mean(hardness[parasite]))
+        lam = self.virulence
+        return (2.0 * x / lam) - (x / lam) ** 2
+
+    def _tournament_pick(self, scores):
+        idx = self.rng.choice(self.pop_size, size=self.tournament, replace=False)
+        return self.parasites[idx[int(np.argmax(scores[idx]))]]
+
+    def _evolve_from(self, scores, hardness):
+        """One (μ+λ)-style parasite generation: elitism + tournament + mutation."""
+        order   = np.argsort(scores)[::-1]
+        elite_n = max(1, self.pop_size // 5)
+        new_pop = [self.parasites[order[j]].copy() for j in range(elite_n)]
+        while len(new_pop) < self.pop_size:
+            new_pop.append(self._mutate(self._tournament_pick(scores), hardness))
+        self.parasites = new_pop
+        self.generation += 1
+
+    def next_batch(self, X, Y, hofs, out_types):
+        """Return the row indices the hosts should train on this chunk.
+
+        Scores the current parasites against the current host champions, takes
+        the toughest *engaged* parasite as the active adversarial batch, then
+        evolves the predator population for the next encounter.  On a cold start
+        (no champion yet) returns a random subset, which seeds the hosts and
+        gives the arms race something to bite on next chunk."""
+        hardness = self._row_hardness(X, Y, hofs, out_types)
+        if hardness is None:
+            return self._random_parasite()
+        scores = np.array([self._score(p, hardness) for p in self.parasites])
+        active = self.parasites[int(np.argmax(scores))].copy()
+        self._evolve_from(scores, hardness)
+        return active
+
+
+def _coevo_next_batch(X, Y, hofs, out_types):
+    """Lazily build (on first use) and step the predator–prey co-evolution,
+    returning the adversarial row indices for this chunk — or None when the
+    requested subset would cover the whole dataset (→ full-data evaluation)."""
+    global _COEVO_RUNTIME
+    n = X.shape[0]
+    if COEVO_CASE_SUBSET >= n:
+        return None
+    if _COEVO_RUNTIME is None or _COEVO_RUNTIME.n_rows != n:
+        _COEVO_RUNTIME = _PredatorPreyCoevolution(
+            n_rows=n, subset=COEVO_CASE_SUBSET, pop_size=COEVO_POP_SIZE,
+            mut_rate=COEVO_MUT_RATE, virulence=COEVO_VIRULENCE)
+    return _COEVO_RUNTIME.next_batch(X, Y, hofs, out_types)
+
+
+def _select_batch_indices(X, Y, hofs, out_types, batch_size):
+    """Pick the training-row indices for the current evolution chunk.
+
+    • Competitive co-evolution ON  → the adversarial fitness-case subset chosen
+      by the co-evolving parasite population (see _PredatorPreyCoevolution).
+    • Co-evolution OFF             → a uniform random mini-batch of `batch_size`
+      rows, or None for the full dataset (the legacy behaviour, unchanged).
+    """
+    if COEVOLUTION_ENABLED:
+        idx = _coevo_next_batch(X, Y, hofs, out_types)
+        if idx is not None:
+            return idx
+        # subset covers the whole dataset → fall through to the full-data path
+    if batch_size and batch_size > 0:
+        return np.random.choice(X.shape[0], batch_size, replace=False)
+    return None
+
+
+def _select_coevolution_mode(n_rows):
+    """Ask whether to run Hillis-style predator–prey competitive co-evolution.
+
+    Asked just before the batch-size prompt: when enabled it REPLACES random
+    mini-batching with an adversarially co-evolved fitness-case subset, so this
+    framework's own knobs (parasite subset size, population, mutation rate,
+    virulence) stand in for the plain batch size.  Default OFF.
+    """
+    global COEVOLUTION_ENABLED, COEVO_CASE_SUBSET, COEVO_POP_SIZE
+    global COEVO_MUT_RATE, COEVO_VIRULENCE, _COEVO_RUNTIME
+
+    print("\n" + "─" * 70)
+    print("COMPETITIVE CO-EVOLUTION  (Hillis Predator–Prey, adapted for SR)")
+    print("─" * 70)
+    print("  Co-evolve TWO populations in an arms race:")
+    print("    • HOSTS (prey)      — the equations, evolved by your chosen model.")
+    print("    • PARASITES (pred.) — each is a subset of training rows that")
+    print("                          evolves to expose where the current best")
+    print("                          equations fail WORST.")
+    print("  Each chunk the hosts train on the toughest parasite's rows instead")
+    print("  of a random mini-batch, so the search is driven onto its own weak")
+    print("  spots.  The parasite subset size is this framework's stand-in for")
+    print("  the mini-batch size.")
+    print()
+    print("  Reduced virulence (Cartlidge & Bullock) stops the predators from")
+    print("  becoming impossibly hard and starving the hosts of gradient.")
+    print()
+    print("  Applies to the population-based models (Island / AFPO families).")
+    print("  The Bayesian and Gradient-Boosting modes use their own sampling")
+    print("  and ignore co-evolution.")
+    print("─" * 70)
+    choice = input("Enable competitive co-evolution? [y/N]: ").strip().lower()
+    if not choice.startswith('y'):
+        COEVOLUTION_ENABLED = False
+        _COEVO_RUNTIME = None
+        print("  Co-evolution disabled — standard random mini-batching.")
+        return
+
+    COEVOLUTION_ENABLED = True
+    _COEVO_RUNTIME = None   # reset any stale state from a previous configuration
+
+    # Parasite subset size — the batch-size analogue.
+    default_subset = max(2, min(COEVO_CASE_SUBSET, max(2, n_rows // 2)))
+    sub_in = input(
+        f"  Fitness-case subset size per parasite "
+        f"(rows the hosts see each gen — the batch-size analogue) "
+        f"[default {default_subset}]: ").strip()
+    COEVO_CASE_SUBSET = default_subset
+    if sub_in:
+        try:
+            COEVO_CASE_SUBSET = max(1, int(sub_in))
+        except ValueError:
+            pass
+    if COEVO_CASE_SUBSET >= n_rows:
+        print(f"  ⚠  Subset ({COEVO_CASE_SUBSET}) ≥ dataset rows ({n_rows}): every")
+        print(f"     parasite would cover all rows, so co-evolution degenerates")
+        print(f"     to full-dataset evaluation.  Pick a smaller subset for a")
+        print(f"     real arms race.")
+
+    pop_in = input(f"  Parasite population size [default {COEVO_POP_SIZE}]: ").strip()
+    if pop_in:
+        try:
+            COEVO_POP_SIZE = max(2, int(pop_in))
+        except ValueError:
+            pass
+
+    mut_in = input(
+        f"  Parasite mutation rate (fraction of rows resampled per generation) "
+        f"[default {COEVO_MUT_RATE}]: ").strip()
+    if mut_in:
+        try:
+            COEVO_MUT_RATE = min(max(float(mut_in), 0.0), 1.0)
+        except ValueError:
+            pass
+
+    vir_in = input(
+        f"  Virulence λ ∈ (0,1]  (1.0 = full; lower keeps the predators engaged) "
+        f"[default {COEVO_VIRULENCE}]: ").strip()
+    if vir_in:
+        try:
+            COEVO_VIRULENCE = min(max(float(vir_in), 1e-3), 1.0)
+        except ValueError:
+            pass
+
+    print(f"  ✓  Competitive co-evolution ENABLED  "
+          f"(subset {COEVO_CASE_SUBSET}, {COEVO_POP_SIZE} parasites, "
+          f"mut {COEVO_MUT_RATE:g}, virulence λ={COEVO_VIRULENCE:g}).")
 
 
 # ==========================================
@@ -28491,17 +28823,31 @@ def train_mode():
         print(f"Error loading file: {e}")
         return
 
+    # ---- Competitive co-evolution (Hillis predator–prey) ----
+    # Asked BEFORE batch size: when enabled it supplies an adversarially
+    # co-evolved fitness-case subset each chunk in place of random mini-batches,
+    # so its own parasite-subset-size knob stands in for the batch size.
+    _select_coevolution_mode(df.shape[0])
+
     # ---- Batch size ----
-    print("─" * 60)
-    print("BATCH SIZE")
-    print("  Use a random mini-batch of this many rows each generation.")
-    print("  Smaller = faster per generation but noisier fitness estimates.")
-    print("  Leave blank to use the full dataset every generation.")
-    batch_input = input("Batch Size [Enter = full dataset]: ").strip()
-    try:
-        BATCH_SIZE = int(batch_input) if batch_input else 0
-    except ValueError:
+    if COEVOLUTION_ENABLED:
+        # The co-evolving parasites choose the per-chunk row subset, so the
+        # plain random-mini-batch knob is bypassed (its size is governed by the
+        # parasite subset size asked above).
         BATCH_SIZE = 0
+        print("  Batch size is governed by the co-evolution parasite subset "
+              "size — skipping the random mini-batch prompt.")
+    else:
+        print("─" * 60)
+        print("BATCH SIZE")
+        print("  Use a random mini-batch of this many rows each generation.")
+        print("  Smaller = faster per generation but noisier fitness estimates.")
+        print("  Leave blank to use the full dataset every generation.")
+        batch_input = input("Batch Size [Enter = full dataset]: ").strip()
+        try:
+            BATCH_SIZE = int(batch_input) if batch_input else 0
+        except ValueError:
+            BATCH_SIZE = 0
 
     # ---- Perceptron gate (must run BEFORE operator selection so the
     # Full / Custom menus reflect the chosen visibility) ----
@@ -28523,11 +28869,20 @@ def train_mode():
     _select_class_weight_mode()
 
     # ---- Per-example difficulty weighting (optional hard-example mining) ----
-    _select_difficulty_weighting()
-    if INSTANCE_REWEIGHT_ENABLED and BATCH_SIZE > 0:
-        print("  [Difficulty Weighting] Mini-batching is incompatible with stable")
-        print("  per-example IDs — switching to full-dataset evaluation for this run.")
-        BATCH_SIZE = 0
+    if COEVOLUTION_ENABLED:
+        # Both competitive co-evolution and difficulty weighting adversarially
+        # re-weight the fitness cases; running them together would double-count.
+        # Co-evolution (chosen above) takes precedence, so difficulty weighting
+        # is skipped here.  (It defaults OFF at module level, so nothing else is
+        # needed to keep it inactive.)
+        print("  [Difficulty Weighting] Skipped — superseded by competitive "
+              "co-evolution (both adversarially weight the fitness cases).")
+    else:
+        _select_difficulty_weighting()
+        if INSTANCE_REWEIGHT_ENABLED and BATCH_SIZE > 0:
+            print("  [Difficulty Weighting] Mini-batching is incompatible with stable")
+            print("  per-example IDs — switching to full-dataset evaluation for this run.")
+            BATCH_SIZE = 0
 
     # ---- Safe vs Unsafe ops ----
     select_ops_safety()
@@ -29216,6 +29571,9 @@ def train_mode():
     # GRADIENT BOOSTING MODE (runs instead of standard evolution)
     # ════════════════════════════════════════════════════════════════
     if GRADIENT_BOOSTING_ENABLED:
+        if COEVOLUTION_ENABLED:
+            print("  [Co-Evolution] Note: Gradient Boosting uses its own per-stage "
+                  "row sampling; competitive co-evolution is not applied here.")
         boosted_models = run_gradient_boosted_evolution(
             X, Y, n_features, n_outputs, feat_names, out_types, dp,
             target_grads_list, X_val=X_val, Y_val=Y_val, BATCH_SIZE=BATCH_SIZE)
@@ -29503,8 +29861,7 @@ def train_mode():
         try:
             with _InterruptiblePool(max_workers=_island_workers) as executor:
                 while True:
-                    batch_idx = (np.random.choice(X.shape[0], BATCH_SIZE, replace=False)
-                                 if BATCH_SIZE > 0 else None)
+                    batch_idx = _select_batch_indices(X, Y, hofs, out_types, BATCH_SIZE)
                     X_b = X[batch_idx] if batch_idx is not None else X
                     Y_b = Y[batch_idx] if batch_idx is not None else Y
 
@@ -29897,7 +30254,7 @@ def train_mode():
         try:
             with _InterruptiblePool(max_workers=_afpo_workers) as executor:
                 while True:
-                    batch_idx = (np.random.choice(X.shape[0], BATCH_SIZE, replace=False) if BATCH_SIZE > 0 else None)
+                    batch_idx = _select_batch_indices(X, Y, hofs, out_types, BATCH_SIZE)
                     X_b = X[batch_idx] if batch_idx is not None else X
                     Y_b = Y[batch_idx] if batch_idx is not None else Y
 
@@ -30295,7 +30652,7 @@ def train_mode():
         try:
             with _InterruptiblePool(max_workers=_staged_afpo_workers) as executor:
                 while True:
-                    batch_idx = (np.random.choice(X.shape[0], BATCH_SIZE, replace=False) if BATCH_SIZE > 0 else None)
+                    batch_idx = _select_batch_indices(X, Y, hofs, out_types, BATCH_SIZE)
                     X_b = X[batch_idx] if batch_idx is not None else X
                     Y_b = Y[batch_idx] if batch_idx is not None else Y
 
@@ -30802,8 +31159,7 @@ def train_mode():
         try:
             with _InterruptiblePool(max_workers=_isl_afpo_workers) as executor:
                 while True:
-                    batch_idx = (np.random.choice(X.shape[0], BATCH_SIZE, replace=False)
-                                 if BATCH_SIZE > 0 else None)
+                    batch_idx = _select_batch_indices(X, Y, hofs, out_types, BATCH_SIZE)
                     X_b = X[batch_idx] if batch_idx is not None else X
                     Y_b = Y[batch_idx] if batch_idx is not None else Y
 
@@ -31159,8 +31515,7 @@ def train_mode():
         try:
             with _InterruptiblePool(max_workers=_staged_isl_workers) as executor:
                 while True:
-                    batch_idx = (np.random.choice(X.shape[0], BATCH_SIZE, replace=False)
-                                 if BATCH_SIZE > 0 else None)
+                    batch_idx = _select_batch_indices(X, Y, hofs, out_types, BATCH_SIZE)
                     X_b = X[batch_idx] if batch_idx is not None else X
                     Y_b = Y[batch_idx] if batch_idx is not None else Y
 
@@ -31496,8 +31851,7 @@ def train_mode():
                                    max(1, os.cpu_count() or 8))
             with _InterruptiblePool(max_workers=_age_grp_workers) as executor:
                 while True:
-                    batch_idx = (np.random.choice(X.shape[0], BATCH_SIZE, replace=False)
-                                 if BATCH_SIZE > 0 else None)
+                    batch_idx = _select_batch_indices(X, Y, hofs, out_types, BATCH_SIZE)
                     X_b = X[batch_idx] if batch_idx is not None else X
                     Y_b = Y[batch_idx] if batch_idx is not None else Y
 
@@ -31758,6 +32112,9 @@ def train_mode():
     # BAYESIAN CGP
     # ════════════════════════════════════════════════════════════════
     elif EVOLUTION_MODEL == "bayesian_cgp":
+        if COEVOLUTION_ENABLED:
+            print("  [Co-Evolution] Note: the Bayesian surrogate model uses its own "
+                  "candidate sampling; competitive co-evolution is not applied here.")
         hofs = [HallOfFame(out_type=out_types[_oi]) for _oi in range(n_outputs)]
 
         # Dispatch to the requested Bayesian variant.  When QD is also
