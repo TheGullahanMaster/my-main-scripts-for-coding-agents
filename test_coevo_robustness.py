@@ -382,6 +382,40 @@ def test_batch_size_contract_various():
     ok("subset ≥ dataset rows still degenerates to full-dataset evaluation")
     print()
 
+class _MetricSpyIndividual:
+    def __init__(self):
+        self.complexity = 1
+        self.loss = 0.0
+        self.r2 = 1.0
+        self.affine_fitted = True
+        self.rows_seen = None
+
+    def calculate_fitness(self, X, y, out_type, update_affine=True, target_grads=None):
+        self.rows_seen = X.shape[0]
+        self.loss = float(X.shape[0])
+        self.r2 = -float(X.shape[0])
+        self.affine_fitted = update_affine
+        return self.loss
+
+
+def test_full_data_hof_candidate_refits_subset_metrics():
+    print("8: HoF admission re-scores subset candidates on full data")
+    X = np.zeros((11, 2))
+    Y = np.zeros((11, 1))
+    subset_scored = _MetricSpyIndividual()
+    subset_scored.loss = 0.0
+    subset_scored.r2 = 1.0
+    subset_scored.affine_fitted = True
+
+    admitted = evo13._full_data_hof_candidate(subset_scored, X, Y[:, 0], 0)
+
+    assert admitted is not subset_scored, "admission scoring must not mutate worker/local HoF objects"
+    assert admitted.rows_seen == 11, "candidate should be scored against every training row"
+    assert admitted.loss == 11.0 and admitted.r2 == -11.0, "stored metrics must be full-data metrics"
+    assert subset_scored.loss == 0.0 and subset_scored.r2 == 1.0, "subset metrics should stay local"
+    ok("global HoF admission uses a full-data, freshly-affine-refit copy")
+    print()
+
 
 if __name__ == "__main__":
     test_robust_hardness_bounded()
@@ -391,4 +425,5 @@ if __name__ == "__main__":
     test_fitness_sharing_prevents_collapse()
     test_anchor_coverage_and_bound()
     test_batch_size_contract_various()
+    test_full_data_hof_candidate_refits_subset_metrics()
     print("ALL ROBUSTNESS TESTS PASSED ✓")
