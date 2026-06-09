@@ -1187,7 +1187,7 @@ INSTANCE_REWEIGHT_UPDATE_EVERY = 1       # re-score / re-weight every N generati
 # rather than at 1.0, keeping both populations engaged.  Toggled interactively
 # at startup (default OFF).
 #
-# Three failure modes of the naive predator–prey loop are guarded against here,
+# Four failure modes of the naive predator–prey loop are guarded against here,
 # all on by default (set the corresponding knob to disable):
 #   1. NOISE-LATCHING — on a near-perfect model the only "hard" rows left are the
 #      irreducible-noise ones, so the predators collapse the whole batch onto
@@ -1204,6 +1204,22 @@ INSTANCE_REWEIGHT_UPDATE_EVERY = 1       # re-score / re-weight every N generati
 #   3. OFF-DISTRIBUTION DRIFT — a 100%-adversarial batch lets the hosts forget
 #      the bulk data.  Countered by mixing a uniform-random ANCHOR fraction into
 #      every batch (also guarantees the whole dataset is covered over time).
+#   4. CYCLING / CATASTROPHIC FORGETTING — the Red-Queen failure that bites hard
+#      on many-variable targets: the predators swing the batch onto a narrow
+#      region that exercises only *some* inputs, the hosts overfit it and prune
+#      the variables that region doesn't need, then the predators swing back and
+#      the hosts have to RELEARN the dropped variable — the search oscillates
+#      instead of converging.  The parasites act on rows, not variables, but a
+#      dropped variable has a model-agnostic signature: the rows that depend on it
+#      REGRESS from a fit the hosts had already achieved.  Countered by (a)
+#      progress TRACKING — the global host loss, its trend, a per-row best-ever
+#      fit and the mean regression ("forgetting") — feeding (b) a STABILISER that,
+#      while the hosts are forgetting, WIDENS the uniform anchor (more breadth, so
+#      every variable stays represented) and damps the predators' virulence,
+#      relaxing back to the configured aggression once the loss falls cleanly.
+#      (Closed-loop simulation found breadth — not re-injecting the specific
+#      dropped rows, which just duplicates what the predators already chase — is
+#      the lever that actually fixes the forgetting.)
 COEVOLUTION_ENABLED = False   # master switch (asked just before batch size)
 COEVO_CASE_SUBSET   = 64      # rows per parasite — the mini-batch-size analogue
 COEVO_POP_SIZE      = 32      # number of parasites in the predator population
@@ -1222,6 +1238,36 @@ COEVO_GUARD_PATIENCE = 5.0    # ~how many times a row must be trained on before 
                               # guard treats persistent hardness as irreducible
 COEVO_GUARD_STRENGTH = 0.90   # max fraction a fully-resistant row's hardness is cut
 COEVO_GUARD_FLOOR   = 0.05    # never discount a row's hardness below this factor
+# ---- Progress tracking + arms-race stabilisation (anti cycling/forgetting) ----
+# These counter failure mode 4 above (the one that bites on 10+-input targets).
+# Every chunk the hosts' GLOBAL loss, its short-term trend, and a per-row
+# best-ever fit are tracked; from those a FORGETTING signal (how much of the
+# signal the hosts have dropped vs their best — the dropped-variable signature)
+# and a smoothed INSTABILITY ∈ [0,1] are derived.  While instability is high the
+# stabiliser widens the uniform ANCHOR — i.e. injects more breadth — and damps the
+# predators' virulence, which is what stops the search oscillating/forgetting on
+# many-variable targets (closed-loop simulation: breadth is the lever that keeps
+# every variable represented; a too-narrow adversarial batch is what drops them).
+# The tracking itself is always on (it's pure observation, surfaced in the
+# per-generation log); only the batch-shaping ACTION is gated by COEVO_STABILIZE.
+COEVO_STABILIZE       = True  # adaptively widen the anchor + damp predators while
+                              # the hosts are forgetting (False ⇒ exact legacy arms race)
+COEVO_ANCHOR_BOOST    = 0.30  # extra anchor fraction added at full instability
+COEVO_VIRULENCE_DAMP  = 0.40  # max fraction the effective virulence λ is cut at full
+                              # instability (calmer, less-aggressive predators)
+COEVO_ADV_FLOOR       = 0.30  # the core arms race always keeps ≥ this batch fraction
+                              # (so the boosted anchor can never swamp the predators)
+COEVO_BEST_DOWN       = 0.50  # per-row best-ever hardness: fast snap-DOWN rate
+COEVO_BEST_UP         = 0.02  # ...and slow drift-UP rate (a row that turns
+                              #  permanently hard is gradually forgiven, so it stops
+                              #  reading as "forgotten" forever — keeps noise out)
+COEVO_INSTAB_RATE     = 0.25  # EMA smoothing rate for the instability signal
+COEVO_INSTAB_SENS     = 0.50  # relative loss-rise that maps to full instability
+COEVO_FORGET_SENS     = 0.12  # mean per-row regression that maps to full instability
+                              # (the plateau-robust term: fires even when the loss is
+                              #  stuck high but variables are taking turns dropping)
+COEVO_LOSS_FAST       = 0.40  # fast global-loss EMA rate  ┐ trend = fast − slow
+COEVO_LOSS_SLOW       = 0.10  # slow global-loss EMA rate  ┘ (>0 ⇒ regressing)
 _COEVO_RUNTIME      = None    # lazily-built _PredatorPreyCoevolution instance
 
 # ---- Bayesian CGP Settings ----
@@ -3946,6 +3992,30 @@ class _PredatorPreyCoevolution:
     so the predators stay engaged instead of collapsing onto impossibly-hard
     cases and starving the hosts of signal.
 
+    On top of the original arms race this class also TRACKS the hosts' progress
+    (the global loss, its short-term trend, and a per-row best-ever fit) and uses
+    it to STABILISE the predator–prey relationship — the part that matters most on
+    many-variable targets, where an un-damped arms race makes the hosts cycle:
+    drop a variable to fit the current narrow adversarial region, then have to
+    relearn it when the predators swing away.  The tracking yields two signals:
+
+      • FORGETTING — the mean per-row REGRESSION (how much worse the hosts now do
+        on rows they once fit better: the model-agnostic signature of a dropped
+        variable).  Unlike a raw loss trend it stays informative on a high *flat*
+        plateau where different variables take turns being dropped.
+      • INSTABILITY ∈ [0,1] — a smoothed blend of the forgetting signal and any
+        upward loss trend; ~0 when the hosts are converging cleanly.
+
+    While instability is high the stabiliser widens the uniform random ANCHOR
+    (injects more breadth, so every variable stays represented and stops being
+    dropped) and damps the predators' effective virulence (calmer, less-extreme
+    cases); it relaxes to the configured aggression once the loss falls cleanly.
+    Closed-loop simulation showed breadth — NOT re-injecting the specific dropped
+    rows, which merely duplicates what the predators already chase — is the lever
+    that fixes the many-variable forgetting.  The progress tracking is always on
+    (pure observation, surfaced in the per-generation log); only the batch-shaping
+    action is gated by `stabilize` (off ⇒ the exact legacy arms race).
+
     The whole mechanism lives in the main process (parasites are just row-index
     arrays); the host workers receive the pre-sliced rows exactly as they do for
     an ordinary mini-batch, so no worker-side change is needed.
@@ -3955,7 +4025,11 @@ class _PredatorPreyCoevolution:
                  tournament=3, seed=None,
                  anchor_frac=0.25, fitness_sharing=True, noise_guard=True,
                  hard_ema_rate=0.20, guard_patience=5.0, guard_strength=0.90,
-                 guard_floor=0.05):
+                 guard_floor=0.05,
+                 stabilize=True, anchor_boost=0.30, virulence_damp=0.40,
+                 adv_floor=0.30, best_down=0.50, best_up=0.02,
+                 instab_rate=0.25, instab_sens=0.50, forget_sens=0.12,
+                 loss_fast=0.40, loss_slow=0.10):
         self.n_rows     = int(n_rows)
         self.subset     = max(1, min(int(subset), self.n_rows))
         self.pop_size   = max(2, int(pop_size))
@@ -3971,11 +4045,37 @@ class _PredatorPreyCoevolution:
         self.guard_patience  = float(max(guard_patience, 1e-6))
         self.guard_strength  = float(min(max(guard_strength, 0.0), 1.0))
         self.guard_floor     = float(min(max(guard_floor, 0.0), 1.0))
+        # ---- progress-tracking + stabiliser knobs (see COEVO_* notes) ----
+        self.stabilize       = bool(stabilize)
+        self.anchor_boost    = float(min(max(anchor_boost, 0.0), 0.95))
+        self.virulence_damp  = float(min(max(virulence_damp, 0.0), 1.0))
+        self.adv_floor       = float(min(max(adv_floor, 0.0), 1.0))
+        self.best_down       = float(min(max(best_down, 1e-3), 1.0))
+        self.best_up         = float(min(max(best_up, 0.0), 1.0))
+        self.instab_rate     = float(min(max(instab_rate, 1e-3), 1.0))
+        self.instab_sens     = float(max(instab_sens, 1e-6))
+        self.forget_sens     = float(max(forget_sens, 1e-6))
+        self.loss_fast_rate  = float(min(max(loss_fast, 1e-3), 1.0))
+        self.loss_slow_rate  = float(min(max(loss_slow, 1e-3), 1.0))
         # EMA of per-row hardness + how often each row has actually been trained
         # on — together they let the guard tell "hard but learnable" rows from
         # "hard no matter what" (≈ noise) rows.
         self.hard_ema   = None
         self.seen_count = np.zeros(self.n_rows, dtype=np.float64)
+        # ---- progress-tracking state (drives the stabiliser) ----
+        # Per-row best-ever (lowest) hardness the hosts have achieved: a row now
+        # much harder than its best has REGRESSED (a dropped variable).  Fast/slow
+        # global-loss EMAs give the short-term trend; `forget_frac` is the mean
+        # regression; `instability` is the smoothed [0,1] blend that drives the
+        # adaptive anchor + virulence damping.
+        self.hard_best   = None
+        self.loss_fast   = None
+        self.loss_slow   = None
+        self.global_loss = None
+        self.forget_frac = 0.0
+        self.instability = 0.0
+        # Rolling diagnostics so a run can inspect the loss curve / instability.
+        self.history     = deque(maxlen=512)
         # Each parasite is an int array of distinct row indices, length `subset`.
         self.parasites  = [self._random_parasite() for _ in range(self.pop_size)]
         self.generation = 0
@@ -4091,19 +4191,28 @@ class _PredatorPreyCoevolution:
         return total / used
 
     # ---- parasite fitness + one GA generation ------------------------------
-    def _score(self, parasite, hardness):
+    def _score(self, parasite, hardness, virulence=None):
         """Cartlidge & Bullock reduced-virulence parasite fitness.
 
         x = the parasite's mean host-failure ∈ [0,1].  At λ=1 the reward is the
         monotone 2x − x² (full virulence: harder is always better).  At λ<1 the
         reward peaks at x=λ then declines, so a parasite that makes the hosts
         fail *completely* is no longer maximally fit — this is the standard fix
-        for co-evolutionary disengagement."""
-        x = float(np.mean(hardness[parasite]))
-        lam = self.virulence
-        return (2.0 * x / lam) - (x / lam) ** 2
+        for co-evolutionary disengagement.
 
-    def _parasite_score(self, parasite, sel, coverage):
+        `virulence` defaults to the configured λ; the stabiliser passes a *damped*
+        λ (closer to 0) while the hosts are regressing, which both lowers the peak
+        host-failure the predators chase and is why the reward is clamped at 0:
+        for x > 2λ the bare quadratic goes negative, and a negative reward would
+        invert the fitness-sharing multiply below.  Clamping flattens those
+        too-hard parasites to 0 instead — exactly the "stop chasing the extreme
+        cases" behaviour the damping is for."""
+        x = float(np.mean(hardness[parasite]))
+        lam = self.virulence if virulence is None else float(virulence)
+        lam = max(lam, 1e-3)
+        return max(0.0, (2.0 * x / lam) - (x / lam) ** 2)
+
+    def _parasite_score(self, parasite, sel, coverage, virulence=None):
         """Full parasite fitness = reduced virulence × distinctness.
 
         The reduced-virulence term (_score) rewards finding hard rows; the
@@ -4111,7 +4220,7 @@ class _PredatorPreyCoevolution:
         the population does NOT cover, so the predators spread across different
         weak regions instead of all collapsing onto the single hardest cluster
         (which would pin the hosts to the same `subset` rows forever)."""
-        vir = self._score(parasite, sel)
+        vir = self._score(parasite, sel, virulence=virulence)
         if not self.fitness_sharing:
             return vir
         # Mean inverse coverage of this parasite's rows ∈ (0,1]: 1.0 when every
@@ -4171,19 +4280,127 @@ class _PredatorPreyCoevolution:
         discount   = np.clip(discount, self.guard_floor, 1.0)
         return hardness * discount
 
+    # ---- progress tracking + stabiliser ------------------------------------
+    def _update_progress(self, hardness):
+        """Track the hosts' GLOBAL loss + short-term trend, the per-row best-ever
+        fit and the FORGETTING signal, then update the smoothed instability ∈[0,1].
+
+        Two ingredients feed instability:
+          • a positive global-loss *trend* (fast EMA above slow EMA) — catches an
+            actively climbing loss; and
+          • the mean per-row REGRESSION (`forget_frac`) — how much of the signal
+            the hosts have dropped relative to their best-ever fit.  This term is
+            the important one for many-variable targets: it stays high on a *flat*
+            high plateau where the hosts keep taking turns dropping variables, a
+            state the loss trend alone (≈0 when flat) would miss entirely.
+
+        instability ≈ 0 only when the hosts are converging cleanly with little
+        forgetting; it rises as they oscillate.  Always computed (the tracking is
+        observational); whether it actually reshapes the batch is gated elsewhere
+        by `stabilize`."""
+        gl = float(np.mean(hardness))
+        self.global_loss = gl
+        # Per-row best-ever (lowest) hardness: snap DOWN fast so a freshly-fit row
+        # is recorded immediately, drift UP slowly so a row that becomes
+        # permanently hard is gradually forgiven and stops reading as "forgotten"
+        # forever (which would otherwise let irreducible noise inflate forgetting).
+        if self.hard_best is None:
+            self.hard_best = hardness.astype(np.float64).copy()
+        else:
+            improved = hardness < self.hard_best
+            self.hard_best = np.where(
+                improved,
+                (1.0 - self.best_down) * self.hard_best + self.best_down * hardness,
+                (1.0 - self.best_up)   * self.hard_best + self.best_up   * hardness)
+        # Forgetting = mean per-row regression vs best-ever (plateau-robust).
+        self.forget_frac = float(np.mean(np.clip(hardness - self.hard_best, 0.0, None)))
+        # Fast/slow global-loss EMAs → trend (fast above slow ⇒ loss rising).
+        if self.loss_fast is None:
+            self.loss_fast = gl
+            self.loss_slow = gl
+        else:
+            self.loss_fast = ((1.0 - self.loss_fast_rate) * self.loss_fast
+                              + self.loss_fast_rate * gl)
+            self.loss_slow = ((1.0 - self.loss_slow_rate) * self.loss_slow
+                              + self.loss_slow_rate * gl)
+        rise = max((self.loss_fast - self.loss_slow) / max(self.loss_slow, 1e-9), 0.0)
+        # Saturating map into [0,1): blend the (relative) trend rise and the
+        # forgetting fraction; either one alone can drive the stabiliser.
+        z = rise / self.instab_sens + self.forget_frac / self.forget_sens
+        inst_target = 1.0 - np.exp(-z)
+        self.instability = ((1.0 - self.instab_rate) * self.instability
+                            + self.instab_rate * float(inst_target))
+        self.instability = float(min(max(self.instability, 0.0), 1.0))
+        return self.instability
+
+    def _regression(self, hardness):
+        """Per-row regression = relu(hardness − best-ever hardness).
+
+        > 0 only for rows the hosts demonstrably fit better in the past and are
+        now doing worse on — the model-agnostic signature of a just-dropped
+        variable.  Rows that were never fit well (label noise, or structure not
+        yet learned) have best-ever ≈ current hardness ⇒ ≈ 0, so noise does not
+        masquerade as forgetting.  Used for the forgetting signal + diagnostics;
+        None before the first observation (the cold start)."""
+        if self.hard_best is None:
+            return None
+        return np.clip(hardness - self.hard_best, 0.0, None)
+
+    def _effective_virulence(self):
+        """λ used for predator scoring this chunk: the configured λ, damped toward
+        0 in proportion to instability so the predators chase *less* extreme cases
+        while the hosts are forgetting (calming the arms race)."""
+        if not self.stabilize:
+            return self.virulence
+        return max(self.virulence * (1.0 - self.virulence_damp * self.instability),
+                   1e-2)
+
+    def _effective_anchor_frac(self):
+        """Anchor fraction for this chunk: the configured anchor, WIDENED toward
+        more breadth as instability rises (capped so the arms race keeps at least
+        `adv_floor`).  Breadth is the lever that keeps every variable represented,
+        which is what stops the many-variable forgetting; when the hosts are
+        converging cleanly (instability ≈ 0) it relaxes back to the configured
+        anchor and the predators get their full share."""
+        if not self.stabilize:
+            return self.anchor_frac
+        f = self.anchor_frac + self.anchor_boost * self.instability
+        return float(min(f, max(0.0, 1.0 - self.adv_floor)))
+
+    def _record_history(self, regression):
+        """Append a compact per-chunk diagnostics row (loss curve + forgetting +
+        instability + how many rows are currently regressed from their best)."""
+        reg_rows = (int(np.count_nonzero(regression > 1e-9))
+                    if regression is not None else 0)
+        self.history.append({
+            'gen':         self.generation,
+            'global_loss': self.global_loss,
+            'loss_fast':   self.loss_fast,
+            'loss_slow':   self.loss_slow,
+            'forget_frac': self.forget_frac,
+            'instability': self.instability,
+            'regressed':   reg_rows,
+        })
+
     # ---- active-batch assembly --------------------------------------------
     def _assemble_batch(self, parasite, sel):
-        """Build the chunk's training rows = the parasite's hardest rows + a
-        uniform-random ANCHOR, total length `subset`.
+        """Build the chunk's `subset` training rows = the parasite's hardest rows
+        (the core arms race) + a uniform-random ANCHOR.
 
-        The anchor keeps a guaranteed slice of the bulk data distribution in
-        every batch, so an adversarial run can never pull the hosts entirely off
-        the data (bounding the noise-latching damage) and, over many chunks, the
-        whole dataset is covered rather than just the `subset` adversarial rows."""
+        The anchor keeps a guaranteed slice of the bulk distribution in every
+        batch — breadth — so an adversarial run can never pull the hosts entirely
+        off the data and, over many chunks, the whole dataset is covered.  When the
+        stabiliser is on, the anchor fraction is WIDENED while the hosts are
+        forgetting (see `_effective_anchor_frac`): more breadth keeps every
+        variable represented, which is what stops the many-variable forgetting.
+        When they are converging cleanly it relaxes back to the configured anchor.
+
+        The arms race always keeps ≥ `adv_floor` of the batch, and the result is
+        always exactly `subset` distinct in-range rows."""
         subset = self.subset
         if subset >= self.n_rows:
             return parasite.copy()
-        n_anchor = min(int(round(self.anchor_frac * subset)), subset)
+        n_anchor = min(int(round(self._effective_anchor_frac() * subset)), subset)
         n_adv    = subset - n_anchor
         if n_adv <= 0:
             adv = np.empty(0, dtype=np.int64)
@@ -4202,25 +4419,32 @@ class _PredatorPreyCoevolution:
 
         Pipeline: compute a robust per-row hardness from the current champions →
         update the noise-guard memory and discount chronically-unlearnable rows →
-        score the parasites with reduced virulence × competitive fitness sharing →
-        hand the toughest parasite's hardest rows (plus a random anchor) to the
+        track progress (global-loss trend + per-row best-ever fit + forgetting) and
+        update the instability signal → score the parasites with a possibly-damped
+        reduced virulence × competitive fitness sharing → hand the toughest
+        parasite's hardest rows plus a (possibly widened) random anchor to the
         hosts → evolve the predator population for the next encounter.  On a cold
-        start (no champion yet) returns a uniform subset to seed the hosts."""
+        start (no champion yet) returns a uniform subset."""
         hardness = self._row_hardness(X, Y, hofs, out_types)
         if hardness is None:
             return self._random_parasite()
         # Noise guard: remember per-row hardness and suppress rows that resist
         # learning despite repeated exposure.
         self._update_hardness_ema(hardness)
-        sel = self._selection_hardness(hardness)
+        # Progress tracking: global-loss trend + per-row best-ever fit + forgetting
+        # → the instability signal that drives the stabiliser (anchor + virulence).
+        self._update_progress(hardness)
+        sel     = self._selection_hardness(hardness)
+        eff_vir = self._effective_virulence()
         # Competitive fitness sharing needs the population's current coverage.
         coverage = self._coverage()
-        scores = np.array([self._parasite_score(p, sel, coverage)
+        scores = np.array([self._parasite_score(p, sel, coverage, virulence=eff_vir)
                            for p in self.parasites])
         best   = self.parasites[int(np.argmax(scores))]
         active = self._assemble_batch(best, sel)
         # Record what the hosts actually train on (drives the noise guard).
         self.seen_count[active] += 1.0
+        self._record_history(self._regression(hardness))
         # Bias mutation toward the post-guard hardness too, so the predators do
         # not keep regenerating the suppressed-noise rows.
         self._evolve_from(scores, sel)
@@ -4242,8 +4466,33 @@ def _coevo_next_batch(X, Y, hofs, out_types):
             anchor_frac=COEVO_ANCHOR_FRAC, fitness_sharing=COEVO_FITNESS_SHARING,
             noise_guard=COEVO_NOISE_GUARD, hard_ema_rate=COEVO_HARDNESS_EMA,
             guard_patience=COEVO_GUARD_PATIENCE, guard_strength=COEVO_GUARD_STRENGTH,
-            guard_floor=COEVO_GUARD_FLOOR)
+            guard_floor=COEVO_GUARD_FLOOR,
+            stabilize=COEVO_STABILIZE, anchor_boost=COEVO_ANCHOR_BOOST,
+            virulence_damp=COEVO_VIRULENCE_DAMP, adv_floor=COEVO_ADV_FLOOR,
+            best_down=COEVO_BEST_DOWN, best_up=COEVO_BEST_UP,
+            instab_rate=COEVO_INSTAB_RATE, instab_sens=COEVO_INSTAB_SENS,
+            forget_sens=COEVO_FORGET_SENS, loss_fast=COEVO_LOSS_FAST,
+            loss_slow=COEVO_LOSS_SLOW)
     return _COEVO_RUNTIME.next_batch(X, Y, hofs, out_types)
+
+
+def _coevo_status_line():
+    """One-line co-evolution health summary for the periodic generation log, or
+    None when co-evolution isn't running yet.  Surfaces the tracked host loss and
+    its short-term trend (↑ regressing / ↓ improving / → flat), the FORGETTING
+    fraction and how many rows are currently regressed from their best (the
+    dropped-variable signal the user can watch), and the instability the stabiliser
+    is acting on via the effective anchor + virulence."""
+    rt = _COEVO_RUNTIME
+    if rt is None or getattr(rt, 'global_loss', None) is None:
+        return None
+    trend = (rt.loss_fast - rt.loss_slow) if rt.loss_fast is not None else 0.0
+    arrow = "↑" if trend > 1e-4 else ("↓" if trend < -1e-4 else "→")
+    reg = rt.history[-1].get('regressed', 0) if rt.history else 0
+    return (f"[Co-evo] host-loss={rt.global_loss:.4f} {arrow}  "
+            f"forgetting={rt.forget_frac:.3f} ({reg} rows)  "
+            f"instability={rt.instability:.2f}  "
+            f"anchor={rt._effective_anchor_frac():.2f}  λ_eff={rt._effective_virulence():.2f}")
 
 
 def _select_batch_indices(X, Y, hofs, out_types, batch_size):
@@ -4300,6 +4549,10 @@ def _select_coevolution_mode(n_rows):
     print("    • A NOISE GUARD discounts rows that stay hard despite repeated")
     print("      training, so the predators don't latch onto label noise once")
     print("      the model is near-perfect.")
+    print("    • A progress STABILISER tracks the host loss + per-row forgetting and,")
+    print("      while the model is dropping variables, widens the anchor (more")
+    print("      breadth) and calms the predators — stops the cycling/forgetting")
+    print("      that bites on many-variable (10+ input) targets.")
     print()
     print("  Applies to the population-based models (Island / AFPO families).")
     print("  The Bayesian and Gradient-Boosting modes use their own sampling")
@@ -4365,6 +4618,7 @@ def _select_coevolution_mode(n_rows):
     if COEVO_ANCHOR_FRAC > 0:   _guards.append(f"anchor {COEVO_ANCHOR_FRAC:.0%}")
     if COEVO_FITNESS_SHARING:   _guards.append("fitness-sharing")
     if COEVO_NOISE_GUARD:       _guards.append("noise-guard")
+    if COEVO_STABILIZE:         _guards.append("forgetting-stabiliser")
     print(f"     Robustness guards: {', '.join(_guards) if _guards else 'none (legacy)'}.")
 
 
@@ -30253,6 +30507,10 @@ def train_mode():
                                 target_pop.append(mig_copy)
 
                     print(f"--- Generation {gen} ---")
+                    if COEVOLUTION_ENABLED:
+                        _co_status = _coevo_status_line()
+                        if _co_status:
+                            print("   " + _co_status)
 
                     # ---- Perfect output detection & early stopping ----
                     if gen % MIGRATION_FREQ == 0:
@@ -30549,6 +30807,10 @@ def train_mode():
 
                     gen += chunk_freq_a
                     print(f"--- Generation {gen} ---")
+                    if COEVOLUTION_ENABLED:
+                        _co_status = _coevo_status_line()
+                        if _co_status:
+                            print("   " + _co_status)
 
                     # ── Plateau-driven meta-extinction ─────────────────────────
                     # Pool current HoF bests across active outputs; if the global
@@ -31135,6 +31397,10 @@ def train_mode():
                               f"{N_STAGES - 1} transition(s); stage-0 refreshed).")
 
                     print(f"--- Generation {gen} ---")
+                    if COEVOLUTION_ENABLED:
+                        _co_status = _coevo_status_line()
+                        if _co_status:
+                            print("   " + _co_status)
 
                     # ── Plateau-driven meta-extinction (stages-as-islands) ──
                     _meta_losses_sa = [
@@ -31555,6 +31821,10 @@ def train_mode():
                                             for j, d in enumerate(divs)))
 
                     print(f"--- Generation {gen} ---")
+                    if COEVOLUTION_ENABLED:
+                        _co_status = _coevo_status_line()
+                        if _co_status:
+                            print("   " + _co_status)
 
                     # ---- Perfect output detection & early stopping ----
                     for o_idx in range(n_outputs):
@@ -31878,6 +32148,10 @@ def train_mode():
                         print(f"  [Gen {gen}] Stage graduation cycle complete.")
 
                     print(f"--- Generation {gen} ---")
+                    if COEVOLUTION_ENABLED:
+                        _co_status = _coevo_status_line()
+                        if _co_status:
+                            print("   " + _co_status)
 
                     for o_idx in range(n_outputs):
                         if o_idx in perfect_outputs:
@@ -32230,6 +32504,10 @@ def train_mode():
                         print(f"  [Gen {gen}] Graduation cycle complete.")
 
                     print(f"--- Generation {gen} ---")
+                    if COEVOLUTION_ENABLED:
+                        _co_status = _coevo_status_line()
+                        if _co_status:
+                            print("   " + _co_status)
 
                     # ---- Perfect output detection & early stopping ----
                     for o_idx in range(n_outputs):
