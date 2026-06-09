@@ -167,8 +167,17 @@ def test_arms_race():
     hofs = [_FakeHoF(_FakeChampion(champ_fn))]
     out_types = [0]
 
+    # Isolate the *core* arms race: turn the robustness guards off so this test
+    # exercises pure predator concentration (the anchor/sharing/noise-guard each
+    # have their own dedicated tests in test_coevo_robustness.py).  In particular
+    # the noise guard would (correctly) suppress these rows — the champion here is
+    # a fixed stub that never improves, so from the guard's view the hard rows are
+    # "irreducible" and it would stop chasing them; that behaviour is verified
+    # separately.
     co = evo13._PredatorPreyCoevolution(n_rows=n, subset=subset, pop_size=32,
-                                        mut_rate=0.3, virulence=1.0, seed=7)
+                                        mut_rate=0.3, virulence=1.0, seed=7,
+                                        anchor_frac=0.0, fitness_sharing=False,
+                                        noise_guard=False)
 
     first = None
     best = 0

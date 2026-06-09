@@ -1186,11 +1186,42 @@ INSTANCE_REWEIGHT_UPDATE_EVERY = 1       # re-score / re-weight every N generati
 # *reduced virulence* λ: a parasite's reward peaks at host-failure level λ
 # rather than at 1.0, keeping both populations engaged.  Toggled interactively
 # at startup (default OFF).
+#
+# Three failure modes of the naive predator–prey loop are guarded against here,
+# all on by default (set the corresponding knob to disable):
+#   1. NOISE-LATCHING — on a near-perfect model the only "hard" rows left are the
+#      irreducible-noise ones, so the predators collapse the whole batch onto
+#      label noise and wreck a good fit.  Countered by (a) a robust, *absolute*
+#      row-hardness (scaled by the target spread and squashed into [0,1), so one
+#      wild outlier can no longer define the scale and a good model yields a
+#      genuinely low signal) and (b) a persistence-based NOISE GUARD that
+#      discounts rows which stay hard *despite* being trained on repeatedly
+#      (≈ unlearnable / mislabelled).
+#   2. SUBSET COLLAPSE — the whole parasite population converging on one cluster
+#      of rows, so the hosts only ever see `subset` examples.  Countered by
+#      Rosin & Belew (1995)-style competitive FITNESS SHARING (reward parasites
+#      for covering hard rows the rest of the pack does not).
+#   3. OFF-DISTRIBUTION DRIFT — a 100%-adversarial batch lets the hosts forget
+#      the bulk data.  Countered by mixing a uniform-random ANCHOR fraction into
+#      every batch (also guarantees the whole dataset is covered over time).
 COEVOLUTION_ENABLED = False   # master switch (asked just before batch size)
 COEVO_CASE_SUBSET   = 64      # rows per parasite — the mini-batch-size analogue
 COEVO_POP_SIZE      = 32      # number of parasites in the predator population
 COEVO_MUT_RATE      = 0.30    # fraction of a parasite's rows resampled per mutation
 COEVO_VIRULENCE     = 0.75    # reduced-virulence λ ∈ (0,1]  (1.0 = full virulence)
+COEVO_ANCHOR_FRAC   = 0.25    # fraction of each batch drawn uniformly at random
+                              # ("anchor": keeps the hosts on the bulk distribution
+                              #  and guarantees whole-dataset coverage; 0 = legacy
+                              #  pure-adversarial behaviour)
+COEVO_FITNESS_SHARING = True  # reward parasites for covering rows the rest of the
+                              # population does not (anti subset-collapse)
+COEVO_NOISE_GUARD   = True    # discount rows that stay hard despite repeated
+                              # training (anti noise-latching)
+COEVO_HARDNESS_EMA  = 0.20    # EMA rate for the per-row hardness the guard tracks
+COEVO_GUARD_PATIENCE = 5.0    # ~how many times a row must be trained on before the
+                              # guard treats persistent hardness as irreducible
+COEVO_GUARD_STRENGTH = 0.90   # max fraction a fully-resistant row's hardness is cut
+COEVO_GUARD_FLOOR   = 0.05    # never discount a row's hardness below this factor
 _COEVO_RUNTIME      = None    # lazily-built _PredatorPreyCoevolution instance
 
 # ---- Bayesian CGP Settings ----
@@ -3921,7 +3952,10 @@ class _PredatorPreyCoevolution:
     """
 
     def __init__(self, n_rows, subset, pop_size, mut_rate, virulence,
-                 tournament=3, seed=None):
+                 tournament=3, seed=None,
+                 anchor_frac=0.25, fitness_sharing=True, noise_guard=True,
+                 hard_ema_rate=0.20, guard_patience=5.0, guard_strength=0.90,
+                 guard_floor=0.05):
         self.n_rows     = int(n_rows)
         self.subset     = max(1, min(int(subset), self.n_rows))
         self.pop_size   = max(2, int(pop_size))
@@ -3929,6 +3963,19 @@ class _PredatorPreyCoevolution:
         self.virulence  = float(min(max(virulence, 1e-3), 1.0))
         self.tournament = max(2, min(int(tournament), self.pop_size))
         self.rng        = np.random.default_rng(seed)
+        # ---- robustness knobs (see the module-level COEVO_* notes) ----
+        self.anchor_frac     = float(min(max(anchor_frac, 0.0), 0.95))
+        self.fitness_sharing = bool(fitness_sharing)
+        self.noise_guard     = bool(noise_guard)
+        self.hard_ema_rate   = float(min(max(hard_ema_rate, 1e-3), 1.0))
+        self.guard_patience  = float(max(guard_patience, 1e-6))
+        self.guard_strength  = float(min(max(guard_strength, 0.0), 1.0))
+        self.guard_floor     = float(min(max(guard_floor, 0.0), 1.0))
+        # EMA of per-row hardness + how often each row has actually been trained
+        # on — together they let the guard tell "hard but learnable" rows from
+        # "hard no matter what" (≈ noise) rows.
+        self.hard_ema   = None
+        self.seen_count = np.zeros(self.n_rows, dtype=np.float64)
         # Each parasite is an int array of distinct row indices, length `subset`.
         self.parasites  = [self._random_parasite() for _ in range(self.pop_size)]
         self.generation = 0
@@ -3976,16 +4023,30 @@ class _PredatorPreyCoevolution:
 
     # ---- host-failure signal ----------------------------------------------
     def _row_hardness(self, X, Y, hofs, out_types):
-        """Per-row host-failure in [0,1]^n_rows from the current champions.
+        """Per-row host-failure in [0,1)^n_rows from the current champions.
 
-        Each output's per-row error is normalised to [0,1] (so no single output
-        dominates by scale) and averaged over the outputs that have a champion.
         Returns None during the cold start when no champion exists yet.
 
-        The metric mirrors the training loss closely enough to rank rows by
-        difficulty: squared residual (after the champion's locked affine) for
-        regression, per-row BCE for classification.  It is a hardness proxy, not
-        the exact selection loss — that is all the predators need."""
+        The metric is *absolute* and *robust*, which is what keeps the predators
+        from latching onto noise once the model is good:
+
+          • Regression — the residual after the champion's locked affine is scaled
+            by the TARGET spread (std of y), not by the maximum residual.  Scaling
+            by the target gives an absolute "fraction of the signal still
+            unexplained" per row, so a near-perfect champion yields a vector that
+            is genuinely ≈0 everywhere (low parasite reward → the arms race
+            disengages) instead of the old max-normalisation that always re-
+            inflated the single worst row back to 1.0.
+          • Classification — per-row BCE scaled by the base-rate entropy, so 0≈
+            perfect and ~1≈no better than predicting the class prior.
+
+        Both are then passed through the saturating map  h = 1 − exp(−z)  ∈ [0,1).
+        Saturation is the robustness fix: one wild outlier (e.g. a mislabelled
+        row) saturates toward 1 but can no longer blow up the scale and crush
+        every other row's signal to zero — a moderately-hard genuine row and a
+        catastrophic-noise row both read ~1, so noise cannot *dominate* the
+        landscape by sheer magnitude.  Averaged over the outputs with a champion.
+        """
         n = X.shape[0]
         total = np.zeros(n, dtype=np.float64)
         used  = 0
@@ -4001,17 +4062,30 @@ class _PredatorPreyCoevolution:
                                           neginf=-1e9), -1e9, 1e9)
             y = Y[:, i]
             if i < len(out_types) and out_types[i] == 6:
-                # Classification: per-row BCE (logits used directly, no affine).
-                err = np.logaddexp(0.0, preds) - preds * y
+                # Classification: per-row BCE (logits used directly, no affine),
+                # normalised by the base-rate entropy so it is scale-free.
+                bce = np.logaddexp(0.0, preds) - preds * y
+                p   = float(np.clip(np.mean(y), 1e-6, 1.0 - 1e-6))
+                h0  = -(p * np.log(p) + (1.0 - p) * np.log1p(-p))
+                z   = bce / (h0 + 1e-12)
             else:
                 a = float(getattr(champ, 'affine_a', 1.0))
                 b = float(getattr(champ, 'affine_b', 0.0))
-                err = (a * preds + b - y) ** 2
-            err = np.nan_to_num(err, nan=0.0, posinf=1e18, neginf=0.0)
-            m = float(err.max())
-            if m > 0.0:
-                total += err / m
-                used  += 1
+                resid = a * preds + b - y
+                scale = float(np.std(y))
+                if not np.isfinite(scale) or scale <= 1e-12:
+                    # Degenerate / constant target → fall back to the residual's
+                    # own spread so the ratio still means something.
+                    rs = float(np.std(resid))
+                    scale = rs if rs > 1e-12 else 1.0
+                z = (resid / scale) ** 2
+            # Cap z at 36: exp(-36)≈2.3e-16, so 1−exp(−z) stays the largest double
+            # strictly below 1.0 — saturated, yet the [0,1) contract holds exactly
+            # in float64 (1−exp(−50) would round up to 1.0).
+            z = np.nan_to_num(z, nan=0.0, posinf=36.0, neginf=0.0)
+            z = np.clip(z, 0.0, 36.0)
+            total += 1.0 - np.exp(-z)
+            used  += 1
         if used == 0:
             return None
         return total / used
@@ -4029,6 +4103,29 @@ class _PredatorPreyCoevolution:
         lam = self.virulence
         return (2.0 * x / lam) - (x / lam) ** 2
 
+    def _parasite_score(self, parasite, sel, coverage):
+        """Full parasite fitness = reduced virulence × distinctness.
+
+        The reduced-virulence term (_score) rewards finding hard rows; the
+        competitive-fitness-sharing term rewards finding hard rows the REST of
+        the population does NOT cover, so the predators spread across different
+        weak regions instead of all collapsing onto the single hardest cluster
+        (which would pin the hosts to the same `subset` rows forever)."""
+        vir = self._score(parasite, sel)
+        if not self.fitness_sharing:
+            return vir
+        # Mean inverse coverage of this parasite's rows ∈ (0,1]: 1.0 when every
+        # row is unique to it, →0 as its rows are shared with the whole pack.
+        share = float(np.mean(1.0 / np.maximum(coverage[parasite], 1.0)))
+        return vir * share
+
+    def _coverage(self):
+        """How many parasites currently include each row (length n_rows)."""
+        cov = np.zeros(self.n_rows, dtype=np.float64)
+        for p in self.parasites:
+            cov[p] += 1.0
+        return cov
+
     def _tournament_pick(self, scores):
         idx = self.rng.choice(self.pop_size, size=self.tournament, replace=False)
         return self.parasites[idx[int(np.argmax(scores[idx]))]]
@@ -4043,20 +4140,90 @@ class _PredatorPreyCoevolution:
         self.parasites = new_pop
         self.generation += 1
 
+    # ---- noise guard -------------------------------------------------------
+    def _update_hardness_ema(self, hardness):
+        """Track an EMA of per-row hardness (the guard's memory of which rows
+        stay hard over time)."""
+        a = self.hard_ema_rate
+        if self.hard_ema is None:
+            self.hard_ema = hardness.astype(np.float64).copy()
+        else:
+            self.hard_ema = (1.0 - a) * self.hard_ema + a * hardness
+
+    def _selection_hardness(self, hardness):
+        """Hardness used for predator selection, after the noise guard.
+
+        A row that has been trained on many times yet *stays* hard is, by
+        definition, one the hosts cannot fit even when handed it repeatedly —
+        i.e. irreducible noise / a mislabelled point.  Such rows have their
+        selection-hardness discounted so the predators stop being rewarded for
+        force-feeding them, which is exactly the near-perfect-model failure mode
+        (predators latching onto noise).  Genuinely learnable hard rows are
+        unaffected: once the hosts learn them their hardness EMA falls and the
+        discount relaxes, and they naturally drop out of the hard set anyway."""
+        if not self.noise_guard or self.hard_ema is None:
+            return hardness
+        # trained ∈ [0,1): →1 only after a row has been fed to the hosts many
+        # times, so brand-new hard rows are never prematurely suppressed.
+        trained    = self.seen_count / (self.seen_count + self.guard_patience)
+        resistance = self.hard_ema * trained            # hard AND repeatedly-fed
+        discount   = 1.0 - self.guard_strength * resistance
+        discount   = np.clip(discount, self.guard_floor, 1.0)
+        return hardness * discount
+
+    # ---- active-batch assembly --------------------------------------------
+    def _assemble_batch(self, parasite, sel):
+        """Build the chunk's training rows = the parasite's hardest rows + a
+        uniform-random ANCHOR, total length `subset`.
+
+        The anchor keeps a guaranteed slice of the bulk data distribution in
+        every batch, so an adversarial run can never pull the hosts entirely off
+        the data (bounding the noise-latching damage) and, over many chunks, the
+        whole dataset is covered rather than just the `subset` adversarial rows."""
+        subset = self.subset
+        if subset >= self.n_rows:
+            return parasite.copy()
+        n_anchor = min(int(round(self.anchor_frac * subset)), subset)
+        n_adv    = subset - n_anchor
+        if n_adv <= 0:
+            adv = np.empty(0, dtype=np.int64)
+        elif n_adv >= parasite.size:
+            adv = parasite.copy()
+        else:
+            # Keep the parasite's own hardest rows (by post-guard hardness).
+            order = np.argsort(sel[parasite])[::-1]
+            adv   = parasite[order[:n_adv]].astype(np.int64)
+        anchor = self._draw_rows(subset - adv.size, set(adv.tolist()),
+                                 hardness=None)        # uniform → coverage
+        return np.concatenate([adv, anchor]).astype(np.int64)
+
     def next_batch(self, X, Y, hofs, out_types):
         """Return the row indices the hosts should train on this chunk.
 
-        Scores the current parasites against the current host champions, takes
-        the toughest *engaged* parasite as the active adversarial batch, then
-        evolves the predator population for the next encounter.  On a cold start
-        (no champion yet) returns a random subset, which seeds the hosts and
-        gives the arms race something to bite on next chunk."""
+        Pipeline: compute a robust per-row hardness from the current champions →
+        update the noise-guard memory and discount chronically-unlearnable rows →
+        score the parasites with reduced virulence × competitive fitness sharing →
+        hand the toughest parasite's hardest rows (plus a random anchor) to the
+        hosts → evolve the predator population for the next encounter.  On a cold
+        start (no champion yet) returns a uniform subset to seed the hosts."""
         hardness = self._row_hardness(X, Y, hofs, out_types)
         if hardness is None:
             return self._random_parasite()
-        scores = np.array([self._score(p, hardness) for p in self.parasites])
-        active = self.parasites[int(np.argmax(scores))].copy()
-        self._evolve_from(scores, hardness)
+        # Noise guard: remember per-row hardness and suppress rows that resist
+        # learning despite repeated exposure.
+        self._update_hardness_ema(hardness)
+        sel = self._selection_hardness(hardness)
+        # Competitive fitness sharing needs the population's current coverage.
+        coverage = self._coverage()
+        scores = np.array([self._parasite_score(p, sel, coverage)
+                           for p in self.parasites])
+        best   = self.parasites[int(np.argmax(scores))]
+        active = self._assemble_batch(best, sel)
+        # Record what the hosts actually train on (drives the noise guard).
+        self.seen_count[active] += 1.0
+        # Bias mutation toward the post-guard hardness too, so the predators do
+        # not keep regenerating the suppressed-noise rows.
+        self._evolve_from(scores, sel)
         return active
 
 
@@ -4071,7 +4238,11 @@ def _coevo_next_batch(X, Y, hofs, out_types):
     if _COEVO_RUNTIME is None or _COEVO_RUNTIME.n_rows != n:
         _COEVO_RUNTIME = _PredatorPreyCoevolution(
             n_rows=n, subset=COEVO_CASE_SUBSET, pop_size=COEVO_POP_SIZE,
-            mut_rate=COEVO_MUT_RATE, virulence=COEVO_VIRULENCE)
+            mut_rate=COEVO_MUT_RATE, virulence=COEVO_VIRULENCE,
+            anchor_frac=COEVO_ANCHOR_FRAC, fitness_sharing=COEVO_FITNESS_SHARING,
+            noise_guard=COEVO_NOISE_GUARD, hard_ema_rate=COEVO_HARDNESS_EMA,
+            guard_patience=COEVO_GUARD_PATIENCE, guard_strength=COEVO_GUARD_STRENGTH,
+            guard_floor=COEVO_GUARD_FLOOR)
     return _COEVO_RUNTIME.next_batch(X, Y, hofs, out_types)
 
 
@@ -4119,6 +4290,16 @@ def _select_coevolution_mode(n_rows):
     print()
     print("  Reduced virulence (Cartlidge & Bullock) stops the predators from")
     print("  becoming impossibly hard and starving the hosts of gradient.")
+    print()
+    print("  Robustness guards (on by default — edit the COEVO_* module knobs to")
+    print("  tune or disable):")
+    print(f"    • Random ANCHOR ({COEVO_ANCHOR_FRAC:.0%} of each batch) keeps the hosts on the")
+    print("      bulk data and covers the whole dataset over time.")
+    print("    • Fitness SHARING spreads the predators across different weak")
+    print("      regions (stops them collapsing onto one cluster of rows).")
+    print("    • A NOISE GUARD discounts rows that stay hard despite repeated")
+    print("      training, so the predators don't latch onto label noise once")
+    print("      the model is near-perfect.")
     print()
     print("  Applies to the population-based models (Island / AFPO families).")
     print("  The Bayesian and Gradient-Boosting modes use their own sampling")
@@ -4180,6 +4361,11 @@ def _select_coevolution_mode(n_rows):
     print(f"  ✓  Competitive co-evolution ENABLED  "
           f"(subset {COEVO_CASE_SUBSET}, {COEVO_POP_SIZE} parasites, "
           f"mut {COEVO_MUT_RATE:g}, virulence λ={COEVO_VIRULENCE:g}).")
+    _guards = []
+    if COEVO_ANCHOR_FRAC > 0:   _guards.append(f"anchor {COEVO_ANCHOR_FRAC:.0%}")
+    if COEVO_FITNESS_SHARING:   _guards.append("fitness-sharing")
+    if COEVO_NOISE_GUARD:       _guards.append("noise-guard")
+    print(f"     Robustness guards: {', '.join(_guards) if _guards else 'none (legacy)'}.")
 
 
 # ==========================================
