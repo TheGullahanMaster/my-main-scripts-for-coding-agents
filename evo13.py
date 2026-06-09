@@ -18931,6 +18931,30 @@ def _hof_executor_workers(active_count, cap=8):
     return min(active_count, max(1, os.cpu_count() or cap), cap)
 
 
+def _rescore_individual_full_data(ind, X, y_col, otype, tg, refit_affine=True):
+    """Re-evaluate one individual on the FULL dataset.
+
+    The island / AFPO workers evolve on a pre-sliced mini-batch or co-evolution
+    subset — each worker receives ``X_b`` as its *entire* dataset (``batch_indices``
+    stays None inside the worker) — so the individual's affine, loss and R² were
+    all fit and measured IN-SAMPLE on that subset.  On a small subset the two free
+    affine parameters alone can drive the in-sample loss to 0 / R² to 1 even for a
+    model that cannot possibly fit the full target (e.g. one variable of a
+    three-variable sum).  Re-scoring on the full data — ``refit_affine`` snaps the
+    locked affine to its unbiased full-data fit — is what makes the number honest.
+
+    Used by the periodic HoF rescore (below) and, crucially, at GLOBAL-HoF
+    admission, so the Pareto frontier, the "New Best" prints and the final report
+    all reflect the true full-data fit rather than a subset-overfit estimate.
+    When no batching is active ``X_b is X`` and the full-data value is already
+    cached, so this is a cheap cache hit returning the identical result.
+    """
+    if refit_affine:
+        ind.affine_fitted = False
+    ind.calculate_fitness(X, y_col, otype, update_affine=refit_affine,
+                          target_grads=tg)
+
+
 def _parallel_rescore_hofs(hofs, X, Y, out_types, target_grads_list,
                            perfect_outputs=None, refit_affine=True,
                            label=None):
@@ -18968,11 +18992,8 @@ def _parallel_rescore_hofs(hofs, X, Y, out_types, target_grads_list,
         otype = out_types[o_idx]
         tg    = target_grads_list[o_idx] if target_grads_list is not None else None
         for ind in hof.best_by_complexity.values():
-            if refit_affine:
-                ind.affine_fitted = False
-            ind.calculate_fitness(X, y_col, otype,
-                                  update_affine=refit_affine,
-                                  target_grads=tg)
+            _rescore_individual_full_data(ind, X, y_col, otype, tg,
+                                          refit_affine=refit_affine)
         # Loss / affine were mutated in place on the HoF entries; bump the
         # version so cached `get_best_overall` results reflect new losses.
         hof._bump_version()
@@ -30138,6 +30159,13 @@ def train_mode():
                         islands_pop[isl_idx][o_idx] = ret_pop
                         stagnation_counters[isl_idx][o_idx] = stag
                         for c, ind in local_hof.best_by_complexity.items():
+                            # Workers fit/scored on the batch subset; re-score on
+                            # the FULL data before admission so the global HoF and
+                            # the print below report the true fit, not a subset
+                            # overfit (see _rescore_individual_full_data).
+                            _rescore_individual_full_data(
+                                ind, X, Y[:, o_idx], out_types[o_idx],
+                                target_grads_list[o_idx])
                             if hofs[o_idx].update(ind):
                                 is_cls = (out_types[o_idx] == 6)
                                 metric = (f"Acc={getattr(ind,'accuracy',0):.4f}"
@@ -30506,6 +30534,11 @@ def train_mode():
                         stag_cntrs[i] = stag
                         # Update global HoF with any new discoveries
                         for c, ind in local_hof.best_by_complexity.items():
+                            # Re-score on the FULL data before admission (workers
+                            # fit/scored on the batch subset only).
+                            _rescore_individual_full_data(
+                                ind, X, Y[:, i], out_types[i],
+                                target_grads_list[i])
                             if hofs[i].update(ind):
                                 is_cls = (out_types[i] == 6)
                                 metric = (f"Acc={getattr(ind,'accuracy',0):.4f}"
@@ -30906,6 +30939,11 @@ def train_mode():
                         stage_pops[s][i] = ret_pop
                         stag_cntrs[s][i] = stag
                         for c, ind in local_hof.best_by_complexity.items():
+                            # Re-score on the FULL data before admission (workers
+                            # fit/scored on the batch subset only).
+                            _rescore_individual_full_data(
+                                ind, X, Y[:, i], out_types[i],
+                                target_grads_list[i])
                             if hofs[i].update(ind):
                                 is_cls = (out_types[i] == 6)
                                 metric = (f"Acc={getattr(ind,'accuracy',0):.4f}"
@@ -31406,6 +31444,11 @@ def train_mode():
                         islands_pop[isl_idx][o_idx] = ret_pop
                         stagnation_counters[isl_idx][o_idx] = stag
                         for c, ind in local_hof.best_by_complexity.items():
+                            # Re-score on the FULL data before admission (workers
+                            # fit/scored on the batch subset only).
+                            _rescore_individual_full_data(
+                                ind, X, Y[:, o_idx], out_types[o_idx],
+                                target_grads_list[o_idx])
                             if hofs[o_idx].update(ind):
                                 is_cls = (out_types[o_idx] == 6)
                                 metric = (f"Acc={getattr(ind,'accuracy',0):.4f}"
@@ -31766,6 +31809,11 @@ def train_mode():
                         stage_islands[s_r][isl_r][o_idx] = ret_pop
                         stag_counters[s_r][isl_r][o_idx] = stag
                         for c, ind in local_hof.best_by_complexity.items():
+                            # Re-score on the FULL data before admission (workers
+                            # fit/scored on the batch subset only).
+                            _rescore_individual_full_data(
+                                ind, X, Y[:, o_idx], out_types[o_idx],
+                                target_grads_list[o_idx])
                             if hofs[o_idx].update(ind):
                                 is_cls = (out_types[o_idx] == 6)
                                 metric = (f"Acc={getattr(ind,'accuracy',0):.4f}"
@@ -32103,6 +32151,11 @@ def train_mode():
                         tier_islands[tier_r][isl_r][o_idx] = ret_pop
                         stag_counters[tier_r][isl_r][o_idx] = stag
                         for c, ind in local_hof.best_by_complexity.items():
+                            # Re-score on the FULL data before admission (workers
+                            # fit/scored on the batch subset only).
+                            _rescore_individual_full_data(
+                                ind, X, Y[:, o_idx], out_types[o_idx],
+                                target_grads_list[o_idx])
                             if hofs[o_idx].update(ind):
                                 is_cls = (out_types[o_idx] == 6)
                                 metric = (f"Acc={getattr(ind,'accuracy',0):.4f}"
