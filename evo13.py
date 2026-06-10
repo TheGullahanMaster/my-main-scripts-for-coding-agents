@@ -1263,6 +1263,17 @@ COEVO_BEST_UP         = 0.02  # ...and slow drift-UP rate (a row that turns
                               #  reading as "forgotten" forever — keeps noise out)
 COEVO_INSTAB_RATE     = 0.25  # EMA smoothing rate for the instability signal
 COEVO_INSTAB_SENS     = 0.50  # relative loss-rise that maps to full instability
+COEVO_INSTAB_LOSS_FLOOR = 0.02  # absolute floor on the loss-trend denominator (on the
+                              #  [0,1) hardness scale).  The trend term is a *relative*
+                              #  rise (fast−slow)/slow; without a meaningful floor a
+                              #  near-solved model (loss→0) turns a negligible absolute
+                              #  wobble into a huge relative rise and reads spuriously
+                              #  unstable — which would widen the anchor and damp the
+                              #  predators just as they should be honing the last hard
+                              #  rows.  Flooring the denominator makes the trend term
+                              #  count only once the loss is meaningfully nonzero; the
+                              #  (absolute) forgetting term still fires below it, so the
+                              #  many-variable signal is unaffected.
 COEVO_FORGET_SENS     = 0.12  # mean per-row regression that maps to full instability
                               # (the plateau-robust term: fires even when the loss is
                               #  stuck high but variables are taking turns dropping)
@@ -4029,7 +4040,7 @@ class _PredatorPreyCoevolution:
                  stabilize=True, anchor_boost=0.30, virulence_damp=0.40,
                  adv_floor=0.30, best_down=0.50, best_up=0.02,
                  instab_rate=0.25, instab_sens=0.50, forget_sens=0.12,
-                 loss_fast=0.40, loss_slow=0.10):
+                 loss_fast=0.40, loss_slow=0.10, instab_loss_floor=0.02):
         self.n_rows     = int(n_rows)
         self.subset     = max(1, min(int(subset), self.n_rows))
         self.pop_size   = max(2, int(pop_size))
@@ -4054,6 +4065,7 @@ class _PredatorPreyCoevolution:
         self.best_up         = float(min(max(best_up, 0.0), 1.0))
         self.instab_rate     = float(min(max(instab_rate, 1e-3), 1.0))
         self.instab_sens     = float(max(instab_sens, 1e-6))
+        self.instab_loss_floor = float(max(instab_loss_floor, 1e-9))
         self.forget_sens     = float(max(forget_sens, 1e-6))
         self.loss_fast_rate  = float(min(max(loss_fast, 1e-3), 1.0))
         self.loss_slow_rate  = float(min(max(loss_slow, 1e-3), 1.0))
@@ -4287,7 +4299,9 @@ class _PredatorPreyCoevolution:
 
         Two ingredients feed instability:
           • a positive global-loss *trend* (fast EMA above slow EMA) — catches an
-            actively climbing loss; and
+            actively climbing loss.  It is a *relative* rise, but its denominator
+            is floored on the absolute [0,1) scale so a near-solved model (loss
+            ≈ 0) cannot turn a negligible wobble into a spurious instability; and
           • the mean per-row REGRESSION (`forget_frac`) — how much of the signal
             the hosts have dropped relative to their best-ever fit.  This term is
             the important one for many-variable targets: it stays high on a *flat*
@@ -4323,7 +4337,17 @@ class _PredatorPreyCoevolution:
                               + self.loss_fast_rate * gl)
             self.loss_slow = ((1.0 - self.loss_slow_rate) * self.loss_slow
                               + self.loss_slow_rate * gl)
-        rise = max((self.loss_fast - self.loss_slow) / max(self.loss_slow, 1e-9), 0.0)
+        # Relative loss rise, but with the denominator floored on the ABSOLUTE
+        # [0,1) hardness scale.  Near convergence loss_slow → 0, so a negligible
+        # absolute wobble would otherwise blow up the *relative* rise (e.g. a
+        # 1e-4 → 4e-3 drift reads as a >100% rise) and saturate instability on an
+        # essentially-solved model — needlessly widening the anchor and damping
+        # the predators just as they should be honing the last hard rows.
+        # Flooring at `instab_loss_floor` makes the trend term count only once the
+        # loss is meaningfully nonzero; the absolute forgetting term below still
+        # fires under the floor, so the many-variable signal is untouched.
+        rise = max((self.loss_fast - self.loss_slow)
+                   / max(self.loss_slow, self.instab_loss_floor), 0.0)
         # Saturating map into [0,1): blend the (relative) trend rise and the
         # forgetting fraction; either one alone can drive the stabiliser.
         z = rise / self.instab_sens + self.forget_frac / self.forget_sens
@@ -4472,7 +4496,7 @@ def _coevo_next_batch(X, Y, hofs, out_types):
             best_down=COEVO_BEST_DOWN, best_up=COEVO_BEST_UP,
             instab_rate=COEVO_INSTAB_RATE, instab_sens=COEVO_INSTAB_SENS,
             forget_sens=COEVO_FORGET_SENS, loss_fast=COEVO_LOSS_FAST,
-            loss_slow=COEVO_LOSS_SLOW)
+            loss_slow=COEVO_LOSS_SLOW, instab_loss_floor=COEVO_INSTAB_LOSS_FLOOR)
     return _COEVO_RUNTIME.next_batch(X, Y, hofs, out_types)
 
 
