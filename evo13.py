@@ -18089,57 +18089,115 @@ def _pareto_dominates_3obj(a, b):
                  or a.complexity < b.complexity))
 
 
+def _crowding_distance_matrix(M):
+    """
+    NSGA-II crowding distance over the rows of objective matrix ``M``
+    (shape (m, n_obj), all objectives minimised).  Boundary points on each
+    axis get +inf so they are always preferred; interior points accumulate
+    the normalised gap to their axis-neighbours.  Returns a length-m array.
+    """
+    m = M.shape[0]
+    if m <= 2:
+        return np.full(m, np.inf)
+    cd = np.zeros(m, dtype=np.float64)
+    for d in range(M.shape[1]):
+        order = np.argsort(M[:, d], kind='stable')
+        cd[order[0]]  = np.inf
+        cd[order[-1]] = np.inf
+        span = M[order[-1], d] - M[order[0], d]
+        if span > 1e-30:
+            cd[order[1:-1]] += (M[order[2:], d] - M[order[:-2], d]) / span
+    return cd
+
+
 def _trim_to_pareto_front_3obj(population, target_size):
     """
-    Remove Pareto-dominated individuals using 3-objective dominance
-    (age, fitness, complexity).  If the front is still too large, remove
-    the individuals with the worst crowding distance (NSGA-II style)
-    over the same three axes.
+    NSGA-II survival selection on (age, fitness, complexity) — all minimised.
 
-    The champion (lowest loss) is always protected.
+    Individuals are sorted into successive non-dominated fronts (F0, F1, …);
+    whole fronts are admitted best-first until the next one would overflow
+    ``target_size``, and that boundary front is admitted partially by crowding
+    distance (least-crowded first).  The population is therefore held AT
+    ``target_size`` whenever enough individuals exist.
+
+    WHY THIS MATTERS — the previous implementation kept *only* the first
+    non-dominated front and discarded every dominated individual outright.
+    On three objectives that first front is small (≈18 members on typical
+    regression/classification data), so the pool could never sustain its
+    nominal size: single-population AFPO ran with an effective breeding pool
+    of ~20 % of ``target_size`` (measured: mean 18 / 80), every refill,
+    immigrant and HoF re-injection was wiped within the same generation, and
+    the search behaved like a tiny under-powered EA.  The islanded / staged /
+    age-group variants only masked this by running many pools in parallel.
+    Admitting the lower fronts (standard NSGA-II) keeps the pool full and
+    diverse, which is exactly the population management the island model gets
+    for free by replacing a single death-tournament victim per birth.
+
+    The champion (lowest loss) is always retained regardless of its front.
     """
     if not population:
         return population
 
+    n = len(population)
     champion = min(population, key=lambda x: x.loss)
 
-    # Remove 3-obj dominated individuals
-    survivors = []
-    for i, ind in enumerate(population):
-        if ind is champion:
-            survivors.append(ind)
-            continue
-        dominated = any(_pareto_dominates_3obj(other, ind)
-                        for j, other in enumerate(population) if j != i)
-        if not dominated:
-            survivors.append(ind)
+    # Below target there is nothing to trim — keep everyone.  The steady-state
+    # loop grows the pool back toward target by appending the per-generation
+    # immigrant and offspring; collapsing it here is what starved the search.
+    if n <= target_size:
+        return list(population)
 
-    # Crowding-distance trim if still too large
-    if len(survivors) > target_size:
-        # Compute crowding distance on (age, fitness, complexity)
-        cd = np.zeros(len(survivors))
-        for dim_fn in [lambda x: x.age, lambda x: x.fitness, lambda x: x.complexity]:
-            vals = np.array([dim_fn(ind) for ind in survivors], dtype=np.float64)
-            order = np.argsort(vals)
-            cd[order[0]]  = float('inf')
-            cd[order[-1]] = float('inf')
-            span = vals[order[-1]] - vals[order[0]] + 1e-30
-            for k in range(1, len(order) - 1):
-                cd[order[k]] += (vals[order[k+1]] - vals[order[k-1]]) / span
+    # ── Objective matrix (all minimised): age, fitness, complexity ───────
+    A = np.empty((n, 3), dtype=np.float64)
+    for k, ind in enumerate(population):
+        A[k, 0] = ind.age
+        A[k, 1] = ind.fitness
+        A[k, 2] = ind.complexity
+    # Non-finite fitness/complexity would poison the vectorised comparison
+    # (NaN compares False both ways, so such an individual would spuriously
+    # land on the first front).  Map them to a large sentinel so they are
+    # correctly dominated by every finite individual.
+    A[:, 1] = np.where(np.isfinite(A[:, 1]), A[:, 1], 1e18)
+    A[:, 2] = np.where(np.isfinite(A[:, 2]), A[:, 2], 1e18)
 
-        # Sort by crowding distance descending, keep top target_size.
-        # Champion is *always* included.  The previous implementation built a
-        # `set` of top-target_size indices, then `add()`-ed the champion, then
-        # sliced `[:target_size]` of the sorted union — which silently dropped
-        # the champion when its survivor-index happened to be the largest.
-        # We now always allocate the champion's slot first and fill the
-        # remaining target_size-1 slots from the CD-ranked list (excluding the
-        # champion to avoid duplicate keeping).
-        champ_idx  = next(i for i, ind in enumerate(survivors) if ind is champion)
-        ranked     = sorted(range(len(survivors)), key=lambda i: cd[i], reverse=True)
-        keep_order = [champ_idx] + [i for i in ranked if i != champ_idx]
-        keep_idx   = keep_order[:max(1, target_size)]
-        survivors  = [survivors[i] for i in keep_idx]
+    # ── Vectorised pairwise domination: dom[i, j] ⇔ i dominates j ────────
+    le  = (A[:, None, :] <= A[None, :, :]).all(axis=2)   # i ≤ j on all axes
+    lt  = (A[:, None, :] <  A[None, :, :]).any(axis=2)    # i < j on some axis
+    dom = le & lt
+    np.fill_diagonal(dom, False)
+
+    # ── Fast non-dominated sort into successive fronts ───────────────────
+    remaining = dom.sum(axis=0).astype(np.int64)   # how many dominate j
+    placed    = np.zeros(n, dtype=bool)
+    fronts    = []
+    cur       = np.where(remaining == 0)[0]
+    while cur.size:
+        fronts.append(cur)
+        placed[cur] = True
+        remaining = remaining - dom[cur, :].sum(axis=0)
+        remaining[placed] = -1                     # exclude already-placed
+        cur = np.where(remaining == 0)[0]
+
+    # ── Admit fronts best-first; crowding-trim the boundary front ────────
+    keep_idx = []
+    for front in fronts:
+        if len(keep_idx) + front.size <= target_size:
+            keep_idx.extend(int(i) for i in front)
+        else:
+            need  = target_size - len(keep_idx)
+            cd    = _crowding_distance_matrix(A[front])
+            order = np.argsort(-cd, kind='stable')   # least-crowded first
+            keep_idx.extend(int(front[t]) for t in order[:need])
+            break
+
+    survivors = [population[k] for k in keep_idx]
+
+    # Champion guarantee: it can fall to a later front (e.g. lowest loss but
+    # old and complex, so dominated on the selection-fitness axis).  If it was
+    # cut, swap it in for the worst-fitness survivor.
+    if champion not in survivors:
+        survivors.sort(key=lambda x: x.fitness)
+        survivors[-1] = champion
 
     return survivors
 
