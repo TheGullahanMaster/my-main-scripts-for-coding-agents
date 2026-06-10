@@ -220,9 +220,13 @@ def test_select_batch_indices():
     evo13.COEVO_VIRULENCE = 0.8
     evo13._COEVO_RUNTIME = None
     cb = evo13._select_batch_indices(X, Y, hofs, out_types, 0)
-    assert cb is not None and len(cb) == 24, f"co-evo batch wrong size: {None if cb is None else len(cb)}"
+    # The batch is the parasite subset padded up to the evaluation floor
+    # (in-sample selection on very few rows cannot resolve host quality).
+    expect = max(24, min(evo13.COEVO_MIN_EVAL_ROWS, n))
+    assert cb is not None and len(cb) == expect, \
+        f"co-evo batch wrong size: {None if cb is None else len(cb)} (expected {expect})"
     assert evo13._COEVO_RUNTIME is not None, "runtime manager should be lazily created"
-    ok("co-evolution ON returns the parasite subset (size = COEVO_CASE_SUBSET)")
+    ok("co-evolution ON returns the parasite subset padded to the eval floor")
 
     # --- subset >= n degenerates to full data path ---
     evo13.COEVO_CASE_SUBSET = n + 10

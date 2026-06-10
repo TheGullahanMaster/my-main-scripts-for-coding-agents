@@ -1187,7 +1187,7 @@ INSTANCE_REWEIGHT_UPDATE_EVERY = 1       # re-score / re-weight every N generati
 # rather than at 1.0, keeping both populations engaged.  Toggled interactively
 # at startup (default OFF).
 #
-# Four failure modes of the naive predator–prey loop are guarded against here,
+# Five failure modes of the naive predator–prey loop are guarded against here,
 # all on by default (set the corresponding knob to disable):
 #   1. NOISE-LATCHING — on a near-perfect model the only "hard" rows left are the
 #      irreducible-noise ones, so the predators collapse the whole batch onto
@@ -1220,6 +1220,28 @@ INSTANCE_REWEIGHT_UPDATE_EVERY = 1       # re-score / re-weight every N generati
 #      (Closed-loop simulation found breadth — not re-injecting the specific
 #      dropped rows, which just duplicates what the predators already chase — is
 #      the lever that actually fixes the forgetting.)
+#   5. RESOLUTION COLLAPSE — when the subset is small relative to the dataset
+#      (the stress regime: subset 1…a few hundred rows on a big/complex target)
+#      the chunk's IN-SAMPLE fitness can no longer tell a genuinely better host
+#      from a lucky one: the workers fit the affine and score entirely on the
+#      batch, so on ≤2 rows the two affine parameters alone tie every host at
+#      ~0 loss, and on a few hundred rows of a complex target the chunk winner
+#      is usually a batch-overfitter that transfers nothing — selection turns
+#      into a random walk and the search "loses the resolution required to
+#      learn".  Countered by (a) an EVALUATION FLOOR — the batch handed to the
+#      hosts is padded with anchor rows up to at least COEVO_MIN_EVAL_ROWS, so
+#      a tiny parasite subset stays an adversarial *spotlight* without starving
+#      selection of signal; (b) a RESOLUTION GOVERNOR — every chunk the hosts'
+#      batch-best candidates are re-scored on the full data anyway (the honest-
+#      HoF fix); the governor watches the relative batch→full generalisation
+#      gap of those candidates, and while it stays high (the batch keeps
+#      electing models the dataset disowns) it GROWS the batch multiplicatively
+#      (up to COEVO_RES_MAX_FACTOR× the base size), shrinking back once the
+#      batch resolves honestly so the configured speed is recovered; and (c) a
+#      STRATIFIED ANCHOR — anchor rows are drawn per class (classification) or
+#      per target-quantile bin (regression) instead of plain-uniform, so even a
+#      floor-sized batch carries every class / the full target spread instead
+#      of whatever a lucky uniform draw happened to include.
 COEVOLUTION_ENABLED = False   # master switch (asked just before batch size)
 COEVO_CASE_SUBSET   = 64      # rows per parasite — the mini-batch-size analogue
 COEVO_POP_SIZE      = 32      # number of parasites in the predator population
@@ -1279,6 +1301,33 @@ COEVO_FORGET_SENS     = 0.12  # mean per-row regression that maps to full instab
                               #  stuck high but variables are taking turns dropping)
 COEVO_LOSS_FAST       = 0.40  # fast global-loss EMA rate  ┐ trend = fast − slow
 COEVO_LOSS_SLOW       = 0.10  # slow global-loss EMA rate  ┘ (>0 ⇒ regressing)
+# ---- Batch-resolution guards (anti resolution-collapse, failure mode 5) ----
+# `subset` stays the size of the adversarial spotlight (the parasite genome);
+# these knobs govern how many rows the HOSTS actually see, which is what
+# selection resolution depends on.  The batch handed to the hosts is
+#     max(subset, COEVO_MIN_EVAL_ROWS) × res_factor   (capped at the dataset)
+# with everything beyond the parasite's adversarial core filled by anchor rows.
+# `res_factor` starts at 1 and is driven by the batch→full generalisation gap
+# of the candidates each chunk admits to the global HoF (they are re-scored on
+# the full data at admission anyway, so the signal is free): a high gap means
+# the batch keeps electing models the full dataset disowns — too little
+# resolution — so the governor grows the batch; once the batch resolves
+# honestly it decays back toward the configured size.
+COEVO_MIN_EVAL_ROWS  = 32     # hosts never train/select on fewer rows than this
+                              # (≤2 rows is degenerate: the affine alone ties all)
+COEVO_RES_MAX_FACTOR = 32.0   # governor may grow the batch up to this × base size
+COEVO_RES_GROW       = 1.50   # max batch growth per chunk (at/above GAP_HI)
+COEVO_RES_SHRINK     = 0.93   # max batch decay per chunk (at/below GAP_LO)
+COEVO_RES_GAP_HI     = 0.35   # gap at/above this ⇒ full-rate growth
+COEVO_RES_GAP_LO     = 0.15   # gap at/below this ⇒ full-rate shrink; between the
+                              # two the controller is PROPORTIONAL around the
+                              # midpoint setpoint (no dead-band: a gap stuck at
+                              # e.g. 0.30 keeps nudging the batch up until the
+                              # chunk winners transfer honestly)
+COEVO_RES_GAP_EMA    = 0.30   # per-chunk EMA rate for the generalisation gap
+COEVO_STRATIFY       = True   # anchor rows drawn per class (classification) /
+                              # per target-quantile bin (regression) so every
+                              # batch is representative, not luck-of-the-draw
 _COEVO_RUNTIME      = None    # lazily-built _PredatorPreyCoevolution instance
 
 # ---- Bayesian CGP Settings ----
@@ -4027,6 +4076,26 @@ class _PredatorPreyCoevolution:
     (pure observation, surfaced in the per-generation log); only the batch-shaping
     action is gated by `stabilize` (off ⇒ the exact legacy arms race).
 
+    Independently of WHICH rows the batch carries, HOW MANY it carries decides
+    whether the hosts' in-sample fitness can resolve a genuinely better equation
+    from a lucky one — the workers fit the affine and score entirely on the
+    batch, so a too-small batch turns selection into a random walk (on ≤2 rows
+    the affine alone ties every host at ~0 loss).  Three guards keep that
+    resolution (failure mode 5 in the COEVO_* notes):
+
+      • EVALUATION FLOOR  — the assembled batch is padded with anchor rows to at
+        least `min_eval_rows`; the parasite stays a small adversarial spotlight.
+      • RESOLUTION GOVERNOR — `observe_generalization` is fed the batch→full
+        loss gap of every candidate the main loop re-scores at global-HoF
+        admission; a proportional controller grows the batch (up to
+        `res_max_factor`×) while the smoothed gap sits above the
+        [res_gap_lo, res_gap_hi] midpoint — chunk winners keep failing the
+        full data: subset overfit — and decays it back once the batch is a
+        faithful proxy again, equilibrating at "just big enough to transfer".
+      • STRATIFIED ANCHOR — anchor rows are drawn per class (classification) or
+        per target-quantile bin (regression), so even a small batch carries the
+        minority class / the full target spread.
+
     The whole mechanism lives in the main process (parasites are just row-index
     arrays); the host workers receive the pre-sliced rows exactly as they do for
     an ordinary mini-batch, so no worker-side change is needed.
@@ -4040,7 +4109,10 @@ class _PredatorPreyCoevolution:
                  stabilize=True, anchor_boost=0.30, virulence_damp=0.40,
                  adv_floor=0.30, best_down=0.50, best_up=0.02,
                  instab_rate=0.25, instab_sens=0.50, forget_sens=0.12,
-                 loss_fast=0.40, loss_slow=0.10, instab_loss_floor=0.02):
+                 loss_fast=0.40, loss_slow=0.10, instab_loss_floor=0.02,
+                 min_eval_rows=32, res_max_factor=32.0, res_grow=1.50,
+                 res_shrink=0.93, res_gap_hi=0.35, res_gap_lo=0.15,
+                 res_gap_ema=0.30, stratify=True):
         self.n_rows     = int(n_rows)
         self.subset     = max(1, min(int(subset), self.n_rows))
         self.pop_size   = max(2, int(pop_size))
@@ -4069,6 +4141,25 @@ class _PredatorPreyCoevolution:
         self.forget_sens     = float(max(forget_sens, 1e-6))
         self.loss_fast_rate  = float(min(max(loss_fast, 1e-3), 1.0))
         self.loss_slow_rate  = float(min(max(loss_slow, 1e-3), 1.0))
+        # ---- batch-resolution knobs (failure mode 5; see COEVO_* notes) ----
+        self.min_eval_rows   = max(0, int(min_eval_rows))
+        self.res_max_factor  = float(max(res_max_factor, 1.0))
+        self.res_grow        = float(max(res_grow, 1.0))
+        self.res_shrink      = float(min(max(res_shrink, 0.1), 1.0))
+        self.res_gap_hi      = float(min(max(res_gap_hi, 0.0), 1.0))
+        self.res_gap_lo      = float(min(max(res_gap_lo, 0.0), self.res_gap_hi))
+        self.res_gap_ema     = float(min(max(res_gap_ema, 1e-3), 1.0))
+        self.stratify        = bool(stratify)
+        # Resolution-governor state: the current batch-size multiplier, the
+        # smoothed batch→full generalisation gap driving it (None until the
+        # first observation, which seeds it directly — no slow ramp from 0),
+        # and the per-chunk accumulator `observe_generalization` fills.
+        self.res_factor      = 1.0
+        self.gap_ema         = None
+        self._gap_chunk_max  = None
+        # Stratum row-index lists for the representative anchor (built lazily
+        # from (Y, out_types) on the first next_batch call; None ⇒ uniform).
+        self._strata_rows    = None
         # EMA of per-row hardness + how often each row has actually been trained
         # on — together they let the guard tell "hard but learnable" rows from
         # "hard no matter what" (≈ noise) rows.
@@ -4099,12 +4190,113 @@ class _PredatorPreyCoevolution:
         return self.rng.choice(self.n_rows, size=self.subset,
                                replace=False).astype(np.int64)
 
+    def _ensure_strata(self, Y, out_types):
+        """Build the per-row strata the representative anchor samples from
+        (once per runtime; n_rows and the targets are fixed for a run).
+
+        • Any CLASSIFICATION outputs present → rows are stratified by class:
+          ≤4 binary outputs combine into their joint label combination
+          (handles independent binary targets exactly); >4 classification
+          columns are treated as a one-hot group and stratified by argmax
+          (the class id).  This is what guarantees a small batch still
+          carries the minority class instead of whatever a lucky uniform
+          draw included.
+        • Pure regression → 8 quantile bins of the first target, so every
+          batch spans the full target spread (a narrow-spread batch makes
+          the in-sample affine fit, and therefore selection, degenerate).
+
+        Degenerate targets collapse to one stratum, which makes the
+        stratified draw exactly the uniform draw."""
+        if self._strata_rows is not None or not self.stratify:
+            return
+        try:
+            Y2 = np.asarray(Y, dtype=np.float64)
+            if Y2.ndim == 1:
+                Y2 = Y2.reshape(-1, 1)
+            if Y2.shape[0] != self.n_rows:
+                self.stratify = False
+                return
+            cls_cols = [i for i, t in enumerate(out_types)
+                        if t == 6 and i < Y2.shape[1]]
+            if cls_cols:
+                if len(cls_cols) <= 4:
+                    labels = np.zeros(self.n_rows, dtype=np.int64)
+                    for c in cls_cols:
+                        labels = labels * 2 + (Y2[:, c] > 0.5).astype(np.int64)
+                else:
+                    labels = np.argmax(Y2[:, cls_cols], axis=1).astype(np.int64)
+            else:
+                y0 = Y2[:, 0]
+                edges = np.quantile(y0, np.linspace(0.0, 1.0, 9)[1:-1])
+                labels = np.searchsorted(edges, y0, side='right').astype(np.int64)
+            self._strata_rows = [np.nonzero(labels == u)[0]
+                                 for u in np.unique(labels)]
+        except Exception:
+            # Strata are an optimisation, never a hard dependency: any surprise
+            # in the targets just falls back to the plain uniform anchor.
+            self._strata_rows = None
+            self.stratify = False
+
+    def _stratified_rows(self, count, exclude):
+        """Draw `count` distinct non-excluded rows spread across the strata:
+        proportional largest-remainder quotas with a ≥1-row guarantee per
+        (available) stratum whenever the batch has room for all of them, so a
+        16-row batch on an imbalanced classification task still contains the
+        minority class and a regression batch still spans the target range."""
+        if count <= 0:
+            return np.empty(0, dtype=np.int64)
+        mask = np.ones(self.n_rows, dtype=bool)
+        if exclude:
+            mask[list(exclude)] = False
+        pools = [s[mask[s]] for s in self._strata_rows]
+        pools = [p for p in pools if p.size > 0]
+        if not pools:
+            return np.empty(0, dtype=np.int64)
+        total_avail = int(sum(p.size for p in pools))
+        if total_avail <= count:
+            return np.concatenate(pools).astype(np.int64)
+        sizes = np.array([p.size for p in pools], dtype=np.float64)
+        raw   = count * sizes / sizes.sum()
+        quota = np.floor(raw).astype(np.int64)
+        if count >= len(pools):
+            quota = np.maximum(quota, 1)          # every stratum represented
+        while int(quota.sum()) > count:           # trim overshoot off the largest
+            quota[int(np.argmax(quota))] -= 1
+        if int(quota.sum()) < count:              # hand shortfall out by remainder
+            order = np.argsort(raw - np.floor(raw))[::-1]
+            i = 0
+            while int(quota.sum()) < count:
+                quota[order[i % len(pools)]] += 1
+                i += 1
+        picked, short = [], 0
+        for p, q in zip(pools, quota):
+            take = min(int(q), int(p.size))
+            short += int(q) - take
+            if take > 0:
+                picked.append(self.rng.choice(p, size=take, replace=False))
+        out = (np.concatenate(picked).astype(np.int64)
+               if picked else np.empty(0, dtype=np.int64))
+        if short > 0:                             # top up from whatever is left
+            left_mask = mask.copy()
+            left_mask[out] = False
+            left = np.nonzero(left_mask)[0]
+            if left.size > 0:
+                extra = self.rng.choice(left, size=min(short, left.size),
+                                        replace=False)
+                out = np.concatenate([out, extra]).astype(np.int64)
+        return out
+
     def _draw_rows(self, count, exclude, hardness):
         """Draw `count` distinct rows not already in `exclude`, biased toward the
-        currently-hard rows when a hardness signal is available (else uniform).
+        currently-hard rows when a hardness signal is available (else uniform —
+        or stratified across classes / target-quantile bins when strata are
+        built, so anchors are representative rather than luck-of-the-draw).
         The hardness bias is what makes the predators chase host weaknesses."""
         if count <= 0:
             return np.empty(0, dtype=np.int64)
+        if (hardness is None and self.stratify
+                and self._strata_rows is not None and len(self._strata_rows) > 1):
+            return self._stratified_rows(count, exclude)
         mask = np.ones(self.n_rows, dtype=bool)
         if exclude:
             mask[list(exclude)] = False
@@ -4391,6 +4583,86 @@ class _PredatorPreyCoevolution:
         f = self.anchor_frac + self.anchor_boost * self.instability
         return float(min(f, max(0.0, 1.0 - self.adv_floor)))
 
+    # ---- batch-resolution governor (failure mode 5) -------------------------
+    def observe_generalization(self, batch_loss, full_loss):
+        """Feed one candidate's batch→full generalisation gap to the governor.
+
+        Called (via `_coevo_admission_rescore`) for every worker candidate the
+        main loop re-scores on the full dataset before global-HoF admission, so
+        the signal costs nothing extra.  The gap is the scale-free shortfall
+            relu(full − batch) / max(full, batch)  ∈ [0, 1]:
+        ~0 when the chunk's in-sample score transferred (the batch is a faithful
+        proxy), → 1 when the batch said "solved" but the dataset disagrees — the
+        signature of a batch too small to resolve host quality.  Within a chunk
+        the MAX over candidates is kept: the candidate that wins selection IS
+        the batch-best, so one badly-overfit winner means the batch failed to
+        resolve, however honest the also-rans were."""
+        try:
+            b = float(batch_loss)
+            f = float(full_loss)
+        except (TypeError, ValueError):
+            return
+        if not (np.isfinite(b) and np.isfinite(f)):
+            return
+        gap = max(f - b, 0.0) / max(f, b, 1e-12)
+        gap = float(min(gap, 1.0))
+        if self._gap_chunk_max is None or gap > self._gap_chunk_max:
+            self._gap_chunk_max = gap
+
+    def _update_resolution(self):
+        """Fold the chunk's observed generalisation gap into the smoothed
+        `gap_ema` and step the batch-size multiplier `res_factor` with a
+        PROPORTIONAL controller seeking the midpoint of [res_gap_lo,
+        res_gap_hi]: at/above `res_gap_hi` the batch grows at the full
+        `res_grow` rate (the chunk winners keep failing the full data — not
+        enough resolution), at/below `res_gap_lo` it decays at the full
+        `res_shrink` rate, and in between the rate scales with the distance
+        from the setpoint — so there is no dead-band where a persistently
+        mediocre gap (say 0.30) leaves the batch stuck half-resolved.  At the
+        setpoint the batch holds: that is the equilibrium "just big enough that
+        the in-sample winner roughly transfers".  No observations this chunk
+        (e.g. a driver that never re-scores) ⇒ no movement — the governor acts
+        only on evidence."""
+        if self._gap_chunk_max is None:
+            return self.res_factor
+        if self.gap_ema is None:
+            self.gap_ema = float(self._gap_chunk_max)
+        else:
+            r = self.res_gap_ema
+            self.gap_ema = float((1.0 - r) * self.gap_ema
+                                 + r * self._gap_chunk_max)
+        self._gap_chunk_max = None
+        if self.res_max_factor > 1.0:
+            mid  = 0.5 * (self.res_gap_hi + self.res_gap_lo)
+            span = max(self.res_gap_hi - mid, 1e-9)
+            err  = float(np.clip((self.gap_ema - mid) / span, -1.0, 1.0))
+            # NOTE: a "stall boost" (force growth whenever the host loss is
+            # flat and the gap is anywhere above res_gap_lo) was tried here and
+            # measurably HURT the complex-regression stress case: it ballooned
+            # the batch past the transfer equilibrium, diluting the adversarial
+            # core until the arms-race advantage over plain full-data training
+            # was gone.  Plateaus are the search's business (meta-extinction
+            # et al.), not the batch-sizer's — the governor only buys
+            # resolution when the transfer gap itself says it is missing.
+            if err >= 0.0:
+                step = self.res_grow ** err
+            else:
+                step = self.res_shrink ** (-err)
+            self.res_factor = float(min(max(self.res_factor * step, 1.0),
+                                        self.res_max_factor))
+        return self.res_factor
+
+    def _effective_rows(self):
+        """How many rows the hosts actually see this chunk: the configured
+        subset, floored at `min_eval_rows` (selection on ≤2 rows is degenerate —
+        the affine alone ties every host) and scaled by the governor's
+        `res_factor`, capped at the dataset.  `subset` itself is untouched: the
+        parasites stay a small adversarial spotlight; resolution rides in on
+        anchor padding."""
+        base = max(self.subset, min(self.min_eval_rows, self.n_rows))
+        rows = int(round(base * self.res_factor))
+        return int(min(max(rows, base, 1), self.n_rows))
+
     def _record_history(self, regression):
         """Append a compact per-chunk diagnostics row (loss curve + forgetting +
         instability + how many rows are currently regressed from their best)."""
@@ -4404,12 +4676,16 @@ class _PredatorPreyCoevolution:
             'forget_frac': self.forget_frac,
             'instability': self.instability,
             'regressed':   reg_rows,
+            'gap_ema':     self.gap_ema if self.gap_ema is not None else 0.0,
+            'res_factor':  self.res_factor,
+            'eval_rows':   self._effective_rows(),
         })
 
     # ---- active-batch assembly --------------------------------------------
     def _assemble_batch(self, parasite, sel):
-        """Build the chunk's `subset` training rows = the parasite's hardest rows
-        (the core arms race) + a uniform-random ANCHOR.
+        """Build the chunk's training rows = the parasite's hardest rows (the
+        core arms race) + a representative random ANCHOR, padded to the
+        governor's effective row count.
 
         The anchor keeps a guaranteed slice of the bulk distribution in every
         batch — breadth — so an adversarial run can never pull the hosts entirely
@@ -4419,11 +4695,16 @@ class _PredatorPreyCoevolution:
         variable represented, which is what stops the many-variable forgetting.
         When they are converging cleanly it relaxes back to the configured anchor.
 
-        The arms race always keeps ≥ `adv_floor` of the batch, and the result is
-        always exactly `subset` distinct in-range rows."""
+        The adversarial core is always carved out of the configured `subset`
+        (the arms race keeps ≥ `adv_floor` of it); everything beyond it — the
+        legacy anchor share plus the evaluation-floor / resolution-governor
+        padding of `_effective_rows` — is anchor.  The result is always
+        `_effective_rows()` distinct in-range rows (== `subset` at the legacy
+        configuration: no floor, governor at ×1)."""
+        total = self._effective_rows()
+        if total >= self.n_rows:
+            return np.arange(self.n_rows, dtype=np.int64)
         subset = self.subset
-        if subset >= self.n_rows:
-            return parasite.copy()
         n_anchor = min(int(round(self._effective_anchor_frac() * subset)), subset)
         n_adv    = subset - n_anchor
         if n_adv <= 0:
@@ -4434,8 +4715,8 @@ class _PredatorPreyCoevolution:
             # Keep the parasite's own hardest rows (by post-guard hardness).
             order = np.argsort(sel[parasite])[::-1]
             adv   = parasite[order[:n_adv]].astype(np.int64)
-        anchor = self._draw_rows(subset - adv.size, set(adv.tolist()),
-                                 hardness=None)        # uniform → coverage
+        anchor = self._draw_rows(total - adv.size, set(adv.tolist()),
+                                 hardness=None)   # representative → coverage
         return np.concatenate([adv, anchor]).astype(np.int64)
 
     def next_batch(self, X, Y, hofs, out_types):
@@ -4444,20 +4725,27 @@ class _PredatorPreyCoevolution:
         Pipeline: compute a robust per-row hardness from the current champions →
         update the noise-guard memory and discount chronically-unlearnable rows →
         track progress (global-loss trend + per-row best-ever fit + forgetting) and
-        update the instability signal → score the parasites with a possibly-damped
-        reduced virulence × competitive fitness sharing → hand the toughest
-        parasite's hardest rows plus a (possibly widened) random anchor to the
-        hosts → evolve the predator population for the next encounter.  On a cold
-        start (no champion yet) returns a uniform subset."""
+        update the instability signal → step the resolution governor on the
+        chunk's observed batch→full generalisation gap → score the parasites with
+        a possibly-damped reduced virulence × competitive fitness sharing → hand
+        the toughest parasite's hardest rows plus a (possibly widened, possibly
+        resolution-padded) representative anchor to the hosts → evolve the
+        predator population for the next encounter.  On a cold start (no champion
+        yet) returns a representative random batch at the current resolution."""
+        self._ensure_strata(Y, out_types)
         hardness = self._row_hardness(X, Y, hofs, out_types)
         if hardness is None:
-            return self._random_parasite()
+            cold = self._draw_rows(self._effective_rows(), set(), hardness=None)
+            return np.asarray(cold, dtype=np.int64)
         # Noise guard: remember per-row hardness and suppress rows that resist
         # learning despite repeated exposure.
         self._update_hardness_ema(hardness)
         # Progress tracking: global-loss trend + per-row best-ever fit + forgetting
         # → the instability signal that drives the stabiliser (anchor + virulence).
         self._update_progress(hardness)
+        # Resolution governor: act on the batch→full generalisation gap the
+        # admission rescores reported since the last batch.
+        self._update_resolution()
         sel     = self._selection_hardness(hardness)
         eff_vir = self._effective_virulence()
         # Competitive fitness sharing needs the population's current coverage.
@@ -4496,8 +4784,30 @@ def _coevo_next_batch(X, Y, hofs, out_types):
             best_down=COEVO_BEST_DOWN, best_up=COEVO_BEST_UP,
             instab_rate=COEVO_INSTAB_RATE, instab_sens=COEVO_INSTAB_SENS,
             forget_sens=COEVO_FORGET_SENS, loss_fast=COEVO_LOSS_FAST,
-            loss_slow=COEVO_LOSS_SLOW, instab_loss_floor=COEVO_INSTAB_LOSS_FLOOR)
+            loss_slow=COEVO_LOSS_SLOW, instab_loss_floor=COEVO_INSTAB_LOSS_FLOOR,
+            min_eval_rows=COEVO_MIN_EVAL_ROWS, res_max_factor=COEVO_RES_MAX_FACTOR,
+            res_grow=COEVO_RES_GROW, res_shrink=COEVO_RES_SHRINK,
+            res_gap_hi=COEVO_RES_GAP_HI, res_gap_lo=COEVO_RES_GAP_LO,
+            res_gap_ema=COEVO_RES_GAP_EMA, stratify=COEVO_STRATIFY)
     return _COEVO_RUNTIME.next_batch(X, Y, hofs, out_types)
+
+
+def _coevo_admission_rescore(ind, X, y_col, otype, tg):
+    """Full-data rescore at global-HoF admission + resolution-governor feed.
+
+    Drop-in for `_rescore_individual_full_data` at the admission sites: the
+    candidate arrives scored IN-SAMPLE on the chunk's batch; after the rescore
+    its loss is the honest full-data value.  The relative shortfall between the
+    two is exactly the "the batch said X, the dataset says Y" signal the
+    co-evolution resolution governor sizes the next batches with — measured on
+    the candidates that actually won the chunk, at zero extra evaluations."""
+    batch_loss = getattr(ind, 'loss', None)
+    _rescore_individual_full_data(ind, X, y_col, otype, tg)
+    if COEVOLUTION_ENABLED and _COEVO_RUNTIME is not None and batch_loss is not None:
+        try:
+            _COEVO_RUNTIME.observe_generalization(batch_loss, ind.loss)
+        except Exception:
+            pass
 
 
 def _coevo_status_line():
@@ -4513,10 +4823,12 @@ def _coevo_status_line():
     trend = (rt.loss_fast - rt.loss_slow) if rt.loss_fast is not None else 0.0
     arrow = "↑" if trend > 1e-4 else ("↓" if trend < -1e-4 else "→")
     reg = rt.history[-1].get('regressed', 0) if rt.history else 0
+    gap = rt.gap_ema if rt.gap_ema is not None else 0.0
     return (f"[Co-evo] host-loss={rt.global_loss:.4f} {arrow}  "
             f"forgetting={rt.forget_frac:.3f} ({reg} rows)  "
             f"instability={rt.instability:.2f}  "
-            f"anchor={rt._effective_anchor_frac():.2f}  λ_eff={rt._effective_virulence():.2f}")
+            f"anchor={rt._effective_anchor_frac():.2f}  λ_eff={rt._effective_virulence():.2f}  "
+            f"rows={rt._effective_rows()}(×{rt.res_factor:.1f})  gap={gap:.2f}")
 
 
 def _select_batch_indices(X, Y, hofs, out_types, batch_size):
@@ -4577,6 +4889,12 @@ def _select_coevolution_mode(n_rows):
     print("      while the model is dropping variables, widens the anchor (more")
     print("      breadth) and calms the predators — stops the cycling/forgetting")
     print("      that bites on many-variable (10+ input) targets.")
+    print("    • A RESOLUTION GOVERNOR keeps each batch big enough to tell a")
+    print("      genuinely better host from a lucky one: tiny subsets are padded")
+    print(f"      to ≥{COEVO_MIN_EVAL_ROWS} rows with class-/quantile-stratified anchor rows, and")
+    print("      while chunk winners keep failing the full-data rescore (subset")
+    print(f"      overfit) the batch grows — up to ×{COEVO_RES_MAX_FACTOR:g} — shrinking back once")
+    print("      the batch resolves honestly again.")
     print()
     print("  Applies to the population-based models (Island / AFPO families).")
     print("  The Bayesian and Gradient-Boosting modes use their own sampling")
@@ -4609,6 +4927,12 @@ def _select_coevolution_mode(n_rows):
         print(f"     parasite would cover all rows, so co-evolution degenerates")
         print(f"     to full-dataset evaluation.  Pick a smaller subset for a")
         print(f"     real arms race.")
+    elif COEVO_CASE_SUBSET < COEVO_MIN_EVAL_ROWS:
+        print(f"  ⚠  Subset ({COEVO_CASE_SUBSET}) is below the {COEVO_MIN_EVAL_ROWS}-row evaluation floor:")
+        print(f"     on so few rows in-sample fitness cannot resolve host quality")
+        print(f"     (the affine alone ties everyone on ≤2 rows), so each batch is")
+        print(f"     padded to {min(COEVO_MIN_EVAL_ROWS, n_rows)} rows with stratified anchor rows; the parasites")
+        print(f"     still steer their {COEVO_CASE_SUBSET} adversarial row(s).")
 
     pop_in = input(f"  Parasite population size [default {COEVO_POP_SIZE}]: ").strip()
     if pop_in:
@@ -4643,6 +4967,10 @@ def _select_coevolution_mode(n_rows):
     if COEVO_FITNESS_SHARING:   _guards.append("fitness-sharing")
     if COEVO_NOISE_GUARD:       _guards.append("noise-guard")
     if COEVO_STABILIZE:         _guards.append("forgetting-stabiliser")
+    if COEVO_MIN_EVAL_ROWS > 0 or COEVO_RES_MAX_FACTOR > 1.0:
+        _guards.append(f"resolution-governor (≥{COEVO_MIN_EVAL_ROWS} rows, "
+                       f"max ×{COEVO_RES_MAX_FACTOR:g})")
+    if COEVO_STRATIFY:          _guards.append("stratified-anchor")
     print(f"     Robustness guards: {', '.join(_guards) if _guards else 'none (legacy)'}.")
 
 
@@ -30440,8 +30768,10 @@ def train_mode():
                             # Workers fit/scored on the batch subset; re-score on
                             # the FULL data before admission so the global HoF and
                             # the print below report the true fit, not a subset
-                            # overfit (see _rescore_individual_full_data).
-                            _rescore_individual_full_data(
+                            # overfit (see _rescore_individual_full_data);
+                            # the wrapper also feeds the batch->full gap to the
+                            # co-evolution resolution governor.
+                            _coevo_admission_rescore(
                                 ind, X, Y[:, o_idx], out_types[o_idx],
                                 target_grads_list[o_idx])
                             if hofs[o_idx].update(ind):
@@ -30817,8 +31147,9 @@ def train_mode():
                         # Update global HoF with any new discoveries
                         for c, ind in local_hof.best_by_complexity.items():
                             # Re-score on the FULL data before admission (workers
-                            # fit/scored on the batch subset only).
-                            _rescore_individual_full_data(
+                            # fit/scored on the batch subset only); also feeds
+                            # the co-evolution resolution governor.
+                            _coevo_admission_rescore(
                                 ind, X, Y[:, i], out_types[i],
                                 target_grads_list[i])
                             if hofs[i].update(ind):
@@ -31226,8 +31557,9 @@ def train_mode():
                         stag_cntrs[s][i] = stag
                         for c, ind in local_hof.best_by_complexity.items():
                             # Re-score on the FULL data before admission (workers
-                            # fit/scored on the batch subset only).
-                            _rescore_individual_full_data(
+                            # fit/scored on the batch subset only); also feeds
+                            # the co-evolution resolution governor.
+                            _coevo_admission_rescore(
                                 ind, X, Y[:, i], out_types[i],
                                 target_grads_list[i])
                             if hofs[i].update(ind):
@@ -31735,8 +32067,9 @@ def train_mode():
                         stagnation_counters[isl_idx][o_idx] = stag
                         for c, ind in local_hof.best_by_complexity.items():
                             # Re-score on the FULL data before admission (workers
-                            # fit/scored on the batch subset only).
-                            _rescore_individual_full_data(
+                            # fit/scored on the batch subset only); also feeds
+                            # the co-evolution resolution governor.
+                            _coevo_admission_rescore(
                                 ind, X, Y[:, o_idx], out_types[o_idx],
                                 target_grads_list[o_idx])
                             if hofs[o_idx].update(ind):
@@ -32104,8 +32437,9 @@ def train_mode():
                         stag_counters[s_r][isl_r][o_idx] = stag
                         for c, ind in local_hof.best_by_complexity.items():
                             # Re-score on the FULL data before admission (workers
-                            # fit/scored on the batch subset only).
-                            _rescore_individual_full_data(
+                            # fit/scored on the batch subset only); also feeds
+                            # the co-evolution resolution governor.
+                            _coevo_admission_rescore(
                                 ind, X, Y[:, o_idx], out_types[o_idx],
                                 target_grads_list[o_idx])
                             if hofs[o_idx].update(ind):
@@ -32450,8 +32784,9 @@ def train_mode():
                         stag_counters[tier_r][isl_r][o_idx] = stag
                         for c, ind in local_hof.best_by_complexity.items():
                             # Re-score on the FULL data before admission (workers
-                            # fit/scored on the batch subset only).
-                            _rescore_individual_full_data(
+                            # fit/scored on the batch subset only); also feeds
+                            # the co-evolution resolution governor.
+                            _coevo_admission_rescore(
                                 ind, X, Y[:, o_idx], out_types[o_idx],
                                 target_grads_list[o_idx])
                             if hofs[o_idx].update(ind):

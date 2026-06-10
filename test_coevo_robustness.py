@@ -365,12 +365,17 @@ def test_batch_size_contract_various():
             co = evo13._PredatorPreyCoevolution(
                 n_rows=n, subset=subset, pop_size=12, mut_rate=0.3, virulence=0.8,
                 seed=99, anchor_frac=af)
+            # The evaluation floor pads tiny subsets with anchor rows so the
+            # hosts' in-sample fitness keeps enough resolution to select on
+            # (selection on ≤2 rows is degenerate: the affine ties everyone).
+            expected = min(max(subset, co.min_eval_rows), n)
             for _ in range(6):
                 b = co.next_batch(X, Y, [champ], [0])
-                assert len(b) == min(subset, n), f"size break: af={af} subset={subset}"
+                assert len(b) == expected, f"size break: af={af} subset={subset}"
                 assert len(set(b.tolist())) == len(b), "duplicate rows in batch"
                 assert b.min() >= 0 and b.max() < n, "row index out of range"
-    ok("batch is always `subset` distinct in-range rows (anchor∈{0,.25,.5,.9}, subset∈{8,32,64})")
+    ok("batch is always max(subset, eval-floor) distinct in-range rows "
+       "(anchor∈{0,.25,.5,.9}, subset∈{8,32,64})")
 
     # subset >= n degenerates safely to full-data evaluation (None) upstream
     evo13.COEVOLUTION_ENABLED = True
