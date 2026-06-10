@@ -318,6 +318,106 @@ def test_stabilizer_helps_many_variable():
     print()
 
 
+# --------------------------------------------------------------------------
+# 7.  a near-perfect model's tiny loss wobble must NOT spike instability
+# --------------------------------------------------------------------------
+def test_near_perfect_no_false_instability():
+    print("7: near-perfect model (tiny wobbling loss) → instability stays ~0")
+    n = 200
+    # Default loss_floor vs the legacy unfloored relative rise (loss_floor=0).
+    co = evo13._PredatorPreyCoevolution(n_rows=n, subset=20, pop_size=8,
+                                        mut_rate=0.3, virulence=0.75, seed=7)
+    co_legacy = evo13._PredatorPreyCoevolution(n_rows=n, subset=20, pop_size=8,
+                                               mut_rate=0.3, virulence=0.75, seed=7,
+                                               loss_floor=0.0)
+    # The pathology: the model first SETTLES at a near-zero loss (the slow EMA
+    # drifts down to ≈0.001), then takes a float-scale bump to ≈0.005 — still
+    # near-perfect in absolute terms.  With the legacy unfloored rise the tiny
+    # slow denominator turns that bump into a (fast−slow)/slow ≫ 1 spike, so
+    # instability saturates near 1 for no real reason; the floored rise sees the
+    # bump as the sub-2%-loss wobble it is and barely moves.
+    for _ in range(50):                              # settle near zero
+        h = np.full(n, 0.001, dtype=np.float64)
+        co._update_progress(h.copy()); co_legacy._update_progress(h.copy())
+    # The over-reaction is a transient: it peaks just as the bump hits (slow EMA
+    # still ≈0) and decays as slow catches up, so we compare the PEAK instability.
+    peak, peak_legacy = co.instability, co_legacy.instability
+    for _ in range(20):                              # tiny absolute bump to ~0.003
+        h = np.full(n, 0.003, dtype=np.float64)
+        co._update_progress(h.copy()); co_legacy._update_progress(h.copy())
+        peak = max(peak, co.instability)
+        peak_legacy = max(peak_legacy, co_legacy.instability)
+    assert co.global_loss < 0.01, "model should still read as near-perfect"
+    assert peak < 0.15, \
+        f"floored instability must stay low on a near-perfect fit (peak {peak:.3f})"
+    assert peak_legacy > 0.40 and peak_legacy > peak + 0.25, \
+        ("the legacy unfloored rise should spike on a float-scale bump "
+         f"(legacy peak={peak_legacy:.3f} vs floored peak={peak:.3f})")
+    ok(f"floored stays calm (peak {peak:.3f}) vs legacy spikes (peak {peak_legacy:.3f})")
+
+    # And the floor must NOT mask a genuine rise off a meaningful loss: a real
+    # climb from ~0.10 to ~0.30 still drives instability up.
+    co2 = evo13._PredatorPreyCoevolution(n_rows=n, subset=20, pop_size=8,
+                                         mut_rate=0.3, virulence=0.75, seed=8)
+    for gl in np.linspace(0.10, 0.30, 20):
+        co2._update_progress(np.full(n, gl, dtype=np.float64))
+    assert co2.instability > 0.20, \
+        f"a genuine loss climb must still raise instability ({co2.instability:.3f})"
+    ok(f"a genuine loss climb (0.10→0.30) still fires instability ({co2.instability:.3f})")
+    print()
+
+
+# --------------------------------------------------------------------------
+# 8.  the [Co-evo] status line is visible during the cold start (no champion)
+# --------------------------------------------------------------------------
+class _EmptyHoF:
+    """A HoF with no champion yet — the cold-start condition."""
+    def get_best_overall(self):
+        return None
+
+
+def test_status_line_cold_start():
+    print("8: [Co-evo] status line is visible during the cold start")
+    saved = (evo13.COEVOLUTION_ENABLED, evo13._COEVO_RUNTIME, evo13.COEVO_CASE_SUBSET)
+    try:
+        evo13.COEVOLUTION_ENABLED = True
+        evo13._COEVO_RUNTIME = None
+        evo13.COEVO_CASE_SUBSET = 32
+
+        # Before the runtime is even built → no line (nothing to report yet).
+        assert evo13._coevo_status_line() is None, "no runtime yet → None"
+
+        n = 300
+        X, Y = _X_ids(n), np.zeros((n, 1), dtype=np.float64)
+        # Cold start: a runtime gets built but there is NO champion, so global_loss
+        # stays None.  The old code returned None here → the line vanished for the
+        # whole first chunk.  It must now show a 'warming up' note instead.
+        idx = evo13._coevo_next_batch(X, Y, [_EmptyHoF()], [0])
+        assert idx is not None and len(idx) == 32, "cold start still returns a seed batch"
+        assert evo13._COEVO_RUNTIME is not None, "runtime should be built"
+        assert evo13._COEVO_RUNTIME.global_loss is None, "no champion → no host loss yet"
+        line = evo13._coevo_status_line()
+        assert line is not None, "cold-start line must NOT be None (the user's complaint)"
+        assert "[Co-evo]" in line and "warming up" in line.lower(), \
+            f"cold-start line should announce warming up: {line!r}"
+        # configured anchor/virulence shown (instability is 0 during warmup)
+        assert "anchor=" in line and "λ_eff=" in line, f"warmup line missing fields: {line!r}"
+        ok(f"cold start shows: {line}")
+
+        # Once a real champion exists the full health line returns (with all fields).
+        champ = _MutChampion(Y[:, 0])
+        evo13._coevo_next_batch(X, Y, [_MutHoF(champ)], [0])
+        assert evo13._COEVO_RUNTIME.global_loss is not None, "champion → host loss tracked"
+        full = evo13._coevo_status_line()
+        for field in ("host-loss=", "forgetting=", "instability=", "anchor=", "λ_eff="):
+            assert field in full, f"full line missing {field!r}: {full!r}"
+        assert "warming up" not in full.lower(), "should leave warmup once a champion exists"
+        ok(f"after first champion: {full}")
+    finally:
+        evo13.COEVOLUTION_ENABLED, evo13._COEVO_RUNTIME, evo13.COEVO_CASE_SUBSET = saved
+    print()
+
+
 if __name__ == "__main__":
     test_progress_tracking_and_instability()
     test_best_ever_and_regression()
@@ -325,4 +425,6 @@ if __name__ == "__main__":
     test_stabilizer_dormant_when_healthy()
     test_effective_virulence_damping()
     test_stabilizer_helps_many_variable()
+    test_near_perfect_no_false_instability()
+    test_status_line_cold_start()
     print("ALL STABILISATION TESTS PASSED ✓")

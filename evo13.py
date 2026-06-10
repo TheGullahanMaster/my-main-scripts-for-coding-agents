@@ -1268,6 +1268,14 @@ COEVO_FORGET_SENS     = 0.12  # mean per-row regression that maps to full instab
                               #  stuck high but variables are taking turns dropping)
 COEVO_LOSS_FAST       = 0.40  # fast global-loss EMA rate  ┐ trend = fast − slow
 COEVO_LOSS_SLOW       = 0.10  # slow global-loss EMA rate  ┘ (>0 ⇒ regressing)
+COEVO_LOSS_FLOOR      = 0.02  # denominator floor for the *relative* loss-rise term of
+                              # instability.  On a near-perfect model the slow loss is
+                              # ≈0, so a float-scale uptick would read as a huge
+                              # RELATIVE rise and falsely spike instability to ~1 (and
+                              # needlessly widen the anchor / damp the predators).
+                              # Flooring the denominator treats sub-`floor` loss as
+                              # "already solved" — only a rise off a meaningful loss
+                              # counts.  (0 ⇒ legacy behaviour, still divide-safe.)
 _COEVO_RUNTIME      = None    # lazily-built _PredatorPreyCoevolution instance
 
 # ---- Bayesian CGP Settings ----
@@ -4029,7 +4037,7 @@ class _PredatorPreyCoevolution:
                  stabilize=True, anchor_boost=0.30, virulence_damp=0.40,
                  adv_floor=0.30, best_down=0.50, best_up=0.02,
                  instab_rate=0.25, instab_sens=0.50, forget_sens=0.12,
-                 loss_fast=0.40, loss_slow=0.10):
+                 loss_fast=0.40, loss_slow=0.10, loss_floor=0.02):
         self.n_rows     = int(n_rows)
         self.subset     = max(1, min(int(subset), self.n_rows))
         self.pop_size   = max(2, int(pop_size))
@@ -4057,6 +4065,10 @@ class _PredatorPreyCoevolution:
         self.forget_sens     = float(max(forget_sens, 1e-6))
         self.loss_fast_rate  = float(min(max(loss_fast, 1e-3), 1.0))
         self.loss_slow_rate  = float(min(max(loss_slow, 1e-3), 1.0))
+        # Floor for the relative loss-rise denominator (see COEVO_LOSS_FLOOR): keeps
+        # a near-perfect model's float-scale loss wobble from reading as a huge
+        # relative rise.  Kept ≥1e-9 so the division is always safe even at 0.
+        self.loss_rel_floor  = float(max(loss_floor, 1e-9))
         # EMA of per-row hardness + how often each row has actually been trained
         # on — together they let the guard tell "hard but learnable" rows from
         # "hard no matter what" (≈ noise) rows.
@@ -4323,7 +4335,11 @@ class _PredatorPreyCoevolution:
                               + self.loss_fast_rate * gl)
             self.loss_slow = ((1.0 - self.loss_slow_rate) * self.loss_slow
                               + self.loss_slow_rate * gl)
-        rise = max((self.loss_fast - self.loss_slow) / max(self.loss_slow, 1e-9), 0.0)
+        # Relative rise, but with the denominator floored at `loss_rel_floor` so a
+        # near-perfect model (slow loss ≈ 0) doesn't turn float-scale wobble into a
+        # giant relative rise — sub-floor losses are treated as "already solved".
+        rise = max((self.loss_fast - self.loss_slow)
+                   / max(self.loss_slow, self.loss_rel_floor), 0.0)
         # Saturating map into [0,1): blend the (relative) trend rise and the
         # forgetting fraction; either one alone can drive the stabiliser.
         z = rise / self.instab_sens + self.forget_frac / self.forget_sens
@@ -4472,7 +4488,7 @@ def _coevo_next_batch(X, Y, hofs, out_types):
             best_down=COEVO_BEST_DOWN, best_up=COEVO_BEST_UP,
             instab_rate=COEVO_INSTAB_RATE, instab_sens=COEVO_INSTAB_SENS,
             forget_sens=COEVO_FORGET_SENS, loss_fast=COEVO_LOSS_FAST,
-            loss_slow=COEVO_LOSS_SLOW)
+            loss_slow=COEVO_LOSS_SLOW, loss_floor=COEVO_LOSS_FLOOR)
     return _COEVO_RUNTIME.next_batch(X, Y, hofs, out_types)
 
 
@@ -4482,10 +4498,24 @@ def _coevo_status_line():
     its short-term trend (↑ regressing / ↓ improving / → flat), the FORGETTING
     fraction and how many rows are currently regressed from their best (the
     dropped-variable signal the user can watch), and the instability the stabiliser
-    is acting on via the effective anchor + virulence."""
+    is acting on via the effective anchor + virulence.
+
+    During the COLD START — the runtime has been built but no host champion has
+    been scored yet, so there is no host-loss to report — it returns a short
+    'warming up' note instead of None.  That keeps the [Co-evo] line visible from
+    the very first generation header (showing the configured anchor/virulence)
+    rather than silently absent until the first champion appears, which otherwise
+    reads as the line having vanished."""
     rt = _COEVO_RUNTIME
-    if rt is None or getattr(rt, 'global_loss', None) is None:
+    if rt is None:
         return None
+    if getattr(rt, 'global_loss', None) is None:
+        # No champion scored yet: the predators are seeding uniformly and the
+        # tracked loss/forgetting don't exist.  Show that co-evolution is live
+        # plus the (configured, since instability=0) anchor + virulence.
+        return (f"[Co-evo] warming up — no host champion scored yet "
+                f"(uniform seeding)  anchor={rt._effective_anchor_frac():.2f}  "
+                f"λ_eff={rt._effective_virulence():.2f}")
     trend = (rt.loss_fast - rt.loss_slow) if rt.loss_fast is not None else 0.0
     arrow = "↑" if trend > 1e-4 else ("↓" if trend < -1e-4 else "→")
     reg = rt.history[-1].get('regressed', 0) if rt.history else 0
