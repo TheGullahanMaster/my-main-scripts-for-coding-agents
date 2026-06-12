@@ -68,32 +68,8 @@ class Cosine(nn.Module):
         return torch.cos(x)
 
 # Imported custom modules (ensure these are in your PYTHONPATH)
-
-try:
-    from pau import PAU
-except ImportError:
-    import torch.nn as nn
-    class PAU(nn.Module):
-        def __init__(self, **kwargs):
-            super().__init__()
-        def forward(self, x):
-            return x
-
-try:
-    from lamb import *
-except ImportError:
-    import torch
-    import torch.nn as nn
-    from torch.optim import Optimizer
-    class Lamb(Optimizer):
-        pass
-    class GoLU(nn.Module):
-        def forward(self, x): return x
-    class AdamMHD(Optimizer):
-        pass
-    def select_optimizer(*args, **kwargs):
-        return torch.optim.Adam(*args)
-
+from pau import PAU      # PAU activation (if needed)
+from lamb import *  # Lamb, GoLU, and AdamMHD
 #from hypergrad import SGDHD
 
 class SelfGatedActivation(nn.Module):
@@ -395,47 +371,6 @@ class InstanceNorm1dWrapper(nn.Module):
         if x.dim() == 1: x = x.unsqueeze(0); out = self.norm(x); return out.squeeze(0)
         return self.norm(x)
 
-
-##############################################
-# Positional Encodings
-##############################################
-class PositionalEncoding1D(nn.Module):
-    def __init__(self, d_model, pos_type="none"):
-        super().__init__()
-        self.pos_type = pos_type.lower()
-        if self.pos_type == "learned":
-            self.pe = nn.Parameter(torch.randn(1, d_model) * 0.02)
-        elif self.pos_type == "sinusoidal":
-            pe = torch.zeros(1, d_model)
-            position = torch.arange(0, d_model, dtype=torch.float)
-            pe[0, 0::2] = torch.sin(position[0::2] / 10000.0)
-            if d_model % 2 != 0:
-                pe[0, 1::2] = torch.cos(position[1::2] / 10000.0)
-            else:
-                pe[0, 1::2] = torch.cos(position[1::2] / 10000.0)
-            self.register_buffer("pe", pe)
-        elif self.pos_type == "rope":
-            position = torch.arange(0, d_model // 2, dtype=torch.float)
-            freqs = 10000 ** (-2 * position / max(d_model, 2))
-            self.register_buffer("freqs", freqs)
-
-    def forward(self, x):
-        if self.pos_type == "learned" or self.pos_type == "sinusoidal":
-            return x + self.pe
-        elif self.pos_type == "rope":
-            d = x.shape[-1]
-            x_out = x.clone()
-            limit = min((d // 2), self.freqs.shape[0])
-            if limit > 0:
-                x_even = x[..., 0:2*limit:2]
-                x_odd = x[..., 1:2*limit:2]
-                sin_val = torch.sin(self.freqs[:limit]).to(x.device)
-                cos_val = torch.cos(self.freqs[:limit]).to(x.device)
-                x_out[..., 0:2*limit:2] = x_even * cos_val - x_odd * sin_val
-                x_out[..., 1:2*limit:2] = x_even * sin_val + x_odd * cos_val
-            return x_out
-        return x
-
 ##############################################
 # Spatial Gating Unit (from gMLP paper)
 ##############################################
@@ -557,35 +492,19 @@ class MultiHeadSelfAttention(nn.Module):
 # MoE and LoRA components
 ##############################################
 class MoELinear(nn.Module):
-    def __init__(self, in_features, out_features, num_experts=4, activation=None, top_k=None):
+    def __init__(self, in_features, out_features, num_experts=4, activation=None):
         super().__init__()
         self.in_features = in_features; self.out_features = out_features
         self.num_experts = num_experts; self.activation = activation
-        self.top_k = min(top_k if top_k is not None else num_experts, num_experts)
         self.experts = nn.ModuleList([nn.Linear(in_features, out_features, bias=True) for _ in range(num_experts)])
-        self.gate = nn.Linear(in_features, num_experts, bias=True)
+        self.gate = nn.Sequential(nn.Linear(in_features, num_experts, bias=True), nn.Softmax(dim=-1))
     def forward(self, x):
-        squeeze = False
+        weights = self.gate(x)
         if x.dim() == 1: x = x.unsqueeze(0); squeeze = True
-
-        logits = self.gate(x)
-        if self.top_k < self.num_experts:
-            topk_logits, topk_indices = torch.topk(logits, self.top_k, dim=-1)
-            topk_weights = torch.softmax(topk_logits, dim=-1)
-            output = torch.zeros(x.size(0), self.out_features, device=x.device, dtype=x.dtype)
-            for i in range(self.num_experts):
-                batch_idx, kth_expert = torch.where(topk_indices == i)
-                if len(batch_idx) > 0:
-                    expert_input = x[batch_idx]
-                    expert_out = self.experts[i](expert_input)
-                    weights = topk_weights[batch_idx, kth_expert].unsqueeze(-1)
-                    output[batch_idx] += expert_out * weights
-        else:
-            weights = torch.softmax(logits, dim=-1)
-            expert_outputs = torch.stack([expert(x) for expert in self.experts], dim=0)
-            weights_expanded = weights.t().unsqueeze(-1)
-            output = (expert_outputs * weights_expanded).sum(dim=0)
-
+        else: squeeze = False
+        expert_outputs = torch.stack([expert(x) for expert in self.experts], dim=0)
+        weights_expanded = weights.t().unsqueeze(-1)
+        output = (expert_outputs * weights_expanded).sum(dim=0)
         if self.activation is not None: output = self.activation(output)
         if squeeze: output = output.squeeze(0)
         return output
@@ -678,45 +597,27 @@ def functional_norm(x, norm_type, groups=1, eps=1e-5, batch_params=None):
 ##############################################
 # Residual Block
 ##############################################
-
-##############################################
-# DropPath (Stochastic Depth)
-##############################################
-def drop_path(x, drop_prob: float = 0., training: bool = False, scale_by_keep: bool = True):
-    if drop_prob == 0. or not training:
-        return x
-    keep_prob = 1 - drop_prob
-    shape = (x.shape[0],) + (1,) * (x.ndim - 1)
-    random_tensor = x.new_empty(shape).bernoulli_(keep_prob)
-    if keep_prob > 0.0 and scale_by_keep:
-        random_tensor.div_(keep_prob)
-    return x * random_tensor
-
 class ResidualBlock(nn.Module):
     def __init__(self, in_dim, out_dim, activation_cls, residual_type="residual",
                  norm_type="layer", groups=1, attention_type="none", num_heads=1,
-                 moe_experts=1, moe_top_k=None, use_noise_injection_layers=False, noise_injection_std=0.0,
+                 moe_experts=1, use_noise_injection_layers=False, noise_injection_std=0.0,
                  hyper_context="x_full", hyper_context_dim=64, hyper_film_per_sample=False,
-                 hyper_per_sample=True, hyper_low_rank_k=None, use_spectral_norm=False, drop_path_rate=0.0):
+                 hyper_per_sample=True, hyper_low_rank_k=None):
         super().__init__()
         self.residual_type = residual_type.lower(); self.norm_type = norm_type.lower()
-        self.attention_type = attention_type.lower();
-        moe_val = moe_experts[0] if isinstance(moe_experts, tuple) else moe_experts
-        top_k_val = moe_experts[1] if isinstance(moe_experts, tuple) else moe_top_k
-        self.use_moe = moe_val > 1
-        self.use_hyper = moe_val < 1 and moe_val > -4
+        self.attention_type = attention_type.lower(); self.use_moe = moe_experts > 1
+        self.use_hyper = moe_experts < 1 and moe_experts > -4
         self.in_dim = in_dim; self.out_dim = out_dim
         self.noise = use_noise_injection_layers; self.std = noise_injection_std; self.groups = groups
-        self.use_sgu = (moe_val == -4 or moe_val == -5)
-        self.use_tiny_attn = (moe_val == -5)
-        if moe_val == 0: hyper_context = "x_full"
-        elif moe_val == -1: hyper_context = "learned"
-        elif moe_val == -2: hyper_context = "x_mean_std"
-        elif moe_val == -3: hyper_context = "x_mean"
+        self.use_sgu = (moe_experts == -4 or moe_experts == -5)
+        self.use_tiny_attn = (moe_experts == -5)
+        if moe_experts == 0: hyper_context = "x_full"
+        elif moe_experts == -1: hyper_context = "learned"
+        elif moe_experts == -2: hyper_context = "x_mean_std"
+        elif moe_experts == -3: hyper_context = "x_mean"
         elif self.use_sgu: hyper_context = "learned"
         self.hyper_context = hyper_context
-        self.use_hyper = (moe_val < 1 and not self.use_sgu)
-
+        self.use_hyper = (moe_experts < 1 and not self.use_sgu)
 
         norm_dim = in_dim
         if self.norm_type == "none": self.norm = nn.Identity()
@@ -729,7 +630,7 @@ class ResidualBlock(nn.Module):
 
         lin1_out_dim = out_dim * 2 if self.use_sgu else out_dim
         if self.use_moe:
-            self.linear1 = MoELinear(in_dim, lin1_out_dim, num_experts=moe_val, activation=nn.Identity(), top_k=top_k_val)
+            self.linear1 = MoELinear(in_dim, lin1_out_dim, num_experts=moe_experts, activation=nn.Identity())
         elif self.use_hyper:
             self.linear1 = LoRAHyperLinear(in_dim, lin1_out_dim, rank=(hyper_low_rank_k or 8), alpha=1.0,
                 context_mode=hyper_context, context_dim=(in_dim if hyper_context == "x_full" else hyper_context_dim),
@@ -745,16 +646,6 @@ class ResidualBlock(nn.Module):
 
         if self.residual_type != "none": self.linear2 = nn.Linear(out_dim, out_dim, bias=True)
         else: self.linear2 = None
-
-        if use_spectral_norm:
-            if isinstance(self.linear1, nn.Linear):
-                self.linear1 = nn.utils.spectral_norm(self.linear1)
-            elif hasattr(self.linear1, "experts"):
-                for i in range(len(self.linear1.experts)):
-                    self.linear1.experts[i] = nn.utils.spectral_norm(self.linear1.experts[i])
-            if self.linear2 is not None:
-                self.linear2 = nn.utils.spectral_norm(self.linear2)
-
 
         if self.use_tiny_attn: self.tiny_attn = TinyAttention(out_dim, attn_dim=64)
         else: self.tiny_attn = None
@@ -785,7 +676,6 @@ class ResidualBlock(nn.Module):
         if self.attention_type == "basic": self.attn = BasicSelfAttention(out_dim)
         elif self.attention_type == "multi": self.attn = MultiHeadSelfAttention(out_dim, num_heads if out_dim >= num_heads else 1)
         else: self.attn = None
-        self.drop_path_rate = drop_path_rate
 
     def _init_weights(self, layer, act_name):
         if isinstance(layer, nn.Linear):
@@ -819,12 +709,7 @@ class ResidualBlock(nn.Module):
         if self.linear2 is not None: z = self.linear2(z)
         if self.use_tiny_attn: z = z + self.tiny_attn(z)
         if self.attn is not None: z = self.attn(z)
-
-        # Apply DropPath before adding back the skip connection
-        z = drop_path(z, self.drop_path_rate, self.training)
-
         return self._apply_residual_nonhyper(z, x)
-
 
     def output_dim(self):
         if self.residual_type == "concat": return self.in_dim + self.out_dim
@@ -937,7 +822,7 @@ class InputFeatureGraph(nn.Module):
 class GNNResidualBlock(nn.Module):
     """A residual block that includes GNN message passing on latent features."""
     def __init__(self, in_dim, out_dim, activation_cls, residual_type="residual",
-                 norm_type="layer", groups=1, use_spectral_norm=False):
+                 norm_type="layer", groups=1):
         super().__init__()
         self.residual_type = residual_type.lower()
         self.in_dim = in_dim; self.out_dim = out_dim
@@ -953,7 +838,6 @@ class GNNResidualBlock(nn.Module):
 
         # Linear projection
         self.linear1 = nn.Linear(in_dim, out_dim, bias=True)
-        if use_spectral_norm: self.linear1 = nn.utils.spectral_norm(self.linear1)
         self.activation = activation_cls()
         
         # Latent GNN message passing
@@ -968,8 +852,6 @@ class GNNResidualBlock(nn.Module):
             
         # Second linear
         self.linear2 = nn.Linear(out_dim, out_dim, bias=True) if residual_type != "none" else None
-        if self.linear2 is not None and use_spectral_norm: self.linear2 = nn.utils.spectral_norm(self.linear2)
-
 
         # Skip connection
         if residual_type == "concat": self.skip = nn.Identity()
@@ -1032,11 +914,10 @@ class GNNMLPO(nn.Module):
     Now includes an Input Feature Graph to learn relationships between raw inputs.
     """
     def __init__(self, input_dim, hidden_dims, output_dim, activation_cls, residual_type="residual",
-                 norm_type="layer", groups=1, dropout_prob=0.0, pos_enc_type="none", use_spectral_norm=False, drop_path_rate=0.0):
+                 norm_type="layer", groups=1, dropout_prob=0.0):
         super().__init__()
         self.residual_type = residual_type.lower()
         self.dropout_prob = dropout_prob
-        self.pos_enc = PositionalEncoding1D(input_dim, pos_type=pos_enc_type)
         
         # --- NEW: Input Feature Graph ---
         # If input_dim is large (>1), we try to learn relationships immediately.
@@ -1051,51 +932,37 @@ class GNNMLPO(nn.Module):
         for hd in hidden_dims:
             block_res = "none" if self.residual_type == "densenet" else residual_type
             block = GNNResidualBlock(current_dim, hd, activation_cls, block_res,
-                                     norm_type=norm_type, groups=groups, use_spectral_norm=use_spectral_norm)
+                                     norm_type=norm_type, groups=groups)
             self.blocks.append(block)
             if self.residual_type == "concat": current_dim = current_dim + hd
             elif self.residual_type == "densenet": current_dim = current_dim + hd
             else: current_dim = hd
 
         self.final_linear = nn.Linear(current_dim, output_dim, bias=True)
-        if use_spectral_norm: self.final_linear = nn.utils.spectral_norm(self.final_linear)
         if current_dim == output_dim: self.final_skip = nn.Identity()
         else: self.final_skip = nn.Linear(current_dim, output_dim, bias=False)
         nn.init.kaiming_uniform_(self.final_linear.weight, a=0, mode='fan_in', nonlinearity='relu')
 
-
-    def forward(self, x, mixup_layer=None, mixup_lam=1.0, mixup_indices=None):
-        x = self.pos_enc(x)
+    def forward(self, x):
         # 1. Apply Input Graph Learning (Feature <-> Feature)
         out = self.input_graph(x)
         
-        if mixup_layer == 0:
-            out = mixup_lam * out + (1 - mixup_lam) * out[mixup_indices]
-
         if self.residual_type == "densenet":
             outputs = [out]
-            for i, block in enumerate(self.blocks):
+            for block in self.blocks:
                 block_input = torch.cat(outputs, dim=-1)
                 block_output = block(block_input)
                 if self.training and self.dropout_prob > 0:
                     block_output = F.dropout(block_output, p=self.dropout_prob, training=True)
-
-                if mixup_layer == (i + 1):
-                    block_output = mixup_lam * block_output + (1 - mixup_lam) * block_output[mixup_indices]
-
                 outputs.append(block_output)
             out = torch.cat(outputs, dim=-1)
         else:
-            for i, block in enumerate(self.blocks):
+            for block in self.blocks:
                 out = block(out)
                 if self.training and self.dropout_prob > 0:
                     out = F.dropout(out, p=self.dropout_prob, training=True)
-
-                if mixup_layer == (i + 1):
-                    out = mixup_lam * out + (1 - mixup_lam) * out[mixup_indices]
                     
         return self.final_linear(out) + self.final_skip(out)
-
 
 
 ##############################################
@@ -1106,10 +973,9 @@ class MLPO(nn.Module):
                  norm_type="layer", groups=1, attention_type="none", num_heads=1,
                  input_attention_type="none", moe_mode=1, dropout_prob=0.0,
                  use_noise_injection_layers=False, noise_injection_std=0.01,
-                 final_lora_rank=8, final_lora_alpha=1.0, final_hyper_context_dim=64, final_lora_per_sample=True, pos_enc_type="none", use_spectral_norm=False, drop_path_rate=0.0):
+                 final_lora_rank=8, final_lora_alpha=1.0, final_hyper_context_dim=64, final_lora_per_sample=True):
         super().__init__()
         self.residual_type = residual_type.lower(); self.dropout_prob = dropout_prob
-        self.pos_enc = PositionalEncoding1D(input_dim, pos_type=pos_enc_type)
         self.use_noise_injection_layers = use_noise_injection_layers; self.moe_mode = moe_mode
 
         self.input_attention_type = input_attention_type.lower()
@@ -1125,17 +991,15 @@ class MLPO(nn.Module):
 
         self.blocks = nn.ModuleList()
         current_dim = input_dim
-        # Stochastic depth rule: linearly scale drop_path_rate from 0 to target over depth
-        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, max(1, len(hidden_dims)))]
         for i, hidden_dim in enumerate(hidden_dims):
             block_in_dim = current_dim
+            # DenseNet handles connectivity externally via concatenation,
+            # so individual blocks should use "none" residual internally
             block_res = "none" if self.residual_type == "densenet" else residual_type
             block = ResidualBlock(block_in_dim, hidden_dim, activation_cls, block_res,
                 norm_type=norm_type, groups=groups, attention_type=attention_type, num_heads=num_heads,
                 moe_experts=moe_mode, use_noise_injection_layers=use_noise_injection_layers,
-                noise_injection_std=noise_injection_std, use_spectral_norm=use_spectral_norm,
-                drop_path_rate=dpr[i])
-
+                noise_injection_std=noise_injection_std)
             self.blocks.append(block)
             if self.residual_type == "concat": current_dim = block_in_dim + hidden_dim
             elif self.residual_type == "densenet": current_dim = current_dim + hidden_dim
@@ -1150,16 +1014,11 @@ class MLPO(nn.Module):
             elif m in [-4, -5]: return "learned"
             else: return "x_full"
 
-
-        moe_val = moe_mode[0] if isinstance(moe_mode, tuple) else moe_mode
-        top_k_val = moe_mode[1] if isinstance(moe_mode, tuple) else None
-
-        if moe_val > 1:
-            self.final_linear = MoELinear(final_in_dim, output_dim, num_experts=moe_val, activation=None, top_k=top_k_val)
+        if moe_mode > 1:
+            self.final_linear = MoELinear(final_in_dim, output_dim, num_experts=moe_mode, activation=None)
             self._final_is_param_linear = False
-        elif moe_val < 1 and moe_val not in [-4, -5]:
-            hyper_context = _ctx_from_moe_mode(moe_val)
-
+        elif moe_mode < 1 and moe_mode not in [-4, -5]:
+            hyper_context = _ctx_from_moe_mode(moe_mode)
             ctx_dim = (final_in_dim if hyper_context == "x_full" else final_hyper_context_dim)
             self.final_linear = LoRAHyperLinear(final_in_dim, output_dim, rank=final_lora_rank,
                 alpha=final_lora_alpha, context_mode=hyper_context, context_dim=ctx_dim, per_sample=final_lora_per_sample)
@@ -1170,14 +1029,6 @@ class MLPO(nn.Module):
 
         if final_in_dim == output_dim: self.final_skip = nn.Identity()
         else: self.final_skip = nn.Linear(final_in_dim, output_dim, bias=False)
-
-        if use_spectral_norm:
-            if isinstance(self.final_linear, nn.Linear):
-                self.final_linear = nn.utils.spectral_norm(self.final_linear)
-            elif hasattr(self.final_linear, "experts"):
-                for i in range(len(self.final_linear.experts)):
-                    self.final_linear.experts[i] = nn.utils.spectral_norm(self.final_linear.experts[i])
-
 
         act_name = activation_cls.__name__ if hasattr(activation_cls, '__name__') else activation_cls().__class__.__name__
         if self._final_is_param_linear: self._init_final_weights(act_name, final_in_dim)
@@ -1191,9 +1042,7 @@ class MLPO(nn.Module):
             bound = math.sqrt(6 / in_features) / 30; nn.init.uniform_(self.final_linear.weight, -bound, bound)
         else: nn.init.kaiming_uniform_(self.final_linear.weight, a=0, mode='fan_in', nonlinearity='relu')
 
-
-    def forward(self, x, mixup_layer=None, mixup_lam=1.0, mixup_indices=None):
-        x = self.pos_enc(x)
+    def forward(self, x):
         if self.input_attn is not None:
             if self.input_attention_type == "basic": x = self.input_attn(x)
             elif self.input_attention_type == "cross":
@@ -1201,37 +1050,24 @@ class MLPO(nn.Module):
                 else: x_expanded = x.unsqueeze(1); q = self.query.expand(x.size(0), -1, -1); squeeze_back = False
                 cross, _ = self.input_cross_attn(q, x_expanded, x_expanded, need_weights=False)
                 x = cross.squeeze(1) if not squeeze_back else cross.squeeze(0).squeeze(0)
-
-        if mixup_layer == 0:
-            x = mixup_lam * x + (1 - mixup_lam) * x[mixup_indices]
-
         if self.residual_type == "densenet":
             outputs = [x]
-            for i, block in enumerate(self.blocks):
+            for block in self.blocks:
                 block_input = torch.cat(outputs, dim=-1); block_output = block(block_input)
                 if self.training:
                     if self.dropout_prob > 0.0: block_output = F.dropout(block_output, p=self.dropout_prob, training=True)
                     elif self.noise_injection is not None: block_output = self.noise_injection(block_output)
-
-                if mixup_layer == (i + 1):
-                    block_output = mixup_lam * block_output + (1 - mixup_lam) * block_output[mixup_indices]
-
                 outputs.append(block_output)
             out = torch.cat(outputs, dim=-1)
         else:
             out = x
-            for i, block in enumerate(self.blocks):
+            for block in self.blocks:
                 out = block(out)
                 if self.training:
                     if self.dropout_prob > 0.0: out = F.dropout(out, p=self.dropout_prob, training=True)
                     elif self.noise_injection is not None: out = self.noise_injection(out)
-
-                if mixup_layer == (i + 1):
-                    out = mixup_lam * out + (1 - mixup_lam) * out[mixup_indices]
-
         out = self.final_linear(out) + self.final_skip(out)
         return out
-
 
     def get_all_learned_parameters(self):
         params = []
@@ -2021,22 +1857,22 @@ def main(csv_file, delimiter=',', input_cols=[], output_cols=[], col_types={}, v
         # GNN mode
         dropout_prob = noise_params.get("dropout_pct", 0.0) if noise_mode == "dropout" else 0.0
         model = GNNMLPO(input_dims, hidden_dims, output_dims, activation_cls, residual_type,
-                        norm_type=norm_type, groups=groups, dropout_prob=dropout_prob, pos_enc_type=pos_enc_type, use_spectral_norm=use_spectral_norm, drop_path_rate=drop_path_rate).to(device)
+                        norm_type=norm_type, groups=groups, dropout_prob=dropout_prob).to(device)
     elif noise_mode == "dropout":
         dropout_prob = noise_params.get("dropout_pct", 0.0)
         model = MLPO(input_dims, hidden_dims, output_dims, activation_cls, residual_type,
                      norm_type=norm_type, groups=groups, attention_type=attention_type, num_heads=num_heads,
-                     input_attention_type=input_attention_type, moe_mode=moe_mode, dropout_prob=dropout_prob, pos_enc_type=pos_enc_type, use_spectral_norm=use_spectral_norm, drop_path_rate=drop_path_rate).to(device)
+                     input_attention_type=input_attention_type, moe_mode=moe_mode, dropout_prob=dropout_prob).to(device)
     elif noise_mode == "noise injection layers":
         injection_std = noise_params.get("std", 0.1)
         model = MLPO(input_dims, hidden_dims, output_dims, activation_cls, residual_type,
                      norm_type=norm_type, groups=groups, attention_type=attention_type, num_heads=num_heads,
                      input_attention_type=input_attention_type, moe_mode=moe_mode,
-                     use_noise_injection_layers=True, noise_injection_std=injection_std, pos_enc_type=pos_enc_type, use_spectral_norm=use_spectral_norm, drop_path_rate=drop_path_rate).to(device)
+                     use_noise_injection_layers=True, noise_injection_std=injection_std).to(device)
     else:
         model = MLPO(input_dims, hidden_dims, output_dims, activation_cls, residual_type,
                      norm_type=norm_type, groups=groups, attention_type=attention_type, num_heads=num_heads,
-                     input_attention_type=input_attention_type, moe_mode=moe_mode, pos_enc_type=pos_enc_type, use_spectral_norm=use_spectral_norm, drop_path_rate=drop_path_rate).to(device)
+                     input_attention_type=input_attention_type, moe_mode=moe_mode).to(device)
 
     if use_lsuv:
         lsuv_init(model, train_loader, device, max_iter=lsuv_max_iter, normalize_mean=lsuv_normalize_mean, verbose=True)
@@ -2057,7 +1893,7 @@ def main(csv_file, delimiter=',', input_cols=[], output_cols=[], col_types={}, v
     config_activation_cls = base_activation_cls_for_config if base_activation_cls_for_config else activation_cls
     save_config(csv_file, col_types, hidden_dims, vocabularies, scalings, image_params,
                 optimizer_choice, batch_size, config_activation_cls, activation_type, residual_type,
-                norm_type, groups, attention_type, num_heads, input_attention_type, moe_mode, noise_mode, noise_params, mlp_mode=mlp_mode, pos_enc_type=pos_enc_type, use_spectral_norm=use_spectral_norm, drop_path_rate=drop_path_rate, use_mixup=use_mixup, mixup_alpha=mixup_alpha)
+                norm_type, groups, attention_type, num_heads, input_attention_type, moe_mode, noise_mode, noise_params, mlp_mode=mlp_mode)
         
     try:
         for epoch in range(10000000):
@@ -2067,52 +1903,24 @@ def main(csv_file, delimiter=',', input_cols=[], output_cols=[], col_types={}, v
                 if noise_mode == "input noise":
                     noisy_inputs = inputs + torch.randn_like(inputs) * noise_params.get("std", 0.1)
                 
-
-                if use_mixup and model.training and np.random.rand() < 0.5:
-                    lam = np.random.beta(mixup_alpha, mixup_alpha)
-                    indices = torch.randperm(inputs.size(0)).to(device)
-                    # Mixup layer can be 0 (input) to num_blocks (last block output)
-                    mixup_layer = np.random.randint(0, len(model.blocks) + 1)
-                else:
-                    lam = 1.0
-                    indices = None
-                    mixup_layer = None
-
                 if _is_evolution:
                     # Evolution optimizer: forward-only closure (no backward/grad clipping)
                     def closure():
-                        if use_mixup and mixup_layer is not None:
-                            outputs = model(noisy_inputs, mixup_layer=mixup_layer, mixup_lam=lam, mixup_indices=indices)
-                            if noise_mode == "output noise":
-                                outputs = outputs + torch.randn_like(outputs) * noise_params.get("std", 0.1)
-                            loss1 = criterion(outputs, targets)
-                            loss2 = criterion(outputs, targets[indices])
-                            loss = lam * loss1 + (1 - lam) * loss2
-                        else:
-                            outputs = model(noisy_inputs)
-                            if noise_mode == "output noise":
-                                outputs = outputs + torch.randn_like(outputs) * noise_params.get("std", 0.1)
-                            loss = criterion(outputs, targets)
+                        outputs = model(noisy_inputs)
+                        if noise_mode == "output noise":
+                            outputs = outputs + torch.randn_like(outputs) * noise_params.get("std", 0.1)
+                        loss = criterion(outputs, targets)
                         return loss
                 else:
                     def closure():
                         optimizer.zero_grad()
-                        if use_mixup and mixup_layer is not None:
-                            outputs = model(noisy_inputs, mixup_layer=mixup_layer, mixup_lam=lam, mixup_indices=indices)
-                            if noise_mode == "output noise":
-                                outputs = outputs + torch.randn_like(outputs) * noise_params.get("std", 0.1)
-                            loss1 = criterion(outputs, targets)
-                            loss2 = criterion(outputs, targets[indices])
-                            loss = lam * loss1 + (1 - lam) * loss2
-                        else:
-                            outputs = model(noisy_inputs)
-                            if noise_mode == "output noise":
-                                outputs = outputs + torch.randn_like(outputs) * noise_params.get("std", 0.1)
-                            loss = criterion(outputs, targets)
+                        outputs = model(noisy_inputs)
+                        if noise_mode == "output noise":
+                            outputs = outputs + torch.randn_like(outputs) * noise_params.get("std", 0.1)
+                        loss = criterion(outputs, targets)
                         loss.backward()
                         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                         return loss
-
                 
                 loss = optimizer.step(closure)
                 
@@ -2170,7 +1978,7 @@ def main(csv_file, delimiter=',', input_cols=[], output_cols=[], col_types={}, v
     config_activation_cls = base_activation_cls_for_config if base_activation_cls_for_config else activation_cls
     save_config(csv_file, col_types, hidden_dims, vocabularies, scalings, image_params,
                 optimizer_choice, batch_size, config_activation_cls, activation_type, residual_type,
-                norm_type, groups, attention_type, num_heads, input_attention_type, moe_mode, noise_mode, noise_params, mlp_mode=mlp_mode, pos_enc_type=pos_enc_type, use_spectral_norm=use_spectral_norm, drop_path_rate=drop_path_rate, use_mixup=use_mixup, mixup_alpha=mixup_alpha)
+                norm_type, groups, attention_type, num_heads, input_attention_type, moe_mode, noise_mode, noise_params, mlp_mode=mlp_mode)
 
 
 ##############################################
@@ -2224,29 +2032,29 @@ def compute_min_output_gap(dataset, output_cols, col_types, scalings):
 
 def build_model_for_auto(input_dims, hidden_dims, output_dims, activation_cls, residual_type,
                           norm_type, groups, attention_type, num_heads, input_attention_type,
-                          moe_mode, noise_mode, noise_params, mlp_mode, device, pos_enc_type="none", use_spectral_norm=False, drop_path_rate=0.0):
+                          moe_mode, noise_mode, noise_params, mlp_mode, device):
     """Build a model (MLP or GNN) for auto-grow training."""
     if mlp_mode == 1:
         # GNN mode
         dropout_prob = noise_params.get("dropout_pct", 0.0) if noise_mode == "dropout" else 0.0
         model = GNNMLPO(input_dims, hidden_dims, output_dims, activation_cls, residual_type,
-                        norm_type=norm_type, groups=groups, dropout_prob=dropout_prob, pos_enc_type=pos_enc_type, use_spectral_norm=use_spectral_norm, drop_path_rate=drop_path_rate).to(device)
+                        norm_type=norm_type, groups=groups, dropout_prob=dropout_prob).to(device)
     else:
         if noise_mode == "dropout":
             dropout_prob = noise_params.get("dropout_pct", 0.0)
             model = MLPO(input_dims, hidden_dims, output_dims, activation_cls, residual_type,
                          norm_type=norm_type, groups=groups, attention_type=attention_type, num_heads=num_heads,
-                         input_attention_type=input_attention_type, moe_mode=moe_mode, dropout_prob=dropout_prob, pos_enc_type=pos_enc_type, use_spectral_norm=use_spectral_norm, drop_path_rate=drop_path_rate).to(device)
+                         input_attention_type=input_attention_type, moe_mode=moe_mode, dropout_prob=dropout_prob).to(device)
         elif noise_mode == "noise injection layers":
             injection_std = noise_params.get("std", 0.1)
             model = MLPO(input_dims, hidden_dims, output_dims, activation_cls, residual_type,
                          norm_type=norm_type, groups=groups, attention_type=attention_type, num_heads=num_heads,
                          input_attention_type=input_attention_type, moe_mode=moe_mode,
-                         use_noise_injection_layers=True, noise_injection_std=injection_std, pos_enc_type=pos_enc_type, use_spectral_norm=use_spectral_norm, drop_path_rate=drop_path_rate).to(device)
+                         use_noise_injection_layers=True, noise_injection_std=injection_std).to(device)
         else:
             model = MLPO(input_dims, hidden_dims, output_dims, activation_cls, residual_type,
                          norm_type=norm_type, groups=groups, attention_type=attention_type, num_heads=num_heads,
-                         input_attention_type=input_attention_type, moe_mode=moe_mode, pos_enc_type=pos_enc_type, use_spectral_norm=use_spectral_norm, drop_path_rate=drop_path_rate).to(device)
+                         input_attention_type=input_attention_type, moe_mode=moe_mode).to(device)
     return model
 
 
@@ -2299,7 +2107,7 @@ def main_auto_grow(csv_file, delimiter=',', input_cols=[], output_cols=[], col_t
     model = build_model_for_auto(input_dims, hidden_dims, output_dims, activation_cls,
                                   residual_type, norm_type, groups, attention_type, num_heads,
                                   input_attention_type, moe_mode, noise_mode, noise_params,
-                                  mlp_mode, device, pos_enc_type=pos_enc_type, use_spectral_norm=use_spectral_norm, drop_path_rate=drop_path_rate)
+                                  mlp_mode, device)
 
     # Initialize with dummy forward pass for lazy modules
     with torch.no_grad(): model(torch.zeros(1, input_dims).to(device))
@@ -2326,7 +2134,7 @@ def main_auto_grow(csv_file, delimiter=',', input_cols=[], output_cols=[], col_t
     config_activation_cls = base_activation_cls_for_config if base_activation_cls_for_config else activation_cls
     save_config(csv_file, col_types, hidden_dims, vocabularies, scalings, image_params,
                 optimizer_choice, batch_size, config_activation_cls, activation_type, residual_type,
-                norm_type, groups, attention_type, num_heads, input_attention_type, moe_mode, noise_mode, noise_params, mlp_mode=mlp_mode, pos_enc_type=pos_enc_type, use_spectral_norm=use_spectral_norm, drop_path_rate=drop_path_rate, use_mixup=use_mixup, mixup_alpha=mixup_alpha)
+                norm_type, groups, attention_type, num_heads, input_attention_type, moe_mode, noise_mode, noise_params, mlp_mode=mlp_mode)
 
     def get_tracked_loss(loss_val):
         """Get the loss we're tracking: val loss if available, else training loss."""
@@ -2365,34 +2173,15 @@ def main_auto_grow(csv_file, delimiter=',', input_cols=[], output_cols=[], col_t
                 if noise_mode == "input noise":
                     noisy_inputs = inputs + torch.randn_like(inputs) * noise_params.get("std", 0.1)
 
-
-                if use_mixup and model.training and np.random.rand() < 0.5:
-                    lam = np.random.beta(mixup_alpha, mixup_alpha)
-                    indices = torch.randperm(inputs.size(0)).to(device)
-                    mixup_layer = np.random.randint(0, len(model.blocks) + 1)
-                else:
-                    lam = 1.0
-                    indices = None
-                    mixup_layer = None
-
                 def closure():
                     optimizer.zero_grad()
-                    if use_mixup and mixup_layer is not None:
-                        outputs = model(noisy_inputs, mixup_layer=mixup_layer, mixup_lam=lam, mixup_indices=indices)
-                        if noise_mode == "output noise":
-                            outputs = outputs + torch.randn_like(outputs) * noise_params.get("std", 0.1)
-                        loss1 = criterion(outputs, targets)
-                        loss2 = criterion(outputs, targets[indices])
-                        loss = lam * loss1 + (1 - lam) * loss2
-                    else:
-                        outputs = model(noisy_inputs)
-                        if noise_mode == "output noise":
-                            outputs = outputs + torch.randn_like(outputs) * noise_params.get("std", 0.1)
-                        loss = criterion(outputs, targets)
+                    outputs = model(noisy_inputs)
+                    if noise_mode == "output noise":
+                        outputs = outputs + torch.randn_like(outputs) * noise_params.get("std", 0.1)
+                    loss = criterion(outputs, targets)
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                     return loss
-
 
                 loss = optimizer.step(closure)
 
@@ -2478,7 +2267,7 @@ def main_auto_grow(csv_file, delimiter=',', input_cols=[], output_cols=[], col_t
                                 input_dims, hidden_dims, output_dims, activation_cls,
                                 residual_type, norm_type, groups, attention_type, num_heads,
                                 input_attention_type, moe_mode, noise_mode, noise_params,
-                                mlp_mode, device, pos_enc_type=pos_enc_type, use_spectral_norm=use_spectral_norm, drop_path_rate=drop_path_rate)
+                                mlp_mode, device)
                             # Lazy init
                             with torch.no_grad(): model(torch.zeros(1, input_dims).to(device))
                             # Transplant weights from old model
@@ -2512,7 +2301,7 @@ def main_auto_grow(csv_file, delimiter=',', input_cols=[], output_cols=[], col_t
                             save_config(csv_file, col_types, hidden_dims, vocabularies, scalings, image_params,
                                         optimizer_choice, batch_size, config_activation_cls, activation_type, residual_type,
                                         norm_type, groups, attention_type, num_heads, input_attention_type, moe_mode,
-                                        noise_mode, noise_params, mlp_mode=mlp_mode, pos_enc_type=pos_enc_type, use_spectral_norm=use_spectral_norm, drop_path_rate=drop_path_rate, use_mixup=use_mixup, mixup_alpha=mixup_alpha)
+                                        noise_mode, noise_params, mlp_mode=mlp_mode)
 
                 total_step += 1
 
@@ -2544,7 +2333,7 @@ def main_auto_grow(csv_file, delimiter=',', input_cols=[], output_cols=[], col_t
             model = build_model_for_auto(input_dims, best_hidden_dims, output_dims, activation_cls,
                                           residual_type, norm_type, groups, attention_type, num_heads,
                                           input_attention_type, moe_mode, noise_mode, noise_params,
-                                          mlp_mode, device, pos_enc_type=pos_enc_type, use_spectral_norm=use_spectral_norm, drop_path_rate=drop_path_rate)
+                                          mlp_mode, device)
             with torch.no_grad(): model(torch.zeros(1, input_dims).to(device))
             hidden_dims = list(best_hidden_dims)
         model.load_state_dict(torch.load('model.pt'))
@@ -2554,7 +2343,7 @@ def main_auto_grow(csv_file, delimiter=',', input_cols=[], output_cols=[], col_t
     config_activation_cls = base_activation_cls_for_config if base_activation_cls_for_config else activation_cls
     save_config(csv_file, col_types, best_hidden_dims, vocabularies, scalings, image_params,
                 optimizer_choice, batch_size, config_activation_cls, activation_type, residual_type,
-                norm_type, groups, attention_type, num_heads, input_attention_type, moe_mode, noise_mode, noise_params, mlp_mode=mlp_mode, pos_enc_type=pos_enc_type, use_spectral_norm=use_spectral_norm, drop_path_rate=drop_path_rate, use_mixup=use_mixup, mixup_alpha=mixup_alpha)
+                norm_type, groups, attention_type, num_heads, input_attention_type, moe_mode, noise_mode, noise_params, mlp_mode=mlp_mode)
     print(f"\nAuto-grow complete. Final architecture: {best_hidden_dims}")
     if grow_stop_reason: print(f"Growth stopped because: {grow_stop_reason}")
 
@@ -2809,7 +2598,7 @@ def _evolution_crossover(parent1, parent2, max_hidden_dim, max_layers):
 
 def _evolution_evaluate(individual, csv_file, delimiter, input_cols, output_cols, col_types,
                          vocabularies, scalings, image_params, batch_size, optimizer_choice,
-                         custom_lr, eval_steps, device, val_loader=None, pos_enc_type="none", use_spectral_norm=False, drop_path_rate=0.0, use_mixup=False, mixup_alpha=0.2):
+                         custom_lr, eval_steps, device, val_loader=None):
     """Evaluate an individual by training for eval_steps and returning loss."""
     act_map = _build_activation_map()
     act_name = individual["activation_name"]
@@ -2850,19 +2639,19 @@ def _evolution_evaluate(individual, csv_file, delimiter, input_cols, output_cols
             model = MLPO(input_dims, hidden_dims, output_pred_dim, activation_cls, residual_type,
                          norm_type=norm_type, groups=1, attention_type=ind_attention_type,
                          num_heads=ind_num_heads, input_attention_type="none",
-                         moe_mode=ind_moe_mode, dropout_prob=dropout_prob, pos_enc_type=pos_enc_type, use_spectral_norm=use_spectral_norm, drop_path_rate=drop_path_rate).to(device)
+                         moe_mode=ind_moe_mode, dropout_prob=dropout_prob).to(device)
         elif noise_mode == "noise injection layers":
             injection_std = noise_params.get("std", 0.1)
             model = MLPO(input_dims, hidden_dims, output_pred_dim, activation_cls, residual_type,
                          norm_type=norm_type, groups=1, attention_type=ind_attention_type,
                          num_heads=ind_num_heads, input_attention_type="none",
                          moe_mode=ind_moe_mode,
-                         use_noise_injection_layers=True, noise_injection_std=injection_std, pos_enc_type=pos_enc_type, use_spectral_norm=use_spectral_norm, drop_path_rate=drop_path_rate).to(device)
+                         use_noise_injection_layers=True, noise_injection_std=injection_std).to(device)
         else:
             model = MLPO(input_dims, hidden_dims, output_pred_dim, activation_cls, residual_type,
                          norm_type=norm_type, groups=1, attention_type=ind_attention_type,
                          num_heads=ind_num_heads, input_attention_type="none",
-                         moe_mode=ind_moe_mode, pos_enc_type=pos_enc_type, use_spectral_norm=use_spectral_norm, drop_path_rate=drop_path_rate).to(device)
+                         moe_mode=ind_moe_mode).to(device)
 
         # Lazy init
         with torch.no_grad():
@@ -2885,34 +2674,15 @@ def _evolution_evaluate(individual, csv_file, delimiter, input_cols, output_cols
                 if noise_mode == "input noise":
                     noisy_inputs = inputs + torch.randn_like(inputs) * noise_params.get("std", 0.1)
 
-
-                if use_mixup and model.training and np.random.rand() < 0.5:
-                    lam = np.random.beta(mixup_alpha, mixup_alpha)
-                    indices = torch.randperm(inputs.size(0)).to(device)
-                    mixup_layer = np.random.randint(0, len(model.blocks) + 1)
-                else:
-                    lam = 1.0
-                    indices = None
-                    mixup_layer = None
-
                 def closure():
                     optimizer.zero_grad()
-                    if use_mixup and mixup_layer is not None:
-                        outputs = model(noisy_inputs, mixup_layer=mixup_layer, mixup_lam=lam, mixup_indices=indices)
-                        if noise_mode == "output noise":
-                            outputs = outputs + torch.randn_like(outputs) * noise_params.get("std", 0.1)
-                        loss1 = criterion(outputs, targets)
-                        loss2 = criterion(outputs, targets[indices])
-                        loss = lam * loss1 + (1 - lam) * loss2
-                    else:
-                        outputs = model(noisy_inputs)
-                        if noise_mode == "output noise":
-                            outputs = outputs + torch.randn_like(outputs) * noise_params.get("std", 0.1)
-                        loss = criterion(outputs, targets)
+                    outputs = model(noisy_inputs)
+                    if noise_mode == "output noise":
+                        outputs = outputs + torch.randn_like(outputs) * noise_params.get("std", 0.1)
+                    loss = criterion(outputs, targets)
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                     return loss
-
 
                 loss = optimizer.step(closure)
 
@@ -2947,7 +2717,7 @@ def run_evolution(csv_file, delimiter, input_cols, output_cols, col_types, vocab
                   scalings, image_params, batch_size, optimizer_choice, custom_lr,
                   max_hidden_dim, max_layers, population_size=20, generations=30,
                   eval_steps=500, val_loader=None,
-                  evolve_set=None, pos_enc_type="none", use_spectral_norm=False, drop_path_rate=0.0, use_mixup=False, mixup_alpha=0.2, fixed_overrides=None,
+                  evolve_set=None, fixed_overrides=None,
                   fixed_hidden_dims=None, fixed_activation=None, fixed_activation_type=None):
     """Run evolutionary NAS to find the best architecture, then train it fully.
     evolve_set: set of field names evolution is allowed to mutate.
@@ -2981,7 +2751,7 @@ def run_evolution(csv_file, delimiter, input_cols, output_cols, col_types, vocab
     population = [_evolution_create_individual(max_hidden_dim, max_layers, act_choices,
                       evolve_set=evolve_set, fixed_overrides=fixed_overrides,
                       fixed_hidden_dims=fixed_hidden_dims, fixed_activation=fixed_activation,
-                      fixed_activation_type=fixed_activation_type, pos_enc_type=pos_enc_type, use_spectral_norm=use_spectral_norm, drop_path_rate=drop_path_rate, use_mixup=use_mixup, mixup_alpha=mixup_alpha)
+                      fixed_activation_type=fixed_activation_type)
                   for _ in range(population_size)]
 
     best_ever = None
@@ -3060,7 +2830,7 @@ def run_evolution(csv_file, delimiter, input_cols, output_cols, col_types, vocab
                             max_hidden_dim, max_layers, act_choices,
                             evolve_set=evolve_set, fixed_overrides=fixed_overrides,
                             fixed_hidden_dims=fixed_hidden_dims, fixed_activation=fixed_activation,
-                            fixed_activation_type=fixed_activation_type, pos_enc_type=pos_enc_type, use_spectral_norm=use_spectral_norm, drop_path_rate=drop_path_rate, use_mixup=use_mixup, mixup_alpha=mixup_alpha))
+                            fixed_activation_type=fixed_activation_type))
                     print(f"  Injected {inject_count} random individuals (low diversity)")
 
                 # Fill rest with crossover + mutation
@@ -4320,47 +4090,7 @@ def ask_input_attention_type():
     if "basic" in choice: return "basic"
     return "none"
 
-
-def ask_positional_encoding():
-    print("Choose positional encoding type:")
-    print("0: None")
-    print("1: Learned Positional Embeddings")
-    print("2: Sinusoidal Positional Encodings")
-    print("3: RoPE (Rotary Positional Embeddings)")
-    choice = input("Enter choice [0-3]: ").strip()
-    if choice == "1":
-        return "learned"
-    elif choice == "2":
-        return "sinusoidal"
-    elif choice == "3":
-        return "rope"
-    return "none"
-
-def ask_spectral_norm():
-    print("Use Spectral Normalization? (y/N)")
-    choice = input("Enter choice: ").strip().lower()
-    return choice == "y"
-
-def ask_drop_path_rate():
-    try:
-        val = input("Enter Stochastic Depth (DropPath) rate [0.0 - 1.0, default=0.0]: ").strip()
-        return float(val) if val else 0.0
-    except ValueError:
-        return 0.0
-
-def ask_manifold_mixup():
-    print("Enable Manifold Mixup? (y/N)")
-    choice = input("Enter choice: ").strip().lower()
-    if choice == "y":
-        alpha = input("Enter mixup alpha (default 0.2): ").strip()
-        try:
-            return True, float(alpha) if alpha else 0.2
-        except:
-            return True, 0.2
-    return False, 0.0
-
 def ask_moe_mode():
-
     while True:
         try:
             moe = int(input("\nMoE mode (1=off, >1=#experts, 0=x_full, -1=learned, -2=x_mean_std, -3=x_mean, -4=gMLP, -5=aMLP): ").strip())
@@ -6822,132 +6552,6 @@ def run_cross_validation(csv_file, delimiter, input_cols, output_cols, col_types
 
 
 ##############################################
-
-##############################################
-# Mode 14: Optuna Hyperparameter Tuning
-##############################################
-def run_optuna_tuning(csv_file, delimiter, input_cols, output_cols, col_types, vocabularies, scalings, image_params, batch_size, n_trials, timeout, device, val_loader=None, pos_enc_type="none", use_spectral_norm=False, drop_path_rate=0.0, use_mixup=False, mixup_alpha=0.2):
-    try:
-        import optuna
-    except ImportError:
-        print("Optuna is not installed. Please run 'pip install optuna' to use this feature.")
-        return
-
-    print(f"\n{'='*60}")
-    print("OPTUNA HYPERPARAMETER TUNING")
-    print(f"{'='*60}")
-    print(f"  Trials: {n_trials}")
-    print(f"  Timeout: {timeout} seconds")
-
-    dataset = CustomDataset(csv_file, delimiter, input_cols, output_cols, col_types, vocabularies, scalings, image_params)
-
-    if val_loader is None:
-        print("  Warning: No validation set provided. Optuna will use training loss (not recommended for true generalization).")
-        train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-    else:
-        train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-
-    input_dims = calculate_input_dim(input_cols, col_types, scalings, vocabularies)
-    output_layout, output_pred_dim, _ = build_output_layout(output_cols, col_types, scalings, vocabularies)
-    has_categorical = any(e['type'] in ['outlabcat', 'outexcat'] for e in output_layout)
-    class_weights = dataset.compute_class_weights(device=device)
-
-    def objective(trial):
-        # 1. Sample hyperparameters
-        num_layers = trial.suggest_int('num_layers', 1, 5)
-        hidden_dims = []
-        for i in range(num_layers):
-            # Encourage smaller widths by using log uniform
-            hidden_dims.append(trial.suggest_int(f'hidden_dim_{i}', 16, 512, log=True))
-
-        act_choices = list(_build_activation_map().keys())
-        act_choices = [c for c in act_choices if c not in ["Custom", "All (Gumbel)"]]
-        if not act_choices: act_choices = ["ReLU"]
-        act_name = trial.suggest_categorical('activation', act_choices)
-
-        act_type = trial.suggest_int('activation_type', 0, 7)
-        res_type = trial.suggest_categorical('residual_type', ["none", "highway", "residual", "rezero", "elementwise_rezero", "concat"])
-        norm_type = trial.suggest_categorical('norm_type', ["none", "layer", "batch", "rmsnorm"])
-
-        opt_choice = trial.suggest_categorical('optimizer', ["Adam", "AdamW", "RAdam", "SGD"])
-        lr = trial.suggest_float('lr', 1e-5, 1e-1, log=True)
-
-        # Regularization params
-        drop_path_rate = trial.suggest_float('drop_path_rate', 0.0, 0.5)
-        use_spectral_norm = trial.suggest_categorical('use_spectral_norm', [True, False])
-
-        # 2. Build model
-        act_map = _build_activation_map()
-        base_act = act_map.get(act_name, nn.ReLU)
-        wrapped_act = wrap_activation(base_act, act_type)
-
-        if has_categorical:
-            criterion = CombinedLoss(output_layout, column_weights=class_weights)
-        else:
-            criterion = nn.HuberLoss()
-
-        model = MLPO(input_dims, hidden_dims, output_pred_dim, wrapped_act, res_type,
-                     norm_type=norm_type, groups=1, attention_type="none", num_heads=1,
-                     input_attention_type="none", moe_mode=1, dropout_prob=0.0,
-                     use_spectral_norm=use_spectral_norm, drop_path_rate=drop_path_rate).to(device)
-
-        optimizer = select_optimizer(opt_choice, model, custom_lr=lr)
-
-        # 3. Train
-        max_steps = 1000
-        step = 0
-
-        model.train()
-        for epoch in range(100): # Just to keep looping
-            for inputs, targets in train_loader:
-                if step >= max_steps: break
-                inputs, targets = inputs.to(device), targets.to(device)
-
-                optimizer.zero_grad()
-                outputs = model(inputs)
-                loss = criterion(outputs, targets)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
-                step += 1
-
-            if step >= max_steps: break
-
-        # 4. Evaluate
-        if val_loader is not None:
-            score = validate_model(model, val_loader, criterion, device)
-        else:
-            # Fallback to train loss
-            model.eval()
-            total_loss = 0
-            with torch.no_grad():
-                for inputs, targets in train_loader:
-                    inputs, targets = inputs.to(device), targets.to(device)
-                    total_loss += criterion(model(inputs), targets).item()
-            score = total_loss / len(train_loader)
-
-        # Optional: Add a small penalty for complexity (number of parameters) to favor smaller models
-        params = sum(p.numel() for p in model.parameters())
-        penalty = params * 1e-8
-
-        return score + penalty
-
-    study = optuna.create_study(direction='minimize')
-
-    timeout_val = timeout if timeout > 0 else None
-    study.optimize(objective, n_trials=n_trials, timeout=timeout_val)
-
-    print(f"\n{'='*60}")
-    print("OPTUNA TUNING COMPLETE")
-    print(f"{'='*60}")
-    print("Best trial:")
-    trial = study.best_trial
-    print(f"  Value (Loss): {trial.value}")
-    print("  Params: ")
-    for key, value in trial.params.items():
-        print(f"    {key}: {value}")
-    print(f"{'='*60}\n")
-
 ##############################################
 # Main runner
 ##############################################
@@ -6967,9 +6571,8 @@ if __name__ == "__main__":
     print("11: Cross-Validation (K-Fold)")
     print("12: Input Sensitivity (Per-Output Gradient Analysis)")
     print("13: Error Analysis (Top-N Worst Examples)")
-    print("14: Optuna Hyperparameter Tuning")
     
-    choice = input("\nEnter choice [0-14]: ").strip().lower()
+    choice = input("\nEnter choice [0-13]: ").strip().lower()
     
     if choice in ["train", "t", "0"]:
         file_path = input("Enter file path: ").strip()
@@ -6995,12 +6598,7 @@ if __name__ == "__main__":
         norm_type, groups = ask_normalization_type()
         attention_type, num_heads = ask_attention_type()
         input_attention_type = ask_input_attention_type()
-        pos_enc_type = ask_positional_encoding()
-        use_spectral_norm = ask_spectral_norm()
-        drop_path_rate = ask_drop_path_rate()
-        use_mixup, mixup_alpha = ask_manifold_mixup()
         moe_mode = ask_moe_mode()
-
         use_lsuv, lsuv_max_iter, lsuv_normalize_mean = ask_lsuv_init()
 
         print("\nAnalyzing training data to establish scalings...")
@@ -7024,10 +6622,6 @@ if __name__ == "__main__":
             if val_file_path: print("Invalid file, falling back to percentage split.")
             try: val_pct = float(input("Validation split % (0.0-1.0, e.g. 0.1): ").strip())
             except ValueError: val_pct = 0.0
-            pos_enc_type = ask_positional_encoding()
-            use_spectral_norm = ask_spectral_norm()
-            drop_path_rate = ask_drop_path_rate()
-            use_mixup, mixup_alpha = ask_manifold_mixup()
             if val_pct > 0.0:
                 val_size = int(len(train_ds_pre) * val_pct)
                 train_size = len(train_ds_pre) - val_size
@@ -7051,7 +6645,7 @@ if __name__ == "__main__":
                  use_lsuv=use_lsuv, lsuv_max_iter=lsuv_max_iter or 10,
                  lsuv_normalize_mean=lsuv_normalize_mean if lsuv_normalize_mean is not None else False,
                  val_loader=val_loader, val_interval=val_interval,
-                 custom_lr=custom_lr, mlp_mode=mlp_mode, pos_enc_type=pos_enc_type, use_spectral_norm=use_spectral_norm, drop_path_rate=drop_path_rate, use_mixup=use_mixup, mixup_alpha=mixup_alpha)
+                 custom_lr=custom_lr, mlp_mode=mlp_mode)
         else:
             main(file_path, delimiter=delimiter, input_cols=input_cols, output_cols=output_cols,
                  col_types=col_types, vocabularies=vocabularies, scalings=scalings, image_params=image_params,
@@ -7065,7 +6659,7 @@ if __name__ == "__main__":
                  use_lsuv=use_lsuv, lsuv_max_iter=lsuv_max_iter or 10,
                  lsuv_normalize_mean=lsuv_normalize_mean if lsuv_normalize_mean is not None else False,
                  val_loader=val_loader, val_interval=val_interval,
-                 custom_lr=custom_lr, mlp_mode=mlp_mode, pos_enc_type=pos_enc_type, use_spectral_norm=use_spectral_norm, drop_path_rate=drop_path_rate, use_mixup=use_mixup, mixup_alpha=mixup_alpha)
+                 custom_lr=custom_lr, mlp_mode=mlp_mode)
 
     elif choice in ["sample", "s", "1"]:
         config = load_config()
@@ -7290,10 +6884,6 @@ if __name__ == "__main__":
             if val_file_path: print("Invalid file, falling back to percentage split.")
             try: val_pct = float(input("Validation split % (0.0-1.0, e.g. 0.1): ").strip())
             except ValueError: val_pct = 0.0
-            pos_enc_type = ask_positional_encoding()
-            use_spectral_norm = ask_spectral_norm()
-            drop_path_rate = ask_drop_path_rate()
-            use_mixup, mixup_alpha = ask_manifold_mixup()
             if val_pct > 0.0:
                 val_size = int(len(train_ds_pre) * val_pct)
                 train_size = len(train_ds_pre) - val_size
@@ -7309,7 +6899,7 @@ if __name__ == "__main__":
             max_hidden_dim, max_layers, population_size, generations, eval_steps,
             evo_val_loader, evolve_set=evolve_set, fixed_overrides=fixed_overrides,
             fixed_hidden_dims=fixed_hidden_dims, fixed_activation=fixed_activation,
-            fixed_activation_type=fixed_activation_type, pos_enc_type=pos_enc_type, use_spectral_norm=use_spectral_norm, drop_path_rate=drop_path_rate, use_mixup=use_mixup, mixup_alpha=mixup_alpha)
+            fixed_activation_type=fixed_activation_type)
 
         if best_individual is not None:
             print("\n>>> Now training the best evolved architecture <<<\n")
@@ -7420,7 +7010,7 @@ if __name__ == "__main__":
         else:
             model = MLPO(input_dims, hidden_dims, output_pred_dim, activation_cls, residual_type,
                          norm_type=norm_type, groups=1, attention_type=attention_type,
-                         num_heads=num_heads, input_attention_type="none", moe_mode=moe_mode, pos_enc_type=pos_enc_type, use_spectral_norm=use_spectral_norm, drop_path_rate=drop_path_rate).to(device)
+                         num_heads=num_heads, input_attention_type="none", moe_mode=moe_mode).to(device)
         with torch.no_grad(): model(torch.zeros(1, input_dims).to(device))
         model.load_state_dict(torch.load("model.pt", map_location=device))
         
@@ -7471,7 +7061,7 @@ if __name__ == "__main__":
         else:
             model = MLPO(input_dims, hidden_dims, output_pred_dim, activation_cls, residual_type,
                          norm_type=norm_type, groups=1, attention_type=attention_type,
-                         num_heads=num_heads, input_attention_type="none", moe_mode=moe_mode, pos_enc_type=pos_enc_type, use_spectral_norm=use_spectral_norm, drop_path_rate=drop_path_rate).to(device)
+                         num_heads=num_heads, input_attention_type="none", moe_mode=moe_mode).to(device)
         with torch.no_grad(): model(torch.zeros(1, input_dims).to(device))
         if os.path.exists("model.pt"):
             model.load_state_dict(torch.load("model.pt", map_location=device))
@@ -7516,7 +7106,7 @@ if __name__ == "__main__":
         else:
             model = MLPO(input_dims, hidden_dims, output_pred_dim, activation_cls, residual_type,
                          norm_type=norm_type, groups=1, attention_type=attention_type,
-                         num_heads=num_heads, input_attention_type="none", moe_mode=moe_mode, pos_enc_type=pos_enc_type, use_spectral_norm=use_spectral_norm, drop_path_rate=drop_path_rate).to(device)
+                         num_heads=num_heads, input_attention_type="none", moe_mode=moe_mode).to(device)
         with torch.no_grad(): model(torch.zeros(1, input_dims).to(device))
         model.load_state_dict(torch.load("model.pt", map_location=device))
         
@@ -7656,7 +7246,7 @@ if __name__ == "__main__":
         else:
             model = MLPO(input_dims, hidden_dims, output_pred_dim, activation_cls, residual_type,
                          norm_type=norm_type, groups=1, attention_type=attention_type,
-                         num_heads=num_heads, input_attention_type="none", moe_mode=moe_mode, pos_enc_type=pos_enc_type, use_spectral_norm=use_spectral_norm, drop_path_rate=drop_path_rate).to(device)
+                         num_heads=num_heads, input_attention_type="none", moe_mode=moe_mode).to(device)
         with torch.no_grad(): model(torch.zeros(1, input_dims).to(device))
         model.load_state_dict(torch.load("model.pt", map_location=device))
         
@@ -7710,7 +7300,7 @@ if __name__ == "__main__":
         else:
             model = MLPO(input_dims, hidden_dims, output_pred_dim, activation_cls, residual_type,
                          norm_type=norm_type, groups=1, attention_type=attention_type,
-                         num_heads=num_heads, input_attention_type="none", moe_mode=moe_mode, pos_enc_type=pos_enc_type, use_spectral_norm=use_spectral_norm, drop_path_rate=drop_path_rate).to(device)
+                         num_heads=num_heads, input_attention_type="none", moe_mode=moe_mode).to(device)
         model.load_state_dict(torch.load("model.pt", map_location=device))
         
         data_csv = input("Enter data CSV path (for error analysis): ").strip()
@@ -7724,58 +7314,6 @@ if __name__ == "__main__":
         run_error_analysis(model, data_csv, delimiter, input_cols_l, output_cols_l,
                           col_types_loaded, vocabularies_l, scalings_l,
                           config.get("image_params", {}), batch_size, device, max_display)
-
-
-    elif choice in ["optuna", "14"]:
-        # Mode 14: Optuna
-        file_path = input("Enter file path: ").strip()
-        preview_csv_file(file_path)
-        print("CSV delimiter: 1=,  2=\\t  3=;  4=space")
-        dc = input("Choice: ").strip()
-        delimiter = {"1":",","2":"\t","3":";","4":" "}.get(dc, ",")
-
-        df = pd.read_csv(file_path, delimiter=delimiter)
-        col_types_opt, vocabularies_opt, image_params_opt = ask_column_types(df.columns.tolist(), file_path, delimiter)
-        input_cols_opt = [c for c, v in col_types_opt.items() if 'in' in v]
-        output_cols_opt = [c for c, v in col_types_opt.items() if 'out' in v]
-
-        batch_size = ask_batch_size()
-
-        n_trials_str = input("Number of trials (default 50): ").strip()
-        n_trials = int(n_trials_str) if n_trials_str else 50
-        timeout_str = input("Timeout in seconds (0 for no timeout, default 0): ").strip()
-        timeout = int(timeout_str) if timeout_str else 0
-
-        dataset_pre = CustomDataset(file_path, delimiter, input_cols_opt, output_cols_opt,
-                                    col_types_opt, vocabularies_opt, {}, image_params_opt)
-        scalings_opt = dataset_pre.scalings
-        vocabularies_opt = dataset_pre.vocabularies
-
-        val_loader = None
-        print("\n--- Validation Setup (Recommended for Optuna) ---")
-        val_file_path = input("Enter validation CSV path (empty for percentage split): ").strip()
-
-        if val_file_path and os.path.isfile(val_file_path):
-            val_dataset = CustomDataset(val_file_path, delimiter, input_cols_opt, output_cols_opt,
-                                      col_types_opt, vocabularies_opt, scalings_opt, image_params_opt)
-            val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-        else:
-            try: val_pct = float(input("Validation split % (0.0-1.0, e.g. 0.1): ").strip())
-            except ValueError: val_pct = 0.0
-            pos_enc_type = ask_positional_encoding()
-            use_spectral_norm = ask_spectral_norm()
-            drop_path_rate = ask_drop_path_rate()
-            use_mixup, mixup_alpha = ask_manifold_mixup()
-            if val_pct > 0.0:
-                val_size = int(len(dataset_pre) * val_pct)
-                train_size = len(dataset_pre) - val_size
-                _, val_subset = torch.utils.data.random_split(dataset_pre, [train_size, val_size])
-                val_loader = DataLoader(val_subset, batch_size=batch_size, shuffle=False)
-
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-        run_optuna_tuning(file_path, delimiter, input_cols_opt, output_cols_opt, col_types_opt,
-                          vocabularies_opt, scalings_opt, image_params_opt, batch_size, n_trials, timeout, device, val_loader)
 
     else:
         print("Invalid choice.")
