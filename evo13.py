@@ -9022,12 +9022,58 @@ def generate_importance_biased_seeds(n_features, feature_names, X, y,
     except Exception:
         pass
 
+    # ── Closed-form COMPOSITE seeds (complex multivariable targets) ──────
+    # Each analytical seed above fits ONE algebraic family to the whole
+    # target.  An additive mix of heterogeneous terms — e.g. a·b/(c·d) + poly
+    # — defeats them all: the polynomial OLS captures the additive part, the
+    # log-OLS bails on the mixed signs, and the multiplicative interaction
+    # term is never seeded.  Here we take the best analytical seed (it already
+    # captures the additive part), then splice a closed-form fit of its
+    # residual — over an interaction basis that includes products / ratios /
+    # rational products — onto it as a single additive genome.  The full
+    # heterogeneous structure is then present in the pool from generation 0,
+    # so the search no longer has to rediscover the interaction term from
+    # scratch through a rugged landscape.  These are analytical priority seeds
+    # too, so they sit inside the pinned block below.
+    if (seeds and n_features >= 2 and '+' in allowed
+            and X is not None and len(y) >= 8):
+        try:
+            y_arr = np.asarray(y, dtype=np.float64)
+            y_var = float(np.var(y_arr))
+            # Rank the analytical seeds by their affine-fit residual WITHOUT
+            # mutating them — locking a regression affine here would corrupt a
+            # classification caller's later (correct-type) fitness fit.
+            best_tree = best_a = best_b = best_resid = None
+            best_score = np.inf
+            for s in seeds:                 # OLS + log-OLS closed-form seeds
+                bp = s.tree.evaluate(X)
+                bp = np.clip(np.nan_to_num(bp, nan=0.0, posinf=1e9, neginf=-1e9),
+                             -1e9, 1e9)
+                a, b, _ = _fit_affine(bp, y_arr)
+                resid = y_arr - (a * bp + b)
+                score = float(np.mean(resid ** 2)) / (y_var + 1e-12)
+                if np.isfinite(score) and score < best_score:
+                    best_score = score
+                    best_tree, best_a, best_b, best_resid = s.tree, a, b, resid
+            if best_tree is not None and best_score < 1.0:
+                # Wrap the winning tree in a throwaway base carrying its fitted
+                # affine (so y reconstructs exactly inside the composite helper)
+                # without mutating the originals.
+                base = Individual(best_tree.clone())
+                base.affine_a, base.affine_b = float(best_a), float(best_b)
+                base.boost_stages = []
+                seeds.extend(_make_residual_composites(
+                    n_features, feature_names, X, best_resid, base,
+                    max_composites=4))
+        except Exception:
+            pass
+
     # Boundary between the closed-form analytical priority block above
-    # (OLS quadratic + linear-only, log-OLS raw + snapped + integer-snapped)
-    # and the combinatorial / template diversity blocks below.  BO callers
-    # that pass ``return_priority_count=True`` use this index to keep the
-    # priority seeds pinned at the front of their pool across a shuffle +
-    # truncation pass.
+    # (OLS quadratic + linear-only, log-OLS raw + snapped + integer-snapped,
+    # plus the residual-composite seeds) and the combinatorial / template
+    # diversity blocks below.  BO callers that pass ``return_priority_count=
+    # True`` use this index to keep the priority seeds pinned at the front of
+    # their pool across a shuffle + truncation pass.
     n_priority = len(seeds)
 
     # Compute feature importance EARLY so it can prioritise the rational-
@@ -9931,8 +9977,393 @@ def _generate_bit_arithmetic_seeds(n_features, feature_names, X, y):
     return seeds
 
 
+# ════════════════════════════════════════════════════════════════════════
+# RESIDUAL-COMPOSITE SEEDS  (complex multivariable correction terms)
+# ════════════════════════════════════════════════════════════════════════
+# The one-shot startup solvers (OLS / log-OLS / rational-product) each fit a
+# SINGLE algebraic family to the *whole* target.  An additive mix of
+# heterogeneous terms — e.g.  y = a·b/(c·d) + poly(x) + … — defeats them: the
+# polynomial OLS captures the additive part and the log-OLS bails on the mixed
+# signs, so the *multiplicative interaction term* is never seeded and evolution
+# almost never assembles it from scratch (it needs several specific wirings AND
+# constants to land simultaneously).  The simple per-feature residual seeds
+# below (Steps 1-6) and crossover rarely splice such a term onto the current
+# best either.
+#
+# The helpers here close that gap.  Given the current best model they:
+#   1. rank candidate interaction terms (products, ratios, rational products,
+#      squares) by their correlation with the residual — the true missing term
+#      reliably tops this ranking;
+#   2. fit a small multi-term least-squares correction over that basis; and
+#   3. splice the correction onto the best as a single additive genome
+#          best(x) · affine_a  +  Σ_k w_k · term_k(x)
+#      that is scored on the FULL target, so a good correction immediately
+#      produces a complete, low-loss, still-evolvable candidate.
+
+def _emit_active_nodes(tree, nf, slot_base):
+    """Copy ``tree``'s ACTIVE compute nodes into a fresh, densely-packed slot
+    range starting at ``slot_base`` (renumbered so the block is forward-only).
+
+    Returns ``(new_nodes, out_buf_idx)`` where ``new_nodes`` is the list of
+    cloned+remapped CGPNodes and ``out_buf_idx`` is the buffer index of the
+    tree's output in the new numbering (an input index ``< nf`` is returned
+    unchanged when the tree's output is a raw feature).
+    """
+    active = sorted(i for i in tree.active_nodes if i >= nf)
+    remap = {i: i for i in range(nf)}                 # inputs map to themselves
+    for k, old in enumerate(active):
+        remap[old] = nf + slot_base + k
+    new_nodes = []
+    for old in active:
+        src = tree.nodes[old - nf]
+        new_nodes.append(CGPNode(
+            src.op,
+            remap.get(src.in1, src.in1),
+            remap.get(src.in2, src.in2),
+            src.const_val,
+            remap.get(src.in3, src.in3)))
+    out_buf = remap.get(tree.out_idx, tree.out_idx)
+    return new_nodes, out_buf
+
+
+def _compose_additive_tree(tree_a, tree_b, scale_a=1.0, max_total=None):
+    """Splice two CGP trees into one genome computing  ``scale_a·A(x) + B(x)``.
+
+    Only the ACTIVE nodes of each tree are copied (so the result stays compact
+    and within the node budget), then renumbered into one forward-only graph
+    with a ``+`` root.  ``scale_a`` (the base model's fitted affine slope) is
+    baked in so a fresh affine fit of the composite starts near the identity
+    and recovers the original term balance.
+
+    Returns a new ``CGPEquation`` or ``None`` if the genome can't be built
+    (``+`` unavailable) or would exceed ``max_total`` node slots.
+    """
+    if tree_a is None or tree_b is None:
+        return None
+    ops = CGPEquation.OPS_ALL
+    if '+' not in ops:
+        return None
+    nf = tree_a.n_features
+    if getattr(tree_b, 'n_features', None) != nf:
+        return None
+    have_const = 'const' in ops
+    have_mul   = '*' in ops
+    use_scale  = (abs(float(scale_a) - 1.0) > 1e-9) and have_const and have_mul
+
+    a_nodes, a_out = _emit_active_nodes(tree_a, nf, 0)
+    b_nodes, b_out = _emit_active_nodes(tree_b, nf, len(a_nodes))
+    nodes = a_nodes + b_nodes
+    cursor = len(nodes)
+
+    a_term = a_out
+    if use_scale:
+        nodes.append(CGPNode('const', 0, 0, float(scale_a)))
+        sc_const = nf + cursor; cursor += 1
+        nodes.append(CGPNode('*', a_term, sc_const))
+        a_term = nf + cursor; cursor += 1
+
+    nodes.append(CGPNode('+', a_term, b_out))
+    out_slot = cursor; cursor += 1
+
+    if cursor <= 0 or (max_total is not None and cursor > max_total):
+        return None
+
+    new = CGPEquation(nf, cursor, tree_a.feature_names)
+    new.nodes = nodes
+    new.out_idx = nf + out_slot
+    new.update_active_nodes()
+    return new
+
+
+def _residual_basis_candidates(n_features, X, residual, max_feats=8):
+    """Rank interaction / transform basis terms by |corr| with ``residual``.
+
+    Covers exactly the multivariable forms the one-shot startup seeds miss:
+    raw features, single-feature unary transforms (sin / cos / sqrt / log /
+    exp / …), squares, pairwise products, pairwise ratios and rational
+    products ``x_i·x_j/(x_k·x_l)``.  Returns a list of
+    ``(corr, kind, params, value_vec)`` sorted by descending correlation.  Only
+    terms whose required operators are available are emitted.
+
+    Including the unary transforms matters: without them a missing
+    transcendental term (e.g. ``+ sin(x)``) has no faithful basis element, so
+    the composite would *approximate* it with products / ratios and trap the
+    search at that approximation — a regression on targets the plain search
+    already solved.  With them the composite captures the term directly.
+    """
+    import itertools
+    ops = set(CGPEquation.OPS_ALL)
+    has_mul = '*' in ops
+    has_div = '/' in ops
+    has_sq  = ('square' in ops) or has_mul
+    # Single-feature unary transforms worth a dedicated additive basis term,
+    # in rough order of usefulness — intersected with the live op set.  Each is
+    # evaluated through the SAME dispatch the CGP node uses, so the ranked /
+    # fitted value matches the transcribed tree exactly (incl. safe-domain
+    # clamping for log / sqrt).
+    unary_ops = [op for op in ('sin', 'cos', 'tanh', 'sqrt', 'log', 'exp',
+                               'gaussian', 'sigmoid', 'abs', 'cube')
+                 if op in ops and op in UNARY_OPS_EVAL]
+    out = []
+    if float(np.std(residual)) < 1e-12:
+        return out
+
+    def _clean(v):
+        return np.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0)
+
+    def _corr(v):
+        s = np.std(v)
+        if s < 1e-12:
+            return 0.0
+        r = np.corrcoef(v, residual)[0, 1]
+        return 0.0 if not np.isfinite(r) else abs(float(r))
+
+    nf = n_features
+    feats = list(range(nf))
+    if nf > max_feats:
+        # Restrict the combinatorial pool to the features most relevant to the
+        # residual (by |corr| of x_i and, if division is available, 1/x_i) so
+        # the product / rational enumeration stays O(max_feats⁴) at worst.
+        def _frel(i):
+            xi = X[:, i]
+            r = _corr(_clean(xi))
+            if has_div:
+                r = max(r, _corr(_clean(1.0 / np.where(np.abs(xi) > 1e-9, xi, 1e-9))))
+            return r
+        feats = sorted(feats, key=_frel, reverse=True)[:max_feats]
+
+    for i in feats:
+        out.append((_corr(_clean(X[:, i])), 'feat', (i,), _clean(X[:, i])))
+    if has_sq:
+        for i in feats:
+            v = _clean(X[:, i] * X[:, i])
+            out.append((_corr(v), 'square', (i,), v))
+    for op in unary_ops:
+        fn = UNARY_OPS_EVAL[op]
+        for i in feats:
+            try:
+                v = _clean(fn(X[:, i]))
+            except Exception:
+                continue
+            out.append((_corr(v), 'unary', (op, i), v))
+    if has_mul:
+        for a in range(len(feats)):
+            for b in range(a + 1, len(feats)):
+                i, j = feats[a], feats[b]
+                v = _clean(X[:, i] * X[:, j])
+                out.append((_corr(v), 'product', (i, j), v))
+    if has_div:
+        for i in feats:
+            for j in feats:
+                if i == j:
+                    continue
+                den = X[:, j]
+                v = _clean(X[:, i] / np.where(np.abs(den) > 1e-9, den, 1e-9))
+                out.append((_corr(v), 'ratio', (i, j), v))
+    if has_mul and has_div:
+        for (i, j) in itertools.combinations(feats, 2):
+            for (k, l) in itertools.combinations(feats, 2):
+                if {i, j} & {k, l}:
+                    continue
+                num = X[:, i] * X[:, j]
+                den = X[:, k] * X[:, l]
+                v = _clean(num / np.where(np.abs(den) > 1e-9, den, 1e-9))
+                out.append((_corr(v), 'ratprod', (i, j, k, l), v))
+
+    out.sort(key=lambda t: -t[0])
+    return out
+
+
+def _build_residual_correction_tree(n_features, feature_names, terms, weights, w0):
+    """Transcribe  ``w0 + Σ_k w_k · term_k(x)``  into a CGPEquation.
+
+    ``terms`` is a list of ``(kind, params)`` where ``kind`` is one of
+    ``feat / unary / square / product / ratio / ratprod`` (see
+    ``_residual_basis_candidates``).  Returns ``None`` when no non-trivial node
+    could be built.
+    """
+    ops = set(CGPEquation.OPS_ALL)
+    nf = n_features
+    nodes = []
+
+    def add(op, i1, i2, cv=0.0, i3=0):
+        nodes.append(CGPNode(op, i1, i2, cv, i3))
+        return nf + len(nodes) - 1
+
+    weighted = []   # buffer index of each  w_k · term_k
+    for (kind, params), w in zip(terms, weights):
+        w = float(w)
+        if not np.isfinite(w) or abs(w) > 1e8 or abs(w) < 1e-12:
+            continue
+        if kind == 'feat':
+            base_idx = params[0]
+        elif kind == 'unary':
+            op_name = params[0]
+            if op_name not in ops:
+                continue
+            base_idx = add(op_name, params[1], 0)
+        elif kind == 'square':
+            if 'square' in ops:
+                base_idx = add('square', params[0], 0)
+            elif '*' in ops:
+                base_idx = add('*', params[0], params[0])
+            else:
+                continue
+        elif kind == 'product':
+            if '*' not in ops:
+                continue
+            base_idx = add('*', params[0], params[1])
+        elif kind == 'ratio':
+            if '/' not in ops:
+                continue
+            base_idx = add('/', params[0], params[1])
+        elif kind == 'ratprod':
+            if '*' not in ops or '/' not in ops:
+                continue
+            a = add('*', params[0], params[1])
+            b = add('*', params[2], params[3])
+            base_idx = add('/', a, b)
+        else:
+            continue
+
+        if abs(w - 1.0) < 1e-9:
+            weighted.append(base_idx)
+        elif 'const' in ops and '*' in ops:
+            c = add('const', 0, 0, w)
+            weighted.append(add('*', base_idx, c))
+        else:
+            weighted.append(base_idx)   # cannot scale — use the raw term
+
+    if not weighted or not nodes:
+        return None    # nothing meaningful (or only a raw passthrough feature)
+
+    acc = weighted[0]
+    rest = list(weighted[1:])
+    if abs(float(w0)) > 1e-12 and 'const' in ops:
+        rest.append(add('const', 0, 0, float(w0)))
+    if rest and '+' not in ops:
+        return None
+    for nxt in rest:
+        acc = add('+', acc, nxt)
+
+    eq = CGPEquation(nf, len(nodes), feature_names)
+    eq.nodes = nodes
+    eq.out_idx = acc
+    eq.update_active_nodes()
+    return eq
+
+
+def _make_residual_composites(n_features, feature_names, X, residual,
+                              base_ind, max_composites=6):
+    """Build  ``base + correction``  composite Individuals where ``correction``
+    is a closed-form least-squares fit to ``residual`` over the interaction
+    basis from ``_residual_basis_candidates``.
+
+    Emits one multi-term composite (a joint OLS over the top-K interaction
+    terms — captures both any additive part the base dropped AND the missing
+    multiplicative term) plus the strongest single-term composites for
+    diversity.  Each composite is scored on the full target by the caller, so
+    only genuinely-improving ones survive.
+    """
+    out = []
+    ops = set(CGPEquation.OPS_ALL)
+    if not USE_SEEDS or n_features < 1 or '+' not in ops:
+        return out
+    if base_ind is None or getattr(base_ind, 'tree', None) is None:
+        return out
+    if getattr(base_ind, 'boost_stages', None):
+        # The residual already accounts for boost stages; a plain tree
+        # composite couldn't reproduce them, so skip (Steps 1-6 still run).
+        return out
+
+    residual = np.nan_to_num(np.asarray(residual, dtype=np.float64),
+                             nan=0.0, posinf=0.0, neginf=0.0)
+    if float(np.std(residual)) < 1e-10:
+        return out
+
+    base_tree = base_ind.tree
+    affine_a = float(getattr(base_ind, 'affine_a', 1.0))
+    affine_b = float(getattr(base_ind, 'affine_b', 0.0))
+    max_total = max(int(CGP_NODES),
+                    int(getattr(base_tree, 'max_nodes', CGP_NODES))) + 24
+
+    # Raw base output and the reconstructed full target (residual = y − base_pred,
+    # base_pred = affine_a·base_raw + affine_b), so the correction can be re-fit
+    # JOINTLY with the base scale against the real target rather than the
+    # residual alone.
+    base_raw = base_tree.evaluate(X)
+    base_raw = np.clip(np.nan_to_num(base_raw, nan=0.0, posinf=1e9, neginf=-1e9),
+                       -1e9, 1e9)
+    y_full = affine_a * base_raw + affine_b + residual
+
+    # Candidate interaction terms are RANKED against the residual (the missing
+    # term reliably tops that ranking) but their coefficients are FIT against
+    # the full target jointly with the base — see ``_joint_composite``.
+    cands = [c for c in _residual_basis_candidates(n_features, X, residual)
+             if c[0] >= 0.15]
+    if not cands:
+        return out
+
+    def _joint_composite(term_list):
+        """Solve  y ≈ α·base_raw + Σ_k w_k·term_k + w0  and transcribe it as the
+        single additive genome  α·base + (Σ w_k·term_k + w0).
+
+        Re-fitting α together with the interaction weights against the FULL
+        target (rather than fixing the base scale and fitting terms to the
+        residual) corrects the coefficient double-count that arises because the
+        base's own fit already absorbed part of the missing term — and it
+        tolerates a stale base affine in the in-flight reseed path.
+        """
+        try:
+            B = np.column_stack(
+                [base_raw] + [t[3] for t in term_list] + [np.ones(len(y_full))])
+            XTX = B.T @ B + 1e-6 * np.eye(B.shape[1])
+            w = np.linalg.solve(XTX, B.T @ y_full)
+        except Exception:
+            return None
+        if not np.all(np.isfinite(w)):
+            return None
+        ct = _build_residual_correction_tree(
+            n_features, feature_names,
+            [(t[1], t[2]) for t in term_list], w[1:-1], float(w[-1]))
+        if ct is None:
+            return None
+        return _compose_additive_tree(base_tree, ct, scale_a=float(w[0]),
+                                      max_total=max_total)
+
+    # ── Multi-term joint composite over the top-K interaction basis ──────
+    comp = _joint_composite(cands[:min(6, len(cands))])
+    if comp is not None:
+        out.append(Individual(comp))
+
+    # ── Strongest single-term composites (robustness / diversity) ────────
+    for cand in cands[:max_composites]:
+        comp = _joint_composite([cand])
+        if comp is not None:
+            out.append(Individual(comp))
+        if len(out) >= max_composites + 1:
+            break
+
+    return out
+
+
+def _hof_lowest_loss_member(hof):
+    """Lowest-loss finite member of a Hall of Fame — the cleanest base for
+    residual-composite seeding (its residual isolates the missing term better
+    than the parsimony-selected ``get_best_overall`` pick).  Returns ``None``
+    when the frontier is empty.
+    """
+    if hof is None or not getattr(hof, 'best_by_complexity', None):
+        return None
+    members = [m for m in hof.best_by_complexity.values()
+               if np.isfinite(getattr(m, 'loss', np.inf))]
+    if not members:
+        return None
+    return min(members, key=lambda m: float(m.loss))
+
+
 def generate_residual_aware_seeds(n_features, feature_names, X, y_target,
-                                   hof_best, max_seeds=10):
+                                   hof_best, max_seeds=10, base_individual=None):
     """
     Generate seeds targeted at regions where the current HoF best is failing.
 
@@ -9948,8 +10379,14 @@ def generate_residual_aware_seeds(n_features, feature_names, X, y_target,
     This breaks the "seed basin trap" where the population converges to seed
     templates and can't discover the correction terms needed for regions those
     seeds don't cover.
+
+    ``base_individual`` (optional) is the model the *composite* corrections are
+    spliced onto — pass the lowest-loss frontier member here; it usually has a
+    cleaner residual than the parsimony-selected ``hof_best``.  Defaults to
+    ``hof_best`` when omitted.
     """
     seeds = []
+    composites = []
     allowed = set(CGPEquation.OPS_ALL)
     if not USE_SEEDS or hof_best is None or n_features < 1:
         return seeds
@@ -10180,10 +10617,41 @@ def generate_residual_aware_seeds(n_features, feature_names, X, y_target,
                     cgp.update_active_nodes()
                     seeds.append(Individual(cgp))
 
+        # ── Step 7: Closed-form multivariable COMPOSITE corrections ────────
+        # Splice a closed-form residual fit (over an interaction basis that
+        # includes products / ratios / rational products) onto the current
+        # best as a single additive genome.  This is the decisive move for
+        # additive mixes of heterogeneous terms — e.g.  a·b/(c·d) + poly — that
+        # the one-shot startup solvers and the simple per-feature seeds above
+        # cannot assemble.  Composed against the lowest-loss frontier member
+        # (``base_individual``) when supplied, which has the cleanest residual.
+        base = base_individual if base_individual is not None else hof_best
+        if base is not None and getattr(base, 'tree', None) is not None:
+            try:
+                base_preds = base.tree.evaluate(X)
+                base_preds = np.clip(np.nan_to_num(
+                    base_preds, nan=0.0, posinf=1e9, neginf=-1e9), -1e9, 1e9)
+                base_preds = base.affine_a * base_preds + base.affine_b
+                for corr_tree, ca, cb, lr in getattr(base, 'boost_stages', []):
+                    corr = corr_tree.evaluate(X)
+                    corr = np.clip(np.nan_to_num(
+                        corr, nan=0.0, posinf=1e9, neginf=-1e9), -1e9, 1e9)
+                    base_preds = base_preds + lr * (ca * corr + cb)
+                base_resid = y_target - base_preds
+                composites = _make_residual_composites(
+                    n_features, feature_names, X, base_resid, base,
+                    max_composites=max(3, max_seeds // 2))
+            except Exception:
+                composites = []
+
     except Exception:
         pass  # never let seed generation crash the main loop
 
-    return seeds[:max_seeds]
+    # Composites are the highest-value entries (a complete, low-loss candidate
+    # rather than a bare correction term that must find a crossover partner), so
+    # they take priority in the truncation; the caller re-scores and keeps the
+    # best regardless of order.
+    return (composites + seeds)[:max_seeds]
 
 
 def generate_seeds_v5(n_features, feature_names):
@@ -17587,7 +18055,8 @@ def evolve_island_chunk(args):
                 try:
                     _new_seeds = generate_residual_aware_seeds(
                         n_features, feat_names, X, y_target,
-                        _hof_best, max_seeds=RESEED_INJECT_N * 2)
+                        _hof_best, max_seeds=RESEED_INJECT_N * 2,
+                        base_individual=_hof_lowest_loss_member(local_hof))
                     if _new_seeds:
                         # Score the new seeds and keep the best RESEED_INJECT_N.
                         for _s in _new_seeds:
@@ -18670,7 +19139,8 @@ def evolve_afpo(population, X, y_target, type_code,
                 try:
                     _new_seeds = generate_residual_aware_seeds(
                         n_features, feat_names, X, y_target,
-                        _hof_best, max_seeds=RESEED_INJECT_N * 2)
+                        _hof_best, max_seeds=RESEED_INJECT_N * 2,
+                        base_individual=_hof_lowest_loss_member(hof))
                     if _new_seeds:
                         for _s in _new_seeds:
                             _s.calculate_fitness(X, y_target, type_code,
