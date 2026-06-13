@@ -1073,22 +1073,20 @@ AFPO_STAGE_GRAD_FREQ = 100  # gens between stage-graduation events (when AFPO_N_
 # / age-group / Bayesian) since they all share ``evolve_afpo``.
 ESCAPE_TOLERANCE_ENABLED = True   # set False for bit-for-bit legacy AFPO survival
 ESCAPE_AGE_RESET_P_MAX   = 0.6    # cap on the per-offspring age-reset probability
-# Metropolis temperature for the reset gate: protection prob ∝
-# exp(-(Δloss / loss_scale) / TAU), so a move worsening loss by TAU × the
-# population loss scale is shielded ~37 % as often as a zero-cost move.
-# Two regimes (chosen per-offspring by whether a discontinuity-escape window is
-# active) because the ideal strictness depends on the landscape:
-#   • TIGHT — used while an escape window is armed, i.e. the champion is cycling
-#     on a plateau/cliff (the rugged, step-function regime).  Such landscapes
-#     produce many bad novel moves, so a strict gate (only near-miss escapes
-#     shielded) is what keeps the age-0 region from flooding with junk.
-#   • LOOSE — used under plain stagnation with no active window (a smoother
-#     multimodal plateau).  Here the escape that pays off is typically a larger
-#     structural jump, so a looser gate that shields bigger uphill moves finds
-#     it.  Empirically: cliffy targets regress under LOOSE, smooth-multimodal
-#     targets regress under TIGHT — adapting per-regime captures both.
-ESCAPE_TOLERANCE_TAU       = 0.30  # TIGHT (escape window active)
-ESCAPE_TOLERANCE_TAU_LOOSE = 0.60  # LOOSE (plain stagnation, no active window)
+ESCAPE_TOLERANCE_TAU     = 0.30   # Metropolis temperature for the reset gate:
+                                  # protection prob ∝ exp(-(Δloss / loss_scale) /
+                                  # TAU), so a move worsening loss by TAU × the
+                                  # population loss scale is shielded ~37 % as
+                                  # often as a zero-cost move.  Kept strict (0.30)
+                                  # because rugged / step-function landscapes
+                                  # produce many bad novel moves and a loose gate
+                                  # floods the age-0 region with junk (measured:
+                                  # loosening to 0.60 erased the discontinuous and
+                                  # seedmismatch escape wins).  Smooth-multimodal
+                                  # targets are protected not by loosening this
+                                  # but by the structural-action gate below, which
+                                  # stops constant-search distractions from being
+                                  # age-shielded in the first place.
 # Reproductive actions that DON'T count as a structural escape — they re-tune or
 # clone the current shape rather than change it — so escape-tolerance never
 # age-protects their uphill offspring (that is just constant-search noise, and
@@ -19488,14 +19486,10 @@ def evolve_afpo(population, X, y_target, type_code,
                        and child.loss > _parent_loss + 1e-12)
             if _uphill and (_in_escape or stag_frac > 0.3):
                 # Metropolis-shaped acceptance: relative uphill vs the pool's
-                # loss scale, annealed through a regime-adaptive temperature —
-                # tight while an escape window is armed (cliffy/flood-prone),
-                # loose under plain stagnation (smoother, larger escapes pay off).
-                _tau       = (ESCAPE_TOLERANCE_TAU if _in_escape
-                              else ESCAPE_TOLERANCE_TAU_LOOSE)
+                # loss scale, annealed through ESCAPE_TOLERANCE_TAU.
                 _loss_scale = max(mean_loss, abs(_parent_loss), 1e-9)
                 _rel_delta  = (child.loss - _parent_loss) / _loss_scale
-                _accept     = float(np.exp(-_rel_delta / _tau))
+                _accept     = float(np.exp(-_rel_delta / ESCAPE_TOLERANCE_TAU))
                 _pressure   = (0.20 + 0.40 * min(1.0, max(0.0, stag_frac))
                                + (0.25 if _in_escape else 0.0))
                 _p_reset    = min(ESCAPE_AGE_RESET_P_MAX, _pressure * _accept)
