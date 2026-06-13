@@ -1058,6 +1058,41 @@ AGE_GROUP_GRAD_FREQ         = 100  # every N generations, graduate best from eac
 AFPO_N_STAGES        = 1    # pipeline stages (1 = classic single-stage behaviour)
 AFPO_STAGE_GRAD_FREQ = 100  # gens between stage-graduation events (when AFPO_N_STAGES > 1)
 
+# ---- AFPO escape-tolerance (local-minima escape) ----
+# AFPO decides survival purely through the (age, fitness, complexity) Pareto
+# trim — it has no simulated-annealing-style acceptance of a temporarily worse
+# solution.  Under canonical age inheritance an *uphill* offspring (one that
+# worsens loss to leave a basin) inherits its parent's age and is dominated and
+# culled the same generation, so the search cannot hold a worse-but-promising
+# escape attempt long enough to refine it.  When enabled, a novel uphill child
+# created under escape pressure (stalled pool or active discontinuity-escape
+# window) is granted age 0 with a stagnation-scaled probability, putting it in
+# the age-protected region of the Pareto front so it survives and can be
+# polished into a competitor.  This is AFPO's multi-objective analogue of SA's
+# uphill acceptance.  Applies to every AFPO variant (single / islanded / staged
+# / age-group / Bayesian) since they all share ``evolve_afpo``.
+ESCAPE_TOLERANCE_ENABLED = True   # set False for bit-for-bit legacy AFPO survival
+ESCAPE_AGE_RESET_P_MAX   = 0.6    # cap on the per-offspring age-reset probability
+ESCAPE_TOLERANCE_TAU     = 0.30   # Metropolis temperature for the reset gate:
+                                  # protection prob ∝ exp(-(Δloss / loss_scale) /
+                                  # TAU), so a move worsening loss by TAU × the
+                                  # population loss scale is shielded ~37 % as
+                                  # often as a zero-cost move.  Kept strict (0.30)
+                                  # because rugged / step-function landscapes
+                                  # produce many bad novel moves and a loose gate
+                                  # floods the age-0 region with junk (measured:
+                                  # loosening to 0.60 erased the discontinuous and
+                                  # seedmismatch escape wins).  Smooth-multimodal
+                                  # targets are protected not by loosening this
+                                  # but by the structural-action gate below, which
+                                  # stops constant-search distractions from being
+                                  # age-shielded in the first place.
+# Reproductive actions that DON'T count as a structural escape — they re-tune or
+# clone the current shape rather than change it — so escape-tolerance never
+# age-protects their uphill offspring (that is just constant-search noise, and
+# protecting it stalls constant-dominated problems such as affine-off scaling).
+_ESCAPE_TOLERANCE_SKIP_ACTIONS = frozenset({'optimize', 'boost', 'do_nothing'})
+
 # ---- Down-Sampled Lexicase ----
 # Fraction of the training set used for DS-Lexicase each generation.
 # 0.0 = disabled (use fixed n_cases=20 as before).
@@ -1535,6 +1570,22 @@ _FITNESS_CACHE = _FitnessCache(maxsize=8000)
 # dramatically faster.
 _INIT_PHASE = False
 _INIT_SUBSAMPLE_CAP = 5000   # max rows during init evaluation
+
+# Two-stage seed screening during AFPO init.  The seed library (OLS / log-OLS /
+# rational-product / reused-input / importance templates) routinely emits
+# several hundred candidates, but the AFPO pool only keeps AFPO_POP_SIZE of
+# them after the Pareto trim.  Fully scoring the whole oversized pool on the
+# init data is the dominant start-up cost yet most candidates are discarded
+# immediately.  When the pool exceeds ``_INIT_SCREEN_TRIGGER_MULT × target`` and
+# there are more than ``_INIT_SCREEN_ROWS`` rows, the candidates are first
+# ranked cheaply on a small row subsample; only the best ``_INIT_SCREEN_KEEP_
+# MULT × target`` are then scored on the full init data and Pareto-trimmed, so
+# the expensive full score scales with the target size rather than the raw seed
+# count.  The generous keep-multiple leaves the full-data trim a rich frontier,
+# so solution quality is unchanged.
+_INIT_SCREEN_ROWS          = 384   # rows used for the cheap pre-score ranking
+_INIT_SCREEN_TRIGGER_MULT  = 3     # only screen when pool > this × target
+_INIT_SCREEN_KEEP_MULT     = 2     # full-score this × target survivors
 
 # ============================================================
 # Per-feature priors (importance weights) shared across the
@@ -19373,9 +19424,77 @@ def evolve_afpo(population, X, y_target, type_code,
                 child.fitness -= _NOVELTY_BONUS * _share * _PUSH_ANNEAL_SCALE
             elif _matches == 0:
                 child.fitness -= _NOVELTY_BONUS * _PUSH_ANNEAL_SCALE
-            if _rugged_archive.is_novel(_child_fp):
+            _child_was_novel = _rugged_archive.is_novel(_child_fp)
+            if _child_was_novel:
                 child.fitness -= _ARCHIVE_NOVELTY_BONUS * _PUSH_ANNEAL_SCALE
             _rugged_archive.add(_child_fp)
+        else:
+            _child_was_novel = False
+
+        # ── Escape-tolerance: protect novel uphill moves with an age reset ────
+        # AFPO has no Metropolis acceptance — survival is decided purely by the
+        # (age, fitness, complexity) Pareto trim.  Under canonical age
+        # inheritance an offspring that *worsens* loss to leave a basin inherits
+        # its (old) parent's age, so it is Pareto-dominated and culled the same
+        # generation: the search snaps straight back into the minimum it just
+        # tried to escape.  This is exactly the "can't tolerate a temporarily
+        # lower fitness after escaping" failure mode.
+        #
+        # The fix is AFPO-native: when an uphill child lands on genuinely NEW
+        # behaviour (archive-novel) AND the pool is under escape pressure
+        # (stalled or inside a discontinuity-escape window), grant it age 0.
+        # That places it in the age-protected region of the front, where the
+        # age objective shields it for several generations — long enough for
+        # ε-lexicase (which selects on per-case wins, and a novel escapee
+        # typically wins cases the incumbent champion fails) to pick it up and
+        # for const-opt / mutation to polish it into a genuine competitor.
+        # This is the multi-objective analogue of simulated-annealing's uphill
+        # acceptance: the worse solution is *kept* long enough to pay off.
+        #
+        # Crucially the protection probability is Metropolis-shaped: it decays
+        # exponentially with how far the child worsens loss, measured RELATIVE
+        # to the population's loss scale.  A near-miss escape (a hair worse than
+        # its parent) is almost always shielded; a wildly worse mutant is almost
+        # never shielded.  Without this magnitude gate, protecting *every* novel
+        # uphill move floods the age-0 region with junk and slows convergence on
+        # cliffy step-function landscapes (where most novel moves are bad) — the
+        # exp(-Δ/T) shape is exactly what keeps tolerance focused on the moves
+        # that are plausibly one polish away from paying off.
+        #
+        # Restricted to genuine STRUCTURAL-exploration actions.  Escaping a
+        # basin means changing the *shape* of the expression; constant-level
+        # actions (`optimize`, `boost`, `do_nothing`) only re-tune or clone an
+        # existing shape, so an uphill move from one of those is not a basin
+        # escape — it is noise around the current structure, already handled by
+        # const-opt.  Age-protecting those moves is actively harmful on problems
+        # whose bottleneck is constant tuning rather than structure: e.g. with
+        # the affine wrapper off `optimize` is up-weighted 2.5× and its uphill
+        # overshoots would otherwise flood the age-0 region and stall the
+        # large-constant search.  Gating on a structural action keeps tolerance
+        # aimed at real shape-changing escapes.
+        #
+        # Strictly targeted — only structural + novel + uphill + under-pressure
+        # offspring, behind a magnitude-shaped probability gate — so it never
+        # degenerates into the blanket "reset every child to 0" that collapses
+        # the age axis (see the genotypic-age-inheritance note above).  On
+        # smooth/converging problems stag_frac stays low and no escape window
+        # arms → a no-op.
+        if (ESCAPE_TOLERANCE_ENABLED and _child_was_novel and child.age > 0
+                and action not in _ESCAPE_TOLERANCE_SKIP_ACTIONS):
+            _parent_loss = getattr(parent, 'loss', np.inf)
+            _uphill = (np.isfinite(child.loss) and np.isfinite(_parent_loss)
+                       and child.loss > _parent_loss + 1e-12)
+            if _uphill and (_in_escape or stag_frac > 0.3):
+                # Metropolis-shaped acceptance: relative uphill vs the pool's
+                # loss scale, annealed through ESCAPE_TOLERANCE_TAU.
+                _loss_scale = max(mean_loss, abs(_parent_loss), 1e-9)
+                _rel_delta  = (child.loss - _parent_loss) / _loss_scale
+                _accept     = float(np.exp(-_rel_delta / ESCAPE_TOLERANCE_TAU))
+                _pressure   = (0.20 + 0.40 * min(1.0, max(0.0, stag_frac))
+                               + (0.25 if _in_escape else 0.0))
+                _p_reset    = min(ESCAPE_AGE_RESET_P_MAX, _pressure * _accept)
+                if random.random() < _p_reset:
+                    child.age = 0
 
         population.append(child)
         population = _trim_to_pareto_front_3obj(population, target_size)
@@ -31532,10 +31651,13 @@ def train_mode():
             otype = out_types[i]
             tg    = target_grads_list[i]
             pop = generate_seeds_v5(n_features, feat_names)
+            n_v5  = len(pop)
             n_imp = 0
+            n_priority = 0
             try:
-                imp_seeds = generate_importance_biased_seeds(
-                    n_features, feat_names, X_init, yi)
+                imp_seeds, n_priority = generate_importance_biased_seeds(
+                    n_features, feat_names, X_init, yi,
+                    return_priority_count=True)
                 if imp_seeds:
                     pop.extend(imp_seeds)
                     n_imp = len(imp_seeds)
@@ -31543,6 +31665,45 @@ def train_mode():
                 pass
             while len(pop) < AFPO_POP_SIZE:
                 pop.append(Individual(random_cgp(n_features, CGP_NODES, feat_names)))
+
+            # ── Two-stage screen for an oversized seed pool ──────────────────
+            # The seed generators routinely emit several hundred candidates (the
+            # rational-product and reused-input template families alone produce
+            # ~580 on a ≥10-feature problem), but the pool only keeps
+            # AFPO_POP_SIZE of them after the Pareto trim — so fully scoring the
+            # whole pool on the init data is the dominant start-up cost yet most
+            # candidates are discarded immediately.  Rank the cheap/speculative
+            # tail on a small row subsample first and full-score only the most
+            # promising survivors, making the expensive full score scale with
+            # AFPO_POP_SIZE rather than the raw seed count.
+            #
+            # The pinned head — v5 seeds + the analytical priority importance
+            # seeds (closed-form OLS / log-OLS / residual composites, which fit
+            # the data directly and are the candidates most likely to *be* the
+            # eventual HoF best) — is exempt from the screen: it is always
+            # full-scored, so screening can never drop the best solution.  Only
+            # the combinatorial template / random tail is pre-ranked.
+            n_pinned = min(len(pop), n_v5 + n_priority)
+            if (len(pop) > AFPO_POP_SIZE * _INIT_SCREEN_TRIGGER_MULT
+                    and X_init.shape[0] > _INIT_SCREEN_ROWS):
+                pinned, tail = pop[:n_pinned], pop[n_pinned:]
+                _scr_idx = np.random.choice(
+                    X_init.shape[0], _INIT_SCREEN_ROWS, replace=False)
+                _Xs, _ys = X_init[_scr_idx], yi[_scr_idx]
+                for ind in tail:
+                    try:
+                        ind.calculate_fitness(_Xs, _ys, otype, use_cache=False)
+                    except Exception:
+                        ind.fitness = 1e18
+                        ind.loss = 1e18
+                # Keep a generous multiple of the target (counting the pinned
+                # head) so the full-data Pareto trim still chooses from a rich,
+                # diverse frontier.
+                _keep_tail = max(0, AFPO_POP_SIZE * _INIT_SCREEN_KEEP_MULT
+                                 - len(pinned))
+                tail.sort(key=lambda x: x.fitness)
+                pop = pinned + tail[:_keep_tail]
+
             for ind in pop:
                 ind.calculate_fitness(X_init, yi, otype, target_grads=tg)
                 hofs[i].update(ind)
