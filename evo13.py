@@ -19086,6 +19086,35 @@ def evolve_afpo(population, X, y_target, type_code,
     # Track the best individual seen inside this chunk for champion protection
     _chunk_champion = min(population, key=lambda x: x.loss) if population else None
 
+    # ── Cross-chunk stagnation tracking ──────────────────────────────────
+    # ``local_stag`` MUST measure improvement against the best solution carried
+    # INTO this chunk — not against ``hof``, which the worker re-creates EMPTY
+    # for every chunk.  Keying the counter off ``hof.update()`` (the previous
+    # behaviour) reset it to 0 on the very first child of every chunk, and again
+    # on every child that opened a fresh complexity bucket, because an
+    # empty / sparse Hall of Fame is trivially "improved".  That silently pinned
+    # ``local_stag`` near 0 for the whole run, so the incoming ``stag_counter``
+    # was discarded and NONE of the stagnation-driven machinery — directed
+    # extinction (needs stag > ext_patience), the stagnation immigrant pulse
+    # (> ext_patience//3), complexity-pressure relaxation, escape-tolerance
+    # (stag_frac > 0.3), the orchestrator's chunk-size halving (> ext_patience//2)
+    # and staged-AFPO's stagnation-scaled graduation volume — could ever engage
+    # across chunks, since each chunk is only MIGRATION_FREQ generations long.
+    # Track the best PERFORMANCE seen instead (loss for regression, accuracy for
+    # classification — matching HallOfFame._perf), primed from the incoming
+    # population, which carries the global elite the orchestrator injects before
+    # each chunk.  (The bench harnesses never hit this because they reuse a
+    # single persistent HoF across chunks.)
+    _stag_is_cls = (type_code == 6)
+    def _stag_perf(ind):
+        if _stag_is_cls:
+            return -float(getattr(ind, 'accuracy', 0.0))
+        return float(getattr(ind, 'loss', np.inf))
+    _best_perf_seen = min(
+        (_stag_perf(ind) for ind in population
+         if np.isfinite(getattr(ind, 'loss', np.inf))),
+        default=np.inf)
+
     # Hard-example mining: bind (or create) this output's difficulty-weight
     # vector for the duration of this chunk; no-op when the feature is off.
     _difficulty_begin(y_target)
@@ -19137,6 +19166,11 @@ def evolve_afpo(population, X, y_target, type_code,
                 rescued = copy.deepcopy(_chunk_champion)
                 rescued.age = 0
                 population.append(rescued)
+                # Re-point at the live copy.  Without this the pointer keeps
+                # referencing the evicted object, so every subsequent 10-gen
+                # check re-injects yet another champion clone (and evicts the
+                # worst) — crowding the front with duplicates.
+                _chunk_champion = rescued
 
         # ── PySR-style SA temperature with cosine annealing ─────────────────
         valid_losses = [ind.loss for ind in population
@@ -19740,9 +19774,17 @@ def evolve_afpo(population, X, y_target, type_code,
                 population.append(ni)
             population = _trim_to_pareto_front_3obj(population, target_size)
 
-        # HoF update uses .loss (not .fitness), so no need to re-evaluate
-        # with freq_parsimony_adj — the loss is already correct from above.
-        if hof.update(child):
+        # Record within-chunk discoveries in the (run-local) HoF for the caller
+        # to merge into the global HoF.  HoF update uses .loss (not .fitness),
+        # so no need to re-evaluate with freq_parsimony_adj — the loss is
+        # already correct from above.  The stagnation counter is updated
+        # SEPARATELY, against the best performance seen (see the cross-chunk
+        # stagnation note above), so it is not reset by the empty-every-chunk
+        # local HoF.
+        hof.update(child)
+        _child_perf = _stag_perf(child)
+        if np.isfinite(child.loss) and _child_perf < _best_perf_seen - 1e-12:
+            _best_perf_seen = _child_perf
             local_stag = 0
         else:
             local_stag += 1
