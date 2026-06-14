@@ -4699,9 +4699,27 @@ class _PredatorPreyCoevolution:
                 step = self.res_grow ** err
             else:
                 step = self.res_shrink ** (-err)
-            self.res_factor = float(min(max(self.res_factor * step, 1.0),
-                                        self.res_max_factor))
+            # Anti-windup: the assembled batch is capped at the whole dataset
+            # (`_effective_rows`), so any res_factor beyond the point where
+            # base×factor already reaches n_rows has NO effect on the batch — it
+            # is pure integral wind-up.  Letting it keep climbing to
+            # res_max_factor means that once the gap finally clears, the factor
+            # has to unwind through that dead range first, leaving the batch
+            # stuck at full data (co-evolution effectively off) for many chunks.
+            # Cap it at the saturation factor so a cleared gap shrinks the batch
+            # on the very next chunk.  (When res_max_factor×base already fits
+            # inside the dataset this is a no-op, e.g. the resolution tests.)
+            sat_factor = self.n_rows / max(self._base_rows(), 1)
+            cap = min(self.res_max_factor, sat_factor)
+            self.res_factor = float(min(max(self.res_factor * step, 1.0), cap))
         return self.res_factor
+
+    def _base_rows(self):
+        """Base batch size before the resolution multiplier: the configured
+        subset, floored at the evaluation minimum, both capped at the dataset.
+        Shared by `_effective_rows` and the governor's anti-windup cap so the
+        two never disagree on what 'full data' means."""
+        return max(self.subset, min(self.min_eval_rows, self.n_rows))
 
     def _effective_rows(self):
         """How many rows the hosts actually see this chunk: the configured
@@ -4710,7 +4728,7 @@ class _PredatorPreyCoevolution:
         `res_factor`, capped at the dataset.  `subset` itself is untouched: the
         parasites stay a small adversarial spotlight; resolution rides in on
         anchor padding."""
-        base = max(self.subset, min(self.min_eval_rows, self.n_rows))
+        base = self._base_rows()
         rows = int(round(base * self.res_factor))
         return int(min(max(rows, base, 1), self.n_rows))
 
@@ -4757,6 +4775,15 @@ class _PredatorPreyCoevolution:
             return np.arange(self.n_rows, dtype=np.int64)
         subset = self.subset
         n_anchor = min(int(round(self._effective_anchor_frac() * subset)), subset)
+        # Never let rounding (or the boosted anchor cap) close the adversarial
+        # spotlight completely: keep at least ONE parasite row in the batch
+        # whenever the subset has one.  At subset=1 — or any small subset under
+        # max instability, where `_effective_anchor_frac` rises to 1−adv_floor —
+        # the plain round() above can otherwise take n_anchor all the way to
+        # `subset`, leaving n_adv=0 and silently turning co-evolution into pure
+        # anchor sampling (the predator population would then contribute nothing).
+        if subset >= 1 and parasite.size >= 1:
+            n_anchor = min(n_anchor, subset - 1)
         n_adv    = subset - n_anchor
         if n_adv <= 0:
             adv = np.empty(0, dtype=np.int64)

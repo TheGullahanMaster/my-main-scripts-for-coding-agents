@@ -180,6 +180,61 @@ def test_resolution_governor():
 
 
 # --------------------------------------------------------------------------
+# 2b.  governor anti-wind-up — res_factor never climbs past the point where the
+#      batch already fills the dataset, so a cleared gap shrinks it right away
+# --------------------------------------------------------------------------
+def test_governor_antiwindup():
+    print("2b: the governor doesn't wind res_factor up past full-data saturation")
+    # res_max_factor (32) × base (32) = 1024 OVERSHOOTS the 600-row dataset, so
+    # the batch saturates at full data once res_factor reaches 600/32 = 18.75.
+    n = 600
+    co = evo13._PredatorPreyCoevolution(n_rows=n, subset=32, pop_size=8,
+                                        mut_rate=0.3, virulence=0.75, seed=4,
+                                        min_eval_rows=32, res_max_factor=32.0,
+                                        res_grow=1.5, res_shrink=0.8,
+                                        res_gap_ema=0.5)
+    sat = n / 32.0
+    for _ in range(60):                         # sustained overfit → grow
+        co.observe_generalization(batch_loss=0.01, full_loss=1.0)
+        co._update_resolution()
+    assert co._effective_rows() == n, "a big sustained gap must reach full data"
+    assert co.res_factor <= sat + 1e-9, \
+        f"res_factor must cap at the saturation factor {sat:.2f}, not wind past it " \
+        f"toward res_max_factor (got {co.res_factor:.2f})"
+    ok(f"res_factor capped at saturation ×{co.res_factor:.2f} (not the configured ×32)")
+
+    # Gap clears: because the factor never wound up into the dead range above
+    # saturation, the batch drops BELOW full data within a couple of chunks.
+    dwell = 0
+    for _ in range(15):
+        co.observe_generalization(batch_loss=0.50, full_loss=0.50)   # gap 0
+        co._update_resolution()
+        if co._effective_rows() >= n:
+            dwell += 1
+        else:
+            break
+    assert dwell <= 2, \
+        f"a cleared gap must shrink the batch within ~1 chunk, not after a long " \
+        f"wind-up unwind (stuck at full data for {dwell} chunks)"
+    ok(f"cleared gap un-pins the batch from full data in {dwell} chunk(s) (no wind-up lag)")
+
+    # The cap is a strict no-op when res_max_factor×base already fits the dataset
+    # (res_max_factor 8 × base 32 = 256 < 2000): the governor still reaches ×8.
+    co2 = evo13._PredatorPreyCoevolution(n_rows=2000, subset=32, pop_size=8,
+                                         mut_rate=0.3, virulence=0.75, seed=4,
+                                         min_eval_rows=16, res_max_factor=8.0,
+                                         res_grow=1.5, res_shrink=0.8,
+                                         res_gap_ema=0.5)
+    for _ in range(12):
+        co2.observe_generalization(batch_loss=0.01, full_loss=1.0)
+        co2._update_resolution()
+    assert co2.res_factor > 7.0 and co2._effective_rows() == 256, \
+        "configs that don't overshoot the dataset must be unaffected by the cap"
+    ok("no-overshoot configs unchanged (cap inactive when the batch can't fill the data)")
+    print()
+
+
+# --------------------------------------------------------------------------
 # 3.  stratified anchor — classification: minority class always represented
 # --------------------------------------------------------------------------
 def test_stratified_anchor_classification():
@@ -316,6 +371,7 @@ def test_cold_start():
 if __name__ == "__main__":
     test_eval_floor()
     test_resolution_governor()
+    test_governor_antiwindup()
     test_stratified_anchor_classification()
     test_stratified_anchor_regression()
     test_admission_wrapper()

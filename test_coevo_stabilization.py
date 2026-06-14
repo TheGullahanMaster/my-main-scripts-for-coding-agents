@@ -200,6 +200,37 @@ def test_adaptive_anchor():
 
 
 # --------------------------------------------------------------------------
+# 3b.  the adversarial spotlight never closes completely — even a 1-row subset
+#      at max instability keeps a parasite row, so co-evolution can't silently
+#      degrade into pure anchor sampling
+# --------------------------------------------------------------------------
+def test_adversarial_core_never_empty():
+    print("3b: a tiny subset under max instability still carries an adversarial row")
+    n = 200
+    # At subset=1 the boosted anchor fraction (→ 1−adv_floor = 0.70) rounds to a
+    # full anchor row, which used to leave n_adv=0: the predator population then
+    # contributed NOTHING and the batch was indistinguishable from a random
+    # anchor draw.  The spotlight must stay open (≥1 parasite row) regardless.
+    for subset in (1, 2, 3):
+        co = evo13._PredatorPreyCoevolution(
+            n_rows=n, subset=subset, pop_size=8, mut_rate=0.3, virulence=0.75,
+            seed=0, anchor_frac=0.25, anchor_boost=0.30, adv_floor=0.30,
+            min_eval_rows=0, stratify=False)
+        parasite = co.parasites[0]
+        sel = np.zeros(n); sel[parasite] = np.linspace(1.0, 0.5, parasite.size)
+        for inst in (0.0, 0.5, 1.0):
+            co.instability = inst
+            b = co._assemble_batch(parasite, sel)
+            adv_rows = len(set(b.tolist()) & set(parasite.tolist()))
+            assert adv_rows >= 1, \
+                f"subset={subset} inst={inst}: adversarial spotlight closed " \
+                f"(0 parasite rows in the batch)"
+            assert len(b) == len(set(b.tolist())), "batch rows must stay distinct"
+    ok("≥1 adversarial row at subset∈{1,2,3} across instability 0→1 (spotlight stays open)")
+    print()
+
+
+# --------------------------------------------------------------------------
 # 4.  dormant when nothing is forgotten (legacy behaviour preserved)
 # --------------------------------------------------------------------------
 def test_stabilizer_dormant_when_healthy():
@@ -322,6 +353,7 @@ if __name__ == "__main__":
     test_progress_tracking_and_instability()
     test_best_ever_and_regression()
     test_adaptive_anchor()
+    test_adversarial_core_never_empty()
     test_stabilizer_dormant_when_healthy()
     test_effective_virulence_damping()
     test_stabilizer_helps_many_variable()
