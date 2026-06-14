@@ -5186,12 +5186,17 @@ def _topological_sort_eq(eq):
     new_nodes = []
     for old_idx in topo:
         node = eq.nodes[old_idx - eq.n_features]
+        # Unresolved references (a node's don't-care input slots that pointed at
+        # a non-topo / inactive node) would otherwise keep their original index,
+        # which is out of range for the compacted+repadded node list.  Map them
+        # to feature 0 so an op-arity mutation can't later make a stale slot live
+        # and walk off the end of self.nodes in update_active_nodes().
         new_nodes.append(CGPNode(
             node.op,
-            old_to_new.get(node.in1, node.in1),
-            old_to_new.get(node.in2, node.in2),
+            old_to_new.get(node.in1, 0),
+            old_to_new.get(node.in2, 0),
             node.const_val,
-            in3=old_to_new.get(node.in3, node.in3),
+            in3=old_to_new.get(node.in3, 0),
         ))
 
     # Pad to at least the original max_nodes with dead const nodes
@@ -6980,23 +6985,44 @@ class CGPEquation:
     def update_active_nodes(self):
         self.active_nodes = set()
         if self.out_idx is None: return
-        
+
+        # Self-healing safety net.  Every reference SHOULD already sit inside
+        # [0, n_features + len(nodes)), but a corrupted genome (e.g. a stale
+        # don't-care input slot promoted live by an op-arity mutation) could
+        # carry an out-of-range index.  Dereferencing it would raise IndexError
+        # here — and because reproduction runs in worker processes, that single
+        # exception tears down the whole (often multi-hour) training run.  We
+        # therefore clamp any out-of-range reference to feature 0 in place: a
+        # no-op for well-formed graphs, and a harmless repair (output/input
+        # reads stay in range for evaluate() too) for the rare malformed one.
+        limit = self.n_features + len(self.nodes)
+        if not (0 <= self.out_idx < limit):
+            self.out_idx = 0
+
         stack = [self.out_idx]
         while stack:
             idx = stack.pop()
             if idx in self.active_nodes:
                 continue
-            
+
             self.active_nodes.add(idx)
-            
+
             # If it's a compute node (not a raw feature), trace its inputs
             if idx >= self.n_features:
                 node = self.nodes[idx - self.n_features]
                 if node.op != 'const':
+                    if not (0 <= node.in1 < limit):
+                        node.in1 = 0
                     stack.append(node.in1)
                     if node.op in self.OPS_BINARY_SET:
+                        if not (0 <= node.in2 < limit):
+                            node.in2 = 0
                         stack.append(node.in2)
                     elif node.op in self.OPS_TERNARY_SET:
+                        if not (0 <= node.in2 < limit):
+                            node.in2 = 0
+                        if not (0 <= node.in3 < limit):
+                            node.in3 = 0
                         stack.append(node.in2)
                         stack.append(node.in3)
 
@@ -10094,12 +10120,21 @@ def _emit_active_nodes(tree, nf, slot_base):
     new_nodes = []
     for old in active:
         src = tree.nodes[old - nf]
+        # Only references that resolve to a raw feature or an ACTIVE node are in
+        # ``remap``.  A reference that misses is a "don't-care" slot (in1 of a
+        # const, in2 of a unary, in3 of a non-ternary) left pointing at an
+        # inactive source node — its index is meaningless in the compacted graph
+        # and is typically out of range for the (much smaller) new node list.
+        # Collapse such slots to feature 0 so they stay in range if a later
+        # op-arity mutation promotes the node and makes the slot live.  (The used
+        # inputs of an active node are themselves active, so this never alters
+        # the computed output — see _topological_sort_eq for the same rule.)
         new_nodes.append(CGPNode(
             src.op,
-            remap.get(src.in1, src.in1),
-            remap.get(src.in2, src.in2),
+            remap.get(src.in1, 0),
+            remap.get(src.in2, 0),
             src.const_val,
-            remap.get(src.in3, src.in3)))
+            remap.get(src.in3, 0)))
     out_buf = remap.get(tree.out_idx, tree.out_idx)
     return new_nodes, out_buf
 
