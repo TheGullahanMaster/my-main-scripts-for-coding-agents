@@ -1121,6 +1121,39 @@ ESCAPE_TOLERANCE_TAU     = 0.30   # Metropolis temperature for the reset gate:
 # protecting it stalls constant-dominated problems such as affine-off scaling).
 _ESCAPE_TOLERANCE_SKIP_ACTIONS = frozenset({'optimize', 'boost', 'do_nothing'})
 
+# ---- AFPO young-frontier ERC (Ephemeral Random Constant) polish ----
+# AFPO injects age-0 individuals with *completely random* constants every
+# generation (the per-generation immigrant, the stagnation immigrant pulse,
+# pop-guard / diversity-injection / extinction new blood) and structure-adding
+# macro-mutations (grow / graft / inject / nest) splice in fresh random ERCs
+# too.  Such a tree can carry a structurally promising SHAPE yet score a
+# terrible loss purely because its constants are random — and under canonical
+# age inheritance it spends only a generation or two in the age-protected part
+# of the front before its age ticks up and the (age, fitness, complexity) trim
+# Pareto-dominates it away.  A few iterations of the constant optimiser
+# (L-BFGS / DE inside optimize_constants — the "Levenberg–Marquardt step" of
+# the AFPO recipe) dial those ERCs in so a good structure survives on merit
+# rather than being lost to bad luck in its initial constants.  Applied once
+# per generation to the youngest members sitting on the current FIRST Pareto
+# front, bounded by a member cap and a small iteration budget, and each member
+# is polished at most once (``_erc_polished`` flag) so the cost stays a small
+# constant per generation.
+AFPO_ERC_POLISH_ENABLED   = True   # set False for legacy (no young-front polish)
+AFPO_ERC_POLISH_MAX_AGE   = 2      # only polish members at/below this genotypic age
+AFPO_ERC_POLISH_MAX_MEMB  = 2      # cap members polished per generation
+AFPO_ERC_POLISH_ITERS     = 12     # L-BFGS/DE iterations per polish
+
+# ---- AFPO balanced low-depth injection ----
+# The per-generation age-0 immigrant should be a small "underdog" with room to
+# scale up structurally via crossover / mutation, NOT a massive random tree.
+# Rather than a single fixed node budget, draw the budget from a balanced low
+# range each generation (a ramped half-and-half analogue) so the stream of
+# injected newcomers spans genuinely tiny up to small-moderate shapes.  Since
+# random_cgp's structured branch caps its target depth at max_nodes // 2, a
+# budget in [CGP_NODES // 12, CGP_NODES // 4] keeps injected active-graph depths
+# in the low ~2–6 band the AFPO 'underdog' role wants.
+AFPO_BALANCED_INJECT_ENABLED = True   # set False for the legacy fixed budget
+
 # ---- AFPO diversity-collapse prevention (active phenotype de-duplication) ----
 # The 3-objective Pareto trim keeps the pool full and spread in OBJECTIVE space
 # (age, fitness, complexity) via NSGA-II crowding, and the novelty bonus nudges
@@ -18815,6 +18848,53 @@ def _crowding_distance_matrix(M):
     return cd
 
 
+def _active_graph_depth(tree):
+    """Longest-path depth of a CGP tree's active graph, from raw inputs to the
+    output node.  Used purely as a final Pareto tie-break (see
+    ``_trim_to_pareto_front_3obj``): when two individuals share an identical
+    (age, fitness, complexity) profile the requirement is to keep the
+    structurally shallower one.  Feed-forward CGP wires every node only to
+    lower indices, so a memoised DFS from ``out_idx`` is acyclic and cheap.
+    Returns 0 for a degenerate output that points straight at a raw feature."""
+    if tree is None:
+        return 0
+    try:
+        nf  = tree.n_features
+        out = tree.out_idx
+        if out < nf:
+            return 0
+        n_total = nf + len(tree.nodes)
+        binary_set = tree.OPS_BINARY_SET
+        memo = {}
+
+        def _d(idx):
+            if idx < nf:
+                return 0
+            cached = memo.get(idx)
+            if cached is not None:
+                return cached
+            memo[idx] = 0      # cycle guard (never triggers on feed-forward CGP)
+            node = tree.nodes[idx - nf]
+            ins  = [node.in1]
+            if node.op in binary_set:
+                ins.append(node.in2)
+            in3 = getattr(node, 'in3', None)
+            if in3 is not None:
+                ins.append(in3)
+            best = 0
+            for c in ins:
+                if 0 <= c < n_total:
+                    d = 1 + _d(c)
+                    if d > best:
+                        best = d
+            memo[idx] = best
+            return best
+
+        return int(_d(out))
+    except (AttributeError, IndexError, RecursionError):
+        return 0
+
+
 def _trim_to_pareto_front_3obj(population, target_size):
     """
     NSGA-II survival selection on (age, fitness, complexity) — all minimised.
@@ -18891,7 +18971,17 @@ def _trim_to_pareto_front_3obj(population, target_size):
         else:
             need  = target_size - len(keep_idx)
             cd    = _crowding_distance_matrix(A[front])
-            order = np.argsort(-cd, kind='stable')   # least-crowded first
+            # Least-crowded first (NSGA-II).  Exact ties — individuals with an
+            # identical (age, fitness, complexity) Pareto profile produce equal
+            # crowding distance — are broken toward the structurally simpler
+            # solution: lower complexity, then shallower active-graph depth (the
+            # requirement's parsimony tie-break).  ``np.lexsort`` ranks by its
+            # LAST key first, so ``-cd`` stays the dominant key and complexity /
+            # depth only separate genuine ties.
+            depth = np.fromiter(
+                (_active_graph_depth(population[int(i)].tree) for i in front),
+                dtype=np.float64, count=front.size)
+            order = np.lexsort((depth, A[front, 2], -cd))
             keep_idx.extend(int(front[t]) for t in order[:need])
             break
 
@@ -19045,6 +19135,95 @@ def _trim_to_pareto_front(population, target_size):
             survivors = survivors[:target_size]
 
     return survivors
+
+
+def _afpo_injection_budget():
+    """Node budget for the per-generation AFPO age-0 immigrant (recipe §5).
+
+    Balanced low-depth injection: when enabled, draw the budget from a small
+    low range each generation (a ramped half-and-half analogue) so injected
+    newcomers span genuinely tiny up to small-moderate shapes, leaving room to
+    scale up structurally via crossover / mutation rather than entering as
+    massive random trees.  ``random_cgp`` caps its structured-branch target
+    depth at ``max_nodes // 2``, so the ``[CGP_NODES // 12, CGP_NODES // 4]``
+    band keeps injected active-graph depths in the low ~2–6 range.  Returns the
+    legacy fixed budget when ``AFPO_BALANCED_INJECT_ENABLED`` is False.
+    """
+    if AFPO_BALANCED_INJECT_ENABLED:
+        return random.randint(max(4, CGP_NODES // 12), max(6, CGP_NODES // 4))
+    return max(4, CGP_NODES // 4)
+
+
+def _polish_young_frontier_constants(population, X, y_target, type_code,
+                                     freq_adj=None, bg_logits=None,
+                                     class_idx_in_group=None, Y_group=None,
+                                     target_grads=None):
+    """ERC dial-in for newly-formed Pareto-front members (AFPO recipe §5).
+
+    AFPO injects age-0 individuals with completely random ERC constants every
+    generation (immigrant / pulse / pop-guard / diversity / extinction blood)
+    and structure-adding macro-mutations splice fresh ERCs into young children.
+    A structurally promising shape can therefore score a terrible loss purely
+    because its constants are random, and — under canonical age inheritance —
+    be Pareto-dominated and culled the moment its age ticks past the
+    age-protected band.  This gives such members a quick local constant
+    optimisation (the optimiser's L-BFGS / DE legs) so a good structure
+    survives on merit instead of being lost to bad initial constants.
+
+    Strictly bounded so the per-generation cost is a small constant:
+      • only members at/below ``AFPO_ERC_POLISH_MAX_AGE`` (genuinely new blood),
+      • only those on the current FIRST non-dominated front,
+      • at most ``AFPO_ERC_POLISH_MAX_MEMB`` polished per call, lowest-loss first,
+      • each member polished at most once (``_erc_polished`` flag).
+    No-op when the feature is disabled or there is no fresh material to polish.
+    Mutates the individuals in place (loss / fitness / complexity stay
+    self-consistent because optimize_constants re-evaluates fitness).
+    """
+    if not AFPO_ERC_POLISH_ENABLED or not population:
+        return
+    # Young, un-polished candidates — cheap O(n) scan; bail before the O(young·n)
+    # front test when nothing fresh exists (the common steady-state case).
+    cands = [ind for ind in population
+             if int(getattr(ind, 'age', 0)) <= AFPO_ERC_POLISH_MAX_AGE
+             and not getattr(ind, '_erc_polished', False)]
+    if not cands:
+        return
+    # Restrict to the first non-dominated front — the "newly formed Pareto-front
+    # members" the recipe targets.  Checking only the (small) young candidate
+    # set against the population keeps this O(young·n), not O(n²).
+    front0 = [ind for ind in cands
+              if not any(_pareto_dominates_3obj(other, ind)
+                         for other in population if other is not ind)]
+    if not front0:
+        return
+    front0.sort(key=lambda z: getattr(z, 'loss', np.inf))
+    polished = 0
+    for ind in front0:
+        if polished >= AFPO_ERC_POLISH_MAX_MEMB:
+            break
+        try:
+            has_consts = bool(get_constants_shared(ind.tree))
+        except Exception:
+            has_consts = False
+        if not has_consts:
+            ind._erc_polished = True      # nothing to tune — don't re-check it
+            continue
+        _fa = 0.0
+        if freq_adj is not None:
+            _fa = freq_adj.get(int(round(getattr(ind, 'complexity', 0.0))), 0.0)
+        try:
+            ind.optimize_constants(
+                X, y_target, type_code,
+                max_rows=min(300, X.shape[0]),
+                n_restarts=1, max_iter=AFPO_ERC_POLISH_ITERS,
+                bg_logits=bg_logits, class_idx_in_group=class_idx_in_group,
+                Y_group=Y_group, freq_parsimony_adj=_fa,
+                target_grads=target_grads)
+        except (ValueError, FloatingPointError, ArithmeticError,
+                RuntimeError, OverflowError, np.linalg.LinAlgError):
+            pass
+        ind._erc_polished = True          # one shot per member, success or not
+        polished += 1
 
 
 def evolve_afpo(population, X, y_target, type_code,
@@ -19298,7 +19477,13 @@ def evolve_afpo(population, X, y_target, type_code,
         # alternative structures continuously in play.
         try:
             _imm_prior = _data_op_prior if (_data_op_prior and random.random() < 0.5) else None
-            _rand_imm = Individual(random_cgp(n_features, max(4, CGP_NODES // 4), feat_names,
+            # Balanced low-depth injection: ramp the node budget across a small
+            # range so the stream of age-0 newcomers spans genuinely tiny up to
+            # small-moderate shapes (ramped half-and-half analogue) instead of
+            # always the same size, giving young trees room to scale up via
+            # crossover / mutation (see _afpo_injection_budget).
+            _inj_budget = _afpo_injection_budget()
+            _rand_imm = Individual(random_cgp(n_features, _inj_budget, feat_names,
                                               op_prior=_imm_prior))
             _rand_imm.age = 0
             if get_constants_shared(_rand_imm.tree):
@@ -19310,6 +19495,10 @@ def evolve_afpo(population, X, y_target, type_code,
                     class_idx_in_group=class_idx_in_group,
                     Y_group=Y_group,
                     target_grads=target_grads)
+            # Already given its ERC dial-in here — exempt it from the per-gen
+            # young-frontier polish so that step spends its small budget on the
+            # *other* age-0 injects (pulse / pop-guard / extinction blood).
+            _rand_imm._erc_polished = True
             _rand_imm.calculate_fitness(X, y_target, type_code, bg_logits=bg_logits, class_idx_in_group=class_idx_in_group, Y_group=Y_group, target_grads=target_grads)
             population.append(_rand_imm)
             population = _trim_to_pareto_front_3obj(population, target_size)
@@ -19733,6 +19922,18 @@ def evolve_afpo(population, X, y_target, type_code,
         # ones that actually lowered loss.
         _mut_tracker.record(
             action, success=(child.fitness < parent.fitness))
+
+        # ── ERC polish for newly-formed Pareto-front members ──────────────────
+        # Dial in the random constants of fresh age-0 injects (and very-young
+        # children) that have just landed on the first Pareto front, so a good
+        # structure with unlucky initial ERCs is not Pareto-dominated and culled
+        # before it can be tuned.  Bounded to a small constant cost per gen and
+        # one shot per member; no-op when AFPO_ERC_POLISH_ENABLED is False.
+        _polish_young_frontier_constants(
+            population, X, y_target, type_code,
+            freq_adj=freq_adj, bg_logits=bg_logits,
+            class_idx_in_group=class_idx_in_group, Y_group=Y_group,
+            target_grads=target_grads)
 
         # ── Complexity budget cap ─────────────────────────────────────────────
         # Prevent unbounded memory growth: if total active-node count across
