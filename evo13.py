@@ -17824,7 +17824,7 @@ def _create_offspring(action, parent, population, n_features, feat_names,
                       tournament_k=3, child_sigma=None):
     """Shared offspring creation logic for both island evolution and AFPO.
 
-    Returns (child_tree, child_sigma) after applying the chosen reproductive
+    Returns (child_tree, child_sigma, parent2) after applying the chosen reproductive
     action to *parent*.
 
     y_residuals : optional (N,) array — current target residuals, used by
@@ -17850,6 +17850,8 @@ def _create_offspring(action, parent, population, n_features, feat_names,
         child_sigma = float(np.clip(
             parent_sigma * np.exp(random.gauss(0, SIGMA_TAU)),
             SIGMA_MIN, SIGMA_MAX))
+
+    parent2 = None
 
     if action == 'crossover' and len(population) >= 2:
         parent2    = tournament_select(population, k=tournament_k)
@@ -17908,7 +17910,7 @@ def _create_offspring(action, parent, population, n_features, feat_names,
         child_tree = mutate(parent.tree, n_features, feat_names,
                             mut_rate=eff_rate, temperature=sa_temp,
                             op_affinity=op_affinity)
-    return child_tree, child_sigma
+    return child_tree, child_sigma, parent2
 
 
 def evolve_island_chunk(args):
@@ -18340,7 +18342,7 @@ def evolve_island_chunk(args):
         # cosine_decay rides 1.0 → 0.1 over the chunk, so (1-cosine_decay)
         # ranges 0 → 0.9.
         _tk = 2 + int(round(5.0 * max(0.0, 1.0 - cosine_decay)))
-        child_tree, child_sigma = _create_offspring(
+        child_tree, child_sigma, _parent2 = _create_offspring(
             action, parent, island_pop, n_features, feat_names,
             eff_rate, sa_temp, parent_sigma, X,
             op_affinity=_op_affinity if _op_affinity else None,
@@ -19296,9 +19298,18 @@ def evolve_afpo(population, X, y_target, type_code,
         # alternative structures continuously in play.
         try:
             _imm_prior = _data_op_prior if (_data_op_prior and random.random() < 0.5) else None
-            _rand_imm = Individual(random_cgp(n_features, CGP_NODES, feat_names,
+            _rand_imm = Individual(random_cgp(n_features, max(4, CGP_NODES // 4), feat_names,
                                               op_prior=_imm_prior))
             _rand_imm.age = 0
+            if get_constants_shared(_rand_imm.tree):
+                _rand_imm.optimize_constants(
+                    X, y_target, type_code,
+                    max_rows=min(300, X.shape[0]),
+                    n_restarts=1, max_iter=20,
+                    bg_logits=bg_logits,
+                    class_idx_in_group=class_idx_in_group,
+                    Y_group=Y_group,
+                    target_grads=target_grads)
             _rand_imm.calculate_fitness(X, y_target, type_code, bg_logits=bg_logits, class_idx_in_group=class_idx_in_group, Y_group=Y_group, target_grads=target_grads)
             population.append(_rand_imm)
             population = _trim_to_pareto_front_3obj(population, target_size)
@@ -19510,7 +19521,7 @@ def evolve_afpo(population, X, y_target, type_code,
 
         # Adaptive tournament k for crossover 2nd-parent (B6).
         _tk = 2 + int(round(5.0 * max(0.0, 1.0 - cosine_decay)))
-        child_tree, child_sigma = _create_offspring(
+        child_tree, child_sigma, parent2 = _create_offspring(
             action, parent, population, n_features, feat_names,
             eff_rate, sa_temp, parent_sigma, X,
             y_residuals=y_target,
@@ -19535,7 +19546,7 @@ def evolve_afpo(population, X, y_target, type_code,
         # lineage's offspring indistinguishable from true newcomers, so the
         # age objective collapsed and AFPO degenerated toward plain fitness
         # selection.
-        child.age   = int(getattr(parent, 'age', 0))
+        child.age   = max(int(getattr(parent, 'age', 0)), int(getattr(parent2, 'age', 0))) if parent2 else int(getattr(parent, 'age', 0))
         fp = _novelty_fp(child.tree)
         if fp is not None:
             child._novelty_fp = fp
