@@ -778,6 +778,34 @@ BEST_MODEL_ACC_MARGIN = 0.005
 # across the entire population and Hall of Fame.
 SIMPLIFICATION_FREQ = 500
 
+# ---- Inter-chunk slowdown control (orchestrator periodic-op cost) ----
+# The population orchestrators print "--- Generation N ---" once per chunk and
+# run several heavy maintenance passes on generation multiples (frontier
+# display, full-data HoF re-score, algebraic simplification, deep constant
+# optimisation, ADF extraction).  Because all of these key off multiples of the
+# SAME few periods (200 / 500 / 1000) they tend to *coincide* on the round
+# generations — so a single inter-chunk gap occasionally runs four heavy passes
+# back-to-back, which is the "occasional, sometimes massive" stall between
+# generation reports.  Two knobs tame that:
+#   • AFPO_PROFILE_TIMING — when True, print a compact per-chunk wall-clock
+#     breakdown ("evolve / rescore / simplify / deepopt = …") so the source of
+#     a stall is visible rather than mysterious.  Off by default (zero noise).
+#   • AFPO_SLOW_PHASE_WARN_SEC — even with profiling off, any single periodic
+#     phase that exceeds this many seconds prints a one-line warning naming the
+#     phase, so a pathological pass (e.g. sympy-heavy simplification) is always
+#     surfaced.  Set to 0 to disable the warning entirely.
+# The simplification pass also takes a wall-clock budget (see
+# SIMPLIFICATION_TIME_BUDGET_SEC) so the single most-likely-unbounded pass can
+# no longer dominate a chunk.
+AFPO_PROFILE_TIMING       = False
+AFPO_SLOW_PHASE_WARN_SEC  = 15.0
+# Soft wall-clock budget (seconds) for one algebraic simplification pass.  The
+# pass processes individuals until the budget is spent, then stops early and
+# leaves the remainder for the next scheduled pass — simplification is
+# opportunistic cleanup, so a partial pass is always safe.  None = unbounded
+# (legacy behaviour).
+SIMPLIFICATION_TIME_BUDGET_SEC = 20.0
+
 # ---- PySR-style Simulated Annealing ----
 # SA acceptance: a newly generated child that is *worse* than the individual it
 # would replace is still accepted with probability exp(-Δfitness / T), where
@@ -1092,6 +1120,35 @@ ESCAPE_TOLERANCE_TAU     = 0.30   # Metropolis temperature for the reset gate:
 # age-protects their uphill offspring (that is just constant-search noise, and
 # protecting it stalls constant-dominated problems such as affine-off scaling).
 _ESCAPE_TOLERANCE_SKIP_ACTIONS = frozenset({'optimize', 'boost', 'do_nothing'})
+
+# ---- AFPO diversity-collapse prevention (active phenotype de-duplication) ----
+# The 3-objective Pareto trim keeps the pool full and spread in OBJECTIVE space
+# (age, fitness, complexity) via NSGA-II crowding, and the novelty bonus nudges
+# fitness toward behavioural uniqueness — but neither *actively removes*
+# behavioural clones.  When the elite lineage's offspring all collapse onto one
+# prediction fingerprint, those clones can fill most of the front: parent
+# selection then keeps drawing from the same basin and structural search stalls,
+# even though the pool looks "full".  The existing periodic diversity check only
+# nudged operator weights when collapse was nearly total (an absolute,
+# scale-dependent prediction-distance threshold), which large-magnitude targets
+# rarely tripped and which never injected fresh material.
+#
+# When enabled, the diversity check additionally measures a SCALE-INVARIANT
+# collapse signal — the fraction of behaviourally DISTINCT individuals — and,
+# if clones dominate WHILE the pool is stalling (so we never fight healthy
+# convergence onto a genuine optimum), replaces a capped share of the redundant
+# clones with fresh diverse blood (data-prior random + mutated HoF) at age 0,
+# letting the Pareto trim arbitrate.  This is the multi-objective analogue of an
+# island's immigrant wave, but triggered by measured behavioural redundancy
+# rather than by time alone.
+DIVERSITY_INJECTION_ENABLED = True   # set False for legacy operator-boost-only behaviour
+DIVERSITY_UNIQUE_FRAC       = 0.55   # collapse trips when distinct-fingerprint
+                                     # fraction falls below this (1.0 = all unique)
+DIVERSITY_INJECT_MAX_FRAC   = 0.15   # cap on the share of the pool replaced per fire
+# Only inject when the pool is at least mildly stalled, measured as a fraction
+# of extinction patience — below this, a behavioural collapse is treated as
+# benign convergence and left alone (operator boost still applies).
+DIVERSITY_INJECT_STAG_FRAC  = 0.25
 
 # ---- Down-Sampled Lexicase ----
 # Fraction of the training set used for DS-Lexicase each generation.
@@ -5461,12 +5518,21 @@ def simplify_cgp_tree(cgp_eq):
     return eq
 
 
-def apply_simplification_pass(islands_pop, hofs, X, Y, out_types, target_grads_list=None):
+def apply_simplification_pass(islands_pop, hofs, X, Y, out_types, target_grads_list=None,
+                              time_budget_sec=None):
     """
     Apply simplify_cgp_tree() to every individual in every island and every
     Hall-of-Fame entry.  Recalculates fitness after simplification so that
     reduced-complexity individuals are correctly scored.
     Prints a short summary of how many nodes were pruned overall.
+
+    ``time_budget_sec`` (optional) caps the pass's wall-clock: once the budget
+    is exceeded the remaining individuals are left untouched for the next
+    scheduled pass.  Simplification is opportunistic cleanup — every individual
+    is independent and a skipped one is simply re-tried later — so a partial
+    pass is always safe, and bounding it stops the single most-likely-unbounded
+    maintenance phase from dominating an inter-chunk gap.  ``None`` = unbounded
+    (legacy behaviour).
     """
     if target_grads_list is None:
         target_grads_list = [None] * len(hofs)
@@ -5474,11 +5540,26 @@ def apply_simplification_pass(islands_pop, hofs, X, Y, out_types, target_grads_l
     total_before = 0
     total_after  = 0
     count = 0
+    _t_start = time.perf_counter()
+    _budget_hit = False
+
+    def _over_budget():
+        return (time_budget_sec is not None
+                and (time.perf_counter() - _t_start) > time_budget_sec)
 
     # ---- Islands ----
     for island_pops in islands_pop:           # list of lists [island][output]
+        if _over_budget():
+            _budget_hit = True
+            break
         for o_idx, pop in enumerate(island_pops):
+            if _over_budget():
+                _budget_hit = True
+                break
             for ind in pop:
+                if _over_budget():
+                    _budget_hit = True
+                    break
                 old_c = ind.complexity
                 old_active = set(ind.tree.active_nodes) if ind.tree is not None else set()
                 ind.tree = simplify_cgp_tree(ind.tree)
@@ -5510,8 +5591,16 @@ def apply_simplification_pass(islands_pop, hofs, X, Y, out_types, target_grads_l
                 count += 1
 
     # ---- Hall of Fame ----
+    # The HoF entries ARE the reported models, so even when the budget is hit
+    # the rebuild below still runs for every output whose entries were touched.
     for o_idx, hof in enumerate(hofs):
+        if _over_budget():
+            _budget_hit = True
+            break
         for c_key in list(hof.best_by_complexity.keys()):
+            if _over_budget():
+                _budget_hit = True
+                break
             ind = hof.best_by_complexity[c_key]
             old_c = ind.complexity
             old_active = set(ind.tree.active_nodes) if ind.tree is not None else set()
@@ -5548,9 +5637,11 @@ def apply_simplification_pass(islands_pop, hofs, X, Y, out_types, target_grads_l
 
     saved = total_before - total_after
     pct   = 100.0 * saved / (total_before + 1e-8)
+    _budget_note = (f"  [budget {time_budget_sec:.0f}s reached — remainder deferred]"
+                    if _budget_hit else "")
     print(f"  [Simplify] {count} individuals | "
           f"complexity {total_before:.0f} → {total_after:.0f}  "
-          f"(−{saved:.0f}, {pct:.1f}% reduction)")
+          f"(−{saved:.0f}, {pct:.1f}% reduction){_budget_note}")
 
 
 
@@ -18645,6 +18736,36 @@ def _heavy_tail_sigma(parent_sigma, sigma_tau=0.15, scale=2.0):
     return float(parent_sigma * np.exp(step))
 
 
+def _gen_crossed(prev_gen, gen, period, offset=0):
+    """True iff the half-open interval ``(prev_gen, gen]`` contains a scheduled
+    boundary ``offset + k·period`` (integer ``k``, boundary value > 0).
+
+    The AFPO / island orchestrators advance the global generation counter by a
+    *variable* chunk size: it is ``MIGRATION_FREQ`` normally but is halved to
+    ``MIGRATION_FREQ // 2`` while a pool is more than half-way to its extinction
+    patience.  A legacy ``gen % period == 0`` test therefore SILENTLY SKIPS a
+    period whenever a step straddles the boundary instead of landing on it —
+    e.g. with ``period == 500`` a run that goes ``… 400 (+25) 425 (+50) 475
+    (+50) 525 …`` never satisfies ``gen % 500 == 0`` and the 500-gen frontier
+    print / full-data re-score / deep-opt for that interval is lost.
+
+    Counting boundary CROSSINGS instead fires the periodic work exactly once
+    per ``period`` generations regardless of how the step size changes, and the
+    optional ``offset`` lets callers stagger independent periodic tasks onto
+    different phases so they do not all pile into the same inter-chunk gap.
+    A step that happens to jump over more than one boundary still fires once
+    (the work cannot be run retroactively for a skipped boundary).
+    """
+    if period <= 0:
+        return False
+
+    def _count(g):
+        # Number of boundaries (offset + k·period) at or below ``g``.
+        return (g - offset) // period if g >= offset else -1
+
+    return _count(gen) > _count(prev_gen)
+
+
 def _pareto_dominates(a, b):
     """
     Return True if individual `a` Pareto-dominates `b` on
@@ -19664,14 +19785,112 @@ def evolve_afpo(population, X, y_target, type_code,
             _op_affinity = _blend_op_affinity(
                 _data_op_prior, compute_hof_operator_affinity([hof]))
 
-        # ── IMPROVEMENT (B7): periodic diversity check ───────────────────────
-        if gen > 0 and gen % _DIVERSITY_CHECK_FREQ == 0 and X.shape[0] > 0:
+        # ── IMPROVEMENT (B7 + collapse prevention): periodic diversity check ──
+        # Two complementary collapse signals, both measured on the chunk's fixed
+        # behavioural probe ``_X_novelty`` so the fingerprints line up with the
+        # novelty archive's accounting:
+        #   1. SEMANTIC distance — mean pairwise prediction MSE (the legacy
+        #      signal; an absolute, scale-dependent trigger that only fires on
+        #      near-total collapse), and
+        #   2. CLONE fraction — the share of behaviourally DISTINCT individuals.
+        #      This is scale-invariant: a large-magnitude target whose pairwise
+        #      MSE never drops below the absolute threshold still trips this one
+        #      the moment the Pareto front fills with prediction-identical
+        #      clones (the real collapse mode the trim's objective-space
+        #      crowding can't see).
+        # Either signal arms the structural-mutation operator boost.  The clone
+        # signal additionally drives ACTIVE de-duplication: when clones dominate
+        # AND the pool is at least mildly stalled — so we never fight a healthy
+        # convergence onto a genuine optimum, where prediction-identical members
+        # are expected and good — a capped share of the redundant clones (all
+        # but the lowest-loss representative of each fingerprint, never the
+        # champion) is replaced with fresh diverse blood at age 0 and the trim
+        # arbitrates.  Fingerprints are recomputed here rather than read from the
+        # cached ``_novelty_fp`` because the incoming population carries stamps
+        # from a previous chunk's (different) probe.
+        if (gen > 0 and gen % _DIVERSITY_CHECK_FREQ == 0
+                and _X_novelty is not None and len(population) >= 4):
             try:
-                _div_idx = np.random.choice(
-                    X.shape[0], min(16, X.shape[0]), replace=False)
-                _div_score = _compute_island_diversity(population, X[_div_idx])
-                if _div_score < _DIVERSITY_THRESHOLD:
+                _div_score = _compute_island_diversity(population, _X_novelty)
+                _semantic_collapse = _div_score < _DIVERSITY_THRESHOLD
+
+                _fp_by_id = {}
+                _fp_counts = {}
+                for _ind in population:
+                    _fpv = _novelty_fp(_ind.tree)
+                    if _fpv is None:
+                        continue
+                    _fp_by_id[id(_ind)] = _fpv
+                    _fp_counts[_fpv] = _fp_counts.get(_fpv, 0) + 1
+                _n_fp = sum(_fp_counts.values())
+                _unique_frac = (len(_fp_counts) / _n_fp) if _n_fp else 1.0
+                _clone_collapse = (_n_fp >= 4
+                                   and _unique_frac < DIVERSITY_UNIQUE_FRAC)
+
+                if _semantic_collapse or _clone_collapse:
                     _diversity_boost_until = gen + _DIVERSITY_BOOST_WINDOW
+
+                if (DIVERSITY_INJECTION_ENABLED and _clone_collapse
+                        and local_stag > DIVERSITY_INJECT_STAG_FRAC * ext_patience):
+                    _champ_div = min(population, key=lambda z: z.loss)
+                    # Group by (recomputed) fingerprint; everything but the
+                    # lowest-loss representative of a multi-member cluster is a
+                    # removable clone.
+                    _by_fp = {}
+                    for _ind in population:
+                        _fpv = _fp_by_id.get(id(_ind))
+                        if _fpv is None:
+                            continue
+                        _by_fp.setdefault(_fpv, []).append(_ind)
+                    _surplus = []
+                    for _grp in _by_fp.values():
+                        if len(_grp) <= 1:
+                            continue
+                        _grp.sort(key=lambda z: z.loss)
+                        _surplus.extend(_grp[1:])
+                    _surplus = [z for z in _surplus if z is not _champ_div]
+                    _cap = max(1, int(target_size * DIVERSITY_INJECT_MAX_FRAC))
+                    random.shuffle(_surplus)
+                    _surplus = _surplus[:_cap]
+                    if _surplus:
+                        _surplus_ids = set(id(z) for z in _surplus)
+                        population = [z for z in population
+                                      if id(z) not in _surplus_ids]
+                        _hof_pool = (list(hof.best_by_complexity.values())
+                                     if hof.best_by_complexity else [])
+                        random.shuffle(_hof_pool)
+                        for _j in range(len(_surplus)):
+                            try:
+                                if _hof_pool and _j % 2 == 0:
+                                    _base = _hof_pool[_j % len(_hof_pool)]
+                                    _tree = mutate(
+                                        _base.tree, n_features, feat_names,
+                                        mut_rate=max(2, CGP_MUT_RATE * 2),
+                                        op_affinity=_op_affinity if _op_affinity else None)
+                                    _ni = Individual(_tree)
+                                    _ni.sigma = float(np.clip(
+                                        getattr(_base, 'sigma', CGP_MUT_RATE)
+                                        * random.uniform(0.8, 2.0),
+                                        SIGMA_MIN, SIGMA_MAX))
+                                else:
+                                    _ni = Individual(random_cgp(
+                                        n_features, CGP_NODES, feat_names,
+                                        op_prior=_data_op_prior))
+                                _ni.age = 0
+                                _ni.calculate_fitness(
+                                    X, y_target, type_code,
+                                    bg_logits=bg_logits,
+                                    class_idx_in_group=class_idx_in_group,
+                                    Y_group=Y_group, target_grads=target_grads)
+                                _nfp = _novelty_fp(_ni.tree)
+                                if _nfp is not None:
+                                    _ni._novelty_fp = _nfp
+                                    _rugged_archive.add(_nfp)
+                                population.append(_ni)
+                            except Exception:
+                                continue
+                        population = _trim_to_pareto_front_3obj(
+                            population, target_size)
             except Exception:
                 pass
 
@@ -31550,6 +31769,13 @@ def train_mode():
                         except Exception:
                             pass
 
+                    # Boundary-crossing periodic schedule — ``chunk_freq`` halves
+                    # to MIGRATION_FREQ//2 under stagnation, so a chunk can
+                    # straddle a generation multiple (e.g. 475 → 525) and a
+                    # legacy ``gen % period == 0`` test would skip that interval's
+                    # periodic work entirely.  ``_gen_crossed(_prev_gen, gen, …)``
+                    # fires it once per period regardless of step size.
+                    _prev_gen = gen
                     gen += chunk_freq
 
                     # ── Plateau-driven meta-extinction bookkeeping ────────
@@ -31618,7 +31844,7 @@ def train_mode():
                             print("   " + _co_status)
 
                     # ---- Perfect output detection & early stopping ----
-                    if gen % MIGRATION_FREQ == 0:
+                    if _gen_crossed(_prev_gen, gen, MIGRATION_FREQ):
                         for o_idx in range(n_outputs):
                             if o_idx in perfect_outputs:
                                 continue
@@ -31641,7 +31867,7 @@ def train_mode():
                             break
 
                     # ---- Periodic frontier display ----
-                    if gen % 500 == 0:
+                    if _gen_crossed(_prev_gen, gen, 500):
                         for o_idx, hof in enumerate(hofs):
                             out_label = dp.output_map[o_idx] if o_idx < len(dp.output_map) else f"Out{o_idx}"
                             pf_tag = " [PERFECT]" if o_idx in perfect_outputs else ""
@@ -31651,14 +31877,14 @@ def train_mode():
                             _print_validation_metrics(hofs, X_val, Y_val, out_types, dp)
 
                     # ---- Interval stability culling (Interval mode only) ----
-                    if INTERVAL_MODE and gen % INTERVAL_CHECK_FREQ == 0:
+                    if INTERVAL_MODE and _gen_crossed(_prev_gen, gen, INTERVAL_CHECK_FREQ):
                         n_pen = _interval_cull_population(islands_pop, X, out_types)
                         if n_pen:
                             print(f"  [Interval] {n_pen} numerically unstable "
                                   f"individual(s) penalised.")
 
                     # ---- ADF extraction pass ----
-                    if ADF_ENABLED and gen % ADF_EXTRACT_FREQ == 0:
+                    if ADF_ENABLED and _gen_crossed(_prev_gen, gen, ADF_EXTRACT_FREQ):
                         print(f"\n[Gen {gen}] ADF extraction scan…")
                         for o_idx in range(n_outputs):
                             # gather all individuals across all islands for this output
@@ -31679,12 +31905,20 @@ def train_mode():
                                   f"{retired}")
 
                     # ---- Periodic simplification pass ----
-                    if SIMPLIFICATION_FREQ > 0 and gen % SIMPLIFICATION_FREQ == 0:
+                    # Staggered onto a half-period offset (see the AFPO loop) so
+                    # it does not coincide with the 500-/1000-gen heavy-pass
+                    # cluster, and bounded by a wall-clock budget.
+                    if (SIMPLIFICATION_FREQ > 0
+                            and _gen_crossed(_prev_gen, gen, SIMPLIFICATION_FREQ,
+                                             offset=SIMPLIFICATION_FREQ // 2)):
                         print(f"\n[Gen {gen}] Running algebraic simplification pass…")
-                        apply_simplification_pass(islands_pop, hofs, X, Y, out_types)
+                        apply_simplification_pass(
+                            islands_pop, hofs, X, Y, out_types,
+                            time_budget_sec=SIMPLIFICATION_TIME_BUDGET_SEC)
 
                     # ---- Extra simplification for perfect outputs ----
-                    if perfect_outputs and gen % max(100, SIMPLIFICATION_FREQ if SIMPLIFICATION_FREQ > 0 else 100) == 0:
+                    _perf_simp_period = max(100, SIMPLIFICATION_FREQ if SIMPLIFICATION_FREQ > 0 else 100)
+                    if perfect_outputs and _gen_crossed(_prev_gen, gen, _perf_simp_period):
                         for o_idx in perfect_outputs:
                             _simplify_perfect_output(
                                 hofs[o_idx], X, Y[:, o_idx], out_types[o_idx],
@@ -31695,7 +31929,7 @@ def train_mode():
                     # (they see X_b as their "full" dataset).  Periodically re-score
                     # all HoF entries on the true full dataset so affine parameters
                     # are accurate and entries are correctly ranked.
-                    if BATCH_SIZE > 0 and gen > 0 and gen % 200 == 0:
+                    if BATCH_SIZE > 0 and _gen_crossed(_prev_gen, gen, 200):
                         _parallel_rescore_hofs(hofs, X, Y, out_types,
                                                target_grads_list,
                                                perfect_outputs=perfect_outputs)
@@ -31705,13 +31939,13 @@ def train_mode():
                     # stages and adaptive parsimony silently drift affine_a/b
                     # away from their unbiased fit over a long run, which makes
                     # cross-complexity ranking unreliable.  Re-fit every 500 gens.
-                    if BATCH_SIZE <= 0 and gen > 0 and gen % 500 == 0:
+                    if BATCH_SIZE <= 0 and _gen_crossed(_prev_gen, gen, 500):
                         _parallel_rescore_hofs(hofs, X, Y, out_types,
                                                target_grads_list,
                                                perfect_outputs=perfect_outputs)
 
                     # ---- Deep constant optimisation ----
-                    if gen > 0 and gen % 1000 == 0:
+                    if _gen_crossed(_prev_gen, gen, 1000):
                         _deep_optimize_hofs(hofs, X, Y, out_types)
 
         except KeyboardInterrupt:
@@ -31870,9 +32104,26 @@ def train_mode():
         # n_outputs futures per chunk; cap at host CPU count so machines with
         # more than 8 cores get full parallelism on multi-output runs.
         _afpo_workers = min(max(1, n_outputs), max(1, os.cpu_count() or 8))
+        # ── Inter-chunk timing instrumentation (see AFPO_PROFILE_TIMING) ──────
+        # The heavy periodic maintenance passes all key off generation multiples
+        # and so tend to fall in the SAME inter-chunk gap, producing the
+        # occasional large stall between "--- Generation N ---" reports.
+        # ``_phase_acc`` attributes each chunk's wall-clock to a phase so the
+        # source of a stall is visible (profiling on) and always-on so any single
+        # pass over AFPO_SLOW_PHASE_WARN_SEC is named.
+        _phase_acc = {}
+        def _phase_done(_name, _t0):
+            _dt = time.perf_counter() - _t0
+            _phase_acc[_name] = _phase_acc.get(_name, 0.0) + _dt
+            if AFPO_SLOW_PHASE_WARN_SEC and _dt >= AFPO_SLOW_PHASE_WARN_SEC:
+                print(f"  [Timing] slow phase '{_name}' took {_dt:.1f}s "
+                      f"(gen {gen})")
+            return _dt
         try:
             with _InterruptiblePool(max_workers=_afpo_workers) as executor:
                 while True:
+                    _chunk_t0 = time.perf_counter()
+                    _phase_acc.clear()
                     batch_idx = _select_batch_indices(X, Y, hofs, out_types, BATCH_SIZE)
                     X_b = X[batch_idx] if batch_idx is not None else X
                     Y_b = Y[batch_idx] if batch_idx is not None else Y
@@ -31953,7 +32204,16 @@ def train_mode():
                                       f"New Best (Comp {ind.complexity:.0f}): "
                                       f"loss={ind.loss:.4f}  {metric}")
 
+                    # Boundary-crossing periodic schedule (issue: variable chunk
+                    # size).  ``_prev_gen`` is the counter BEFORE this chunk's
+                    # advance; every ``gen % period == 0`` test below is replaced
+                    # by ``_gen_crossed(_prev_gen, gen, period)`` so a chunk that
+                    # straddles a boundary (e.g. 475 → 525 when the size halves to
+                    # 25 under stagnation) still fires that interval's work
+                    # exactly once instead of skipping it.
+                    _prev_gen = gen
                     gen += chunk_freq_a
+                    _phase_acc['evolve'] = time.perf_counter() - _chunk_t0
                     print(f"--- Generation {gen} ---")
                     if COEVOLUTION_ENABLED:
                         _co_status = _coevo_status_line()
@@ -31966,6 +32226,7 @@ def train_mode():
                     # META_PLATEAU_GENS, fire a single rebuild.  The pseudo-
                     # islands wrapper lets `_meta_extinction` operate on the
                     # single AFPO pool without changing its signature.
+                    _meta_t0 = time.perf_counter()
                     _meta_losses = [hofs[mi].get_best_overall().loss
                                     for mi in range(n_outputs)
                                     if mi not in perfect_outputs
@@ -32037,6 +32298,7 @@ def train_mode():
                                 pass
                             _meta_last_imp_gen = gen
                             _meta_best_loss   = _cur_loss
+                    _phase_done('meta', _meta_t0)
 
                     # ---- Perfect output detection & early stopping ----
                     for o_idx in range(n_outputs):
@@ -32060,7 +32322,7 @@ def train_mode():
                         break
 
                     # ---- Periodic frontier display ----
-                    if gen % 500 == 0:
+                    if _gen_crossed(_prev_gen, gen, 500):
                         for o_idx, hof in enumerate(hofs):
                             out_label = dp.output_map[o_idx] if o_idx < len(dp.output_map) else f"Out{o_idx}"
                             pf_tag = " [PERFECT]" if o_idx in perfect_outputs else ""
@@ -32074,7 +32336,7 @@ def train_mode():
                             print(f"  [Cache] {_FITNESS_CACHE.stats_str()}")
 
                     # ---- Interval stability culling (Interval mode only) ----
-                    if INTERVAL_MODE and gen % INTERVAL_CHECK_FREQ == 0:
+                    if INTERVAL_MODE and _gen_crossed(_prev_gen, gen, INTERVAL_CHECK_FREQ):
                         n_pen = 0
                         for i in range(n_outputs):
                             for ind in afpo_pops[i]:
@@ -32089,7 +32351,8 @@ def train_mode():
                                   f"individual(s) penalised.")
 
                     # ---- ADF extraction (immediate, single-process) ----
-                    if ADF_ENABLED and gen % ADF_EXTRACT_FREQ == 0:
+                    if ADF_ENABLED and _gen_crossed(_prev_gen, gen, ADF_EXTRACT_FREQ):
+                        _adf_t0 = time.perf_counter()
                         print(f"\n[Gen {gen}] ADF extraction scan…")
                         for i in range(n_outputs):
                             new_adfs = try_extract_adfs_from_population(
@@ -32103,19 +32366,34 @@ def train_mode():
                         if retired:
                             print(f"  [ADF] Retired {len(retired)} idle operator(s): "
                                   f"{retired}")
+                        _phase_done('adf', _adf_t0)
 
                     # ---- Periodic simplification pass ----
-                    if SIMPLIFICATION_FREQ > 0 and gen % SIMPLIFICATION_FREQ == 0:
+                    # Staggered onto a half-period offset so it never coincides
+                    # with the 500-/1000-gen frontier + full-data re-score + deep
+                    # constant-optimisation cluster — that pile-up of heavy passes
+                    # in one inter-chunk gap is the dominant "occasional massive
+                    # slowdown".  A wall-clock budget bounds the pass itself
+                    # (simplification is opportunistic cleanup, so stopping early
+                    # and finishing next time is always safe).
+                    if (SIMPLIFICATION_FREQ > 0
+                            and _gen_crossed(_prev_gen, gen, SIMPLIFICATION_FREQ,
+                                             offset=SIMPLIFICATION_FREQ // 2)):
+                        _simp_t0 = time.perf_counter()
                         print(f"\n[Gen {gen}] Running algebraic simplification pass…")
                         # Wrap afpo_pops as if they were islands (list of [pop])
                         pseudo_islands = [[pop] for pop in afpo_pops]
-                        apply_simplification_pass(pseudo_islands, hofs, X, Y, out_types)
+                        apply_simplification_pass(
+                            pseudo_islands, hofs, X, Y, out_types,
+                            time_budget_sec=SIMPLIFICATION_TIME_BUDGET_SEC)
                         # Unwrap back
                         for i in range(n_outputs):
                             afpo_pops[i] = pseudo_islands[i][0]
+                        _phase_done('simplify', _simp_t0)
 
                     # ---- Extra simplification for perfect outputs ----
-                    if perfect_outputs and gen % max(100, SIMPLIFICATION_FREQ if SIMPLIFICATION_FREQ > 0 else 100) == 0:
+                    _perf_simp_period = max(100, SIMPLIFICATION_FREQ if SIMPLIFICATION_FREQ > 0 else 100)
+                    if perfect_outputs and _gen_crossed(_prev_gen, gen, _perf_simp_period):
                         for o_idx in perfect_outputs:
                             _simplify_perfect_output(
                                 hofs[o_idx], X, Y[:, o_idx], out_types[o_idx],
@@ -32127,10 +32405,12 @@ def train_mode():
                     # 200 gens we re-score every HoF entry on the true X so
                     # rankings stay correct and downstream validation/plot
                     # output reflects the real predictor.
-                    if BATCH_SIZE > 0 and gen > 0 and gen % 200 == 0:
+                    if BATCH_SIZE > 0 and _gen_crossed(_prev_gen, gen, 200):
+                        _rsc_t0 = time.perf_counter()
                         _parallel_rescore_hofs(hofs, X, Y, out_types,
                                                target_grads_list,
                                                perfect_outputs=perfect_outputs)
+                        _phase_done('rescore', _rsc_t0)
 
                     # ---- Periodic HoF re-scoring on full data (non-batch mode) ----
                     # Even without minibatching, the constant-optimiser, boost
@@ -32139,14 +32419,28 @@ def train_mode():
                     # generations we re-fit the affine on the FULL training set
                     # so HoF entries stay correctly ranked and downstream
                     # validation / plotting reflects the true predictor.
-                    if BATCH_SIZE <= 0 and gen > 0 and gen % 500 == 0:
+                    if BATCH_SIZE <= 0 and _gen_crossed(_prev_gen, gen, 500):
+                        _rsc_t0 = time.perf_counter()
                         _parallel_rescore_hofs(hofs, X, Y, out_types,
                                                target_grads_list,
                                                perfect_outputs=perfect_outputs)
+                        _phase_done('rescore', _rsc_t0)
 
                     # ---- Deep constant optimisation ----
-                    if gen > 0 and gen % 1000 == 0:
+                    if _gen_crossed(_prev_gen, gen, 1000):
+                        _dopt_t0 = time.perf_counter()
                         _deep_optimize_hofs(hofs, X, Y, out_types)
+                        _phase_done('deepopt', _dopt_t0)
+
+                    # ── Per-chunk timing breakdown (opt-in) ──────────────────────
+                    if AFPO_PROFILE_TIMING:
+                        _tot = time.perf_counter() - _chunk_t0
+                        _parts = " ".join(f"{_k}={_v:.2f}s"
+                                          for _k, _v in sorted(_phase_acc.items(),
+                                                               key=lambda kv: -kv[1])
+                                          if _v >= 0.005)
+                        print(f"  [Timing] chunk gen {gen}: total={_tot:.2f}s "
+                              f"({_parts})")
 
         except KeyboardInterrupt:
             print("\nStopping Evolution…")
@@ -32687,7 +32981,9 @@ def train_mode():
                         print(f"\n[Gen {gen}] Running algebraic simplification pass…")
                         for s in range(N_STAGES):
                             pseudo_isl = [[stage_pops[s][j]] for j in range(n_outputs)]
-                            apply_simplification_pass(pseudo_isl, hofs, X, Y, out_types)
+                            apply_simplification_pass(
+                                pseudo_isl, hofs, X, Y, out_types,
+                                time_budget_sec=SIMPLIFICATION_TIME_BUDGET_SEC)
                             for j in range(n_outputs):
                                 stage_pops[s][j] = pseudo_isl[j][0]
 
@@ -33035,7 +33331,9 @@ def train_mode():
                     # ---- Periodic simplification ----
                     if SIMPLIFICATION_FREQ > 0 and gen % SIMPLIFICATION_FREQ == 0:
                         print(f"\n[Gen {gen}] Running algebraic simplification pass…")
-                        apply_simplification_pass(islands_pop, hofs, X, Y, out_types)
+                        apply_simplification_pass(
+                            islands_pop, hofs, X, Y, out_types,
+                            time_budget_sec=SIMPLIFICATION_TIME_BUDGET_SEC)
 
                     # ---- Extra simplification for perfect outputs ----
                     if perfect_outputs and gen % max(100, SIMPLIFICATION_FREQ if SIMPLIFICATION_FREQ > 0 else 100) == 0:
@@ -33378,7 +33676,9 @@ def train_mode():
                             flat_isl = [[stage_islands[s][isl][j]
                                          for j in range(n_outputs)]
                                         for isl in range(N_ISL)]
-                            apply_simplification_pass(flat_isl, hofs, X, Y, out_types)
+                            apply_simplification_pass(
+                                flat_isl, hofs, X, Y, out_types,
+                                time_budget_sec=SIMPLIFICATION_TIME_BUDGET_SEC)
                             for isl in range(N_ISL):
                                 for j in range(n_outputs):
                                     stage_islands[s][isl][j] = flat_isl[isl][j]
@@ -33737,7 +34037,9 @@ def train_mode():
                             flat_isl = [[tier_islands[tier][isl][j]
                                          for j in range(n_outputs)]
                                         for isl in range(N_ISL_PER_G)]
-                            apply_simplification_pass(flat_isl, hofs, X, Y, out_types)
+                            apply_simplification_pass(
+                                flat_isl, hofs, X, Y, out_types,
+                                time_budget_sec=SIMPLIFICATION_TIME_BUDGET_SEC)
                             for isl in range(N_ISL_PER_G):
                                 for j in range(n_outputs):
                                     tier_islands[tier][isl][j] = flat_isl[isl][j]
