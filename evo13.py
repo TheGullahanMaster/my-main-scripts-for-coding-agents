@@ -1227,8 +1227,27 @@ ADF_FITNESS_THRESH     = 0.50   # maximum normalised fitness percentile (lower =
 ADF_MAX_LIBRARY        = 8      # cap on how many ADFs can be accumulated
 ADF_EXTRACT_FREQ       = 500    # check for new ADFs every N generations
 ADF_RETIRE_PATIENCE    = 3      # consecutive zero-use cycles before an ADF is retired
+ADF_SELECTION_BOOST    = 0.75   # min weight an ADF op gets in the mutation/init
+                                # operator choice, as a fraction of the top op's
+                                # weight.  Without it a freshly-frozen ADF has
+                                # zero HoF usage and is pinned at the 0.10
+                                # exploration floor against primitives near 1.0,
+                                # so the search never trials it — the reported
+                                # "ADFs register but evolution won't use them"
+                                # behaviour.  Set 0.0 to disable the boost.
 _ADF_REGISTRY          = []     # list of serialisable ADF dicts (shared state)
 _ADF_ZERO_USE_COUNT    = {}     # name → consecutive zero-usage extraction cycles
+
+# ---- Input/output normalization (min-max) ----
+# When enabled, numeric inputs and outputs are min-max rescaled before
+# evolution.  DEFAULT is "no": normalization warps the recovered maths
+# (constants/affine end up in scaled units), so it is opt-in.  Predictions
+# from the exported model are de-normalized automatically, so real-scale
+# inference is always correct regardless of this setting.
+#   "no"       — disabled (default)
+#   "minus1_1" — rescale each numeric column to [-1, 1]
+#   "zero_1"   — rescale each numeric column to [0, 1]
+NORMALIZE_MODE = "no"
 
 # ---- Arithmetic Interval mode ----
 # Runs Unsafe ops but periodically evaluates every individual against the
@@ -1890,12 +1909,33 @@ def affinity_biased_op_choice(affinity: dict, ops: list | None = None) -> str:
     doesn't collapse to ~0 probability.  Without the floor a HoF using only
     `+ * /` would zero-pressure `sin/exp/log` discovery; with the floor each
     such op still has at least a 10% relative chance of being sampled.
+
+    ADF ops get an extra, much higher floor (``ADF_SELECTION_BOOST`` × the top
+    op's weight).  A just-frozen ADF appears in zero HoF entries, so the
+    affinity above would pin it at the plain 0.10 floor while the primitives it
+    is meant to compete with sit near 1.0 — and the search would then never
+    trial the building block.  The boost makes mutation/initialisation actually
+    exercise freshly-defined ADFs; selection still discards unhelpful ones and
+    the retirement sweep still reclaims any that fall out of use.
     """
     if ops is None:
         ops = CGPEquation.OPS_ALL
     if not affinity:
         return random.choice(ops)
     weights = [max(affinity.get(op, 0.3), 0.10) for op in ops]
+    if ADF_SELECTION_BOOST > 0.0:
+        # Single pass: find the top weight and whether any ADF op is present.
+        wmax = 0.0
+        adf_present = False
+        for w, op in zip(weights, ops):
+            if w > wmax:
+                wmax = w
+            if op[:4] == 'adf_':
+                adf_present = True
+        if adf_present:
+            floor = ADF_SELECTION_BOOST * wmax
+            weights = [max(w, floor) if op[:4] == 'adf_' else w
+                       for w, op in zip(weights, ops)]
     return random.choices(ops, weights=weights, k=1)[0]
 
 
@@ -2481,6 +2521,8 @@ PERCEPTRON_ENABLED    = False   # flipped by `_select_perceptron_mode()`
 _BINARY_SAFE = {
     '+':         lambda v1, v2: v1 + v2,
     '-':         lambda v1, v2: v1 - v2,
+    # Absolute difference |v1 - v2| (unsigned magnitude; distinct from signed '-')
+    'delta':     lambda v1, v2: np.abs(v1 - v2),
     '*':         lambda v1, v2: v1 * v2,
     # Denominator nudged away from zero → never divides by zero
     '/':         lambda v1, v2: v1 / np.where(np.abs(v2) > 1e-8, v2,
@@ -2535,6 +2577,8 @@ _BINARY_SAFE = {
 _BINARY_UNSAFE = {
     '+':         lambda v1, v2: v1 + v2,
     '-':         lambda v1, v2: v1 - v2,
+    # Absolute difference |v1 - v2| (unsigned magnitude; distinct from signed '-')
+    'delta':     lambda v1, v2: np.abs(v1 - v2),
     '*':         lambda v1, v2: v1 * v2,
     # Raw — NaN/Inf on zero denominator (caught by nan_to_num in evaluate)
     '/':         lambda v1, v2: v1 / v2,
@@ -2616,6 +2660,8 @@ _UNARY_SAFE = {
     'floor':      np.floor,
     'ceil':       np.ceil,
     'round':      lambda v: np.round(v),
+    # Truncate toward zero — drops the decimal part (int(2.7)=2.0, int(-2.7)=-2.0)
+    'int':        np.trunc,
     'cube':       lambda v: v**3,
     'sinc':       _sinc_fn,
     # Epsilon inside log prevents log(0)
@@ -2681,6 +2727,8 @@ _UNARY_UNSAFE = {
     'floor':      np.floor,
     'ceil':       np.ceil,
     'round':      lambda v: np.round(v),
+    # Truncate toward zero — drops the decimal part (int(2.7)=2.0, int(-2.7)=-2.0)
+    'int':        np.trunc,
     'cube':       lambda v: v**3,
     'sinc':       _sinc_fn,
     # NaN at v=0 (log(0)=-Inf, then 0*-Inf=NaN)
@@ -2879,6 +2927,7 @@ def select_ops_safety():
 OP_COSTS = {
     # Binary
     '+': COST_OP_SIMPLE, '-': COST_OP_SIMPLE,
+    'delta': COST_OP_SIMPLE,
     '*': COST_OP_COMPLEX, '/': COST_OP_COMPLEX,
     'max': COST_OP_COMPLEX, 'min': COST_OP_COMPLEX,
     'pow': COST_OP_COMPLEX,
@@ -2928,7 +2977,7 @@ OP_COSTS = {
     '10^x': COST_UNARY_RISK, 'log10': COST_UNARY_RISK,
     'relu': COST_UNARY_CHEAP, 'leaky_relu': COST_UNARY_CHEAP,
     'sign': COST_UNARY_CHEAP, 'floor': COST_UNARY_CHEAP,
-    'ceil': COST_UNARY_CHEAP,
+    'ceil': COST_UNARY_CHEAP, 'int': COST_UNARY_CHEAP,
     'atan': COST_UNARY_SAFE, 'gaussian': COST_UNARY_RISK,
     'softplus': COST_UNARY_RISK,
     'cube': COST_OP_SIMPLE,
@@ -3317,6 +3366,8 @@ def _binary_str(op, s1, s2):
         return f"({s1} << {s2})"
     elif op == 'rshift':
         return f"({s1} >> {s2})"
+    elif op == 'delta':
+        return f"|{s1} - {s2}|"
     elif op.startswith('adf_'):
         return f"{op}({s1}, {s2})"
     else:
@@ -3347,6 +3398,8 @@ def _unary_str(op, s1):
         return f"round({s1})"
     if op == 'bitwise_not':
         return f"(~{s1})"
+    if op == 'int':
+        return f"int({s1})"
     if op in ('pow4', 'pow5', 'pow6', 'pow7', 'pow8', 'pow9', 'pow10'):
         return f"({s1})^{op[3:]}"
     return f"{op}({s1})"
@@ -3361,6 +3414,7 @@ ALL_OP_DESCRIPTIONS = {
     # Binary
     '+':         "Addition             (x + y)  — linear combination building block",
     '-':         "Subtraction          (x - y)  — difference, enables offsets",
+    'delta':     "Absolute difference  |x - y|  — unsigned magnitude of difference",
     '*':         "Multiplication       (x * y)  — product, enables interactions",
     '/':         "Division             (x / y)  — ratio, protected against zero",
     'max':       "Maximum              max(x,y) — piecewise max, threshold effect",
@@ -3441,6 +3495,7 @@ ALL_OP_DESCRIPTIONS = {
     'sign':      "Sign                 sign(x)  — +1/0/-1 indicator, cheap",
     'floor':     "Floor                ⌊x⌋      — integer rounding down",
     'ceil':      "Ceil                 ⌈x⌉      — integer rounding up",
+    'int':       "Integer truncation   trunc(x) — drops decimal part (toward zero)",
     'cube':      "Cube                 x³       — odd polynomial, cheap",
     'sinc':      "Sinc                 sin(x)/x — decaying oscillation",
     'xlogx':     "x·log(x)             x·log|x| — entropy-like term",
@@ -3728,6 +3783,41 @@ def _select_adf_mode():
 
     print(f"  ✓  ADF enabled  (Q≥{ADF_MODULARITY_THRESH}, max {ADF_MAX_LIBRARY} ADFs, "
           f"check every {ADF_EXTRACT_FREQ} gens, retire after {ADF_RETIRE_PATIENCE} idle cycles)")
+
+
+def _select_normalize_mode():
+    """Ask whether to min-max normalize numeric inputs and outputs.
+
+    Disabled by default: rescaling warps the recovered maths (the printed
+    constants/affine land in normalized units), so it is opt-in.  When enabled,
+    every numeric input and output column is rescaled to the chosen range using
+    its training min/max.  Predictions from the exported model are de-normalized
+    automatically, so real-scale inference is correct regardless of the choice.
+    """
+    global NORMALIZE_MODE
+
+    print("\n" + "─" * 70)
+    print("INPUT / OUTPUT NORMALIZATION (min-max)")
+    print("─" * 70)
+    print("  Rescale each numeric input AND output column to a fixed range,")
+    print("  using its min/max on the training data.  Off by default because")
+    print("  normalization warps the discovered equation (its constants/affine")
+    print("  end up in normalized units).  Exported predictions are de-normalized")
+    print("  back to real units automatically, so inference stays correct.")
+    print()
+    print("  [0] No normalization        (default)")
+    print("  [1] Normalize to [-1, 1]")
+    print("  [2] Normalize to [0, 1]")
+    choice = input("Normalization [0]: ").strip()
+    if choice == '1':
+        NORMALIZE_MODE = "minus1_1"
+        print("  ✓  Normalizing numeric inputs/outputs to [-1, 1].")
+    elif choice == '2':
+        NORMALIZE_MODE = "zero_1"
+        print("  ✓  Normalizing numeric inputs/outputs to [0, 1].")
+    else:
+        NORMALIZE_MODE = "no"
+        print("  Normalization disabled.")
 
 
 def _select_perceptron_mode():
@@ -6467,8 +6557,14 @@ CAT_HIGH_CARD_THRESHOLD = 12   # > this many unique values → use compact encod
 
 
 class DataProcessor:
-    def __init__(self, scale=False, one_hot_threshold=CAT_HIGH_CARD_THRESHOLD):
+    def __init__(self, scale=False, one_hot_threshold=CAT_HIGH_CARD_THRESHOLD,
+                 normalize="no"):
         self.scale = scale
+        # Min-max normalization mode: "no" | "minus1_1" | "zero_1".  Independent
+        # of `scale` (z-score); the interactive setup enables at most one.
+        # Stored on the instance so it round-trips through the pickled
+        # DataProcessor embedded in exported prediction scripts.
+        self.normalize = normalize
         self.one_hot_threshold = one_hot_threshold
         self.col_configs = []
         self.stats = {}
@@ -6481,6 +6577,43 @@ class DataProcessor:
         self.nan_report = {}
 
     def set_configs(self, configs): self.col_configs = configs
+
+    # ---- Min-max normalization helpers (see NORMALIZE_MODE) -----------------
+    # getattr fallbacks keep these safe against DataProcessor objects pickled
+    # by older versions that predate the `normalize` attribute.
+    def _normalize_active(self):
+        """True when min-max normalization is enabled for this processor."""
+        return getattr(self, 'normalize', 'no') in ('minus1_1', 'zero_1')
+
+    def _fit_normalize(self, vals, stat):
+        """Record this column's min/max on fit and return the rescaled values."""
+        stat['norm_min'] = float(np.min(vals))
+        stat['norm_max'] = float(np.max(vals))
+        return self._apply_normalize(vals, stat)
+
+    def _norm_lo_rng(self, stat):
+        lo  = stat['norm_min']
+        rng = stat['norm_max'] - lo
+        if not np.isfinite(rng) or abs(rng) < 1e-12:
+            rng = 1.0          # constant column → maps to the low end (0 or -1)
+        return lo, rng
+
+    def _apply_normalize(self, vals, stat):
+        """Rescale → [0,1] or [-1,1] using the stored per-column min/max."""
+        lo, rng = self._norm_lo_rng(stat)
+        u = (vals - lo) / rng                          # → [0, 1]
+        if getattr(self, 'normalize', 'no') == 'minus1_1':
+            return 2.0 * u - 1.0
+        return u
+
+    def _invert_normalize(self, vals, stat):
+        """Inverse of _apply_normalize — map normalized values back to real units."""
+        lo, rng = self._norm_lo_rng(stat)
+        if getattr(self, 'normalize', 'no') == 'minus1_1':
+            u = (vals + 1.0) / 2.0
+        else:
+            u = vals
+        return u * rng + lo
 
     # ----------------------------------------------------------- helpers
     def _impute_numeric(self, col_name, vals, stat_target):
@@ -6682,6 +6815,8 @@ class DataProcessor:
                     stat['mean'] = mean
                     stat['std']  = std
                     vals = (vals - mean) / std
+                if self._normalize_active():
+                    vals = self._fit_normalize(vals, stat)
                 self.stats[col_name] = stat
                 Y_parts.append(vals.reshape(-1, 1))
                 self.output_map.append(col_name)
@@ -6727,6 +6862,8 @@ class DataProcessor:
                     stat['mean'] = mean
                     stat['std']  = std
                     vals = (vals - mean) / std
+                if self._normalize_active():
+                    vals = self._fit_normalize(vals, stat)
                 self.stats[col_name] = stat
                 X_parts.append(vals.reshape(-1, 1))
                 self.input_map.append(col_name)
@@ -6807,6 +6944,8 @@ class DataProcessor:
                     vals = np.where(bad, fill, vals)
                 if self.scale and 'mean' in stat:
                     vals = (vals - stat['mean']) / stat['std']
+                if self._normalize_active() and 'norm_min' in stat:
+                    vals = self._apply_normalize(vals, stat)
                 X_parts.append(vals.reshape(-1, 1))
             elif type_code == 2:
                 s = pd.Series(col_data).astype(object)
@@ -6866,6 +7005,8 @@ class DataProcessor:
                     vals = np.where(bad, fill, vals)
                 if self.scale and 'mean' in stat:
                     vals = (vals - stat['mean']) / stat['std']
+                if self._normalize_active() and 'norm_min' in stat:
+                    vals = self._apply_normalize(vals, stat)
                 Y_parts.append(vals.reshape(-1, 1))
             elif type_code == 6:
                 s = pd.Series(col_data).astype(object)
@@ -6909,6 +7050,8 @@ class DataProcessor:
                         fval = float(stat.get('nan_fill', 0.0))
                 if self.scale and 'mean' in stat:
                     fval = (fval - stat['mean']) / stat['std']
+                if self._normalize_active() and 'norm_min' in stat:
+                    fval = self._apply_normalize(fval, stat)
                 vec_parts.append([fval])
             elif type_code == 2:
                 classes = stat.get('classes', [])
@@ -6945,6 +7088,9 @@ class DataProcessor:
             stat = self.stats[col_name]
             if type_code == 5:
                 val = col_preds[0]
+                # Undo in reverse order of fit (normalize was applied last).
+                if self._normalize_active() and 'norm_min' in stat:
+                    val = self._invert_normalize(val, stat)
                 if self.scale and 'mean' in stat:
                     val = (val * stat['std']) + stat['mean']
                 res[col_name] = val
@@ -15468,6 +15614,8 @@ def _adf_to_sympy(adf_dict, input_exprs, safe=True):
             sbuf[slot] = v1 + v2
         elif op == '-':
             sbuf[slot] = v1 - v2
+        elif op == 'delta':
+            sbuf[slot] = sympy.Abs(v1 - v2)
         elif op == '*':
             sbuf[slot] = v1 * v2
         elif op == '/':
@@ -15509,6 +15657,8 @@ def _adf_to_sympy(adf_dict, input_exprs, safe=True):
             sbuf[slot] = v1 - sympy.floor(v1)
         elif op == 'round':
             sbuf[slot] = sympy.floor(v1 + sympy.Rational(1, 2))
+        elif op == 'int':
+            sbuf[slot] = sympy.sign(v1) * sympy.floor(sympy.Abs(v1))
         elif op == 'floordiv':
             if safe:
                 v2_safe = sympy.Piecewise(
@@ -15608,6 +15758,8 @@ def tree_to_sympy(cgp_eq, feature_vars, safe=None):
                 buf[idx] = v1 + v2
             elif node.op == '-':
                 buf[idx] = v1 - v2
+            elif node.op == 'delta':
+                buf[idx] = sympy.Abs(v1 - v2)
             elif node.op == '*':
                 buf[idx] = v1 * v2
 
@@ -15834,6 +15986,9 @@ def tree_to_sympy(cgp_eq, feature_vars, safe=None):
                 buf[idx] = sympy.floor(v1)
             elif node.op == 'ceil':
                 buf[idx] = sympy.ceiling(v1)
+            elif node.op == 'int':
+                # Truncate toward zero: sign(x)·floor(|x|)
+                buf[idx] = sympy.sign(v1) * sympy.floor(sympy.Abs(v1))
             elif node.op == 'cube':
                 buf[idx] = v1**3
             elif node.op == 'sinc':
@@ -15919,6 +16074,7 @@ def tree_to_sympy(cgp_eq, feature_vars, safe=None):
 def _binary_python_expr(op, v1, v2, safe):
     if op == '+': return f"({v1} + {v2})"
     if op == '-': return f"({v1} - {v2})"
+    if op == 'delta': return f"np.abs(({v1}) - ({v2}))"
     if op == '*': return f"({v1} * {v2})"
     if op == '/':
         if safe:
@@ -16034,6 +16190,7 @@ def _unary_python_expr(op, v1, safe):
     if op == 'sign':  return f"np.sign({v1})"
     if op == 'floor': return f"np.floor({v1})"
     if op == 'ceil':  return f"np.ceil({v1})"
+    if op == 'int':   return f"np.trunc({v1})"
     if op == 'cube':  return f"(({v1})**3)"
     if op == 'sinc':  return f"np.sinc(({v1}) / np.pi)"
     if op == 'xlogx':
@@ -16359,6 +16516,8 @@ def generate_script(models, dp, filename="best_model.py", X_data=None):
                 lines.append(f"    _buf[{slot}] = {v1} + {v2}")
             elif op == '-':
                 lines.append(f"    _buf[{slot}] = {v1} - {v2}")
+            elif op == 'delta':
+                lines.append(f"    _buf[{slot}] = _np.abs({v1} - {v2})")
             elif op == '*':
                 lines.append(f"    _buf[{slot}] = {v1} * {v2}")
             elif op == '/':
@@ -16381,6 +16540,8 @@ def generate_script(models, dp, filename="best_model.py", X_data=None):
                 lines.append(f"    _buf[{slot}] = {v1} - _np.floor({v1})")
             elif op == 'round':
                 lines.append(f"    _buf[{slot}] = _np.round({v1})")
+            elif op == 'int':
+                lines.append(f"    _buf[{slot}] = _np.trunc({v1})")
             elif op == 'floordiv':
                 lines.append(f"    _buf[{slot}] = _np.floor({v1} / _np.where(_np.abs({v2})>1e-8, {v2}, 1e-8))")
             elif op == 'relu':
@@ -30143,6 +30304,8 @@ def _generate_boosted_script(boosted_models, dp, X_data=None):
                 lines.append(f"    _buf[{slot}] = {v1} + {v2}")
             elif op == '-':
                 lines.append(f"    _buf[{slot}] = {v1} - {v2}")
+            elif op == 'delta':
+                lines.append(f"    _buf[{slot}] = _np.abs({v1} - {v2})")
             elif op == '*':
                 lines.append(f"    _buf[{slot}] = {v1} * {v2}")
             elif op == '/':
@@ -30165,6 +30328,8 @@ def _generate_boosted_script(boosted_models, dp, X_data=None):
                 lines.append(f"    _buf[{slot}] = {v1} - _np.floor({v1})")
             elif op == 'round':
                 lines.append(f"    _buf[{slot}] = _np.round({v1})")
+            elif op == 'int':
+                lines.append(f"    _buf[{slot}] = _np.trunc({v1})")
             elif op == 'floordiv':
                 lines.append(f"    _buf[{slot}] = _np.floor({v1} / _np.where(_np.abs({v2})>1e-8, {v2}, 1e-8))")
             elif op == 'relu':
@@ -30887,6 +31052,7 @@ def train_mode():
     global QUALITY_DIVERSITY_ENABLED
     global _INIT_PHASE
     global _BO_GP_FIT_CAP
+    global NORMALIZE_MODE
 
     # ---- Load CSV ----
     try:
@@ -31454,9 +31620,12 @@ def train_mode():
             print("  Invalid value; keeping default (off).")
 
 
+    # ---- Normalization (min-max) ----
+    _select_normalize_mode()
+
     # ---- Column config ----
     configs = get_configs(df)
-    dp = DataProcessor(scale=False)
+    dp = DataProcessor(scale=False, normalize=NORMALIZE_MODE)
     dp.set_configs(configs)
 
     print("Preprocessing...")
