@@ -1182,6 +1182,36 @@ DIVERSITY_INJECT_MAX_FRAC   = 0.15   # cap on the share of the pool replaced per
 # of extinction patience — below this, a behavioural collapse is treated as
 # benign convergence and left alone (operator boost still applies).
 DIVERSITY_INJECT_STAG_FRAC  = 0.25
+# ---- Small-population diversity tuning ----
+# Small pools (the user-set default doubles to a 100-member AFPO pool; harder
+# tasks are run with even smaller pools) collapse onto a single behaviour faster
+# than large ones AND suffer more when they do — there are fewer surviving
+# niches to recover from a clone takeover.  The three knobs below make the
+# collapse machinery population-aware: they reduce to EXACTLY the legacy values
+# at the default-and-larger pool (≥100) and only become more aggressive as the
+# pool shrinks, so existing runs are unchanged while small pools get a faster,
+# larger diversity rescue.
+#
+#   • The periodic diversity check — which drives both the structural-operator
+#     boost and the active de-duplication — fires more often as the pool
+#     shrinks, down to every DIVERSITY_CHECK_FREQ_MIN gens, capped at the legacy
+#     DIVERSITY_CHECK_FREQ_MAX for pools ≥ 2·MAX (so ≥100 is unchanged).
+DIVERSITY_CHECK_FREQ_MAX = 50
+DIVERSITY_CHECK_FREQ_MIN = 20
+#   • The active de-dup's stagnation gate is relaxed by collapse SEVERITY: a
+#     near-monomorphic pool no longer waits for the full stagnation bar (it can
+#     only do local search, so waiting wastes the run), while a mild collapse
+#     still must clear the full DIVERSITY_INJECT_STAG_FRAC so genuine
+#     convergence onto an optimum is left alone.  The bar is relaxed linearly
+#     from full (at the trip threshold) down to (1 - this)× at total collapse —
+#     never to zero.  Applies at every pool size, including the default.
+DIVERSITY_DEEP_COLLAPSE_RELAX = 0.5
+#   • The replacement cap scales up for small pools (a fixed 15% of a 30-member
+#     pool is only ~4 distinct newcomers — too few to actually re-diversify),
+#     bounded so we never replace more than this fraction in one fire; the
+#     legacy DIVERSITY_INJECT_MAX_FRAC is the floor, hit by pools ≥ the pivot.
+DIVERSITY_INJECT_MAX_FRAC_CAP = 0.30
+DIVERSITY_INJECT_PIVOT_POP    = 80   # pop at/above which the legacy 15% applies
 
 # ---- Down-Sampled Lexicase ----
 # Fraction of the training set used for DS-Lexicase each generation.
@@ -19097,6 +19127,63 @@ def _compute_island_diversity(population, X_probe):
         return 0.0
 
 
+def _diversity_check_freq(target_size):
+    """Generations between periodic diversity checks in ``evolve_afpo``.
+
+    Small pools collapse onto one behaviour faster and recover worse (fewer
+    surviving niches), so the check — which drives both the structural-operator
+    boost and the active de-duplication — fires more often as the pool shrinks,
+    down to ``DIVERSITY_CHECK_FREQ_MIN``.  Pools at/above 2× the cap (i.e. the
+    default 100-member AFPO pool and larger) keep the legacy
+    ``DIVERSITY_CHECK_FREQ_MAX`` cadence, so their behaviour is unchanged.
+    """
+    return max(DIVERSITY_CHECK_FREQ_MIN,
+               min(DIVERSITY_CHECK_FREQ_MAX, int(target_size) // 2))
+
+
+def _diversity_collapse_severity(unique_frac, n_fp):
+    """Behavioural-collapse severity in [0, 1].
+
+    0 at the clone-collapse trip threshold (``DIVERSITY_UNIQUE_FRAC``) and 1 at
+    total collapse (a single surviving fingerprint, ``unique_frac == 1/n_fp``).
+    Used to relax the de-dup stagnation gate as a pool goes monomorphic.
+    """
+    min_unique = 1.0 / max(1, int(n_fp))
+    denom = DIVERSITY_UNIQUE_FRAC - min_unique
+    if denom <= 1e-9:
+        return 0.0
+    sev = (DIVERSITY_UNIQUE_FRAC - float(unique_frac)) / denom
+    return float(min(1.0, max(0.0, sev)))
+
+
+def _diversity_dedup_stag_gate(unique_frac, n_fp):
+    """Stagnation fraction the active de-dup must exceed before firing.
+
+    Relaxed linearly by collapse severity: the full ``DIVERSITY_INJECT_STAG_FRAC``
+    at a mild collapse (so genuine convergence onto an optimum is left alone)
+    down to ``(1 - DIVERSITY_DEEP_COLLAPSE_RELAX)×`` of it at total collapse —
+    never zero.  A near-monomorphic pool can only do local search, so it should
+    not have to wait for full stagnation before fresh blood is injected.
+    """
+    sev = _diversity_collapse_severity(unique_frac, n_fp)
+    return DIVERSITY_INJECT_STAG_FRAC * (1.0 - DIVERSITY_DEEP_COLLAPSE_RELAX * sev)
+
+
+def _diversity_dedup_cap(target_size):
+    """Max number of behavioural clones replaced per active-de-dup fire.
+
+    Small pools get a proportionally larger refresh — a fixed
+    ``DIVERSITY_INJECT_MAX_FRAC`` (15%) of a 30-member pool is only ~4 distinct
+    newcomers, too few to re-diversify — scaling up as the pool shrinks below
+    ``DIVERSITY_INJECT_PIVOT_POP`` and bounded by ``DIVERSITY_INJECT_MAX_FRAC_CAP``.
+    Pools at/above the pivot keep the legacy fraction (the floor).
+    """
+    ts = max(1, int(target_size))
+    frac = DIVERSITY_INJECT_MAX_FRAC * max(1.0, DIVERSITY_INJECT_PIVOT_POP / ts)
+    frac = min(DIVERSITY_INJECT_MAX_FRAC_CAP, frac)
+    return max(1, int(ts * frac))
+
+
 def _trim_to_pareto_front(population, target_size):
     """
     Remove Pareto-dominated individuals.  If the Pareto front is still larger
@@ -19382,7 +19469,10 @@ def evolve_afpo(population, X, y_target, type_code,
     _ESCAPE_WINDOW     = max(40, min(120, n_generations // 4 + 20))
 
     # ── IMPROVEMENT (B7): diversity-driven structural boost ──────────────
-    _DIVERSITY_CHECK_FREQ   = 50
+    # Population-aware cadence: small pools check (and thus boost / de-dup) more
+    # often because they collapse faster and recover worse; pools ≥100 keep the
+    # legacy every-50-gens cadence (see _diversity_check_freq).
+    _DIVERSITY_CHECK_FREQ   = _diversity_check_freq(target_size)
     # Window extended from 50 → 80 gens.  At MIGRATION_FREQ=50 the previous
     # window expired in roughly the same chunk it was activated, so the
     # structural-mutation push barely propagated across chunk boundaries.
@@ -20042,8 +20132,14 @@ def evolve_afpo(population, X, y_target, type_code,
                 if _semantic_collapse or _clone_collapse:
                     _diversity_boost_until = gen + _DIVERSITY_BOOST_WINDOW
 
+                # Severity-scaled stagnation gate: a near-monomorphic pool fires
+                # the de-dup at a relaxed (never zero) stagnation bar — it can
+                # only do local search, so waiting for full stagnation wastes the
+                # run — while a mild collapse still clears the full bar so genuine
+                # convergence onto an optimum is left alone.
+                _dedup_stag_gate = _diversity_dedup_stag_gate(_unique_frac, _n_fp)
                 if (DIVERSITY_INJECTION_ENABLED and _clone_collapse
-                        and local_stag > DIVERSITY_INJECT_STAG_FRAC * ext_patience):
+                        and local_stag > _dedup_stag_gate * ext_patience):
                     _champ_div = min(population, key=lambda z: z.loss)
                     # Group by (recomputed) fingerprint; everything but the
                     # lowest-loss representative of a multi-member cluster is a
@@ -20061,7 +20157,11 @@ def evolve_afpo(population, X, y_target, type_code,
                         _grp.sort(key=lambda z: z.loss)
                         _surplus.extend(_grp[1:])
                     _surplus = [z for z in _surplus if z is not _champ_div]
-                    _cap = max(1, int(target_size * DIVERSITY_INJECT_MAX_FRAC))
+                    # Population-aware cap: small pools get a proportionally
+                    # larger refresh (15% of a tiny pool is too few distinct
+                    # newcomers to re-diversify); ≥80-member pools keep the
+                    # legacy 15% (see _diversity_dedup_cap).
+                    _cap = _diversity_dedup_cap(target_size)
                     random.shuffle(_surplus)
                     _surplus = _surplus[:_cap]
                     if _surplus:
