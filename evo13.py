@@ -1086,6 +1086,34 @@ AGE_GROUP_GRAD_FREQ         = 100  # every N generations, graduate best from eac
 AFPO_N_STAGES        = 1    # pipeline stages (1 = classic single-stage behaviour)
 AFPO_STAGE_GRAD_FREQ = 100  # gens between stage-graduation events (when AFPO_N_STAGES > 1)
 
+# ---- NSGA-III reference-point selection for AFPO survival ----
+# AFPO's survival trim (`_trim_to_pareto_front_3obj`) sorts the pool into
+# non-dominated fronts on (age, fitness, complexity) and admits whole fronts
+# best-first; the single *boundary* front that would overflow the target size
+# is admitted partially.  Classic AFPO (NSGA-II) picks that partial front by
+# crowding distance.  When NSGA3_ENABLED is True the boundary front is instead
+# chosen by NSGA-III's structured reference-point niching (Deb & Jain, 2014):
+# the candidate objectives are normalised onto the unit simplex, each member is
+# associated with its nearest of a set of evenly-spread aspiration directions
+# (Das-Dennis reference points), and survivors are drawn one per least-occupied
+# reference direction.  This gives a markedly more uniform spread across the
+# whole age/fitness/complexity trade-off surface than crowding distance, which
+# tends to clump on three objectives.
+#
+# Asked interactively right after competitive co-evolution; the PROMPT defaults
+# to YES.  The MODULE-level default stays False so non-interactive / direct
+# `_trim_to_pareto_front_3obj` callers (and the existing AFPO unit tests) keep
+# the documented NSGA-II contract bit-for-bit.  Applies to EVERY AFPO-family
+# model that shares the trim: single AFPO, multi-stage AFPO, islanded AFPO and
+# age-group islands.  The plain Island model and the Bayesian modes use their
+# own selection and are untouched.  On Linux fork the flag (set in the parent
+# before the worker pools are spawned) is inherited by every AFPO worker, the
+# same way the COEVOLUTION_* knobs are.
+NSGA3_ENABLED   = False   # flipped True by `_select_nsga3_mode()` (prompt default yes)
+NSGA3_DIVISIONS = 0       # Das-Dennis divisions p per objective; 0 = auto-size to pool
+NSGA3_REF_MAX   = 4000    # hard cap on the number of generated reference points
+_NSGA3_REF_CACHE = {}     # (n_obj, p) -> reference-point ndarray, built lazily/once
+
 # ---- AFPO escape-tolerance (local-minima escape) ----
 # AFPO decides survival purely through the (age, fitness, complexity) Pareto
 # trim — it has no simulated-annealing-style acceptance of a temporarily worse
@@ -5260,6 +5288,68 @@ def _select_coevolution_mode(n_rows):
                        f"max ×{COEVO_RES_MAX_FACTOR:g})")
     if COEVO_STRATIFY:          _guards.append("stratified-anchor")
     print(f"     Robustness guards: {', '.join(_guards) if _guards else 'none (legacy)'}.")
+
+
+def _select_nsga3_mode():
+    """Ask whether the AFPO survival trim should use NSGA-III reference-point
+    selection.  Asked right after competitive co-evolution.  DEFAULT YES.
+
+    When enabled, every AFPO-family model — single AFPO, multi-stage AFPO,
+    islanded AFPO and age-group islands — replaces NSGA-II crowding distance on
+    the boundary Pareto front with NSGA-III's structured reference-point niching
+    (Deb & Jain, 2014).  The plain Island model and the Bayesian modes use their
+    own selection and are unaffected.  Only the module flags are flipped here;
+    on Linux fork the AFPO worker pools inherit them, exactly like the
+    co-evolution knobs above.
+    """
+    global NSGA3_ENABLED, NSGA3_DIVISIONS
+
+    print("\n" + "─" * 70)
+    print("NSGA-III REFERENCE-POINT SELECTION  (Deb & Jain 2014, for AFPO)")
+    print("─" * 70)
+    print("  AFPO trims its pool to the non-dominated fronts on")
+    print("    (age, fitness, complexity)  — all minimised.")
+    print("  The single boundary front that would overflow the pool is admitted")
+    print("  partially.  Classic AFPO picks it by NSGA-II CROWDING DISTANCE,")
+    print("  which clumps unevenly once there are three objectives.")
+    print()
+    print("  NSGA-III instead fans a lattice of evenly-spread reference")
+    print("  directions across the normalised objective simplex and keeps one")
+    print("  survivor per least-occupied direction, giving a far more uniform")
+    print("  spread across the whole age/fitness/complexity trade-off surface")
+    print("  (better diversity of ages, accuracies and expression sizes).")
+    print()
+    print("  Applies to the AFPO family only — single AFPO, multi-stage AFPO,")
+    print("  islanded AFPO and age-group islands.  The plain Island model and")
+    print("  the Bayesian modes use their own selection and ignore this.")
+    print("─" * 70)
+    choice = input("Use NSGA-III reference-point selection? [Y/n]: ").strip().lower()
+    if choice.startswith('n'):
+        NSGA3_ENABLED = False
+        print("  NSGA-III disabled — AFPO uses NSGA-II crowding distance (legacy).")
+        return
+
+    NSGA3_ENABLED = True
+    _NSGA3_REF_CACHE.clear()   # drop any lattice cached under a previous config
+    div_in = input(
+        "  Reference-point divisions p per objective "
+        "[Enter = auto-size to the pool]: ").strip()
+    if div_in:
+        try:
+            NSGA3_DIVISIONS = max(1, int(div_in))
+        except ValueError:
+            NSGA3_DIVISIONS = 0
+            print("  Invalid value; auto-sizing reference points to the pool.")
+    else:
+        NSGA3_DIVISIONS = 0
+
+    if NSGA3_DIVISIONS > 0:
+        n_ref = _das_dennis_count(3, NSGA3_DIVISIONS)
+        print(f"  ✓  NSGA-III ENABLED  (p={NSGA3_DIVISIONS} → {n_ref} reference "
+              f"points on the 3-objective simplex).")
+    else:
+        print("  ✓  NSGA-III ENABLED  (reference points auto-sized to the AFPO "
+              "pool each run).")
 
 
 # ==========================================
@@ -19086,15 +19176,177 @@ def _active_graph_depth(tree):
         return 0
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# NSGA-III reference-point selection (Deb & Jain, 2014) for AFPO survival
+# ──────────────────────────────────────────────────────────────────────────
+def _das_dennis_count(n_obj, p):
+    """Number of Das-Dennis reference points for ``p`` divisions on an
+    ``n_obj``-objective unit simplex: the multiset coefficient
+    ``C(p + n_obj - 1, n_obj - 1)``."""
+    from math import comb
+    return comb(p + n_obj - 1, n_obj - 1)
+
+
+def _das_dennis_reference_points(n_obj, p):
+    """Das-Dennis structured reference points on the unit simplex.
+
+    Returns an ``(H, n_obj)`` array of all vectors whose coordinates are
+    multiples of ``1/p`` and sum to 1 (``H = C(p + n_obj - 1, n_obj - 1)``).
+    These are the canonical NSGA-III aspiration points — an even lattice of
+    directions fanned across the objective simplex.  ``p <= 0`` degenerates to
+    the single centroid direction.
+    """
+    if p <= 0:
+        return np.full((1, n_obj), 1.0 / n_obj, dtype=np.float64)
+    pts = []
+
+    def _recurse(remaining, depth, prefix):
+        # Last objective absorbs whatever division budget is left.
+        if depth == n_obj - 1:
+            pts.append(prefix + [remaining / p])
+            return
+        for i in range(remaining + 1):
+            _recurse(remaining - i, depth + 1, prefix + [i / p])
+
+    _recurse(p, 0, [])
+    return np.asarray(pts, dtype=np.float64)
+
+
+def _nsga3_reference_points(n_obj, target):
+    """Reference points sized so their count ``H`` ≳ ``target`` — roughly one
+    aspiration direction per surviving slot, the standard NSGA-III sizing
+    (Deb & Jain recommend ``H ≈ N``).  ``NSGA3_DIVISIONS`` overrides the
+    auto-sizing with an explicit number of divisions ``p``.  Results are cached
+    per ``(n_obj, p)`` so the lattice is built once per worker process.
+    """
+    if NSGA3_DIVISIONS and NSGA3_DIVISIONS > 0:
+        p = max(1, int(NSGA3_DIVISIONS))
+    else:
+        target = max(1, int(target))
+        p = 1
+        # Grow p while the lattice is still smaller than the pool AND the next
+        # step would not blow past the hard reference-point cap.
+        while (_das_dennis_count(n_obj, p) < target
+               and _das_dennis_count(n_obj, p + 1) <= NSGA3_REF_MAX):
+            p += 1
+    key = (int(n_obj), int(p))
+    pts = _NSGA3_REF_CACHE.get(key)
+    if pts is None:
+        pts = _das_dennis_reference_points(n_obj, p)
+        if pts.shape[0] > NSGA3_REF_MAX:
+            # Deterministically thin an over-large lattice while keeping spread.
+            sel = np.linspace(0, pts.shape[0] - 1, NSGA3_REF_MAX).astype(np.int64)
+            pts = pts[np.unique(sel)]
+        _NSGA3_REF_CACHE[key] = pts
+    return pts
+
+
+def _nsga3_normalise(M):
+    """NSGA-III adaptive normalisation of an objective matrix ``M`` (rows =
+    candidates, cols = minimised objectives).
+
+    Translates by the ideal point, finds the per-axis extreme points via the
+    achievement scalarising function, fits the linear hyperplane through them
+    and divides by its axis intercepts so the candidates sit on / inside the
+    unit simplex.  Falls back to the translated per-axis range whenever the
+    hyperplane is degenerate (singular system or non-positive intercepts),
+    which is common early on when the front is tiny or axis-aligned.
+    """
+    n_obj = M.shape[1]
+    ideal = M.min(axis=0)
+    Mt = M - ideal                                   # translate to the ideal
+
+    # Extreme point per axis: argmin of ASF(x, e_j) with zeros softened so the
+    # max picks out the j-th axis (Deb & Jain use w_i = 1e-6 off-axis).
+    w = np.full((n_obj, n_obj), 1e-6, dtype=np.float64)
+    np.fill_diagonal(w, 1.0)
+    asf = np.max(Mt[:, None, :] / w[None, :, :], axis=2)   # (m, n_obj)
+    extreme = np.argmin(asf, axis=0)
+
+    intercepts = None
+    if np.unique(extreme).size == n_obj:
+        try:
+            Z = Mt[extreme]                          # (n_obj, n_obj)
+            coef = np.linalg.solve(Z, np.ones(n_obj))
+            if np.all(np.isfinite(coef)) and np.all(coef > 1e-12):
+                intercepts = 1.0 / coef
+        except np.linalg.LinAlgError:
+            intercepts = None
+    if intercepts is None or not np.all(np.isfinite(intercepts)):
+        intercepts = Mt.max(axis=0)
+    intercepts = np.where(intercepts > 1e-12, intercepts, 1e-12)
+    return Mt / intercepts
+
+
+def _nsga3_select_from_front(A, admitted, front, need, target_size):
+    """Pick ``need`` survivors from the boundary front by NSGA-III niching.
+
+    ``A`` is the full ``(n, n_obj)`` minimised-objective matrix, ``admitted``
+    the indices already secured from the fully-admitted earlier fronts, and
+    ``front`` the boundary-front indices.  The normalisation/association set is
+    ``St = admitted ∪ front`` (the canonical NSGA-III ``S_t``); niche counts are
+    seeded from the already-admitted members and survivors are taken one at a
+    time from the least-occupied reference direction, ties broken by smallest
+    perpendicular distance (a deterministic, reproducible stand-in for the
+    paper's random pick).  Returns a list of chosen indices into ``A``.
+    """
+    front = np.asarray(front, dtype=np.int64)
+    if need <= 0:
+        return []
+    if need >= front.size:
+        return [int(i) for i in front]
+
+    admitted = np.asarray(admitted, dtype=np.int64)
+    n_adm = admitted.size
+    St = np.concatenate([admitted, front]) if n_adm else front
+
+    N = _nsga3_normalise(A[St].astype(np.float64))   # normalised objectives
+    R = _nsga3_reference_points(A.shape[1], target_size)
+
+    # Associate each candidate with its nearest reference DIRECTION (line from
+    # the origin through r): perpendicular distance² = |n|² − (n·r̂)².
+    Rn = R / np.linalg.norm(R, axis=1, keepdims=True).clip(min=1e-12)
+    proj = N @ Rn.T                                  # (|St|, H)
+    n_sq = np.sum(N * N, axis=1, keepdims=True)      # (|St|, 1)
+    dperp2 = np.maximum(n_sq - proj * proj, 0.0)
+    assoc = np.argmin(dperp2, axis=1)
+    dmin  = dperp2[np.arange(dperp2.shape[0]), assoc]
+
+    H = R.shape[0]
+    rho = np.zeros(H, dtype=np.int64)                # niche counts
+    if n_adm:
+        np.add.at(rho, assoc[:n_adm], 1)
+
+    bnd_assoc = assoc[n_adm:]                         # ref per boundary member
+    bnd_dist  = dmin[n_adm:]                          # its perpendicular distance
+    available = np.ones(front.size, dtype=bool)
+    chosen = []
+    while len(chosen) < need:
+        # Members whose reference niche is currently least filled; among those,
+        # take the one lying closest to its reference line.
+        avail_idx = np.where(available)[0]
+        rmin = rho[bnd_assoc[avail_idx]].min()
+        cand = avail_idx[rho[bnd_assoc[avail_idx]] == rmin]
+        pick = int(cand[np.argmin(bnd_dist[cand])])
+        available[pick] = False
+        rho[bnd_assoc[pick]] += 1
+        chosen.append(int(front[pick]))
+    return chosen
+
+
 def _trim_to_pareto_front_3obj(population, target_size):
     """
-    NSGA-II survival selection on (age, fitness, complexity) — all minimised.
+    Pareto survival selection on (age, fitness, complexity) — all minimised.
 
     Individuals are sorted into successive non-dominated fronts (F0, F1, …);
     whole fronts are admitted best-first until the next one would overflow
-    ``target_size``, and that boundary front is admitted partially by crowding
-    distance (least-crowded first).  The population is therefore held AT
-    ``target_size`` whenever enough individuals exist.
+    ``target_size``, and that boundary front is admitted partially.  The
+    boundary front is trimmed by NSGA-II crowding distance (least-crowded
+    first) by default, or — when the module flag ``NSGA3_ENABLED`` is set (the
+    interactive default for every AFPO-family model) — by NSGA-III structured
+    reference-point niching, which spreads the survivors more evenly across the
+    age/fitness/complexity trade-off surface.  Either way the population is held
+    AT ``target_size`` whenever enough individuals exist.
 
     WHY THIS MATTERS — the previous implementation kept *only* the first
     non-dominated front and discarded every dominated individual outright.
@@ -19154,26 +19406,39 @@ def _trim_to_pareto_front_3obj(population, target_size):
         remaining[placed] = -1                     # exclude already-placed
         cur = np.where(remaining == 0)[0]
 
-    # ── Admit fronts best-first; crowding-trim the boundary front ────────
+    # ── Admit fronts best-first; trim the single boundary front ──────────
+    # The boundary (first overflowing) front is admitted partially: by
+    # NSGA-III reference-point niching when NSGA3_ENABLED, otherwise by the
+    # classic NSGA-II crowding distance.  Either way exactly ``target_size``
+    # individuals survive when the pool is large enough.
     keep_idx = []
     for front in fronts:
         if len(keep_idx) + front.size <= target_size:
             keep_idx.extend(int(i) for i in front)
         else:
-            need  = target_size - len(keep_idx)
-            cd    = _crowding_distance_matrix(A[front])
-            # Least-crowded first (NSGA-II).  Exact ties — individuals with an
-            # identical (age, fitness, complexity) Pareto profile produce equal
-            # crowding distance — are broken toward the structurally simpler
-            # solution: lower complexity, then shallower active-graph depth (the
-            # requirement's parsimony tie-break).  ``np.lexsort`` ranks by its
-            # LAST key first, so ``-cd`` stays the dominant key and complexity /
-            # depth only separate genuine ties.
-            depth = np.fromiter(
-                (_active_graph_depth(population[int(i)].tree) for i in front),
-                dtype=np.float64, count=front.size)
-            order = np.lexsort((depth, A[front, 2], -cd))
-            keep_idx.extend(int(front[t]) for t in order[:need])
+            need = target_size - len(keep_idx)
+            if NSGA3_ENABLED:
+                # NSGA-III: spread the boundary survivors across an even fan of
+                # reference directions on the normalised (age, fitness,
+                # complexity) simplex.  ``keep_idx`` (the already-admitted
+                # fronts) seeds the per-direction niche counts.
+                keep_idx.extend(
+                    _nsga3_select_from_front(A, keep_idx, front, need,
+                                             target_size))
+            else:
+                cd = _crowding_distance_matrix(A[front])
+                # Least-crowded first (NSGA-II).  Exact ties — individuals with
+                # an identical (age, fitness, complexity) Pareto profile produce
+                # equal crowding distance — are broken toward the structurally
+                # simpler solution: lower complexity, then shallower active-graph
+                # depth (the requirement's parsimony tie-break).  ``np.lexsort``
+                # ranks by its LAST key first, so ``-cd`` stays the dominant key
+                # and complexity / depth only separate genuine ties.
+                depth = np.fromiter(
+                    (_active_graph_depth(population[int(i)].tree) for i in front),
+                    dtype=np.float64, count=front.size)
+                order = np.lexsort((depth, A[front, 2], -cd))
+                keep_idx.extend(int(front[t]) for t in order[:need])
             break
 
     survivors = [population[k] for k in keep_idx]
@@ -31089,6 +31354,13 @@ def train_mode():
     # co-evolved fitness-case subset each chunk in place of random mini-batches,
     # so its own parasite-subset-size knob stands in for the batch size.
     _select_coevolution_mode(df.shape[0])
+
+    # ---- NSGA-III reference-point selection for AFPO survival ----
+    # Asked right after co-evolution.  Default YES.  Swaps NSGA-II crowding for
+    # NSGA-III reference-point niching on the AFPO boundary front; applies to
+    # the AFPO family (single / multi-stage / islanded / age-group) and is
+    # ignored by the plain Island model and the Bayesian modes.
+    _select_nsga3_mode()
 
     # ---- Batch size ----
     if COEVOLUTION_ENABLED:
