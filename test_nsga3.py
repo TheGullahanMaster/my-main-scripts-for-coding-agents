@@ -272,6 +272,176 @@ def test_flag_off_matches_legacy_nsga2_tiebreak():
     print("PASS test_flag_off_matches_legacy_nsga2_tiebreak")
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# Optional modules: A-NSGA-III adaptation and the NSGA-III-UR trigger
+# (Farias, Santos & Nobre, 2025).  The base path ("basic") is unchanged; these
+# cover the inclusion/exclusion operator, the Spreading-Index trigger, and the
+# variant toggle wiring.
+# ──────────────────────────────────────────────────────────────────────────
+def test_ur_threshold_matches_paper_cubic():
+    # threshold(m) = c3 m³ + c2 m² + c1 m + c0 with the paper's coefficients.
+    # It is NEGATIVE for few objectives (m <= 6) and crosses positive by m = 10,
+    # so at the 3-objective AFPO trade-off the default trigger flags any
+    # non-trivial front as irregular (matching the paper's reported tendency).
+    c3, c2, c1, c0 = e.NSGA3_UR_THRESH_COEF
+    for m in (3, 4, 5, 6, 8, 10):
+        expect = c3 * m ** 3 + c2 * m ** 2 + c1 * m + c0
+        assert abs(e._nsga3_ur_threshold(m) - expect) < 1e-15, m
+    for m in (3, 4, 5, 6):
+        assert e._nsga3_ur_threshold(m) < 0, m
+    assert e._nsga3_ur_threshold(5) < 0 < e._nsga3_ur_threshold(10)
+    print("PASS test_ur_threshold_matches_paper_cubic")
+
+
+def test_spreading_index_formula():
+    # SI = sqrt(Σ_i Σ_j f_ij²) / h, scaling as 1/h, zero on an ideal front.
+    old_h = e.NSGA3_UR_H
+    try:
+        N = np.array([[0., 0., 1.], [1., 0., 0.]])
+        e.NSGA3_UR_H = 4.0
+        assert abs(e._nsga3_spreading_index(N) - np.sqrt(2.0) / 4.0) < 1e-12
+        e.NSGA3_UR_H = 2.0
+        assert abs(e._nsga3_spreading_index(N) - np.sqrt(2.0) / 2.0) < 1e-12
+        e.NSGA3_UR_H = 4.0
+        assert e._nsga3_spreading_index(np.zeros((5, 3))) == 0.0
+    finally:
+        e.NSGA3_UR_H = old_h
+    print("PASS test_spreading_index_formula")
+
+
+def test_ansga3_inclusion_and_exclusion():
+    R0 = e._das_dennis_reference_points(3, 2)   # 6 base vectors, incl. (1,0,0)
+    # Crowd the (1,0,0) vertex direction (>= 2 members) and seed two members on
+    # the local-simplex directions inclusion will add, so those survive
+    # exclusion: z + (e_k - z)/3 around (1,0,0) is (2/3,1/3,0) and (2/3,0,1/3).
+    N = np.array([
+        [0.95, 0.03, 0.02], [0.96, 0.02, 0.02], [0.94, 0.03, 0.03],  # crowd vertex
+        [0.66, 0.33, 0.01],                                          # -> (2/3,1/3,0)
+        [0.66, 0.01, 0.33],                                          # -> (2/3,0,1/3)
+        [0.0, 1.0, 0.0], [0.0, 0.0, 1.0],                            # other vertices
+        [0.5, 0.5, 0.0], [0.5, 0.0, 0.5], [0.0, 0.5, 0.5],           # edge mids
+    ])
+    R = e._ansga3_adapt_reference_points(N, R0)
+    assert R.shape[0] > R0.shape[0], (R0.shape[0], R.shape[0])     # inclusion grew it
+    assert np.allclose(R.sum(axis=1), 1.0, atol=1e-9)             # stays on simplex
+    assert (R >= -1e-9).all()                                     # non-negative
+    for r in R0:                                                  # base never dropped
+        assert np.min(np.sum((R - r) ** 2, axis=1)) < 1e-12
+    cap = min(int(np.ceil(e.NSGA3_ADAPT_MAX_FRAC * R0.shape[0])), e.NSGA3_REF_MAX)
+    assert R.shape[0] <= cap                                      # bounded by the cap
+    assert np.array_equal(R, e._ansga3_adapt_reference_points(N, R0))  # deterministic
+    print("PASS test_ansga3_inclusion_and_exclusion")
+
+
+def test_ansga3_no_adaptation_when_uncrowded():
+    # One member per base direction -> no niche count reaches 2 -> set unchanged.
+    R0 = e._das_dennis_reference_points(3, 2)
+    R = e._ansga3_adapt_reference_points(R0.copy(), R0)
+    assert np.array_equal(R, R0)
+    print("PASS test_ansga3_no_adaptation_when_uncrowded")
+
+
+def test_ansga3_respects_cap():
+    R0 = e._das_dennis_reference_points(3, 4)   # 15 base vectors
+    old = e.NSGA3_ADAPT_MAX_FRAC
+    try:
+        e.NSGA3_ADAPT_MAX_FRAC = 1.2
+        rng = np.random.default_rng(0)
+        N = np.abs(rng.standard_normal((200, 3)))   # dense cloud, many crowded dirs
+        N = N / N.sum(axis=1, keepdims=True)
+        R = e._ansga3_adapt_reference_points(N, R0)
+        assert R0.shape[0] <= R.shape[0] <= int(np.ceil(1.2 * R0.shape[0])), R.shape[0]
+    finally:
+        e.NSGA3_ADAPT_MAX_FRAC = old
+    print("PASS test_ansga3_respects_cap")
+
+
+def test_variant_module_default_is_basic():
+    # Non-interactive callers default to the original fixed-lattice behaviour.
+    import subprocess, sys
+    out = subprocess.run(
+        [sys.executable, "-c", "import evo13; print(evo13.NSGA3_VARIANT)"],
+        capture_output=True, text=True)
+    assert out.stdout.strip() == "basic", out.stdout + out.stderr
+    print("PASS test_variant_module_default_is_basic")
+
+
+def test_variants_hold_target_and_keep_champion():
+    e.set_ops_mode(True); e._INIT_PHASE = False
+    old_en, old_var = e.NSGA3_ENABLED, e.NSGA3_VARIANT
+    try:
+        e.NSGA3_ENABLED = True
+        for variant in ("basic", "a", "ur"):
+            e.NSGA3_VARIANT = variant
+            random.seed(0); np.random.seed(0)
+            pop = [_mk(random.randint(0, 30), random.random() * 100,
+                       random.randint(1, 60)) for _ in range(160)]
+            champ = min(pop, key=lambda x: x.loss)
+            surv = e._trim_to_pareto_front_3obj(pop, 80)
+            assert len(surv) == 80, (variant, len(surv))
+            assert champ in surv, variant
+            assert len({id(s) for s in surv}) == 80, variant
+    finally:
+        e.NSGA3_ENABLED, e.NSGA3_VARIANT = old_en, old_var
+    print("PASS test_variants_hold_target_and_keep_champion")
+
+
+def _corners_and_cluster():
+    corners = [_mk(0, 10, 10), _mk(10, 0, 10), _mk(10, 10, 0)]
+    cluster = [_mk(4, 6, 5), _mk(5, 5, 5), _mk(6, 4, 5), _mk(5, 6, 4),
+               _mk(4, 5, 6), _mk(3, 7, 5), _mk(7, 3, 5), _mk(5, 4, 6),
+               _mk(6, 5, 4)]
+    return corners + cluster
+
+
+def test_variant_a_reroutes_boundary_selection():
+    """A-NSGA-III adaptation changes which interior members survive on a
+    constructed boundary front — proof the module re-routes selection."""
+    e.set_ops_mode(True); e._INIT_PHASE = False
+    old_en, old_var = e.NSGA3_ENABLED, e.NSGA3_VARIANT
+    try:
+        pop = _corners_and_cluster()
+        e.NSGA3_ENABLED = True
+        e.NSGA3_VARIANT = "basic"
+        b = _profiles(e._trim_to_pareto_front_3obj(list(pop), 5))
+        e.NSGA3_VARIANT = "a"
+        a = _profiles(e._trim_to_pareto_front_3obj(list(pop), 5))
+        assert a != b, "A-NSGA-III should re-route the boundary selection"
+    finally:
+        e.NSGA3_ENABLED, e.NSGA3_VARIANT = old_en, old_var
+    print("PASS test_variant_a_reroutes_boundary_selection")
+
+
+def test_ur_trigger_gates_adaptation():
+    """UR adapts only when SI > threshold(m).  A huge threshold makes the front
+    'regular' so UR falls back to the fixed lattice (== basic); the default
+    (negative at m = 3) threshold makes UR adapt exactly like A-NSGA-III."""
+    e.set_ops_mode(True); e._INIT_PHASE = False
+    old_en, old_var, old_coef = (e.NSGA3_ENABLED, e.NSGA3_VARIANT,
+                                 e.NSGA3_UR_THRESH_COEF)
+    try:
+        pop = _corners_and_cluster()
+        e.NSGA3_ENABLED = True
+        e.NSGA3_VARIANT = "basic"
+        base = _profiles(e._trim_to_pareto_front_3obj(list(pop), 5))
+        e.NSGA3_VARIANT = "a"
+        adapt = _profiles(e._trim_to_pareto_front_3obj(list(pop), 5))
+
+        e.NSGA3_VARIANT = "ur"
+        e.NSGA3_UR_THRESH_COEF = (0.0, 0.0, 0.0, 1e9)   # threshold >> SI -> regular
+        ur_regular = _profiles(e._trim_to_pareto_front_3obj(list(pop), 5))
+        assert ur_regular == base, "UR on a 'regular' front must equal basic"
+
+        e.NSGA3_UR_THRESH_COEF = old_coef               # default -> irregular
+        ur_default = _profiles(e._trim_to_pareto_front_3obj(list(pop), 5))
+        assert ur_default == adapt, "UR with the default threshold must adapt"
+        assert ur_default != ur_regular, "the UR gate must change the outcome here"
+    finally:
+        (e.NSGA3_ENABLED, e.NSGA3_VARIANT,
+         e.NSGA3_UR_THRESH_COEF) = old_en, old_var, old_coef
+    print("PASS test_ur_trigger_gates_adaptation")
+
+
 if __name__ == "__main__":
     test_das_dennis_points()
     test_reference_points_autosize_cache_and_override()
@@ -283,4 +453,14 @@ if __name__ == "__main__":
     test_nsga3_differs_from_nsga2()
     test_module_default_is_off()
     test_flag_off_matches_legacy_nsga2_tiebreak()
+    # Optional A-NSGA-III / NSGA-III-UR modules.
+    test_ur_threshold_matches_paper_cubic()
+    test_spreading_index_formula()
+    test_ansga3_inclusion_and_exclusion()
+    test_ansga3_no_adaptation_when_uncrowded()
+    test_ansga3_respects_cap()
+    test_variant_module_default_is_basic()
+    test_variants_hold_target_and_keep_champion()
+    test_variant_a_reroutes_boundary_selection()
+    test_ur_trigger_gates_adaptation()
     print("\nALL NSGA-III TESTS PASSED")

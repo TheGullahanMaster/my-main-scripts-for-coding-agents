@@ -1114,6 +1114,49 @@ NSGA3_DIVISIONS = 0       # Das-Dennis divisions p per objective; 0 = auto-size 
 NSGA3_REF_MAX   = 4000    # hard cap on the number of generated reference points
 _NSGA3_REF_CACHE = {}     # (n_obj, p) -> reference-point ndarray, built lazily/once
 
+# ---- NSGA-III variant: basic / A-NSGA-III / NSGA-III-UR ----
+# On top of the fixed Das-Dennis lattice ("basic", the default), two optional
+# modules from Farias, Santos & Nobre (2025, "A Non-Dominated Sorting
+# Evolutionary Algorithm Updating When Required") can be switched on.  Both only
+# ever change WHICH reference vectors guide the boundary-front niching — the
+# normalise → associate → niche-preserve selection is otherwise the stock
+# NSGA-III path — so "basic" stays bit-for-bit the original behaviour and is the
+# default for every direct / non-interactive caller:
+#
+#   "a"  — A-NSGA-III (Jain & Deb, 2014): the reference set is ADAPTED to the
+#          current front each trim by two operators.  INCLUSION adds a local
+#          simplex of m vectors  z + (e_k − z)/m  around every over-crowded
+#          reference vector (niche count >= 2), giving finer resolution where
+#          solutions actually cluster; EXCLUSION drops any ADDED vector that
+#          ends a pass with no associated solution.  The original Das-Dennis
+#          vectors are never removed, so the lattice can only gain detail.
+#
+#   "ur" — NSGA-III-UR: the same A-NSGA-III adaptation, but GATED by the
+#          Update-when-Required trigger.  The Spreading Index
+#          SI = sqrt(ΣΣ f_ij²)/h (h = NSGA3_UR_H) of the normalised front is
+#          compared against a cubic threshold(m) (NSGA3_UR_THRESH_COEF);
+#          adaptation runs only when SI > threshold, i.e. only when the front
+#          looks IRREGULAR, and the plain fixed lattice is kept otherwise.  The
+#          paper evaluates this once at ~20 % of the run; because our survival
+#          trim is stateless and re-entered on every birth across many
+#          independent sub-populations, we evaluate the (very cheap) SI test on
+#          each trim instead — the same criterion, checked continuously rather
+#          than latched once.  NB the paper's cubic gives threshold(m) < 0 for
+#          m <= 6, so with the default coefficients and the 3-objective AFPO
+#          trade-off the trigger fires for any non-trivial front (matching the
+#          paper's reported tendency to flag low-objective fronts as irregular);
+#          h and the coefficients below are exposed for tuning / many-objective
+#          reuse.
+NSGA3_VARIANT = "basic"   # "basic" | "a" (A-NSGA-III) | "ur" (NSGA-III-UR)
+# A-NSGA-III inclusion cap: added vectors are bounded to this multiple of the
+# base lattice size (and to NSGA3_REF_MAX), so adaptation refines without the
+# reference set growing without bound on a pathologically clustered front.
+NSGA3_ADAPT_MAX_FRAC = 1.5
+# UR trigger (Farias et al. 2025, Eqs. 1–2; de Farias & Araújo 2022).
+NSGA3_UR_H = 4.0          # Spreading-Index normalisation factor h (paper: 4)
+# threshold(m) = c3·m³ + c2·m² + c1·m + c0  (cubic regression from the paper)
+NSGA3_UR_THRESH_COEF = (-0.00001989, 0.0002034, 0.03376, -0.2373)
+
 # ---- AFPO escape-tolerance (local-minima escape) ----
 # AFPO decides survival purely through the (age, fitness, complexity) Pareto
 # trim — it has no simulated-annealing-style acceptance of a temporarily worse
@@ -5302,7 +5345,7 @@ def _select_nsga3_mode():
     on Linux fork the AFPO worker pools inherit them, exactly like the
     co-evolution knobs above.
     """
-    global NSGA3_ENABLED, NSGA3_DIVISIONS
+    global NSGA3_ENABLED, NSGA3_DIVISIONS, NSGA3_VARIANT
 
     print("\n" + "─" * 70)
     print("NSGA-III REFERENCE-POINT SELECTION  (Deb & Jain 2014, for AFPO)")
@@ -5343,13 +5386,36 @@ def _select_nsga3_mode():
     else:
         NSGA3_DIVISIONS = 0
 
+    # Optional adaptation modules (paper: NSGA-III-UR, Farias et al. 2025).
+    print()
+    print("  Reference-vector module (Farias et al. 2025):")
+    print("    basic — fixed Das-Dennis lattice (original NSGA-III).")
+    print("    a     — A-NSGA-III: adapt the lattice every trim (add vectors")
+    print("            around crowded directions, drop unused added ones).")
+    print("    ur    — NSGA-III-UR: A-NSGA-III adaptation, but only when the")
+    print("            Spreading Index flags the front as irregular.")
+    var_in = input("  Module [basic/a/ur, Enter = basic]: ").strip().lower()
+    if var_in in ("a", "ansga3", "a-nsga-iii", "adaptive"):
+        NSGA3_VARIANT = "a"
+    elif var_in in ("ur", "nsga-iii-ur", "uwr", "update"):
+        NSGA3_VARIANT = "ur"
+    else:
+        if var_in and var_in != "basic":
+            print("  Unrecognised module; using 'basic'.")
+        NSGA3_VARIANT = "basic"
+
+    _variant_desc = {
+        "basic": "fixed Das-Dennis lattice",
+        "a":     "A-NSGA-III adaptive reference vectors",
+        "ur":    "NSGA-III-UR (adapt only when the front is irregular)",
+    }[NSGA3_VARIANT]
     if NSGA3_DIVISIONS > 0:
         n_ref = _das_dennis_count(3, NSGA3_DIVISIONS)
         print(f"  ✓  NSGA-III ENABLED  (p={NSGA3_DIVISIONS} → {n_ref} reference "
-              f"points on the 3-objective simplex).")
+              f"points on the 3-objective simplex; module: {_variant_desc}).")
     else:
-        print("  ✓  NSGA-III ENABLED  (reference points auto-sized to the AFPO "
-              "pool each run).")
+        print(f"  ✓  NSGA-III ENABLED  (reference points auto-sized to the AFPO "
+              f"pool each run; module: {_variant_desc}).")
 
 
 # ==========================================
@@ -19278,6 +19344,116 @@ def _nsga3_normalise(M):
     return Mt / intercepts
 
 
+def _nsga3_associate(N, R):
+    """Associate each normalised candidate (row of ``N``) with its nearest
+    reference DIRECTION — the line from the origin through a row of ``R``.
+
+    Returns ``(assoc, dmin)`` where ``assoc[i]`` indexes the closest reference
+    vector to candidate ``i`` by perpendicular distance and ``dmin[i]`` is that
+    squared distance ``|n|² − (n·r̂)²``.  Shared by the boundary-front niching
+    and the A-NSGA-III adaptation so both measure association identically.
+    """
+    Rn = R / np.linalg.norm(R, axis=1, keepdims=True).clip(min=1e-12)
+    proj = N @ Rn.T                                  # (|N|, H)
+    n_sq = np.sum(N * N, axis=1, keepdims=True)      # (|N|, 1)
+    dperp2 = np.maximum(n_sq - proj * proj, 0.0)
+    assoc = np.argmin(dperp2, axis=1)
+    dmin = dperp2[np.arange(dperp2.shape[0]), assoc]
+    return assoc, dmin
+
+
+def _nsga3_ur_threshold(m):
+    """Cubic regression threshold on the Spreading Index (Farias et al. 2025,
+    Eq. 2): a front whose SI sits below it is treated as REGULAR (keep the fixed
+    lattice), above it as IRREGULAR (enable A-NSGA-III adaptation).  Coefficients
+    live in ``NSGA3_UR_THRESH_COEF`` for tuning / many-objective reuse."""
+    c3, c2, c1, c0 = NSGA3_UR_THRESH_COEF
+    m = float(m)
+    return c3 * m ** 3 + c2 * m ** 2 + c1 * m + c0
+
+
+def _nsga3_spreading_index(N):
+    """Spreading Index of a normalised objective matrix (Farias et al. 2025,
+    Eq. 1): ``SI = sqrt(Σ_i Σ_j f_ij²) / h`` with ``h = NSGA3_UR_H``.  A larger
+    SI signals a more dispersed / irregular fitness distribution."""
+    h = NSGA3_UR_H if NSGA3_UR_H else 1.0
+    return float(np.sqrt(np.sum(np.asarray(N, dtype=np.float64) ** 2))) / h
+
+
+def _nsga3_ur_should_adapt(N, m):
+    """NSGA-III-UR decision: adapt the reference vectors iff the front's
+    Spreading Index exceeds the cubic threshold for ``m`` objectives, i.e. only
+    when the front is judged irregular."""
+    return _nsga3_spreading_index(N) > _nsga3_ur_threshold(m)
+
+
+def _ansga3_adapt_reference_points(N, R_base):
+    """A-NSGA-III reference-vector adaptation (Jain & Deb, 2014) for one trim.
+
+    Given the normalised candidate matrix ``N`` (rows = members of ``S_t``) and
+    the base Das-Dennis lattice ``R_base``, return an adapted reference set:
+
+      • INCLUSION — every reference vector with niche count >= 2 (more than one
+        associated member) spawns ``m`` new vectors on a local simplex
+        ``z + (e_k − z)/m`` centred on it, refining resolution where members
+        cluster.  Applied iteratively — newly added vectors may themselves split
+        — until no vector is crowded or the size cap
+        ``min(NSGA3_ADAPT_MAX_FRAC·|R_base|, NSGA3_REF_MAX)`` is reached.
+      • EXCLUSION — any ADDED vector left with niche count 0 after inclusion is
+        dropped; the original Das-Dennis vectors are always retained.
+
+    New vectors stay on the unit simplex (non-negative, sum to one).  The
+    procedure is deterministic — densest-crowded vectors split first, ties by
+    index — so the survival trim stays reproducible.
+    """
+    R = np.array(R_base, dtype=np.float64, copy=True)
+    m = R.shape[1]
+    if m < 2 or N.shape[0] == 0:
+        return R
+    n_base = R.shape[0]
+    cap = min(int(np.ceil(NSGA3_ADAPT_MAX_FRAC * n_base)), int(NSGA3_REF_MAX))
+    is_base = np.ones(n_base, dtype=bool)
+    eye = np.eye(m, dtype=np.float64)
+    expanded = set()                                 # vectors already split
+
+    while R.shape[0] < cap:
+        assoc, _ = _nsga3_associate(N, R)
+        rho = np.bincount(assoc, minlength=R.shape[0])
+        cand = [j for j in range(R.shape[0])
+                if rho[j] >= 2 and j not in expanded]
+        if not cand:
+            break
+        cand.sort(key=lambda j: (-int(rho[j]), j))   # densest first, then index
+        new_rows = []
+        for j in cand:
+            if R.shape[0] + len(new_rows) >= cap:
+                break
+            block = R[j] + (eye - R[j]) / m          # (m, m) local simplex
+            for row in block:
+                if (row < -1e-12).any():
+                    continue                         # off-simplex guard
+                if R.shape[0] and np.min(
+                        np.sum((R - row) ** 2, axis=1)) < 1e-12:
+                    continue                         # duplicates an existing
+                if any(np.sum((r - row) ** 2) < 1e-12 for r in new_rows):
+                    continue                         # duplicates a queued one
+                new_rows.append(row)
+            expanded.add(j)
+        if not new_rows:
+            break
+        R = np.vstack([R, np.asarray(new_rows, dtype=np.float64)])
+        is_base = np.concatenate(
+            [is_base, np.zeros(len(new_rows), dtype=bool)])
+
+    if R.shape[0] > n_base:                          # EXCLUSION pass
+        assoc, _ = _nsga3_associate(N, R)
+        rho = np.bincount(assoc, minlength=R.shape[0])
+        keep = is_base | (rho > 0)
+        if not keep.all():
+            R = R[keep]
+    return R
+
+
 def _nsga3_select_from_front(A, admitted, front, need, target_size):
     """Pick ``need`` survivors from the boundary front by NSGA-III niching.
 
@@ -19303,14 +19479,17 @@ def _nsga3_select_from_front(A, admitted, front, need, target_size):
     N = _nsga3_normalise(A[St].astype(np.float64))   # normalised objectives
     R = _nsga3_reference_points(A.shape[1], target_size)
 
+    # Optional A-NSGA-III / NSGA-III-UR reference-vector adaptation: refine the
+    # lattice around crowded directions (always for "a"; for "ur" only when the
+    # Spreading Index flags the front as irregular).  "basic" leaves R fixed, so
+    # this whole block is skipped and the selection is the stock NSGA-III path.
+    if NSGA3_VARIANT in ("a", "ur"):
+        if NSGA3_VARIANT == "a" or _nsga3_ur_should_adapt(N, A.shape[1]):
+            R = _ansga3_adapt_reference_points(N, R)
+
     # Associate each candidate with its nearest reference DIRECTION (line from
     # the origin through r): perpendicular distance² = |n|² − (n·r̂)².
-    Rn = R / np.linalg.norm(R, axis=1, keepdims=True).clip(min=1e-12)
-    proj = N @ Rn.T                                  # (|St|, H)
-    n_sq = np.sum(N * N, axis=1, keepdims=True)      # (|St|, 1)
-    dperp2 = np.maximum(n_sq - proj * proj, 0.0)
-    assoc = np.argmin(dperp2, axis=1)
-    dmin  = dperp2[np.arange(dperp2.shape[0]), assoc]
+    assoc, dmin = _nsga3_associate(N, R)
 
     H = R.shape[0]
     rho = np.zeros(H, dtype=np.int64)                # niche counts
