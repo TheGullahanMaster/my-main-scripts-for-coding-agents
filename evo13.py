@@ -1157,6 +1157,37 @@ NSGA3_UR_H = 4.0          # Spreading-Index normalisation factor h (paper: 4)
 # threshold(m) = c3·m³ + c2·m² + c1·m + c0  (cubic regression from the paper)
 NSGA3_UR_THRESH_COEF = (-0.00001989, 0.0002034, 0.03376, -0.2373)
 
+# ---- NSGA-III EXTRA objectives (optional; for the 4+-objective regime) ----
+# Classic AFPO trims on three objectives (age, fitness, complexity).  NSGA-III's
+# reference-point niching genuinely shines at FOUR or more objectives, so when
+# NSGA-III is enabled the user may switch on any of these extra MINIMISED
+# objectives, widening the trade-off surface the survival trim spreads across:
+#
+#   'instability' — 1 − extrapolation-smoothness (bumped to 1 if the in-sample
+#                   output already went non-finite/clipped).  Pushes the pool
+#                   toward numerically robust models that don't blow up just
+#                   outside the data cloud.
+#   'shape'       — 1 − |Spearman(prediction, target)|.  Rewards models whose
+#                   prediction ORDERING already matches the dataset's shape,
+#                   independent of the (affine-fixable) magnitude.
+#   'diversity'   — negative behavioural sparseness (mean distance to the k
+#                   nearest neighbours in standardized-prediction space).
+#                   Behavioural clones score high (crowded → bad); structurally
+#                   novel shapes score low (good), so the trim actively protects
+#                   behavioural diversity instead of only objective-space spread.
+#
+# Off by default and ONLY consulted when NSGA3_ENABLED — direct/non-interactive
+# callers and the NSGA-II legacy path stay on the bit-for-bit 3-objective trim.
+# The first two are cached per-individual on the last full-data REGRESSION
+# evaluation (calculate_fitness); diversity is computed once per trim on the
+# fixed pool, so the whole selection remains deterministic.  Enabled
+# interactively inside `_select_nsga3_mode`; inherited by AFPO fork workers like
+# every other NSGA-III knob.
+NSGA3_EXTRA_OBJ_ENABLED = False        # module default off (interactive opt-in)
+NSGA3_EXTRA_OBJECTIVES  = ()           # subset of ('instability','shape','diversity')
+NSGA3_DIVERSITY_K       = 15           # k nearest neighbours for the diversity metric
+NSGA3_BEHAVIOR_SIG_K    = 16           # length of the standardized-prediction signature
+
 # ---- AFPO escape-tolerance (local-minima escape) ----
 # AFPO decides survival purely through the (age, fitness, complexity) Pareto
 # trim — it has no simulated-annealing-style acceptance of a temporarily worse
@@ -2588,6 +2619,52 @@ PERCEPTRON_BINARY_OPS = ('perceptronSigma2', 'perceptronReLU2', 'perceptronCusto
 PERCEPTRON_ALL_OPS    = PERCEPTRON_UNARY_OPS + PERCEPTRON_BINARY_OPS
 PERCEPTRON_ENABLED    = False   # flipped by `_select_perceptron_mode()`
 
+
+# ---- Distance / native-root / logarithm op family ------------------------
+# 2- and 3-variable Euclidean distances, native fractional-power roots
+# x**(1/k) for k = 3..10, integer order-of-magnitude (oom), and log of x to an
+# arbitrary base y.  Each has a SAFE form (always finite/real) and an UNSAFE
+# form (raw numpy semantics — NaN/Inf on a domain violation, caught later by
+# nan_to_num in evaluate()).  distance_2 / distance_3 are sign-free sqrt(Σ x²),
+# so SAFE == UNSAFE for them (exactly like the existing `hypot`).
+def _distance_2(v1, v2):
+    """Euclidean norm of two variables: sqrt(x² + y²)."""
+    return np.sqrt(v1 * v1 + v2 * v2)
+def _distance_3(v1, v2, v3):
+    """Euclidean norm of three variables: sqrt(x² + y² + z²)."""
+    return np.sqrt(v1 * v1 + v2 * v2 + v3 * v3)
+
+def _root_k_safe(v, k):
+    """Real k-th root.  ODD k preserves sign (sign(v)·|v|^(1/k)); EVEN k uses
+    |v| so the result is always real.  Always finite (0 → 0)."""
+    r = np.power(np.abs(v), 1.0 / k)
+    return np.sign(v) * r if (k % 2) else r
+def _root_k_unsafe(v, k):
+    """Raw k-th root via np.power — NaN for a negative base under a fractional
+    root (the same domain behaviour as UNSAFE sqrt / pow)."""
+    return np.power(v, 1.0 / k)
+
+def _oom_safe(v):
+    """Integer order of magnitude: floor(log10(|x|)).  |x| is ε-guarded so
+    x = 0 maps to a large-negative sentinel rather than -Inf."""
+    return np.floor(np.log10(np.abs(v) + 1e-30))
+def _oom_unsafe(v):
+    """Raw integer order of magnitude — -Inf at x = 0 (caught downstream)."""
+    return np.floor(np.log10(np.abs(v)))
+
+def _log_base_safe(v1, v2):
+    """log_y(x) = log|x| / log|y|, both logs ε-guarded and the denominator
+    nudged away from 0 (base ≈ 1) so the result stays finite."""
+    num = np.log(np.abs(v1) + 1e-30)
+    den = np.log(np.abs(v2) + 1e-30)
+    den = np.where(np.abs(den) > 1e-8, den, np.sign(den + 1e-18) * 1e-8)
+    return num / den
+def _log_base_unsafe(v1, v2):
+    """Raw log_y(x) = log(x) / log(y) — NaN for non-positive args, Inf/NaN at
+    base 1 (caught downstream by nan_to_num)."""
+    return np.log(v1) / np.log(v2)
+
+
 # ---- SAFE binary ----
 _BINARY_SAFE = {
     '+':         lambda v1, v2: v1 + v2,
@@ -2603,6 +2680,10 @@ _BINARY_SAFE = {
     # Base forced positive; exponent clamped to prevent ±∞
     'pow':       lambda v1, v2: np.where(np.abs(np.round(v2) - v2) < 1e-4, np.where(np.abs(np.mod(np.round(v2), 2)) < 1e-8, np.power(np.abs(v1) + 1e-30, np.clip(v2, -250.0, 250.0)), np.copysign(np.power(np.abs(v1) + 1e-30, np.clip(v2, -250.0, 250.0)), v1)), np.power(np.abs(v1) + 1e-30, np.clip(v2, -250.0, 250.0))),
     'hypot':     lambda v1, v2: np.sqrt(v1**2 + v2**2),
+    # 2-variable Euclidean distance sqrt(x²+y²); always real (== hypot)
+    'distance_2': _distance_2,
+    # log_y(x) = log|x|/log|y|, ε-guarded so it never divides by zero
+    'log_base':  _log_base_safe,
     'atan2':     lambda v1, v2: np.arctan2(v1, v2),
     # Denominator guard prevents 0/0 at v1=v2=0
     'harmonic':  lambda v1, v2: 2.0 * v1 * v2 / (np.abs(v1 + v2) + 1e-8),
@@ -2658,6 +2739,10 @@ _BINARY_UNSAFE = {
     # Raw — NaN for negative base with fractional exponent
     'pow':       lambda v1, v2: np.power(v1, v2),
     'hypot':     lambda v1, v2: np.sqrt(v1**2 + v2**2),
+    # 2-variable Euclidean distance sqrt(x²+y²); always real (== hypot)
+    'distance_2': _distance_2,
+    # Raw log_y(x) = log(x)/log(y) — NaN for non-positive args, Inf/NaN at base 1
+    'log_base':  _log_base_unsafe,
     'atan2':     lambda v1, v2: np.arctan2(v1, v2),
     # Raw — NaN/Inf when v1+v2=0
     'harmonic':  lambda v1, v2: 2.0 * v1 * v2 / (v1 + v2),
@@ -2754,6 +2839,18 @@ _UNARY_SAFE = {
     'pow8':       lambda v: np.power(v, 8),
     'pow9':       lambda v: np.power(v, 9),
     'pow10':      lambda v: np.power(v, 10),
+    # Native fractional-power roots x**(1/k).  Odd k keeps the sign; even k uses
+    # |x| so the root is always real.  ('root2' is just the existing sqrt.)
+    'root3':      lambda v: _root_k_safe(v, 3),
+    'root4':      lambda v: _root_k_safe(v, 4),
+    'root5':      lambda v: _root_k_safe(v, 5),
+    'root6':      lambda v: _root_k_safe(v, 6),
+    'root7':      lambda v: _root_k_safe(v, 7),
+    'root8':      lambda v: _root_k_safe(v, 8),
+    'root9':      lambda v: _root_k_safe(v, 9),
+    'root10':     lambda v: _root_k_safe(v, 10),
+    # Integer order of magnitude: floor(log10(|x|))
+    'oom':        _oom_safe,
     # Perceptron 1-input variants (gated behind PERCEPTRON_ENABLED in the menu)
     'perceptronSigma1':  _perc_sigma1,
     'perceptronReLU1':   _perc_relu1,
@@ -2821,6 +2918,18 @@ _UNARY_UNSAFE = {
     'pow8':       lambda v: np.power(v, 8),
     'pow9':       lambda v: np.power(v, 9),
     'pow10':      lambda v: np.power(v, 10),
+    # Native fractional-power roots x**(1/k) — raw np.power (NaN for a negative
+    # base under a fractional root, just like UNSAFE sqrt / pow).
+    'root3':      lambda v: _root_k_unsafe(v, 3),
+    'root4':      lambda v: _root_k_unsafe(v, 4),
+    'root5':      lambda v: _root_k_unsafe(v, 5),
+    'root6':      lambda v: _root_k_unsafe(v, 6),
+    'root7':      lambda v: _root_k_unsafe(v, 7),
+    'root8':      lambda v: _root_k_unsafe(v, 8),
+    'root9':      lambda v: _root_k_unsafe(v, 9),
+    'root10':     lambda v: _root_k_unsafe(v, 10),
+    # Integer order of magnitude: floor(log10(|x|)) — -Inf at x=0 (caught)
+    'oom':        _oom_unsafe,
     'perceptronSigma1':  _perc_sigma1,
     'perceptronReLU1':   _perc_relu1,
     'perceptronCustom1': _perc_custom1,
@@ -2851,6 +2960,8 @@ _TERNARY_SAFE = {
     'if_in_range':     _if_in_range,
     'if_out_of_range': _if_out_of_range,
     'lerp':            _lerp,
+    # 3-variable Euclidean distance sqrt(x²+y²+z²); always real
+    'distance_3':      _distance_3,
 }
 _TERNARY_UNSAFE = dict(_TERNARY_SAFE)
 
@@ -3003,6 +3114,7 @@ OP_COSTS = {
     'max': COST_OP_COMPLEX, 'min': COST_OP_COMPLEX,
     'pow': COST_OP_COMPLEX,
     'hypot': COST_OP_COMPLEX, 'atan2': COST_UNARY_SAFE,
+    'distance_2': COST_OP_COMPLEX, 'log_base': COST_OP_COMPLEX,
     'harmonic': COST_OP_COMPLEX, 'geometric': COST_OP_COMPLEX,
     'mod': COST_OP_COMPLEX, 'copysign': COST_OP_SIMPLE,
     'floordiv': COST_OP_COMPLEX,
@@ -3015,6 +3127,7 @@ OP_COSTS = {
     'if_in_range':     COST_IF,
     'if_out_of_range': COST_IF,
     'lerp':            COST_OP_COMPLEX,
+    'distance_3':      COST_OP_COMPLEX,
     # Bitwise / digit ops
     'bitwise_and': COST_OP_COMPLEX, 'bitwise_or': COST_OP_COMPLEX,
     'bitwise_xor': COST_OP_COMPLEX, 'bitwise_not': COST_OP_SIMPLE,
@@ -3030,6 +3143,11 @@ OP_COSTS = {
     'pow4': COST_OP_SIMPLE, 'pow5': COST_OP_SIMPLE, 'pow6': COST_OP_SIMPLE,
     'pow7': COST_OP_SIMPLE, 'pow8': COST_OP_SIMPLE, 'pow9': COST_OP_SIMPLE,
     'pow10': COST_OP_SIMPLE,
+    # Native fractional-power roots x**(1/k) — domain-risk like sqrt
+    'root3': COST_UNARY_RISK, 'root4': COST_UNARY_RISK, 'root5': COST_UNARY_RISK,
+    'root6': COST_UNARY_RISK, 'root7': COST_UNARY_RISK, 'root8': COST_UNARY_RISK,
+    'root9': COST_UNARY_RISK, 'root10': COST_UNARY_RISK,
+    'oom': COST_UNARY_RISK,
     # Perceptron variants — expressive, so a moderate cost keeps parsimony fair
     'perceptronSigma1':  COST_UNARY_SAFE,
     'perceptronReLU1':   COST_UNARY_SAFE,
@@ -3439,6 +3557,10 @@ def _binary_str(op, s1, s2):
         return f"({s1} >> {s2})"
     elif op == 'delta':
         return f"|{s1} - {s2}|"
+    elif op == 'distance_2':
+        return f"sqrt(({s1})² + ({s2})²)"
+    elif op == 'log_base':
+        return f"log_{s2}({s1})"
     elif op.startswith('adf_'):
         return f"{op}({s1}, {s2})"
     else:
@@ -3454,6 +3576,8 @@ def _ternary_str(op, s1, s2, s3):
         return f"if_out_of_range({s1}, {s2}, {s3})"
     if op == 'lerp':
         return f"lerp({s1}, {s2}, {s3})"
+    if op == 'distance_3':
+        return f"sqrt(({s1})² + ({s2})² + ({s3})²)"
     return f"{op}({s1}, {s2}, {s3})"
 
 def _unary_str(op, s1):
@@ -3473,6 +3597,10 @@ def _unary_str(op, s1):
         return f"int({s1})"
     if op in ('pow4', 'pow5', 'pow6', 'pow7', 'pow8', 'pow9', 'pow10'):
         return f"({s1})^{op[3:]}"
+    if op in ('root3', 'root4', 'root5', 'root6', 'root7', 'root8', 'root9', 'root10'):
+        return f"({s1})^(1/{op[4:]})"
+    if op == 'oom':
+        return f"oom({s1})"
     return f"{op}({s1})"
 
 
@@ -3492,6 +3620,8 @@ ALL_OP_DESCRIPTIONS = {
     'min':       "Minimum              min(x,y) — piecewise min, lower-bound clip",
     'pow':       "Power                |x|^y    — generalised polynomial",
     'hypot':     "Hypotenuse           sqrt(x²+y²) — Euclidean distance",
+    'distance_2':"Distance (2 vars)    sqrt(x²+y²) — Euclidean norm of two variables",
+    'log_base':  "Log base y           log_y(x) = log|x|/log|y| — logarithm to base y",
     'atan2':     "Atan2                atan2(x,y)  — angle in [-π, π]",
     'harmonic':  "Harmonic mean        2xy/(|x+y|) — blending of two signals",
     'geometric': "Geometric mean       sqrt(|xy|)  — multiplicative average",
@@ -3510,6 +3640,7 @@ ALL_OP_DESCRIPTIONS = {
     'if_in_range':     "Clamp to range       clamp(x, lo, hi)   — pass-through inside, saturate at limits",
     'if_out_of_range': "Anti-clamp           push out of [lo, hi] — passes through outside the range",
     'lerp':            "Linear interpolation a + (b-a)·t   — blend between two values",
+    'distance_3':      "Distance (3 vars)    sqrt(x²+y²+z²) — Euclidean norm of three variables",
     # Bitwise / integer ops (auto-coerce floats to int64 via floor)
     'bitwise_and': "Bitwise AND         (int(x) & int(y))  — RNG / hashing building block",
     'bitwise_or':  "Bitwise OR          (int(x) | int(y))  — RNG / hashing building block",
@@ -3542,6 +3673,16 @@ ALL_OP_DESCRIPTIONS = {
     'pow8':   "x⁸                   v**8  — octic,  cheap",
     'pow9':   "x⁹                   v**9  — nonic,  cheap",
     'pow10':  "x¹⁰                  v**10 — decic,  cheap",
+    # Native fractional-power roots (odd keeps sign, even uses |x|)
+    'root3':  "Cube root            x^(1/3) — native 3rd root (sign-preserving)",
+    'root4':  "4th root             x^(1/4) — native quartic root (|x|)",
+    'root5':  "5th root             x^(1/5) — native quintic root (sign-preserving)",
+    'root6':  "6th root             x^(1/6) — native sextic root (|x|)",
+    'root7':  "7th root             x^(1/7) — native septic root (sign-preserving)",
+    'root8':  "8th root             x^(1/8) — native octic root (|x|)",
+    'root9':  "9th root             x^(1/9) — native nonic root (sign-preserving)",
+    'root10': "10th root            x^(1/10) — native decic root (|x|)",
+    'oom':    "Order of magnitude   ⌊log10|x|⌋ — integer power-of-ten scale",
     # Unary
     'sin':       "Sine                 sin(x)   — oscillation, periodicity",
     'cos':       "Cosine               cos(x)   — oscillation (phase-shifted)",
@@ -5346,6 +5487,7 @@ def _select_nsga3_mode():
     co-evolution knobs above.
     """
     global NSGA3_ENABLED, NSGA3_DIVISIONS, NSGA3_VARIANT
+    global NSGA3_EXTRA_OBJ_ENABLED, NSGA3_EXTRA_OBJECTIVES
 
     print("\n" + "─" * 70)
     print("NSGA-III REFERENCE-POINT SELECTION  (Deb & Jain 2014, for AFPO)")
@@ -5369,6 +5511,8 @@ def _select_nsga3_mode():
     choice = input("Use NSGA-III reference-point selection? [Y/n]: ").strip().lower()
     if choice.startswith('n'):
         NSGA3_ENABLED = False
+        NSGA3_EXTRA_OBJ_ENABLED = False   # extras only ride on the NSGA-III path
+        NSGA3_EXTRA_OBJECTIVES = ()
         print("  NSGA-III disabled — AFPO uses NSGA-II crowding distance (legacy).")
         return
 
@@ -5387,35 +5531,74 @@ def _select_nsga3_mode():
         NSGA3_DIVISIONS = 0
 
     # Optional adaptation modules (paper: NSGA-III-UR, Farias et al. 2025).
+    # A-NSGA-III is the recommended default — adapting the lattice to the actual
+    # front consistently spreads survivors better than the fixed lattice.
     print()
     print("  Reference-vector module (Farias et al. 2025):")
+    print("    a     — A-NSGA-III (default): adapt the lattice every trim — add")
+    print("            vectors around crowded directions, drop unused added ones.")
     print("    basic — fixed Das-Dennis lattice (original NSGA-III).")
-    print("    a     — A-NSGA-III: adapt the lattice every trim (add vectors")
-    print("            around crowded directions, drop unused added ones).")
     print("    ur    — NSGA-III-UR: A-NSGA-III adaptation, but only when the")
     print("            Spreading Index flags the front as irregular.")
-    var_in = input("  Module [basic/a/ur, Enter = basic]: ").strip().lower()
-    if var_in in ("a", "ansga3", "a-nsga-iii", "adaptive"):
+    var_in = input("  Module [a/basic/ur, Enter = a (A-NSGA-III)]: ").strip().lower()
+    if not var_in or var_in in ("a", "ansga3", "a-nsga-iii", "adaptive"):
         NSGA3_VARIANT = "a"
     elif var_in in ("ur", "nsga-iii-ur", "uwr", "update"):
         NSGA3_VARIANT = "ur"
-    else:
-        if var_in and var_in != "basic":
-            print("  Unrecognised module; using 'basic'.")
+    elif var_in in ("basic", "b", "fixed"):
         NSGA3_VARIANT = "basic"
+    else:
+        print("  Unrecognised module; using 'a' (A-NSGA-III).")
+        NSGA3_VARIANT = "a"
+
+    # ── Optional EXTRA objectives — NSGA-III niching is strongest at 4+ ────
+    print()
+    print("  EXTRA OBJECTIVES (optional — NSGA-III niching is strongest at 4+):")
+    print("    Added on top of (age, fitness, complexity), all minimised:")
+    print("      instability — favour numerically robust models that don't blow")
+    print("                    up when extrapolated just outside the data cloud.")
+    print("      shape       — favour models whose prediction ORDERING already")
+    print("                    matches the dataset (|Spearman|), magnitude aside.")
+    print("      diversity   — favour behaviourally novel models (spread in")
+    print("                    standardized-prediction space), protecting variety.")
+    print("    Regression-side selection objectives; classification runs leave")
+    print("    them neutral.  Pick 'all', a subset (e.g. 'i,s'), or none.")
+    eo_in = input("  Extra objectives [a=all / i,s,d subset / N=none, "
+                  "Enter = none]: ").strip().lower()
+    _eo_map = {'i': 'instability', 's': 'shape', 'd': 'diversity',
+               'instability': 'instability', 'shape': 'shape',
+               'diversity': 'diversity'}
+    chosen_eo = []
+    if eo_in and not eo_in.startswith('n'):
+        if eo_in in ('a', 'all', 'y', 'yes'):
+            chosen_eo = ['instability', 'shape', 'diversity']
+        else:
+            for tok in re.split(r'[\s,]+', eo_in):
+                name = _eo_map.get(tok)
+                if name and name not in chosen_eo:
+                    chosen_eo.append(name)
+    if chosen_eo:
+        NSGA3_EXTRA_OBJ_ENABLED = True
+        NSGA3_EXTRA_OBJECTIVES = tuple(chosen_eo)
+    else:
+        NSGA3_EXTRA_OBJ_ENABLED = False
+        NSGA3_EXTRA_OBJECTIVES = ()
 
     _variant_desc = {
         "basic": "fixed Das-Dennis lattice",
         "a":     "A-NSGA-III adaptive reference vectors",
         "ur":    "NSGA-III-UR (adapt only when the front is irregular)",
     }[NSGA3_VARIANT]
+    n_obj = 3 + len(NSGA3_EXTRA_OBJECTIVES)
     if NSGA3_DIVISIONS > 0:
-        n_ref = _das_dennis_count(3, NSGA3_DIVISIONS)
+        n_ref = _das_dennis_count(n_obj, NSGA3_DIVISIONS)
         print(f"  ✓  NSGA-III ENABLED  (p={NSGA3_DIVISIONS} → {n_ref} reference "
-              f"points on the 3-objective simplex; module: {_variant_desc}).")
+              f"points on the {n_obj}-objective simplex; module: {_variant_desc}).")
     else:
-        print(f"  ✓  NSGA-III ENABLED  (reference points auto-sized to the AFPO "
-              f"pool each run; module: {_variant_desc}).")
+        print(f"  ✓  NSGA-III ENABLED  ({n_obj}-objective trim; reference points "
+              f"auto-sized to the AFPO pool each run; module: {_variant_desc}).")
+    if NSGA3_EXTRA_OBJ_ENABLED:
+        print(f"     Extra objectives: {', '.join(NSGA3_EXTRA_OBJECTIVES)}.")
 
 
 # ==========================================
@@ -14316,6 +14499,35 @@ def compute_push_intrinsic(preds, y, tree, X, affine_a, affine_b):
     return float(min(PUSH_INTRINSIC_MAX, bonus))
 
 
+def _behavior_signature(preds, k=None):
+    """Compact, scale-free behavioural signature of a model's predictions for
+    the optional NSGA-III diversity objective.
+
+    Returns a length-``k`` standardized (z-scored) sample of the prediction
+    vector taken at deterministic evenly-spaced rows: ``(p − mean) / std``.  The
+    z-score makes the signature invariant to the affine rescaling evolution can
+    freely apply, so the diversity objective compares the SHAPE of two models'
+    outputs rather than their magnitude.  A constant (degenerate) prediction
+    maps to the zero vector — all such models cluster together and are correctly
+    treated as behaviourally identical (non-diverse).  Returns ``None`` for an
+    empty input.  Cheap: one deterministic subsample plus a mean/std.
+    """
+    if k is None:
+        k = NSGA3_BEHAVIOR_SIG_K
+    p = np.asarray(preds, dtype=np.float64).ravel()
+    n = p.size
+    if n == 0:
+        return None
+    if n > k:
+        idx = np.linspace(0, n - 1, int(k)).astype(np.intp)
+        p = p[idx]
+    p = np.nan_to_num(p, nan=0.0, posinf=1e9, neginf=-1e9)
+    sd = float(p.std())
+    if sd < 1e-12:
+        return np.zeros_like(p)
+    return (p - float(p.mean())) / sd
+
+
 # Per-chunk Discovery-Push annealing scale (1.0 = full push).  Set by the
 # evolution loops at the top of every generation from the same cosine schedule
 # the SA temperature uses, and read at the single parsimony_fitness choke-point
@@ -14682,6 +14894,16 @@ class Individual:
         # .fitness via parsimony_fitness.  Recomputed on every full-data
         # evaluation and cached; stays 0.0 for classification individuals.
         self.push_intrinsic = 0.0
+        # Optional NSGA-III extra-objective metrics (selection-only; only
+        # consulted when NSGA3_ENABLED and NSGA3_EXTRA_OBJ_ENABLED — see
+        # _afpo_extra_objective_columns).  Cached on the last full-data
+        # regression evaluation.  Defaults are the WORST value (1.0) for the
+        # minimised shape / instability axes so an unevaluated or
+        # classification individual is never spuriously rewarded; behaviour_sig
+        # is None until a prediction signature exists.
+        self.shape_obj       = 1.0
+        self.instability_obj = 1.0
+        self.behavior_sig    = None
         # Selection-only MDL constant cost (set in calculate_fitness; see
         # compute_const_cost).  0.0 until evaluated / when the feature is off.
         self.const_cost = 0.0
@@ -14932,6 +15154,40 @@ class Individual:
             # Update complexity to account for the correction
             self.complexity += best.tree.get_complexity() * 0.5  # discounted
 
+    def _update_nsga3_extra_objectives(self, preds, y_eval, X_eval):
+        """Cache the optional NSGA-III extra-objective metrics from a full-data
+        REGRESSION evaluation: shape mismatch, numerical instability, and the
+        behavioural signature used by the diversity objective.  All are
+        selection-only and only consulted when NSGA3_ENABLED and
+        NSGA3_EXTRA_OBJ_ENABLED (see _afpo_extra_objective_columns).  Cheap —
+        two capped rank sorts plus one ~32-point extrapolation probe — and only
+        invoked on the cacheable full-data path, so minibatch re-evaluations
+        reuse the cached values and the trim stays deterministic.
+        """
+        try:
+            # SHAPE mismatch: 1 − |Spearman(pred, target)| (0 = ordering nailed).
+            self.shape_obj = 1.0 - _push_shape_score(
+                preds, y_eval, PUSH_SHAPE_MAX_ROWS)
+            # INSTABILITY: 1 − extrapolation-smoothness, forced to 1 (maximally
+            # unstable) when the in-sample output already went non-finite/clipped.
+            instab = 1.0
+            Xp = _push_probe_inputs(X_eval)
+            if Xp is not None and preds.size:
+                smooth = _push_smooth_score(
+                    self.tree, Xp, self.affine_a, self.affine_b,
+                    float(np.min(preds)), float(np.max(preds)))
+                instab = 1.0 - smooth
+            if getattr(self.tree, 'last_eval_clipped', False):
+                instab = 1.0
+            self.instability_obj = float(min(1.0, max(0.0, instab)))
+            # DIVERSITY: standardized-prediction signature (compared at trim time).
+            self.behavior_sig = _behavior_signature(preds)
+        except Exception:
+            # Neutral-worst defaults so a failure never silently rewards a model.
+            self.shape_obj = 1.0
+            self.instability_obj = 1.0
+            self.behavior_sig = None
+
     def calculate_fitness(self, X, y_target, type_code, batch_indices=None,
                           bg_logits=None, class_idx_in_group=None, Y_group=None,
                           freq_parsimony_adj=0.0, update_affine=True,
@@ -14990,6 +15246,11 @@ class Individual:
                 self.affine_a   = cached['affine_a']
                 self.affine_b   = cached['affine_b']
                 self.push_intrinsic = cached.get('push', 0.0)
+                # Optional NSGA-III extra-objective metrics (worst-value
+                # defaults for entries cached before the feature was armed).
+                self.shape_obj       = cached.get('shape_obj', 1.0)
+                self.instability_obj = cached.get('instability_obj', 1.0)
+                self.behavior_sig    = cached.get('behavior_sig', None)
                 # Constant cost is a pure function of the tree's constants and
                 # std(y) (both invariant for a cached tree+target), so the stored
                 # value is always valid; every entry written this process carries
@@ -15216,6 +15477,14 @@ class Individual:
                         preds, y_eval, self.tree, X_eval,
                         self.affine_a, self.affine_b)
 
+                # ── Optional NSGA-III extra objectives (shape / instability /
+                # diversity) ─────────────────────────────────────────────────
+                # Cached on the full-data path so the survival trim can read a
+                # stable, deterministic value; only computed when the feature is
+                # actually armed (regression only — `preds`/`y_eval` continuous).
+                if NSGA3_EXTRA_OBJ_ENABLED and batch_indices is None:
+                    self._update_nsga3_extra_objectives(preds, y_eval, X_eval)
+
                 # Clamp the BASE loss before adding flat/clipped penalties so
                 # those large additive penalties remain visible to selection.
                 # Without this pre-clamp the final hard ceiling would erase
@@ -15375,6 +15644,11 @@ class Individual:
                     'affine_b':   self.affine_b,
                     'push':       self.push_intrinsic,
                     'const_cost': self.const_cost,
+                    # Optional NSGA-III extra-objective metrics (cached so
+                    # minibatch re-evals / cache hits keep a stable value).
+                    'shape_obj':       self.shape_obj,
+                    'instability_obj': self.instability_obj,
+                    'behavior_sig':    self.behavior_sig,
                 })
 
         except Exception:
@@ -15855,6 +16129,28 @@ def _adf_to_sympy(adf_dict, input_exprs, safe=True):
             sbuf[slot] = sympy.erf(v1)
         elif op == 'hypot':
             sbuf[slot] = sympy.sqrt(v1**2 + v2**2)
+        elif op == 'distance_2':
+            sbuf[slot] = sympy.sqrt(v1**2 + v2**2)
+        elif op == 'log_base':
+            if safe:
+                sbuf[slot] = (sympy.log(sympy.Abs(v1) + sympy.Float(1e-30))
+                              / sympy.log(sympy.Abs(v2) + sympy.Float(1e-30)))
+            else:
+                sbuf[slot] = sympy.log(v1) / sympy.log(v2)
+        elif op in ('root3', 'root4', 'root5', 'root6',
+                    'root7', 'root8', 'root9', 'root10'):
+            k = int(op[4:])
+            if safe:
+                r = sympy.Pow(sympy.Abs(v1), sympy.Rational(1, k))
+                sbuf[slot] = sympy.sign(v1) * r if (k % 2) else r
+            else:
+                sbuf[slot] = sympy.Pow(v1, sympy.Rational(1, k))
+        elif op == 'oom':
+            if safe:
+                sbuf[slot] = sympy.floor(
+                    sympy.log(sympy.Abs(v1) + sympy.Float(1e-30), 10))
+            else:
+                sbuf[slot] = sympy.floor(sympy.log(sympy.Abs(v1), 10))
         elif op == 'max':
             sbuf[slot] = sympy.Max(v1, v2)
         elif op == 'min':
@@ -15956,6 +16252,14 @@ def tree_to_sympy(cgp_eq, feature_vars, safe=None):
 
             elif node.op == 'hypot':
                 buf[idx] = sympy.sqrt(v1**2 + v2**2)
+            elif node.op == 'distance_2':
+                buf[idx] = sympy.sqrt(v1**2 + v2**2)
+            elif node.op == 'log_base':
+                if safe:
+                    buf[idx] = (sympy.log(sympy.Abs(v1) + sympy.Float(1e-30))
+                                / sympy.log(sympy.Abs(v2) + sympy.Float(1e-30)))
+                else:
+                    buf[idx] = sympy.log(v1) / sympy.log(v2)
             elif node.op == 'atan2':
                 buf[idx] = sympy.atan2(v1, v2)
 
@@ -16049,6 +16353,8 @@ def tree_to_sympy(cgp_eq, feature_vars, safe=None):
                 buf[idx] = sympy.Piecewise((v1, outside), (nearest, True))
             elif node.op == 'lerp':
                 buf[idx] = v1 + (v2 - v1) * v3
+            elif node.op == 'distance_3':
+                buf[idx] = sympy.sqrt(v1**2 + v2**2 + v3**2)
             else:
                 buf[idx] = sympy.Float(0)
 
@@ -16180,6 +16486,20 @@ def tree_to_sympy(cgp_eq, feature_vars, safe=None):
                 buf[idx] = v1 ** 9
             elif node.op == 'pow10':
                 buf[idx] = v1 ** 10
+            elif node.op in ('root3', 'root4', 'root5', 'root6',
+                             'root7', 'root8', 'root9', 'root10'):
+                k = int(node.op[4:])
+                if safe:
+                    r = sympy.Pow(sympy.Abs(v1), sympy.Rational(1, k))
+                    buf[idx] = sympy.sign(v1) * r if (k % 2) else r
+                else:
+                    buf[idx] = sympy.Pow(v1, sympy.Rational(1, k))
+            elif node.op == 'oom':
+                if safe:
+                    buf[idx] = sympy.floor(
+                        sympy.log(sympy.Abs(v1) + sympy.Float(1e-30), 10))
+                else:
+                    buf[idx] = sympy.floor(sympy.log(sympy.Abs(v1), 10))
             elif node.op == 'deg2rad':
                 buf[idx] = v1 * sympy.pi / 180
             elif node.op == 'rad2deg':
@@ -16250,6 +16570,14 @@ def _binary_python_expr(op, v1, v2, safe):
             )
         return f"np.power({v1}, {v2})"
     if op == 'hypot':   return f"np.sqrt(({v1})**2 + ({v2})**2)"
+    if op == 'distance_2': return f"np.sqrt(({v1})**2 + ({v2})**2)"
+    if op == 'log_base':
+        if safe:
+            return (f"(np.log(np.abs({v1}) + 1e-30) / np.where("
+                    f"np.abs(np.log(np.abs({v2}) + 1e-30)) > 1e-8, "
+                    f"np.log(np.abs({v2}) + 1e-30), "
+                    f"np.sign(np.log(np.abs({v2}) + 1e-30) + 1e-18) * 1e-8))")
+        return f"(np.log({v1}) / np.log({v2}))"
     if op == 'atan2':   return f"np.arctan2({v1}, {v2})"
     if op == 'harmonic':
         if safe:
@@ -16299,6 +16627,8 @@ def _ternary_python_expr(op, v1, v2, v3):
         return f"_op_if_out_of_range({v1}, {v2}, {v3})"
     if op == 'lerp':
         return f"(({v1}) + (({v2}) - ({v1})) * ({v3}))"
+    if op == 'distance_3':
+        return f"np.sqrt(({v1})**2 + ({v2})**2 + ({v3})**2)"
     return "0.0"
 
 
@@ -16360,6 +16690,16 @@ def _unary_python_expr(op, v1, safe):
         return f"(1.0 / ({v1}))"
     if op in ('pow4', 'pow5', 'pow6', 'pow7', 'pow8', 'pow9', 'pow10'):
         return f"(({v1}) ** {op[3:]})"
+    if op in ('root3', 'root4', 'root5', 'root6', 'root7', 'root8', 'root9', 'root10'):
+        k = int(op[4:])
+        if safe:
+            if k % 2:
+                return f"(np.sign({v1}) * np.power(np.abs({v1}), 1.0 / {k}))"
+            return f"np.power(np.abs({v1}), 1.0 / {k})"
+        return f"np.power({v1}, 1.0 / {k})"
+    if op == 'oom':
+        if safe: return f"np.floor(np.log10(np.abs({v1}) + 1e-30))"
+        return f"np.floor(np.log10(np.abs({v1})))"
     if op == 'deg2rad': return f"(({v1}) * (np.pi / 180.0))"
     if op == 'rad2deg': return f"(({v1}) * (180.0 / np.pi))"
     if op == 'signbit': return f"np.where(np.signbit(np.nan_to_num({v1}, nan=0.0)), 1.0, 0.0)"
@@ -19513,6 +19853,79 @@ def _nsga3_select_from_front(A, admitted, front, need, target_size):
     return chosen
 
 
+def _afpo_diversity_column(population):
+    """Negative behavioural sparseness for each member of ``population`` (an
+    objective to be MINIMISED): a behavioural clone sits at ~0 distance from its
+    neighbours → small sparseness → large (bad) objective; a structurally novel
+    model is far from everything → large sparseness → small (good) objective.
+
+    Sparseness is the mean distance to the ``NSGA3_DIVERSITY_K`` nearest
+    neighbours in standardized-prediction-signature space (the cached
+    ``behavior_sig``).  Computed once on the fixed input pool, so it is
+    deterministic for the trim.  Members lacking a valid signature are given the
+    median sparseness (neutral — neither helped nor hurt).  Falls back to an
+    all-zero (inert) column when fewer than three signatures are available.
+    """
+    n = len(population)
+    sigs = [getattr(ind, 'behavior_sig', None) for ind in population]
+    dim = 0
+    for s in sigs:
+        if isinstance(s, np.ndarray) and s.ndim == 1 and s.size:
+            dim = int(s.size)
+            break
+    if dim == 0 or n < 3:
+        return np.zeros(n, dtype=np.float64)
+    M = np.zeros((n, dim), dtype=np.float64)
+    ok = np.zeros(n, dtype=bool)
+    for i, s in enumerate(sigs):
+        if (isinstance(s, np.ndarray) and s.shape == (dim,)
+                and np.all(np.isfinite(s))):
+            M[i] = s
+            ok[i] = True
+    if ok.sum() < 3:
+        return np.zeros(n, dtype=np.float64)
+    # Pairwise Euclidean distances; mask the self-distance with +inf.
+    d2 = np.maximum(((M[:, None, :] - M[None, :, :]) ** 2).sum(axis=2), 0.0)
+    d = np.sqrt(d2)
+    np.fill_diagonal(d, np.inf)
+    k = max(1, min(int(NSGA3_DIVERSITY_K), n - 1))
+    part = np.partition(d, k - 1, axis=1)[:, :k]
+    part[~np.isfinite(part)] = 0.0
+    sparse = part.mean(axis=1)
+    if not ok.all():
+        sparse[~ok] = float(np.median(sparse[ok]))
+    return -sparse
+
+
+def _afpo_extra_objective_columns(population):
+    """Optional NSGA-III extra-objective columns (all MINIMISED) for the AFPO
+    survival trim, or ``[]`` when the feature is disabled.
+
+    Returns a list of ``(name, length-n float ndarray)`` pairs for whichever of
+    ``instability`` / ``shape`` / ``diversity`` are listed in
+    ``NSGA3_EXTRA_OBJECTIVES``.  Gated on BOTH ``NSGA3_ENABLED`` and
+    ``NSGA3_EXTRA_OBJ_ENABLED`` so the NSGA-II legacy path (and every direct /
+    non-interactive caller) keeps the bit-for-bit 3-objective trim.  ``shape`` /
+    ``instability`` are read from the per-individual values cached on the last
+    full-data regression evaluation; ``diversity`` is computed here on the pool.
+    """
+    if not (NSGA3_ENABLED and NSGA3_EXTRA_OBJ_ENABLED) or not NSGA3_EXTRA_OBJECTIVES:
+        return []
+    n = len(population)
+    cols = []
+    if 'instability' in NSGA3_EXTRA_OBJECTIVES:
+        cols.append(('instability', np.fromiter(
+            (float(getattr(ind, 'instability_obj', 1.0)) for ind in population),
+            dtype=np.float64, count=n)))
+    if 'shape' in NSGA3_EXTRA_OBJECTIVES:
+        cols.append(('shape', np.fromiter(
+            (float(getattr(ind, 'shape_obj', 1.0)) for ind in population),
+            dtype=np.float64, count=n)))
+    if 'diversity' in NSGA3_EXTRA_OBJECTIVES:
+        cols.append(('diversity', _afpo_diversity_column(population)))
+    return cols
+
+
 def _trim_to_pareto_front_3obj(population, target_size):
     """
     Pareto survival selection on (age, fitness, complexity) — all minimised.
@@ -19554,18 +19967,29 @@ def _trim_to_pareto_front_3obj(population, target_size):
     if n <= target_size:
         return list(population)
 
-    # ── Objective matrix (all minimised): age, fitness, complexity ───────
-    A = np.empty((n, 3), dtype=np.float64)
+    # ── Objective matrix (all minimised): age, fitness, complexity, plus any
+    # enabled NSGA-III extra objectives (instability / shape / diversity) ──
+    # The three base objectives are always present; the optional extra columns
+    # only appear under NSGA-III with NSGA3_EXTRA_OBJ_ENABLED, widening the
+    # trade-off surface into the 4+-objective regime NSGA-III niching favours.
+    extra_cols = _afpo_extra_objective_columns(population)
+    n_obj = 3 + len(extra_cols)
+    A = np.empty((n, n_obj), dtype=np.float64)
     for k, ind in enumerate(population):
         A[k, 0] = ind.age
         A[k, 1] = ind.fitness
         A[k, 2] = ind.complexity
-    # Non-finite fitness/complexity would poison the vectorised comparison
-    # (NaN compares False both ways, so such an individual would spuriously
-    # land on the first front).  Map them to a large sentinel so they are
-    # correctly dominated by every finite individual.
+    for j, (_name, col) in enumerate(extra_cols):
+        A[:, 3 + j] = col
+    # Non-finite objective values would poison the vectorised comparison (NaN
+    # compares False both ways, so such an individual would spuriously land on
+    # the first front).  Map them to a large sentinel so they are correctly
+    # dominated by every finite individual — applied to every column, base and
+    # extra alike.
     A[:, 1] = np.where(np.isfinite(A[:, 1]), A[:, 1], 1e18)
     A[:, 2] = np.where(np.isfinite(A[:, 2]), A[:, 2], 1e18)
+    for j in range(3, n_obj):
+        A[:, j] = np.where(np.isfinite(A[:, j]), A[:, j], 1e18)
 
     # ── Vectorised pairwise domination: dom[i, j] ⇔ i dominates j ────────
     le  = (A[:, None, :] <= A[None, :, :]).all(axis=2)   # i ≤ j on all axes
