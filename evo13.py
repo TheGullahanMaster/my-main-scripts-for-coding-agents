@@ -2684,6 +2684,11 @@ _BINARY_SAFE = {
     'distance_2': _distance_2,
     # log_y(x) = log|x|/log|y|, ε-guarded so it never divides by zero
     'log_base':  _log_base_safe,
+    # Exponential decay exp(-x·y); product clamped so exp can't overflow
+    'exp_decay': lambda v1, v2: np.exp(-np.clip(v1 * v2, -700.0, 700.0)),
+    # Gaussian / RBF kernel exp(-(x-y)²) — similarity that decays with distance;
+    # squared term clamped (== the unary `gaussian`, lifted to two variables)
+    'rbf':       lambda v1, v2: np.exp(-np.clip((v1 - v2) ** 2, 0.0, 500.0)),
     'atan2':     lambda v1, v2: np.arctan2(v1, v2),
     # Denominator guard prevents 0/0 at v1=v2=0
     'harmonic':  lambda v1, v2: 2.0 * v1 * v2 / (np.abs(v1 + v2) + 1e-8),
@@ -2743,6 +2748,10 @@ _BINARY_UNSAFE = {
     'distance_2': _distance_2,
     # Raw log_y(x) = log(x)/log(y) — NaN for non-positive args, Inf/NaN at base 1
     'log_base':  _log_base_unsafe,
+    # TRUE exp(-x·y) — can overflow to Inf for a large negative product
+    'exp_decay': lambda v1, v2: np.exp(-(v1 * v2)),
+    # Raw Gaussian / RBF kernel exp(-(x-y)²) — overflow only via Inf inputs
+    'rbf':       lambda v1, v2: np.exp(-((v1 - v2) ** 2)),
     'atan2':     lambda v1, v2: np.arctan2(v1, v2),
     # Raw — NaN/Inf when v1+v2=0
     'harmonic':  lambda v1, v2: 2.0 * v1 * v2 / (v1 + v2),
@@ -2805,6 +2814,13 @@ _UNARY_SAFE = {
     # Exp argument clamped → sigmoid never overflows
     'sigmoid':    lambda v: 1.0 / (1.0 + np.exp(-np.clip(v, -50.0, 50.0))),
     'tanh':       np.tanh,
+    # Hyperbolic sine/cosine — args clamped so they can't overflow to ±Inf
+    'sinh':       lambda v: np.sinh(np.clip(v, -700.0, 700.0)),
+    'cosh':       lambda v: np.cosh(np.clip(v, -700.0, 700.0)),
+    # exp(x) − 1, numerically accurate near 0; arg clamped to avoid overflow
+    'expm1':      lambda v: np.expm1(np.clip(v, -700.0, 700.0)),
+    # log(1 + x), accurate near 0; arg guarded to stay > −1 so it never hits −Inf
+    'log1p':      lambda v: np.log1p(np.maximum(v, -1.0 + 1e-6)),
     'relu':       lambda v: np.maximum(0.0, v),
     'leaky_relu': lambda v: np.where(v >= 0, v, 0.01 * v),
     'atan':       np.arctan,
@@ -2883,6 +2899,13 @@ _UNARY_UNSAFE = {
     # Overflow for |v|>~710
     'sigmoid':    lambda v: 1.0 / (1.0 + np.exp(-v)),
     'tanh':       np.tanh,
+    # Raw hyperbolic sine/cosine — ±Inf for |v| ≳ 710 (caught by nan_to_num)
+    'sinh':       np.sinh,
+    'cosh':       np.cosh,
+    # Raw exp(x) − 1 — overflow to Inf for large positive v
+    'expm1':      np.expm1,
+    # Raw log(1 + x) — NaN for v < −1, −Inf at v = −1 (caught downstream)
+    'log1p':      np.log1p,
     'relu':       lambda v: np.maximum(0.0, v),
     'leaky_relu': lambda v: np.where(v >= 0, v, 0.01 * v),
     'atan':       np.arctan,
@@ -3115,6 +3138,7 @@ OP_COSTS = {
     'pow': COST_OP_COMPLEX,
     'hypot': COST_OP_COMPLEX, 'atan2': COST_UNARY_SAFE,
     'distance_2': COST_OP_COMPLEX, 'log_base': COST_OP_COMPLEX,
+    'exp_decay': COST_OP_COMPLEX, 'rbf': COST_OP_COMPLEX,
     'harmonic': COST_OP_COMPLEX, 'geometric': COST_OP_COMPLEX,
     'mod': COST_OP_COMPLEX, 'copysign': COST_OP_SIMPLE,
     'floordiv': COST_OP_COMPLEX,
@@ -3160,6 +3184,8 @@ OP_COSTS = {
     'tan': COST_UNARY_SAFE,
     'tanh': COST_UNARY_SAFE, 'sigmoid': COST_UNARY_SAFE,
     'exp': COST_UNARY_RISK, 'log': COST_UNARY_RISK,
+    'sinh': COST_UNARY_SAFE, 'cosh': COST_UNARY_SAFE,
+    'expm1': COST_UNARY_RISK, 'log1p': COST_UNARY_RISK,
     'sqrt': COST_UNARY_RISK, 'abs': COST_UNARY_CHEAP,
     'square': COST_UNARY_CHEAP, 'neg': COST_UNARY_CHEAP,
     'frac': COST_UNARY_CHEAP, 'round': COST_UNARY_CHEAP,
@@ -3561,6 +3587,10 @@ def _binary_str(op, s1, s2):
         return f"sqrt(({s1})² + ({s2})²)"
     elif op == 'log_base':
         return f"log_{s2}({s1})"
+    elif op == 'exp_decay':
+        return f"exp(-({s1})·({s2}))"
+    elif op == 'rbf':
+        return f"exp(-(({s1}) - ({s2}))²)"
     elif op.startswith('adf_'):
         return f"{op}({s1}, {s2})"
     else:
@@ -3622,6 +3652,8 @@ ALL_OP_DESCRIPTIONS = {
     'hypot':     "Hypotenuse           sqrt(x²+y²) — Euclidean distance",
     'distance_2':"Distance (2 vars)    sqrt(x²+y²) — Euclidean norm of two variables",
     'log_base':  "Log base y           log_y(x) = log|x|/log|y| — logarithm to base y",
+    'exp_decay': "Exponential decay    exp(-x·y) — decaying response (rate·input)",
+    'rbf':       "RBF / Gauss kernel   exp(-(x-y)²) — similarity decaying with distance",
     'atan2':     "Atan2                atan2(x,y)  — angle in [-π, π]",
     'harmonic':  "Harmonic mean        2xy/(|x+y|) — blending of two signals",
     'geometric': "Geometric mean       sqrt(|xy|)  — multiplicative average",
@@ -3688,7 +3720,9 @@ ALL_OP_DESCRIPTIONS = {
     'cos':       "Cosine               cos(x)   — oscillation (phase-shifted)",
     'tan':       "Tangent              tan(x)   — sin/cos ratio, singularities",
     'exp':       "Exponential          exp(x)   — exponential growth/decay",
+    'expm1':     "Exp minus 1          exp(x)-1 — accurate exponential near 0",
     'log':       "Natural log          log(|x|) — compresses large values",
+    'log1p':     "Log of 1 plus x      log(1+x) — accurate logarithm near 0",
     'sqrt':      "Square root          sqrt(|x|)— sublinear growth",
     'abs':       "Absolute value       |x|      — removes sign, very cheap",
     'square':    "Square               x²       — quadratic, very cheap",
@@ -3699,6 +3733,8 @@ ALL_OP_DESCRIPTIONS = {
     'log10':     "Log base 10          log10|x| — order-of-magnitude scale",
     'sigmoid':   "Sigmoid              1/(1+e⁻ˣ)— smooth 0-1 gate",
     'tanh':      "Tanh                 tanh(x)  — smooth -1 to 1 squash",
+    'sinh':      "Hyperbolic sine      sinh(x)  — odd exponential growth",
+    'cosh':      "Hyperbolic cosine    cosh(x)  — even exponential growth (catenary)",
     'relu':      "ReLU                 max(0,x) — half-wave rectifier, cheap",
     'leaky_relu':"Leaky ReLU  max(x,0.01x) — like ReLU but non-zero for x<0",
     'atan':      "Arctangent           atan(x)  — bounded monotone, -π/2..π/2",
@@ -16137,6 +16173,10 @@ def _adf_to_sympy(adf_dict, input_exprs, safe=True):
                               / sympy.log(sympy.Abs(v2) + sympy.Float(1e-30)))
             else:
                 sbuf[slot] = sympy.log(v1) / sympy.log(v2)
+        elif op == 'exp_decay':
+            sbuf[slot] = sympy.exp(-(v1 * v2))
+        elif op == 'rbf':
+            sbuf[slot] = sympy.exp(-(v1 - v2)**2)
         elif op in ('root3', 'root4', 'root5', 'root6',
                     'root7', 'root8', 'root9', 'root10'):
             k = int(op[4:])
@@ -16151,6 +16191,14 @@ def _adf_to_sympy(adf_dict, input_exprs, safe=True):
                     sympy.log(sympy.Abs(v1) + sympy.Float(1e-30), 10))
             else:
                 sbuf[slot] = sympy.floor(sympy.log(sympy.Abs(v1), 10))
+        elif op == 'sinh':
+            sbuf[slot] = sympy.sinh(v1)
+        elif op == 'cosh':
+            sbuf[slot] = sympy.cosh(v1)
+        elif op == 'expm1':
+            sbuf[slot] = sympy.exp(v1) - 1
+        elif op == 'log1p':
+            sbuf[slot] = sympy.log(1 + v1)
         elif op == 'max':
             sbuf[slot] = sympy.Max(v1, v2)
         elif op == 'min':
@@ -16260,6 +16308,17 @@ def tree_to_sympy(cgp_eq, feature_vars, safe=None):
                                 / sympy.log(sympy.Abs(v2) + sympy.Float(1e-30)))
                 else:
                     buf[idx] = sympy.log(v1) / sympy.log(v2)
+            elif node.op == 'exp_decay':
+                if safe:
+                    p = sympy.Min(sympy.Max(v1 * v2, sympy.Float(-700.0)), sympy.Float(700.0))
+                    buf[idx] = sympy.exp(-p)
+                else:
+                    buf[idx] = sympy.exp(-(v1 * v2))
+            elif node.op == 'rbf':
+                if safe:
+                    buf[idx] = sympy.exp(-sympy.Min((v1 - v2)**2, sympy.Float(500)))
+                else:
+                    buf[idx] = sympy.exp(-(v1 - v2)**2)
             elif node.op == 'atan2':
                 buf[idx] = sympy.atan2(v1, v2)
 
@@ -16500,6 +16559,26 @@ def tree_to_sympy(cgp_eq, feature_vars, safe=None):
                         sympy.log(sympy.Abs(v1) + sympy.Float(1e-30), 10))
                 else:
                     buf[idx] = sympy.floor(sympy.log(sympy.Abs(v1), 10))
+            elif node.op == 'sinh':
+                if safe:
+                    buf[idx] = sympy.sinh(sympy.Min(sympy.Max(v1, sympy.Float(-700.0)), sympy.Float(700.0)))
+                else:
+                    buf[idx] = sympy.sinh(v1)
+            elif node.op == 'cosh':
+                if safe:
+                    buf[idx] = sympy.cosh(sympy.Min(sympy.Max(v1, sympy.Float(-700.0)), sympy.Float(700.0)))
+                else:
+                    buf[idx] = sympy.cosh(v1)
+            elif node.op == 'expm1':
+                if safe:
+                    buf[idx] = sympy.exp(sympy.Min(sympy.Max(v1, sympy.Float(-700.0)), sympy.Float(700.0))) - 1
+                else:
+                    buf[idx] = sympy.exp(v1) - 1
+            elif node.op == 'log1p':
+                if safe:
+                    buf[idx] = sympy.log(1 + sympy.Max(v1, sympy.Float(-1.0 + 1e-6)))
+                else:
+                    buf[idx] = sympy.log(1 + v1)
             elif node.op == 'deg2rad':
                 buf[idx] = v1 * sympy.pi / 180
             elif node.op == 'rad2deg':
@@ -16578,6 +16657,12 @@ def _binary_python_expr(op, v1, v2, safe):
                     f"np.log(np.abs({v2}) + 1e-30), "
                     f"np.sign(np.log(np.abs({v2}) + 1e-30) + 1e-18) * 1e-8))")
         return f"(np.log({v1}) / np.log({v2}))"
+    if op == 'exp_decay':
+        if safe: return f"np.exp(-np.clip(({v1}) * ({v2}), -700.0, 700.0))"
+        return f"np.exp(-(({v1}) * ({v2})))"
+    if op == 'rbf':
+        if safe: return f"np.exp(-np.clip((({v1}) - ({v2}))**2, 0.0, 500.0))"
+        return f"np.exp(-((({v1}) - ({v2}))**2))"
     if op == 'atan2':   return f"np.arctan2({v1}, {v2})"
     if op == 'harmonic':
         if safe:
@@ -16700,6 +16785,18 @@ def _unary_python_expr(op, v1, safe):
     if op == 'oom':
         if safe: return f"np.floor(np.log10(np.abs({v1}) + 1e-30))"
         return f"np.floor(np.log10(np.abs({v1})))"
+    if op == 'sinh':
+        if safe: return f"np.sinh(np.clip({v1}, -700.0, 700.0))"
+        return f"np.sinh({v1})"
+    if op == 'cosh':
+        if safe: return f"np.cosh(np.clip({v1}, -700.0, 700.0))"
+        return f"np.cosh({v1})"
+    if op == 'expm1':
+        if safe: return f"np.expm1(np.clip({v1}, -700.0, 700.0))"
+        return f"np.expm1({v1})"
+    if op == 'log1p':
+        if safe: return f"np.log1p(np.maximum({v1}, -1.0 + 1e-6))"
+        return f"np.log1p({v1})"
     if op == 'deg2rad': return f"(({v1}) * (np.pi / 180.0))"
     if op == 'rad2deg': return f"(({v1}) * (180.0 / np.pi))"
     if op == 'signbit': return f"np.where(np.signbit(np.nan_to_num({v1}, nan=0.0)), 1.0, 0.0)"
@@ -22529,8 +22626,8 @@ _BO_OP_CATEGORIES = {
     'arith':   {'+', '-', '*', '/', 'square', 'cube', 'inv', 'neg', 'abs'},
     'trig':    {'sin', 'cos', 'tan', 'sinh', 'cosh', 'asin', 'acos', 'atan'},
     'bounded': {'tanh', 'sigmoid', 'erf', 'sinc'},
-    'expon':   {'exp', '10^x', 'pow'},
-    'log':     {'log', 'log10', 'sqrt'},
+    'expon':   {'exp', '10^x', 'pow', 'exp_decay', 'rbf', 'expm1'},
+    'log':     {'log', 'log10', 'sqrt', 'log1p'},
     'cond':    {'gt', 'lt', 'gte', 'lte', 'eq', 'if_else', 'min', 'max', 'sign'},
     'const':   {'const'},
 }
