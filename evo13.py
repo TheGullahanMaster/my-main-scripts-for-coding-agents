@@ -1175,16 +1175,25 @@ NSGA3_UR_THRESH_COEF = (-0.00001989, 0.0002034, 0.03376, -0.2373)
 #                   Behavioural clones score high (crowded → bad); structurally
 #                   novel shapes score low (good), so the trim actively protects
 #                   behavioural diversity instead of only objective-space spread.
+#   'logloss'     — the MAIN regression loss recomputed in signed-log (symlog)
+#                   space: predictions and target are pushed through
+#                   sign(x)·log1p(|x|) before scoring, so every decade of output
+#                   magnitude weighs comparably and the loss can no longer be
+#                   driven down by nailing only the largest outputs.  Pushes the
+#                   pool to explore models that fit the WHOLE output range, the
+#                   small rows included, not just the high ones.  Squashed to
+#                   [0,1) so it sits on the same bounded scale as shape /
+#                   instability (see _logloss_objective).
 #
 # Off by default and ONLY consulted when NSGA3_ENABLED — direct/non-interactive
 # callers and the NSGA-II legacy path stay on the bit-for-bit 3-objective trim.
-# The first two are cached per-individual on the last full-data REGRESSION
+# All but diversity are cached per-individual on the last full-data REGRESSION
 # evaluation (calculate_fitness); diversity is computed once per trim on the
 # fixed pool, so the whole selection remains deterministic.  Enabled
 # interactively inside `_select_nsga3_mode`; inherited by AFPO fork workers like
 # every other NSGA-III knob.
 NSGA3_EXTRA_OBJ_ENABLED = False        # module default off (interactive opt-in)
-NSGA3_EXTRA_OBJECTIVES  = ()           # subset of ('instability','shape','diversity')
+NSGA3_EXTRA_OBJECTIVES  = ()           # subset of ('instability','shape','diversity','logloss')
 NSGA3_DIVERSITY_K       = 15           # k nearest neighbours for the diversity metric
 NSGA3_BEHAVIOR_SIG_K    = 16           # length of the standardized-prediction signature
 
@@ -5597,17 +5606,21 @@ def _select_nsga3_mode():
     print("                    matches the dataset (|Spearman|), magnitude aside.")
     print("      diversity   — favour behaviourally novel models (spread in")
     print("                    standardized-prediction space), protecting variety.")
+    print("      logloss     — the main loss recomputed in signed-log space, so")
+    print("                    the trim explores models that fit ALL output")
+    print("                    magnitudes, not just the highest ones.")
     print("    Regression-side selection objectives; classification runs leave")
     print("    them neutral.  Pick 'all', a subset (e.g. 'i,s'), or none.")
-    eo_in = input("  Extra objectives [a=all / i,s,d subset / N=none, "
+    eo_in = input("  Extra objectives [a=all / i,s,d,l subset / N=none, "
                   "Enter = none]: ").strip().lower()
     _eo_map = {'i': 'instability', 's': 'shape', 'd': 'diversity',
+               'l': 'logloss',
                'instability': 'instability', 'shape': 'shape',
-               'diversity': 'diversity'}
+               'diversity': 'diversity', 'logloss': 'logloss', 'log': 'logloss'}
     chosen_eo = []
     if eo_in and not eo_in.startswith('n'):
         if eo_in in ('a', 'all', 'y', 'yes'):
-            chosen_eo = ['instability', 'shape', 'diversity']
+            chosen_eo = ['instability', 'shape', 'diversity', 'logloss']
         else:
             for tok in re.split(r'[\s,]+', eo_in):
                 name = _eo_map.get(tok)
@@ -14216,6 +14229,83 @@ def regression_loss(preds, y, sample_weights=None):
     return float(loss)
 
 
+# ── Signed-log (symlog) loss space — the optional 'logloss' NSGA-III objective ──
+# A genuine logarithm squashes the gaps BETWEEN large outputs, so a loss computed
+# AFTER pushing predictions and target through one stops being owned by the few
+# highest-magnitude rows and instead rewards tracking the target across EVERY
+# output scale — "explore all outputs, not just the highest ones".  Plain log(·)
+# can't stand in (it is undefined at and below zero, and regression targets are
+# signed), so we use the signed-log symlog(x) = sign(x)·log1p(|x|): odd, smooth,
+# strictly MONOTONIC through zero, ≈ x for |x| ≲ 1 and ≈ sign(x)·ln|x| for
+# |x| ≫ 1.  Monotonicity is what lets a loss taken in this space serve as a
+# Pareto objective without reordering anything relative to the raw log-space loss.
+_SYMLOG_TARGET_CACHE = OrderedDict()
+_SYMLOG_TARGET_MAX   = 16
+
+
+def _symlog(x):
+    """Signed logarithm ``sign(x)·log1p(|x|)`` — see the block comment above."""
+    x = np.asarray(x, dtype=np.float64)
+    return np.sign(x) * np.log1p(np.abs(x))
+
+
+def _symlog_target(y):
+    """``_symlog(y)`` cached on the target's array identity.
+
+    The target is one array reused across every individual in a generation, so
+    transforming it once and handing back the SAME array also keeps the
+    downstream ``_loss_ystats`` cache inside :func:`regression_loss` warm (that
+    cache is keyed on ``id(y)`` and identity-checked).  LRU-capped and
+    identity-checked exactly like ``_LOSS_YSTATS_CACHE`` so a recycled ``id()``
+    can never return a stale transform.
+    """
+    key = id(y)
+    ent = _SYMLOG_TARGET_CACHE.get(key)
+    if ent is not None and ent[0] is y:
+        _SYMLOG_TARGET_CACHE.move_to_end(key)
+        return ent[1]
+    sy = _symlog(y)
+    _SYMLOG_TARGET_CACHE[key] = (y, sy)
+    _SYMLOG_TARGET_CACHE.move_to_end(key)
+    if len(_SYMLOG_TARGET_CACHE) > _SYMLOG_TARGET_MAX:
+        _SYMLOG_TARGET_CACHE.popitem(last=False)
+    return sy
+
+
+def logspace_regression_loss(preds, y):
+    """The main :func:`regression_loss`, evaluated in signed-log (symlog) space.
+
+    Both the prediction and the target are pushed through :func:`_symlog` first,
+    then scored by the ordinary regression loss.  Because symlog compresses the
+    high-magnitude rows toward each other, the squared / absolute error terms can
+    no longer be driven down by nailing only the largest outputs — every decade
+    of magnitude now contributes comparably, so the loss rewards getting the
+    SHAPE right across ALL outputs, the small ones included.  Inherits
+    regression_loss's variance normalisation (taken here in log space), so it is
+    still ~O(1) for a mean predictor and 0 for a perfect fit.
+    """
+    return regression_loss(_symlog(preds), _symlog_target(y))
+
+
+def _logloss_objective(preds, y):
+    """Bounded NSGA-III ``logloss`` extra objective (minimised, ∈ [0, 1)).
+
+    Maps :func:`logspace_regression_loss` through the strictly-monotonic squash
+    ``L/(1+L)`` so it shares the bounded ``[0, 1]`` range (worst → 1) of the
+    other extra objectives (``shape`` / ``instability``).  Monotonicity means the
+    Pareto DOMINATION ordering is identical to the raw log-space loss — only the
+    placement on the NSGA-III niching simplex is rescaled, which stops a single
+    badly-behaved individual from blowing up the per-axis normalisation the way
+    an unbounded loss column would (``_nsga3_normalise`` divides by the per-axis
+    range).  A perfect fit maps to 0, a mean predictor to ≈0.5; non-finite /
+    negative losses fall back to the worst value ``1.0``.
+    """
+    L = logspace_regression_loss(preds, y)
+    if not np.isfinite(L) or L < 0.0:
+        return 1.0
+    return float(L / (1.0 + L))
+
+
 # ==========================================
 # AFFINE MAGNITUDE FINETUNE (shape → magnitude)
 # ==========================================
@@ -14934,11 +15024,12 @@ class Individual:
         # consulted when NSGA3_ENABLED and NSGA3_EXTRA_OBJ_ENABLED — see
         # _afpo_extra_objective_columns).  Cached on the last full-data
         # regression evaluation.  Defaults are the WORST value (1.0) for the
-        # minimised shape / instability axes so an unevaluated or
+        # minimised shape / instability / logloss axes so an unevaluated or
         # classification individual is never spuriously rewarded; behaviour_sig
         # is None until a prediction signature exists.
         self.shape_obj       = 1.0
         self.instability_obj = 1.0
+        self.logloss_obj     = 1.0
         self.behavior_sig    = None
         # Selection-only MDL constant cost (set in calculate_fitness; see
         # compute_const_cost).  0.0 until evaluated / when the feature is off.
@@ -15192,13 +15283,15 @@ class Individual:
 
     def _update_nsga3_extra_objectives(self, preds, y_eval, X_eval):
         """Cache the optional NSGA-III extra-objective metrics from a full-data
-        REGRESSION evaluation: shape mismatch, numerical instability, and the
-        behavioural signature used by the diversity objective.  All are
-        selection-only and only consulted when NSGA3_ENABLED and
-        NSGA3_EXTRA_OBJ_ENABLED (see _afpo_extra_objective_columns).  Cheap —
-        two capped rank sorts plus one ~32-point extrapolation probe — and only
-        invoked on the cacheable full-data path, so minibatch re-evaluations
-        reuse the cached values and the trim stays deterministic.
+        REGRESSION evaluation: shape mismatch, numerical instability, the
+        signed-log-space loss, and the behavioural signature used by the
+        diversity objective.  All are selection-only and only consulted when
+        NSGA3_ENABLED and NSGA3_EXTRA_OBJ_ENABLED (see
+        _afpo_extra_objective_columns).  Cheap — two capped rank sorts, one
+        ~32-point extrapolation probe and one extra O(N) loss pass (the symlog'd
+        target is cached) — and only invoked on the cacheable full-data path, so
+        minibatch re-evaluations reuse the cached values and the trim stays
+        deterministic.
         """
         try:
             # SHAPE mismatch: 1 − |Spearman(pred, target)| (0 = ordering nailed).
@@ -15218,11 +15311,17 @@ class Individual:
             self.instability_obj = float(min(1.0, max(0.0, instab)))
             # DIVERSITY: standardized-prediction signature (compared at trim time).
             self.behavior_sig = _behavior_signature(preds)
+            # LOG-LOSS: the main regression loss recomputed in signed-log space
+            # (see _logloss_objective), so the survival trim can favour models
+            # that track the target across ALL output magnitudes rather than
+            # parking on the high-magnitude rows.
+            self.logloss_obj = _logloss_objective(preds, y_eval)
         except Exception:
             # Neutral-worst defaults so a failure never silently rewards a model.
             self.shape_obj = 1.0
             self.instability_obj = 1.0
             self.behavior_sig = None
+            self.logloss_obj = 1.0
 
     def calculate_fitness(self, X, y_target, type_code, batch_indices=None,
                           bg_logits=None, class_idx_in_group=None, Y_group=None,
@@ -15286,6 +15385,7 @@ class Individual:
                 # defaults for entries cached before the feature was armed).
                 self.shape_obj       = cached.get('shape_obj', 1.0)
                 self.instability_obj = cached.get('instability_obj', 1.0)
+                self.logloss_obj     = cached.get('logloss_obj', 1.0)
                 self.behavior_sig    = cached.get('behavior_sig', None)
                 # Constant cost is a pure function of the tree's constants and
                 # std(y) (both invariant for a cached tree+target), so the stored
@@ -15684,6 +15784,7 @@ class Individual:
                     # minibatch re-evals / cache hits keep a stable value).
                     'shape_obj':       self.shape_obj,
                     'instability_obj': self.instability_obj,
+                    'logloss_obj':     self.logloss_obj,
                     'behavior_sig':    self.behavior_sig,
                 })
 
@@ -19999,12 +20100,13 @@ def _afpo_extra_objective_columns(population):
     survival trim, or ``[]`` when the feature is disabled.
 
     Returns a list of ``(name, length-n float ndarray)`` pairs for whichever of
-    ``instability`` / ``shape`` / ``diversity`` are listed in
+    ``instability`` / ``shape`` / ``diversity`` / ``logloss`` are listed in
     ``NSGA3_EXTRA_OBJECTIVES``.  Gated on BOTH ``NSGA3_ENABLED`` and
     ``NSGA3_EXTRA_OBJ_ENABLED`` so the NSGA-II legacy path (and every direct /
     non-interactive caller) keeps the bit-for-bit 3-objective trim.  ``shape`` /
-    ``instability`` are read from the per-individual values cached on the last
-    full-data regression evaluation; ``diversity`` is computed here on the pool.
+    ``instability`` / ``logloss`` are read from the per-individual values cached
+    on the last full-data regression evaluation; ``diversity`` is computed here
+    on the pool.
     """
     if not (NSGA3_ENABLED and NSGA3_EXTRA_OBJ_ENABLED) or not NSGA3_EXTRA_OBJECTIVES:
         return []
@@ -20020,6 +20122,10 @@ def _afpo_extra_objective_columns(population):
             dtype=np.float64, count=n)))
     if 'diversity' in NSGA3_EXTRA_OBJECTIVES:
         cols.append(('diversity', _afpo_diversity_column(population)))
+    if 'logloss' in NSGA3_EXTRA_OBJECTIVES:
+        cols.append(('logloss', np.fromiter(
+            (float(getattr(ind, 'logloss_obj', 1.0)) for ind in population),
+            dtype=np.float64, count=n)))
     return cols
 
 
