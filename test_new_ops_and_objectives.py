@@ -87,7 +87,7 @@ def _build(op, arity, feat=('x0', 'x1', 'x2')):
     return t
 
 
-def _mk(age, fit, comp, *, shape=1.0, instab=1.0, sig=None, loss=None):
+def _mk(age, fit, comp, *, shape=1.0, instab=1.0, logloss=1.0, sig=None, loss=None):
     """Trivial individual with an explicit objective profile (mirrors
     test_nsga3._mk) plus the optional extra-objective metrics."""
     t = e.CGPEquation(2, 4, ['x0', 'x1'])
@@ -101,6 +101,7 @@ def _mk(age, fit, comp, *, shape=1.0, instab=1.0, sig=None, loss=None):
     ind.complexity = float(comp)
     ind.shape_obj = float(shape)
     ind.instability_obj = float(instab)
+    ind.logloss_obj = float(logloss)
     ind.behavior_sig = sig
     return ind
 
@@ -249,6 +250,16 @@ def test_extra_objective_columns_gated_and_shaped():
         e.NSGA3_EXTRA_OBJECTIVES = ('shape',)
         cols = e._afpo_extra_objective_columns(pop)
         assert [c[0] for c in cols] == ['shape']
+        # The optional 'logloss' axis reads its cached per-individual value and
+        # appends after the others in canonical order.
+        for ind, val in zip(pop, [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]):
+            ind.logloss_obj = val
+        e.NSGA3_EXTRA_OBJECTIVES = ('shape', 'logloss')
+        cols = e._afpo_extra_objective_columns(pop)
+        assert [c[0] for c in cols] == ['shape', 'logloss']
+        ll = dict(cols)['logloss']
+        assert ll.shape == (6,)
+        assert np.allclose(ll, [0.1, 0.2, 0.3, 0.4, 0.5, 0.6])
     print("PASS test_extra_objective_columns_gated_and_shaped")
 
 
@@ -320,13 +331,14 @@ def test_extras_reshape_selection_vs_3obj():
 
 
 def test_calculate_fitness_caches_extra_objectives():
-    """A full-data regression evaluation must populate shape_obj, instability_obj
-    and behavior_sig when the feature is armed."""
+    """A full-data regression evaluation must populate shape_obj, instability_obj,
+    logloss_obj and behavior_sig when the feature is armed — and a subsequent
+    cache hit must restore them unchanged."""
     e.set_ops_mode(True); e._INIT_PHASE = False
     with _saved_nsga3_globals():
         e.NSGA3_ENABLED = True
         e.NSGA3_EXTRA_OBJ_ENABLED = True
-        e.NSGA3_EXTRA_OBJECTIVES = ('instability', 'shape', 'diversity')
+        e.NSGA3_EXTRA_OBJECTIVES = ('instability', 'shape', 'diversity', 'logloss')
         np.random.seed(0)
         X = np.random.uniform(0.5, 4.0, size=(120, 1))
         y = (2.0 * X[:, 0] + 1.0)            # perfectly ordered → shape_obj ≈ 0
@@ -341,6 +353,14 @@ def test_calculate_fitness_caches_extra_objectives():
         assert 0.0 <= ind.instability_obj <= 1.0
         # A monotone increasing model of a monotone target nails the ordering.
         assert ind.shape_obj < 1e-6, ind.shape_obj
+        # f = 2·x0 affine-fits y = 2·x0 + 1 exactly, so the signed-log-space loss
+        # (hence the bounded logloss objective) is ≈ 0, well under the ≈0.5
+        # mean-predictor level.
+        assert 0.0 <= ind.logloss_obj < 0.1, ind.logloss_obj
+        # Cache hit on a fresh individual with the same tree+target restores it.
+        ind2 = e.Individual(t.clone())
+        ind2.calculate_fitness(X, y, 5)
+        assert ind2.logloss_obj == ind.logloss_obj
     print("PASS test_calculate_fitness_caches_extra_objectives")
 
 
@@ -388,12 +408,17 @@ def test_interactive_extra_objectives_all_and_subset():
             e._select_nsga3_mode()
         assert e.NSGA3_EXTRA_OBJ_ENABLED is True
         assert set(e.NSGA3_EXTRA_OBJECTIVES) == {
-            'instability', 'shape', 'diversity'}
+            'instability', 'shape', 'diversity', 'logloss'}
     with _saved_nsga3_globals():
         with feed_input(["", "", "a", "i,d"]):
             e._select_nsga3_mode()
         assert e.NSGA3_EXTRA_OBJ_ENABLED is True
         assert e.NSGA3_EXTRA_OBJECTIVES == ('instability', 'diversity')
+    with _saved_nsga3_globals():
+        with feed_input(["", "", "a", "l"]):
+            e._select_nsga3_mode()
+        assert e.NSGA3_EXTRA_OBJ_ENABLED is True
+        assert e.NSGA3_EXTRA_OBJECTIVES == ('logloss',)
     print("PASS test_interactive_extra_objectives_all_and_subset")
 
 
