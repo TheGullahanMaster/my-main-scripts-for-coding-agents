@@ -3,6 +3,7 @@
 """
 Multi-Architecture GAN Trainer with:
 - MLP (CIPS-style coordinate-based generation)
+- CREPS (column-row entangled pixel synthesis)
 - Deconv (Original DCGAN-style)
 - ViT (Vision Transformer)
 - GRU (Autoregressive column generation)
@@ -695,6 +696,104 @@ class MLPGenerator(nn.Module):
         
         return img
 
+
+
+
+class CREPSGenerator(nn.Module):
+    """Column-Row Entangled Pixel Synthesis generator.
+
+    This is a compact CREPS-inspired generator option for this trainer.  It avoids
+    spatial convolutions in the synthesis trunk by producing separate thick row
+    and column feature encodings, composing them with a dot product, and fusing
+    layer-wise composed maps with lightweight 1x1 decoder blocks.
+    """
+    def __init__(self, zdim: int, img_ch: int, hidden_dim: int, num_layers: int,
+                 img_size: int, thickness: int = 8, decoder_depth: int = 4):
+        super().__init__()
+        self.zdim = zdim
+        self.img_ch = img_ch
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+        self.img_size = img_size
+        self.thickness = max(1, thickness)
+        self.coord_dim = 128
+        self.embed_dim = 128
+        self.pos_dim = self.coord_dim + self.embed_dim
+
+        self.mapping_network = nn.Sequential(
+            nn.Linear(zdim, hidden_dim), nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim), nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim), nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim), nn.SiLU(),
+        )
+        self.style_dim = hidden_dim
+
+        # Separate row/column Fourier bases and learnable position embeddings.
+        self.row_fourier = nn.Parameter(torch.randn(1, self.coord_dim // 2))
+        self.col_fourier = nn.Parameter(torch.randn(1, self.coord_dim // 2))
+        self.row_embeddings = nn.Parameter(torch.randn(img_size, self.embed_dim) * 0.02)
+        self.col_embeddings = nn.Parameter(torch.randn(img_size, self.embed_dim) * 0.02)
+
+        self.row_input = nn.Conv2d(self.pos_dim, hidden_dim, 1)
+        self.col_input = nn.Conv2d(self.pos_dim, hidden_dim, 1)
+        self.row_blocks = nn.ModuleList()
+        self.col_blocks = nn.ModuleList()
+        self.decoders = nn.ModuleList()
+        for _ in range(num_layers):
+            self.row_blocks.append(ModulatedConv1x1(hidden_dim, hidden_dim, self.style_dim, demodulate=True))
+            self.col_blocks.append(ModulatedConv1x1(hidden_dim, hidden_dim, self.style_dim, demodulate=True))
+            layers = []
+            dec_hidden = max(32, hidden_dim // 2)
+            in_ch = hidden_dim
+            for _j in range(max(1, decoder_depth - 1)):
+                layers.extend([nn.Conv2d(in_ch, dec_hidden, 1), nn.LeakyReLU(0.2, inplace=True)])
+                in_ch = dec_hidden
+            layers.append(nn.Conv2d(in_ch, hidden_dim, 1))
+            self.decoders.append(nn.Sequential(*layers))
+
+        self.refine = nn.Sequential(
+            nn.Conv2d(hidden_dim, max(64, hidden_dim // 2), 1),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(max(64, hidden_dim // 2), max(32, hidden_dim // 4), 1),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(max(32, hidden_dim // 4), img_ch, 1),
+        )
+
+    def _axis_encoding(self, axis: str, batch: int, device: torch.device) -> torch.Tensor:
+        coords = torch.linspace(-1, 1, self.img_size, device=device).unsqueeze(1)
+        if axis == 'row':
+            fourier_matrix = self.row_fourier
+            learned = self.row_embeddings
+        else:
+            fourier_matrix = self.col_fourier
+            learned = self.col_embeddings
+        fourier_input = coords @ fourier_matrix
+        fourier = torch.cat([torch.sin(fourier_input), torch.cos(fourier_input)], dim=1)
+        pos = torch.cat([fourier, learned.to(device)], dim=1)  # (R, pos_dim)
+        pos = pos.transpose(0, 1).view(1, self.pos_dim, self.img_size, 1)
+        pos = pos.expand(batch, -1, -1, self.thickness)
+        return pos
+
+    def _compose(self, row: torch.Tensor, col: torch.Tensor) -> torch.Tensor:
+        # row/col are (B, C, R, D).  Output is (B, C, R, R).
+        return torch.einsum('bchd,bcwd->bchw', row, col) / math.sqrt(float(self.thickness))
+
+    def forward(self, z):
+        batch = z.size(0)
+        device = z.device
+        w = self.mapping_network(z)
+        row = self.row_input(self._axis_encoding('row', batch, device))
+        col = self.col_input(self._axis_encoding('col', batch, device))
+
+        fused = None
+        for row_block, col_block, decoder in zip(self.row_blocks, self.col_blocks, self.decoders):
+            row = SineEvenLReLU(0.2)(row_block(row, w))
+            col = SineEvenLReLU(0.2)(col_block(col, w))
+            composed = self._compose(row, col)
+            fused = composed if fused is None else decoder(fused) + composed
+
+        img = self.refine(fused)
+        return img
 
 
 
@@ -5168,6 +5267,7 @@ class TrainConfig:
     min_patch_size: int = 0  # Minimum patch size (for gMLP GAN)
     latent_mode: str = "per_patch"
     use_film: bool = True
+    creps_thickness: int = 8
 
     def to_json(self):
         d = asdict(self)
@@ -5264,6 +5364,9 @@ def build_models(cfg: TrainConfig, device: torch.device):
 #            base_ch = 48
         G = R3GANGenerator(cfg.zdim, cfg.channels, cfg.image_size,
                           base_channels=cfg.g_filters, max_channels=cfg.fmap_max, attn_type=cfg.attn_type, attn_res=attn_res_set, attn_heads_map=heads_map, use_adaptive_norm=getattr(cfg, 'use_adaptive_norm', False)).to(device)
+    elif cfg.g_type == 'creps':
+        G = CREPSGenerator(cfg.zdim, cfg.channels, cfg.g_hidden_dim, cfg.g_num_layers,
+                          cfg.image_size, thickness=getattr(cfg, 'creps_thickness', 8)).to(device)
     elif cfg.g_type == 'vit':
         G = ViTGenerator(cfg.zdim, cfg.channels, cfg.g_hidden_dim, cfg.g_num_heads,
                         cfg.g_num_layers, cfg.image_size, cfg.patch_size, cfg.overlap).to(device)
@@ -5635,15 +5738,16 @@ def main():
         print("  MLP-Mixer(7)")
         print("  R3GAN Architecture(8)")
         print("  Basic MLP GAN(9)")
-        print("  PatchMLP (Simplified gMLP)(10)")  # NEW
+        print("  PatchMLP (Simplified gMLP)(10)")
+        print("  CREPS Column-Row Generator(11)")
         
         cfg.g_type = ask_choice("G type> ", 
-            ["mlp", "deconv", "vit", "gru", "swin", "lada", "gmlp", "mlpmixer", "r3gan", "mlpgan", "patchmlp",
-            "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"]).lower()
+            ["mlp", "deconv", "vit", "gru", "swin", "lada", "gmlp", "mlpmixer", "r3gan", "mlpgan", "patchmlp", "creps",
+            "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11"]).lower()
         
         type_map = {
             "0": "mlp", "1": "deconv", "2": "vit", "3": "gru", "4": "swin",
-            "5": "lada", "6": "gmlp", "7": "mlpmixer", "8": "r3gan", "9": "mlpgan", "10": "patchmlp"
+            "5": "lada", "6": "gmlp", "7": "mlpmixer", "8": "r3gan", "9": "mlpgan", "10": "patchmlp", "11": "creps"
         }
         cfg.g_type = type_map.get(cfg.g_type, cfg.g_type)
         
@@ -5702,6 +5806,8 @@ def main():
         else:
             cfg.g_hidden_dim = ask_int("G hidden dimension: ", cond=lambda v: v > 0)
             cfg.g_num_layers = ask_int("G number of layers: ", cond=lambda v: v > 0)
+            if cfg.g_type == 'creps':
+                cfg.creps_thickness = ask_int("CREPS thickness D (e.g. 8): ", cond=lambda v: v > 0)
             if cfg.g_type == 'vit' or cfg.g_type == "lada":
                 cfg.g_num_heads = ask_int("G number of attention heads: ", cond=lambda v: v > 0)
 
