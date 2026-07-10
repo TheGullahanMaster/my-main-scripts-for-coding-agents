@@ -1932,8 +1932,12 @@ class _FitnessCache:
     def _fingerprint(self, tree) -> tuple:
         """
         Canonical tuple representation of the *active* CGP graph.
-        Inactive nodes are ignored entirely.  Const values are rounded to
-        4 significant figures so near-identical constants collapse together.
+        Inactive nodes are ignored entirely.  Const values are used EXACTLY:
+        the old 4-sig-fig rounding made trees that differ only in fine
+        constant digits share one cache entry, so an individual could
+        inherit another tree's loss/R² wholesale (e.g. ``x + 1.0e8`` and
+        ``x + 1.00001e8`` collided — a 1000-unit output difference reported
+        with the first tree's perfect score).
         """
         tree.update_active_nodes()
         parts = []
@@ -1946,9 +1950,7 @@ class _FitnessCache:
             else:
                 node = tree.nodes[idx - tree.n_features]
                 if node.op == 'const':
-                    # round to 4 sig-figs to tolerate floating-point noise
-                    v = float(f"{node.const_val:.4g}")
-                    parts.append(('C', v))
+                    parts.append(('C', float(node.const_val)))
                 elif node.op in CGPEquation.OPS_TERNARY_SET:
                     parts.append((node.op, node.in1, node.in2, node.in3))
                 else:
@@ -6291,22 +6293,29 @@ def simplify_cgp_tree(cgp_eq):
                         pass
 
                 # ---- IDENTITY REDUCTION (fold-to-zero / fold-to-one) ----
+                # EXACT matches only.  The old ``abs(c) < 1e-9`` tolerance
+                # treated legitimate tiny coefficients as zero, so a fitted
+                # term like ``f(x) * 5e-10`` (common when the affine or the
+                # data scale makes small multipliers meaningful) was folded
+                # into a literal 0 — collapsing a working model into a flat
+                # constant.  Exact 0.0/1.0 constants (initial values, snapped
+                # constants) still fold.
                 # x * 0 = 0 and 0 * x = 0
                 if node.op == '*':
-                    if (c1 and abs(_cval(node.in1)) < 1e-9) or \
-                       (c2 and abs(_cval(node.in2)) < 1e-9):
+                    if (c1 and _cval(node.in1) == 0.0) or \
+                       (c2 and _cval(node.in2) == 0.0):
                         node.op = 'const'
                         node.const_val = 0.0
                         changed = True
                         continue
                 # 0 / x = 0
-                if node.op == '/' and c1 and abs(_cval(node.in1)) < 1e-9:
+                if node.op == '/' and c1 and _cval(node.in1) == 0.0:
                     node.op = 'const'
                     node.const_val = 0.0
                     changed = True
                     continue
                 # x ^ 0 = 1
-                if node.op == 'pow' and c2 and abs(_cval(node.in2)) < 1e-9:
+                if node.op == 'pow' and c2 and _cval(node.in2) == 0.0:
                     node.op = 'const'
                     node.const_val = 1.0
                     changed = True
@@ -6316,17 +6325,17 @@ def simplify_cgp_tree(cgp_eq):
                 # These replace references to this node with a direct pointer
                 # to one of its inputs (effectively removing the node).
                 redirect_to = None
-                if node.op in ('+', '-') and c2 and abs(_cval(node.in2)) < 1e-9:
+                if node.op in ('+', '-') and c2 and _cval(node.in2) == 0.0:
                     redirect_to = node.in1   # x ± 0 → x
-                if node.op == '+' and c1 and abs(_cval(node.in1)) < 1e-9:
+                if node.op == '+' and c1 and _cval(node.in1) == 0.0:
                     redirect_to = node.in2   # 0 + x → x
-                if node.op == '*' and c2 and abs(_cval(node.in2) - 1.0) < 1e-9:
+                if node.op == '*' and c2 and _cval(node.in2) == 1.0:
                     redirect_to = node.in1   # x * 1 → x
-                if node.op == '*' and c1 and abs(_cval(node.in1) - 1.0) < 1e-9:
+                if node.op == '*' and c1 and _cval(node.in1) == 1.0:
                     redirect_to = node.in2   # 1 * x → x
-                if node.op == '/' and c2 and abs(_cval(node.in2) - 1.0) < 1e-9:
+                if node.op == '/' and c2 and _cval(node.in2) == 1.0:
                     redirect_to = node.in1   # x / 1 → x
-                if node.op == 'pow' and c2 and abs(_cval(node.in2) - 1.0) < 1e-9:
+                if node.op == 'pow' and c2 and _cval(node.in2) == 1.0:
                     redirect_to = node.in1   # x ^ 1 → x
 
                 if redirect_to is not None:
@@ -6349,8 +6358,9 @@ def simplify_cgp_tree(cgp_eq):
                     continue
                 # If both branches are constants, fold to a single constant
                 # (only when condition is also constant — handled above — so
-                # this folds if_else(var, c1, c1) when c1==c2)
-                if c2 and c3 and abs(_cval(node.in2) - _cval(node.in3)) < 1e-12:
+                # this folds if_else(var, c1, c1) when c1==c2).  Exact match
+                # only — see the identity-reduction note above.
+                if c2 and c3 and _cval(node.in2) == _cval(node.in3):
                     node.op = 'const'
                     node.const_val = _cval(node.in2)
                     changed = True
@@ -8167,7 +8177,11 @@ class CGPEquation:
             if idx < self.n_features: continue
             node = self.nodes[idx - self.n_features]
             if node.op == 'const':
-                buf[idx] = f"{node.const_val:.4f}"
+                # 12 significant digits, not fixed decimals: the old ``:.4f``
+                # displayed every |c| < 5e-5 as "0.0000", so equations whose
+                # fit lives in small coefficients *read* (and re-evaluate, if
+                # pasted) as flat constants despite genuinely fitting.
+                buf[idx] = f"{node.const_val:.12g}"
                 continue
             s1 = buf.get(node.in1, "0")
             if node.op in self.OPS_BINARY_SET:
@@ -14568,6 +14582,36 @@ _LOSS_YSTATS_CACHE = OrderedDict()
 _LOSS_YSTATS_MAX   = 16
 
 
+def _target_scale_floor(ym):
+    """Numerical noise floor for target-derived scale statistics.
+
+    float64 carries ~16 significant digits, so spread below ≈1e-12·|mean|
+    is indistinguishable from representation noise — a target that "varies"
+    by less than this around its mean is numerically constant.  This
+    REPLACES the old absolute 1e-8/1e-9 epsilons which assumed O(1)-scale
+    targets: on genuinely tiny-scale targets (std(y) ≲ 1e-4) those absolute
+    epsilons dominated the variance normalisers, flattening every loss
+    toward 0 and every R² toward 1 — flat constants included — which is
+    how junk equations were reported as perfect fits.
+    """
+    return 1e-12 * (abs(float(ym)) + 1e-300)
+
+
+def _safe_r2(ss_res, ss_tot):
+    """Scale-free R² = 1 − ss_res/ss_tot with a constant-target guard.
+
+    The legacy form ``1 − ss_res/(ss_tot + 1e-8)`` reported R²≈1 for ANY
+    prediction whenever the target's total variance was small against the
+    absolute 1e-8 epsilon.  A numerically constant target (ss_tot ≈ 0) now
+    scores 0.0 — a model explains none of a variance that does not exist.
+    """
+    ss_tot = float(ss_tot)
+    if not np.isfinite(ss_tot) or ss_tot <= 1e-300:
+        return 0.0
+    r2 = 1.0 - float(ss_res) / ss_tot
+    return r2 if np.isfinite(r2) else 0.0
+
+
 def _loss_ystats(y):
     """Return (s, c, v, mad_y, ym, dr) for target `y`, cached on the array identity.
 
@@ -14585,7 +14629,13 @@ def _loss_ystats(y):
         return ent[1]
 
     ym = float(np.mean(y))
-    s  = float(np.sqrt(np.mean((y - ym) ** 2) + 1e-8))
+    # Scale-aware floor instead of the old absolute +1e-8: the epsilon must
+    # never dominate a genuinely tiny-scale target's own spread (see
+    # _target_scale_floor for the failure mode it fixes).
+    s  = float(np.sqrt(np.mean((y - ym) ** 2)))
+    _floor = max(_target_scale_floor(ym), 1e-300)
+    if not np.isfinite(s) or s <= _floor:
+        s = _floor
     a  = np.abs(y)
     a_nz = a[a > 0]
     if a_nz.size:
@@ -14632,7 +14682,12 @@ def regression_loss(preds, y, sample_weights=None):
     # ── Legacy variance-normalised MSE + MAE ────────────────────────────────
     if REGRESSION_LOSS_MODE == "mse_mae":
         diff  = preds - y
-        y_var = float(np.var(y)) + 1e-8
+        y_var = float(np.var(y))
+        # Scale-aware floor (was an absolute +1e-8 that flattened all losses
+        # to ≈0 on tiny-scale targets — see _target_scale_floor).
+        _vfloor = max(_target_scale_floor(float(np.mean(y))) ** 2, 1e-300)
+        if not np.isfinite(y_var) or y_var <= _vfloor:
+            y_var = _vfloor
         if w is not None:
             return float(np.mean(w * diff ** 2) / y_var
                          + np.mean(w * np.abs(diff)) / np.sqrt(y_var))
@@ -14681,8 +14736,11 @@ def regression_loss(preds, y, sample_weights=None):
 
     # L_collapse: graduated anti-constant push.  Guarded so it is silent on a
     # genuinely constant target (where every model is a constant and the var
-    # normaliser is degenerate anyway).
-    if ROBUST_LOSS_COLLAPSE_WEIGHT > 0.0 and mad_y > 1e-9 * (abs(ym) + 1.0):
+    # normaliser is degenerate anyway).  The guard is scale-aware: the old
+    # ``1e-9 * (|ym| + 1.0)`` silently disabled the push on tiny-scale targets
+    # (mad ≲ 1e-9) AND on huge-offset ones (|ym|=1e10, mad=O(1)) — both are
+    # genuinely varying targets where flat constants must keep feeling it.
+    if ROBUST_LOSS_COLLAPSE_WEIGHT > 0.0 and mad_y > _target_scale_floor(ym):
         ratio = spread_p / (mad_y + 1e-30)
         if ratio < 1.0:
             loss += ROBUST_LOSS_COLLAPSE_WEIGHT * (1.0 - ratio) ** 2
@@ -14823,7 +14881,8 @@ def _fit_affine(preds, y):
     # loss's own r/std(y) units.  OLS is the warm start (iteration 0), so with no
     # outliers the weights stay ≈1 and the result barely moves; with outliers the
     # heavy-tail rows are smoothly down-weighted toward the robust optimum.
-    s = float(np.sqrt(np.mean((yv - y_mean) ** 2) + 1e-8))
+    s = float(np.sqrt(np.mean((yv - y_mean) ** 2)))
+    s = max(s, _target_scale_floor(y_mean), 1e-300)
     knee = max(1e-6, float(ROBUST_LOSS_HUBER_DELTA)) * s
     a, b = a_ols, b_ols
     for _ in range(int(AFFINE_ROBUST_FIT_ITERS)):
@@ -16335,7 +16394,7 @@ class Individual:
 
                 ss_res = float(np.sum(diff ** 2))
                 ss_tot = float(np.sum((y_eval - y_mean) ** 2))
-                self.r2       = 1.0 - ss_res / (ss_tot + 1e-8)
+                self.r2       = _safe_r2(ss_res, ss_tot)
                 self.accuracy = float(self.r2)
 
                 # ── Discovery Push (intrinsic: shape + smooth) ────────────────
@@ -16380,8 +16439,13 @@ class Individual:
                 # a varying sliver of an always-skipped branch even though the
                 # exported (hard) model is constant — so we re-check on the hard
                 # evaluation whenever the tree actually contains an if_else.
+                # Scale-aware activation: the guard must also run on targets
+                # whose absolute spread is tiny (std ≤ 1e-9) but genuinely
+                # non-constant — the old absolute threshold skipped it there,
+                # letting flat predictions keep the near-perfect R²/loss the
+                # degenerate epsilons used to hand out on tiny-scale targets.
                 y_std_d = float(np.std(y_eval))
-                if y_std_d > 1e-9:
+                if y_std_d > _target_scale_floor(y_mean):
                     if DIFFERENTIABLE_BRANCHING and self.tree.has_conditional():
                         ph = self.tree.evaluate(X_eval, force_hard=True)
                         ph = np.clip(np.nan_to_num(ph, nan=0.0, posinf=1e9,
@@ -16537,6 +16601,11 @@ class Individual:
 
         except Exception:
             self.fitness  = 1e10
+            # Reset the loss too: leaving the PREVIOUS loss in place let a
+            # tree that later broke (mutation, simplification, evaluation
+            # error) keep a stale — possibly perfect — loss, and the Hall of
+            # Fame is keyed on .loss for regression.
+            self.loss     = 1e10
             self.r2       = -1e10
             self.accuracy = 0.0
             self.modularity = 0.0
@@ -16874,13 +16943,20 @@ class Individual:
         return errs
 
     def full_expr_string(self):
-        """String representation including boost correction stages."""
-        base = f"{self.affine_a:.4g} * ({str(self.tree)}) + {self.affine_b:.4g}"
+        """String representation including boost correction stages.
+
+        Constants are emitted with round-trip precision (repr): users paste
+        these expressions, and lossy ``:.4g`` affine terms destroyed fits
+        whose signal is small relative to the offset (e.g. b = 1e8 + 0.5).
+        """
+        base = (f"{float(self.affine_a)!r} * ({str(self.tree)}) "
+                f"+ {float(self.affine_b)!r}")
         if not getattr(self, 'boost_stages', []):
             return base
         parts = [base]
         for i, (corr_tree, ca, cb, lr) in enumerate(self.boost_stages):
-            parts.append(f" + {lr:.3g} * ({ca:.4g} * ({str(corr_tree)}) + {cb:.4g})")
+            parts.append(f" + {float(lr)!r} * ({float(ca)!r} * "
+                         f"({str(corr_tree)}) + {float(cb)!r})")
         return "".join(parts)
 
 
@@ -17764,10 +17840,13 @@ def _check_output_perfect(hof, X, Y_col, out_type):
     mse   = float(np.mean((Y_col - pred) ** 2))
     y_var = float(np.var(Y_col))
     # Use MSE relative to the target's variance — units-free and robust to
-    # rescaled targets.  Fall back to absolute MSE if y is constant.
-    if y_var > 1e-12:
+    # rescaled targets.  Fall back to a scale-aware absolute check if y is
+    # numerically constant (the old absolute 1e-12 thresholds misfired on
+    # targets whose genuine variance sits below 1e-12).
+    _var_floor = _target_scale_floor(float(np.mean(Y_col))) ** 2
+    if y_var > _var_floor:
         return (mse / y_var) <= _PERFECT_MSE_REL_TOLERANCE, best
-    return mse <= 1e-12, best
+    return mse <= max(_var_floor, 1e-300), best
 
 
 def _save_backup_model(models, dp, output_idx, X_data=None):
@@ -18095,6 +18174,47 @@ def plot_scatter_from_csv():
 '''
 
 
+def _sympy_expr_diverges(py_expr, tree, final_vars, X_sample):
+    """True when evaluating *py_expr* diverges from ``tree.evaluate(X_sample)``.
+
+    ``py_expr`` is a NumPy expression string over the columns of *X_sample*
+    (one variable per entry of *final_vars*).  The SymPy round-trip
+    (tree → sympy → simplify → NumPy code) used to be only syntax-checked
+    before export; protected-op guards, Float rounding and piecewise edge
+    cases can change semantics, so an algebraically "simplified" equation
+    may not compute what the fitted model computes — in the worst case it
+    collapses to a constant while the reported metrics belong to the real
+    model.  More than 1% of rows off by more than 1e-6 of the output scale
+    ⇒ diverged.  Also returns True when the expression cannot be evaluated
+    at all (unverifiable ⇒ don't trust the rewrite).
+    """
+    try:
+        import math as _math
+        t = tree.evaluate(X_sample)
+        t = np.clip(np.nan_to_num(np.asarray(t, dtype=np.float64),
+                                  nan=0.0, posinf=1e9, neginf=-1e9), -1e9, 1e9)
+
+        class _MathShim:
+            """math module with a vectorised erf (mirrors the exported script)."""
+            def __getattr__(self, k):
+                if k == 'erf':
+                    return (scipy_special.erf if HAS_SCIPY_SPECIAL
+                            else np.vectorize(_math.erf))
+                return getattr(_math, k)
+
+        env = {'np': np, 'numpy': np, 'math': _MathShim()}
+        for j, name in enumerate(final_vars):
+            env[name] = X_sample[:, j]
+        p = eval(py_expr, env)  # our own generated code, not user input
+        p = np.broadcast_to(np.asarray(p, dtype=np.float64), t.shape)
+        p = np.clip(np.nan_to_num(p, nan=0.0, posinf=1e9, neginf=-1e9), -1e9, 1e9)
+        tol = 1e-6 * (float(np.max(np.abs(t))) + 1e-30)
+        frac_bad = float(np.mean(np.abs(p - t) > tol))
+        return frac_bad > 0.01
+    except Exception:
+        return True
+
+
 def generate_script(models, dp, filename="best_model.py", X_data=None):
     import inspect
 
@@ -18246,6 +18366,15 @@ def generate_script(models, dp, filename="best_model.py", X_data=None):
                 # Validate syntax; some sympy edge cases (e.g. ComplexInfinity
                 # surviving as Python literal) yield strings that won't parse.
                 compile(_sym_expr, '<expr>', 'eval')
+                # Validate NUMERICALLY on real data: only adopt the SymPy form
+                # when it computes what the fitted tree computes.  Without
+                # this the exported model could silently diverge from the
+                # reported metrics (worst case: simplify to a flat constant).
+                if X_data is not None and len(X_data) > 0:
+                    _X_chk = np.asarray(X_data, dtype=np.float64)[:512]
+                    if _sympy_expr_diverges(_sym_expr, ind.tree,
+                                            final_vars, _X_chk):
+                        raise ValueError("sympy expression diverges numerically")
                 py_expr = _sym_expr
             except Exception:
                 py_expr = fallback_expr
@@ -23536,7 +23665,7 @@ def _print_validation_metrics(hofs, X_val, Y_val, out_types, dp):
                 val_loss = 0.5 * smape + 0.5 * nrmse
                 ss_res   = float(np.sum((y_v - preds)**2))
                 ss_tot   = float(np.sum((y_v - np.mean(y_v))**2))
-                val_r2   = 1.0 - ss_res / (ss_tot + 1e-8)
+                val_r2   = _safe_r2(ss_res, ss_tot)
                 gap      = val_loss - best.loss
                 gap_str  = f"+{gap:.4f}" if gap >= 0 else f"{gap:.4f}"
                 print(f"  Out {o_idx} ({out_label}): "
@@ -32356,7 +32485,7 @@ def run_gradient_boosted_evolution(X, Y, n_features, n_outputs, feat_names,
             boosted = GradientBoostedModel(intercept=y_mean, task='regression')
             F = np.full(N, y_mean)
             metric_name = "R²"
-            ss_tot = float(np.sum((y_target - y_mean) ** 2)) + 1e-8
+            ss_tot = float(np.sum((y_target - y_mean) ** 2))
             print(f"\n  [Output {o_idx} ({out_label})] Regression boosting…")
             print(f"    Initial residual variance: {np.var(y_target - y_mean):.6f}")
             bin_class_w = None  # not used in the regression branch
@@ -32513,7 +32642,7 @@ def run_gradient_boosted_evolution(X, Y, n_features, n_outputs, feat_names,
                       f"log-loss: {cum_logloss:.5f}")
             else:
                 cum_ss_res = float(np.sum((y_target - F) ** 2))
-                cum_r2 = 1.0 - cum_ss_res / ss_tot
+                cum_r2 = _safe_r2(cum_ss_res, ss_tot)
                 cum_metric = cum_r2
                 new_res_var = float(np.var(y_target - F))
                 improvement = 1.0 - new_res_var / (res_var + 1e-30)
@@ -32536,8 +32665,8 @@ def run_gradient_boosted_evolution(X, Y, n_features, n_outputs, feat_names,
                     val_pred = boosted.predict(X_val)
                     ss_res_v = float(np.sum((y_val_target - val_pred) ** 2))
                     ss_tot_v = float(np.sum(
-                        (y_val_target - np.mean(y_val_target)) ** 2)) + 1e-8
-                    val_metric = 1.0 - ss_res_v / ss_tot_v
+                        (y_val_target - np.mean(y_val_target)) ** 2))
+                    val_metric = _safe_r2(ss_res_v, ss_tot_v)
                     metric_label = "R²"
 
                 improved = boosted.snapshot(val_metric)
@@ -32570,7 +32699,7 @@ def run_gradient_boosted_evolution(X, Y, n_features, n_outputs, feat_names,
         else:
             y_pred = boosted.predict(X)
             ss_res = float(np.sum((y_target - y_pred) ** 2))
-            boosted_r2 = 1.0 - ss_res / ss_tot
+            boosted_r2 = _safe_r2(ss_res, ss_tot)
             print(f"\n    Final boosted R² for output {o_idx}: {boosted_r2:.6f}")
 
         print(f"    Total stages used: {len(boosted.stages)}")
@@ -32587,8 +32716,8 @@ def run_gradient_boosted_evolution(X, Y, n_features, n_outputs, feat_names,
                 y_val_pred = boosted.predict(X_val)
                 ss_res_v = float(np.sum((y_val_target - y_val_pred) ** 2))
                 ss_tot_v = float(np.sum(
-                    (y_val_target - np.mean(y_val_target)) ** 2)) + 1e-8
-                val_r2 = 1.0 - ss_res_v / ss_tot_v
+                    (y_val_target - np.mean(y_val_target)) ** 2))
+                val_r2 = _safe_r2(ss_res_v, ss_tot_v)
                 print(f"    Final Validation R²: {val_r2:.6f}")
 
         # Check if this boosted output reached perfect performance
@@ -32602,10 +32731,12 @@ def run_gradient_boosted_evolution(X, Y, n_features, n_outputs, feat_names,
             _y_pred_perf = boosted.predict(X)
             _mse_perf = float(np.mean((y_target - _y_pred_perf) ** 2))
             _ss_res_perf = float(np.sum((y_target - _y_pred_perf) ** 2))
-            _ss_tot_perf = float(np.sum((y_target - np.mean(y_target)) ** 2)) + 1e-8
-            _r2_perf = 1.0 - _ss_res_perf / _ss_tot_perf
+            _ss_tot_perf = float(np.sum((y_target - np.mean(y_target)) ** 2))
+            _r2_perf = _safe_r2(_ss_res_perf, _ss_tot_perf)
             _y_var_perf = float(np.var(y_target))
-            _mse_rel = (_mse_perf / _y_var_perf) if _y_var_perf > 1e-12 else _mse_perf
+            _var_floor_perf = _target_scale_floor(float(np.mean(y_target))) ** 2
+            _mse_rel = ((_mse_perf / _y_var_perf)
+                        if _y_var_perf > _var_floor_perf else _mse_perf)
             _perf = (_r2_perf >= _PERFECT_R2_THRESHOLD
                      and _mse_rel <= _PERFECT_MSE_REL_TOLERANCE)
 
@@ -34401,8 +34532,8 @@ def train_mode():
             y_pred = bm.predict(X)
             y_target = Y[:, i]
             ss_res = float(np.sum((y_target - y_pred) ** 2))
-            ss_tot = float(np.sum((y_target - np.mean(y_target)) ** 2)) + 1e-8
-            r2 = 1.0 - ss_res / ss_tot
+            ss_tot = float(np.sum((y_target - np.mean(y_target)) ** 2))
+            r2 = _safe_r2(ss_res, ss_tot)
             mse = float(np.mean((y_target - y_pred) ** 2))
             print(f"\nOutput {i} ({out_label})  [Regression, {len(bm.stages)} stages]")
             print(f"  Boosted R² : {r2:.6f}")
@@ -34421,7 +34552,7 @@ def train_mode():
                         simplified  = advanced_simplify_expr(raw_sym)
                         expr_str    = str(simplified)
                     except Exception:
-                        expr_str = f"{a:.4g} * ({expr_str}) + {b:.4g}"
+                        expr_str = f"{float(a)!r} * ({expr_str}) + {float(b)!r}"
                 print(f"  Stage {s}: lr={lr:.3f}  → {expr_str}")
 
             if X_val is not None and Y_val is not None:
@@ -37204,12 +37335,15 @@ def train_mode():
                 metric_val   = getattr(best, 'r2', 0.0)
 
             # --- 1. Format the raw expression string ---
+            # Round-trip precision (repr): this is the equation users copy;
+            # ``:.4g`` here silently broke fits with large offsets / small
+            # coefficients (they re-evaluated as flat or wrong constants).
             raw_expr_str = str(best.tree)
             if not is_cls:
-                a = getattr(best, 'affine_a', 1.0)
-                b = getattr(best, 'affine_b', 0.0)
+                a = float(getattr(best, 'affine_a', 1.0))
+                b = float(getattr(best, 'affine_b', 0.0))
                 sign = "+" if b >= 0 else "-"
-                raw_expr_str = f"({a:.4g} * ({raw_expr_str}) {sign} {abs(b):.4g})"
+                raw_expr_str = f"({a!r} * ({raw_expr_str}) {sign} {abs(b)!r})"
 
             # --- 2. Format the SymPy simplified string ---
             simplified_expr = raw_expr_str
@@ -37227,6 +37361,31 @@ def train_mode():
                         
                     simplified_sym = advanced_simplify_expr(raw_sym)
                     simplified_expr = str(simplified_sym)
+                    # Numeric sanity check: warn when the pretty "Simplified"
+                    # form no longer computes what the fitted model computes
+                    # (e.g. SymPy collapsed it to a constant) so the perfect
+                    # Loss/R² above are never attributed to a wrong equation.
+                    try:
+                        _Xc = np.asarray(X, dtype=np.float64)[:512]
+                        _f  = sympy.lambdify(sym_vars, simplified_sym,
+                                             modules='numpy')
+                        _p  = np.asarray(_f(*[_Xc[:, j]
+                                              for j in range(_Xc.shape[1])]),
+                                         dtype=np.float64)
+                        _t  = best.tree.evaluate(_Xc)
+                        _t  = np.clip(np.nan_to_num(_t, nan=0.0, posinf=1e9,
+                                                    neginf=-1e9), -1e9, 1e9)
+                        if not is_cls:
+                            _t = (getattr(best, 'affine_a', 1.0) * _t
+                                  + getattr(best, 'affine_b', 0.0))
+                        _p = np.broadcast_to(_p, _t.shape)
+                        _tol = 1e-6 * (float(np.max(np.abs(_t))) + 1e-30)
+                        if float(np.mean(np.abs(_p - _t) > _tol)) > 0.01:
+                            simplified_expr += ("   [WARNING: diverges "
+                                                "numerically from the fitted "
+                                                "model — use 'Expression']")
+                    except Exception:
+                        pass
                 except Exception:
                     pass
 

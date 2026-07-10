@@ -44,8 +44,13 @@ def _with_mode(mode, fn, **knobs):
 
 
 def _legacy(preds, y):
+    # Mirrors evo13's mse_mae mode: the historical absolute +1e-8 epsilon is
+    # now a scale-aware floor (see evo13._target_scale_floor) so tiny-scale
+    # targets no longer see every loss flattened to ≈0.
     diff = preds - y
-    yv = float(np.var(y)) + 1e-8
+    yv = float(np.var(y))
+    floor = evo13._target_scale_floor(float(np.mean(y))) ** 2
+    yv = max(yv, floor, 1e-300)
     return float(np.mean(diff ** 2) / yv + np.mean(np.abs(diff)) / np.sqrt(yv))
 
 
