@@ -11,6 +11,8 @@ import warnings
 import re
 import hashlib
 import threading
+import json
+import weakref
 from collections import Counter, OrderedDict, deque
 import networkx as nx
 from networkx.algorithms.community import greedy_modularity_communities
@@ -373,6 +375,155 @@ def _difficulty_update(population, X, y_target, type_code, gen,
 # answer involves constants like 700_000 or 30 is unreachable from the default
 # magnitudes (gauss(0, 2) * 1000 ≈ 6000 maximum).
 _DATA_SCALE_HINT = 10.0
+
+_OUTPUT_CONTEXT = threading.local()
+_ALL_OUTPUT_BLOCKED_FEATURES_BY_OUTPUT = {}
+_ALL_OUTPUT_MASK_ENV = "EVO67_ALL_OUTPUT_BLOCKED_FEATURES"
+
+
+def _set_output_context(output_idx):
+    """Bind newly-created/evaluated trees to one output's feature mask."""
+    try:
+        _OUTPUT_CONTEXT.output_idx = None if output_idx is None else int(output_idx)
+    except Exception:
+        _OUTPUT_CONTEXT.output_idx = None
+
+
+def _current_output_context():
+    return getattr(_OUTPUT_CONTEXT, 'output_idx', None)
+
+
+def _normalise_blocked_features(blocked, n_features=None):
+    """Return a sorted tuple of valid integer feature indices."""
+    clean = []
+    for idx in blocked or ():
+        try:
+            i = int(idx)
+        except Exception:
+            continue
+        if i < 0:
+            continue
+        if n_features is not None and i >= int(n_features):
+            continue
+        clean.append(i)
+    return tuple(sorted(set(clean)))
+
+
+def _load_all_output_feature_masks_from_env():
+    """Restore all-output masks in spawned worker processes."""
+    global _ALL_OUTPUT_BLOCKED_FEATURES_BY_OUTPUT
+    if _ALL_OUTPUT_BLOCKED_FEATURES_BY_OUTPUT:
+        return
+    raw = os.environ.get(_ALL_OUTPUT_MASK_ENV)
+    if not raw:
+        return
+    try:
+        data = json.loads(raw)
+        clean = {}
+        for out_idx, blocked in data.items():
+            b = _normalise_blocked_features(blocked)
+            if b:
+                clean[int(out_idx)] = b
+        _ALL_OUTPUT_BLOCKED_FEATURES_BY_OUTPUT = clean
+    except Exception:
+        _ALL_OUTPUT_BLOCKED_FEATURES_BY_OUTPUT = {}
+
+
+def _current_blocked_features():
+    _load_all_output_feature_masks_from_env()
+    out_idx = _current_output_context()
+    if out_idx is None:
+        return ()
+    return tuple(_ALL_OUTPUT_BLOCKED_FEATURES_BY_OUTPUT.get(out_idx, ()))
+
+
+def _set_all_output_feature_masks(dp):
+    """Install output-index -> blocked-feature mapping for all-output mode."""
+    global _ALL_OUTPUT_BLOCKED_FEATURES_BY_OUTPUT
+    mapping = getattr(dp, 'all_output_blocked_features_by_output', {}) or {}
+    clean = {}
+    for out_idx, blocked in mapping.items():
+        try:
+            b = _normalise_blocked_features(blocked)
+            if b:
+                clean[int(out_idx)] = b
+        except Exception:
+            continue
+    _ALL_OUTPUT_BLOCKED_FEATURES_BY_OUTPUT = clean
+    try:
+        if clean:
+            os.environ[_ALL_OUTPUT_MASK_ENV] = json.dumps(
+                {str(k): list(v) for k, v in clean.items()})
+        else:
+            os.environ.pop(_ALL_OUTPUT_MASK_ENV, None)
+    except Exception:
+        pass
+
+
+def _adopt_output_feature_mask(output_idx, *holders):
+    """Seed a worker's mask map from already-pickled trees if env restore missed."""
+    if output_idx is None:
+        return
+    try:
+        out_idx = int(output_idx)
+    except Exception:
+        return
+    _load_all_output_feature_masks_from_env()
+    if _ALL_OUTPUT_BLOCKED_FEATURES_BY_OUTPUT.get(out_idx):
+        return
+
+    stack = list(holders)
+    while stack:
+        obj = stack.pop()
+        if obj is None:
+            continue
+        if isinstance(obj, (list, tuple, set)):
+            stack.extend(obj)
+            continue
+        tree = getattr(obj, 'tree', obj)
+        blocked = _normalise_blocked_features(
+            getattr(tree, 'blocked_features', ()),
+            getattr(tree, 'n_features', None))
+        if blocked:
+            _ALL_OUTPUT_BLOCKED_FEATURES_BY_OUTPUT[out_idx] = blocked
+            try:
+                os.environ[_ALL_OUTPUT_MASK_ENV] = json.dumps(
+                    {str(k): list(v)
+                     for k, v in _ALL_OUTPUT_BLOCKED_FEATURES_BY_OUTPUT.items()})
+            except Exception:
+                pass
+            return
+
+
+def _bind_tree_to_current_output(tree):
+    """Apply the current output's blocked-feature mask to a CGP tree."""
+    if tree is None:
+        return tree
+    out_idx = _current_output_context()
+    # No active output context means this is a context-free operation such as
+    # prediction/export. Preserve the mask already stored on the tree. When a
+    # context *is* explicit, however, it is authoritative -- including an empty
+    # mask. The old truthiness check left a mask from the previous output
+    # attached when switching to an unmasked output.
+    if out_idx is None:
+        if not hasattr(tree, 'blocked_features'):
+            tree.blocked_features = ()
+        return tree
+    blocked = _normalise_blocked_features(
+        _current_blocked_features(), getattr(tree, 'n_features', None))
+    tree.blocked_features = blocked
+    return tree
+
+
+def _bind_individual_to_current_output(ind):
+    if ind is None:
+        return ind
+    _bind_tree_to_current_output(getattr(ind, 'tree', None))
+    for stage in getattr(ind, 'boost_stages', []) or []:
+        if stage:
+            _bind_tree_to_current_output(stage[0])
+    return ind
+
 
 def _set_data_scale_hint(X, Y):
     """Set the module-level _DATA_SCALE_HINT from training data."""
@@ -1127,9 +1278,11 @@ _NSGA3_REF_CACHE = {}     # (n_obj, p) -> reference-point ndarray, built lazily/
 #          current front each trim by two operators.  INCLUSION adds a local
 #          simplex of m vectors  z + (e_k − z)/m  around every over-crowded
 #          reference vector (niche count >= 2), giving finer resolution where
-#          solutions actually cluster; EXCLUSION drops any ADDED vector that
-#          ends a pass with no associated solution.  The original Das-Dennis
-#          vectors are never removed, so the lattice can only gain detail.
+#          solutions actually cluster; EXCLUSION drops reference vectors that
+#          end a pass with no associated solution.  The adapted reference set is
+#          carried across successive AFPO survival trims for the same
+#          objective/configuration regime, matching the paper's stateful
+#          reference-vector update rather than rebuilding from scratch.
 #
 #   "ur" — NSGA-III-UR: the same A-NSGA-III adaptation, but GATED by the
 #          Update-when-Required trigger.  The Spreading Index
@@ -1137,17 +1290,16 @@ _NSGA3_REF_CACHE = {}     # (n_obj, p) -> reference-point ndarray, built lazily/
 #          compared against a cubic threshold(m) (NSGA3_UR_THRESH_COEF);
 #          adaptation runs only when SI > threshold, i.e. only when the front
 #          looks IRREGULAR, and the plain fixed lattice is kept otherwise.  The
-#          paper evaluates this once at ~20 % of the run; because our survival
-#          trim is stateless and re-entered on every birth across many
-#          independent sub-populations, we evaluate the (very cheap) SI test on
-#          each trim instead — the same criterion, checked continuously rather
-#          than latched once.  NB the paper's cubic gives threshold(m) < 0 for
+#          paper evaluates this once at ~20 % of the run and latches the choice.
+#          Our survival trim does not receive a global generation budget, so
+#          NSGA3_UR_WARMUP_TRIMS approximates that 20 % stage per objective
+#          count, then the standard-vs-adaptive decision is latched for the rest
+#          of the run/worker.  NB the paper's cubic gives threshold(m) < 0 for
 #          m <= 6, so with the default coefficients and the 3-objective AFPO
-#          trade-off the trigger fires for any non-trivial front (matching the
-#          paper's reported tendency to flag low-objective fronts as irregular);
-#          h and the coefficients below are exposed for tuning / many-objective
-#          reuse.
-NSGA3_VARIANT = "basic"   # "basic" | "a" (A-NSGA-III) | "ur" (NSGA-III-UR)
+#          trade-off the trigger can still favour adaptation for non-trivial
+#          fronts; h and the coefficients below are exposed for tuning /
+#          many-objective reuse.
+NSGA3_VARIANT = "ur"   # "basic" | "a" (A-NSGA-III) | "ur" (NSGA-III-UR)
 # A-NSGA-III inclusion cap: added vectors are bounded to this multiple of the
 # base lattice size (and to NSGA3_REF_MAX), so adaptation refines without the
 # reference set growing without bound on a pathologically clustered front.
@@ -1156,6 +1308,14 @@ NSGA3_ADAPT_MAX_FRAC = 1.5
 NSGA3_UR_H = 4.0          # Spreading-Index normalisation factor h (paper: 4)
 # threshold(m) = c3·m³ + c2·m² + c1·m + c0  (cubic regression from the paper)
 NSGA3_UR_THRESH_COEF = (-0.00001989, 0.0002034, 0.03376, -0.2373)
+# The UR paper evaluates the SI trigger once at 20 % of the run and then latches
+# the mode.  This AFPO implementation is steady-state and `_trim_to_pareto...`
+# does not know the global generation budget, so we approximate that stage with
+# a small per-objective-count warmup measured in survival trims, then latch the
+# decision for the rest of the run/worker.
+NSGA3_UR_WARMUP_TRIMS = 20
+_NSGA3_UR_STATE = {}      # n_obj -> {'trims': int, 'mode': None|bool}
+_NSGA3_ADAPT_STATE = {}   # persistent A-NSGA-III reference sets, keyed by config
 
 # ---- NSGA-III EXTRA objectives (optional; for the 4+-objective regime) ----
 # Classic AFPO trims on three objectives (age, fitness, complexity).  NSGA-III's
@@ -1184,18 +1344,48 @@ NSGA3_UR_THRESH_COEF = (-0.00001989, 0.0002034, 0.03376, -0.2373)
 #                   small rows included, not just the high ones.  Squashed to
 #                   [0,1) so it sits on the same bounded scale as shape /
 #                   instability (see _logloss_objective).
+#   'tails'       — 1 − |Spearman| on the extreme target rows only.  Protects
+#                   formulas that get the rare high/low regimes in the right
+#                   order even before their bulk fit is fully polished.
+#   'magnitude'   — remaining unexplained target magnitude after affine scaling
+#                   (1 − clipped R²).  Keeps NSGA-III pressure on value-level
+#                   fit separately from order/shape fit.
+#   'residuals'   — residual-balance penalty across target-magnitude bins.
+#                   Favours models that spread error evenly instead of hiding
+#                   most error in a small output regime.
+#   'gradient'    — bounded Sobolev-style gradient mismatch, when target
+#                   gradients are available.  Favours local slope agreement as
+#                   a separate trade-off axis.
+#   'sensitivity' — bounded response to tiny deterministic input perturbations.
+#                   Favours models that are locally stable inside the data cloud
+#                   instead of amplifying floating-point/input noise.
+#   'domain'      — bounded penalty from risky operator-domain margins recorded
+#                   during evaluation (near-zero divisors, near-boundary logs,
+#                   saturated exponentials, unsafe NaN/Inf production).
+#   'class_margin'— classification-only separation objective.  Favours logits
+#                   with larger correct-class margins, neutral for regression.
+#   'class_brier' — classification-only probability-quality objective.  Favours
+#                   calibrated probabilities via binary/multiclass Brier score.
 #
-# Off by default and ONLY consulted when NSGA3_ENABLED — direct/non-interactive
-# callers and the NSGA-II legacy path stay on the bit-for-bit 3-objective trim.
+# Enabled by default but ONLY consulted when NSGA3_ENABLED — the NSGA-II legacy
+# path stays on the bit-for-bit 3-objective trim.  Interactive callers can still
+# enter ``N`` at the prompt to keep the classic 3-objective NSGA-III trim.
 # All but diversity are cached per-individual on the last full-data REGRESSION
 # evaluation (calculate_fitness); diversity is computed once per trim on the
 # fixed pool, so the whole selection remains deterministic.  Enabled
 # interactively inside `_select_nsga3_mode`; inherited by AFPO fork workers like
 # every other NSGA-III knob.
-NSGA3_EXTRA_OBJ_ENABLED = False        # module default off (interactive opt-in)
-NSGA3_EXTRA_OBJECTIVES  = ()           # subset of ('instability','shape','diversity','logloss')
+NSGA3_EXTRA_OBJECTIVE_CHOICES = (
+    'instability', 'shape', 'diversity', 'logloss',
+    'tails', 'magnitude', 'residuals', 'gradient',
+    'sensitivity', 'domain', 'class_margin', 'class_brier',
+)
+NSGA3_EXTRA_OBJ_ENABLED = True         # module default on when NSGA-III is active
+NSGA3_EXTRA_OBJECTIVES  = NSGA3_EXTRA_OBJECTIVE_CHOICES
 NSGA3_DIVERSITY_K       = 15           # k nearest neighbours for the diversity metric
 NSGA3_BEHAVIOR_SIG_K    = 16           # length of the standardized-prediction signature
+NSGA3_SENSITIVITY_EPS   = 1e-4         # normalized perturbation size for sensitivity
+NSGA3_SENSITIVITY_ROWS  = 64           # deterministic row cap for sensitivity evals
 
 # ---- AFPO escape-tolerance (local-minima escape) ----
 # AFPO decides survival purely through the (age, fitness, complexity) Pareto
@@ -1710,7 +1900,8 @@ np.seterr(all='ignore')
 # post-extinction diversity.
 
 class _FitnessCache:
-    """FIFO cache keyed by (active-graph fingerprint, target-hash)
+    """FIFO cache keyed by
+    (active-graph fingerprint, input-hash, target-hash, evaluation-context)
     → Individual attributes.
 
     Eviction is by insertion order (oldest 20 % drop on overflow), not LRU
@@ -1724,6 +1915,12 @@ class _FitnessCache:
         self._maxsize = maxsize
         self.hits = 0
         self.misses = 0
+        # Full X digests are cached by live array identity. AFPO evaluates many
+        # individuals against the same immutable chunk, so re-hashing an N×D
+        # matrix for every lookup would erase the fitness-cache speedup. Weak
+        # references avoid retaining old minibatches or risking id reuse.
+        self._input_sigs: dict = {}
+        self._input_sig_order: list = []
         # Guard the eviction loop + (_cache, _order) pair against torn updates
         # when re-scoring HoFs is parallelised across outputs with threads.
         # Dict get and single put are atomic in CPython, but the size-check
@@ -1740,6 +1937,9 @@ class _FitnessCache:
         """
         tree.update_active_nodes()
         parts = []
+        blocked = _normalise_blocked_features(
+            getattr(tree, 'blocked_features', ()), tree.n_features)
+        parts.append(('B', blocked))
         for idx in sorted(tree.active_nodes):
             if idx < tree.n_features:
                 parts.append(('F', idx))
@@ -1773,9 +1973,37 @@ class _FitnessCache:
             hashlib.blake2b(arr.tobytes(), digest_size=16).digest(),
         )
 
-    def get(self, tree, y_target) -> dict | None:
+    def _input_sig(self, X) -> tuple:
+        """Stable X digest, memoized while the exact ndarray remains alive."""
+        key = id(X)
+        with self._lock:
+            entry = self._input_sigs.get(key)
+            if entry is not None and entry[0]() is X:
+                return entry[1]
+        sig = self._target_sig(X)
+        try:
+            ref = weakref.ref(X)
+        except TypeError:
+            return sig
+        with self._lock:
+            self._input_sigs[key] = (ref, sig)
+            if key not in self._input_sig_order:
+                self._input_sig_order.append(key)
+            # A worker normally sees only a handful of chunks; this is a
+            # defensive cap for long-lived non-AFPO callers.
+            while len(self._input_sig_order) > 64:
+                old = self._input_sig_order.pop(0)
+                self._input_sigs.pop(old, None)
+        return sig
+
+    def get(self, tree, y_target, X=None, context=None) -> dict | None:
         """Return cached result dict or None on miss."""
-        fp = (self._fingerprint(tree), self._target_sig(y_target))
+        # AFPO workers receive each row subset as their apparent full dataset,
+        # so ``batch_indices`` is None inside the worker. Target-only keys can
+        # collide when two subsets have the same labels but different inputs.
+        x_sig = self._input_sig(X) if X is not None else None
+        fp = (self._fingerprint(tree), x_sig, self._target_sig(y_target),
+              context)
 
         if fp in self._cache:
             self.hits += 1
@@ -1783,9 +2011,11 @@ class _FitnessCache:
         self.misses += 1
         return None
 
-    def put(self, tree, y_target, result: dict):
-        """Store result dict for this tree's fingerprint AND target."""
-        fp = (self._fingerprint(tree), self._target_sig(y_target))
+    def put(self, tree, y_target, result: dict, X=None, context=None):
+        """Store a result for this tree, input matrix and target."""
+        x_sig = self._input_sig(X) if X is not None else None
+        fp = (self._fingerprint(tree), x_sig, self._target_sig(y_target),
+              context)
 
         with self._lock:
             if fp in self._cache:
@@ -1804,6 +2034,8 @@ class _FitnessCache:
         with self._lock:
             self._cache.clear()
             self._order.clear()
+            self._input_sigs.clear()
+            self._input_sig_order.clear()
 
     def stats_str(self) -> str:
         total = self.hits + self.misses
@@ -1874,6 +2106,26 @@ def set_feature_priors(weights):
     FEATURE_PRIORS = arr / s
 
 
+def _candidate_feature_indices(n_features, max_index=None, blocked=None):
+    """Feature indices available for this output, excluding blocked targets."""
+    if max_index is None:
+        max_index = n_features
+    try:
+        max_index = max(1, int(max_index))
+    except Exception:
+        max_index = n_features
+    max_index = min(max_index, max(1, int(n_features)))
+    if blocked is None:
+        blocked = _current_blocked_features()
+    blocked = set(_normalise_blocked_features(blocked, n_features))
+    candidates = [i for i in range(max_index) if i not in blocked]
+    if candidates:
+        return candidates
+    # Degenerate fallback: keep the caller alive if every reachable feature is
+    # blocked. All normal all-output runs have at least one non-blocked column.
+    return list(range(max_index))
+
+
 def _pick_feature_idx(n_features, max_index=None, bias=None):
     """Pick a feature index, optionally biased by ``FEATURE_PRIORS``.
 
@@ -1887,27 +2139,52 @@ def _pick_feature_idx(n_features, max_index=None, bias=None):
     max_index = max(1, int(max_index))
     if max_index >= n_features:
         max_index = n_features
+    candidates = _candidate_feature_indices(n_features, max_index=max_index)
 
-    if FEATURE_PRIORS is None or len(FEATURE_PRIORS) != n_features or max_index <= 1:
-        return random.randint(0, max_index - 1)
+    if (FEATURE_PRIORS is None or len(FEATURE_PRIORS) != n_features
+            or len(candidates) <= 1):
+        return random.choice(candidates)
 
     b = FEATURE_PRIOR_BIAS if bias is None else float(bias)
     b = max(0.0, min(1.0, b))
     # When max_index < n_features (e.g. early CGP slots that can't
     # reference later features), restrict the prior to the feasible head
     # and renormalise on the fly.
-    head = FEATURE_PRIORS[:max_index].astype(np.float64)
+    cand_arr = np.asarray(candidates, dtype=np.int64)
+    head = FEATURE_PRIORS[cand_arr].astype(np.float64)
     s = float(head.sum())
     if s <= 0:
-        return random.randint(0, max_index - 1)
+        return random.choice(candidates)
     head = head / s
-    uniform = np.full(max_index, 1.0 / max_index, dtype=np.float64)
+    uniform = np.full(len(candidates), 1.0 / len(candidates), dtype=np.float64)
     mixed = b * head + (1.0 - b) * uniform
     mixed = mixed / float(mixed.sum())
     try:
-        return int(np.random.choice(max_index, p=mixed))
+        return int(np.random.choice(cand_arr, p=mixed))
     except Exception:
-        return random.randint(0, max_index - 1)
+        return random.choice(candidates)
+
+
+def _candidate_input_indices(n_features, max_connect, blocked=None):
+    """Reachable CGP wiring indices, excluding blocked raw-feature slots."""
+    try:
+        max_connect = int(max_connect)
+    except Exception:
+        max_connect = 0
+    if max_connect <= 0:
+        return [0]
+    blocked = set(_normalise_blocked_features(blocked, n_features))
+    candidates = [
+        idx for idx in range(max_connect + 1)
+        if not (idx < n_features and idx in blocked)
+    ]
+    return candidates or list(range(max_connect + 1))
+
+
+def _pick_input_idx(n_features, max_connect, blocked=None):
+    """Pick any reachable CGP input while respecting blocked raw features."""
+    return random.choice(_candidate_input_indices(
+        n_features, max_connect, blocked=blocked))
 
 
 # ==========================================
@@ -5337,7 +5614,7 @@ def _coevo_next_batch(X, Y, hofs, out_types):
     return _COEVO_RUNTIME.next_batch(X, Y, hofs, out_types)
 
 
-def _coevo_admission_rescore(ind, X, y_col, otype, tg):
+def _coevo_admission_rescore(ind, X, y_col, otype, tg, output_idx=None):
     """Full-data rescore at global-HoF admission + resolution-governor feed.
 
     Drop-in for `_rescore_individual_full_data` at the admission sites: the
@@ -5346,6 +5623,9 @@ def _coevo_admission_rescore(ind, X, y_col, otype, tg):
     two is exactly the "the batch said X, the dataset says Y" signal the
     co-evolution resolution governor sizes the next batches with — measured on
     the candidates that actually won the chunk, at zero extra evaluations."""
+    if output_idx is not None:
+        _set_output_context(output_idx)
+        _bind_individual_to_current_output(ind)
     batch_loss = getattr(ind, 'loss', None)
     _rescore_individual_full_data(ind, X, y_col, otype, tg)
     if COEVOLUTION_ENABLED and _COEVO_RUNTIME is not None and batch_loss is not None:
@@ -5563,6 +5843,8 @@ def _select_nsga3_mode():
 
     NSGA3_ENABLED = True
     _NSGA3_REF_CACHE.clear()   # drop any lattice cached under a previous config
+    _NSGA3_UR_STATE.clear()    # drop any UR latch from a previous run/config
+    _NSGA3_ADAPT_STATE.clear() # drop persistent adaptive vectors from old config
     div_in = input(
         "  Reference-point divisions p per objective "
         "[Enter = auto-size to the pool]: ").strip()
@@ -5585,16 +5867,16 @@ def _select_nsga3_mode():
     print("    basic — fixed Das-Dennis lattice (original NSGA-III).")
     print("    ur    — NSGA-III-UR: A-NSGA-III adaptation, but only when the")
     print("            Spreading Index flags the front as irregular.")
-    var_in = input("  Module [a/basic/ur, Enter = a (A-NSGA-III)]: ").strip().lower()
-    if not var_in or var_in in ("a", "ansga3", "a-nsga-iii", "adaptive"):
+    var_in = input("  Module [a/basic/ur, Enter = ur (NSGA-III-UR)]: ").strip().lower()
+    if var_in in ("a", "ansga3", "a-nsga-iii", "adaptive"):
         NSGA3_VARIANT = "a"
-    elif var_in in ("ur", "nsga-iii-ur", "uwr", "update"):
+    elif not var_in or var_in in ("ur", "nsga-iii-ur", "uwr", "update"):
         NSGA3_VARIANT = "ur"
     elif var_in in ("basic", "b", "fixed"):
         NSGA3_VARIANT = "basic"
     else:
-        print("  Unrecognised module; using 'a' (A-NSGA-III).")
-        NSGA3_VARIANT = "a"
+        print("  Unrecognised module; using 'ur' (NSGA-III-UR).")
+        NSGA3_VARIANT = "ur"
 
     # ── Optional EXTRA objectives — NSGA-III niching is strongest at 4+ ────
     print()
@@ -5609,23 +5891,45 @@ def _select_nsga3_mode():
     print("      logloss     — the main loss recomputed in signed-log space, so")
     print("                    the trim explores models that fit ALL output")
     print("                    magnitudes, not just the highest ones.")
-    print("    Regression-side selection objectives; classification runs leave")
-    print("    them neutral.  Pick 'all', a subset (e.g. 'i,s'), or none.")
-    eo_in = input("  Extra objectives [a=all / i,s,d,l subset / N=none, "
-                  "Enter = none]: ").strip().lower()
+    print("      tails       — favour models that rank the target extremes well.")
+    print("      magnitude   — favour models with value-level variance explained.")
+    print("      residuals   — favour models whose residuals are balanced across")
+    print("                    target-magnitude regimes.")
+    print("      gradient    — favour models whose local slopes match target")
+    print("                    gradients when Sobolev gradients are available.")
+    print("      sensitivity — favour models that are locally stable under tiny")
+    print("                    input perturbations.")
+    print("      domain      — favour models with safer operator-domain margins.")
+    print("      class_margin— classification: favour larger correct-class margins.")
+    print("      class_brier — classification: favour calibrated probabilities.")
+    print("    Regression-only objectives are neutral for classification, and")
+    print("    classification-only objectives are neutral for regression.")
+    print("    Pick 'all', a subset (e.g. 'i,s'), or none.")
+    eo_in = input("  Extra objectives [a=all / i,s,d,l,t,m,r,g,sens,domain,cm,cb subset / N=none, "
+                  "Enter = all]: ").strip().lower()
     _eo_map = {'i': 'instability', 's': 'shape', 'd': 'diversity',
-               'l': 'logloss',
+               'l': 'logloss', 't': 'tails', 'm': 'magnitude',
+               'r': 'residuals', 'g': 'gradient',
+               'sens': 'sensitivity', 'sensitivity': 'sensitivity',
+               'domain': 'domain', 'dom': 'domain',
+               'cm': 'class_margin', 'margin': 'class_margin',
+               'class_margin': 'class_margin', 'classmargin': 'class_margin',
+               'cb': 'class_brier', 'brier': 'class_brier',
+               'class_brier': 'class_brier', 'classbrier': 'class_brier',
                'instability': 'instability', 'shape': 'shape',
-               'diversity': 'diversity', 'logloss': 'logloss', 'log': 'logloss'}
+               'diversity': 'diversity', 'logloss': 'logloss', 'log': 'logloss',
+               'tails': 'tails', 'tail': 'tails',
+               'magnitude': 'magnitude', 'mag': 'magnitude',
+               'residuals': 'residuals', 'residual': 'residuals',
+               'gradient': 'gradient', 'grad': 'gradient'}
     chosen_eo = []
-    if eo_in and not eo_in.startswith('n'):
-        if eo_in in ('a', 'all', 'y', 'yes'):
-            chosen_eo = ['instability', 'shape', 'diversity', 'logloss']
-        else:
-            for tok in re.split(r'[\s,]+', eo_in):
-                name = _eo_map.get(tok)
-                if name and name not in chosen_eo:
-                    chosen_eo.append(name)
+    if not eo_in or eo_in in ('a', 'all', 'y', 'yes'):
+        chosen_eo = list(NSGA3_EXTRA_OBJECTIVE_CHOICES)
+    elif not eo_in.startswith('n'):
+        for tok in re.split(r'[\s,]+', eo_in):
+            name = _eo_map.get(tok)
+            if name and name not in chosen_eo:
+                chosen_eo.append(name)
     if chosen_eo:
         NSGA3_EXTRA_OBJ_ENABLED = True
         NSGA3_EXTRA_OBJECTIVES = tuple(chosen_eo)
@@ -6094,6 +6398,7 @@ def apply_simplification_pass(islands_pop, hofs, X, Y, out_types, target_grads_l
             _budget_hit = True
             break
         for o_idx, pop in enumerate(island_pops):
+            _set_output_context(o_idx)
             if _over_budget():
                 _budget_hit = True
                 break
@@ -6135,6 +6440,7 @@ def apply_simplification_pass(islands_pop, hofs, X, Y, out_types, target_grads_l
     # The HoF entries ARE the reported models, so even when the budget is hit
     # the rebuild below still runs for every output whose entries were touched.
     for o_idx, hof in enumerate(hofs):
+        _set_output_context(o_idx)
         if _over_budget():
             _budget_hit = True
             break
@@ -6959,6 +7265,11 @@ class DataProcessor:
         self.input_map = []
         self.output_map = []
         self.output_slices = {}
+        self.all_output_cols = []
+        self.all_output_input_enabled = False
+        self.all_output_input_feature_by_col = {}
+        self.all_output_output_index_by_col = {}
+        self.all_output_blocked_features_by_output = {}
         # Per-column count of cells that were NaN/missing on fit; printed as a
         # summary after preprocessing so the user can see at a glance whether
         # imputation kicked in for any of their columns.
@@ -7157,6 +7468,11 @@ class DataProcessor:
         X_parts, Y_parts = [], []
         self.input_map, self.output_map = [], []
         self.output_slices = {}
+        self.all_output_cols = []
+        self.all_output_input_enabled = False
+        self.all_output_input_feature_by_col = {}
+        self.all_output_output_index_by_col = {}
+        self.all_output_blocked_features_by_output = {}
         self.nan_report = {}
         y_cursor = 0
 
@@ -7178,7 +7494,7 @@ class DataProcessor:
                     print(f"  ⚠  Column '{col_name}' is type object but was marked "
                           f"Numeric Input — auto-switching to Categorical Input.")
                     type_code = 2
-            elif type_code == 5 and is_object:
+            elif type_code in (5, -1) and is_object:
                 is_bool, _, _ = _detect_boolean_like_column(col_data)
                 if not is_bool and not _column_is_mostly_numeric(col_data):
                     print(f"  ⚠  Column '{col_name}' is type object but was marked "
@@ -7187,14 +7503,19 @@ class DataProcessor:
             effective_configs.append((col_name, type_code))
         # Cache so transform/transform_input_sample use the same effective types.
         self.effective_configs = effective_configs
+        self.all_output_cols = [
+            col_name for col_name, type_code in effective_configs
+            if type_code == -1 and col_name in df.columns
+        ]
+        self.all_output_input_enabled = len(self.all_output_cols) > 1
 
         # ---- Pass 1: build Y from output columns -----------------------
         for col_name, type_code in effective_configs:
-            if type_code < 5 or col_name not in df.columns:
+            if (type_code not in (-1, 5, 6)) or col_name not in df.columns:
                 continue
             col_data = df[col_name].values
-            if type_code == 5:  # Num Out
-                stat = {'type': 5}
+            if type_code in (-1, 5):  # Num Out
+                stat = {'type': type_code}
                 vals = self._coerce_numeric_column(col_name, col_data, stat)
                 vals = self._impute_numeric(col_name, vals, stat)
                 if self.scale:
@@ -7209,6 +7530,8 @@ class DataProcessor:
                 Y_parts.append(vals.reshape(-1, 1))
                 self.output_map.append(col_name)
                 self.output_slices[col_name] = (y_cursor, y_cursor + 1)
+                if type_code == -1:
+                    self.all_output_output_index_by_col[col_name] = y_cursor
                 y_cursor += 1
             elif type_code == 6:  # Cat Out — explicit MISSING category for NaN
                 s = pd.Series(col_data).astype(object)
@@ -7236,25 +7559,42 @@ class DataProcessor:
 
         # ---- Pass 2: build X from input columns ------------------------
         for col_name, type_code in effective_configs:
-            if type_code == 0 or type_code >= 5 or col_name not in df.columns:
+            if (type_code == 0
+                    or (type_code >= 5 and type_code != -1)
+                    or col_name not in df.columns):
                 continue
             col_data = df[col_name].values
 
-            if type_code == 1:  # Num In
-                stat = {'type': 1}
-                vals = self._coerce_numeric_column(col_name, col_data, stat)
-                vals = self._impute_numeric(col_name, vals, stat)
-                if self.scale:
-                    mean = float(np.mean(vals))
-                    std  = float(np.std(vals)) + 1e-8
-                    stat['mean'] = mean
-                    stat['std']  = std
-                    vals = (vals - mean) / std
-                if self._normalize_active():
-                    vals = self._fit_normalize(vals, stat)
-                self.stats[col_name] = stat
+            if type_code == 1 or (type_code == -1 and self.all_output_input_enabled):  # Num In
+                if type_code == -1:
+                    stat = self.stats[col_name]
+                    vals = self._coerce_numeric_column(col_name, col_data, stat)
+                    vals = np.asarray(vals, dtype=float)
+                    bad = ~np.isfinite(vals)
+                    if bad.any():
+                        vals = np.where(bad, float(stat.get('nan_fill', 0.0)), vals)
+                    if self.scale and 'mean' in stat:
+                        vals = (vals - stat['mean']) / stat['std']
+                    if self._normalize_active() and 'norm_min' in stat:
+                        vals = self._apply_normalize(vals, stat)
+                else:
+                    stat = {'type': 1}
+                    vals = self._coerce_numeric_column(col_name, col_data, stat)
+                    vals = self._impute_numeric(col_name, vals, stat)
+                    if self.scale:
+                        mean = float(np.mean(vals))
+                        std  = float(np.std(vals)) + 1e-8
+                        stat['mean'] = mean
+                        stat['std']  = std
+                        vals = (vals - mean) / std
+                    if self._normalize_active():
+                        vals = self._fit_normalize(vals, stat)
+                    self.stats[col_name] = stat
+                feature_idx = len(self.input_map)
                 X_parts.append(vals.reshape(-1, 1))
                 self.input_map.append(col_name)
+                if type_code == -1:
+                    self.all_output_input_feature_by_col[col_name] = feature_idx
 
             elif type_code == 2:  # Cat In
                 stat = {'type': 2}
@@ -7287,6 +7627,12 @@ class DataProcessor:
         X = np.hstack(X_parts) if X_parts else np.array([])
         Y = np.hstack(Y_parts) if Y_parts else np.array([])
 
+        if self.all_output_input_enabled:
+            for col_name, out_idx in self.all_output_output_index_by_col.items():
+                feat_idx = self.all_output_input_feature_by_col.get(col_name)
+                if feat_idx is not None:
+                    self.all_output_blocked_features_by_output[int(out_idx)] = (int(feat_idx),)
+
         # Print a NaN-imputation summary so the user sees what happened.
         if self.nan_report:
             print("\n  NaN / missing cells (auto-handled):")
@@ -7318,7 +7664,26 @@ class DataProcessor:
                        np.full(len(df), np.nan, dtype=object)
             stat = self.stats.get(col_name, {})
 
-            if type_code == 1:
+            if type_code == -1:
+                if stat.get('boolean'):
+                    vals = _convert_boolean_column_to_numeric(
+                        col_data, set(stat.get('true_tokens', [])),
+                        set(stat.get('false_tokens', [])))
+                else:
+                    vals = pd.to_numeric(col_data, errors='coerce')
+                    vals = np.asarray(vals, dtype=float)
+                fill = float(stat.get('nan_fill', 0.0))
+                bad = ~np.isfinite(vals)
+                if bad.any():
+                    vals = np.where(bad, fill, vals)
+                if self.scale and 'mean' in stat:
+                    vals = (vals - stat['mean']) / stat['std']
+                if self._normalize_active() and 'norm_min' in stat:
+                    vals = self._apply_normalize(vals, stat)
+                if getattr(self, 'all_output_input_enabled', False):
+                    X_parts.append(vals.reshape(-1, 1))
+                Y_parts.append(vals.reshape(-1, 1))
+            elif type_code == 1:
                 if stat.get('boolean'):
                     vals = _convert_boolean_column_to_numeric(
                         col_data, set(stat.get('true_tokens', [])),
@@ -7414,10 +7779,13 @@ class DataProcessor:
         vec_parts = []
         configs_iter = getattr(self, 'effective_configs', None) or self.col_configs
         for col_name, type_code in configs_iter:
-            if type_code in [0, 5, 6, 7]: continue
+            if type_code in [0, 5, 6, 7]:
+                continue
+            if type_code == -1 and not getattr(self, 'all_output_input_enabled', False):
+                continue
             val = input_dict.get(col_name)
             stat = self.stats.get(col_name, {})
-            if type_code == 1:
+            if type_code in (1, -1):
                 if stat.get('boolean'):
                     if val is None or val == '':
                         fval = float(stat.get('nan_fill', 0.0))
@@ -7470,11 +7838,11 @@ class DataProcessor:
         res = {}
         configs_iter = getattr(self, 'effective_configs', None) or self.col_configs
         for col_name, type_code in configs_iter:
-            if type_code not in [5, 6, 7]: continue
+            if type_code not in [-1, 5, 6, 7]: continue
             start, end = self.output_slices[col_name]
             col_preds = y_pred_vec[start:end]
             stat = self.stats[col_name]
-            if type_code == 5:
+            if type_code in (-1, 5):
                 val = col_preds[0]
                 # Undo in reverse order of fit (normalize was applied last).
                 if self._normalize_active() and 'norm_min' in stat:
@@ -7491,8 +7859,9 @@ class DataProcessor:
         types_list = []
         configs_iter = getattr(self, 'effective_configs', None) or self.col_configs
         for col_name, type_code in configs_iter:
-            if type_code < 5: continue
-            if type_code == 5: types_list.append(5)
+            if type_code not in (-1, 5, 6):
+                continue
+            if type_code in (-1, 5): types_list.append(5)
             elif type_code == 6: types_list.extend([6] * len(self.stats[col_name]['classes']))
         return types_list
 
@@ -7545,6 +7914,7 @@ class CGPEquation:
         self.nodes = []
         self.out_idx = 0
         self.active_nodes = set()
+        self.blocked_features = tuple(_current_blocked_features())
 
     def clone(self):
         """Fast structural copy that replaces ``copy.deepcopy`` in the
@@ -7565,6 +7935,7 @@ class CGPEquation:
         new.nodes = [CGPNode(n.op, n.in1, n.in2, n.const_val, n.in3)
                      for n in self.nodes]
         new.out_idx = self.out_idx
+        new.blocked_features = tuple(getattr(self, 'blocked_features', ()))
         # active_nodes is copied via deepcopy specifically to reproduce its
         # exact set ITERATION ORDER.  `set(...)` / `.copy()` build an
         # identically-valued set but, for the same int elements, can iterate in
@@ -7593,6 +7964,11 @@ class CGPEquation:
         batch_size = X.shape[0]
         buffer = np.zeros((batch_size, self.n_features + self.max_nodes))
         buffer[:, :self.n_features] = X
+        blocked = getattr(self, 'blocked_features', ())
+        if blocked:
+            for _bf in blocked:
+                if 0 <= int(_bf) < self.n_features:
+                    buffer[:, int(_bf)] = 0.0
         
         # Track if the FINAL OUTPUT has numerical issues.
         # IMPORTANT: we intentionally do NOT flag intermediate-node explosions.
@@ -7600,6 +7976,7 @@ class CGPEquation:
         # values that the affine rescaling a*f(x)+b handles perfectly.
         # Only flag when the output itself is NaN/Inf-dominated.
         self.last_eval_clipped = False
+        self.last_eval_domain_margin = 0.0
 
         for i in sorted(self.active_nodes):
             if i < self.n_features:
@@ -7611,6 +7988,9 @@ class CGPEquation:
             if node.op in self.OPS_BINARY_SET:
                 v2 = buffer[:, node.in2]
                 result = BINARY_OPS_EVAL[node.op](v1, v2)
+                self.last_eval_domain_margin = max(
+                    self.last_eval_domain_margin,
+                    _domain_margin_value(node.op, v1, v2=v2, result=result))
             elif node.op in self.OPS_TERNARY_SET:
                 # Ternary node — in1, in2, in3 each feed an operand.
                 v2 = buffer[:, node.in2]
@@ -7622,8 +8002,14 @@ class CGPEquation:
                     result = gate * v2 + (1.0 - gate) * v3
                 else:
                     result = TERNARY_OPS_EVAL[node.op](v1, v2, v3)
+                self.last_eval_domain_margin = max(
+                    self.last_eval_domain_margin,
+                    _domain_margin_value(node.op, v1, v2=v2, v3=v3, result=result))
             elif node.op in self.OPS_UNARY_SET:
                 result = UNARY_OPS_EVAL[node.op](v1)
+                self.last_eval_domain_margin = max(
+                    self.last_eval_domain_margin,
+                    _domain_margin_value(node.op, v1, result=result))
             elif node.op == 'const':
                 buffer[:, i] = node.const_val
                 continue
@@ -7770,7 +8156,12 @@ class CGPEquation:
     def __str__(self):
         if not self.active_nodes:
             self.update_active_nodes()
-        buf = {i: str(self.feature_names[i]) for i in range(self.n_features)}
+        blocked = set(_normalise_blocked_features(
+            getattr(self, 'blocked_features', ()), self.n_features))
+        buf = {
+            i: ("0" if i in blocked else str(self.feature_names[i]))
+            for i in range(self.n_features)
+        }
 
         for idx in sorted(self.active_nodes):
             if idx < self.n_features: continue
@@ -8396,7 +8787,8 @@ def random_cgp(n_features, max_nodes, feature_names, op_prior=None):
             if random.random() < 0.5:
                 cap = min(n_features, max_connect + 1)
                 return _pick_feature_idx(n_features, max_index=cap)
-        return random.randint(0, max_connect)
+        return _pick_input_idx(n_features, max_connect,
+                               blocked=getattr(eq, 'blocked_features', ()))
 
     if use_structured:
         # --- Structured random: build a tree bottom-up ---
@@ -8447,10 +8839,13 @@ def random_cgp(n_features, max_nodes, feature_names, op_prior=None):
                     seed_feats.append(f)
                 tries += 1
             if not seed_feats:
-                seed_feats = list(range(min(n_features, 6)))
+                seed_feats = _candidate_feature_indices(
+                    n_features, max_index=min(n_features, 6),
+                    blocked=getattr(eq, 'blocked_features', ()))
             layer_outputs = seed_feats
         else:
-            layer_outputs = list(range(n_features))  # start with raw features
+            layer_outputs = _candidate_feature_indices(
+                n_features, blocked=getattr(eq, 'blocked_features', ()))
 
         for layer in range(target_depth):
             slot = layer
@@ -8487,7 +8882,9 @@ def random_cgp(n_features, max_nodes, feature_names, op_prior=None):
             layer_outputs.append(n_features + slot)
             # Keep the pool bounded to avoid always referencing distant nodes
             if len(layer_outputs) > 6:
-                layer_outputs = layer_outputs[-4:] + list(range(min(n_features, 3)))
+                layer_outputs = layer_outputs[-4:] + _candidate_feature_indices(
+                    n_features, max_index=min(n_features, 3),
+                    blocked=getattr(eq, 'blocked_features', ()))
 
         # Point output at the last structured node
         eq.out_idx = n_features + min(target_depth - 1, max_nodes - 1)
@@ -8507,7 +8904,8 @@ def random_cgp(n_features, max_nodes, feature_names, op_prior=None):
             in2 = _pick_input(max_connect)
             in3 = _pick_input(max_connect)
             eq.nodes.append(CGPNode(op, in1, in2, _random_const(), in3=in3))
-        eq.out_idx = random.randint(0, n_features + max_nodes - 1)
+        eq.out_idx = _pick_input_idx(n_features, n_features + max_nodes - 1,
+                                     blocked=getattr(eq, 'blocked_features', ()))
 
     eq.update_active_nodes()
     return eq
@@ -8548,15 +8946,20 @@ def _build_seed(n_features, feature_names, node_specs, out_offset=None):
 # promising features and feature pairs.  Used to bias seed generation
 # and feature-grafting toward features that actually correlate with the target.
 
-def compute_feature_importance(X, y):
+def compute_feature_importance(X, y, blocked=None):
     """
     Rank features by absolute Pearson correlation with y.
     Returns a dict: feature_index → importance ∈ [0, 1].
     Also returns top pairwise product/ratio importance.
     """
     n_features = X.shape[1]
+    feature_indices = _candidate_feature_indices(
+        n_features, blocked=_current_blocked_features() if blocked is None else blocked)
     importance = {}
-    for i in range(n_features):
+    blocked_set = set(range(n_features)) - set(feature_indices)
+    for i in blocked_set:
+        importance[i] = 0.0
+    for i in feature_indices:
         xi = X[:, i]
         if np.std(xi) < 1e-10:
             importance[i] = 0.0
@@ -8566,7 +8969,7 @@ def compute_feature_importance(X, y):
 
     # Also compute importance for x^2, sqrt, log, 1/x transforms
     transform_importance = {}
-    for i in range(n_features):
+    for i in feature_indices:
         xi = X[:, i]
         if np.std(xi) < 1e-10:
             continue
@@ -8590,8 +8993,8 @@ def compute_feature_importance(X, y):
     # Pairwise product and ratio importance (only top pairs)
     pair_importance = {}
     if n_features <= 20:
-        for i in range(n_features):
-            for j in range(i+1, n_features):
+        for a, i in enumerate(feature_indices):
+            for j in feature_indices[a + 1:]:
                 xi, xj = X[:, i], X[:, j]
                 if np.std(xi) < 1e-10 or np.std(xj) < 1e-10:
                     continue
@@ -8864,6 +9267,7 @@ def generate_ols_basis_seeds(n_features, feature_names, X, y, max_terms=12):
     # We need at minimum '+', '*', 'const' to encode a weighted sum
     if not ({'+', '*', 'const'} <= allowed):
         return seeds
+    feature_indices = _candidate_feature_indices(n_features)
 
     X_clean = np.nan_to_num(X.astype(np.float64),
                             nan=0.0, posinf=0.0, neginf=0.0)
@@ -8877,7 +9281,7 @@ def generate_ols_basis_seeds(n_features, feature_names, X, y, max_terms=12):
     # ── Build polynomial basis ──────────────────────────────────────────
     # Each entry: (kind, params, vector)
     basis = [('const1', None, np.ones(N))]
-    for i in range(n_features):
+    for i in feature_indices:
         basis.append(('feat', (i,), X_clean[:, i].copy()))
 
     # Quadratic terms: cap when n_features is large to keep basis tractable.
@@ -8885,10 +9289,10 @@ def generate_ols_basis_seeds(n_features, feature_names, X, y, max_terms=12):
     # bases make OLS itself expensive.
     QUAD_FEATURE_CAP = 12
     if n_features <= QUAD_FEATURE_CAP:
-        for i in range(n_features):
+        for i in feature_indices:
             basis.append(('square', (i,), X_clean[:, i] ** 2))
-        for i in range(n_features):
-            for j in range(i + 1, n_features):
+        for a, i in enumerate(feature_indices):
+            for j in feature_indices[a + 1:]:
                 basis.append(('product', (i, j), X_clean[:, i] * X_clean[:, j]))
 
     # ── Solve OLS (column-scaled, ridge-regularised for stability) ─────
@@ -9242,6 +9646,9 @@ def generate_log_ols_seeds(n_features, feature_names, X, y):
         return seeds
     if n_features < 1 or len(y) < 5 or X.size == 0:
         return seeds
+    feature_indices = _candidate_feature_indices(n_features)
+    if not feature_indices:
+        return seeds
 
     X_arr = np.nan_to_num(np.asarray(X, dtype=np.float64),
                            nan=0.0, posinf=0.0, neginf=0.0)
@@ -9256,7 +9663,8 @@ def generate_log_ols_seeds(n_features, feature_names, X, y):
     #   • If y is consistently negative but its magnitude is positive, fit
     #     log(|y|) and emit a seed with an outer ``-1`` constant.  Mixed
     #     signs in y would invalidate the log-linear assumption, so skip.
-    pos_X = np.all(X_arr > 1e-12, axis=1)
+    X_fit_all = X_arr[:, feature_indices]
+    pos_X = np.all(X_fit_all > 1e-12, axis=1)
     pos_y = y_arr > 1e-12
     neg_y = y_arr < -1e-12
     n_pos = int(pos_X.sum())
@@ -9276,7 +9684,7 @@ def generate_log_ols_seeds(n_features, feature_names, X, y):
     if int(mask.sum()) < max(10, n_features + 2):
         return seeds
 
-    Xp = X_arr[mask]
+    Xp = X_fit_all[mask]
     yp = y_arr[mask] * sign  # always positive in this branch
     log_y = np.log(yp + 1e-300)
     log_X = np.log(Xp + 1e-300)
@@ -9313,9 +9721,15 @@ def generate_log_ols_seeds(n_features, feature_names, X, y):
     floor     = 0.005 * float(np.std(log_y) + 1e-12)
     coeffs_filt = np.where(contrib >= floor, coeffs, 0.0)
 
+    def _expand_coeffs(local_coeffs):
+        full = np.zeros(n_features, dtype=np.float64)
+        for local_i, feat_i in enumerate(feature_indices):
+            full[int(feat_i)] = float(local_coeffs[local_i])
+        return full
+
     # Emit raw-coeff seed (whatever the fit returned).
     raw_seed = _build_monomial_seed(n_features, feature_names,
-                                     coeffs_filt, c0_raw)
+                                     _expand_coeffs(coeffs_filt), c0_raw)
     if raw_seed is not None:
         seeds.append(raw_seed)
 
@@ -9336,7 +9750,7 @@ def generate_log_ols_seeds(n_features, feature_names, X, y):
         log_c0_snap = float(np.mean(log_y - snap_pred_log))
         c0_snap = float(np.exp(np.clip(log_c0_snap, -50.0, 50.0))) * sign
         snap_seed = _build_monomial_seed(n_features, feature_names,
-                                          snapped, c0_snap)
+                                          _expand_coeffs(snapped), c0_snap)
         if snap_seed is not None:
             seeds.append(snap_seed)
 
@@ -9355,7 +9769,7 @@ def generate_log_ols_seeds(n_features, feature_names, X, y):
         log_c0_int = float(np.mean(log_y - int_pred_log))
         c0_int = float(np.exp(np.clip(log_c0_int, -50.0, 50.0))) * sign
         int_seed = _build_monomial_seed(n_features, feature_names,
-                                         int_snapped, c0_int)
+                                         _expand_coeffs(int_snapped), c0_int)
         if int_seed is not None:
             seeds.append(int_seed)
 
@@ -9393,13 +9807,16 @@ def _generate_rational_product_seeds(n_features, feature_names, X, y,
         return seeds
 
     nf = n_features
+    available = _candidate_feature_indices(n_features)
     if feat_priority is not None:
         feat_pool = [int(f) for f in feat_priority
-                     if 0 <= int(f) < n_features][:6]
+                     if 0 <= int(f) < n_features and int(f) in available][:6]
         if len(feat_pool) < 2:
-            feat_pool = list(range(min(n_features, 6)))
+            feat_pool = available[:6]
     else:
-        feat_pool = list(range(min(n_features, 6)))
+        feat_pool = available[:6]
+    if len(feat_pool) < 2:
+        return seeds
 
     # ---- 2-feature plain ratio: a / b -------------------------------
     if n_features >= 2:
@@ -9544,13 +9961,16 @@ def _generate_reused_input_seeds(n_features, feature_names, feat_priority=None):
     if n_features < 2:
         return seeds
 
+    available = _candidate_feature_indices(n_features)
     if feat_priority is not None:
         feat_pool = [int(f) for f in feat_priority
-                     if 0 <= int(f) < n_features][:6]
+                     if 0 <= int(f) < n_features and int(f) in available][:6]
         if len(feat_pool) < 2:
-            feat_pool = list(range(min(n_features, 6)))
+            feat_pool = available[:6]
     else:
-        feat_pool = list(range(min(n_features, 6)))
+        feat_pool = available[:6]
+    if len(feat_pool) < 2:
+        return seeds
     F = len(feat_pool)
     nf = n_features
 
@@ -11460,7 +11880,18 @@ def generate_seeds_v5(n_features, feature_names):
     if not USE_SEEDS:
         return []
     seeds = []
-    feat = lambda: random.randint(0, n_features - 1)
+    feat_pool = _candidate_feature_indices(n_features)
+    if not feat_pool:
+        return seeds
+    feat = lambda: random.choice(feat_pool)
+
+    def first_feats(max_count):
+        return feat_pool[:min(len(feat_pool), int(max_count))]
+
+    def sample_feats(count):
+        if len(feat_pool) < int(count):
+            return None
+        return random.sample(feat_pool, int(count))
     
     # Pre-calculate for fast O(1) lookups
     allowed = set(CGPEquation.OPS_ALL)
@@ -11546,21 +11977,27 @@ def generate_seeds_v5(n_features, feature_names):
 
     # 11. Two-feature product: x1 * x2
     if n_features >= 2 and '*' in allowed:
-        f1, f2 = random.sample(range(n_features), 2)
-        seeds.append(_build_seed(n_features, feature_names, [
-            ('*', f1, f2),
-        ]))
+        pair = sample_feats(2)
+        if pair is None:
+            pair = []
+        if pair:
+            f1, f2 = pair
+            seeds.append(_build_seed(n_features, feature_names, [
+                ('*', f1, f2),
+            ]))
 
     # 12. Two-feature linear sum: c1*x1 + c2*x2
     if n_features >= 2 and '*' in allowed and '+' in allowed and 'const' in allowed:
-        f1, f2 = random.sample(range(n_features), 2)
-        seeds.append(_build_seed(n_features, feature_names, [
-            ('const', 0, 0, random.uniform(0.1, 3.0)),
-            ('const', 0, 0, random.uniform(0.1, 3.0)),
-            ('*', n_features, f1),
-            ('*', n_features + 1, f2),
-            ('+', n_features + 2, n_features + 3),
-        ]))
+        pair = sample_feats(2)
+        if pair:
+            f1, f2 = pair
+            seeds.append(_build_seed(n_features, feature_names, [
+                ('const', 0, 0, random.uniform(0.1, 3.0)),
+                ('const', 0, 0, random.uniform(0.1, 3.0)),
+                ('*', n_features, f1),
+                ('*', n_features + 1, f2),
+                ('+', n_features + 2, n_features + 3),
+            ]))
 
     # 13. ReLU linear: relu(c*x + b)
     if 'relu' in allowed and '*' in allowed and 'const' in allowed:
@@ -11578,7 +12015,7 @@ def generate_seeds_v5(n_features, feature_names):
     # threshold values.  Works for tasks like Diode (V_in > 0.7 → V_in else 0
     # ≡ relu(V_in - 0.7) + something).
     if 'relu' in allowed and '-' in allowed and 'const' in allowed:
-        for fi in range(min(n_features, 4)):
+        for fi in first_feats(4):
             for thresh in [0.0, 0.5, 0.7, 1.0]:
                 seeds.append(_build_seed(n_features, feature_names, [
                     ('const', 0, 0, thresh),
@@ -11589,7 +12026,7 @@ def generate_seeds_v5(n_features, feature_names):
     # 13c. max-style threshold gate (for op sets without relu):
     #      max(x_i - c, 0) — same shape as relu(x - c).
     if 'max' in allowed and '-' in allowed and 'const' in allowed and 'relu' not in allowed:
-        for fi in range(min(n_features, 4)):
+        for fi in first_feats(4):
             for thresh in [0.0, 0.5, 0.7]:
                 seeds.append(_build_seed(n_features, feature_names, [
                     ('const', 0, 0, thresh),
@@ -11603,7 +12040,7 @@ def generate_seeds_v5(n_features, feature_names):
     # any threshold from a continuous gradient, even when if_else isn't enabled.
     if ('sigmoid' in allowed and '*' in allowed and '-' in allowed
             and 'const' in allowed):
-        for fi in range(min(n_features, 3)):
+        for fi in first_feats(3):
             for thresh in [0.0, 0.7, 1.0]:
                 seeds.append(_build_seed(n_features, feature_names, [
                     ('const', 0, 0, thresh),         # 0
@@ -11619,7 +12056,7 @@ def generate_seeds_v5(n_features, feature_names):
     # max HP, sat sensors).  Many "saturating" problems are best expressed
     # this way and the lazy seeds rarely place a const next to a min call.
     if 'min' in allowed and 'const' in allowed:
-        for fi in range(min(n_features, 3)):
+        for fi in first_feats(3):
             for cap in [1.0, 30.0, 100.0]:
                 seeds.append(_build_seed(n_features, feature_names, [
                     ('const', 0, 0, cap),
@@ -11627,7 +12064,7 @@ def generate_seeds_v5(n_features, feature_names):
                 ]))
     # max(0, x_i - c)  — clip-from-below (relu offset, hinge loss).
     if 'max' in allowed and '-' in allowed and 'const' in allowed:
-        for fi in range(min(n_features, 3)):
+        for fi in first_feats(3):
             for thresh in [0.0, 0.5, 0.7]:
                 seeds.append(_build_seed(n_features, feature_names, [
                     ('const', 0, 0, thresh),
@@ -11640,7 +12077,10 @@ def generate_seeds_v5(n_features, feature_names):
             and 'const' in allowed):
         for cap in [30.0, 100.0, 200.0]:
             for _ in range(2):
-                fi, fj = random.sample(range(n_features), 2)
+                pair = sample_feats(2)
+                if pair is None:
+                    continue
+                fi, fj = pair
                 seeds.append(_build_seed(n_features, feature_names, [
                     ('+', fi, fj),
                     ('const', 0, 0, cap),
@@ -11650,7 +12090,10 @@ def generate_seeds_v5(n_features, feature_names):
     if (n_features >= 2 and 'max' in allowed and '-' in allowed
             and 'const' in allowed):
         for _ in range(3):
-            fi, fj = random.sample(range(n_features), 2)
+            pair = sample_feats(2)
+            if pair is None:
+                continue
+            fi, fj = pair
             seeds.append(_build_seed(n_features, feature_names, [
                 ('-', fi, fj),
                 ('const', 0, 0, 0.0),
@@ -11665,13 +12108,17 @@ def generate_seeds_v5(n_features, feature_names):
     # ordering.
     if (n_features >= 3 and 'max' in allowed and '-' in allowed
             and 'const' in allowed):
-        _trios = [tuple(random.sample(range(n_features), 3)) for _ in range(2)]
+        _trios = []
+        for _ in range(2):
+            trio = sample_feats(3)
+            if trio:
+                _trios.append(tuple(trio))
         # Plus a deterministic sweep over the first three features (every
         # permutation of who is carrier vs take vs cap).
         if n_features >= 3:
-            for fk in range(min(n_features, 4)):
-                for fi in range(min(n_features, 4)):
-                    for fj in range(min(n_features, 4)):
+            for fk in first_feats(4):
+                for fi in first_feats(4):
+                    for fj in first_feats(4):
                         if len({fk, fi, fj}) == 3:
                             _trios.append((fk, fi, fj))
         for fk, fi, fj in _trios:
@@ -11685,9 +12132,9 @@ def generate_seeds_v5(n_features, feature_names):
     if n_features >= 3 and 'relu' in allowed and '-' in allowed:
         _trios = []
         if n_features >= 3:
-            for fk in range(min(n_features, 4)):
-                for fi in range(min(n_features, 4)):
-                    for fj in range(min(n_features, 4)):
+            for fk in first_feats(4):
+                for fi in first_feats(4):
+                    for fj in first_feats(4):
                         if len({fk, fi, fj}) == 3:
                             _trios.append((fk, fi, fj))
         for fk, fi, fj in _trios:
@@ -11702,7 +12149,7 @@ def generate_seeds_v5(n_features, feature_names):
     if ('relu' in allowed and 'min' in allowed and 'exp' in allowed
             and '-' in allowed and '*' in allowed and '+' in allowed
             and 'const' in allowed):
-        for fi in range(min(n_features, 3)):
+        for fi in first_feats(3):
             for alpha_val in [1.0, 0.5]:
                 seeds.append(_build_seed(n_features, feature_names, [
                     ('const', 0, 0, 0.0),                       # 0
@@ -12938,7 +13385,7 @@ def _build_random_mini_tree(child_eq, n_features, start_slot, max_depth=3,
     can introduce conditional structures, not just arithmetic ones.
     """
     if available_inputs is None:
-        available_inputs = list(range(n_features))
+        available_inputs = _candidate_feature_indices(n_features)
 
     unary_ops  = CGPEquation.OPS_UNARY  or []
     binary_ops = CGPEquation.OPS_BINARY or []
@@ -13044,6 +13491,7 @@ def mutate(parent_eq, n_features, feature_names, mut_rate=None, temperature=0.0,
     if mut_rate is None:
         mut_rate = CGP_MUT_RATE
     child_eq = parent_eq.clone()
+    blocked_features = tuple(getattr(child_eq, 'blocked_features', ()))
 
     perturb_scale = SA_PERTURBATION_FACTOR * temperature + 1.0
 
@@ -13090,7 +13538,9 @@ def mutate(parent_eq, n_features, feature_names, mut_rate=None, temperature=0.0,
     for _ in range(mut_rate):
         # 10% chance: shift output pointer
         if random.random() < 0.10:
-            child_eq.out_idx = random.randint(0, n_features + child_eq.max_nodes - 1)
+            child_eq.out_idx = _pick_input_idx(
+                n_features, n_features + child_eq.max_nodes - 1,
+                blocked=blocked_features)
             child_eq.update_active_nodes()
             active_compute   = [i - n_features for i in child_eq.active_nodes if i >= n_features]
             inactive_compute = list(all_compute - set(active_compute))
@@ -13142,21 +13592,24 @@ def mutate(parent_eq, n_features, feature_names, mut_rate=None, temperature=0.0,
                 cap = min(n_features, max_connect + 1)
                 target.in1 = _pick_feature_idx(n_features, max_index=cap)
             else:
-                target.in1 = random.randint(0, max_connect)
+                target.in1 = _pick_input_idx(
+                    n_features, max_connect, blocked=blocked_features)
         elif choice == 'rewire2':
             if (FEATURE_PRIORS is not None and n_features > 4
                     and random.random() < 0.5):
                 cap = min(n_features, max_connect + 1)
                 target.in2 = _pick_feature_idx(n_features, max_index=cap)
             else:
-                target.in2 = random.randint(0, max_connect)
+                target.in2 = _pick_input_idx(
+                    n_features, max_connect, blocked=blocked_features)
         elif choice == 'rewire3':
             if (FEATURE_PRIORS is not None and n_features > 4
                     and random.random() < 0.5):
                 cap = min(n_features, max_connect + 1)
                 target.in3 = _pick_feature_idx(n_features, max_index=cap)
             else:
-                target.in3 = random.randint(0, max_connect)
+                target.in3 = _pick_input_idx(
+                    n_features, max_connect, blocked=blocked_features)
         elif choice == 'perturb_const':
             noise_sigma = (abs(target.const_val) * 0.3 + 1.0) * perturb_scale
             target.const_val += random.gauss(0, noise_sigma)
@@ -13277,8 +13730,10 @@ def mutate(parent_eq, n_features, feature_names, mut_rate=None, temperature=0.0,
                 for idx in child_eq.active_nodes:
                     if idx < n_features:
                         used_feats.add(idx)
-                unused = [f for f in range(n_features) if f not in used_feats]
-                used_list = sorted(used_feats)
+                blocked_set = set(blocked_features)
+                unused = [f for f in range(n_features)
+                          if f not in used_feats and f not in blocked_set]
+                used_list = sorted(f for f in used_feats if f not in blocked_set)
                 if used_list and random.random() < 0.30:
                     new_feat = random.choice(used_list)
                 elif unused:
@@ -13336,7 +13791,8 @@ def mutate(parent_eq, n_features, feature_names, mut_rate=None, temperature=0.0,
                 # Pick a contiguous region of inactive slots
                 inactive_sorted = sorted(inactive_compute)
                 start = random.choice(inactive_sorted[:max(1, len(inactive_sorted) - 2)])
-                avail_inputs = list(range(n_features))
+                avail_inputs = _candidate_feature_indices(
+                    n_features, blocked=blocked_features)
                 # Also allow referencing existing active nodes below start
                 for ac in active_compute:
                     if ac < start:
@@ -13781,8 +14237,10 @@ def macro_prune(cgp_eq, n_features):
 def _active_feature_set(cgp_eq, n_features):
     """Return the set of raw feature indices (0..n_features-1) used in the active graph."""
     used = set()
+    blocked = set(_normalise_blocked_features(
+        getattr(cgp_eq, 'blocked_features', ()), n_features))
     for idx in cgp_eq.active_nodes:
-        if idx < n_features:
+        if idx < n_features and idx not in blocked:
             used.add(idx)
     return used
 
@@ -13858,7 +14316,10 @@ def macro_graft_feature(cgp_eq, n_features, feature_names):
 
     # 1. Find unused features
     used_feats = _active_feature_set(child, n_features)
-    unused     = [f for f in range(n_features) if f not in used_feats]
+    blocked = set(_normalise_blocked_features(
+        getattr(child, 'blocked_features', ()), n_features))
+    unused = [f for f in range(n_features)
+              if f not in used_feats and f not in blocked]
     if not unused:
         # All features already present — grow complexity instead
         return macro_grow(cgp_eq, n_features, feature_names)
@@ -14584,6 +15045,200 @@ def _magnitude_gap(preds, y):
     return 1.0 - r2c
 
 
+def _residual_balance_objective(preds, y, n_bins=5):
+    """Residual concentration across target regimes, squashed to ``[0, 1)``.
+
+    The target is sorted and split into equal-count bins; each bin contributes
+    its mean absolute residual.  A model that spreads error evenly scores near
+    0, while one that hides most of its error in one magnitude regime scores
+    toward 1.  This is selection-only and complements the scalar loss: two
+    models with similar global loss can differ sharply in where they fail.
+    """
+    p = np.asarray(preds, dtype=np.float64).ravel()
+    t = np.asarray(y, dtype=np.float64).ravel()
+    n = p.size
+    if n < 8 or t.size != n or not (np.all(np.isfinite(p)) and np.all(np.isfinite(t))):
+        return 1.0
+    n_bins = max(2, min(int(n_bins), n // 2))
+    order = np.argsort(t, kind="stable")
+    abs_res = np.abs(p[order] - t[order])
+    chunks = np.array_split(abs_res, n_bins)
+    means = np.asarray([float(np.mean(c)) for c in chunks if c.size], dtype=np.float64)
+    if means.size < 2 or not np.all(np.isfinite(means)):
+        return 1.0
+    mu = float(np.mean(means))
+    if mu <= 1e-30:
+        return 0.0
+    cv = float(np.std(means) / mu)
+    if not np.isfinite(cv) or cv < 0.0:
+        return 1.0
+    return float(cv / (1.0 + cv))
+
+
+def _gradient_mismatch_objective(tree, X, affine_a, target_grads):
+    """Bounded gradient-mismatch objective for NSGA-III (0 best, 1 worst)."""
+    if target_grads is None:
+        return 1.0
+    try:
+        tg = np.asarray(target_grads, dtype=np.float64)
+        if tg.ndim != 2 or tg.shape[0] != X.shape[0] or tg.shape[1] != X.shape[1]:
+            return 1.0
+        tree_grads = evaluate_tree_gradients(tree, X, affine_a)
+        grad_var = np.var(tg, axis=0) + 1e-8
+        grad_mse = float(np.mean((tree_grads - tg) ** 2 / grad_var))
+        if not np.isfinite(grad_mse) or grad_mse < 0.0:
+            return 1.0
+        return float(grad_mse / (1.0 + grad_mse))
+    except Exception:
+        return 1.0
+
+
+def _domain_margin_value(op, v1, v2=None, v3=None, result=None):
+    """Bounded domain-risk score for one node evaluation (0 best, 1 worst).
+
+    This is intentionally a cheap heuristic rather than symbolic interval
+    arithmetic.  It catches the numerical pathologies the evaluator already
+    guards or sanitises: near-zero divisors, log/sqrt boundary hits, exponent
+    saturation and raw NaN/Inf production.  The score is cached on the tree after
+    evaluation and exposed as the optional NSGA-III ``domain`` objective.
+    """
+    try:
+        risks = []
+        if result is not None:
+            r = np.asarray(result)
+            if r.size:
+                bad = float(np.mean(~np.isfinite(r)))
+                huge = float(np.mean(np.abs(np.nan_to_num(
+                    r, nan=0.0, posinf=1e12, neginf=-1e12)) >= 1e9))
+                risks.extend([bad, huge])
+
+        if op in ('/', 'floordiv', 'mod'):
+            den = np.asarray(v2, dtype=np.float64)
+            risks.append(float(np.mean(1.0 / (1.0 + np.abs(den) / 1e-6))))
+        elif op == 'harmonic':
+            den = np.asarray(v1, dtype=np.float64) + np.asarray(v2, dtype=np.float64)
+            risks.append(float(np.mean(1.0 / (1.0 + np.abs(den) / 1e-6))))
+        elif op == 'log_base':
+            a = np.asarray(v1, dtype=np.float64)
+            b = np.asarray(v2, dtype=np.float64)
+            base_log = np.log(np.abs(b) + 1e-30)
+            risks.append(float(np.mean(a <= 1e-12)))
+            risks.append(float(np.mean(1.0 / (1.0 + np.abs(base_log) / 1e-6))))
+        elif op in ('log', 'log10', 'xlogx', 'oom'):
+            a = np.asarray(v1, dtype=np.float64)
+            risks.append(float(np.mean(np.abs(a) <= 1e-12)))
+        elif op in ('sqrt', 'geometric'):
+            a = np.asarray(v1, dtype=np.float64)
+            if v2 is not None:
+                a = a * np.asarray(v2, dtype=np.float64)
+            risks.append(float(np.mean(a < 0.0)))
+        elif op == 'pow':
+            a = np.asarray(v1, dtype=np.float64)
+            b = np.asarray(v2, dtype=np.float64)
+            frac_exp = np.abs(np.round(b) - b) >= 1e-4
+            risks.append(float(np.mean((a < 0.0) & frac_exp)))
+            risks.append(float(np.mean(np.abs(b) > 100.0)))
+        elif op in ('root3', 'root4', 'root5', 'root6', 'root7',
+                    'root8', 'root9', 'root10'):
+            a = np.asarray(v1, dtype=np.float64)
+            if op in ('root4', 'root6', 'root8', 'root10'):
+                risks.append(float(np.mean(a < 0.0)))
+        elif op in ('exp', '10^x', 'sinh', 'cosh', 'expm1', 'softplus'):
+            a = np.asarray(v1, dtype=np.float64)
+            limit = 700.0 if op not in ('10^x', 'softplus') else (300.0 if op == '10^x' else 500.0)
+            risks.append(float(np.mean(np.maximum(0.0, np.abs(a) - 0.8 * limit)
+                                       / (0.2 * limit + 1e-12))))
+        elif op == 'tan':
+            c = np.abs(np.cos(np.asarray(v1, dtype=np.float64)))
+            risks.append(float(np.mean(1.0 / (1.0 + c / 1e-4))))
+        elif op in ('if_in_range', 'if_out_of_range'):
+            lo = np.asarray(v2, dtype=np.float64)
+            hi = np.asarray(v3, dtype=np.float64)
+            risks.append(float(np.mean(1.0 / (1.0 + np.abs(hi - lo) / 1e-6))))
+
+        if not risks:
+            return 0.0
+        val = float(max(risks))
+        if not np.isfinite(val):
+            return 1.0
+        return float(min(1.0, max(0.0, val)))
+    except Exception:
+        return 1.0
+
+
+def _sensitivity_objective(ind, X, preds, y):
+    """Bounded local input-sensitivity objective for NSGA-III (0 best, 1 worst)."""
+    try:
+        Xv = np.asarray(X, dtype=np.float64)
+        p = np.asarray(preds, dtype=np.float64).ravel()
+        yv = np.asarray(y, dtype=np.float64).ravel()
+        if Xv.ndim != 2 or Xv.shape[0] < 4 or p.size != Xv.shape[0] or yv.size != p.size:
+            return 1.0
+        n = Xv.shape[0]
+        m = min(int(NSGA3_SENSITIVITY_ROWS), n)
+        idx = np.linspace(0, n - 1, m).astype(np.intp)
+        Xs = Xv[idx].copy()
+        ps = p[idx]
+        x_scale = np.std(Xv, axis=0)
+        x_scale = np.where(np.isfinite(x_scale) & (x_scale > 1e-12), x_scale, 1.0)
+        signs = np.where(((np.arange(m)[:, None] + np.arange(Xv.shape[1])[None, :]) % 2) == 0,
+                         1.0, -1.0)
+        step = float(NSGA3_SENSITIVITY_EPS) * x_scale
+        Xp = Xs + signs * step
+        pp = ind._predict_with_boosts(Xp)
+        pp = np.clip(np.nan_to_num(pp, nan=0.0, posinf=1e9, neginf=-1e9), -1e9, 1e9)
+        y_scale = float(np.std(yv)) + 1e-8
+        gain = float(np.sqrt(np.mean((pp - ps) ** 2)) /
+                     (max(float(NSGA3_SENSITIVITY_EPS), 1e-12) * y_scale))
+        if not np.isfinite(gain) or gain < 0.0:
+            return 1.0
+        return float(gain / (1.0 + gain))
+    except Exception:
+        return 1.0
+
+
+def _binary_class_objectives(logits, y_true):
+    """Return (margin_obj, brier_obj) for binary logits; both minimised."""
+    try:
+        z = np.asarray(logits, dtype=np.float64).ravel()
+        yb = (np.asarray(y_true).ravel() >= 0.5).astype(np.float64)
+        if z.size == 0 or z.size != yb.size:
+            return 1.0, 1.0
+        signed = np.where(yb > 0.5, 1.0, -1.0) * z
+        margin = float(np.mean(np.tanh(np.clip(signed, -50.0, 50.0))))
+        margin_obj = 0.5 * (1.0 - margin)
+        prob = 1.0 / (1.0 + np.exp(-np.clip(z, -50.0, 50.0)))
+        brier = float(np.mean((prob - yb) ** 2))
+        return float(np.clip(margin_obj, 0.0, 1.0)), float(np.clip(brier, 0.0, 1.0))
+    except Exception:
+        return 1.0, 1.0
+
+
+def _multiclass_class_objectives(logits, y_onehot):
+    """Return (margin_obj, brier_obj) for multiclass logits; both minimised."""
+    try:
+        L = np.asarray(logits, dtype=np.float64)
+        Y = np.asarray(y_onehot, dtype=np.float64)
+        if L.ndim != 2 or Y.shape != L.shape or L.shape[0] == 0 or L.shape[1] < 2:
+            return 1.0, 1.0
+        true_idx = np.argmax(Y, axis=1)
+        rows = np.arange(L.shape[0])
+        true_logits = L[rows, true_idx]
+        masked = L.copy()
+        masked[rows, true_idx] = -np.inf
+        other_logits = np.max(masked, axis=1)
+        margins = true_logits - other_logits
+        margin = float(np.mean(np.tanh(np.clip(margins, -50.0, 50.0))))
+        margin_obj = 0.5 * (1.0 - margin)
+        row_max = L.max(axis=1, keepdims=True)
+        exp_l = np.exp(np.clip(L - row_max, -500.0, 0.0))
+        prob = exp_l / (exp_l.sum(axis=1, keepdims=True) + 1e-30)
+        brier = float(np.mean(np.sum((prob - Y) ** 2, axis=1)) / 2.0)
+        return float(np.clip(margin_obj, 0.0, 1.0)), float(np.clip(brier, 0.0, 1.0))
+    except Exception:
+        return 1.0, 1.0
+
+
 def compute_push_intrinsic(preds, y, tree, X, affine_a, affine_b):
     """Combine the INTRINSIC push components into a single bonus (≥ 0).
 
@@ -15007,6 +15662,7 @@ class Individual:
     def __init__(self, cgp_eq):
         self.tree = cgp_eq
         if self.tree:
+            _bind_tree_to_current_output(self.tree)
             self.tree.update_active_nodes()
             self.complexity = self.tree.get_complexity()
         else:
@@ -15024,12 +15680,20 @@ class Individual:
         # consulted when NSGA3_ENABLED and NSGA3_EXTRA_OBJ_ENABLED — see
         # _afpo_extra_objective_columns).  Cached on the last full-data
         # regression evaluation.  Defaults are the WORST value (1.0) for the
-        # minimised shape / instability / logloss axes so an unevaluated or
+        # minimised extra-objective axes so an unevaluated or
         # classification individual is never spuriously rewarded; behaviour_sig
         # is None until a prediction signature exists.
         self.shape_obj       = 1.0
         self.instability_obj = 1.0
         self.logloss_obj     = 1.0
+        self.tails_obj       = 1.0
+        self.magnitude_obj   = 1.0
+        self.residuals_obj   = 1.0
+        self.gradient_obj    = 1.0
+        self.sensitivity_obj = 1.0
+        self.domain_obj      = 1.0
+        self.class_margin_obj = 1.0
+        self.class_brier_obj  = 1.0
         self.behavior_sig    = None
         # Selection-only MDL constant cost (set in calculate_fitness; see
         # compute_const_cost).  0.0 until evaluated / when the feature is off.
@@ -15281,11 +15945,13 @@ class Individual:
             # Update complexity to account for the correction
             self.complexity += best.tree.get_complexity() * 0.5  # discounted
 
-    def _update_nsga3_extra_objectives(self, preds, y_eval, X_eval):
+    def _update_nsga3_extra_objectives(self, preds, y_eval, X_eval,
+                                       target_grads=None):
         """Cache the optional NSGA-III extra-objective metrics from a full-data
-        REGRESSION evaluation: shape mismatch, numerical instability, the
-        signed-log-space loss, and the behavioural signature used by the
-        diversity objective.  All are selection-only and only consulted when
+        REGRESSION evaluation: shape mismatch, numerical instability,
+        signed-log-space loss, tail ordering, magnitude gap, residual balance,
+        gradient mismatch, and the behavioural signature used by the diversity
+        objective.  All are selection-only and only consulted when
         NSGA3_ENABLED and NSGA3_EXTRA_OBJ_ENABLED (see
         _afpo_extra_objective_columns).  Cheap — two capped rank sorts, one
         ~32-point extrapolation probe and one extra O(N) loss pass (the symlog'd
@@ -15294,34 +15960,86 @@ class Individual:
         deterministic.
         """
         try:
-            # SHAPE mismatch: 1 − |Spearman(pred, target)| (0 = ordering nailed).
-            self.shape_obj = 1.0 - _push_shape_score(
-                preds, y_eval, PUSH_SHAPE_MAX_ROWS)
-            # INSTABILITY: 1 − extrapolation-smoothness, forced to 1 (maximally
-            # unstable) when the in-sample output already went non-finite/clipped.
-            instab = 1.0
-            Xp = _push_probe_inputs(X_eval)
-            if Xp is not None and preds.size:
-                smooth = _push_smooth_score(
-                    self.tree, Xp, self.affine_a, self.affine_b,
-                    float(np.min(preds)), float(np.max(preds)))
-                instab = 1.0 - smooth
-            if getattr(self.tree, 'last_eval_clipped', False):
+            chosen = set(NSGA3_EXTRA_OBJECTIVES)
+            domain_margin = float(min(1.0, max(0.0,
+                getattr(self.tree, 'last_eval_domain_margin', 1.0))))
+            if 'shape' in chosen:
+                # SHAPE mismatch: 1 − |Spearman(pred, target)| (0 = ordering nailed).
+                self.shape_obj = 1.0 - _push_shape_score(
+                    preds, y_eval, PUSH_SHAPE_MAX_ROWS)
+            if 'instability' in chosen:
+                # INSTABILITY: 1 − extrapolation-smoothness, forced to 1 when
+                # the in-sample output already went non-finite/clipped.
                 instab = 1.0
-            self.instability_obj = float(min(1.0, max(0.0, instab)))
-            # DIVERSITY: standardized-prediction signature (compared at trim time).
-            self.behavior_sig = _behavior_signature(preds)
-            # LOG-LOSS: the main regression loss recomputed in signed-log space
-            # (see _logloss_objective), so the survival trim can favour models
-            # that track the target across ALL output magnitudes rather than
-            # parking on the high-magnitude rows.
-            self.logloss_obj = _logloss_objective(preds, y_eval)
+                Xp = _push_probe_inputs(X_eval)
+                if Xp is not None and preds.size:
+                    smooth = _push_smooth_score(
+                        self.tree, Xp, self.affine_a, self.affine_b,
+                        float(np.min(preds)), float(np.max(preds)))
+                    instab = 1.0 - smooth
+                if getattr(self.tree, 'last_eval_clipped', False):
+                    instab = 1.0
+                self.instability_obj = float(min(1.0, max(0.0, instab)))
+            if 'diversity' in chosen:
+                # DIVERSITY: standardized-prediction signature (compared at trim time).
+                self.behavior_sig = _behavior_signature(preds)
+            if 'logloss' in chosen:
+                # LOG-LOSS: the main regression loss recomputed in signed-log space.
+                self.logloss_obj = _logloss_objective(preds, y_eval)
+            if 'tails' in chosen:
+                # TAILS: ordering quality on the target extremes only.
+                self.tails_obj = 1.0 - _push_tails_score(
+                    preds, y_eval, PUSH_TAILS_FRAC, PUSH_SHAPE_MAX_ROWS)
+            if 'magnitude' in chosen:
+                # MAGNITUDE: remaining unexplained variance after affine scaling.
+                self.magnitude_obj = _magnitude_gap(preds, y_eval)
+            if 'residuals' in chosen:
+                # RESIDUALS: whether errors are concentrated in one target regime.
+                self.residuals_obj = _residual_balance_objective(preds, y_eval)
+            if 'gradient' in chosen:
+                # GRADIENT: slope mismatch when target gradients are available.
+                self.gradient_obj = _gradient_mismatch_objective(
+                    self.tree, X_eval, self.affine_a, target_grads)
+            if 'sensitivity' in chosen:
+                # SENSITIVITY: local response to tiny deterministic perturbations.
+                self.sensitivity_obj = _sensitivity_objective(self, X_eval, preds, y_eval)
+            if 'domain' in chosen:
+                # DOMAIN: evaluator-recorded risky-domain margin from this pass.
+                self.domain_obj = domain_margin
         except Exception:
             # Neutral-worst defaults so a failure never silently rewards a model.
             self.shape_obj = 1.0
             self.instability_obj = 1.0
             self.behavior_sig = None
             self.logloss_obj = 1.0
+            self.tails_obj = 1.0
+            self.magnitude_obj = 1.0
+            self.residuals_obj = 1.0
+            self.gradient_obj = 1.0
+            self.sensitivity_obj = 1.0
+            self.domain_obj = 1.0
+
+    def _update_nsga3_class_objectives(self, logits, y_eval, multiclass=False):
+        """Cache optional classification-specific NSGA-III objectives."""
+        try:
+            chosen = set(NSGA3_EXTRA_OBJECTIVES)
+            if not ({'class_margin', 'class_brier'} & chosen):
+                return
+            if multiclass:
+                margin, brier = _multiclass_class_objectives(logits, y_eval)
+            else:
+                margin, brier = _binary_class_objectives(logits, y_eval)
+            if 'class_margin' in chosen:
+                self.class_margin_obj = margin
+            if 'class_brier' in chosen:
+                self.class_brier_obj = brier
+            if 'domain' in chosen:
+                self.domain_obj = float(min(1.0, max(0.0,
+                    getattr(self.tree, 'last_eval_domain_margin', 1.0))))
+        except Exception:
+            self.class_margin_obj = 1.0
+            self.class_brier_obj = 1.0
+            self.domain_obj = 1.0
 
     def calculate_fitness(self, X, y_target, type_code, batch_indices=None,
                           bg_logits=None, class_idx_in_group=None, Y_group=None,
@@ -15355,16 +16073,22 @@ class Individual:
                               When provided, the regression loss is a weighted MSE.
                               Weights are normalised internally so they sum to N.
         """
+        _bind_individual_to_current_output(self)
         # ── Cache lookup (full-dataset, no batch, no bg_logits) ─────────────────
         # Only cache simple regression/classification calls on the full dataset.
         # Batched calls, multi-class group calls, and const-opt sub-calls are
         # excluded because they either have extra context or mutate in-place.
         _cacheable = (use_cache and batch_indices is None and bg_logits is None
                       and sample_weights is None
+                      # The tree fingerprint does not encode additive boost
+                      # correction stages. Reusing a base-tree entry here would
+                      # silently discard their contribution.
+                      and not getattr(self, 'boost_stages', None)
                       and not (INSTANCE_REWEIGHT_ENABLED and _DIFFICULTY_ACTIVE is not None))
 
         if _cacheable:
-            cached = _FITNESS_CACHE.get(self.tree, y_target)
+            cached = _FITNESS_CACHE.get(
+                self.tree, y_target, X=X, context=int(type_code))
             if cached is not None:
                 self.loss       = cached['loss']
                 self.r2         = cached['r2']
@@ -15386,6 +16110,14 @@ class Individual:
                 self.shape_obj       = cached.get('shape_obj', 1.0)
                 self.instability_obj = cached.get('instability_obj', 1.0)
                 self.logloss_obj     = cached.get('logloss_obj', 1.0)
+                self.tails_obj       = cached.get('tails_obj', 1.0)
+                self.magnitude_obj   = cached.get('magnitude_obj', 1.0)
+                self.residuals_obj   = cached.get('residuals_obj', 1.0)
+                self.gradient_obj    = cached.get('gradient_obj', 1.0)
+                self.sensitivity_obj = cached.get('sensitivity_obj', 1.0)
+                self.domain_obj      = cached.get('domain_obj', 1.0)
+                self.class_margin_obj = cached.get('class_margin_obj', 1.0)
+                self.class_brier_obj  = cached.get('class_brier_obj', 1.0)
                 self.behavior_sig    = cached.get('behavior_sig', None)
                 # Constant cost is a pure function of the tree's constants and
                 # std(y) (both invariant for a cached tree+target), so the stored
@@ -15470,6 +16202,9 @@ class Individual:
                     if sat_pen > 0:
                         self.loss += LOGIT_SATURATION_WEIGHT * sat_pen
 
+                if NSGA3_EXTRA_OBJ_ENABLED and batch_indices is None:
+                    self._update_nsga3_class_objectives(logits, yg, multiclass=True)
+
             elif type_code == 6:  # Classification — Binary Cross Entropy + Accuracy
                 # Numerically stable BCE: log(1+exp(F)) - F*y == logaddexp(0,F) - F*y
                 bce = np.logaddexp(0.0, preds) - preds * y_eval
@@ -15504,6 +16239,9 @@ class Individual:
                     sat_pen = float(np.mean(excess ** 2))
                     if sat_pen > 0:
                         self.loss += LOGIT_SATURATION_WEIGHT * sat_pen
+
+                if NSGA3_EXTRA_OBJ_ENABLED and batch_indices is None:
+                    self._update_nsga3_class_objectives(preds, y_eval, multiclass=False)
             else:               # Regression — Normalized MSE + Analytic Scaling
 
                 # ── Affine precompute-and-lock ────────────────────────────────
@@ -15619,7 +16357,8 @@ class Individual:
                 # stable, deterministic value; only computed when the feature is
                 # actually armed (regression only — `preds`/`y_eval` continuous).
                 if NSGA3_EXTRA_OBJ_ENABLED and batch_indices is None:
-                    self._update_nsga3_extra_objectives(preds, y_eval, X_eval)
+                    self._update_nsga3_extra_objectives(
+                        preds, y_eval, X_eval, target_grads)
 
                 # Clamp the BASE loss before adding flat/clipped penalties so
                 # those large additive penalties remain visible to selection.
@@ -15785,8 +16524,16 @@ class Individual:
                     'shape_obj':       self.shape_obj,
                     'instability_obj': self.instability_obj,
                     'logloss_obj':     self.logloss_obj,
+                    'tails_obj':       self.tails_obj,
+                    'magnitude_obj':   self.magnitude_obj,
+                    'residuals_obj':   self.residuals_obj,
+                    'gradient_obj':    self.gradient_obj,
+                    'sensitivity_obj': self.sensitivity_obj,
+                    'domain_obj':      self.domain_obj,
+                    'class_margin_obj': self.class_margin_obj,
+                    'class_brier_obj':  self.class_brier_obj,
                     'behavior_sig':    self.behavior_sig,
-                })
+                }, X=X, context=int(type_code))
 
         except Exception:
             self.fitness  = 1e10
@@ -16336,7 +17083,11 @@ def tree_to_sympy(cgp_eq, feature_vars, safe=None):
     if safe is None:
         safe = SAFE_OPS_MODE
 
-    buf = {i: feature_vars[i] for i in range(cgp_eq.n_features)}
+    blocked = set(getattr(cgp_eq, 'blocked_features', ()))
+    buf = {
+        i: (sympy.Float(0) if i in blocked else feature_vars[i])
+        for i in range(cgp_eq.n_features)
+    }
 
     for idx in sorted(cgp_eq.active_nodes):
         if idx < cgp_eq.n_features:
@@ -16930,7 +17681,11 @@ def tree_to_python_expr(cgp_eq, feature_var_names, safe=None):
     if not cgp_eq.active_nodes:
         cgp_eq.update_active_nodes()
 
-    buf = {i: feature_var_names[i] for i in range(cgp_eq.n_features)}
+    blocked = set(getattr(cgp_eq, 'blocked_features', ()))
+    buf = {
+        i: ("0.0" if i in blocked else feature_var_names[i])
+        for i in range(cgp_eq.n_features)
+    }
 
     for idx in sorted(cgp_eq.active_nodes):
         if idx < cgp_eq.n_features:
@@ -17024,9 +17779,12 @@ def _save_backup_model(models, dp, output_idx, X_data=None):
     print(f"  [Perfect] Backup model saved to: {filename}")
 
 
-def _simplify_perfect_output(hof, X, Y_col, out_type, target_grads=None):
+def _simplify_perfect_output(hof, X, Y_col, out_type, target_grads=None,
+                             output_idx=None):
     """Run aggressive simplification on a perfect output's HoF,
     trying to reduce complexity while keeping perfect performance."""
+    if output_idx is not None:
+        _set_output_context(output_idx)
     if sympy is None:
         return
 
@@ -17062,7 +17820,7 @@ def _derived_input_feature_names(col_name, type_code, stat):
     ``{col}_ordinal_tm``), not just classic one-hot (``{col}_{cls}``) — the
     former silently dropped out of the exported model's prompt list before.
     """
-    if type_code == 1:                       # Numeric input → single column
+    if type_code in (1, -1):                 # Numeric input → single column
         return [col_name]
     if type_code == 2:                       # Categorical input
         encoding = stat.get('encoding', 'one_hot')
@@ -17094,6 +17852,8 @@ def _input_feature_owner_columns(dp):
     owners = []
     for col, type_c in configs_iter:
         if type_c in (0, 5, 6, 7):
+            continue
+        if type_c == -1 and not getattr(dp, 'all_output_input_enabled', False):
             continue
         # A column contributes to input_map iff it was actually encoded at fit
         # time (fit_transform skips columns missing from the dataframe and never
@@ -17128,6 +17888,8 @@ def _used_input_columns(dp, used_feature_indices):
         for col, type_c in configs_iter:
             if type_c in (0, 5, 6, 7):
                 continue
+            if type_c == -1 and not getattr(dp, 'all_output_input_enabled', False):
+                continue
             stat = dp.stats.get(col, {})
             if any(n in used_names
                    for n in _derived_input_feature_names(col, type_c, stat)):
@@ -17137,10 +17899,200 @@ def _used_input_columns(dp, used_feature_indices):
     for col, type_c in configs_iter:
         if type_c in (0, 5, 6, 7):
             continue
+        if type_c == -1 and not getattr(dp, 'all_output_input_enabled', False):
+            continue
         if col in used_owner_cols and col not in seen:
             seen.add(col)
             used_cols.append(col)
     return used_cols
+
+
+def _export_extra_tools_source():
+    return r'''
+def _yesish(value):
+    return str(value).strip().lower() in ("y", "yes", "1")
+
+
+def _unique_name(name, used):
+    base = str(name) if str(name) else "output"
+    if base not in used:
+        used.add(base)
+        return base
+    idx = 1
+    while True:
+        cand = f"{base}_predicted" if idx == 1 else f"{base}_predicted_{idx}"
+        if cand not in used:
+            used.add(cand)
+            return cand
+        idx += 1
+
+
+def _ask_range_for_column(col):
+    while True:
+        raw = input(f"  Range for {col} (min max): ").strip()
+        parts = raw.replace(",", " ").split()
+        if len(parts) != 2:
+            print("    Enter two numbers.")
+            continue
+        try:
+            lo, hi = float(parts[0]), float(parts[1])
+        except ValueError:
+            print("    Could not parse that range.")
+            continue
+        if hi < lo:
+            lo, hi = hi, lo
+        return lo, hi
+
+
+def generate_csv_from_model():
+    if not USED_COLS:
+        print("No input columns are required by this model.")
+        return
+    filename = input("CSV filename: ").strip()
+    if not filename:
+        filename = "generated_model_data.csv"
+
+    specs = []
+    print("\nInput column ranges:")
+    for col in USED_COLS:
+        lo, hi = _ask_range_for_column(col)
+        typ = input(f"  Value type for {col} [0=float / 1=integer, default 0]: ").strip()
+        specs.append((col, lo, hi, typ == "1"))
+
+    raw_n = input("Amount of rows: ").strip()
+    try:
+        n_rows = max(1, int(float(raw_n)))
+    except ValueError:
+        print("Invalid row count; using 100.")
+        n_rows = 100
+
+    rows = []
+    used_names = set(USED_COLS)
+    output_name_map = {}
+    for _ in range(n_rows):
+        inp = {}
+        for col, lo, hi, as_int in specs:
+            if as_int:
+                ilo = int(np.ceil(lo))
+                ihi = int(np.floor(hi))
+                if ihi < ilo:
+                    ilo, ihi = int(round(lo)), int(round(hi))
+                    if ihi < ilo:
+                        ilo, ihi = ihi, ilo
+                inp[col] = int(_random.randint(ilo, ihi))
+            else:
+                inp[col] = float(_random.uniform(lo, hi))
+        pred = predict(inp) or {}
+        row = dict(inp)
+        for out_name, value in pred.items():
+            target_name = output_name_map.get(out_name)
+            if target_name is None:
+                target_name = _unique_name(out_name, used_names)
+                output_name_map[out_name] = target_name
+            row[target_name] = value
+        rows.append(row)
+
+    pd.DataFrame(rows).to_csv(filename, index=False)
+    print(f"Saved generated CSV to: {filename}")
+
+
+def _numeric_output_values(vals, out_idx):
+    vals = np.asarray(vals, dtype=float)
+    configs_iter = getattr(dp, "effective_configs", None) or getattr(dp, "col_configs", [])
+    for col_name, type_code in configs_iter:
+        if type_code not in (-1, 5):
+            continue
+        start_end = getattr(dp, "output_slices", {}).get(col_name)
+        if not start_end:
+            continue
+        start, end = start_end
+        if start <= out_idx < end:
+            stat = dp.stats.get(col_name, {})
+            out = vals.copy()
+            try:
+                if dp._normalize_active() and "norm_min" in stat:
+                    out = dp._invert_normalize(out, stat)
+            except Exception:
+                pass
+            try:
+                if getattr(dp, "scale", False) and "mean" in stat:
+                    out = out * stat["std"] + stat["mean"]
+            except Exception:
+                pass
+            return out, col_name
+    return vals, OUTPUT_NAMES[out_idx] if out_idx < len(OUTPUT_NAMES) else f"Out{out_idx}"
+
+
+def plot_scatter_from_csv():
+    csv_path = input("CSV file for scatterplot: ").strip()
+    if not csv_path:
+        print("No CSV file supplied.")
+        return
+    try:
+        df = pd.read_csv(csv_path)
+        X, Y = dp.transform(df)
+    except Exception as exc:
+        print(f"Could not load/transform CSV: {exc}")
+        return
+    if Y is None or np.asarray(Y).size == 0:
+        print("The CSV does not contain ground-truth output columns for this model.")
+        return
+    try:
+        pred = predict_raw(X)
+    except Exception as exc:
+        print(f"Prediction failed: {exc}")
+        return
+
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+    except Exception:
+        pass
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("matplotlib is required for scatter plotting. Install with: pip install matplotlib")
+        return
+
+    import os
+    plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plots")
+    os.makedirs(plot_dir, exist_ok=True)
+    saved = 0
+    for out_idx in range(min(pred.shape[1], Y.shape[1], len(OUTPUT_NAMES))):
+        if out_idx < len(OUTPUT_TYPES) and OUTPUT_TYPES[out_idx] == 6:
+            continue
+        y_true, label = _numeric_output_values(Y[:, out_idx], out_idx)
+        y_pred, _ = _numeric_output_values(pred[:, out_idx], out_idx)
+        mask = np.isfinite(y_true) & np.isfinite(y_pred)
+        if not mask.any():
+            continue
+        yt = y_true[mask]
+        yp = y_pred[mask]
+        lo = float(min(np.min(yt), np.min(yp)))
+        hi = float(max(np.max(yt), np.max(yp)))
+        if abs(hi - lo) < 1e-12:
+            pad = max(1.0, abs(hi) * 0.05)
+            lo -= pad
+            hi += pad
+
+        fig, ax = plt.subplots(figsize=(6, 6))
+        ax.scatter(yt, yp, s=18, alpha=0.65, edgecolors="none")
+        ax.plot([lo, hi], [lo, hi], color="black", linewidth=1.5, linestyle="--",
+                label="ground truth")
+        ax.set_xlim(lo, hi)
+        ax.set_ylim(lo, hi)
+        ax.set_xlabel("Ground truth")
+        ax.set_ylabel("Model prediction")
+        ax.set_title(f"Prediction scatter: {label}")
+        ax.grid(True, alpha=0.25)
+        ax.legend(loc="best")
+        fig.tight_layout()
+        fname = f"scatter_{_sanitize_filename(label)}.png"
+        fig.savefig(os.path.join(plot_dir, fname), dpi=150)
+        plt.close(fig)
+        saved += 1
+    print(f"Saved {saved} scatterplot(s) to: {plot_dir}")
+'''
 
 
 def generate_script(models, dp, filename="best_model.py", X_data=None):
@@ -17155,8 +18107,9 @@ def generate_script(models, dp, filename="best_model.py", X_data=None):
     for ind in models:
         if ind is None: continue
         ind.tree.update_active_nodes()
+        blocked = set(getattr(ind.tree, 'blocked_features', ()))
         for idx in ind.tree.active_nodes:
-            if idx < ind.tree.n_features:
+            if idx < ind.tree.n_features and idx not in blocked:
                 used_feature_indices.add(idx)
 
     # Map active feature indices back to their *raw* source columns.  Handles
@@ -17354,6 +18307,7 @@ def generate_script(models, dp, filename="best_model.py", X_data=None):
     output_names_list = [dp.output_map[i] if i < len(dp.output_map) else f"Out{i}" for i in range(len(models))]
 
     _bitwise_src = _bitwise_ops_source(BITWISE_MODE)
+    export_extra_tools_src = _export_extra_tools_source()
 
     script_content = f'''import numpy as np
 import pandas as pd
@@ -17463,6 +18417,7 @@ USED_COLS = {repr(used_cols)}
 FEATURE_NAMES = {repr(final_vars)}
 FEATURE_RANGES = {repr(feature_ranges)}
 OUTPUT_NAMES = {repr(output_names_list)}
+OUTPUT_TYPES = {repr(out_types)}
 N_FEATURES = {len(final_vars)}
 N_OUTPUTS = {len(models)}
 
@@ -17734,6 +18689,7 @@ def plot_model():
 
     print(f"Saved {{plot_count}} plots to {{plot_dir}}")
 
+{export_extra_tools_src}
 
 def _describe_input(col):
     """Short hint listing the valid values for a categorical input prompt.
@@ -17767,6 +18723,20 @@ def main():
         do_plot = input("\\nWould you like to plot the model? [y/N]: ").strip().lower()
         if do_plot == 'y':
             plot_model()
+    except (KeyboardInterrupt, EOFError):
+        pass
+
+    try:
+        do_csv = input("\\nWould you like to generate a CSV with the model? [y/N]: ").strip()
+        if _yesish(do_csv):
+            generate_csv_from_model()
+    except (KeyboardInterrupt, EOFError):
+        pass
+
+    try:
+        do_scatter = input("\\nWould you like to create a prediction scatterplot from a CSV? [y/N]: ").strip()
+        if _yesish(do_scatter):
+            plot_scatter_from_csv()
     except (KeyboardInterrupt, EOFError):
         pass
 
@@ -17804,6 +18774,8 @@ def get_configs(df):
       0 = Ignore      — column is completely excluded from training.
       1 = Numeric In  — continuous numeric feature (input).
       2 = Categoric In— categorical/string feature; one-hot or compact-encoded.
+     -1 = All Output  — numeric regression target that also becomes a peer
+                        input for other -1 targets.
       5 = Numeric Out — continuous regression target.
       6 = Categoric Out — categorical classification target; one-hot encoded.
 
@@ -17811,7 +18783,7 @@ def get_configs(df):
     e.g. '1*10' marks the next 10 columns as numeric inputs.
 
     Auto-coercion (applied later by DataProcessor):
-      * Numeric (1 or 5) chosen on an object column → auto-promoted to the
+      * Numeric (1, -1 or 5) chosen on an object column → auto-promoted to the
         matching categorical type unless the column is boolean-like
         (True/False, Yes/No, Y/N — case-insensitive) or contains mostly
         numeric strings.
@@ -17830,6 +18802,8 @@ def get_configs(df):
     print("  1  Numeric  Input — continuous number used as a feature")
     print("  2  Categoric Input— text/category, auto-encoded (one-hot if few")
     print("                      classes, compact freq+target+ordinal if many)")
+    print(" -1  All Output     — numeric output; if multiple -1 columns exist,")
+    print("                      each uses the other -1 columns as inputs")
     print("  5  Numeric  Output— continuous regression target")
     print("  6  Categoric Output—classification target (BCE loss, Accuracy metric)")
     print()
@@ -17887,7 +18861,7 @@ def get_configs(df):
             print(f"    {hint}")
         valid = False
         while not valid:
-            u = input("    Set Type [0/1/2/5/6 or T*N]: ").strip()
+            u = input("    Set Type [-1/0/1/2/5/6 or T*N]: ").strip()
             if not u:
                 continue
             try:
@@ -18073,6 +19047,7 @@ def _pool_worker_init():
         signal.signal(signal.SIGINT, signal.SIG_IGN)
     except Exception:
         pass
+    _load_all_output_feature_masks_from_env()
 
 
 def _shutdown_pool_now(executor):
@@ -18237,16 +19212,21 @@ def macro_trig_identity(cgp_eq, n_features):
         if len(free_slots) >= 3:
             # Pick two different features (prefer ones NOT already in active graph)
             used_feats = _active_feature_set(child, n_features)
-            unused = [f for f in range(n_features) if f not in used_feats]
-            all_feats = list(range(n_features))
+            blocked = set(_normalise_blocked_features(
+                getattr(child, 'blocked_features', ()), n_features))
+            unused = [f for f in range(n_features)
+                      if f not in used_feats and f not in blocked]
+            all_feats = _candidate_feature_indices(
+                n_features, blocked=blocked)
 
             if len(unused) >= 2:
                 fi, fj = random.sample(unused, 2)
             elif len(unused) == 1:
                 fi = unused[0]
-                fj = random.choice([f for f in all_feats if f != fi])
+                fj = random.choice([f for f in all_feats if f != fi] or all_feats)
             else:
-                fi, fj = random.sample(all_feats, 2)
+                fi, fj = (random.sample(all_feats, 2)
+                          if len(all_feats) >= 2 else (all_feats[0], all_feats[0]))
 
             s1, s2, s3 = free_slots[0], free_slots[1], free_slots[2]
             trig1 = random.choice(trig_ops)
@@ -18357,7 +19337,9 @@ def macro_piecewise(cgp_eq, n_features, feature_names, X=None):
         return child
 
     cur_out = child.out_idx
-    feat_idx = random.randint(0, n_features - 1)
+    feature_pool = _candidate_feature_indices(
+        n_features, blocked=getattr(child, 'blocked_features', ()))
+    feat_idx = random.choice(feature_pool)
 
     def _threshold_const(fi):
         """Pick a threshold const for feature fi: data quantile if X provided,
@@ -18396,7 +19378,8 @@ def macro_piecewise(cgp_eq, n_features, feature_names, X=None):
     elif strategy < 0.50 and n_features >= 2:
         # Strategy 2: Feature gate — IF(x_i > x_j) THEN expr ELSE x_j
         s1, s2 = free_slots[0], free_slots[1]
-        feat2 = random.choice([f for f in range(n_features) if f != feat_idx])
+        feat2 = random.choice([f for f in feature_pool if f != feat_idx]
+                              or feature_pool)
         child.nodes[s1 - n_features] = CGPNode(random.choice(comp_ops), feat_idx, feat2)
         child.nodes[s2 - n_features] = CGPNode('if_else', s1, cur_out, 0.0, in3=feat2)
         child.out_idx = s2
@@ -18406,7 +19389,7 @@ def macro_piecewise(cgp_eq, n_features, feature_names, X=None):
         child.nodes[s1 - n_features] = CGPNode('const', 0, 0, _threshold_const(feat_idx))
         child.nodes[s2 - n_features] = CGPNode(random.choice(comp_ops), feat_idx, s1)
         # False branch: use a different feature or feature * const
-        alt_feat = random.randint(0, n_features - 1)
+        alt_feat = random.choice(feature_pool)
         child.nodes[s3 - n_features] = CGPNode('const', 0, 0, random.uniform(0.5, 3.0))
         child.nodes[s4 - n_features] = CGPNode('if_else', s2, cur_out, 0.0, in3=alt_feat)
         child.out_idx = s4
@@ -18468,14 +19451,18 @@ def macro_nest_compound(cgp_eq, n_features, feature_names, op_affinity=None):
     # impossible to assemble via mutation, because every grow step is
     # forced onto a fresh feature.
     used_feats = _active_feature_set(child, n_features)
-    unused = [f for f in range(n_features) if f not in used_feats]
-    used_list = sorted(used_feats)
+    blocked = set(_normalise_blocked_features(
+        getattr(child, 'blocked_features', ()), n_features))
+    unused = [f for f in range(n_features)
+              if f not in used_feats and f not in blocked]
+    used_list = sorted(f for f in used_feats if f not in blocked)
+    feature_pool = _candidate_feature_indices(n_features, blocked=blocked)
     if used_list and random.random() < 0.30:
         feat = random.choice(used_list)
     elif unused:
         feat = random.choice(unused)
     else:
-        feat = random.randint(0, n_features - 1)
+        feat = random.choice(feature_pool)
 
     unary_ops  = [op for op in CGPEquation.OPS_UNARY  if op in ALLOWED_OPS]
     binary_ops = [op for op in CGPEquation.OPS_BINARY if op in ALLOWED_OPS]
@@ -18632,9 +19619,11 @@ def macro_inject_subtree(cgp_eq, n_features, feature_names, op_affinity=None):
     # so compositional targets like sin(A)·cos(A), A·B − A/B, and
     # √(2A+B)³ can be assembled via subtree injection too.
     used_feats = _active_feature_set(child, n_features)
-    all_feats = list(range(n_features))
+    blocked = set(_normalise_blocked_features(
+        getattr(child, 'blocked_features', ()), n_features))
+    all_feats = _candidate_feature_indices(n_features, blocked=blocked)
     unused = [f for f in all_feats if f not in used_feats]
-    used_list = sorted(used_feats)
+    used_list = sorted(f for f in used_feats if f not in blocked)
 
     def _pick_feat(prefer_unused=True):
         if prefer_unused:
@@ -18894,6 +19883,8 @@ def evolve_island_chunk(args):
          bg_logits, class_idx_in_group, Y_group,
          target_grads) = args
         sample_weights = None
+    _set_output_context(out_idx)
+    _adopt_output_feature_mask(out_idx, island_pop)
     # bg_logits / class_idx_in_group / Y_group: non-None for class groups using
     # joint softmax CE.  bg_logits is (N, n_classes) with all sibling class logits
     # pre-filled from the main process HoF; column class_idx_in_group is overwritten
@@ -19093,7 +20084,8 @@ def evolve_island_chunk(args):
                         sample_weights=sample_weights)
                     # If const-opt improved the individual, clear its cache entry
                     # (the tree's constants changed, so the cached result is stale).
-                    if _ind.loss < _old_loss - 1e-8:
+                    if (_ind.loss < _old_loss - 1e-8
+                            and not getattr(_ind, 'boost_stages', None)):
                         _FITNESS_CACHE.put(_ind.tree, y_target, {
                             'loss':       _ind.loss,
                             'r2':         _ind.r2,
@@ -19102,7 +20094,7 @@ def evolve_island_chunk(args):
                             'complexity': _ind.complexity,
                             'affine_a':   _ind.affine_a,
                             'affine_b':   _ind.affine_b,
-                        })
+                        }, X=X, context=int(type_code))
 
         # ── IMPROVEMENT: Periodic intra-individual boosting ──────────────────
         # Every 150 gens, try boosting the top-3 individuals' residuals.
@@ -19925,11 +20917,42 @@ def _nsga3_ur_should_adapt(N, m):
     return _nsga3_spreading_index(N) > _nsga3_ur_threshold(m)
 
 
-def _ansga3_adapt_reference_points(N, R_base):
+def _nsga3_ur_latched_should_adapt(N, m):
+    """Paper-style UR trigger: warm up, evaluate SI once, then latch the mode.
+
+    Farias et al.'s NSGA-III-UR tests the Spreading Index at a fixed stage
+    (~20 % of the run) and then either continues with standard NSGA-III or with
+    A-NSGA-III.  AFPO calls this survival trim from many steady-state loops
+    without passing a generation budget, so this function uses
+    ``NSGA3_UR_WARMUP_TRIMS`` as the local analogue of that 20 % point.
+    """
+    key = int(m)
+    st = _NSGA3_UR_STATE.get(key)
+    if st is None:
+        st = {'trims': 0, 'mode': None}
+        _NSGA3_UR_STATE[key] = st
+    if st['mode'] is not None:
+        return bool(st['mode'])
+    st['trims'] += 1
+    if st['trims'] < max(1, int(NSGA3_UR_WARMUP_TRIMS)):
+        return False
+    st['mode'] = bool(_nsga3_ur_should_adapt(N, m))
+    return bool(st['mode'])
+
+
+def _nsga3_adapt_state_key(n_obj, target_size):
+    """Configuration key for persistent adaptive reference-vector state."""
+    return (int(n_obj), int(target_size), int(NSGA3_DIVISIONS),
+            tuple(NSGA3_EXTRA_OBJECTIVES), str(NSGA3_VARIANT))
+
+
+def _ansga3_adapt_reference_points(N, R_base, R_current=None):
     """A-NSGA-III reference-vector adaptation (Jain & Deb, 2014) for one trim.
 
     Given the normalised candidate matrix ``N`` (rows = members of ``S_t``) and
-    the base Das-Dennis lattice ``R_base``, return an adapted reference set:
+    the base Das-Dennis lattice ``R_base``, update and return an adapted
+    reference set.  ``R_current`` is the persistent reference set carried from
+    previous trims; ``None`` starts from ``R_base``.
 
       • INCLUSION — every reference vector with niche count >= 2 (more than one
         associated member) spawns ``m`` new vectors on a local simplex
@@ -19937,20 +20960,24 @@ def _ansga3_adapt_reference_points(N, R_base):
         cluster.  Applied iteratively — newly added vectors may themselves split
         — until no vector is crowded or the size cap
         ``min(NSGA3_ADAPT_MAX_FRAC·|R_base|, NSGA3_REF_MAX)`` is reached.
-      • EXCLUSION — any ADDED vector left with niche count 0 after inclusion is
-        dropped; the original Das-Dennis vectors are always retained.
+      • EXCLUSION — any vector left with niche count 0 after inclusion is
+        dropped, matching the adaptive-reference deletion operator.
 
     New vectors stay on the unit simplex (non-negative, sum to one).  The
     procedure is deterministic — densest-crowded vectors split first, ties by
     index — so the survival trim stays reproducible.
     """
-    R = np.array(R_base, dtype=np.float64, copy=True)
+    if R_current is not None:
+        R = np.array(R_current, dtype=np.float64, copy=True)
+        if R.ndim != 2 or R.shape[1] != R_base.shape[1] or R.shape[0] == 0:
+            R = np.array(R_base, dtype=np.float64, copy=True)
+    else:
+        R = np.array(R_base, dtype=np.float64, copy=True)
     m = R.shape[1]
     if m < 2 or N.shape[0] == 0:
         return R
-    n_base = R.shape[0]
+    n_base = R_base.shape[0]
     cap = min(int(np.ceil(NSGA3_ADAPT_MAX_FRAC * n_base)), int(NSGA3_REF_MAX))
-    is_base = np.ones(n_base, dtype=bool)
     eye = np.eye(m, dtype=np.float64)
     expanded = set()                                 # vectors already split
 
@@ -19980,15 +21007,28 @@ def _ansga3_adapt_reference_points(N, R_base):
         if not new_rows:
             break
         R = np.vstack([R, np.asarray(new_rows, dtype=np.float64)])
-        is_base = np.concatenate(
-            [is_base, np.zeros(len(new_rows), dtype=bool)])
 
     if R.shape[0] > n_base:                          # EXCLUSION pass
         assoc, _ = _nsga3_associate(N, R)
         rho = np.bincount(assoc, minlength=R.shape[0])
-        keep = is_base | (rho > 0)
-        if not keep.all():
+        keep = rho > 0
+        if keep.any() and not keep.all():
             R = R[keep]
+    return R
+
+
+def _ansga3_stateful_reference_points(N, R_base, n_obj, target_size):
+    """Persistent A-NSGA-III reference-vector update.
+
+    The paper's adaptive reference set is carried forward over generations.  In
+    this AFPO integration, one survival trim is the local generation analogue,
+    so this cache stores the adapted vectors across successive trims for the
+    same objective/configuration regime.
+    """
+    key = _nsga3_adapt_state_key(n_obj, target_size)
+    R_current = _NSGA3_ADAPT_STATE.get(key)
+    R = _ansga3_adapt_reference_points(N, R_base, R_current=R_current)
+    _NSGA3_ADAPT_STATE[key] = R
     return R
 
 
@@ -20000,9 +21040,11 @@ def _nsga3_select_from_front(A, admitted, front, need, target_size):
     ``front`` the boundary-front indices.  The normalisation/association set is
     ``St = admitted ∪ front`` (the canonical NSGA-III ``S_t``); niche counts are
     seeded from the already-admitted members and survivors are taken one at a
-    time from the least-occupied reference direction, ties broken by smallest
-    perpendicular distance (a deterministic, reproducible stand-in for the
-    paper's random pick).  Returns a list of chosen indices into ``A``.
+    time using Deb & Jain's niching rule: randomly choose one of the
+    least-occupied reference directions with boundary candidates; if its niche
+    count is zero, take the closest candidate to that reference line, otherwise
+    take a random associated candidate.  Returns a list of chosen indices into
+    ``A``.
     """
     front = np.asarray(front, dtype=np.int64)
     if need <= 0:
@@ -20022,8 +21064,8 @@ def _nsga3_select_from_front(A, admitted, front, need, target_size):
     # Spreading Index flags the front as irregular).  "basic" leaves R fixed, so
     # this whole block is skipped and the selection is the stock NSGA-III path.
     if NSGA3_VARIANT in ("a", "ur"):
-        if NSGA3_VARIANT == "a" or _nsga3_ur_should_adapt(N, A.shape[1]):
-            R = _ansga3_adapt_reference_points(N, R)
+        if NSGA3_VARIANT == "a" or _nsga3_ur_latched_should_adapt(N, A.shape[1]):
+            R = _ansga3_stateful_reference_points(N, R, A.shape[1], target_size)
 
     # Associate each candidate with its nearest reference DIRECTION (line from
     # the origin through r): perpendicular distance² = |n|² − (n·r̂)².
@@ -20039,14 +21081,26 @@ def _nsga3_select_from_front(A, admitted, front, need, target_size):
     available = np.ones(front.size, dtype=bool)
     chosen = []
     while len(chosen) < need:
-        # Members whose reference niche is currently least filled; among those,
-        # take the one lying closest to its reference line.
+        # Canonical NSGA-III niching: choose randomly among the least-occupied
+        # reference directions that still have candidates.  Empty niches get the
+        # closest candidate; occupied niches get a random candidate.
         avail_idx = np.where(available)[0]
-        rmin = rho[bnd_assoc[avail_idx]].min()
-        cand = avail_idx[rho[bnd_assoc[avail_idx]] == rmin]
-        pick = int(cand[np.argmin(bnd_dist[cand])])
+        if avail_idx.size == 0:
+            break
+        refs_with_candidates = np.unique(bnd_assoc[avail_idx])
+        rmin = int(np.min(rho[refs_with_candidates]))
+        least_refs = refs_with_candidates[rho[refs_with_candidates] == rmin]
+        ref = int(random.choice(list(least_refs)))
+        cand = avail_idx[bnd_assoc[avail_idx] == ref]
+        if cand.size == 0:
+            rho[ref] = np.iinfo(np.int64).max
+            continue
+        if rho[ref] == 0:
+            pick = int(cand[np.argmin(bnd_dist[cand])])
+        else:
+            pick = int(random.choice(list(cand)))
         available[pick] = False
-        rho[bnd_assoc[pick]] += 1
+        rho[ref] += 1
         chosen.append(int(front[pick]))
     return chosen
 
@@ -20100,13 +21154,15 @@ def _afpo_extra_objective_columns(population):
     survival trim, or ``[]`` when the feature is disabled.
 
     Returns a list of ``(name, length-n float ndarray)`` pairs for whichever of
-    ``instability`` / ``shape`` / ``diversity`` / ``logloss`` are listed in
+    ``instability`` / ``shape`` / ``diversity`` / ``logloss`` / ``tails`` /
+    ``magnitude`` / ``residuals`` / ``gradient`` / ``sensitivity`` /
+    ``domain`` / ``class_margin`` / ``class_brier`` are listed in
     ``NSGA3_EXTRA_OBJECTIVES``.  Gated on BOTH ``NSGA3_ENABLED`` and
     ``NSGA3_EXTRA_OBJ_ENABLED`` so the NSGA-II legacy path (and every direct /
     non-interactive caller) keeps the bit-for-bit 3-objective trim.  ``shape`` /
-    ``instability`` / ``logloss`` are read from the per-individual values cached
-    on the last full-data regression evaluation; ``diversity`` is computed here
-    on the pool.
+    non-diversity objectives are read from the per-individual values cached on
+    the last full-data regression evaluation; ``diversity`` is computed here on
+    the pool.
     """
     if not (NSGA3_ENABLED and NSGA3_EXTRA_OBJ_ENABLED) or not NSGA3_EXTRA_OBJECTIVES:
         return []
@@ -20125,6 +21181,38 @@ def _afpo_extra_objective_columns(population):
     if 'logloss' in NSGA3_EXTRA_OBJECTIVES:
         cols.append(('logloss', np.fromiter(
             (float(getattr(ind, 'logloss_obj', 1.0)) for ind in population),
+            dtype=np.float64, count=n)))
+    if 'tails' in NSGA3_EXTRA_OBJECTIVES:
+        cols.append(('tails', np.fromiter(
+            (float(getattr(ind, 'tails_obj', 1.0)) for ind in population),
+            dtype=np.float64, count=n)))
+    if 'magnitude' in NSGA3_EXTRA_OBJECTIVES:
+        cols.append(('magnitude', np.fromiter(
+            (float(getattr(ind, 'magnitude_obj', 1.0)) for ind in population),
+            dtype=np.float64, count=n)))
+    if 'residuals' in NSGA3_EXTRA_OBJECTIVES:
+        cols.append(('residuals', np.fromiter(
+            (float(getattr(ind, 'residuals_obj', 1.0)) for ind in population),
+            dtype=np.float64, count=n)))
+    if 'gradient' in NSGA3_EXTRA_OBJECTIVES:
+        cols.append(('gradient', np.fromiter(
+            (float(getattr(ind, 'gradient_obj', 1.0)) for ind in population),
+            dtype=np.float64, count=n)))
+    if 'sensitivity' in NSGA3_EXTRA_OBJECTIVES:
+        cols.append(('sensitivity', np.fromiter(
+            (float(getattr(ind, 'sensitivity_obj', 1.0)) for ind in population),
+            dtype=np.float64, count=n)))
+    if 'domain' in NSGA3_EXTRA_OBJECTIVES:
+        cols.append(('domain', np.fromiter(
+            (float(getattr(ind, 'domain_obj', 1.0)) for ind in population),
+            dtype=np.float64, count=n)))
+    if 'class_margin' in NSGA3_EXTRA_OBJECTIVES:
+        cols.append(('class_margin', np.fromiter(
+            (float(getattr(ind, 'class_margin_obj', 1.0)) for ind in population),
+            dtype=np.float64, count=n)))
+    if 'class_brier' in NSGA3_EXTRA_OBJECTIVES:
+        cols.append(('class_brier', np.fromiter(
+            (float(getattr(ind, 'class_brier_obj', 1.0)) for ind in population),
             dtype=np.float64, count=n)))
     return cols
 
@@ -20545,11 +21633,85 @@ def _polish_young_frontier_constants(population, X, y_target, type_code,
         polished += 1
 
 
+def _afpo_target_grads_for_rows(target_grads_list, row_indices):
+    """Row-align Sobolev target-gradient arrays with an AFPO init/batch slice."""
+    if target_grads_list is None:
+        return None
+    return [_slice_optional_rows(tg, row_indices) for tg in target_grads_list]
+
+
+def _afpo_rescore_population_for_rows(population, X_rows, y_rows, type_code,
+                                      target_grads=None, bg_logits=None,
+                                      class_idx_in_group=None, Y_group=None,
+                                      refit_affine=True):
+    """Re-score an AFPO population on the exact rows used by the next chunk.
+
+    Ages are preserved. Cache is bypassed so an incoming population is always
+    refit and measured on the exact rows used by the next worker chunk (the
+    normal cache key now includes X as an additional safety net).
+    """
+    if not population:
+        return population
+    for ind in population:
+        try:
+            if refit_affine:
+                ind.affine_fitted = False
+            ind.calculate_fitness(
+                X_rows, y_rows, type_code,
+                bg_logits=bg_logits,
+                class_idx_in_group=class_idx_in_group,
+                Y_group=Y_group,
+                target_grads=target_grads,
+                use_cache=False)
+        except Exception:
+            ind.loss = 1e10
+            ind.fitness = 1e10
+    return population
+
+
+def _afpo_seed_hof_from_population(hof, population):
+    """Seed a worker-local HoF from already-scored incoming AFPO members."""
+    if hof is None or not population:
+        return
+    for ind in population:
+        try:
+            hof.update(ind)
+        except Exception:
+            pass
+
+
+def _afpo_hof_beats_population(hof, candidate, population, tol=1e-9):
+    """Whether a HoF candidate is genuinely better than a live AFPO pool.
+
+    Regression is loss-driven. Classification follows ``HallOfFame`` exactly:
+    higher accuracy wins, with lower cross-entropy breaking an accuracy tie.
+    The old AFPO re-injection gates always compared loss, so a more accurate
+    classifier could be kept out by a less accurate but better-calibrated pool.
+    """
+    if hof is None or candidate is None or not population:
+        return False
+    if hof.out_type == 6:
+        cand_acc = float(getattr(candidate, 'accuracy', 0.0))
+        best_acc = max(float(getattr(ind, 'accuracy', 0.0))
+                       for ind in population)
+        if cand_acc > best_acc + tol:
+            return True
+        if cand_acc < best_acc - tol:
+            return False
+        best_loss_at_acc = min(
+            float(getattr(ind, 'loss', np.inf)) for ind in population
+            if abs(float(getattr(ind, 'accuracy', 0.0)) - best_acc) <= tol)
+        return float(getattr(candidate, 'loss', np.inf)) < best_loss_at_acc - tol
+    return (float(getattr(candidate, 'loss', np.inf))
+            < min(float(getattr(ind, 'loss', np.inf)) for ind in population)
+            - tol)
+
+
 def evolve_afpo(population, X, y_target, type_code,
                 n_features, feat_names, target_size,
                 n_generations, hof, stag_counter, ext_patience,
                 bg_logits=None, class_idx_in_group=None, Y_group=None,
-                target_grads=None, stage_frac=None):
+                target_grads=None, stage_frac=None, generation_offset=0):
     """
     Age-Fitness Pareto Optimisation (AFPO) — single-process evolution loop.
 
@@ -20580,6 +21742,11 @@ def evolve_afpo(population, X, y_target, type_code,
     stages exploit the inherited material (mutate / optimize / boost).
     ``None`` (default) leaves the weights untilted — used by single-stage
     AFPO and the islanded-AFPO path.
+
+    generation_offset: absolute generation at the start of this worker chunk.
+    AFPO is executed in short process-pool chunks, so periodic work must use
+    this run-level clock rather than restarting at local generation zero on
+    every call.
     """
     global _PUSH_ANNEAL_SCALE          # per-chunk Discovery-Push anneal scale
     global _COMPLEXITY_PRESSURE_SCALE  # per-gen stagnation complexity relaxation
@@ -20741,7 +21908,7 @@ def evolve_afpo(population, X, y_target, type_code,
     _POP_GUARD_FREQ   = max(10, n_generations // 3)
     _POP_GUARD_FLOOR  = 0.6
 
-    local_stag = stag_counter
+    local_stag = max(0, int(stag_counter or 0))
     # Track the best individual seen inside this chunk for champion protection
     _chunk_champion = min(population, key=lambda x: x.loss) if population else None
 
@@ -20759,26 +21926,57 @@ def evolve_afpo(population, X, y_target, type_code,
     # (stag_frac > 0.3), the orchestrator's chunk-size halving (> ext_patience//2)
     # and staged-AFPO's stagnation-scaled graduation volume — could ever engage
     # across chunks, since each chunk is only MIGRATION_FREQ generations long.
-    # Track the best PERFORMANCE seen instead (loss for regression, accuracy for
-    # classification — matching HallOfFame._perf), primed from the incoming
-    # population, which carries the global elite the orchestrator injects before
-    # each chunk.  (The bench harnesses never hit this because they reuse a
-    # single persistent HoF across chunks.)
+    # Track the best PERFORMANCE seen instead, primed from both the incoming
+    # population and the run-best marker carried on its members.  The marker is
+    # needed because parent-side migration / HoF injection happens between
+    # worker chunks; without it an externally improved population silently
+    # inherited the old stagnation count.
     _stag_is_cls = (type_code == 6)
     def _stag_perf(ind):
         if _stag_is_cls:
-            return -float(getattr(ind, 'accuracy', 0.0))
-        return float(getattr(ind, 'loss', np.inf))
-    _best_perf_seen = min(
+            # HallOfFame semantics: higher accuracy first, then lower CE.
+            return (-float(getattr(ind, 'accuracy', 0.0)),
+                    float(getattr(ind, 'loss', np.inf)))
+        return (float(getattr(ind, 'loss', np.inf)),)
+
+    def _stag_improves(candidate, incumbent):
+        if candidate[0] < incumbent[0] - 1e-12:
+            return True
+        return (len(candidate) > 1
+                and abs(candidate[0] - incumbent[0]) <= 1e-12
+                and candidate[1] < incumbent[1] - 1e-12)
+
+    _current_perf = min(
         (_stag_perf(ind) for ind in population
          if np.isfinite(getattr(ind, 'loss', np.inf))),
-        default=np.inf)
+        default=((np.inf, np.inf) if _stag_is_cls else (np.inf,)))
+    _stag_context = (
+        int(type_code),
+        _FitnessCache._target_sig(X),
+        _FitnessCache._target_sig(y_target),
+    )
+    _carried_perf = []
+    for ind in population:
+        value = getattr(ind, '_afpo_best_perf_seen', None)
+        if (getattr(ind, '_afpo_best_perf_context', None) == _stag_context
+                and isinstance(value, tuple)
+                and len(value) == len(_current_perf)):
+            _carried_perf.append(value)
+    if _carried_perf:
+        _prior_perf = min(_carried_perf)
+        if _stag_improves(_current_perf, _prior_perf):
+            local_stag = 0
+        _best_perf_seen = min(_prior_perf, _current_perf)
+    else:
+        _best_perf_seen = _current_perf
 
     # Hard-example mining: bind (or create) this output's difficulty-weight
     # vector for the duration of this chunk; no-op when the feature is off.
     _difficulty_begin(y_target)
 
-    for gen in range(n_generations):
+    generation_offset = max(0, int(generation_offset or 0))
+    for chunk_gen in range(n_generations):
+        gen = generation_offset + chunk_gen
         for ind in population:
             ind.age += 1
 
@@ -20854,7 +22052,9 @@ def evolve_afpo(population, X, y_target, type_code,
         valid_losses = [ind.loss for ind in population
                         if np.isfinite(ind.loss) and ind.loss < 1e9]
         mean_loss    = float(np.mean(valid_losses)) if valid_losses else 1.0
-        gen_frac     = gen / max(1, n_generations - 1)
+        # Annealing intentionally restarts for each worker chunk; only periodic
+        # schedules use the absolute ``gen`` above.
+        gen_frac     = chunk_gen / max(1, n_generations - 1)
         cosine_decay = 0.1 + 0.9 * 0.5 * (1.0 + np.cos(np.pi * gen_frac))
 
         # ── Discovery-Push annealing ─────────────────────────────────────────
@@ -21266,10 +22466,15 @@ def evolve_afpo(population, X, y_target, type_code,
         _COMPLEXITY_BUDGET = target_size * MAX_COMPLEXITY * 0.5
         total_complexity = sum(ind.complexity for ind in population)
         if total_complexity > _COMPLEXITY_BUDGET:
+            _loss_champion = min(population, key=lambda x: x.loss)
             population.sort(key=lambda x: x.complexity, reverse=True)
             while (len(population) > max(2, target_size // 2)
                    and sum(ind.complexity for ind in population) > _COMPLEXITY_BUDGET):
-                population.pop(0)  # remove most complex
+                _drop_idx = next((k for k, ind in enumerate(population)
+                                  if ind is not _loss_champion), None)
+                if _drop_idx is None:
+                    break
+                population.pop(_drop_idx)  # remove most complex non-champion
 
         # ── IMPROVEMENT: Periodic light constant optimisation ─────────────────
         if gen > 0 and gen % _LIGHT_CONST_OPT_FREQ == 0:
@@ -21285,7 +22490,8 @@ def evolve_afpo(population, X, y_target, type_code,
                         class_idx_in_group=class_idx_in_group,
                         Y_group=Y_group,
                         target_grads=target_grads)
-                    if _ind.loss < _old_loss - 1e-8:
+                    if (_ind.loss < _old_loss - 1e-8
+                            and not getattr(_ind, 'boost_stages', None)):
                         _FITNESS_CACHE.put(_ind.tree, y_target, {
                             'loss':       _ind.loss,
                             'r2':         _ind.r2,
@@ -21294,7 +22500,7 @@ def evolve_afpo(population, X, y_target, type_code,
                             'complexity': _ind.complexity,
                             'affine_a':   _ind.affine_a,
                             'affine_b':   _ind.affine_b,
-                        })
+                        }, X=X, context=int(type_code))
 
         # ── IMPROVEMENT: Periodic intra-individual boosting ──────────────────
         _BOOST_FREQ = 150
@@ -21572,17 +22778,21 @@ def evolve_afpo(population, X, y_target, type_code,
                 population.append(ni)
             population = _trim_to_pareto_front_3obj(population, target_size)
 
-        # Record within-chunk discoveries in the (run-local) HoF for the caller
-        # to merge into the global HoF.  HoF update uses .loss (not .fitness),
-        # so no need to re-evaluate with freq_parsimony_adj — the loss is
-        # already correct from above.  The stagnation counter is updated
-        # SEPARATELY, against the best performance seen (see the cross-chunk
-        # stagnation note above), so it is not reset by the empty-every-chunk
-        # local HoF.
+        # Record within-chunk discoveries in the run-local HoF.  Stagnation is
+        # evaluated against the best member of the WHOLE generation, not only
+        # ``child``: immigrants, reseeds, ERC polish and diversity refreshes can
+        # all produce the actual improvement.
         hof.update(child)
-        _child_perf = _stag_perf(child)
-        if np.isfinite(child.loss) and _child_perf < _best_perf_seen - 1e-12:
-            _best_perf_seen = _child_perf
+        _finite_population = [
+            ind for ind in population
+            if np.isfinite(getattr(ind, 'loss', np.inf))
+            and getattr(ind, 'loss', np.inf) < 1e10]
+        _generation_best = (min(_finite_population, key=_stag_perf)
+                            if _finite_population else child)
+        hof.update(_generation_best)
+        _generation_perf = _stag_perf(_generation_best)
+        if _stag_improves(_generation_perf, _best_perf_seen):
+            _best_perf_seen = _generation_perf
             local_stag = 0
         else:
             local_stag += 1
@@ -21664,9 +22874,15 @@ def evolve_afpo(population, X, y_target, type_code,
 
         # Directed extinction
         if local_stag > ext_patience:
+            _loss_champion = min(population, key=lambda x: x.loss)
             population.sort(key=lambda x: x.fitness)
             keep_n    = max(1, int(target_size * 0.10))
             survivors = population[:keep_n]
+            if _loss_champion not in survivors:
+                if len(survivors) >= keep_n:
+                    survivors[-1] = _loss_champion
+                else:
+                    survivors.append(_loss_champion)
             new_blood = list(generate_seeds_v5(n_features, feat_names))
 
             # Post-extinction diversity makes most cached entries stale
@@ -21843,12 +23059,19 @@ def evolve_afpo(population, X, y_target, type_code,
                 if _nfp is not None:
                     ind._novelty_fp = _nfp
                     _rugged_archive.add(_nfp)
-            population = survivors + new_blood
+            population = _trim_to_pareto_front_3obj(
+                survivors + new_blood, target_size)
             local_stag = 0
             # Fresh population — clear cycle history so the next champion
             # gets a clean window before the tabu detector can re-fire.
             _rugged_archive.reset_cycle()
 
+    # Persist the run-best performance through the pickle round-trip so the
+    # next worker chunk can recognise improvements inserted by the parent
+    # process between chunks.
+    for ind in population:
+        ind._afpo_best_perf_seen = _best_perf_seen
+        ind._afpo_best_perf_context = _stag_context
     return population, local_stag
 
 
@@ -21864,6 +23087,7 @@ def evolve_afpo_stage_worker(args_bundle):
     falls back to NaN losses.
     """
     args, s, i, adf_registry = args_bundle
+    _set_output_context(i)
 
     # Sync ADF registry into this worker process
     global _ADF_REGISTRY
@@ -21871,23 +23095,49 @@ def evolve_afpo_stage_worker(args_bundle):
     for d in _ADF_REGISTRY:
         _register_adf_from_dict(d)
 
-    # Backward-compatible unpack: pre-stage-tilt callers passed a 14-tuple,
-    # current callers append `stage_frac` for staged AFPO operator tilt.
-    if len(args) == 15:
+    # Backward-compatible unpack. Current callers append the absolute
+    # generation offset after the row-subset re-score flag.
+    if len(args) == 17:
+        (pop, X_b, Y_b, out_type,
+         n_features, feat_names, AFPO_POP_SIZE,
+         chunk_freq_a, stag_cntrs, EXTINCTION_PATIENCE,
+         col_bg_a, local_k_a, Y_group_a, target_grads, stage_frac,
+         rescore_incoming, generation_offset) = args
+    elif len(args) == 16:
+        (pop, X_b, Y_b, out_type,
+         n_features, feat_names, AFPO_POP_SIZE,
+         chunk_freq_a, stag_cntrs, EXTINCTION_PATIENCE,
+         col_bg_a, local_k_a, Y_group_a, target_grads, stage_frac,
+         rescore_incoming) = args
+        generation_offset = 0
+    elif len(args) == 15:
         (pop, X_b, Y_b, out_type,
          n_features, feat_names, AFPO_POP_SIZE,
          chunk_freq_a, stag_cntrs, EXTINCTION_PATIENCE,
          col_bg_a, local_k_a, Y_group_a, target_grads, stage_frac) = args
+        rescore_incoming = False
+        generation_offset = 0
     else:
         (pop, X_b, Y_b, out_type,
          n_features, feat_names, AFPO_POP_SIZE,
          chunk_freq_a, stag_cntrs, EXTINCTION_PATIENCE,
          col_bg_a, local_k_a, Y_group_a, target_grads) = args
         stage_frac = None
+        rescore_incoming = False
+        generation_offset = 0
+    _adopt_output_feature_mask(i, pop)
 
     # Created after the unpack so the frontier ranks on the right metric
     # (accuracy for classification, loss for regression).
     local_hof = HallOfFame(out_type=out_type)
+    if rescore_incoming:
+        _afpo_rescore_population_for_rows(
+            pop, X_b, Y_b, out_type,
+            target_grads=target_grads,
+            bg_logits=col_bg_a,
+            class_idx_in_group=local_k_a,
+            Y_group=Y_group_a)
+    _afpo_seed_hof_from_population(local_hof, pop)
 
     ret_pop, stag = evolve_afpo(
         pop, X_b, Y_b, out_type,
@@ -21896,6 +23146,7 @@ def evolve_afpo_stage_worker(args_bundle):
         local_hof, stag_cntrs, EXTINCTION_PATIENCE,
         bg_logits=col_bg_a, class_idx_in_group=local_k_a, Y_group=Y_group_a,
         target_grads=target_grads, stage_frac=stage_frac,
+        generation_offset=generation_offset,
     )
     return ret_pop, stag, s, i, local_hof
 
@@ -21913,14 +23164,38 @@ def evolve_afpo_island_chunk(args):
     -------
     (population, local_stag, island_idx, out_idx, local_hof)
     """
-    (population, X, y_target, type_code,
-     n_features, feat_names,
-     target_size, n_generations,
-     stag_counter, ext_patience,
-     island_idx, out_idx,
-     adf_registry,
-     bg_logits, class_idx_in_group, Y_group,
-     target_grads) = args
+    if len(args) == 19:
+        (population, X, y_target, type_code,
+         n_features, feat_names,
+         target_size, n_generations,
+         stag_counter, ext_patience,
+         island_idx, out_idx,
+         adf_registry,
+         bg_logits, class_idx_in_group, Y_group,
+         target_grads, rescore_incoming, generation_offset) = args
+    elif len(args) == 18:
+        (population, X, y_target, type_code,
+         n_features, feat_names,
+         target_size, n_generations,
+         stag_counter, ext_patience,
+         island_idx, out_idx,
+         adf_registry,
+         bg_logits, class_idx_in_group, Y_group,
+         target_grads, rescore_incoming) = args
+        generation_offset = 0
+    else:
+        (population, X, y_target, type_code,
+         n_features, feat_names,
+         target_size, n_generations,
+         stag_counter, ext_patience,
+         island_idx, out_idx,
+         adf_registry,
+         bg_logits, class_idx_in_group, Y_group,
+        target_grads) = args
+        rescore_incoming = False
+        generation_offset = 0
+    _set_output_context(out_idx)
+    _adopt_output_feature_mask(out_idx, population)
 
     # Sync ADF registry into this worker process
     global _ADF_REGISTRY
@@ -21929,6 +23204,14 @@ def evolve_afpo_island_chunk(args):
         _register_adf_from_dict(d)
 
     local_hof = HallOfFame(out_type=type_code)
+    if rescore_incoming:
+        _afpo_rescore_population_for_rows(
+            population, X, y_target, type_code,
+            target_grads=target_grads,
+            bg_logits=bg_logits,
+            class_idx_in_group=class_idx_in_group,
+            Y_group=Y_group)
+    _afpo_seed_hof_from_population(local_hof, population)
     population, local_stag = evolve_afpo(
         population, X, y_target, type_code,
         n_features, feat_names, target_size,
@@ -21937,6 +23220,7 @@ def evolve_afpo_island_chunk(args):
         class_idx_in_group=class_idx_in_group,
         Y_group=Y_group,
         target_grads=target_grads,
+        generation_offset=generation_offset,
     )
     return population, local_stag, island_idx, out_idx, local_hof
 
@@ -21962,6 +23246,7 @@ def _meta_extinction(islands_pop, hofs, X, Y, out_types,
         return
 
     for o_idx in range(n_outputs):
+        _set_output_context(o_idx)
         # 1. Collect global elite for this output across all islands.
         all_inds = []
         for isl in islands_pop:
@@ -22029,7 +23314,7 @@ def _meta_extinction(islands_pop, hofs, X, Y, out_types,
                     n_features, CGP_NODES, feat_names)))
             isl[o_idx] = new_pop[:target_n]
 
-    # The fitness cache is keyed by tree fingerprint + target hash; entries
+    # The fitness cache is keyed by tree fingerprint + input/target hashes; entries
     # for evicted individuals are wasted memory after a wipe.
     try:
         _FITNESS_CACHE.clear()
@@ -22105,6 +23390,7 @@ def _parallel_rescore_hofs(hofs, X, Y, out_types, target_grads_list,
         return
 
     def _rescore_one(o_idx):
+        _set_output_context(o_idx)
         hof = hofs[o_idx]
         if not hof.best_by_complexity:
             return
@@ -22159,6 +23445,7 @@ def _deep_optimize_hofs(hofs, X, Y, out_types,
           f"(dataset cap={cap}/{N} rows, {n_restarts} restarts × {max_iter} iters)…")
 
     def _opt_one(out_idx):
+        _set_output_context(out_idx)
         h = hofs[out_idx]
         if not h.best_by_complexity:
             return (out_idx, 0, 0, None, 0)
@@ -22660,6 +23947,8 @@ def _bo_calc_fitness(child, X, y_target, type_code, opt=None,
     The wrapper is a no-op for regression / binary-classification
     outputs (returns the underlying ``calculate_fitness`` directly).
     """
+    if opt is not None and getattr(opt, 'output_idx', None) is not None:
+        _set_output_context(opt.output_idx)
     if opt is not None:
         mc = opt.get_full_mc_context()
     else:
@@ -22846,6 +24135,7 @@ def cgp_to_vector(cgp_eq, max_nodes, X_probe=None, y_probe=None,
 
     cgp_eq.update_active_nodes()
     active = cgp_eq.active_nodes
+    blocked = set(getattr(cgp_eq, 'blocked_features', ()))
 
     # Pre-compute slot → node mapping for active compute nodes
     active_compute_nodes = []
@@ -22857,7 +24147,7 @@ def cgp_to_vector(cgp_eq, max_nodes, X_probe=None, y_probe=None,
     for idx in active:
         if idx < n_feat:
             # Feature index is "used" if it appears as an active input
-            if idx < len(feature_use_counts):
+            if idx < len(feature_use_counts) and idx not in blocked:
                 feature_use_counts[idx] += 1.0
             continue
         node_pos = idx - n_feat
@@ -24570,10 +25860,12 @@ class BayesianCGPOptimizer:
     def __init__(self, n_features, max_nodes, feat_names, X_probe=None,
                  y_probe=None, y_probe_stats=None,
                  max_points=500, xi=0.01,
-                 has_mc_context: bool = False):
+                 has_mc_context: bool = False,
+                 output_idx=None):
         self.n_features = n_features
         self.max_nodes  = max_nodes
         self.feat_names = feat_names
+        self.output_idx = output_idx
         self.X_probe    = X_probe
         self.y_probe    = y_probe
         # ``y_probe_stats`` (dict with keys ``mean`` / ``std``) is computed
@@ -24831,6 +26123,9 @@ class BayesianCGPOptimizer:
         ``cgp_eq.evaluate(X_probe)`` call that dominates the
         encoding's wall-clock cost when the probe set is non-trivial.
         """
+        if getattr(self, 'output_idx', None) is not None:
+            _set_output_context(self.output_idx)
+            _bind_tree_to_current_output(cgp_eq)
         try:
             fp = _FITNESS_CACHE._fingerprint(cgp_eq)
         except Exception:
@@ -24888,6 +26183,10 @@ class BayesianCGPOptimizer:
         like" contrast to actually discriminate structural patterns,
         which is what makes the surrogate worth running.
         """
+        if getattr(self, 'output_idx', None) is not None:
+            _set_output_context(self.output_idx)
+            _bind_individual_to_current_output(individual)
+            _bind_tree_to_current_output(cgp_eq)
         vec = self._encode(cgp_eq)
         y   = self._transform_fitness(individual.loss)
         # ── Adaptive-refit jump bookkeeper ───────────────────────────────
@@ -25336,6 +26635,8 @@ class BayesianCGPOptimizer:
             self._last_arm_name = None
             self._arm_counterfactual_rewards = None
             return np.array([], dtype=np.float64)
+        if getattr(self, 'output_idx', None) is not None:
+            _set_output_context(self.output_idx)
         if not self.gp_fitted or len(self.X_observed) < 10:
             # Random fallback when the surrogate isn't ready.  We
             # still encode + cache so subsequent operations (diverse
@@ -27127,7 +28428,8 @@ def _bo_build_optimizers(n_features, n_outputs, feat_names, X, Y, X_probe,
                 y_probe_stats=y_stats,
                 max_points=BAYESIAN_MAX_GP_POINTS,
                 xi=BAYESIAN_EXPLORATION,
-                has_mc_context=(o_idx in mc_set)))
+                has_mc_context=(o_idx in mc_set),
+                output_idx=o_idx))
     return optimizers
 
 
@@ -27150,6 +28452,9 @@ def _bo_global_feature_priors(X, y_target, n_features):
         return weights / weights.sum()
     for i in range(n):
         xi = X[:, i]
+        if i in set(_current_blocked_features()):
+            weights[i] = 0.01
+            continue
         if np.std(xi) < 1e-10:
             weights[i] = 0.05
             continue
@@ -27222,10 +28527,10 @@ def run_bayesian_afpo(X, Y, n_features, n_outputs, feat_names, out_types,
     # Critical when n_features > 5: uniform feature selection turns the
     # search into a needle-in-a-haystack problem because most CGP slots
     # end up referencing irrelevant variables.
-    feature_priors = [
-        _bo_global_feature_priors(X, Y[:, o_idx], n_features)
-        for o_idx in range(n_outputs)
-    ]
+    feature_priors = []
+    for o_idx in range(n_outputs):
+        _set_output_context(o_idx)
+        feature_priors.append(_bo_global_feature_priors(X, Y[:, o_idx], n_features))
 
     AFPO_POP_SIZE = POPULATION_SIZE * 2
     afpo_pops = [[] for _ in range(n_outputs)]
@@ -27248,6 +28553,7 @@ def run_bayesian_afpo(X, Y, n_features, n_outputs, feat_names, out_types,
         X_init, Y_init = X, Y
 
     for o_idx in range(n_outputs):
+        _set_output_context(o_idx)
         v5_seeds = generate_seeds_v5(n_features, feat_names)
         try:
             imp_seeds, n_priority = generate_importance_biased_seeds(
@@ -27295,6 +28601,7 @@ def run_bayesian_afpo(X, Y, n_features, n_outputs, feat_names, out_types,
     if N_train > _INIT_SUBSAMPLE_CAP:
         print("  Re-scoring Hall of Fame and GP buffer on full dataset…")
         for o_idx in range(n_outputs):
+            _set_output_context(o_idx)
             for ind in hofs[o_idx].best_by_complexity.values():
                 ind.affine_fitted = False
                 ind.calculate_fitness(X, Y[:, o_idx], out_types[o_idx],
@@ -27352,6 +28659,7 @@ def run_bayesian_afpo(X, Y, n_features, n_outputs, feat_names, out_types,
                 opt.xi = current_xi
 
             for o_idx in range(n_outputs):
+                _set_output_context(o_idx)
                 if o_idx in perfect_outputs:
                     continue
                 opt = optimizers[o_idx]
@@ -27618,6 +28926,7 @@ def run_bayesian_afpo(X, Y, n_features, n_outputs, feat_names, out_types,
             # --- Parallel refit surrogates ---
             opts_to_refit = []
             for o_idx in range(n_outputs):
+                _set_output_context(o_idx)
                 if o_idx in perfect_outputs: continue
                 opt = optimizers[o_idx]
                 if getattr(opt, '_needs_refit', False):
@@ -27638,6 +28947,7 @@ def run_bayesian_afpo(X, Y, n_features, n_outputs, feat_names, out_types,
                         print(f"  [Out {o_idx}] GP: {optimizers[o_idx].summary_str()}")
 
             for o_idx in range(n_outputs):
+                _set_output_context(o_idx)
                 if o_idx in perfect_outputs:
                     continue
                 is_perf, best_ind = _check_output_perfect(
@@ -27647,7 +28957,8 @@ def run_bayesian_afpo(X, Y, n_features, n_outputs, feat_names, out_types,
                     print(f"\n  ★ Output {o_idx} ({out_label}) reached PERFECT performance!")
                     _simplify_perfect_output(
                         hofs[o_idx], X, Y[:, o_idx], out_types[o_idx],
-                        target_grads=target_grads_list[o_idx])
+                        target_grads=target_grads_list[o_idx],
+                        output_idx=o_idx)
                     perfect_outputs.add(o_idx)
 
             if len(perfect_outputs) == n_outputs:
@@ -27667,6 +28978,7 @@ def run_bayesian_afpo(X, Y, n_features, n_outputs, feat_names, out_types,
                     and iteration % max(1, SIMPLIFICATION_FREQ // 50) == 0):
                 print(f"\n[BO AFPO iter {iteration}] Running algebraic simplification on HoF…")
                 for o_idx, hof in enumerate(hofs):
+                    _set_output_context(o_idx)
                     for c_key in list(hof.best_by_complexity.keys()):
                         ind = hof.best_by_complexity[c_key]
                         old_active = set(ind.tree.active_nodes) if ind.tree is not None else set()
@@ -27761,10 +29073,10 @@ def run_bayesian_islands(X, Y, n_features, n_outputs, feat_names, out_types,
     # Critical when n_features > 5: uniform feature selection turns the
     # search into a needle-in-a-haystack problem because most CGP slots
     # end up referencing irrelevant variables.
-    feature_priors = [
-        _bo_global_feature_priors(X, Y[:, o_idx], n_features)
-        for o_idx in range(n_outputs)
-    ]
+    feature_priors = []
+    for o_idx in range(n_outputs):
+        _set_output_context(o_idx)
+        feature_priors.append(_bo_global_feature_priors(X, Y[:, o_idx], n_features))
 
     islands_pop = [[[] for _ in range(n_outputs)] for _ in range(NUM_ISLANDS)]
     # Per-output Interplay Escape Oracle.  Islands share one oracle
@@ -27786,6 +29098,7 @@ def run_bayesian_islands(X, Y, n_features, n_outputs, feat_names, out_types,
 
     for island_idx in range(NUM_ISLANDS):
         for o_idx in range(n_outputs):
+            _set_output_context(o_idx)
             v5_seeds = generate_seeds_v5(n_features, feat_names)
             try:
                 imp_seeds, n_priority = generate_importance_biased_seeds(
@@ -27828,6 +29141,7 @@ def run_bayesian_islands(X, Y, n_features, n_outputs, feat_names, out_types,
     if N_train > _INIT_SUBSAMPLE_CAP:
         print("  Re-scoring Hall of Fame and GP buffer on full dataset…")
         for o_idx in range(n_outputs):
+            _set_output_context(o_idx)
             for ind in hofs[o_idx].best_by_complexity.values():
                 ind.affine_fitted = False
                 ind.calculate_fitness(X, Y[:, o_idx], out_types[o_idx],
@@ -27886,6 +29200,7 @@ def run_bayesian_islands(X, Y, n_features, n_outputs, feat_names, out_types,
                 opt.xi = current_xi
 
             for o_idx in range(n_outputs):
+                _set_output_context(o_idx)
                 if o_idx in perfect_outputs:
                     continue
                 opt = optimizers[o_idx]
@@ -28211,6 +29526,7 @@ def run_bayesian_islands(X, Y, n_features, n_outputs, feat_names, out_types,
             # --- Parallel refit surrogates ---
             opts_to_refit = []
             for o_idx in range(n_outputs):
+                _set_output_context(o_idx)
                 if o_idx in perfect_outputs: continue
                 opt = optimizers[o_idx]
                 if getattr(opt, '_needs_refit', False):
@@ -28226,6 +29542,7 @@ def run_bayesian_islands(X, Y, n_features, n_outputs, feat_names, out_types,
             print(f"--- BO Islands Iteration {iteration}  (total evals: {total_evals}) ---")
 
             for o_idx in range(n_outputs):
+                _set_output_context(o_idx)
                 if o_idx in perfect_outputs:
                     continue
                 is_perf, best_ind = _check_output_perfect(
@@ -28235,7 +29552,8 @@ def run_bayesian_islands(X, Y, n_features, n_outputs, feat_names, out_types,
                     print(f"\n  ★ Output {o_idx} ({out_label}) reached PERFECT performance!")
                     _simplify_perfect_output(
                         hofs[o_idx], X, Y[:, o_idx], out_types[o_idx],
-                        target_grads=target_grads_list[o_idx])
+                        target_grads=target_grads_list[o_idx],
+                        output_idx=o_idx)
                     perfect_outputs.add(o_idx)
 
             if len(perfect_outputs) == n_outputs:
@@ -28344,10 +29662,10 @@ def run_bayesian_islanded_afpo(X, Y, n_features, n_outputs, feat_names, out_type
     # Critical when n_features > 5: uniform feature selection turns the
     # search into a needle-in-a-haystack problem because most CGP slots
     # end up referencing irrelevant variables.
-    feature_priors = [
-        _bo_global_feature_priors(X, Y[:, o_idx], n_features)
-        for o_idx in range(n_outputs)
-    ]
+    feature_priors = []
+    for o_idx in range(n_outputs):
+        _set_output_context(o_idx)
+        feature_priors.append(_bo_global_feature_priors(X, Y[:, o_idx], n_features))
 
     islands_pop = [[[] for _ in range(n_outputs)] for _ in range(NUM_ISLANDS)]
     # Per-output Interplay Escape Oracle (see module-level
@@ -28794,7 +30112,8 @@ def run_bayesian_islanded_afpo(X, Y, n_features, n_outputs, feat_names, out_type
                     print(f"\n  ★ Output {o_idx} ({out_label}) reached PERFECT performance!")
                     _simplify_perfect_output(
                         hofs[o_idx], X, Y[:, o_idx], out_types[o_idx],
-                        target_grads=target_grads_list[o_idx])
+                        target_grads=target_grads_list[o_idx],
+                        output_idx=o_idx)
                     perfect_outputs.add(o_idx)
 
             if len(perfect_outputs) == n_outputs:
@@ -28907,10 +30226,10 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
     # Critical when n_features > 5: uniform feature selection turns the
     # search into a needle-in-a-haystack problem because most CGP slots
     # end up referencing irrelevant variables.
-    feature_priors = [
-        _bo_global_feature_priors(X, Y[:, o_idx], n_features)
-        for o_idx in range(n_outputs)
-    ]
+    feature_priors = []
+    for o_idx in range(n_outputs):
+        _set_output_context(o_idx)
+        feature_priors.append(_bo_global_feature_priors(X, Y[:, o_idx], n_features))
 
     # Per-output Interplay Escape Oracle (see the module-level
     # "INTERPLAY ESCAPE ORACLE" comment).  Disabled via the
@@ -29536,7 +30855,8 @@ def run_bayesian_cgp(X, Y, n_features, n_outputs, feat_names, out_types,
                     print(f"\n  ★ Output {o_idx} ({out_label}) reached PERFECT performance!")
                     _simplify_perfect_output(
                         hofs[o_idx], X, Y[:, o_idx], out_types[o_idx],
-                        target_grads=target_grads_list[o_idx])
+                        target_grads=target_grads_list[o_idx],
+                        output_idx=o_idx)
                     perfect_outputs.add(o_idx)
 
             if len(perfect_outputs) == n_outputs:
@@ -29690,10 +31010,10 @@ def run_bayesian_qd(X, Y, n_features, n_outputs, feat_names, out_types,
     # Critical when n_features > 5: uniform feature selection turns the
     # search into a needle-in-a-haystack problem because most CGP slots
     # end up referencing irrelevant variables.
-    feature_priors = [
-        _bo_global_feature_priors(X, Y[:, o_idx], n_features)
-        for o_idx in range(n_outputs)
-    ]
+    feature_priors = []
+    for o_idx in range(n_outputs):
+        _set_output_context(o_idx)
+        feature_priors.append(_bo_global_feature_priors(X, Y[:, o_idx], n_features))
 
     archives = [QualityDiversityArchive(n_features, CGP_NODES)
                 for _ in range(n_outputs)]
@@ -30361,7 +31681,8 @@ def run_bayesian_qd(X, Y, n_features, n_outputs, feat_names, out_types,
                     print(f"\n  ★ Output {o_idx} ({out_label}) reached PERFECT performance!")
                     _simplify_perfect_output(
                         hofs[o_idx], X, Y[:, o_idx], out_types[o_idx],
-                        target_grads=target_grads_list[o_idx])
+                        target_grads=target_grads_list[o_idx],
+                        output_idx=o_idx)
                     perfect_outputs.add(o_idx)
 
             if len(perfect_outputs) == n_outputs:
@@ -30616,7 +31937,8 @@ def _run_boosting_stage_evolution(X, residuals, n_features, feat_names,
                                   stage_hof, gens_per_stage,
                                   prev_stage_best, BATCH_SIZE,
                                   subsample_idx=None,
-                                  sample_weights=None):
+                                  sample_weights=None,
+                                  output_idx=None):
     """
     Run a single boosting stage's CGP evolution on given residuals.
 
@@ -30626,6 +31948,7 @@ def _run_boosting_stage_evolution(X, residuals, n_features, feat_names,
     When sample_weights is provided (2nd-order Hessian boosting), uses
     weighted MSE where wi = hessian_i, targeting Newton-step residuals.
     """
+    _set_output_context(output_idx)
     from concurrent.futures import ProcessPoolExecutor
     import concurrent.futures
 
@@ -30642,7 +31965,14 @@ def _run_boosting_stage_evolution(X, residuals, n_features, feat_names,
     stage_target_grads = None
     if SOBOLEV_ENABLED:
         try:
-            stage_target_grads = compute_target_gradients(X_stage, res_stage)
+            X_grad = X_stage
+            blocked = _current_blocked_features()
+            if blocked:
+                X_grad = X_stage.copy()
+                for _bf in blocked:
+                    if 0 <= int(_bf) < X_grad.shape[1]:
+                        X_grad[:, int(_bf)] = 0.0
+            stage_target_grads = compute_target_gradients(X_grad, res_stage)
         except Exception:
             pass
 
@@ -30742,7 +32072,8 @@ def _run_boosting_stage_evolution(X, residuals, n_features, feat_names,
                         islands_pop[isl][0],
                         X_b, res_b, 5,  # regression on residuals
                         n_features, feat_names,
-                        MIGRATION_FREQ, isl, 0,
+                        MIGRATION_FREQ, isl,
+                        0 if output_idx is None else int(output_idx),
                         150,  # extinction patience
                         stagnation_counters[isl][0],
                         list(_ADF_REGISTRY),
@@ -30926,7 +32257,8 @@ def run_gradient_boosted_evolution(X, Y, n_features, n_outputs, feat_names,
                     X, stage_residuals, n_features, feat_names,
                     stage_hof, gens_per_stage, prev_bests[k], BATCH_SIZE,
                     subsample_idx=sub_idx,
-                    sample_weights=mc_hessian_weights)
+                    sample_weights=mc_hessian_weights,
+                    output_idx=grp_indices[k])
 
                 best_stage = stage_hof.get_best_overall()
                 if best_stage is None:
@@ -31121,7 +32453,8 @@ def run_gradient_boosted_evolution(X, Y, n_features, n_outputs, feat_names,
                 X, residuals, n_features, feat_names,
                 stage_hof, gens_per_stage, prev_stage_best, BATCH_SIZE,
                 subsample_idx=sub_idx,
-                sample_weights=hessian_weights)
+                sample_weights=hessian_weights,
+                output_idx=o_idx)
 
             best_stage = stage_hof.get_best_overall()
             if best_stage is None:
@@ -31323,8 +32656,9 @@ def _generate_boosted_script(boosted_models, dp, X_data=None):
         for ind, _lr in stages_to_scan:
             all_stage_inds.append(ind)
             ind.tree.update_active_nodes()
+            blocked = set(getattr(ind.tree, 'blocked_features', ()))
             for idx in ind.tree.active_nodes:
-                if idx < ind.tree.n_features:
+                if idx < ind.tree.n_features and idx not in blocked:
                     used_feature_indices.add(idx)
 
     # Map active feature indices back to their *raw* source columns.  Handles
@@ -31567,6 +32901,7 @@ def _generate_boosted_script(boosted_models, dp, X_data=None):
     output_names_list = [dp.output_map[i] if i < len(dp.output_map) else f"Out{i}" for i in range(len(boosted_models))]
 
     _bitwise_src = _bitwise_ops_source(BITWISE_MODE)
+    export_extra_tools_src = _export_extra_tools_source()
 
     script_content = f'''import numpy as np
 import pandas as pd
@@ -31676,6 +33011,7 @@ USED_COLS = {repr(used_cols)}
 FEATURE_NAMES = {repr(final_vars)}
 FEATURE_RANGES = {repr(feature_ranges)}
 OUTPUT_NAMES = {repr(output_names_list)}
+OUTPUT_TYPES = {repr(out_types)}
 N_FEATURES = {len(final_vars)}
 N_OUTPUTS = {len(boosted_models)}
 
@@ -31949,6 +33285,7 @@ def plot_model():
 
     print(f"Saved {{plot_count}} plots to {{plot_dir}}")
 
+{export_extra_tools_src}
 
 def _describe_input(col):
     """Short hint listing the valid values for a categorical input prompt.
@@ -31982,6 +33319,20 @@ def main():
         do_plot = input("\\nWould you like to plot the model? [y/N]: ").strip().lower()
         if do_plot == 'y':
             plot_model()
+    except (KeyboardInterrupt, EOFError):
+        pass
+
+    try:
+        do_csv = input("\\nWould you like to generate a CSV with the model? [y/N]: ").strip()
+        if _yesish(do_csv):
+            generate_csv_from_model()
+    except (KeyboardInterrupt, EOFError):
+        pass
+
+    try:
+        do_scatter = input("\\nWould you like to create a prediction scatterplot from a CSV? [y/N]: ").strip()
+        if _yesish(do_scatter):
+            plot_scatter_from_csv()
     except (KeyboardInterrupt, EOFError):
         pass
 
@@ -32708,8 +34059,12 @@ def train_mode():
 
     print("Preprocessing...")
     X, Y = dp.fit_transform(df)
+    _set_all_output_feature_masks(dp)
     n_features, n_outputs = X.shape[1], Y.shape[1]
     feat_names, out_types = dp.input_map, dp.get_output_types_flat()
+    if getattr(dp, 'all_output_input_enabled', False):
+        print("  All-output mode active: each -1 output masks its own input "
+              "feature and may use the other -1 columns as inputs.")
 
     # Data-scale hint: lets constant optimisation, mutation and seed
     # generation size their search by the dataset magnitude.  Without this,
@@ -32785,6 +34140,8 @@ def train_mode():
         _cap = min(X.shape[0], 5000)
         _X_sample = X[:_cap]
         for o_idx in range(n_outputs):
+            _set_output_context(o_idx)
+            _blocked_features = set(_current_blocked_features())
             _y = Y[:_cap, o_idx]
             out_label = dp.output_map[o_idx] if o_idx < len(dp.output_map) else f"Out{o_idx}"
             is_cls = (out_types[o_idx] == 6)
@@ -32793,6 +34150,8 @@ def train_mode():
                 # For classification, use point-biserial correlation
                 _cors = []
                 for j in range(n_features):
+                    if j in _blocked_features:
+                        continue
                     _c = abs(float(np.corrcoef(_X_sample[:, j], _y)[0, 1]))
                     _cors.append((_c if np.isfinite(_c) else 0.0, feat_names[j]))
             else:
@@ -32803,6 +34162,8 @@ def train_mode():
                     _spearmanr_fn = None
                 _cors = []
                 for j in range(n_features):
+                    if j in _blocked_features:
+                        continue
                     _pearson = abs(float(np.corrcoef(_X_sample[:, j], _y)[0, 1]))
                     if _spearmanr_fn is not None:
                         _spearman = abs(float(_spearmanr_fn(_X_sample[:, j], _y).statistic))
@@ -32895,7 +34256,15 @@ def train_mode():
         for i in range(n_outputs):
             if out_types[i] != 6:  # regression only
                 try:
-                    target_grads_list[i] = compute_target_gradients(X, Y[:, i])
+                    _set_output_context(i)
+                    X_grad = X
+                    blocked = _current_blocked_features()
+                    if blocked:
+                        X_grad = X.copy()
+                        for _bf in blocked:
+                            if 0 <= int(_bf) < X_grad.shape[1]:
+                                X_grad[:, int(_bf)] = 0.0
+                    target_grads_list[i] = compute_target_gradients(X_grad, Y[:, i])
                     dim_desc = f"{n_features}D KNN" if n_features >= 2 else "1D finite-diff"
                     print(f"  Output {i}: ∇y estimated ({dim_desc}, {X.shape[0]} points)")
                 except Exception as e:
@@ -33091,7 +34460,10 @@ def train_mode():
             X_init, Y_init = X[init_idx], Y[init_idx]
             print(f"  (using {_INIT_SUBSAMPLE_CAP}/{N_train} row subsample for fast init)")
         else:
+            init_idx = None
             X_init, Y_init = X, Y
+        target_grads_init = _afpo_target_grads_for_rows(
+            target_grads_list, init_idx)
 
         # Per-output initialisation, parallelised across outputs (each output
         # owns its own HoF, so there is no cross-thread contention — the same
@@ -33103,9 +34475,10 @@ def train_mode():
         # O(NUM_ISLANDS·n_outputs·N·n_features⁴) redundancy that dominated
         # start-up on many-input / multi-output problems.
         def _init_island_output(i):
+            _set_output_context(i)
             yi    = Y_init[:, i]
             otype = out_types[i]
-            tg    = target_grads_list[i]
+            tg    = target_grads_init[i]
             try:
                 shared_imp = generate_importance_biased_seeds(
                     n_features, feat_names, X_init, yi)
@@ -33302,7 +34675,8 @@ def train_mode():
                             # co-evolution resolution governor.
                             _coevo_admission_rescore(
                                 ind, X, Y[:, o_idx], out_types[o_idx],
-                                target_grads_list[o_idx])
+                                target_grads_list[o_idx],
+                                output_idx=o_idx)
                             if hofs[o_idx].update(ind):
                                 is_cls = (out_types[o_idx] == 6)
                                 metric = (f"Acc={getattr(ind,'accuracy',0):.4f}"
@@ -33415,7 +34789,8 @@ def train_mode():
                                 print(f"    Running simplification pass on perfect output...")
                                 _simplify_perfect_output(
                                     hofs[o_idx], X, Y[:, o_idx], out_types[o_idx],
-                                    target_grads=target_grads_list[o_idx])
+                                    target_grads=target_grads_list[o_idx],
+                                    output_idx=o_idx)
                                 perfect_outputs.add(o_idx)
                                 # Save backup model
                                 best_models_snapshot = [h.get_best_overall() for h in hofs]
@@ -33481,7 +34856,8 @@ def train_mode():
                         for o_idx in perfect_outputs:
                             _simplify_perfect_output(
                                 hofs[o_idx], X, Y[:, o_idx], out_types[o_idx],
-                                target_grads=target_grads_list[o_idx])
+                                target_grads=target_grads_list[o_idx],
+                                output_idx=o_idx)
 
                     # ---- Periodic HoF re-scoring on full data (batch mode) ----
                     # When BATCH_SIZE > 0, island workers fit affine on batch data
@@ -33531,7 +34907,10 @@ def train_mode():
             X_init, Y_init = X[init_idx], Y[init_idx]
             print(f"  (using {_INIT_SUBSAMPLE_CAP}/{N_train} row subsample for fast init)")
         else:
+            init_idx = None
             X_init, Y_init = X, Y
+        target_grads_init = _afpo_target_grads_for_rows(
+            target_grads_list, init_idx)
 
         # Importance-biased seeds: closed-form OLS / log-OLS templates over the
         # most-correlated features and rational/composite forms.  The single-
@@ -33544,9 +34923,10 @@ def train_mode():
         # output start-up no longer pays each output's OLS + full-pool scoring
         # serially.
         def _init_afpo_output(i):
+            _set_output_context(i)
             yi    = Y_init[:, i]
             otype = out_types[i]
-            tg    = target_grads_list[i]
+            tg    = target_grads_init[i]
             pop = generate_seeds_v5(n_features, feat_names)
             n_v5  = len(pop)
             n_imp = 0
@@ -33628,6 +35008,14 @@ def train_mode():
         if N_train > _INIT_SUBSAMPLE_CAP:
             print("  Re-scoring Hall of Fame on full dataset…")
             _parallel_rescore_hofs(hofs, X, Y, out_types, target_grads_list)
+            print("  Re-scoring AFPO populations on full dataset…")
+            for i in range(n_outputs):
+                _set_output_context(i)
+                _afpo_rescore_population_for_rows(
+                    afpo_pops[i], X, Y[:, i], out_types[i],
+                    target_grads=target_grads_list[i])
+                afpo_pops[i] = _trim_to_pareto_front_3obj(
+                    afpo_pops[i], AFPO_POP_SIZE)
         _INIT_PHASE = False
 
         # ── Detect multi-class groups for joint softmax CE ──────────────────
@@ -33686,6 +35074,8 @@ def train_mode():
                     batch_idx = _select_batch_indices(X, Y, hofs, out_types, BATCH_SIZE)
                     X_b = X[batch_idx] if batch_idx is not None else X
                     Y_b = Y[batch_idx] if batch_idx is not None else Y
+                    target_grads_b = _afpo_target_grads_for_rows(
+                        target_grads_list, batch_idx)
 
                     # ── Build background logits for class groups ────────────────
                     bg_logits_cache_a = {}
@@ -33725,21 +35115,24 @@ def train_mode():
                         # ── Elitist HoF injection ─────────────────────────────────
                         hof_best_i = hofs[i].get_best_overall()
                         if hof_best_i is not None and afpo_pops[i]:
-                            pop_best_loss = min(ind.loss for ind in afpo_pops[i])
-                            if hof_best_i.loss < pop_best_loss - 1e-9:
+                            if _afpo_hof_beats_population(
+                                    hofs[i], hof_best_i, afpo_pops[i]):
                                 worst = max(afpo_pops[i], key=lambda x: x.fitness)
                                 afpo_pops[i].remove(worst)
                                 elite = copy.deepcopy(hof_best_i)
                                 elite.age = 0   # reset so AFPO Pareto trim won't kill it immediately
                                 afpo_pops[i].append(elite)
+                                stag_cntrs[i] = 0
 
                         args = (
                             afpo_pops[i], X_b, Y_b[:, i], out_types[i],
                             n_features, feat_names, AFPO_POP_SIZE,
                             chunk_freq_a,            # generations per chunk
                             stag_cntrs[i], EXTINCTION_PATIENCE,
-                            col_bg_a, local_k_a, Y_group_a, target_grads_list[i],
+                            col_bg_a, local_k_a, Y_group_a, target_grads_b[i],
                             None,                    # stage_frac: single-stage = neutral weights
+                            (batch_idx is not None or col_bg_a is not None),
+                            gen,                     # absolute generation offset
                         )
                         futures.append(executor.submit(evolve_afpo_stage_worker, (args, 0, i, list(_ADF_REGISTRY))))
 
@@ -33754,7 +35147,8 @@ def train_mode():
                             # the co-evolution resolution governor.
                             _coevo_admission_rescore(
                                 ind, X, Y[:, i], out_types[i],
-                                target_grads_list[i])
+                                target_grads_list[i],
+                                output_idx=i)
                             if hofs[i].update(ind):
                                 is_cls = (out_types[i] == 6)
                                 metric = (f"Acc={getattr(ind,'accuracy',0):.4f}"
@@ -33817,6 +35211,7 @@ def train_mode():
                             # size.  Pad each pop with placeholder Individuals
                             # so the rebuild lands at the configured pool size.
                             for _oi in range(n_outputs):
+                                _set_output_context(_oi)
                                 while len(afpo_pops[_oi]) < AFPO_POP_SIZE:
                                     afpo_pops[_oi].append(Individual(
                                         random_cgp(n_features, CGP_NODES, feat_names)))
@@ -33825,6 +35220,7 @@ def train_mode():
                                              n_features, feat_names,
                                              target_grads_list)
                             for _oi in range(n_outputs):
+                                _set_output_context(_oi)
                                 # The `_meta_extinction` helper only scores the
                                 # seed pool; random_cgp pad members come back with
                                 # the Individual defaults (loss=fitness=1e10).  If
@@ -33871,7 +35267,8 @@ def train_mode():
                             print(f"    Running simplification pass on perfect output...")
                             _simplify_perfect_output(
                                 hofs[o_idx], X, Y[:, o_idx], out_types[o_idx],
-                                target_grads=target_grads_list[o_idx])
+                                target_grads=target_grads_list[o_idx],
+                                output_idx=o_idx)
                             perfect_outputs.add(o_idx)
                             best_models_snapshot = [h.get_best_overall() for h in hofs]
                             _save_backup_model(best_models_snapshot, dp, o_idx, X_data=X)
@@ -33940,14 +35337,14 @@ def train_mode():
                                              offset=SIMPLIFICATION_FREQ // 2)):
                         _simp_t0 = time.perf_counter()
                         print(f"\n[Gen {gen}] Running algebraic simplification pass…")
-                        # Wrap afpo_pops as if they were islands (list of [pop])
-                        pseudo_islands = [[pop] for pop in afpo_pops]
+                        # One pseudo-island containing every output population.
+                        # ``[[pop] for pop in afpo_pops]`` transposes the layout
+                        # and makes the helper score every population as output 0.
+                        pseudo_islands = [afpo_pops]
                         apply_simplification_pass(
                             pseudo_islands, hofs, X, Y, out_types,
                             time_budget_sec=SIMPLIFICATION_TIME_BUDGET_SEC)
-                        # Unwrap back
-                        for i in range(n_outputs):
-                            afpo_pops[i] = pseudo_islands[i][0]
+                        afpo_pops = pseudo_islands[0]
                         _phase_done('simplify', _simp_t0)
 
                     # ---- Extra simplification for perfect outputs ----
@@ -33956,7 +35353,8 @@ def train_mode():
                         for o_idx in perfect_outputs:
                             _simplify_perfect_output(
                                 hofs[o_idx], X, Y[:, o_idx], out_types[o_idx],
-                                target_grads=target_grads_list[o_idx])
+                                target_grads=target_grads_list[o_idx],
+                                output_idx=o_idx)
 
                     # ---- Periodic HoF re-scoring on full data (batch mode) ----
                     # When BATCH_SIZE > 0 the workers see X_b as their full
@@ -34032,7 +35430,10 @@ def train_mode():
             X_init, Y_init = X[init_idx], Y[init_idx]
             print(f"  (using {_INIT_SUBSAMPLE_CAP}/{N_train} row subsample for fast init)")
         else:
+            init_idx = None
             X_init, Y_init = X, Y
+        target_grads_init = _afpo_target_grads_for_rows(
+            target_grads_list, init_idx)
 
         # Importance-biased seeds (closed-form OLS / log-OLS templates) depend
         # only on the OUTPUT, so they are built + scored ONCE per output and
@@ -34043,9 +35444,10 @@ def train_mode():
         # whole per-output build → score → per-stage assembly is parallelised
         # across outputs (mirrors _parallel_rescore_hofs).
         def _init_staged_output(i):
+            _set_output_context(i)
             yi    = Y_init[:, i]
             otype = out_types[i]
-            tg    = target_grads_list[i]
+            tg    = target_grads_init[i]
             try:
                 shared_imp = generate_importance_biased_seeds(
                     n_features, feat_names, X_init, yi)
@@ -34094,6 +35496,15 @@ def train_mode():
         if N_train > _INIT_SUBSAMPLE_CAP:
             print("  Re-scoring Hall of Fame on full dataset…")
             _parallel_rescore_hofs(hofs, X, Y, out_types, target_grads_list)
+            print("  Re-scoring staged AFPO populations on full dataset…")
+            for s in range(N_STAGES):
+                for i in range(n_outputs):
+                    _set_output_context(i)
+                    _afpo_rescore_population_for_rows(
+                        stage_pops[s][i], X, Y[:, i], out_types[i],
+                        target_grads=target_grads_list[i])
+                    stage_pops[s][i] = _trim_to_pareto_front_3obj(
+                        stage_pops[s][i], AFPO_POP_SIZE)
         _INIT_PHASE = False
 
         class_groups_sa   = detect_class_groups(dp, out_types)
@@ -34137,6 +35548,8 @@ def train_mode():
                     batch_idx = _select_batch_indices(X, Y, hofs, out_types, BATCH_SIZE)
                     X_b = X[batch_idx] if batch_idx is not None else X
                     Y_b = Y[batch_idx] if batch_idx is not None else Y
+                    target_grads_b = _afpo_target_grads_for_rows(
+                        target_grads_list, batch_idx)
 
                     bg_logits_cache_sa = {}
                     for col_name, group_idxs in class_groups_sa.items():
@@ -34177,13 +35590,14 @@ def train_mode():
 
                             hof_best_i = hofs[i].get_best_overall()
                             if hof_best_i is not None and stage_pops[s][i]:
-                                pop_best = min(ind.loss for ind in stage_pops[s][i])
-                                if hof_best_i.loss < pop_best - 1e-9:
+                                if _afpo_hof_beats_population(
+                                        hofs[i], hof_best_i, stage_pops[s][i]):
                                     worst = max(stage_pops[s][i], key=lambda x: x.fitness)
                                     stage_pops[s][i].remove(worst)
                                     elite = copy.deepcopy(hof_best_i)
                                     elite.age = 0
                                     stage_pops[s][i].append(elite)
+                                    stag_cntrs[s][i] = 0
 
                             # Stage-aware operator tilt: 0.0 (earliest stage =
                             # exploration-biased) → 1.0 (latest = exploitation).
@@ -34192,8 +35606,10 @@ def train_mode():
                                 stage_pops[s][i], X_b, Y_b[:, i], out_types[i],
                                 n_features, feat_names, AFPO_POP_SIZE,
                                 MIGRATION_FREQ, stag_cntrs[s][i], EXTINCTION_PATIENCE,
-                                col_bg_sa, local_k_sa, Y_group_sa, target_grads_list[i],
+                                col_bg_sa, local_k_sa, Y_group_sa, target_grads_b[i],
                                 stage_frac_si,
+                                (batch_idx is not None or col_bg_sa is not None),
+                                gen,                 # absolute generation offset
                             )
                             futures.append(executor.submit(evolve_afpo_stage_worker, (args, s, i, list(_ADF_REGISTRY))))
 
@@ -34207,7 +35623,8 @@ def train_mode():
                             # the co-evolution resolution governor.
                             _coevo_admission_rescore(
                                 ind, X, Y[:, i], out_types[i],
-                                target_grads_list[i])
+                                target_grads_list[i],
+                                output_idx=i)
                             if hofs[i].update(ind):
                                 is_cls = (out_types[i] == 6)
                                 metric = (f"Acc={getattr(ind,'accuracy',0):.4f}"
@@ -34255,6 +35672,7 @@ def train_mode():
                         for s in range(N_STAGES - 1):
                             ns = s + 1
                             for i in range(n_outputs):
+                                _set_output_context(i)
                                 if i in perfect_outputs:
                                     continue
                                 src = stage_pops[s][i]
@@ -34343,7 +35761,7 @@ def train_mode():
                                             bg_logits=_cbg,
                                             class_idx_in_group=_lk,
                                             Y_group=_yg,
-                                            target_grads=target_grads_list[i])
+                                            target_grads=target_grads_b[i])
                                     except Exception:
                                         r.fitness = 1e10
                                         r.loss = 1e10
@@ -34362,6 +35780,7 @@ def train_mode():
                         # Structure (ALPS).
                         _n_fresh0 = max(2, AFPO_POP_SIZE // 20)
                         for i in range(n_outputs):
+                            _set_output_context(i)
                             if i in perfect_outputs:
                                 continue
                             s0 = stage_pops[0][i]
@@ -34386,7 +35805,7 @@ def train_mode():
                                         bg_logits=_cbg,
                                         class_idx_in_group=_lk,
                                         Y_group=_yg,
-                                        target_grads=target_grads_list[i])
+                                        target_grads=target_grads_b[i])
                                 except Exception:
                                     _ni.fitness = 1e10
                                     _ni.loss = 1e10
@@ -34430,6 +35849,7 @@ def train_mode():
                             # the current, possibly Pareto-trimmed, length).
                             for _s in range(N_STAGES):
                                 for _oi in range(n_outputs):
+                                    _set_output_context(_oi)
                                     while len(stage_pops[_s][_oi]) < AFPO_POP_SIZE:
                                         stage_pops[_s][_oi].append(Individual(
                                             random_cgp(n_features, CGP_NODES,
@@ -34442,6 +35862,7 @@ def train_mode():
                                              target_grads_list)
                             for _s in range(N_STAGES):
                                 for _oi in range(n_outputs):
+                                    _set_output_context(_oi)
                                     for _ind in stage_pops[_s][_oi]:
                                         _ind.age = 0
                                         if (not np.isfinite(getattr(_ind, 'fitness', np.inf))
@@ -34476,7 +35897,8 @@ def train_mode():
                             print(f"    Running simplification pass on perfect output...")
                             _simplify_perfect_output(
                                 hofs[o_idx], X, Y[:, o_idx], out_types[o_idx],
-                                target_grads=target_grads_list[o_idx])
+                                target_grads=target_grads_list[o_idx],
+                                output_idx=o_idx)
                             perfect_outputs.add(o_idx)
                             best_models_snapshot = [h.get_best_overall() for h in hofs]
                             _save_backup_model(best_models_snapshot, dp, o_idx, X_data=X)
@@ -34539,12 +35961,11 @@ def train_mode():
                     if SIMPLIFICATION_FREQ > 0 and gen % SIMPLIFICATION_FREQ == 0:
                         print(f"\n[Gen {gen}] Running algebraic simplification pass…")
                         for s in range(N_STAGES):
-                            pseudo_isl = [[stage_pops[s][j]] for j in range(n_outputs)]
+                            pseudo_isl = [stage_pops[s]]
                             apply_simplification_pass(
                                 pseudo_isl, hofs, X, Y, out_types,
                                 time_budget_sec=SIMPLIFICATION_TIME_BUDGET_SEC)
-                            for j in range(n_outputs):
-                                stage_pops[s][j] = pseudo_isl[j][0]
+                            stage_pops[s] = pseudo_isl[0]
 
                     if perfect_outputs and gen % max(
                             100,
@@ -34552,7 +35973,8 @@ def train_mode():
                         for o_idx in perfect_outputs:
                             _simplify_perfect_output(
                                 hofs[o_idx], X, Y[:, o_idx], out_types[o_idx],
-                                target_grads=target_grads_list[o_idx])
+                                target_grads=target_grads_list[o_idx],
+                                output_idx=o_idx)
 
                     # ---- Periodic HoF re-scoring on full data (batch mode) ----
                     if BATCH_SIZE > 0 and gen > 0 and gen % 200 == 0:
@@ -34611,10 +36033,14 @@ def train_mode():
             X_init, Y_init = X[init_idx], Y[init_idx]
             print(f"  (using {_INIT_SUBSAMPLE_CAP}/{N_train} row subsample for fast init)")
         else:
+            init_idx = None
             X_init, Y_init = X, Y
+        target_grads_init = _afpo_target_grads_for_rows(
+            target_grads_list, init_idx)
 
         for island_idx in range(NUM_ISLANDS):
             for i in range(n_outputs):
+                _set_output_context(i)
                 pop = generate_seeds_v5(n_features, feat_names)
                 try:
                     imp_seeds = generate_importance_biased_seeds(
@@ -34627,7 +36053,7 @@ def train_mode():
                 for ind in pop:
                     ind.age = 0
                     ind.calculate_fitness(X_init, Y_init[:, i], out_types[i],
-                                          target_grads=target_grads_list[i])
+                                          target_grads=target_grads_init[i])
                     hofs[i].update(ind)
                 islands_pop[island_idx].append(pop)
             print(f"  Island {island_idx+1}/{NUM_ISLANDS} initialized.")
@@ -34635,6 +36061,15 @@ def train_mode():
         if N_train > _INIT_SUBSAMPLE_CAP:
             print("  Re-scoring Hall of Fame on full dataset…")
             _parallel_rescore_hofs(hofs, X, Y, out_types, target_grads_list)
+            print("  Re-scoring islanded AFPO populations on full dataset…")
+            for island_idx in range(NUM_ISLANDS):
+                for i in range(n_outputs):
+                    _set_output_context(i)
+                    _afpo_rescore_population_for_rows(
+                        islands_pop[island_idx][i], X, Y[:, i], out_types[i],
+                        target_grads=target_grads_list[i])
+                    islands_pop[island_idx][i] = _trim_to_pareto_front_3obj(
+                        islands_pop[island_idx][i], AFPO_POP_SIZE)
         _INIT_PHASE = False
 
         ds_label  = (f"DS-Lexicase {DS_LEXICASE_FRAC*100:.0f}%"
@@ -34656,6 +36091,8 @@ def train_mode():
                     batch_idx = _select_batch_indices(X, Y, hofs, out_types, BATCH_SIZE)
                     X_b = X[batch_idx] if batch_idx is not None else X
                     Y_b = Y[batch_idx] if batch_idx is not None else Y
+                    target_grads_b = _afpo_target_grads_for_rows(
+                        target_grads_list, batch_idx)
 
                     # ── Background logits ─────────────────────────────────────
                     bg_logits_cache_ia = {}
@@ -34671,13 +36108,14 @@ def train_mode():
                             pop = islands_pop[island_idx][i]
                             if not pop:
                                 continue
-                            pop_best_loss = min(ind.loss for ind in pop)
-                            if hof_best_i.loss < pop_best_loss - 1e-9:
+                            if _afpo_hof_beats_population(
+                                    hofs[i], hof_best_i, pop):
                                 worst = max(pop, key=lambda x: x.fitness)
                                 pop.remove(worst)
                                 elite = copy.deepcopy(hof_best_i)
                                 elite.age = 0
                                 pop.append(elite)
+                                stagnation_counters[island_idx][i] = 0
 
                     # ── Submit AFPO chunks ────────────────────────────────────
                     futures = []
@@ -34704,7 +36142,9 @@ def train_mode():
                                 island_idx, i,
                                 list(_ADF_REGISTRY),
                                 col_bg, local_k, Y_group_i,
-                                target_grads_list[i],  # ← Sobolev
+                                target_grads_b[i],  # row-aligned Sobolev
+                                (batch_idx is not None or col_bg is not None),
+                                gen,                # absolute generation offset
                             )
                             futures.append(
                                 executor.submit(evolve_afpo_island_chunk, args_ia))
@@ -34719,7 +36159,8 @@ def train_mode():
                             # the co-evolution resolution governor.
                             _coevo_admission_rescore(
                                 ind, X, Y[:, o_idx], out_types[o_idx],
-                                target_grads_list[o_idx])
+                                target_grads_list[o_idx],
+                                output_idx=o_idx)
                             if hofs[o_idx].update(ind):
                                 is_cls = (out_types[o_idx] == 6)
                                 metric = (f"Acc={getattr(ind,'accuracy',0):.4f}"
@@ -34761,6 +36202,7 @@ def train_mode():
                     # of HoF mutations and fresh random individuals.
                     _ISL_RESET_THRESH = EXTINCTION_PATIENCE * 2
                     for i in range(n_outputs):
+                        _set_output_context(i)
                         # Check if any island is severely stagnated
                         max_stag_isl = -1
                         max_stag_val = 0
@@ -34805,8 +36247,9 @@ def train_mode():
                                 ind.age = 0
                                 ind.calculate_fitness(
                                     X_b, Y_b[:, i], out_types[i],
-                                    target_grads=target_grads_list[i])
-                            islands_pop[max_stag_isl][i] = survivors + new_blood
+                                    target_grads=target_grads_b[i])
+                            islands_pop[max_stag_isl][i] = _trim_to_pareto_front_3obj(
+                                survivors + new_blood, AFPO_POP_SIZE)
                             stagnation_counters[max_stag_isl][i] = 0
                             print(f"  [Island Reset] Island {max_stag_isl} / "
                                   f"Output {i}: stagnation={max_stag_val}, "
@@ -34843,7 +36286,8 @@ def train_mode():
                             print(f"    Running simplification pass on perfect output...")
                             _simplify_perfect_output(
                                 hofs[o_idx], X, Y[:, o_idx], out_types[o_idx],
-                                target_grads=target_grads_list[o_idx])
+                                target_grads=target_grads_list[o_idx],
+                                output_idx=o_idx)
                             perfect_outputs.add(o_idx)
                             best_models_snapshot = [h.get_best_overall() for h in hofs]
                             _save_backup_model(best_models_snapshot, dp, o_idx, X_data=X)
@@ -34899,7 +36343,8 @@ def train_mode():
                         for o_idx in perfect_outputs:
                             _simplify_perfect_output(
                                 hofs[o_idx], X, Y[:, o_idx], out_types[o_idx],
-                                target_grads=target_grads_list[o_idx])
+                                target_grads=target_grads_list[o_idx],
+                                output_idx=o_idx)
 
                     # ---- Periodic HoF re-scoring on full data (batch mode) ----
                     # When BATCH_SIZE > 0 the workers see X_b as their full
@@ -34972,11 +36417,15 @@ def train_mode():
             X_init, Y_init = X[init_idx], Y[init_idx]
             print(f"  (using {_INIT_SUBSAMPLE_CAP}/{N_train} row subsample for fast init)")
         else:
+            init_idx = None
             X_init, Y_init = X, Y
+        target_grads_init = _afpo_target_grads_for_rows(
+            target_grads_list, init_idx)
 
         for s in range(N_STAGES):
             for isl in range(N_ISL):
                 for i in range(n_outputs):
+                    _set_output_context(i)
                     pop = generate_seeds_v5(n_features, feat_names)
                     try:
                         imp_seeds = generate_importance_biased_seeds(
@@ -34989,7 +36438,7 @@ def train_mode():
                     for ind in pop:
                         ind.age = 0
                         ind.calculate_fitness(X_init, Y_init[:, i], out_types[i],
-                                              target_grads=target_grads_list[i])
+                                              target_grads=target_grads_init[i])
                         hofs[i].update(ind)
                     stage_islands[s][isl].append(pop)
             print(f"  Stage {s+1}/{N_STAGES} initialized.")
@@ -34997,6 +36446,16 @@ def train_mode():
         if N_train > _INIT_SUBSAMPLE_CAP:
             print("  Re-scoring Hall of Fame on full dataset…")
             _parallel_rescore_hofs(hofs, X, Y, out_types, target_grads_list)
+            print("  Re-scoring staged islanded AFPO populations on full dataset…")
+            for s in range(N_STAGES):
+                for isl in range(N_ISL):
+                    for i in range(n_outputs):
+                        _set_output_context(i)
+                        _afpo_rescore_population_for_rows(
+                            stage_islands[s][isl][i], X, Y[:, i], out_types[i],
+                            target_grads=target_grads_list[i])
+                        stage_islands[s][isl][i] = _trim_to_pareto_front_3obj(
+                            stage_islands[s][isl][i], AFPO_POP_SIZE)
         _INIT_PHASE = False
 
         ds_label  = (f"DS-Lexicase {DS_LEXICASE_FRAC*100:.0f}%"
@@ -35024,6 +36483,8 @@ def train_mode():
                     batch_idx = _select_batch_indices(X, Y, hofs, out_types, BATCH_SIZE)
                     X_b = X[batch_idx] if batch_idx is not None else X
                     Y_b = Y[batch_idx] if batch_idx is not None else Y
+                    target_grads_b = _afpo_target_grads_for_rows(
+                        target_grads_list, batch_idx)
 
                     bg_logits_cache_si = {}
                     for col_name, group_idxs in class_groups_si.items():
@@ -35040,13 +36501,14 @@ def train_mode():
                                 pop = stage_islands[s][isl][i]
                                 if not pop:
                                     continue
-                                pop_best = min(ind.loss for ind in pop)
-                                if hof_best_i.loss < pop_best - 1e-9:
+                                if _afpo_hof_beats_population(
+                                        hofs[i], hof_best_i, pop):
                                     worst = max(pop, key=lambda x: x.fitness)
                                     pop.remove(worst)
                                     elite = copy.deepcopy(hof_best_i)
                                     elite.age = 0
                                     pop.append(elite)
+                                    stag_counters[s][isl][i] = 0
 
                     # Submit AFPO chunks for every (stage, island)
                     futures_si = []
@@ -35074,7 +36536,9 @@ def train_mode():
                                 flat_idx, i,
                                 list(_ADF_REGISTRY),
                                 col_bg, local_k, Y_group_i,
-                                target_grads_list[i],
+                                target_grads_b[i],
+                                (batch_idx is not None or col_bg is not None),
+                                gen,                # absolute generation offset
                             )
                             futures_si.append(
                                 executor.submit(evolve_afpo_island_chunk, args_si))
@@ -35091,7 +36555,8 @@ def train_mode():
                             # the co-evolution resolution governor.
                             _coevo_admission_rescore(
                                 ind, X, Y[:, o_idx], out_types[o_idx],
-                                target_grads_list[o_idx])
+                                target_grads_list[o_idx],
+                                output_idx=o_idx)
                             if hofs[o_idx].update(ind):
                                 is_cls = (out_types[o_idx] == 6)
                                 metric = (f"Acc={getattr(ind,'accuracy',0):.4f}"
@@ -35124,6 +36589,7 @@ def train_mode():
                         for s in range(N_STAGES - 1):
                             ns = s + 1
                             for i in range(n_outputs):
+                                _set_output_context(i)
                                 for isl in range(N_ISL):
                                     src_pop = stage_islands[s][isl][i]
                                     if not src_pop:
@@ -35148,7 +36614,7 @@ def train_mode():
                                     new_ind.age = 0
                                     new_ind.calculate_fitness(
                                         X_b, Y_b[:, i], out_types[i],
-                                        target_grads=target_grads_list[i])
+                                        target_grads=target_grads_b[i])
                                     if src_pop:
                                         weak = max(src_pop, key=lambda x: x.fitness)
                                         src_pop.remove(weak)
@@ -35175,7 +36641,8 @@ def train_mode():
                             print(f"    Running simplification pass on perfect output...")
                             _simplify_perfect_output(
                                 hofs[o_idx], X, Y[:, o_idx], out_types[o_idx],
-                                target_grads=target_grads_list[o_idx])
+                                target_grads=target_grads_list[o_idx],
+                                output_idx=o_idx)
                             perfect_outputs.add(o_idx)
                             best_models_snapshot = [h.get_best_overall() for h in hofs]
                             _save_backup_model(best_models_snapshot, dp, o_idx, X_data=X)
@@ -35248,7 +36715,8 @@ def train_mode():
                         for o_idx in perfect_outputs:
                             _simplify_perfect_output(
                                 hofs[o_idx], X, Y[:, o_idx], out_types[o_idx],
-                                target_grads=target_grads_list[o_idx])
+                                target_grads=target_grads_list[o_idx],
+                                output_idx=o_idx)
 
                     # ---- Periodic HoF re-scoring on full data (batch mode) ----
                     if BATCH_SIZE > 0 and gen > 0 and gen % 200 == 0:
@@ -35319,11 +36787,15 @@ def train_mode():
             X_init, Y_init = X[init_idx], Y[init_idx]
             print(f"  (using {_INIT_SUBSAMPLE_CAP}/{N_train} row subsample for fast init)")
         else:
+            init_idx = None
             X_init, Y_init = X, Y
+        target_grads_init = _afpo_target_grads_for_rows(
+            target_grads_list, init_idx)
 
         for tier in range(N_GROUPS):
             for isl in range(N_ISL_PER_G):
                 for i in range(n_outputs):
+                    _set_output_context(i)
                     pop = generate_seeds_v5(n_features, feat_names)
                     try:
                         imp_seeds = generate_importance_biased_seeds(
@@ -35336,7 +36808,7 @@ def train_mode():
                     for ind in pop:
                         ind.age = 0
                         ind.calculate_fitness(X_init, Y_init[:, i], out_types[i],
-                                              target_grads=target_grads_list[i])
+                                              target_grads=target_grads_init[i])
                         hofs[i].update(ind)
                     tier_islands[tier][isl].append(pop)
             print(f"  Tier {tier+1}/{N_GROUPS} initialized.")
@@ -35344,6 +36816,16 @@ def train_mode():
         if N_train > _INIT_SUBSAMPLE_CAP:
             print("  Re-scoring Hall of Fame on full dataset…")
             _parallel_rescore_hofs(hofs, X, Y, out_types, target_grads_list)
+            print("  Re-scoring age-group AFPO populations on full dataset…")
+            for tier in range(N_GROUPS):
+                for isl in range(N_ISL_PER_G):
+                    for i in range(n_outputs):
+                        _set_output_context(i)
+                        _afpo_rescore_population_for_rows(
+                            tier_islands[tier][isl][i], X, Y[:, i], out_types[i],
+                            target_grads=target_grads_list[i])
+                        tier_islands[tier][isl][i] = _trim_to_pareto_front_3obj(
+                            tier_islands[tier][isl][i], AFPO_POP_SIZE)
         _INIT_PHASE = False
 
         ds_label  = (f"DS-Lexicase {DS_LEXICASE_FRAC*100:.0f}%"
@@ -35372,6 +36854,8 @@ def train_mode():
                     batch_idx = _select_batch_indices(X, Y, hofs, out_types, BATCH_SIZE)
                     X_b = X[batch_idx] if batch_idx is not None else X
                     Y_b = Y[batch_idx] if batch_idx is not None else Y
+                    target_grads_b = _afpo_target_grads_for_rows(
+                        target_grads_list, batch_idx)
 
                     # ── Background logits ─────────────────────────────────────
                     bg_logits_cache_ag = {}
@@ -35389,13 +36873,14 @@ def train_mode():
                                 pop = tier_islands[tier][isl][i]
                                 if not pop:
                                     continue
-                                pop_best = min(ind.loss for ind in pop)
-                                if hof_best_i.loss < pop_best - 1e-9:
+                                if _afpo_hof_beats_population(
+                                        hofs[i], hof_best_i, pop):
                                     worst = max(pop, key=lambda x: x.fitness)
                                     pop.remove(worst)
                                     elite = copy.deepcopy(hof_best_i)
                                     elite.age = 0
                                     pop.append(elite)
+                                    stag_counters[tier][isl][i] = 0
 
                     # ── Submit AFPO chunks for every (tier, island) ───────────
                     futures_ag = []
@@ -35423,7 +36908,9 @@ def train_mode():
                                 flat_idx, i,
                                 list(_ADF_REGISTRY),
                                 col_bg, local_k, Y_group_i,
-                                target_grads_list[i],  # ← Sobolev
+                                target_grads_b[i],  # row-aligned Sobolev
+                                (batch_idx is not None or col_bg is not None),
+                                gen,                # absolute generation offset
                             )
                             futures_ag.append(
                                 executor.submit(evolve_afpo_island_chunk, args_ag))
@@ -35440,7 +36927,8 @@ def train_mode():
                             # the co-evolution resolution governor.
                             _coevo_admission_rescore(
                                 ind, X, Y[:, o_idx], out_types[o_idx],
-                                target_grads_list[o_idx])
+                                target_grads_list[o_idx],
+                                output_idx=o_idx)
                             if hofs[o_idx].update(ind):
                                 is_cls = (out_types[o_idx] == 6)
                                 metric = (f"Acc={getattr(ind,'accuracy',0):.4f}"
@@ -35479,6 +36967,7 @@ def train_mode():
                         for tier in range(N_GROUPS - 1):
                             next_tier = tier + 1
                             for i in range(n_outputs):
+                                _set_output_context(i)
                                 for isl in range(N_ISL_PER_G):
                                     src_pop = tier_islands[tier][isl][i]
                                     if not src_pop:
@@ -35506,7 +36995,7 @@ def train_mode():
                                     new_ind.age = 0
                                     new_ind.calculate_fitness(
                                         X_b, Y_b[:, i], out_types[i],
-                                        target_grads=target_grads_list[i])
+                                        target_grads=target_grads_b[i])
                                     # Replace a weak individual in source island
                                     if src_pop:
                                         weak = max(src_pop, key=lambda x: x.fitness)
@@ -35532,7 +37021,8 @@ def train_mode():
                             print(f"    Running simplification pass on perfect output...")
                             _simplify_perfect_output(
                                 hofs[o_idx], X, Y[:, o_idx], out_types[o_idx],
-                                target_grads=target_grads_list[o_idx])
+                                target_grads=target_grads_list[o_idx],
+                                output_idx=o_idx)
                             perfect_outputs.add(o_idx)
                             best_models_snapshot = [h.get_best_overall() for h in hofs]
                             _save_backup_model(best_models_snapshot, dp, o_idx, X_data=X)
@@ -35608,7 +37098,8 @@ def train_mode():
                         for o_idx in perfect_outputs:
                             _simplify_perfect_output(
                                 hofs[o_idx], X, Y[:, o_idx], out_types[o_idx],
-                                target_grads=target_grads_list[o_idx])
+                                target_grads=target_grads_list[o_idx],
+                                output_idx=o_idx)
 
                     # ---- Periodic HoF re-scoring on full data (batch mode) ----
                     # When BATCH_SIZE > 0 the workers see X_b as their full
