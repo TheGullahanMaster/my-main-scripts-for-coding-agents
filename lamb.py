@@ -17,10 +17,47 @@ from torch.autograd import Function
 from torch.nn import Parameter, Module
 from torch.distributions.exponential import Exponential
 import re
-class Lamb(Optimizer):
+class _FP32StateOptimizer(Optimizer):
+    """Keep floating optimizer state in FP32 for FP16/BF16 parameters.
+
+    Updates use temporary FP32 parameters, then round back to the model dtype.
+    This does not maintain master weights: sub-ULP parameter updates may round away.
+    """
+
+    def load_state_dict(self, state_dict):
+        result = super().load_state_dict(state_dict)
+        # Optimizer.load_state_dict casts floating state to the parameter dtype.
+        # Restore from the original checkpoint to avoid losing small moments.
+        for saved_group, group in zip(state_dict['param_groups'], self.param_groups):
+            for saved_id, param in zip(saved_group['params'], group['params']):
+                if param.dtype in (torch.float16, torch.bfloat16):
+                    for key, value in state_dict['state'].get(saved_id, {}).items():
+                        if torch.is_tensor(value) and value.is_floating_point() and key != 'step':
+                            self.state[param][key] = value.to(device=param.device, dtype=torch.float32).clone()
+        return result
+
+
+def _optimizer_work_param(param, state):
+    if param.dtype in (torch.float16, torch.bfloat16):
+        for key, value in state.items():
+            if torch.is_tensor(value) and value.is_floating_point() and key != 'step':
+                state[key] = value.float()
+        return param.float()
+    return param
+
+
+def _optimizer_copy_back(originals, working):
+    for original, work in zip(originals, working):
+        if original is not work:
+            original.copy_(work)
+
+
+class Lamb(_FP32StateOptimizer):
     r"""Implements Lamb algorithm.
 
     It has been proposed in `Large Batch Optimization for Deep Learning: Training BERT in 76 minutes`_.
+    FP16/BF16 parameters use FP32 state and temporary FP32 updates; model
+    parameters are rounded back to their storage dtype after each step.
 
     Arguments:
         params (iterable): iterable of parameters to optimize or dicts defining
@@ -37,7 +74,7 @@ class Lamb(Optimizer):
     """
 
     def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-6,
-                 weight_decay=1.0):
+                 weight_decay=0.0, adam=False, foreach=True):
         if not 0.0 <= lr:
             raise ValueError("Invalid learning rate: {}".format(lr))
         if not 0.0 <= eps:
@@ -46,10 +83,19 @@ class Lamb(Optimizer):
             raise ValueError("Invalid beta parameter at index 0: {}".format(betas[0]))
         if not 0.0 <= betas[1] < 1.0:
             raise ValueError("Invalid beta parameter at index 1: {}".format(betas[1]))
+        if not 0.0 <= weight_decay:
+            raise ValueError("Invalid weight_decay value: {}".format(weight_decay))
         defaults = dict(lr=lr, betas=betas, eps=eps,
-                        weight_decay=weight_decay)
+                        weight_decay=weight_decay, adam=adam, foreach=foreach)
         super(Lamb, self).__init__(params, defaults)
 
+    def __setstate__(self, state):
+        super(Lamb, self).__setstate__(state)
+        for group in self.param_groups:
+            group.setdefault('adam', False)
+            group.setdefault('foreach', True)
+
+    @torch.no_grad()
     def step(self, closure=None):
         """Performs a single optimization step.
 
@@ -59,36 +105,76 @@ class Lamb(Optimizer):
         """
         loss = None
         if closure is not None:
-            loss = closure()
+            with torch.enable_grad():
+                loss = closure()
 
         for group in self.param_groups:
+            beta1, beta2 = group['betas']
+            params_with_grad = []
+            grads = []
+            exp_avgs = []
+            exp_avg_sqs = []
+            states = []
+            originals = []
+
             for p in group['params']:
                 if p.grad is None:
                     continue
-                grad = p.grad.data
+                grad = p.grad
                 if grad.is_sparse:
-                    raise RuntimeError('Lamb does not support sparse gradients, consider SparseAdam instad.')
+                    raise RuntimeError('Lamb does not support sparse gradients, consider SparseAdam instead.')
 
                 state = self.state[p]
+                originals.append(p)
+                p = _optimizer_work_param(p, state)
+                grad = grad.to(dtype=p.dtype)
 
                 # State initialization
                 if len(state) == 0:
                     state['step'] = 0
                     # Exponential moving average of gradient values
-                    state['exp_avg'] = torch.zeros_like(p.data)
+                    state['exp_avg'] = torch.zeros_like(p, memory_format=torch.preserve_format)
                     # Exponential moving average of squared gradient values
-                    state['exp_avg_sq'] = torch.zeros_like(p.data)
+                    state['exp_avg_sq'] = torch.zeros_like(p, memory_format=torch.preserve_format)
 
                 exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
-                beta1, beta2 = group['betas']
-
                 state['step'] += 1
+
+                params_with_grad.append(p)
+                grads.append(grad)
+                exp_avgs.append(exp_avg)
+                exp_avg_sqs.append(exp_avg_sq)
+                states.append(state)
+
+            if not params_with_grad:
+                continue
+
+            if group.get('foreach', True):
+                # Bias corrections are step-specific; separating a rare late
+                # parameter from an established group preserves scalar behavior.
+                buckets = {}
+                for values in zip(params_with_grad, grads, exp_avgs, exp_avg_sqs, states):
+                    param, _, _, _, state = values
+                    key = (param.device, param.dtype, param.layout, state['step'])
+                    buckets.setdefault(key, []).append(values)
+                for tensors in buckets.values():
+                    params, bucket_grads, bucket_exp_avgs, bucket_exp_avg_sqs, bucket_states = map(list, zip(*tensors))
+                    self._foreach_update(
+                        params, bucket_grads, bucket_exp_avgs, bucket_exp_avg_sqs,
+                        bucket_states, beta1, beta2, group,
+                    )
+                _optimizer_copy_back(originals, params_with_grad)
+                continue
+
+            for p, grad, exp_avg, exp_avg_sq, state in zip(
+                params_with_grad, grads, exp_avgs, exp_avg_sqs, states,
+            ):
 
                 # Decay the first and second moment running average coefficient
                 # m_t
-                exp_avg.mul_(beta1).add_(1 - beta1, grad)
+                exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
                 # v_t
-                exp_avg_sq.mul_(beta2).addcmul_(1 - beta2, grad, grad)
+                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
 
                 # Debiasing
                 bias_correction1 = 1 - beta1 ** state['step']
@@ -96,19 +182,219 @@ class Lamb(Optimizer):
                 exp_avg_hat = exp_avg / bias_correction1
                 exp_avg_sq_hat = exp_avg_sq / bias_correction2
 
-                adam_step = exp_avg_hat / (exp_avg_sq_hat.sqrt().add(group['eps']))
+                adam_step = exp_avg_hat / exp_avg_sq_hat.sqrt().add(group['eps'])
 
                 if group['weight_decay'] != 0:
-                    adam_step.add_(group['weight_decay'], p.data)
+                    adam_step = adam_step.add(p, alpha=group['weight_decay'])
 
-                weight_norm = torch.norm(p.data)
+                weight_norm = torch.norm(p)
                 adam_norm = torch.norm(adam_step)
-                if weight_norm > 0 and adam_norm > 0:
+                if group.get('adam', False):
+                    trust_ratio = 1.0
+                elif weight_norm.item() > 0 and adam_norm.item() > 0:
                     trust_ratio = weight_norm / adam_norm
                 else:
                     trust_ratio = 1.0
+                state['weight_norm'] = weight_norm
+                state['adam_norm'] = adam_norm
+                state['trust_ratio'] = trust_ratio
 
-                p.data.add_(-group['lr'] * trust_ratio, adam_step)
+                p.add_(adam_step * trust_ratio, alpha=-group['lr'])
+
+            _optimizer_copy_back(originals, params_with_grad)
+
+        return loss
+
+    @staticmethod
+    def _foreach_update(params, grads, exp_avgs, exp_avg_sqs, states, beta1, beta2, group):
+        """Apply Lamb to a homogeneous device/dtype/step tensor bucket."""
+        step = states[0]['step']
+        torch._foreach_mul_(exp_avgs, beta1)
+        torch._foreach_add_(exp_avgs, grads, alpha=1 - beta1)
+        torch._foreach_mul_(exp_avg_sqs, beta2)
+        torch._foreach_addcmul_(exp_avg_sqs, grads, grads, value=1 - beta2)
+
+        bias_correction1 = 1 - beta1 ** step
+        bias_correction2_sqrt = math.sqrt(1 - beta2 ** step)
+        adam_steps = torch._foreach_div(exp_avgs, bias_correction1)
+        denom = torch._foreach_sqrt(exp_avg_sqs)
+        torch._foreach_div_(denom, bias_correction2_sqrt)
+        torch._foreach_add_(denom, group['eps'])
+        torch._foreach_div_(adam_steps, denom)
+        if group['weight_decay'] != 0:
+            torch._foreach_add_(adam_steps, params, alpha=group['weight_decay'])
+
+        weight_norms = torch.stack(torch._foreach_norm(params, 2))
+        adam_norms = torch.stack(torch._foreach_norm(adam_steps, 2))
+        if group.get('adam', False):
+            trust_ratios = torch.ones_like(weight_norms)
+        else:
+            valid_norms = (weight_norms > 0) & (adam_norms > 0)
+            trust_ratios = torch.where(
+                valid_norms, weight_norms / adam_norms, torch.ones_like(weight_norms),
+            )
+        for state, weight_norm, adam_norm, trust_ratio in zip(
+            states, weight_norms.unbind(), adam_norms.unbind(), trust_ratios.unbind(),
+        ):
+            state['weight_norm'] = weight_norm
+            state['adam_norm'] = adam_norm
+            state['trust_ratio'] = trust_ratio
+
+        torch._foreach_mul_(adam_steps, trust_ratios.unbind())
+        torch._foreach_add_(params, adam_steps, alpha=-group['lr'])
+
+
+class EqualizedAdamW(Optimizer):
+    r"""AdamW with optimizer-side StyleGAN2 equalized learning-rate scaling.
+
+    Parameters with two or more dimensions are treated as if their forward pass
+    used ``weight * (lr_multiplier / sqrt(fan_in))``. Under Adam this means the
+    Adam moments see the scaled gradient, then the effective parameter update is
+    multiplied by the same fixed coefficient. This mirrors StyleGAN2's equalized
+    LR update behavior; it does not renormalize each layer's update by its
+    current RMS. One-dimensional tensors, such as biases and norm parameters,
+    use standard AdamW updates. ``finite_guard`` prevents a single non-finite
+    gradient or moment value from poisoning the optimizer state.
+    """
+
+    def __init__(
+        self,
+        params,
+        lr=1e-3,
+        betas=(0.9, 0.999),
+        eps=1e-8,
+        weight_decay=0.0,
+        lr_multiplier=1.0,
+        equalize_ndim=2,
+        norm_eps=1e-12,
+        finite_guard=True,
+    ):
+        if lr < 0.0:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        if eps < 0.0:
+            raise ValueError(f"Invalid epsilon value: {eps}")
+        if not 0.0 <= betas[0] < 1.0:
+            raise ValueError(f"Invalid beta parameter at index 0: {betas[0]}")
+        if not 0.0 <= betas[1] < 1.0:
+            raise ValueError(f"Invalid beta parameter at index 1: {betas[1]}")
+        if weight_decay < 0.0:
+            raise ValueError(f"Invalid weight_decay value: {weight_decay}")
+        if lr_multiplier <= 0.0:
+            raise ValueError(f"Invalid lr_multiplier value: {lr_multiplier}")
+        if equalize_ndim < 2:
+            raise ValueError(f"equalize_ndim must be at least 2, got {equalize_ndim}")
+        if norm_eps <= 0.0:
+            raise ValueError(f"Invalid norm_eps value: {norm_eps}")
+
+        defaults = dict(
+            lr=lr,
+            betas=betas,
+            eps=eps,
+            weight_decay=weight_decay,
+            lr_multiplier=lr_multiplier,
+            equalize_ndim=equalize_ndim,
+            norm_eps=norm_eps,
+            finite_guard=finite_guard,
+        )
+        super().__init__(params, defaults)
+
+    @staticmethod
+    def _fan_in(param: torch.Tensor) -> int:
+        if param.ndim < 2:
+            return 1
+        fan_in, _ = torch.nn.init._calculate_fan_in_and_fan_out(param)
+        return max(1, int(fan_in))
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            beta1, beta2 = group['betas']
+            lr = group['lr']
+            eps = group['eps']
+            weight_decay = group['weight_decay']
+            lr_multiplier = group['lr_multiplier']
+            equalize_ndim = group['equalize_ndim']
+            finite_guard = bool(group.get('finite_guard', True))
+
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                grad = p.grad
+                if grad.is_sparse:
+                    raise RuntimeError('EqualizedAdamW does not support sparse gradients')
+                if finite_guard:
+                    grad = torch.nan_to_num(grad, nan=0.0, posinf=0.0, neginf=0.0)
+
+                equalized = p.ndim >= equalize_ndim
+                if equalized:
+                    eq_scale = lr_multiplier / math.sqrt(self._fan_in(p))
+                    moment_grad = grad * eq_scale
+                else:
+                    eq_scale = 1.0
+                    moment_grad = grad
+
+                state = self.state[p]
+                if len(state) == 0:
+                    state['step'] = 0
+                    state['exp_avg'] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                    state['exp_avg_sq'] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                    state['equalized_lr_scale'] = 1.0
+                    state['update_rms'] = 0.0
+                    state['equalized_adamw_version'] = 2
+
+                exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
+                if state.get('equalized_adamw_version', 1) < 2:
+                    if equalized:
+                        exp_avg.mul_(eq_scale)
+                        exp_avg_sq.mul_(eq_scale * eq_scale)
+                    state['equalized_adamw_version'] = 2
+                if finite_guard:
+                    torch.nan_to_num(exp_avg, nan=0.0, posinf=0.0, neginf=0.0, out=exp_avg)
+                    torch.nan_to_num(
+                        exp_avg_sq,
+                        nan=0.0,
+                        posinf=torch.finfo(exp_avg_sq.dtype).max,
+                        neginf=0.0,
+                        out=exp_avg_sq,
+                    )
+                    exp_avg_sq.clamp_(min=0.0)
+                state['step'] += 1
+                step = state['step']
+
+                exp_avg.mul_(beta1).add_(moment_grad, alpha=1.0 - beta1)
+                exp_avg_sq.mul_(beta2).addcmul_(moment_grad, moment_grad, value=1.0 - beta2)
+                if finite_guard:
+                    torch.nan_to_num(exp_avg, nan=0.0, posinf=0.0, neginf=0.0, out=exp_avg)
+                    torch.nan_to_num(
+                        exp_avg_sq,
+                        nan=0.0,
+                        posinf=torch.finfo(exp_avg_sq.dtype).max,
+                        neginf=0.0,
+                        out=exp_avg_sq,
+                    )
+                    exp_avg_sq.clamp_(min=0.0)
+
+                bias_correction1 = 1.0 - beta1 ** step
+                bias_correction2 = 1.0 - beta2 ** step
+                step_size = lr / bias_correction1
+                denom = exp_avg_sq.sqrt().div_(math.sqrt(bias_correction2)).add_(eps)
+                update = exp_avg / denom
+                if finite_guard:
+                    update = torch.nan_to_num(update, nan=0.0, posinf=0.0, neginf=0.0)
+
+                if weight_decay != 0.0:
+                    p.mul_(1.0 - lr * weight_decay)
+
+                update_rms = update.double().pow(2).mean().sqrt()
+                rms_is_finite = bool(torch.isfinite(update_rms).item())
+                state['equalized_lr_scale'] = eq_scale
+                state['update_rms'] = float(update_rms.item()) if rms_is_finite else 0.0
+                p.add_(update, alpha=-step_size * eq_scale)
 
         return loss
 import math
@@ -2082,20 +2368,33 @@ import torch
 from torch.optim.optimizer import Optimizer, required
 
 class NSGDA(Optimizer):
-    r"""Implements vanilla normalized SGD–ascent (nSGDA).
+    r"""Implements normalized SGD–ascent (nSGDA).
     
-    Each parameter update is:
+    Each parameter-group update is:
     
-        param = param - lr * (grad / (||grad|| + eps))
+        param = param - lr * (direction / (||group_direction|| + eps))
+
+    where direction is either the raw gradient or an EMA momentum buffer. If
+    cautious masking is enabled, coordinates whose current gradient conflicts
+    with the direction are zeroed in the applied update, while normalization
+    still uses the unmasked group direction so sparse masks cannot amplify the
+    surviving coordinates.
     
     Args:
         params (iterable): iterable of parameters to optimize or dicts defining
             parameter groups.
         lr (float): learning rate.
         eps (float, optional): term added to the denominator to improve numerical stability (default: 1e-8).
+        momentum (float, optional): EMA momentum for the update direction. 0.0
+            preserves vanilla nSGDA behavior. (default: 0.0)
+        cautious (bool, optional): mask coordinates where current gradient and
+            update direction disagree. Zero gradients are treated as
+            non-conflicting so momentum can carry through flat steps.
     """
-    def __init__(self, params, lr=required, eps=1e-8):
-        defaults = dict(lr=lr, eps=eps)
+    def __init__(self, params, lr=required, eps=1e-8, momentum=0.0, cautious=False):
+        if not 0.0 <= momentum < 1.0:
+            raise ValueError(f"Invalid momentum value: {momentum}")
+        defaults = dict(lr=lr, eps=eps, momentum=momentum, cautious=cautious)
         super(NSGDA, self).__init__(params, defaults)
     
     def step(self, closure=None):
@@ -2113,15 +2412,49 @@ class NSGDA(Optimizer):
         for group in self.param_groups:
             lr = group['lr']
             eps = group['eps']
-            for p in group['params']:
-                if p.grad is None:
-                    continue
+            momentum = group.get('momentum', 0.0)
+            cautious = group.get('cautious', False)
+            params_with_grad = [p for p in group['params'] if p.grad is not None]
+            if not params_with_grad:
+                continue
+            directions = []
+            group_norm_sq = None
+            active = 0
+            total = 0
+            for p in params_with_grad:
                 grad = p.grad.data
-                norm = grad.norm()
-                # Only update if the gradient norm is nonzero.
-                if norm != 0:
-                    update = grad / (norm + eps)
-                    p.data.add_(-lr * update)
+                if grad.is_sparse:
+                    raise RuntimeError('NSGDA does not support sparse gradients')
+                if momentum > 0.0:
+                    state = self.state[p]
+                    if 'momentum_buffer' not in state:
+                        state['momentum_buffer'] = torch.zeros_like(p.data, memory_format=torch.preserve_format)
+                    direction = state['momentum_buffer']
+                    direction.mul_(momentum).add_(grad, alpha=1 - momentum)
+                else:
+                    direction = grad
+
+                term = direction.pow(2).sum()
+                group_norm_sq = term if group_norm_sq is None else group_norm_sq + term
+
+                if cautious:
+                    mask = (direction * grad >= 0).to(direction.dtype)
+                    active += int(mask.count_nonzero().item())
+                    total += mask.numel()
+                    direction = direction * mask
+                else:
+                    active += direction.numel()
+                    total += direction.numel()
+
+                directions.append(direction)
+            group_norm = group_norm_sq.sqrt()
+            group['last_group_norm'] = group_norm.item()
+            group['last_cautious_fraction'] = active / total if total > 0 else 0.0
+            if group_norm == 0:
+                continue
+            scale = -lr / (group_norm + eps)
+            for p, direction in zip(params_with_grad, directions):
+                p.data.add_(direction, alpha=scale)
         return loss
 
     
@@ -2843,11 +3176,12 @@ from torch.optim.optimizer import Optimizer, required
 class AdaNSGDA(Optimizer):
     r"""Implements ada-nSGDA: grafting Adam's adaptive magnitude onto the normalized SGDA direction.
     
-    For each parameter, we maintain an exponential moving average of the squared gradients (v).
+    For each parameter, we maintain Adam-style first and second moments.
+    The gradient direction and adaptive magnitude are normalized per parameter group.
     
-    The update for each parameter is:
+    The update for each parameter group is:
     
-        adaptive = grad / (sqrt(v) + eps)
+        adaptive = m_hat / (sqrt(v_hat) + eps)
         adaptive_norm = ||adaptive||
         direction = grad / (||grad|| + eps)
         param = param - lr * adaptive_norm * direction
@@ -2855,11 +3189,18 @@ class AdaNSGDA(Optimizer):
     Args:
         params (iterable): iterable of parameters to optimize or dicts defining parameter groups.
         lr (float): learning rate.
-        beta2 (float, optional): coefficient used for computing running averages of squared gradients (default: 0.999).
+        betas (Tuple[float, float], optional): Adam moment coefficients.
+        beta2 (float, optional): backward-compatible override for betas[1].
         eps (float, optional): term added to the denominator to improve numerical stability (default: 1e-8).
     """
-    def __init__(self, params, lr=required, beta2=0.999, eps=1e-8):
-        defaults = dict(lr=lr, beta2=beta2, eps=eps)
+    def __init__(self, params, lr=required, betas=(0.0, 0.99), beta2=None, eps=1e-8):
+        if beta2 is not None:
+            betas = (betas[0], beta2)
+        if not 0.0 <= betas[0] < 1.0:
+            raise ValueError("Invalid beta parameter at index 0: {}".format(betas[0]))
+        if not 0.0 <= betas[1] < 1.0:
+            raise ValueError("Invalid beta parameter at index 1: {}".format(betas[1]))
+        defaults = dict(lr=lr, betas=betas, eps=eps)
         super(AdaNSGDA, self).__init__(params, defaults)
     
     def step(self, closure=None):
@@ -2876,31 +3217,46 @@ class AdaNSGDA(Optimizer):
             
         for group in self.param_groups:
             lr    = group['lr']
-            beta2 = group['beta2']
+            beta1, beta2 = group['betas']
             eps   = group['eps']
-            for p in group['params']:
-                if p.grad is None:
-                    continue
+            params_with_grad = [p for p in group['params'] if p.grad is not None]
+            if not params_with_grad:
+                continue
+            grad_norm_sq = None
+            adaptive_norm_sq = None
+            for p in params_with_grad:
                 grad = p.grad.data
+                if grad.is_sparse:
+                    raise RuntimeError('AdaNSGDA does not support sparse gradients')
 
-                # Update state: maintain a running average of squared gradients.
                 state = self.state[p]
-                if 'v' not in state:
-                    state['v'] = torch.zeros_like(p.data)
-                v = state['v']
-                v.mul_(beta2).addcmul_(1 - beta2, grad, grad)
+                if len(state) == 0:
+                    state['step'] = 0
+                    state['exp_avg'] = torch.zeros_like(p.data)
+                    state['exp_avg_sq'] = torch.zeros_like(p.data)
+                state['step'] += 1
+                exp_avg = state['exp_avg']
+                exp_avg_sq = state['exp_avg_sq']
+                exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
 
-                # Compute the adaptive update (Adam-style scaling)
-                adaptive = grad / (v.sqrt() + eps)
-                adaptive_norm = adaptive.norm()
+                bias_correction1 = 1 - beta1 ** state['step']
+                bias_correction2 = 1 - beta2 ** state['step']
+                exp_avg_hat = exp_avg / bias_correction1
+                exp_avg_sq_hat = exp_avg_sq / bias_correction2
+                adaptive = exp_avg_hat / (exp_avg_sq_hat.sqrt() + eps)
+                grad_term = grad.pow(2).sum()
+                adaptive_term = adaptive.pow(2).sum()
+                grad_norm_sq = grad_term if grad_norm_sq is None else grad_norm_sq + grad_term
+                adaptive_norm_sq = adaptive_term if adaptive_norm_sq is None else adaptive_norm_sq + adaptive_term
 
-                grad_norm = grad.norm()
-                if grad_norm == 0:
-                    continue
-                direction = grad / (grad_norm + eps)
-                
-                # Update: use the adaptive magnitude multiplied by the normalized direction.
-                p.data.add_(-lr * adaptive_norm * direction)
+            grad_norm = grad_norm_sq.sqrt()
+            if grad_norm == 0:
+                continue
+            adaptive_norm = adaptive_norm_sq.sqrt()
+            scale = -lr * adaptive_norm / (grad_norm + eps)
+            for p in params_with_grad:
+                p.data.add_(p.grad.data, alpha=scale)
         return loss
 import torch
 from torch.optim.optimizer import Optimizer, required
@@ -4983,7 +5339,7 @@ class RAdamScheduleFree(torch.optim.Optimizer):
     def __init__(self,
                  params: ParamsT,
                  lr: Union[float, torch.Tensor] = 0.0025,
-                 betas: Tuple[float, float] = (0.9, 0.9999),
+                 betas: Tuple[float, float] = (0.9, 0.999),
                  eps: float = 1e-8,
                  weight_decay: float = 0,
                  r: float = 0.0,
@@ -5155,6 +5511,28 @@ class RAdamScheduleFree(torch.optim.Optimizer):
 
             group["k"] = k + 1
         return loss
+
+
+import contextlib
+
+
+def is_schedule_free(optimizer):
+    """Schedule-free optimizers train at y and evaluate at the averaged x."""
+    return (optimizer is not None and hasattr(optimizer, 'eval') and bool(optimizer.param_groups)
+            and 'train_mode' in optimizer.param_groups[0])
+
+
+@contextlib.contextmanager
+def schedule_free_eval(optimizer):
+    """Swap model weights to x for evaluation or saving, then back to y."""
+    swap = is_schedule_free(optimizer) and optimizer.param_groups[0]['train_mode']
+    if swap:
+        optimizer.eval()
+    try:
+        yield
+    finally:
+        if swap:
+            optimizer.train()
 import math
 import torch
 from torch.optim.optimizer import Optimizer
@@ -5949,9 +6327,9 @@ import torch.nn as nn
 # Define The Analog Activation Function (TAAF)
 class TAAF(nn.Module):
     def forward(self, x):
-        numerator = torch.exp(-x)
-        denominator = torch.exp(-x) + torch.exp(-(x**2))  # Sum of e^{-x} and e^{-x^2}
-        return (numerator / denominator) - (1 / 2)  # TAAF formula
+        #numerator = torch.exp(-x)
+        #denominator = torch.exp(-x) + torch.exp(-(x**2))  # Sum of e^{-x} and e^{-x^2}
+        return torch.sigmoid((input)**2 - input)#(numerator / denominator) - (1 / 2)  # TAAF formula
 
 
 # Define Extended TAAF Function (ExTAAF)
@@ -6510,7 +6888,15 @@ class CoLU(nn.Module):
         super(CoLU, self).__init__()
 
     def forward(self, x):
-        return x / (((1-x)**(-(x+torch.exp(x)))) + 1e-8)
+        # CoLU (Vagerwal 2021, arXiv:2112.12078): f(x) = x / (1 - x * exp(-(x + e^x))).
+        # Each sign gets an algebraically equal form on clamped inputs so neither
+        # values nor gradients overflow (the unused torch.where branch stays finite).
+        xp = x.clamp(0, 10)  # x >= 0: exp(-(x + e^x)) <= 1/e; beyond 10 it is ~exp(-22036) = 0 (fp16-safe)
+        pos = x / (1 - x * torch.exp(-(xp + torch.exp(xp))))
+        xn = x.clamp(max=0)  # x < 0: multiply through by u = exp(x + e^x) in (0, e]
+        u = torch.exp(xn + torch.exp(xn))
+        neg = xn * u / (u - xn)
+        return torch.where(x >= 0, pos, neg)
 
 class StarReLU(nn.Module):
     def __init__(self):
@@ -10223,70 +10609,6 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
     return X
 
 
-class AdaMuon(torch.optim.Optimizer):
-    def __init__(self, params, lr=0.02, weight_decay=0.01, momentum=0.95, nesterov=True, ns_steps=5, eps=1e-8):
-        defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps, eps=eps)
-        super().__init__(params, defaults)
-        
-    @torch.no_grad()
-    def step(self):
-        for group in self.param_groups:
-            for p in group["params"]:
-                if p.grad is None:
-                    continue
-                    
-                g = p.grad
-                state = self.state[p]
-
-                # Initialize momentum buffer
-                if "momentum_buffer" not in state:
-                    state["momentum_buffer"] = torch.zeros_like(g)
-
-                buf: Tensor = state["momentum_buffer"]
-
-                # Apply momentum
-                buf.mul_(group["momentum"]).add_(g)
-
-                # Nesterov momentum
-                g = g.add(buf, alpha=group["momentum"]) if group['nesterov'] else buf
-
-                # Store original shape
-                original_shape = g.shape
-                
-                # Reshape for Newton-Schulz if needed
-                if g.ndim == 1:
-                    # For 1D tensors (like biases), reshape to 2D
-                    g = g.unsqueeze(0)
-                elif g.ndim == 4:
-                    g = g.view(len(g), -1)
-                elif g.ndim > 2:
-                    # For other high-dimensional tensors, flatten to 2D
-                    g = g.view(g.size(0), -1)
-                
-                # Apply Newton-Schulz orthogonalization
-                g = zeropower_via_newtonschulz5(torch.sign(g), steps=group["ns_steps"]).flatten()
-                
-                # Initialize second moment buffer
-                if "v_buffer" not in state:
-                    state["v_buffer"] = torch.zeros_like(g)
-                v = state["v_buffer"]
-
-                # Update second moment
-                v.mul_(group["momentum"]).addcmul_(g, g, value=1 - group["momentum"])
-                
-                # Normalize by second moment
-                g = g.div(v.sqrt().add(group["eps"]))
-
-                # Scale gradient
-                scale = 0.2 * (min(p.shape) * max(p.shape))**0.5 / (g.norm() + group["eps"])
-                g.mul_(scale)
-
-                # Reshape back to original shape
-                g = g.view(original_shape)
-
-                # Apply weight decay and update
-                p.mul_(1 - group["lr"] * group["weight_decay"])
-                p.add_(g, alpha=-group["lr"])
 
 """
 Muon Optimizer - PyTorch Implementation
@@ -10296,7 +10618,7 @@ arXiv:2502.16982v1
 
 Key features:
 - Matrix orthogonalization via Newton-Schulz iterations for 2D+ parameters
-- AdamW fallback for 1D parameters (biases, norms, embeddings)
+- AdamW fallback for scalars/vectors and explicitly selected embeddings/heads
 - Weight decay and consistent update RMS scaling
 """
 
@@ -10305,12 +10627,45 @@ from torch.optim.optimizer import Optimizer
 from typing import List, Optional, Callable
 
 
-class Muon(Optimizer):
+def muon_param_groups(model, adamw_params=(), param_groups=None):
+    """Split model parameters into Muon/AdamW groups, preserving group options.
+
+    Embedding/EmbeddingBag weights and scalars/vectors always use AdamW.
+    Callers supply learned positional embeddings and output-head parameters in
+    adamw_params: tensor shape alone cannot identify their role. Shared weights
+    are classified by identity before grouping and included only once.
+    Optimizers with muon_all=True override this routing at update time.
+    """
+    adamw_ids = {id(p) for p in adamw_params}
+    for module in model.modules():
+        if isinstance(module, (torch.nn.Embedding, torch.nn.EmbeddingBag)):
+            adamw_ids.update(id(p) for p in module.parameters())
+    if param_groups is None:
+        param_groups = [{'params': model.parameters()}]
+    result, seen = [], set()
+    for group in param_groups:
+        buckets = {True: [], False: []}
+        for p in group['params']:
+            if not p.requires_grad or id(p) in seen:
+                continue
+            seen.add(id(p))
+            use_muon = p.ndim >= 2 and id(p) not in adamw_ids
+            buckets[use_muon].append(p)
+        for use_muon, params in buckets.items():
+            if params:
+                result.append(dict(group, params=params, use_muon=use_muon))
+    return result
+
+
+class Muon(_FP32StateOptimizer):
     """
     Muon optimizer with improvements for large-scale training.
     
-    Uses Newton-Schulz orthogonalization for matrix parameters (2D+)
-    and AdamW for non-matrix parameters (1D).
+    Uses Polar Express orthogonalization by default for matrix parameters (2D+)
+    and, unless muon_all=True, AdamW for scalars/vectors or use_muon=False groups. Use
+    muon_param_groups to exclude embeddings and model-specific output heads.
+    FP16/BF16 parameters use FP32 state and temporary FP32 updates (no master
+    weights). Missing gradients skip both the update and weight decay.
     
     Args:
         params: iterable of parameters to optimize or dicts defining parameter groups
@@ -10320,7 +10675,49 @@ class Muon(Optimizer):
         newton_schulz_iter: number of Newton-Schulz iterations (default: 5)
         adam_betas: betas for Adam on non-matrix parameters (default: (0.9, 0.999))
         adam_eps: epsilon for Adam numerical stability (default: 1e-8)
-        
+        foreach: batch elementwise updates by device/dtype (default: True).
+            With rank=0 and ns_bfloat16=False, batch same-shaped NS inputs, each
+            normalized separately. Chunks contain at most 16 matrices and
+            4M input elements (larger individual matrices run separately).
+        ns_bfloat16: opt into BF16 matrix iterations (default: False)
+        rank: approximate update rank; 0 uses full Muon (default: 0). Ranks
+            >= min(rows, cols) also use the full path. Positive lower ranks
+            use a fresh randomized range sketch and QR factors, with NS on a
+            rank-by-rank core. The update is rescaled by sqrt(min_dim/rank)
+            to retain approximately the full update RMS. Momentum stays full
+            size; this is an approximate optimizer, not LoRA model adapters.
+        orthogonalization_backend: 'polar_express' (default, arXiv:2505.16932v5,
+            Appendix A) or 'newton_schulz' (legacy behavior). Both use
+            newton_schulz_iter iterations and honor ns_bfloat16 and rank.
+        cautious: mask final updates against gradients and rescale (default: False).
+            Applies to matrix updates and the AdamW fallback.
+        muon_all: use this optimizer for all parameters, overriding use_muon=False
+            (default: False). MuonAll (arXiv:2511.06086) lifts vectors to diagonal
+            matrices; scalars use 1x1 matrices, an extension of the reference.
+            Dense diagonal state/iterations cost O(n^2) memory for length n.
+            Muon's scale in this mode is set by muon_all_scale; subclasses
+            retain their own matrix adaptation/scaling on the lifted
+            matrices. Backend, rank, BF16, decay and cautious options still apply.
+            Changing this flag after stepping requires fresh optimizer state.
+            Reference: https://github.com/Saurabh750/optimizer/blob/main/muon.py
+        muon_all_reshape: when muon_all=True, reshape vectors using their closest
+            factor pair instead of lifting to diagonals (default: False). Pairs
+            exceeding a 4:1 aspect ratio (including prime lengths) are zero-padded
+            to ceil(sqrt(n)) squared; updates are trimmed
+            to the original length. Scalars remain (1, 1). Uses O(n) memory,
+            but changes the update direction; this is not diagonal MuonAll.
+            Matrix/convolution handling is unchanged.
+            Ignored when muon_all=False. Changing the active representation
+            after stepping requires fresh optimizer state.
+        muon_all_scale: Muon's update scale when muon_all=True (default: 'rms').
+            'rms' keeps the AdamW-matched 0.2*sqrt(max(rows, cols)) used
+            without muon_all, so the same lr suits both modes. 'reference' is
+            the MuonAll reference sqrt(max(1, rows/cols)), about
+            0.2*sqrt(max dim) times smaller (~4.5x at width 512), so it needs
+            a correspondingly larger lr. Optimizer states saved before this
+            option existed load as 'reference', preserving their behavior.
+            Subclasses keep their own scaling and ignore it.
+
     Example:
         >>> optimizer = Muon(model.parameters(), lr=4.2e-4)
         >>> optimizer.zero_grad()
@@ -10337,6 +10734,14 @@ class Muon(Optimizer):
         newton_schulz_iter: int = 5,
         adam_betas: tuple = (0.9, 0.999),
         adam_eps: float = 1e-8,
+        foreach: bool = True,
+        ns_bfloat16: bool = False,
+        rank: int = 0,
+        orthogonalization_backend: str = 'polar_express',
+        cautious: bool = False,
+        muon_all: bool = False,
+        muon_all_reshape: bool = False,
+        muon_all_scale: str = 'rms',
     ):
         if lr < 0.0:
             raise ValueError(f"Invalid learning rate: {lr}")
@@ -10346,6 +10751,11 @@ class Muon(Optimizer):
             raise ValueError(f"Invalid weight_decay value: {weight_decay}")
         if newton_schulz_iter < 1:
             raise ValueError(f"Invalid newton_schulz_iter: {newton_schulz_iter}")
+        if len(adam_betas) != 2 or not all(0 <= beta < 1 for beta in adam_betas):
+            raise ValueError(f"Invalid adam_betas: {adam_betas}")
+        if adam_eps <= 0:
+            raise ValueError(f"Invalid adam_eps: {adam_eps}")
+        self._validate_rank(rank)
             
         defaults = dict(
             lr=lr,
@@ -10354,9 +10764,115 @@ class Muon(Optimizer):
             newton_schulz_iter=newton_schulz_iter,
             adam_betas=adam_betas,
             adam_eps=adam_eps,
+            foreach=foreach,
+            ns_bfloat16=ns_bfloat16,
+            rank=rank,
+            orthogonalization_backend=orthogonalization_backend,
+            cautious=cautious,
+            muon_all=muon_all,
+            muon_all_reshape=muon_all_reshape,
+            muon_all_scale=muon_all_scale,
         )
         super().__init__(params, defaults)
-    
+        for group in self.param_groups:
+            self._validate_rank(group['rank'])
+            self._validate_backend(group)
+
+    @staticmethod
+    def _validate_backend(group):
+        if not isinstance(group.get('muon_all_reshape', False), bool):
+            raise ValueError('muon_all_reshape must be boolean')
+        if not isinstance(group.get('muon_all', False), bool):
+            raise ValueError('muon_all must be boolean')
+        if not isinstance(group.get('cautious', False), bool):
+            raise ValueError('cautious must be boolean')
+        if group.get('muon_all_scale', 'rms') not in ('rms', 'reference'):
+            raise ValueError("muon_all_scale must be 'rms' or 'reference'")
+        backend = group.get('orthogonalization_backend', 'polar_express')
+        if backend not in ('newton_schulz', 'polar_express'):
+            raise ValueError(f'Unknown orthogonalization_backend: {backend!r}')
+        steps = group['newton_schulz_iter']
+        if isinstance(steps, bool) or not isinstance(steps, int) or steps < 1:
+            raise ValueError('Orthogonalization iterations must be a positive integer')
+
+    @staticmethod
+    def _validate_rank(rank):
+        if isinstance(rank, bool) or not isinstance(rank, int) or rank < 0:
+            raise ValueError(f"rank must be a nonnegative integer, got {rank!r}")
+
+    def __setstate__(self, state):
+        super().__setstate__(state)
+        for group in self.param_groups:
+            # Checkpoints from the original implementation have none of these.
+            group.setdefault('foreach', True)
+            group.setdefault('ns_bfloat16', False)
+            group.setdefault('rank', 0)
+            group.setdefault('cautious', False)
+            group.setdefault('muon_all', False)
+            group.setdefault('muon_all_reshape', False)
+            group.setdefault('orthogonalization_backend', 'newton_schulz')
+            # Earlier MuonAll states used the reference scale.
+            group.setdefault('muon_all_scale', 'reference')
+            self._validate_backend(group)
+
+    @staticmethod
+    def _muon_reshape_shape(size):
+        """Closest exact factors within 4:1, otherwise a zero-padded square."""
+        if size <= 1:
+            return 1, size
+        root = math.isqrt(size)
+        for rows in range(root, 1, -1):
+            if size % rows == 0:
+                cols = size // rows
+                if cols <= 4 * rows:
+                    return rows, cols
+                break
+        side = root + 1
+        return side, side
+
+    @staticmethod
+    def _reshape_muon_vector(vector, shape):
+        flat = vector.reshape(-1)
+        size = shape[0] * shape[1]
+        if size != flat.numel():
+            padded = vector.new_zeros(size)
+            padded[:flat.numel()].copy_(flat)
+            flat = padded
+        return flat.reshape(shape)
+
+    @staticmethod
+    def _prepare_muon_param(param, state, group):
+        """Lift before state initialization; keep state keyed by the real parameter."""
+        muon_all = group.get('muon_all', False)
+        if state and state.get('muon_all', False) != muon_all:
+            raise ValueError('Changing muon_all requires fresh optimizer state')
+        reshape = muon_all and group.get('muon_all_reshape', False)
+        if state and state.get('muon_all_reshape', False) != reshape:
+            raise ValueError('Changing muon_all_reshape requires fresh optimizer state')
+        work = _optimizer_work_param(param, state)
+        grad = param.grad.to(dtype=work.dtype)
+        if muon_all and param.ndim < 2:
+            if reshape:
+                shape = Muon._muon_reshape_shape(param.numel())
+                work = Muon._reshape_muon_vector(work, shape)
+                grad = Muon._reshape_muon_vector(grad, shape)
+            else:
+                work = torch.diag(work.reshape(-1))
+                grad = torch.diag(grad.reshape(-1))
+        matrix = muon_all or (param.ndim >= 2 and group.get('use_muon', True))
+        return work, grad, matrix
+
+    @staticmethod
+    def _copy_muon_back(originals, working, group):
+        for original, work in zip(originals, working):
+            if original is not work:
+                if original.ndim < 2 and work.ndim == 2:
+                    if group.get('muon_all_reshape', False):
+                        work = work.reshape(-1)[:original.numel()].reshape_as(original)
+                    else:
+                        work = work.diagonal().reshape_as(original)
+                original.copy_(work)
+
     @torch.no_grad()
     def step(self, closure: Optional[Callable] = None):
         """
@@ -10374,38 +10890,73 @@ class Muon(Optimizer):
                 loss = closure()
         
         for group in self.param_groups:
+            self._validate_rank(group.get('rank', 0))
+            self._validate_backend(group)
             lr = group['lr']
             momentum = group['momentum']
             weight_decay = group['weight_decay']
-            newton_schulz_iter = group['newton_schulz_iter']
             adam_betas = group['adam_betas']
             adam_eps = group['adam_eps']
             
-            for p in group['params']:
-                if p.grad is None:
-                    continue
-                
-                grad = p.grad
+            active = [p for p in group['params'] if p.grad is not None]
+            for p in active:
+                if p.grad.is_sparse or p.grad.layout != torch.strided:
+                    raise RuntimeError("Muon does not support sparse gradients")
+                if not p.is_floating_point():
+                    raise RuntimeError("Muon requires real floating-point parameters")
+            buckets = {}
+            for p in active:
                 state = self.state[p]
+                work, grad, use_muon = self._prepare_muon_param(p, state, group)
                 
                 # State initialization
                 if len(state) == 0:
                     state['step'] = 0
-                    if p.ndim >= 2:
+                    if use_muon:
                         # Muon: single momentum buffer for matrix parameters
-                        state['momentum'] = torch.zeros_like(p)
+                        state['momentum'] = torch.zeros_like(work)
                     else:
                         # Adam: first and second moment for non-matrix parameters
-                        state['exp_avg'] = torch.zeros_like(p)
-                        state['exp_avg_sq'] = torch.zeros_like(p)
+                        state['exp_avg'] = torch.zeros_like(work)
+                        state['exp_avg_sq'] = torch.zeros_like(work)
                 
+                if group.get('muon_all', False):
+                    state['muon_all'] = True
+                    if group.get('muon_all_reshape', False):
+                        state['muon_all_reshape'] = True
                 state['step'] += 1
                 
-                # Use Muon for 2D+ tensors (matrices), Adam for 1D tensors
-                if p.ndim >= 2:
-                    self._muon_step(p, grad, state, lr, momentum, weight_decay, newton_schulz_iter)
+                if group.get('foreach', True):
+                    key = (work.device, work.dtype, bool(use_muon))
+                    buckets.setdefault(key, []).append((p, work, grad, state))
+                elif use_muon:
+                    self._muon_step(work, grad, state, lr, momentum, weight_decay, group)
                 else:
-                    self._adam_step(p, grad, state, lr, weight_decay, adam_betas, adam_eps)
+                    self._adam_step(work, grad, state, lr, weight_decay, adam_betas, adam_eps,
+                                    group.get('cautious', False))
+                if not group.get('foreach', True) and work is not p:
+                    self._copy_muon_back([p], [work], group)
+
+            for (_, _, use_muon), entries in buckets.items():
+                originals, params, grads, states = map(list, zip(*entries))
+                if use_muon:
+                    buffers = [state['momentum'] for state in states]
+                    torch._foreach_mul_(buffers, momentum)
+                    torch._foreach_add_(buffers, grads)
+                    inputs = torch._foreach_mul(buffers, momentum)
+                    torch._foreach_add_(inputs, grads)
+                    updates = self._orthogonalize_batch(inputs, group)
+                    if group.get('cautious', False):
+                        for update, grad in zip(updates, grads):
+                            self._apply_cautious_mask_(update, grad)
+                    scales = [-lr * self._update_scale(g, group) for g in inputs]
+                    torch._foreach_mul_(updates, scales)
+                    if weight_decay:
+                        torch._foreach_mul_(params, 1 - lr * weight_decay)
+                    torch._foreach_add_(params, updates)
+                else:
+                    self._foreach_adam_step(params, grads, states, group)
+                self._copy_muon_back(originals, params, group)
         
         return loss
     
@@ -10417,7 +10968,7 @@ class Muon(Optimizer):
         lr: float,
         momentum: float,
         weight_decay: float,
-        num_iters: int,
+        group: dict,
     ):
         """Apply Muon update to a matrix parameter."""
         momentum_buffer = state['momentum']
@@ -10429,34 +10980,180 @@ class Muon(Optimizer):
         # This is mentioned in footnote 1 of the paper
         nesterov_input = momentum * momentum_buffer + grad
         
-        # Newton-Schulz orthogonalization
-        # For tensors with ndim > 2, reshape to 2D for orthogonalization
-        original_shape = nesterov_input.shape
-        if nesterov_input.ndim > 2:
-            # Reshape to [first_dim, product_of_rest]
-            nesterov_2d = nesterov_input.reshape(original_shape[0], -1)
-        else:
-            nesterov_2d = nesterov_input
-        
-        orthogonalized_2d = self._newton_schulz_orthogonalize(nesterov_2d, num_iters)
-        
-        # Reshape back to original shape if needed
-        if nesterov_input.ndim > 2:
-            orthogonalized = orthogonalized_2d.reshape(original_shape)
-        else:
-            orthogonalized = orthogonalized_2d
-        
-        # Scale by sqrt(max(A, B)) for consistent RMS across different shapes
-        # Scale by 0.2 to match AdamW's update RMS (Section 2.2, Equation 4)
-        # Use the dimensions of the 2D reshaped matrix
-        A, B = nesterov_2d.shape[0], nesterov_2d.shape[1]
-        update_scale = 0.2 * (max(A, B) ** 0.5)
+        orthogonalized = self._orthogonalize(nesterov_input, group)
+        if group.get('cautious', False):
+            self._apply_cautious_mask_(orthogonalized, grad)
+        # Match AdamW's update RMS using the flattened matrix dimensions.
+        update_scale = self._update_scale(nesterov_input, group)
         
         # Apply weight decay: W_t = W_{t-1} - lr * weight_decay * W_{t-1}
-        param.mul_(1 - lr * weight_decay)
+        if weight_decay:
+            param.mul_(1 - lr * weight_decay)
         
         # Apply Muon update: W_t = W_t - lr * scale * O_t
         param.add_(orthogonalized, alpha=-lr * update_scale)
+
+    @staticmethod
+    def _apply_cautious_mask_(update, grad):
+        """Mask the final descent direction, with independent per-tensor rescaling.
+
+        C-Optim reference: retain update * gradient > 0, divide by the retained
+        fraction clamped at 1e-3. Never alter momentum/variance or weight decay.
+        """
+        mask = (update * grad.reshape_as(update)).gt(0).to(update.dtype)
+        mask.div_(mask.mean().clamp_min(1e-3))
+        update.mul_(mask)
+
+    @staticmethod
+    def _update_scale(matrix, group=None):
+        rows = matrix.shape[0]
+        cols = matrix.numel() // rows
+        if (group is not None and group.get('muon_all', False)
+                and group.get('muon_all_scale', 'rms') == 'reference'):
+            return max(1, rows / cols) ** 0.5
+        return 0.2 * max(rows, cols) ** 0.5
+
+    def _orthogonalize_batch(self, matrices, group):
+        """Batch full Muon without mixing matrix norms or parameter groups.
+
+        Keep the randomized low-rank path and its RNG consumption unchanged.
+        BF16 retains per-matrix kernels: batched GEMM rounding can materially
+        change its quintic iteration, even when full-precision results agree.
+        Limit stacked-input size; NS also allocates Gram/intermediate tensors.
+        """
+        if group.get('rank', 0) != 0 or group.get('ns_bfloat16', False):
+            return [self._orthogonalize(matrix, group) for matrix in matrices]
+        buckets = {}
+        for index, matrix in enumerate(matrices):
+            key = (matrix.device, matrix.dtype, tuple(matrix.shape))
+            buckets.setdefault(key, []).append(index)
+        updates = [None] * len(matrices)
+        for indices in buckets.values():
+            example = matrices[indices[0]]
+            chunk_size = max(1, min(16, (4 * 1024 * 1024) // max(1, example.numel())))
+            for start in range(0, len(indices), chunk_size):
+                chunk = indices[start:start + chunk_size]
+                if len(chunk) == 1:
+                    index = chunk[0]
+                    updates[index] = self._orthogonalize(matrices[index], group)
+                    continue
+                stacked = torch.stack([matrices[i].reshape(example.shape[0], -1) for i in chunk])
+                result = self._group_orthogonalize(stacked, group).to(example.dtype)
+                for index, update in zip(chunk, result.unbind(0)):
+                    updates[index] = update.reshape(example.shape)
+        return updates
+
+    def _orthogonalize(self, matrix, group):
+        shape, dtype = matrix.shape, matrix.dtype
+        matrix = matrix.reshape(shape[0], -1)
+        rank = group.get('rank', 0)
+        if 0 < rank < min(matrix.shape):
+            return self._low_rank_orthogonalize(
+                matrix, rank, group['newton_schulz_iter'],
+                group.get('ns_bfloat16', False),
+                group.get('orthogonalization_backend', 'polar_express')).to(dtype).reshape(shape)
+        if group.get('ns_bfloat16', False):
+            matrix = matrix.bfloat16()
+        return self._group_orthogonalize(matrix, group).to(dtype).reshape(shape)
+
+    def _group_orthogonalize(self, matrix, group):
+        backend = group.get('orthogonalization_backend', 'polar_express')
+        if group.get('muon_all', False) and backend == 'newton_schulz':
+            return self._newton_schulz_orthogonalize(
+                matrix, group['newton_schulz_iter'], add_eps=True)
+        return self._matrix_orthogonalize(matrix, group['newton_schulz_iter'], backend)
+
+    @staticmethod
+    def _matrix_orthogonalize(matrix, num_iters, backend):
+        if backend == 'polar_express':
+            return Muon._polar_express_orthogonalize(matrix, num_iters)
+        if backend == 'newton_schulz':
+            return Muon._newton_schulz_orthogonalize(matrix, num_iters)
+        raise ValueError(f'Unknown orthogonalization_backend: {backend!r}')
+
+    @staticmethod
+    def _polar_express_orthogonalize(matrix, num_iters):
+        """Degree-five Polar Express, Appendix A of arXiv:2505.16932v5.
+
+        Uses the published polynomial schedule and BOTH 1.01 safety factors.
+        Repeat the final polynomial beyond eight iterations. Preserve the
+        caller's precision; ns_bfloat16 opts into BF16, including for PE.
+        FP32 norms guard low-precision overflow and all-zero inputs. Supports
+        individual matrices and batches with independent Frobenius norms.
+        """
+        coefficients = (
+            (8.28721201814563, -23.595886519098837, 17.300387312530933),
+            (4.107059111542203, -2.9478499167379106, 0.5448431082926601),
+            (3.9486908534822946, -2.908902115962949, 0.5518191394370137),
+            (3.3184196573706015, -2.488488024314874, 0.51004894012372),
+            (2.300652019954817, -1.6689039845747493, 0.4188073119525673),
+            (1.891301407787398, -1.2679958271945868, 0.37680408948524835),
+            (1.8750014808534479, -1.2500016453999487, 0.3750001645474248),
+            (1.875, -1.25, 0.375),
+        )
+        transposed = matrix.shape[-2] > matrix.shape[-1]
+        x = matrix.mT if transposed else matrix
+        norm_input = x.float() if x.dtype in (torch.float16, torch.bfloat16) else x
+        norm = norm_input.norm(dim=(-2, -1), keepdim=True)
+        x = (x / (norm * 1.01 + 1e-7)).to(matrix.dtype)
+        for index in range(num_iters):
+            a, b, c = coefficients[min(index, len(coefficients) - 1)]
+            if index < len(coefficients) - 1:
+                a, b, c = a / 1.01, b / 1.01**3, c / 1.01**5
+            gram = x @ x.mT
+            polynomial = b * gram + c * (gram @ gram)
+            x = a * x + polynomial @ x
+        return x.mT if transposed else x
+
+    @staticmethod
+    def _low_rank_orthogonalize(matrix, rank, num_iters, ns_bfloat16=False,
+                              orthogonalization_backend='polar_express'):
+        """Approximate M = Q C V.T, then return Q NS(C) V.T.
+
+        Randomized range finding follows the QR sketch used by Halko et al.
+        (2009), also used in torch.svd_lowrank, but no SVD is needed here.
+        Both QR decompositions run in FP32 (FP64 inputs retain FP64). Only
+        the small Newton-Schulz core optionally uses BF16. Fresh sketches
+        consume the device RNG; reproducible resumes need the training RNG
+        state as well as the optimizer checkpoint.
+        """
+        transposed = matrix.shape[0] > matrix.shape[1]
+        x = matrix.mT if transposed else matrix
+        if x.dtype in (torch.float16, torch.bfloat16):
+            x = x.float()
+        x = x / x.norm().clamp_min(1e-7)
+        sketch = torch.randn(x.shape[1], rank, device=x.device, dtype=x.dtype)
+        q = torch.linalg.qr(x @ sketch, mode='reduced').Q
+        # B.T = V R, hence the compressed core Q.T M V is R.T.
+        v, r = torch.linalg.qr((q.mT @ x).mT, mode='reduced')
+        core = r.mT.bfloat16() if ns_bfloat16 else r.mT
+        core = Muon._matrix_orthogonalize(core, num_iters, orthogonalization_backend).to(x.dtype)
+        update = (q @ core) @ v.mT
+        update.mul_((min(matrix.shape) / rank) ** 0.5)
+        return update.mT if transposed else update
+
+    @staticmethod
+    def _foreach_adam_step(params, grads, states, group):
+        beta1, beta2 = group['adam_betas']
+        exp_avgs = [state['exp_avg'] for state in states]
+        exp_avg_sqs = [state['exp_avg_sq'] for state in states]
+        torch._foreach_mul_(exp_avgs, beta1)
+        torch._foreach_add_(exp_avgs, grads, alpha=1 - beta1)
+        torch._foreach_mul_(exp_avg_sqs, beta2)
+        torch._foreach_addcmul_(exp_avg_sqs, grads, grads, value=1 - beta2)
+        denom = torch._foreach_sqrt(exp_avg_sqs)
+        torch._foreach_div_(denom, [(1 - beta2 ** s['step']) ** 0.5 for s in states])
+        torch._foreach_add_(denom, group['adam_eps'])
+        if group['weight_decay']:
+            torch._foreach_mul_(params, 1 - group['lr'] * group['weight_decay'])
+        step_sizes = [-group['lr'] / (1 - beta1 ** s['step']) for s in states]
+        if group.get('cautious', False):
+            updates = torch._foreach_div(exp_avgs, denom)
+            for update, grad in zip(updates, grads):
+                Muon._apply_cautious_mask_(update, grad)
+            torch._foreach_add_(params, torch._foreach_mul(updates, step_sizes))
+        else:
+            torch._foreach_addcdiv_(params, exp_avgs, denom, step_sizes)
     
     def _adam_step(
         self,
@@ -10467,6 +11164,7 @@ class Muon(Optimizer):
         weight_decay: float,
         betas: tuple,
         eps: float,
+        cautious: bool = False,
     ):
         """Apply AdamW update to a non-matrix parameter."""
         beta1, beta2 = betas
@@ -10492,30 +11190,38 @@ class Muon(Optimizer):
         
         # Update parameters: θ_t = θ_{t-1} - α * m̂_t / (√v̂_t + ε)
         denom = (exp_avg_sq.sqrt() / bias_correction2_sqrt).add_(eps)
-        param.addcdiv_(exp_avg, denom, value=-step_size)
+        if cautious:
+            update = exp_avg / denom
+            self._apply_cautious_mask_(update, grad)
+            param.add_(update, alpha=-step_size)
+        else:
+            param.addcdiv_(exp_avg, denom, value=-step_size)
     
+    @staticmethod
     def _newton_schulz_orthogonalize(
-        self,
         matrix: torch.Tensor,
         num_iters: int,
+        add_eps: bool = False,
     ) -> torch.Tensor:
         """
         Perform Newton-Schulz iteration to approximate orthogonalization.
         
         Computes (M @ M^T)^{-1/2} @ M ≈ U @ V^T where M = U @ Σ @ V^T is the SVD.
-        This orthogonalizes the matrix by removing the singular values.
+        The quintic coefficients flatten singular values approximately; they do
+        not converge to an exact polar factor even with additional iterations.
         
         Uses the iteration from Section 2.1 (Equation 2):
         X_k = a*X_{k-1} + b*(X_{k-1}*X_{k-1}^T)*X_{k-1} + c*(X_{k-1}*X_{k-1}^T)²*X_{k-1}
         
         Args:
-            matrix: Input 2D matrix to orthogonalize [A, B]
+            matrix: Input matrix [A, B] or batch [N, A, B]; each is normalized separately
             num_iters: Number of Newton-Schulz iterations (typically 5)
+            add_eps: use MuonAll reference additive epsilon instead of clamping
             
         Returns:
-            Approximately orthogonalized 2D matrix [A, B]
+            Approximately orthogonalized matrix or batch with the input shape
         """
-        assert matrix.ndim == 2, "Input to Newton-Schulz must be 2D"
+        assert matrix.ndim in (2, 3), "Input to Newton-Schulz must be 2D or a 3D batch"
         
         # Coefficients from the paper (Section 2.1)
         # These are tuned to make convergence faster for small initial singular values
@@ -10525,7 +11231,13 @@ class Muon(Optimizer):
         
         # Initialize: X_0 = M / ||M||_F
         # Normalize by Frobenius norm to ensure convergence
-        X = matrix / matrix.norm(p='fro')
+        transposed = matrix.shape[-2] > matrix.shape[-1]
+        X = matrix.mT if transposed else matrix
+        # Accumulate low-precision norms in FP32 and guard zero momentum/gradients.
+        norm_input = X.float() if X.dtype in (torch.float16, torch.bfloat16) else X
+        norm = (norm_input.norm(p='fro') if matrix.ndim == 2 else
+                norm_input.norm(p='fro', dim=(-2, -1), keepdim=True))
+        X = (X / (norm + 1e-7 if add_eps else norm.clamp_min(1e-7))).to(matrix.dtype)
         
         # Iteratively refine the orthogonalization
         for _ in range(num_iters):
@@ -10533,16 +11245,642 @@ class Muon(Optimizer):
             XXT = X @ X.mT
             
             # Compute (X @ X^T)²
-            XXT_squared = XXT @ XXT
+            polynomial = b * XXT + c * (XXT @ XXT)
             
             # Apply polynomial iteration: f(x) = ax + bx³ + cx⁵
             # X_k = a*X + b*XXT*X + c*XXT²*X
-            X = a * X + b * (XXT @ X) + c * (XXT_squared @ X)
+            X = a * X + polynomial @ X
         
-        return X
+        return X.mT if transposed else X
 
 
 
+
+
+class AdaMuon(Muon):
+    """AdaMuon Algorithm 1 (Si et al., arXiv:2507.11005v3), on Muon's kernels.
+
+    Matrix updates use NS(sign(momentum)), an elementwise second moment of
+    that direction with the SAME momentum coefficient (no bias correction),
+    and normalization to RMS 0.2. Vectors/scalars and use_muon=False groups
+    use the inherited AdamW fallback. Convolutions flatten to (shape[0], -1).
+
+    Inherits FP32 state, foreach updates, chunked same-shape NS, optional
+    BF16 iterations and randomized low-rank NS from Muon. rank>0 is an
+    approximate extension, not the paper algorithm. Full-size moment buffers
+    are retained even in low-rank mode; there are no FP32 master weights.
+    Polar Express is the default orthogonalization backend; select
+    newton_schulz for the paper's NS5. cautious=False preserves unmasked updates.
+
+    nesterov=False follows Algorithm 1. True matches the authors' reference
+    code's optional Nesterov direction before sign transformation. ns_steps
+    is a compatibility alias for newton_schulz_iter. eps stabilizes the
+    adaptive denominator and update norm; adam_eps is separate.
+
+    Sources: https://arxiv.org/html/2507.11005v3#alg1
+    https://github.com/Chongjie-Si/AdaMuon/blob/main/adamuon.py
+    Legacy AdaMuon optimizer state is incompatible; retain model weights and
+    start fresh optimizer state when moving from that implementation.
+    muon_all=True applies this matrix rule to all parameters using Muon's lifting.
+    """
+
+    def __init__(self, params, lr=4.2e-4, weight_decay=0.1, momentum=0.95,
+                 nesterov=False, ns_steps=None, eps=1e-8, *,
+                 newton_schulz_iter=5, adam_betas=(0.9, 0.999), adam_eps=1e-8,
+                 foreach=True, ns_bfloat16=False, rank=0,
+                 orthogonalization_backend='polar_express', cautious=False, muon_all=False, muon_all_reshape=False):
+        if ns_steps is not None:
+            if newton_schulz_iter != 5 and newton_schulz_iter != ns_steps:
+                raise ValueError('Conflicting ns_steps and newton_schulz_iter')
+            newton_schulz_iter = ns_steps
+        super().__init__(params, lr=lr, momentum=momentum, weight_decay=weight_decay,
+                         newton_schulz_iter=newton_schulz_iter, adam_betas=adam_betas,
+                         adam_eps=adam_eps, foreach=foreach, ns_bfloat16=ns_bfloat16, rank=rank,
+                         orthogonalization_backend=orthogonalization_backend, cautious=cautious, muon_all=muon_all,
+                         muon_all_reshape=muon_all_reshape)
+        self.defaults.update(eps=eps, nesterov=nesterov, adamuon_version=1)
+        for group in self.param_groups:
+            group.setdefault('eps', eps)
+            group.setdefault('nesterov', nesterov)
+            group['adamuon_version'] = 1
+            self._validate_adamuon_group(group)
+
+    @staticmethod
+    def _validate_adamuon_group(group):
+        Muon._validate_backend(group)
+        for key in ('lr', 'weight_decay', 'eps', 'adam_eps'):
+            value = group[key]
+            if not math.isfinite(value) or value < 0 or (key in ('eps', 'adam_eps') and value == 0):
+                raise ValueError(f'Invalid AdaMuon {key}: {value}')
+        if not 0 <= group['momentum'] < 1:
+            raise ValueError('AdaMuon momentum must be in [0, 1)')
+        if len(group['adam_betas']) != 2 or not all(0 <= beta < 1 for beta in group['adam_betas']):
+            raise ValueError('Invalid AdaMuon AdamW fallback betas')
+        steps = group['newton_schulz_iter']
+        if isinstance(steps, bool) or not isinstance(steps, int) or steps < 1:
+            raise ValueError('Newton-Schulz iteration count must be a positive integer')
+        Muon._validate_rank(group['rank'])
+        for key in ('nesterov', 'foreach', 'ns_bfloat16'):
+            if not isinstance(group[key], bool):
+                raise ValueError(f'AdaMuon {key} must be boolean')
+
+    def load_state_dict(self, state_dict):
+        for group in state_dict['param_groups']:
+            if group.get('adamuon_version') != 1:
+                raise ValueError('Incompatible AdaMuon optimizer checkpoint: load model weights '
+                                 'and initialize fresh AdaMuon state for legacy AdaMuon/Muon checkpoints')
+            self._validate_adamuon_group(group)
+        return super().load_state_dict(state_dict)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        for group in self.param_groups:
+            self._validate_adamuon_group(group)
+            active = [p for p in group['params'] if p.grad is not None]
+            for param in active:
+                if param.grad.layout != torch.strided:
+                    raise RuntimeError('AdaMuon does not support sparse gradients')
+                if not param.is_floating_point():
+                    raise RuntimeError('AdaMuon requires real floating-point parameters')
+            buckets = {}
+            for param in active:
+                state = self.state[param]
+                work, grad, matrix = self._prepare_muon_param(param, state, group)
+                if not state:
+                    state['step'] = 0
+                    state['momentum' if matrix else 'exp_avg'] = torch.zeros_like(work)
+                    state['exp_avg_sq'] = self._matrix_variance(work) if matrix else torch.zeros_like(work)
+                if group.get('muon_all', False):
+                    state['muon_all'] = True
+                    if group.get('muon_all_reshape', False):
+                        state['muon_all_reshape'] = True
+                state['step'] += 1
+                if group['foreach']:
+                    buckets.setdefault((work.device, work.dtype, matrix), []).append((param, work, grad, state))
+                else:
+                    if matrix:
+                        self._adamuon_step(work, grad, state, group)
+                    else:
+                        self._adam_step(work, grad, state, group['lr'], group['weight_decay'],
+                                        group['adam_betas'], group['adam_eps'], group.get('cautious', False))
+                    if work is not param:
+                        self._copy_muon_back([param], [work], group)
+            for (_, _, matrix), entries in buckets.items():
+                originals, params, grads, states = map(list, zip(*entries))
+                if matrix:
+                    self._foreach_adamuon_step(params, grads, states, group)
+                else:
+                    self._foreach_adam_step(params, grads, states, group)
+                self._copy_muon_back(originals, params, group)
+        return loss
+
+    @staticmethod
+    def _matrix_variance(work):
+        return torch.zeros_like(work)
+
+    def _adamuon_step(self, param, grad, state, group):
+        beta = group['momentum']
+        momentum = state['momentum']
+        momentum.mul_(beta).add_(grad)
+        direction = grad.add(momentum, alpha=beta) if group['nesterov'] else momentum
+        update = self._orthogonalize(direction.sign(), group)
+        variance = state['exp_avg_sq']
+        variance.mul_(beta).addcmul_(update, update, value=1 - beta)
+        update.div_(variance.sqrt().add_(group['eps']))
+        update.div_(update.norm().add_(group['eps']))
+        if group.get('cautious', False):
+            self._apply_cautious_mask_(update, grad)
+        param.mul_(1 - group['lr'] * group['weight_decay'])
+        param.add_(update, alpha=-group['lr'] * .2 * param.numel() ** .5)
+
+    def _foreach_adamuon_step(self, params, grads, states, group):
+        beta = group['momentum']
+        buffers = [state['momentum'] for state in states]
+        torch._foreach_mul_(buffers, beta)
+        torch._foreach_add_(buffers, grads)
+        if group['nesterov']:
+            inputs = torch._foreach_mul(buffers, beta)
+            torch._foreach_add_(inputs, grads)
+            torch._foreach_sign_(inputs)
+        else:
+            inputs = torch._foreach_sign(buffers)
+        updates = self._orthogonalize_batch(inputs, group)
+        variances = [state['exp_avg_sq'] for state in states]
+        torch._foreach_mul_(variances, beta)
+        torch._foreach_addcmul_(variances, updates, updates, value=1 - beta)
+        denominators = torch._foreach_sqrt(variances)
+        torch._foreach_add_(denominators, group['eps'])
+        torch._foreach_div_(updates, denominators)
+        norms = torch._foreach_norm(updates)
+        torch._foreach_add_(norms, group['eps'])
+        torch._foreach_div_(updates, norms)
+        if group.get('cautious', False):
+            for update, grad in zip(updates, grads):
+                self._apply_cautious_mask_(update, grad)
+        torch._foreach_mul_(updates, [-group['lr'] * .2 * p.numel() ** .5 for p in params])
+        if group['weight_decay']:
+            torch._foreach_mul_(params, 1 - group['lr'] * group['weight_decay'])
+        torch._foreach_add_(params, updates)
+
+
+class NorMuon(AdaMuon):
+    """NorMuon Algorithm 1, arXiv:2510.05491 (Li et al.).
+
+    EMA(momentum) -> orthogonalize -> row-wise EMA(update squared) ->
+    normalize rows -> rescale to RMS 0.2. No sign transform, Nesterov or bias
+    correction. beta2 defaults to 0.95, independent of momentum (beta1).
+    Matrix variance has shape (rows, 1); convolutions flatten after axis 0.
+    AdamW fallback, FP32 state, batching, Polar Express by default, and optional
+    BF16/approximate rank are shared with Muon. rank=0 and newton_schulz reproduce
+    the paper algorithm. Zero-update normalization is guarded by eps.
+    cautious=False is inherited; True masks final matrix and fallback updates.
+    muon_all=True applies this matrix rule to all parameters using Muon's lifting.
+    """
+    def __init__(self, params, lr=4.2e-4, momentum=0.95, beta2=0.95,
+                 weight_decay=0.1, eps=1e-8, *, newton_schulz_iter=5,
+                 adam_betas=(0.9, 0.999), adam_eps=1e-8, foreach=True,
+                 ns_bfloat16=False, rank=0, orthogonalization_backend='polar_express', cautious=False, muon_all=False, muon_all_reshape=False):
+        super().__init__(params, lr=lr, momentum=momentum, weight_decay=weight_decay,
+                         eps=eps, newton_schulz_iter=newton_schulz_iter,
+                         adam_betas=adam_betas, adam_eps=adam_eps, foreach=foreach,
+                         ns_bfloat16=ns_bfloat16, rank=rank,
+                         orthogonalization_backend=orthogonalization_backend, cautious=cautious, muon_all=muon_all,
+                         muon_all_reshape=muon_all_reshape)
+        self.defaults.pop('adamuon_version')
+        self.defaults.update(beta2=beta2, normuon_version=1)
+        for group in self.param_groups:
+            group.pop('adamuon_version', None)
+            group.setdefault('beta2', beta2)
+            group['normuon_version'] = 1
+            self._validate_adamuon_group(group)
+
+    @staticmethod
+    def _validate_adamuon_group(group):
+        AdaMuon._validate_adamuon_group(group)
+        if not 0 <= group.get('beta2', 0.95) < 1:
+            raise ValueError('NorMuon beta2 must be in [0, 1)')
+        if group.get('nesterov', False):
+            raise ValueError('NorMuon follows Algorithm 1 without Nesterov')
+
+    def load_state_dict(self, state_dict):
+        for group in state_dict['param_groups']:
+            if group.get('normuon_version') != 1:
+                raise ValueError('Incompatible NorMuon checkpoint: initialize fresh NorMuon state')
+            self._validate_adamuon_group(group)
+        return Muon.load_state_dict(self, state_dict)
+
+    @staticmethod
+    def _matrix_variance(work):
+        return work.new_zeros((work.shape[0], 1))
+
+    def _adamuon_step(self, param, grad, state, group):
+        beta1, beta2 = group['momentum'], group['beta2']
+        state['momentum'].mul_(beta1).add_(grad, alpha=1 - beta1)
+        update = self._orthogonalize(state['momentum'], group).reshape(param.shape[0], -1)
+        variance = state['exp_avg_sq']
+        variance.mul_(beta2).add_(update.square().mean(dim=1, keepdim=True), alpha=1 - beta2)
+        update.div_(variance.sqrt().add_(group['eps']))
+        update.div_(update.norm().add_(group['eps']))
+        if group.get('cautious', False):
+            self._apply_cautious_mask_(update, grad)
+        param.mul_(1 - group['lr'] * group['weight_decay'])
+        param.add_(update.reshape_as(param), alpha=-group['lr'] * .2 * param.numel() ** .5)
+
+    def _foreach_adamuon_step(self, params, grads, states, group):
+        beta1, beta2 = group['momentum'], group['beta2']
+        buffers = [state['momentum'] for state in states]
+        torch._foreach_mul_(buffers, beta1)
+        torch._foreach_add_(buffers, grads, alpha=1 - beta1)
+        updates = [u.reshape(p.shape[0], -1)
+                   for u, p in zip(self._orthogonalize_batch(buffers, group), params)]
+        variances = [state['exp_avg_sq'] for state in states]
+        row_squares = [u.square().mean(dim=1, keepdim=True) for u in updates]
+        torch._foreach_mul_(variances, beta2)
+        torch._foreach_add_(variances, row_squares, alpha=1 - beta2)
+        denominators = torch._foreach_sqrt(variances)
+        torch._foreach_add_(denominators, group['eps'])
+        # Broadcasting small row buffers avoids allocating a full variance matrix.
+        for update, denominator in zip(updates, denominators):
+            update.div_(denominator)
+        norms = torch._foreach_norm(updates)
+        torch._foreach_add_(norms, group['eps'])
+        torch._foreach_div_(updates, norms)
+        if group.get('cautious', False):
+            for update, grad in zip(updates, grads):
+                self._apply_cautious_mask_(update, grad)
+        torch._foreach_mul_(updates, [-group['lr'] * .2 * p.numel() ** .5 for p in params])
+        if group['weight_decay']:
+            torch._foreach_mul_(params, 1 - group['lr'] * group['weight_decay'])
+        torch._foreach_add_(params, [u.reshape_as(p) for u, p in zip(updates, params)])
+
+
+class AdaGO(Muon):
+    """AdaGO Algorithm 2, https://arxiv.org/html/2509.02981v2#alg2.
+
+    Per matrix: M = momentum*M + (1-momentum)*grad;
+    c = min(||grad||_F, gamma); v_sq += c**2;
+    param -= max(eps, lr*c/sqrt(v_sq)) * Orth(M).
+    One scalar accumulator starts at v0**2. No Nesterov, elementwise variance,
+    or Muon RMS multiplier is applied. eps is a MINIMUM STEP, not a denominator
+    epsilon; the floor remains active even if a scheduler sets lr to zero.
+
+    lr=.05, eps=5e-4, momentum=.95 and zero weight decay follow the paper's
+    classification settings. gamma=1 and v0=1 are configurable implementation
+    defaults; the paper does not specify experimental values for these.
+    AdamW fallback uses adam_betas=(.9, .95) and the group's lr/weight_decay.
+
+    Inherits parameter grouping, FP32 state, Polar Express by default, BF16
+    iterations, and optional approximate rank. Newton-Schulz is also available.
+    cautious=True is an optional extension that masks the final update and
+    breaks its orthogonality. Nonzero weight decay is a decoupled extension
+    using the base learning rate. Missing gradients skip all state and decay.
+    muon_all=True applies this matrix rule to all parameters using Muon's lifting.
+    """
+    def __init__(self, params, lr=.05, momentum=.95, gamma=1., v0=1.,
+                 eps=5e-4, weight_decay=0., *, newton_schulz_iter=5,
+                 adam_betas=(.9, .95), adam_eps=1e-8, foreach=True,
+                 ns_bfloat16=False, rank=0, orthogonalization_backend='polar_express',
+                 cautious=False, muon_all=False, muon_all_reshape=False):
+        super().__init__(params, lr=lr, momentum=momentum, weight_decay=weight_decay,
+                         newton_schulz_iter=newton_schulz_iter, adam_betas=adam_betas,
+                         adam_eps=adam_eps, foreach=foreach, ns_bfloat16=ns_bfloat16,
+                         rank=rank, orthogonalization_backend=orthogonalization_backend,
+                         cautious=cautious, muon_all=muon_all,
+                      muon_all_reshape=muon_all_reshape)
+        self.defaults.update(gamma=gamma, v0=v0, eps=eps, adago_version=1)
+        for group in self.param_groups:
+            group.setdefault('gamma', gamma)
+            group.setdefault('v0', v0)
+            group.setdefault('eps', eps)
+            group['adago_version'] = 1
+            self._validate_adago_group(group)
+
+    @staticmethod
+    def _validate_adago_group(group):
+        Muon._validate_backend(group)
+        Muon._validate_rank(group['rank'])
+        for key in ('gamma', 'v0', 'eps', 'adam_eps', 'lr', 'weight_decay'):
+            value = group[key]
+            if (isinstance(value, bool) or not math.isfinite(value) or value < 0
+                    or (key not in ('lr', 'weight_decay') and value == 0)):
+                raise ValueError(f'Invalid AdaGO {key}: {value}')
+        if not 0 <= group['momentum'] < 1:
+            raise ValueError('AdaGO momentum must be in [0, 1)')
+        if len(group['adam_betas']) != 2 or not all(0 <= b < 1 for b in group['adam_betas']):
+            raise ValueError('Invalid AdaGO AdamW fallback betas')
+        for key in ('foreach', 'ns_bfloat16', 'cautious'):
+            if not isinstance(group[key], bool):
+                raise ValueError(f'AdaGO {key} must be boolean')
+
+    def load_state_dict(self, state_dict):
+        for group in state_dict['param_groups']:
+            if group.get('adago_version') != 1:
+                raise ValueError('Incompatible AdaGO checkpoint: initialize fresh AdaGO state')
+            self._validate_adago_group(group)
+        return super().load_state_dict(state_dict)
+
+    def _init_matrix_state(self, work, group):
+        return {'momentum': torch.zeros_like(work),
+                'grad_norm_sq_sum': work.new_full((), group['v0'] ** 2)}
+
+    def _adaptive_step_size(self, norm, state, group):
+        clipped = norm.clamp(max=group['gamma'])
+        accumulated = state['grad_norm_sq_sum']
+        accumulated.add_(clipped.square())
+        return (group['lr'] * clipped / accumulated.sqrt()).clamp_min(group['eps'])
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        for group in self.param_groups:
+            self._validate_adago_group(group)
+            active = [p for p in group['params'] if p.grad is not None]
+            for param in active:
+                if param.grad.layout != torch.strided:
+                    raise RuntimeError(f'{type(self).__name__} does not support sparse gradients')
+                if not param.is_floating_point():
+                    raise RuntimeError(f'{type(self).__name__} requires real floating-point parameters')
+            buckets = {}
+            for param in active:
+                state = self.state[param]
+                work, grad, matrix = self._prepare_muon_param(param, state, group)
+                if not state:
+                    state['step'] = 0
+                    if matrix:
+                        state.update(self._init_matrix_state(work, group))
+                    else:
+                        state['exp_avg'] = torch.zeros_like(work)
+                        state['exp_avg_sq'] = torch.zeros_like(work)
+                if group.get('muon_all', False):
+                    state['muon_all'] = True
+                    if group.get('muon_all_reshape', False):
+                        state['muon_all_reshape'] = True
+                state['step'] += 1
+                if group['foreach']:
+                    buckets.setdefault((work.device, work.dtype, matrix), []).append((param, work, grad, state))
+                else:
+                    if matrix:
+                        self._adago_matrix_step([work], [grad], [state], group)
+                    else:
+                        self._adam_step(work, grad, state, group['lr'], group['weight_decay'],
+                                        group['adam_betas'], group['adam_eps'], group['cautious'])
+                    if work is not param:
+                        self._copy_muon_back([param], [work], group)
+            for (_, _, matrix), entries in buckets.items():
+                originals, params, grads, states = map(list, zip(*entries))
+                if matrix:
+                    self._adago_matrix_step(params, grads, states, group)
+                else:
+                    self._foreach_adam_step(params, grads, states, group)
+                self._copy_muon_back(originals, params, group)
+        return loss
+
+    def _adago_matrix_step(self, params, grads, states, group):
+        beta = group['momentum']
+        buffers = [s['momentum'] for s in states]
+        if group['foreach']:
+            torch._foreach_mul_(buffers, beta)
+            torch._foreach_add_(buffers, grads, alpha=1 - beta)
+            updates = self._orthogonalize_batch(buffers, group)
+            norms = torch._foreach_norm(grads)
+        else:
+            buffers[0].mul_(beta).add_(grads[0], alpha=1 - beta)
+            updates = [self._orthogonalize(buffers[0], group)]
+            norms = [grads[0].norm()]
+        for update, grad, norm, state in zip(updates, grads, norms, states):
+            step_size = self._adaptive_step_size(norm, state, group)
+            if group['cautious']:
+                self._apply_cautious_mask_(update, grad)
+            update.mul_(step_size)
+        if group['foreach']:
+            if group['weight_decay']:
+                torch._foreach_mul_(params, 1 - group['lr'] * group['weight_decay'])
+            torch._foreach_sub_(params, updates)
+        else:
+            params[0].mul_(1 - group['lr'] * group['weight_decay']).sub_(updates[0])
+
+
+class RMSGO(AdaGO):
+    """AdaGO with an RMSProp-style, bias-uncorrected norm EMA.
+
+    M = momentum*M + (1-momentum)*grad; c = min(||grad||_F, gamma);
+    v = beta2*v + (1-beta2)*c**2, initialized at v0**2 per matrix;
+    param -= max(eps, lr*c/sqrt(v)) * Orth(M).
+
+    Retains AdaGO's initialization, minimum step, orthogonalization, parameter
+    grouping and AdamW fallback. beta2=.99 controls forgetting; no Adam bias
+    correction is applied. The denominator is clamped to the dtype's smallest
+    positive normal value to keep zero gradients finite if the EMA underflows.
+    eps remains a minimum step, including at lr=0. This is an experimental
+    variant; AdaGO's convergence guarantees do not automatically apply.
+    """
+    def __init__(self, params, lr=.05, momentum=.95, gamma=1., v0=1.,
+                 eps=5e-4, weight_decay=0., *, beta2=.99, newton_schulz_iter=5,
+                 adam_betas=(.9, .95), adam_eps=1e-8, foreach=True,
+                 ns_bfloat16=False, rank=0, orthogonalization_backend='polar_express',
+                 cautious=False, muon_all=False, muon_all_reshape=False):
+        Muon.__init__(self, params, lr=lr, momentum=momentum, weight_decay=weight_decay,
+                         newton_schulz_iter=newton_schulz_iter, adam_betas=adam_betas,
+                         adam_eps=adam_eps, foreach=foreach, ns_bfloat16=ns_bfloat16,
+                         rank=rank, orthogonalization_backend=orthogonalization_backend,
+                         cautious=cautious, muon_all=muon_all,
+                      muon_all_reshape=muon_all_reshape)
+        options = dict(gamma=gamma, v0=v0, eps=eps, beta2=beta2)
+        self.defaults.update(**options, rmsgo_version=1)
+        for group in self.param_groups:
+            for key, value in options.items():
+                group.setdefault(key, value)
+            group['rmsgo_version'] = 1
+            self._validate_adago_group(group)
+
+    @staticmethod
+    def _validate_adago_group(group):
+        AdaGO._validate_adago_group(group)
+        beta2 = group['beta2']
+        if isinstance(beta2, bool) or not 0 <= beta2 < 1:
+            raise ValueError('RMSGO beta2 must be in [0, 1)')
+
+    def load_state_dict(self, state_dict):
+        for group in state_dict['param_groups']:
+            if group.get('rmsgo_version') != 1:
+                raise ValueError('Incompatible RMSGO checkpoint: initialize fresh RMSGO state')
+            self._validate_adago_group(group)
+        return Muon.load_state_dict(self, state_dict)
+
+    def _init_matrix_state(self, work, group):
+        return {'momentum': torch.zeros_like(work),
+                'grad_norm_sq_ema': work.new_full((), group['v0'] ** 2)}
+
+    def _adaptive_step_size(self, norm, state, group):
+        clipped = norm.clamp(max=group['gamma'])
+        variance = state['grad_norm_sq_ema']
+        variance.mul_(group['beta2']).add_(clipped.square(), alpha=1 - group['beta2'])
+        denominator = variance.sqrt().clamp_min(torch.finfo(variance.dtype).tiny)
+        return (group['lr'] * clipped / denominator).clamp_min(group['eps'])
+
+
+class AdaDeltaGO(AdaGO):
+    """Experimental Adadelta scaling of the GO clipped norm, per matrix.
+
+    M = momentum*M + (1-momentum)*grad; c = min(||grad||_F, gamma);
+    v = rho*v + (1-rho)*c**2;
+    d = c * sqrt(u + eps) / sqrt(v + eps);
+    u = rho*u + (1-rho)*d**2; param -= lr*d * Orth(M).
+
+    Both scalar averages start at zero. The update average tracks d BEFORE
+    learning-rate scaling, cautious masking and decoupled weight decay, as in
+    torch.optim.Adadelta's unscaled delta recurrence. eps stabilizes both RMS
+    terms; it is NOT AdaGO's minimum step. There is no floor or bias correction.
+    Zero gradients produce zero steps even if momentum remains nonzero.
+
+    Retains GO's lr=.05, momentum=.95, gamma=1, zero weight decay, AdamW
+    fallback and shared orthogonalization/FP32/foreach/MuonAll options.
+    rho=.9 and eps=1e-6 follow PyTorch Adadelta defaults. The scalar norm
+    adaptation is experimental, not elementwise Adadelta or a published GO rule.
+    """
+    def __init__(self, params, lr=.05, momentum=.95, gamma=1., rho=.9,
+                 eps=1e-6, weight_decay=0., *, newton_schulz_iter=5,
+                 adam_betas=(.9, .95), adam_eps=1e-8, foreach=True,
+                 ns_bfloat16=False, rank=0, orthogonalization_backend='polar_express',
+                 cautious=False, muon_all=False, muon_all_reshape=False):
+        Muon.__init__(self, params, lr=lr, momentum=momentum, weight_decay=weight_decay,
+                         newton_schulz_iter=newton_schulz_iter, adam_betas=adam_betas,
+                         adam_eps=adam_eps, foreach=foreach, ns_bfloat16=ns_bfloat16,
+                         rank=rank, orthogonalization_backend=orthogonalization_backend,
+                         cautious=cautious, muon_all=muon_all,
+                      muon_all_reshape=muon_all_reshape)
+        options = dict(gamma=gamma, rho=rho, eps=eps)
+        self.defaults.update(**options, adadeltago_version=1)
+        for group in self.param_groups:
+            for key, value in options.items():
+                group.setdefault(key, value)
+            group['adadeltago_version'] = 1
+            self._validate_adago_group(group)
+
+    @staticmethod
+    def _validate_adago_group(group):
+        Muon._validate_backend(group)
+        Muon._validate_rank(group['rank'])
+        for key in ('gamma', 'eps', 'adam_eps', 'lr', 'weight_decay'):
+            value = group[key]
+            if (isinstance(value, bool) or not math.isfinite(value) or value < 0
+                    or (key in ('gamma', 'eps', 'adam_eps') and value == 0)):
+                raise ValueError(f'Invalid AdaDeltaGO {key}: {value}')
+        for key in ('momentum', 'rho'):
+            if isinstance(group[key], bool) or not 0 <= group[key] < 1:
+                raise ValueError(f'AdaDeltaGO {key} must be in [0, 1)')
+        if len(group['adam_betas']) != 2 or not all(0 <= b < 1 for b in group['adam_betas']):
+            raise ValueError('Invalid AdaDeltaGO AdamW fallback betas')
+        for key in ('foreach', 'ns_bfloat16', 'cautious'):
+            if not isinstance(group[key], bool):
+                raise ValueError(f'AdaDeltaGO {key} must be boolean')
+
+    def load_state_dict(self, state_dict):
+        for group in state_dict['param_groups']:
+            if group.get('adadeltago_version') != 1:
+                raise ValueError('Incompatible AdaDeltaGO checkpoint: initialize fresh AdaDeltaGO state')
+            self._validate_adago_group(group)
+        return Muon.load_state_dict(self, state_dict)
+
+    def _init_matrix_state(self, work, group):
+        return {'momentum': torch.zeros_like(work),
+                'grad_norm_sq_ema': work.new_zeros(()),
+                'update_sq_ema': work.new_zeros(())}
+
+    def _adaptive_step_size(self, norm, state, group):
+        clipped = norm.clamp(max=group['gamma'])
+        rho, eps = group['rho'], group['eps']
+        variance, updates = state['grad_norm_sq_ema'], state['update_sq_ema']
+        variance.mul_(rho).add_(clipped.square(), alpha=1 - rho)
+        delta = clipped * (updates + eps).sqrt() / (variance + eps).sqrt()
+        updates.mul_(rho).add_(delta.square(), alpha=1 - rho)
+        return group['lr'] * delta
+
+
+class AdamGO(AdaGO):
+    """Experimental Adam-style norm adaptation of AdaGO (not published AdamNorm).
+
+    M = momentum*M + (1-momentum)*grad; c = min(||grad||_F, gamma);
+    v = beta2*v + (1-beta2)*c**2, initialized at zero for each matrix;
+    v_hat = v/(1-beta2**step);
+    param -= max(min_step, lr*c/(sqrt(v_hat)+delta)) * Orth(M).
+
+    The numerator is the CURRENT clipped gradient norm, as in AdaGO. The
+    moving average forgets old norms instead of accumulating them forever.
+    min_step=0 disables the floor; delta=1e-8 stabilizes the denominator.
+    No Nesterov or Muon RMS multiplier. Scalar scaling happens after Orth.
+    lr=.05, momentum=.95, gamma=1 and zero decay retain AdaGO's starting
+    settings; beta2=.999 is an experimental default, not a tuned result.
+
+    Inherits AdamW fallback, FP32 state, foreach, optional rank/BF16,
+    Polar Express by default, and cautious=False. Cautious masking is an
+    optional extension that breaks orthogonality. Positive min_step keeps
+    matrix updates active even at lr=0 if momentum remains nonzero.
+    AdaGO's convergence guarantees do not automatically apply to AdamGO.
+    muon_all=True applies this matrix rule to all parameters using Muon's lifting.
+    """
+    def __init__(self, params, lr=.05, momentum=.95, beta2=.999, gamma=1.,
+                 delta=1e-8, min_step=0., weight_decay=0., *, newton_schulz_iter=5,
+                 adam_betas=(.9, .95), adam_eps=1e-8, foreach=True,
+                 ns_bfloat16=False, rank=0, orthogonalization_backend='polar_express',
+                 cautious=False, muon_all=False, muon_all_reshape=False):
+        Muon.__init__(self, params, lr=lr, momentum=momentum, weight_decay=weight_decay,
+                      newton_schulz_iter=newton_schulz_iter, adam_betas=adam_betas,
+                      adam_eps=adam_eps, foreach=foreach, ns_bfloat16=ns_bfloat16,
+                      rank=rank, orthogonalization_backend=orthogonalization_backend,
+                      cautious=cautious, muon_all=muon_all,
+                      muon_all_reshape=muon_all_reshape)
+        options = dict(beta2=beta2, gamma=gamma, delta=delta, min_step=min_step)
+        self.defaults.update(**options, adamgo_version=1)
+        for group in self.param_groups:
+            for key, value in options.items():
+                group.setdefault(key, value)
+            group['adamgo_version'] = 1
+            self._validate_adago_group(group)
+
+    @staticmethod
+    def _validate_adago_group(group):
+        # Shared training loop dispatches validation through this hook.
+        Muon._validate_backend(group)
+        Muon._validate_rank(group['rank'])
+        for key in ('gamma', 'delta', 'adam_eps', 'lr', 'weight_decay', 'min_step'):
+            value = group[key]
+            if (isinstance(value, bool) or not math.isfinite(value) or value < 0
+                    or (key in ('gamma', 'delta', 'adam_eps') and value == 0)):
+                raise ValueError(f'Invalid AdamGO {key}: {value}')
+        for key in ('momentum', 'beta2'):
+            if isinstance(group[key], bool) or not 0 <= group[key] < 1:
+                raise ValueError(f'AdamGO {key} must be in [0, 1)')
+        if len(group['adam_betas']) != 2 or not all(0 <= b < 1 for b in group['adam_betas']):
+            raise ValueError('Invalid AdamGO AdamW fallback betas')
+        for key in ('foreach', 'ns_bfloat16', 'cautious'):
+            if not isinstance(group[key], bool):
+                raise ValueError(f'AdamGO {key} must be boolean')
+
+    def load_state_dict(self, state_dict):
+        for group in state_dict['param_groups']:
+            if group.get('adamgo_version') != 1:
+                raise ValueError('Incompatible AdamGO checkpoint: initialize fresh AdamGO state')
+            self._validate_adago_group(group)
+        return Muon.load_state_dict(self, state_dict)
+
+    def _init_matrix_state(self, work, group):
+        return {'momentum': torch.zeros_like(work), 'grad_norm_sq_ema': work.new_zeros(())}
+
+    def _adaptive_step_size(self, norm, state, group):
+        clipped = norm.clamp(max=group['gamma'])
+        beta2 = group['beta2']
+        variance = state['grad_norm_sq_ema']
+        variance.mul_(beta2).add_(clipped.square(), alpha=1 - beta2)
+        corrected = variance / (1 - beta2 ** state['step'])
+        return (group['lr'] * clipped / (corrected.sqrt() + group['delta'])).clamp_min(group['min_step'])
 
 
 def _matrix_inverse_square_root_newton_schulz(A: torch.Tensor, num_iters: int = 5) -> torch.Tensor:
@@ -12324,168 +13662,397 @@ class OGDRA(nn.Module):
 
 
 import torch
+import math
 from torch.optim.optimizer import Optimizer
 
-class CLion(Optimizer):
+def _clion_step_lr(lr, step, warmup_steps):
+    if warmup_steps <= 0:
+        return lr
+    return lr * min(1.0, step / warmup_steps)
+
+
+def _clion_stabilize_grad(grad, grad_clip_value):
+    # Run sanitization unconditionally. The previous finite check read a scalar
+    # from every CUDA tensor, synchronizing the optimizer once per parameter.
+    # nan_to_num is an identity for finite gradients and keeps momentum safe.
+    grad = torch.nan_to_num(grad, nan=0.0, posinf=1.0, neginf=-1.0)
+    if grad_clip_value is not None:
+        grad = grad.clamp(min=-grad_clip_value, max=grad_clip_value)
+    return grad
+
+
+def _clion_clip_step_(update, lr, param, max_step_norm_ratio):
+    if max_step_norm_ratio is None or lr <= 0.0:
+        return
+
+    update_norm = update.norm(2)
+    param_norm = param.norm(2)
+    max_step_norm = max_step_norm_ratio * torch.maximum(param_norm, torch.ones_like(param_norm))
+    scale = (max_step_norm / (lr * update_norm + 1e-12)).clamp(max=1.0)
+    update.mul_(scale)
+
+
+def _clion_clip_steps_(updates, params, lr, max_step_norm_ratio):
+    """Apply the existing per-tensor step-norm cap without CPU synchronization."""
+    if max_step_norm_ratio is None or lr <= 0.0:
+        return
+    update_norms = torch.stack(torch._foreach_norm(updates))
+    param_norms = torch.stack(torch._foreach_norm(params))
+    max_step_norms = max_step_norm_ratio * torch.maximum(param_norms, torch.ones_like(param_norms))
+    scales = (max_step_norms / (lr * update_norms + 1e-12)).clamp(max=1.0)
+    torch._foreach_mul_(updates, scales.unbind())
+
+
+class CLion(_FP32StateOptimizer):
     r"""
-    Implements Cautious Lion (C-Lion) Algorithm.
-    
-    Includes automatic logic to skip weight decay for 0D (scalars) 
-    and 1D (biases, layernorms) parameters.
+    Implements Cautious Lion (C-Lion) with the Cautious Optimizers mask.
 
-    Arguments:
-        params (iterable): iterable of parameters to optimize or dicts defining parameter groups
-        lr (float, optional): learning rate (default: 1e-4)
-        betas (Tuple[float, float], optional): coefficients used for computing
-            running averages of gradient and its square (default: (0.9, 0.99))
-        weight_decay (float, optional): weight decay coefficient (default: 0)
+    The default safe mask gates conflicting coordinates without rescaling the
+    surviving sign steps. `rescale_mask=True` instead follows the C-Lion paper
+    and scales active coordinates by numel / (active + 1).
+
+    Finite gradient spikes are clipped before they reach the momentum buffer,
+    and a short default warmup avoids the first steps being full-strength sign
+    jumps before the estimator has any history. These are custom heuristics,
+    not guarantees of improved convergence. Disable grad_clip_value,
+    max_step_norm_ratio and warmup_steps, and enable rescale_mask for the
+    paper-style update on finite gradients.
+
+    nonfinite="raise" rejects invalid gradients or momentum before any update.
+    nonfinite="sanitize" opts into the legacy NaN-to-zero/Inf-to-sign policy.
+    Strict checks synchronize once per active device, before any mutation.
+    The foreach path batches clipping and same-shaped cautious masks, with
+    bounded temporary storage. FP16/BF16 state and updates use FP32;
+    final parameters are rounded back to their storage dtype.
     """
-
-    def __init__(self, params, lr=1e-4, betas=(0.9, 0.99), weight_decay=0.0):
+    def __init__(self, params, lr=1e-4, betas=(0.95, 0.98), weight_decay=0.0,
+                 grad_clip_value=1.0, warmup_steps=20,
+                 max_step_norm_ratio=0.05, rescale_mask=False, foreach=True,
+                 nonfinite="raise"):
+        if nonfinite not in ("raise", "sanitize"):
+            raise ValueError("nonfinite must be 'raise' or 'sanitize'")
         if not 0.0 <= lr:
             raise ValueError(f"Invalid learning rate: {lr}")
         if not 0.0 <= betas[0] < 1.0:
             raise ValueError(f"Invalid beta parameter at index 0: {betas[0]}")
         if not 0.0 <= betas[1] < 1.0:
             raise ValueError(f"Invalid beta parameter at index 1: {betas[1]}")
-        
-        defaults = dict(lr=lr, betas=betas, weight_decay=weight_decay)
+        if not 0.0 <= weight_decay:
+            raise ValueError(f"Invalid weight_decay value: {weight_decay}")
+        if grad_clip_value is not None and grad_clip_value <= 0.0:
+            raise ValueError(f"Invalid grad_clip_value: {grad_clip_value}")
+        if warmup_steps < 0 or int(warmup_steps) != warmup_steps:
+            raise ValueError(f"Invalid warmup_steps: {warmup_steps}")
+        if max_step_norm_ratio is not None and max_step_norm_ratio <= 0.0:
+            raise ValueError(f"Invalid max_step_norm_ratio: {max_step_norm_ratio}")
+        defaults = dict(lr=lr, betas=betas, weight_decay=weight_decay,
+                        grad_clip_value=grad_clip_value,
+                        warmup_steps=int(warmup_steps),
+                        max_step_norm_ratio=max_step_norm_ratio,
+                        rescale_mask=rescale_mask, foreach=foreach, nonfinite=nonfinite)
         super(CLion, self).__init__(params, defaults)
+
+    @staticmethod
+    def _validate_finite(tensors):
+        """Validate all strict-policy tensors with one host decision per device.
+
+        Pack at most 4M elements / 64 tensors per check. Checking elements
+        directly avoids rejecting finite tensors whose norms overflow.
+        """
+        buckets = {}
+        for tensor in tensors:
+            buckets.setdefault((tensor.device, tensor.dtype), []).append(tensor)
+        checks = {}
+        for (device, _), values in buckets.items():
+            chunks, current, size = [], [], 0
+            for tensor in values:
+                if current and (size + tensor.numel() > 4 * 1024 * 1024 or len(current) >= 64):
+                    chunks.append(current)
+                    current, size = [], 0
+                current.append(tensor)
+                size += tensor.numel()
+            if current:
+                chunks.append(current)
+            for chunk in chunks:
+                packed = chunk[0] if len(chunk) == 1 else torch.cat([t.reshape(-1) for t in chunk])
+                checks.setdefault(device, []).append(torch.isfinite(packed).all())
+        for flags in checks.values():
+            if not torch.stack(flags).all():
+                raise RuntimeError('CLion found non-finite gradient or momentum')
+
+    @staticmethod
+    def _cautious_masks(updates, grads, rescale_mask):
+        """Build independent per-parameter masks in same-shaped chunks."""
+        buckets = {}
+        for index, grad in enumerate(grads):
+            buckets.setdefault(tuple(grad.shape), []).append(index)
+        masks, scales = [None] * len(grads), [None] * len(grads)
+        for indices in buckets.values():
+            example = grads[indices[0]]
+            chunk_size = max(1, min(64, (4 * 1024 * 1024) // max(1, example.numel())))
+            for start in range(0, len(indices), chunk_size):
+                chunk = indices[start:start + chunk_size]
+                if len(chunk) == 1:
+                    index = chunk[0]
+                    update, grad = updates[index], grads[index]
+                    mask = ((update > 0) & (grad > 0) | (update < 0) & (grad < 0)).to(grad.dtype)
+                    masks[index] = mask
+                    if rescale_mask:
+                        scales[index] = mask.numel() / (mask.sum(
+                            dtype=torch.float64 if mask.dtype == torch.float64 else torch.float32) + 1)
+                    continue
+                update = torch.stack([updates[i] for i in chunk])
+                grad = torch.stack([grads[i] for i in chunk])
+                mask = ((update > 0) & (grad > 0) | (update < 0) & (grad < 0)).to(grad.dtype)
+                for index, part in zip(chunk, mask.unbind()):
+                    masks[index] = part
+                if rescale_mask:
+                    counts = mask.reshape(len(chunk), -1).sum(
+                        dim=1, dtype=torch.float64 if mask.dtype == torch.float64 else torch.float32)
+                    for index, scale in zip(chunk, (example.numel() / (counts + 1)).unbind()):
+                        scales[index] = scale
+        return masks, scales
 
     @torch.no_grad()
     def step(self, closure=None):
-        """Performs a single optimization step."""
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        # Validate all groups before mutating state, so an invalid later tensor
+        # cannot leave a partially applied optimizer step.
+        strict_tensors = []
+        for group in self.param_groups:
+            policy = group.get('nonfinite', 'raise')
+            if policy not in ('raise', 'sanitize'):
+                raise ValueError("nonfinite must be 'raise' or 'sanitize'")
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                if p.grad.is_sparse:
+                    raise RuntimeError('CLion does not support sparse gradients.')
+                if policy == 'raise':
+                    momentum = self.state.get(p, {}).get('exp_avg')
+                    strict_tensors.append(p.grad)
+                    if momentum is not None:
+                        strict_tensors.append(momentum)
+
+        self._validate_finite(strict_tensors)
+
+        for group in self.param_groups:
+            beta1, beta2 = group['betas']
+            lr = group['lr']
+            weight_decay = group['weight_decay']
+            grad_clip_value = group['grad_clip_value']
+            warmup_steps = group['warmup_steps']
+            max_step_norm_ratio = group['max_step_norm_ratio']
+            rescale_mask = group.get('rescale_mask', False)
+            foreach = group.get('foreach', True)
+            buckets = {}
+            originals, working = [], []
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                if p.grad.is_sparse:
+                    raise RuntimeError('CLion does not support sparse gradients.')
+
+                # --- 1. Cautious Sanitization ---
+                # Keep outliers from poisoning the sign estimator for many steps.
+                state = self.state[p]
+                original = p
+                p = _optimizer_work_param(original, state)
+                grad = original.grad.to(dtype=p.dtype)
+                if group.get('nonfinite', 'raise') == 'sanitize':
+                    grad = _clion_stabilize_grad(grad, None if foreach else grad_clip_value)
+                elif grad_clip_value is not None and not foreach:
+                    grad = grad.clamp(min=-grad_clip_value, max=grad_clip_value)
+                originals.append(original)
+                working.append(p)
+
+                if len(state) == 0:
+                    state['step'] = 0
+                    state['exp_avg'] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                elif 'step' not in state:
+                    state['step'] = 0
+
+                exp_avg = state['exp_avg']
+                if group.get('nonfinite', 'raise') == 'sanitize':
+                    torch.nan_to_num_(exp_avg, nan=0.0, posinf=1.0, neginf=-1.0)
+
+                state['step'] += 1
+                step_lr = _clion_step_lr(lr, state['step'], warmup_steps)
+                buckets.setdefault((p.device, p.dtype, step_lr), [[], [], []])
+                bucket = buckets[(p.device, p.dtype, step_lr)]
+                bucket[0].append(p)
+                bucket[1].append(grad)
+                bucket[2].append(exp_avg)
+
+            for (_, _, step_lr), (params, grads, exp_avgs) in buckets.items():
+                if not foreach:
+                    for p, grad, exp_avg in zip(params, grads, exp_avgs):
+                        update = exp_avg.clone().mul_(beta1).add_(grad, alpha=1 - beta1)
+                        mask = ((update > 0) & (grad > 0) | (update < 0) & (grad < 0)).to(grad.dtype)
+                        update.sign_().mul_(mask)
+                        if rescale_mask:
+                            update.mul_(mask.numel() / (mask.sum(dtype=torch.float64 if mask.dtype == torch.float64 else torch.float32) + 1))
+                        _clion_clip_step_(update, step_lr, p, max_step_norm_ratio)
+                        if weight_decay > 0:
+                            p.mul_(1 - step_lr * weight_decay)
+                        p.add_(update, alpha=-step_lr)
+                        exp_avg.mul_(beta2).add_(grad, alpha=1 - beta2)
+                    continue
+
+                # Batched Lion estimate, sign, decay, parameter, and momentum
+                # updates reduce Python dispatch and CUDA kernel launches.
+                if grad_clip_value is not None:
+                    grads = torch._foreach_clamp_min(grads, -grad_clip_value)
+                    torch._foreach_clamp_max_(grads, grad_clip_value)
+                updates = torch._foreach_mul(exp_avgs, beta1)
+                torch._foreach_add_(updates, grads, alpha=1 - beta1)
+                masks, mask_scales = self._cautious_masks(updates, grads, rescale_mask)
+                torch._foreach_sign_(updates)
+                torch._foreach_mul_(updates, masks)
+                if rescale_mask:
+                    torch._foreach_mul_(updates, mask_scales)
+                _clion_clip_steps_(updates, params, step_lr, max_step_norm_ratio)
+                if weight_decay > 0:
+                    torch._foreach_mul_(params, 1 - step_lr * weight_decay)
+                torch._foreach_add_(params, updates, alpha=-step_lr)
+                torch._foreach_mul_(exp_avgs, beta2)
+                torch._foreach_add_(exp_avgs, grads, alpha=1 - beta2)
+
+            _optimizer_copy_back(originals, working)
+
+        return loss
+
+
+class ModernCLion(Optimizer):
+    r"""
+    Implements the 2026 CLion update from:
+    "CLion: Efficient Cautious Lion Optimizer with Enhanced Generalization".
+
+    It uses Lion's gradient estimator
+        c_t = beta1 * m_{t-1} + (1 - beta1) * grad
+    and applies sign(c_t) to coordinates whose magnitude is at least nu. Tiny
+    coordinates fall back to the raw c_t update. This elementwise threshold is
+    important for large models: using the global minimum would let one nearly
+    zero coordinate disable sign updates for the whole parameter group.
+    """
+    def __init__(self, params, lr=1e-4, betas=(0.9, 0.99), weight_decay=0.0,
+                 nu=1e-15, raw_update_clip=1.0, grad_clip_value=1.0,
+                 warmup_steps=20, max_step_norm_ratio=0.05):
+        if not 0.0 <= lr:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        if not 0.0 <= betas[0] < 1.0:
+            raise ValueError(f"Invalid beta parameter at index 0: {betas[0]}")
+        if not 0.0 <= betas[1] < 1.0:
+            raise ValueError(f"Invalid beta parameter at index 1: {betas[1]}")
+        if not 0.0 <= weight_decay:
+            raise ValueError(f"Invalid weight_decay value: {weight_decay}")
+        if not 0.0 < nu:
+            raise ValueError(f"Invalid nu threshold: {nu}")
+        if raw_update_clip is not None and raw_update_clip <= 0.0:
+            raise ValueError(f"Invalid raw_update_clip: {raw_update_clip}")
+        if grad_clip_value is not None and grad_clip_value <= 0.0:
+            raise ValueError(f"Invalid grad_clip_value: {grad_clip_value}")
+        if warmup_steps < 0 or int(warmup_steps) != warmup_steps:
+            raise ValueError(f"Invalid warmup_steps: {warmup_steps}")
+        if max_step_norm_ratio is not None and max_step_norm_ratio <= 0.0:
+            raise ValueError(f"Invalid max_step_norm_ratio: {max_step_norm_ratio}")
+        defaults = dict(lr=lr, betas=betas, weight_decay=weight_decay, nu=nu,
+                        raw_update_clip=raw_update_clip,
+                        grad_clip_value=grad_clip_value,
+                        warmup_steps=int(warmup_steps),
+                        max_step_norm_ratio=max_step_norm_ratio)
+        super(ModernCLion, self).__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self, closure=None):
         loss = None
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
 
         for group in self.param_groups:
-            params_with_grad = []
-            grads = []
-            exp_avgs = []
-            
             beta1, beta2 = group['betas']
             lr = group['lr']
             weight_decay = group['weight_decay']
+            nu = group['nu']
+            raw_update_clip = group.get('raw_update_clip', 1.0)
+            grad_clip_value = group['grad_clip_value']
+            warmup_steps = group['warmup_steps']
+            max_step_norm_ratio = group['max_step_norm_ratio']
+
+            min_nonzero_abs = None
+            sign_count = 0
+            total_count = 0
+            saw_grad = False
 
             for p in group['params']:
                 if p.grad is None:
                     continue
-                
+                saw_grad = True
                 grad = p.grad
-                state = self.state[p]
+                if grad.is_sparse:
+                    raise RuntimeError('ModernCLion does not support sparse gradients.')
+                grad = _clion_stabilize_grad(grad, grad_clip_value)
 
-                # State initialization
+                state = self.state[p]
                 if len(state) == 0:
+                    state['step'] = 0
                     state['exp_avg'] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                elif 'step' not in state:
+                    state['step'] = 0
 
                 exp_avg = state['exp_avg']
+                if not torch.isfinite(exp_avg).all():
+                    torch.nan_to_num_(exp_avg, nan=0.0, posinf=1.0, neginf=-1.0)
 
-                # --- 1. Decoupled Weight Decay ---
-                # Logic: Only decay if explicitly set AND the parameter is a matrix (ndim >= 2).
-                # This automatically protects biases (1D) and scalars (0D).
-                if weight_decay > 0 and p.ndim >= 2:
-                    p.data.mul_(1 - lr * weight_decay)
+                state['step'] += 1
+                step_lr = _clion_step_lr(lr, state['step'], warmup_steps)
 
-                # --- 2. Calculate Lion Update Direction ---
-                # Lion update = sign(beta1 * m_t + (1-beta1) * g_t)
-                # stored in a temp buffer 'update'
-                update = exp_avg.clone().mul_(beta1).add_(grad, alpha=1 - beta1).sign_()
+                update = exp_avg.clone().mul_(beta1).add_(grad, alpha=1 - beta1)
+                abs_update = update.abs()
+                nonzero = abs_update[abs_update > 0]
+                if nonzero.numel() > 0:
+                    tensor_min = nonzero.min()
+                    min_nonzero_abs = tensor_min if min_nonzero_abs is None else torch.minimum(min_nonzero_abs, tensor_min)
 
-                # --- 3. THE CAUTIOUS MASK (C-Lion) ---
-                # If momentum and current gradient disagree (dot product < 0), mask = 0 (wait).
-                # If they agree, mask = 1 (step).
-                # Mask = (momentum * gradient > 0)
-                mask = (exp_avg * grad > 0).float()
-                
-                # Apply mask
-                update.mul_(mask)
+                sign_mask = abs_update >= nu
+                tensor_sign_count = int(sign_mask.count_nonzero().item())
+                tensor_total_count = sign_mask.numel()
+                sign_count += tensor_sign_count
+                total_count += tensor_total_count
 
-                # --- 4. Apply Update ---
-                p.add_(update, alpha=-lr)
+                if tensor_sign_count == tensor_total_count:
+                    active_update = update.sign()
+                else:
+                    raw_update = update
+                    if raw_update_clip is not None:
+                        raw_update = raw_update.clamp(
+                            min=-raw_update_clip,
+                            max=raw_update_clip,
+                        )
+                    if tensor_sign_count == 0:
+                        active_update = raw_update
+                    else:
+                        active_update = torch.where(sign_mask, update.sign(), raw_update)
 
-                # --- 5. Update Momentum ---
-                # m_t = beta2 * m_{t-1} + (1-beta2) * g_t
+                _clion_clip_step_(active_update, step_lr, p, max_step_norm_ratio)
+
+                if weight_decay != 0:
+                    p.mul_(1 - step_lr * weight_decay)
+                p.add_(active_update, alpha=-step_lr)
+
                 exp_avg.mul_(beta2).add_(grad, alpha=1 - beta2)
 
-        return loss
-
-import torch
-import math
-from torch.optim import Optimizer
-
-import torch
-import math
-from torch.optim.optimizer import Optimizer
-
-class CLion(Optimizer):
-    r"""
-    Implements Cautious Lion (C-Lion) with Cautious Weight Decay 
-    and Gradient Sanitization.
-    """
-    def __init__(self, params, lr=1e-4, betas=(0.9, 0.99), weight_decay=0.0):
-        if not 0.0 <= lr: raise ValueError(f"Invalid learning rate: {lr}")
-        defaults = dict(lr=lr, betas=betas, weight_decay=weight_decay)
-        super(CLion, self).__init__(params, defaults)
-
-    @torch.no_grad()
-    def step(self, closure=None):
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
-
-        for group in self.param_groups:
-            params_with_grad = []
-            grads = []
-            exp_avgs = []
-            
-            beta1, beta2 = group['betas']
-            lr = group['lr']
-            weight_decay = group['weight_decay']
-
-            for p in group['params']:
-                if p.grad is None: continue
-
-                # --- 1. Cautious Sanitization (User Requested) ---
-                # Fixes NaNs -> 0, Infs -> 1/-1 to prevent breaking momentum
-                if not torch.isfinite(p.grad).all():
-                    torch.nan_to_num_(p.grad, nan=0.0, posinf=1.0, neginf=-1.0)
-
-                grad = p.grad
-                state = self.state[p]
-
-                if len(state) == 0:
-                    state['exp_avg'] = torch.zeros_like(p, memory_format=torch.preserve_format)
-
-                exp_avg = state['exp_avg']
-
-                # --- 2. Calculate Lion Update Direction ---
-                # update = sign(beta1 * m_t + (1-beta1) * g_t)
-                update = exp_avg.clone().mul_(beta1).add_(grad, alpha=1 - beta1).sign_()
-
-                # --- 3. The Cautious Mask ---
-                # Mask = 1 if (momentum and gradient align), else 0
-                # We align 'exp_avg' (momentum) with 'grad'
-                mask = (exp_avg * grad > 0).float()
-                
-                # Apply mask to the Update
-                update.mul_(mask)
-
-                # --- 4. Cautious Weight Decay ---
-                # Only apply weight decay if the mask allowed an update.
-                # This prevents decaying weights when the model is "uncertain".
-                if weight_decay > 0 and p.ndim >= 2:
-                    # We multiply the decay amount by the mask
-                    # FIXED
-                    p.data.addcmul_(p.data, mask, value=-lr * weight_decay)
-
-                # --- 5. Apply Main Update ---
-                p.add_(update, alpha=-lr)
-
-                # --- 6. Update Momentum ---
-                exp_avg.mul_(beta2).add_(grad, alpha=1 - beta2)
+            if saw_grad:
+                sign_fraction = sign_count / total_count if total_count > 0 else 0.0
+                group['last_min_nonzero_abs'] = None if min_nonzero_abs is None else min_nonzero_abs.item()
+                group['last_sign_fraction'] = sign_fraction
+                group['last_raw_fraction'] = 1.0 - sign_fraction
+                group['last_used_sign'] = sign_count == total_count and total_count > 0
 
         return loss
 
@@ -14451,11 +16018,78 @@ class SophiaG(Optimizer):
 import torch
 from torch.optim import Optimizer
 
-class Adan(Optimizer):
-    def __init__(self, params, lr=1e-3, betas=(0.98, 0.92, 0.99), eps=1e-8, weight_decay=0.0, l1=False):
-        # Added l1 to defaults
-        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay, l1=l1)
+class Adan(_FP32StateOptimizer):
+    """Adan with per-parameter update counts and per-group gradient clipping.
+
+    Missing gradients pause a parameter's history. Legacy checkpoints use the
+    saved group step for existing state because past activity cannot be recovered.
+    ``l1=True`` is unsupported and rejected; weight_decay uses L2 decay, with
+    proximal decay by default or decoupled decay when no_prox=True.
+    FP16/BF16 parameters use FP32 state and temporary FP32 updates.
+    """
+    def __init__(
+        self,
+        params,
+        lr=1e-3,
+        betas=(0.98, 0.92, 0.99),
+        eps=1e-8,
+        weight_decay=0.0,
+        max_grad_norm=0.0,
+        no_prox=False,
+        l1=False,
+        foreach=True,
+    ):
+        if l1:
+            raise ValueError("Adan does not implement l1=True; use L2 weight_decay")
+        if not 0.0 <= max_grad_norm:
+            raise ValueError("Invalid max grad norm: {}".format(max_grad_norm))
+        if not 0.0 <= lr:
+            raise ValueError("Invalid learning rate: {}".format(lr))
+        if not 0.0 <= eps:
+            raise ValueError("Invalid epsilon value: {}".format(eps))
+        if len(betas) != 3:
+            raise ValueError("Adan requires three beta values")
+        if not 0.0 <= betas[0] < 1.0:
+            raise ValueError("Invalid beta parameter at index 0: {}".format(betas[0]))
+        if not 0.0 <= betas[1] < 1.0:
+            raise ValueError("Invalid beta parameter at index 1: {}".format(betas[1]))
+        if not 0.0 <= betas[2] < 1.0:
+            raise ValueError("Invalid beta parameter at index 2: {}".format(betas[2]))
+        if not 0.0 <= weight_decay:
+            raise ValueError("Invalid weight_decay value: {}".format(weight_decay))
+
+        defaults = dict(
+            lr=lr,
+            betas=betas,
+            eps=eps,
+            weight_decay=weight_decay,
+            max_grad_norm=max_grad_norm,
+            no_prox=no_prox,
+            l1=l1,
+            foreach=foreach,
+        )
         super().__init__(params, defaults)
+
+    def __setstate__(self, state):
+        super(Adan, self).__setstate__(state)
+        for group in self.param_groups:
+            group.setdefault("max_grad_norm", 0.0)
+            group.setdefault("no_prox", False)
+            group.setdefault("l1", False)
+            group.setdefault("foreach", True)
+            if group["l1"]:
+                raise ValueError("Adan does not implement l1=True; use L2 weight_decay")
+            for p in group["params"]:
+                if self.state.get(p):
+                    self.state[p].setdefault("step", group.get("step", 0))
+
+    @torch.no_grad()
+    def restart_opt(self):
+        for group in self.param_groups:
+            group["step"] = 0
+            for p in group["params"]:
+                state = self.state[p]
+                state.clear()
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -14464,57 +16098,122 @@ class Adan(Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
+        # Reject unsupported options before mutating any parameter or state.
+        if any(group.get("l1", False) for group in self.param_groups):
+            raise ValueError("Adan does not implement l1=True; use L2 weight_decay")
         for group in self.param_groups:
-            for p in group['params']:
-                if p.grad is None: continue
-                grad = p.grad
-                state = self.state[p]
+            beta1, beta2, beta3 = group["betas"]
+            active = [p for p in group["params"] if p.grad is not None]
+            if not active:
+                continue
+            if any(p.grad.is_sparse for p in active):
+                raise RuntimeError("Adan does not support sparse gradients")
 
-                if len(state) == 0:
-                    state['step'] = 0
-                    state['exp_avg'] = torch.zeros_like(p)      # m
-                    state['exp_avg_sq'] = torch.zeros_like(p)   # v
-                    state['exp_avg_diff'] = torch.zeros_like(p) # n
-                    state['pre_grad'] = grad.clone()
+            # Compute the group norm from local norms, transferring only scalars.
+            # The coefficient is zero-dimensional, including for scalar parameters.
+            clip = None
+            if group["max_grad_norm"] > 0:
+                device = active[0].device
+                norms = [p.grad.to(dtype=torch.float64 if p.dtype == torch.float64
+                                   else torch.float32).norm().to(device) for p in active]
+                norm = torch.stack(norms).norm()
+                clip = (group["max_grad_norm"] / (norm + group["eps"])).clamp(max=1.0)
 
-                state['step'] += 1
-                beta1, beta2, beta3 = group['betas']
-                
-                m = state['exp_avg']
-                v = state['exp_avg_sq']
-                diff = state['exp_avg_diff']
-                pre_grad = state['pre_grad']
+            buckets = {}
+            originals, working = [], []
+            for original in active:
+                state = self.state[original]
+                p = _optimizer_work_param(original, state)
+                grad = original.grad.to(dtype=p.dtype)
+                if clip is not None:
+                    grad = grad * clip.to(device=p.device, dtype=p.dtype)
+                if not state:
+                    state["step"] = 0
+                    state["exp_avg"] = torch.zeros_like(p)
+                    state["exp_avg_sq"] = torch.zeros_like(p)
+                    state["exp_avg_diff"] = torch.zeros_like(p)
+                state.setdefault("step", group.get("step", 0))
+                if "neg_pre_grad" not in state:
+                    state["neg_pre_grad"] = -grad.clone()
+                state["step"] += 1
+                key = (p.device, p.dtype, p.layout, state["step"])
+                buckets.setdefault(key, []).append((p, grad, state["exp_avg"],
+                    state["exp_avg_sq"], state["exp_avg_diff"], state["neg_pre_grad"]))
+                originals.append(original)
+                working.append(p)
 
-                # 1. Calculate Gradient Difference
-                grad_diff = grad - pre_grad
-                
-                # 2. Update stats
-                m.mul_(beta1).add_(grad, alpha=1 - beta1)
-                diff.mul_(beta2).add_(grad_diff, alpha=1 - beta2)
-                
-                update_signal = grad + beta2 * grad_diff
-                v.mul_(beta3).addcmul_(update_signal, update_signal, value=1 - beta3)
+            for (_, _, _, step), tensors in buckets.items():
+                params, grads, exp_avgs, exp_avg_sqs, exp_avg_diffs, neg_pre_grads = map(list, zip(*tensors))
+                bias_correction1 = 1.0 - beta1 ** step
+                bias_correction2 = 1.0 - beta2 ** step
+                bias_correction3_sqrt = math.sqrt(1.0 - beta3 ** step)
+                step_size = group["lr"] / bias_correction1
+                step_size_diff = group["lr"] * beta2 / bias_correction2
+                if group.get("foreach", True):
+                    self._foreach_update(
+                        params, grads, exp_avgs, exp_avg_sqs, exp_avg_diffs,
+                        neg_pre_grads, beta1, beta2, beta3, bias_correction1,
+                        bias_correction2, bias_correction3_sqrt, group,
+                    )
+                    continue
 
-                # 3. Apply Update
-                denom = v.sqrt().add_(group['eps'])
-                step_size = m + beta2 * diff
-                
-                # --- Regularization Logic ---
-                if group['weight_decay'] > 0:
-                    if group['l1']:
-                        # L1 Regularization: p = p - lr * wd * sign(p)
-                        # We use sign() to push weights toward zero
-                        p.add_(torch.sign(p), alpha=-group['lr'] * group['weight_decay'])
+                for p, grad, exp_avg, exp_avg_sq, exp_avg_diff, neg_grad_or_diff in zip(
+                    params, grads, exp_avgs, exp_avg_sqs, exp_avg_diffs, neg_pre_grads,
+                ):
+
+                    neg_grad_or_diff.add_(grad)
+                    exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+                    exp_avg_diff.mul_(beta2).add_(neg_grad_or_diff, alpha=1 - beta2)
+
+                    neg_grad_or_diff.mul_(beta2).add_(grad)
+                    exp_avg_sq.mul_(beta3).addcmul_(
+                        neg_grad_or_diff, neg_grad_or_diff, value=1 - beta3
+                    )
+
+                    denom = (exp_avg_sq.sqrt() / bias_correction3_sqrt).add_(group["eps"])
+                    if group["no_prox"]:
+                        p.mul_(1 - group["lr"] * group["weight_decay"])
+                        p.addcdiv_(exp_avg, denom, value=-step_size)
+                        p.addcdiv_(exp_avg_diff, denom, value=-step_size_diff)
                     else:
-                        # Standard L2 Weight Decay
-                        p.mul_(1 - group['lr'] * group['weight_decay'])
+                        p.addcdiv_(exp_avg, denom, value=-step_size)
+                        p.addcdiv_(exp_avg_diff, denom, value=-step_size_diff)
+                        p.div_(1 + group["lr"] * group["weight_decay"])
 
-                p.addcdiv_(step_size, denom, value=-group['lr'])
-                
-                # Update previous gradient
-                state['pre_grad'].copy_(grad)
+                    neg_grad_or_diff.zero_().add_(grad, alpha=-1.0)
+
+            _optimizer_copy_back(originals, working)
 
         return loss
+
+    @staticmethod
+    def _foreach_update(params, grads, exp_avgs, exp_avg_sqs, exp_avg_diffs,
+                        neg_pre_grads, beta1, beta2, beta3, bias_correction1,
+                        bias_correction2, bias_correction3_sqrt, group):
+        """Apply Adan's scalar update sequence to a homogeneous tensor bucket."""
+        torch._foreach_add_(neg_pre_grads, grads)
+        torch._foreach_mul_(exp_avgs, beta1)
+        torch._foreach_add_(exp_avgs, grads, alpha=1 - beta1)
+        torch._foreach_mul_(exp_avg_diffs, beta2)
+        torch._foreach_add_(exp_avg_diffs, neg_pre_grads, alpha=1 - beta2)
+        torch._foreach_mul_(neg_pre_grads, beta2)
+        torch._foreach_add_(neg_pre_grads, grads)
+        torch._foreach_mul_(exp_avg_sqs, beta3)
+        torch._foreach_addcmul_(exp_avg_sqs, neg_pre_grads, neg_pre_grads, value=1 - beta3)
+
+        denom = torch._foreach_sqrt(exp_avg_sqs)
+        torch._foreach_div_(denom, bias_correction3_sqrt)
+        torch._foreach_add_(denom, group["eps"])
+        step_size = group["lr"] / bias_correction1
+        step_size_diff = group["lr"] * beta2 / bias_correction2
+        if group["no_prox"]:
+            torch._foreach_mul_(params, 1 - group["lr"] * group["weight_decay"])
+        torch._foreach_addcdiv_(params, exp_avgs, denom, value=-step_size)
+        torch._foreach_addcdiv_(params, exp_avg_diffs, denom, value=-step_size_diff)
+        if not group["no_prox"]:
+            torch._foreach_div_(params, 1 + group["lr"] * group["weight_decay"])
+        torch._foreach_zero_(neg_pre_grads)
+        torch._foreach_add_(neg_pre_grads, grads, alpha=-1.0)
 
 import math
 from typing import TYPE_CHECKING, Any, Callable, Optional
@@ -14642,11 +16341,11 @@ class Prodigy(torch.optim.Optimizer):
     """
     def __init__(self, params, lr=1.0, betas=(0.9, 0.999), beta3=None,
                  eps=1e-8, weight_decay=0.0, decouple=True, use_bias_correction=True,
-                 safeguard_warmup=True, d0=1e-6, d_coef=1.0, growth_rate=float('inf'),
+                 safeguard_warmup=True, d0=1e-6, d_coef=0.5, growth_rate=1.02,
                  fsdp_in_use=False, slice_p=1, cautious_coeff=1.0, centralization='rms',
                  # --- Stability parameters ---
-                 d_decay=0.9995, d_upper_limit=float('inf'), d_ema_beta=0.95,
-                 grad_clip_norm=1.0, update_clip_norm=None):
+                 d_decay=0.9995, d_upper_limit=1e-2, d_ema_beta=0.95,
+                 grad_clip_norm=1.0, update_clip_norm=1.0, max_dlr=1e-2):
 
         if not 0.0 < d0:
             raise ValueError("Invalid d0 value: {}".format(d0))
@@ -14664,6 +16363,8 @@ class Prodigy(torch.optim.Optimizer):
             raise ValueError("Invalid d_decay: {}. Must be in (0.0, 1.0]".format(d_decay))
         if not 0.0 <= d_ema_beta < 1.0:
             raise ValueError("Invalid d_ema_beta: {}. Must be in [0.0, 1.0)".format(d_ema_beta))
+        if max_dlr is not None and max_dlr <= 0.0:
+            raise ValueError("Invalid max_dlr: {}. Must be positive or None".format(max_dlr))
 
         valid_modes = {'mean', 'mean_var', 'rms', 'none'}
         if centralization not in valid_modes:
@@ -14683,7 +16384,8 @@ class Prodigy(torch.optim.Optimizer):
                         d_decay=d_decay, d_upper_limit=d_upper_limit,
                         d_ema_beta=d_ema_beta, d_hat_ema=0.0,
                         grad_clip_norm=grad_clip_norm,
-                        update_clip_norm=update_clip_norm)
+                        update_clip_norm=update_clip_norm, max_dlr=max_dlr,
+                        last_dlr=0.0, unclipped_dlr=0.0)
 
         self.d0 = d0
         super().__init__(params, defaults)
@@ -14776,7 +16478,9 @@ class Prodigy(torch.optim.Optimizer):
         else:
             bias_correction = 1
 
-        dlr = d * lr * bias_correction
+        unclipped_dlr = d * lr * bias_correction
+        max_dlr = group['max_dlr']
+        dlr = min(unclipped_dlr, max_dlr) if max_dlr is not None else unclipped_dlr
         growth_rate = group['growth_rate']
         decouple = group['decouple']
         d_numerator = group['d_numerator']
@@ -14916,6 +16620,13 @@ class Prodigy(torch.optim.Optimizer):
             # behavior matches original Prodigy.
             d_max *= d_decay
 
+            # A single outlier d_hat should not become a permanent future target.
+            # The reference growth_rate only limits the current d, but once d_max
+            # ratchets to a huge value, d will eventually chase it. Bound the
+            # stored target too, so D only climbs when high estimates persist.
+            if math.isfinite(growth_rate):
+                d_hat_effective = min(d_hat_effective, max(d * growth_rate, group['d0']))
+
             if d == group['d0']:
                 d = max(d, d_hat_effective)
             d_max = max(d_max, d_hat_effective)
@@ -14928,6 +16639,7 @@ class Prodigy(torch.optim.Optimizer):
             # Also enforce upper limit on d directly
             d = min(d, d_upper_limit)
             d = max(d, 1e-6)
+            d_max = max(d_max, d)
 
         # -----------------------------------------------------------
         # PHASE 3: Update Parameters
@@ -14939,6 +16651,8 @@ class Prodigy(torch.optim.Optimizer):
             group['d_max'] = d_max
             group['d_hat'] = d_hat
             group['d_hat_ema'] = d_hat_ema
+            group['last_dlr'] = dlr
+            group['unclipped_dlr'] = unclipped_dlr
 
             decay = group['weight_decay']
             k = group['k']
@@ -15043,8 +16757,24 @@ class ProdigyAdan(torch.optim.Optimizer):
                  d_decay=0.9995, d_upper_limit=float('inf'), d_ema_beta=0.95,
                  grad_clip_norm=1.0, update_clip_norm=None):
 
+        if not 0.0 < d0:
+            raise ValueError("Invalid d0 value: {}".format(d0))
+        if not 0.0 < lr:
+            raise ValueError("Invalid learning rate: {}".format(lr))
+        if not 0.0 < eps:
+            raise ValueError("Invalid epsilon value: {}".format(eps))
         if not 0.0 <= betas[0] < 1.0 or not 0.0 <= betas[1] < 1.0 or not 0.0 <= betas[2] < 1.0:
             raise ValueError(f"Invalid beta parameters: {betas}")
+        if not 0.0 <= cautious_coeff <= 1.0:
+            raise ValueError("Invalid cautious_coeff: {}. Must be between 0.0 and 1.0".format(cautious_coeff))
+        if not 0.0 < d_decay <= 1.0:
+            raise ValueError("Invalid d_decay: {}. Must be in (0.0, 1.0]".format(d_decay))
+        if not 0.0 <= d_ema_beta < 1.0:
+            raise ValueError("Invalid d_ema_beta: {}. Must be in [0.0, 1.0)".format(d_ema_beta))
+
+        valid_modes = {'mean', 'mean_var', 'rms', 'none'}
+        if centralization not in valid_modes:
+            raise ValueError(f"Invalid centralization mode: {centralization}. Must be one of {valid_modes}")
 
         defaults = dict(lr=lr, betas=betas, beta3=beta3, eps=eps,
                         weight_decay=weight_decay, d=d0, d0=d0, d_max=d0,
@@ -15089,138 +16819,268 @@ class ProdigyAdan(torch.optim.Optimizer):
         if closure is not None:
             loss = closure()
 
+        d_denom = 0.0
+
         group = self.param_groups[0]
         beta1, beta2, beta3 = group['betas']
-        # Prodigy stepsize beta
         p_beta3 = group['beta3'] if group['beta3'] is not None else math.sqrt(beta3)
-        
+
         k = group['k']
         d = group['d']
         d_max = group['d_max']
+        d_coef = group['d_coef']
         lr = max(group['lr'] for group in self.param_groups)
-        
-        # Bias corrections
+
         if group['use_bias_correction']:
             bc1 = 1 - beta1**(k + 1)
             bc2 = 1 - beta2**(k + 1)
             bc3 = 1 - beta3**(k + 1)
-            # Adan usually doesn't use a single dlr bias correction, 
-            # but we follow Prodigy's logic for the D-estimate scaling.
-            prodigy_bc = (math.sqrt(bc3) / bc1) 
         else:
-            bc1 = bc2 = bc3 = prodigy_bc = 1.0
+            bc1 = bc2 = bc3 = 1.0
 
-        dlr = d * lr * prodigy_bc
+        dlr = d * lr
         d_numerator = group['d_numerator'] * p_beta3
         delta_numerator = 0.0
-        d_denom = 0.0
+        global_d_numerator = 0.0
+        global_d_denom = 0.0
 
-        # Phase 1: Accumulate Stats & Update Moments
+        d_decay = group['d_decay']
+        d_upper_limit = group['d_upper_limit']
+        d_ema_beta = group['d_ema_beta']
+        d_hat_ema = group['d_hat_ema']
+
+        # Phase 1: match Prodigy's D-stat pass while collecting Adan moments.
         for group in self.param_groups:
+            decay = group['weight_decay']
+            group_lr = group['lr']
+            d0 = group['d0']
+            safeguard_warmup = group['safeguard_warmup']
+            slice_p = group['slice_p']
+            decouple = group['decouple']
             grad_clip = group['grad_clip_norm']
-            centralization_mode = group['centralization']
-            
+
+            if group_lr not in [lr, 0.0]:
+                raise RuntimeError(
+                    f"Setting different lr values in different parameter groups "
+                    f"is only supported for values of 0")
+
             for p in group['params']:
-                if p.grad is None: continue
+                if p.grad is None:
+                    continue
+                if p.grad.is_sparse:
+                    raise RuntimeError("ProdigyAdan does not support sparse gradients")
                 grad = p.grad.data
-                
+
                 if grad_clip is not None:
                     self._clip_grad(grad, grad_clip)
-                
-                self._centralize_gradient(grad, mode=centralization_mode)
-                
+
+                if decay != 0 and not decouple:
+                    grad.add_(p.data, alpha=decay)
+
                 state = self.state[p]
                 if 'step' not in state:
                     state['step'] = 0
-                    state['m'] = torch.zeros_like(p.data) # 1st moment
-                    state['v'] = torch.zeros_like(p.data) # 2nd moment (grad diff)
-                    state['n'] = torch.zeros_like(p.data) # 3rd moment (variance)
-                    state['prev_grad'] = grad.clone().detach()
-                    # D-Adaptation states
-                    state['s'] = torch.zeros_like(p.data.flatten()[::group['slice_p']])
-                    state['p0'] = p.flatten()[::group['slice_p']].detach().clone()
+                    state['exp_avg'] = torch.zeros_like(p.data).detach()
+                    state['exp_avg_diff'] = torch.zeros_like(p.data).detach()
+                    state['exp_avg_sq'] = torch.zeros_like(p.data).detach()
+                    state['neg_pre_grad'] = grad.clone().detach().neg_()
+                    state['s'] = torch.zeros_like(p.data.flatten()[::slice_p]).detach()
+                    if p.any():
+                        state['p0'] = p.flatten()[::slice_p].detach().clone()
+                    else:
+                        state['p0'] = torch.tensor(0, device=p.device, dtype=p.dtype)
 
-                m, v, n = state['m'], state['v'], state['n']
-                prev_grad = state['prev_grad']
-                
-                # Prodigy numerator logic
-                sliced_p = group['slice_p']
-                p0_slice = state['p0']
-                p_slice = p.data.flatten()[::sliced_p]
-                grad_slice = grad.flatten()[::sliced_p]
-                
-                if group['lr'] > 0:
-                    delta_numerator += (d/group['d0']) * dlr * torch.dot(grad_slice, p0_slice - p_slice).item()
-
-                # Adan Moment Updates
-                diff = grad - prev_grad
-                m.mul_(beta1).add_(grad, alpha=1 - beta1)
-                v.mul_(beta2).add_(diff, alpha=1 - beta2)
-                
-                # n_t update: grad + beta2 * diff
-                # We use a temporary buffer for n update to match Adan paper exactly
-                current_n_update = grad + beta2 * diff
-                n.mul_(beta3).addcmul_(current_n_update, current_n_update, value=1 - beta3)
-                
-                # Prodigy Denominator logic
+                exp_avg = state['exp_avg']
+                exp_avg_diff = state['exp_avg_diff']
+                exp_avg_sq = state['exp_avg_sq']
+                neg_grad_or_diff = state['neg_pre_grad']
                 s = state['s']
-                if group['safeguard_warmup']:
-                    s.mul_(p_beta3).add_(grad_slice, alpha=((d / group['d0']) * d))
+                p0 = state['p0']
+
+                sliced_grad = grad.flatten()[::slice_p]
+
+                if group_lr > 0.0:
+                    delta_numerator += (
+                        (d / d0) * dlr *
+                        torch.dot(
+                            sliced_grad,
+                            p0.data - p.data.flatten()[::slice_p]
+                        ).item()
+                    )
+
+                # Official Adan moments: grad EMA, grad-difference EMA, and
+                # variance of grad + beta2 * grad_diff.
+                neg_grad_or_diff.add_(grad)
+                exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+                exp_avg_diff.mul_(beta2).add_(neg_grad_or_diff, alpha=1 - beta2)
+                neg_grad_or_diff.mul_(beta2).add_(grad)
+                exp_avg_sq.mul_(beta3).addcmul_(
+                    neg_grad_or_diff, neg_grad_or_diff, value=1 - beta3
+                )
+
+                if safeguard_warmup:
+                    s.mul_(p_beta3).add_(sliced_grad, alpha=((d / d0) * d))
                 else:
-                    s.mul_(p_beta3).add_(grad_slice, alpha=((d / group['d0']) * dlr))
+                    s.mul_(p_beta3).add_(sliced_grad, alpha=((d / d0) * dlr))
                 d_denom += s.abs().sum().item()
-                
-                state['prev_grad'].copy_(grad)
 
-        # Phase 2: D-Adaptation Update (Smoothing & Decay)
-        if d_denom > 0 and lr > 0:
-            d_hat = group['d_coef'] * (d_numerator + delta_numerator) / d_denom
-            
-            if group['d_ema_beta'] > 0:
-                if k == 0: group['d_hat_ema'] = d_hat
-                else: group['d_hat_ema'] = group['d_ema_beta'] * group['d_hat_ema'] + (1 - group['d_ema_beta']) * d_hat
-                d_hat_eff = group['d_hat_ema']
+                neg_grad_or_diff.zero_().add_(grad, alpha=-1.0)
+
+        # Phase 2: same D adaptation as Prodigy.
+        d_hat = d
+
+        if d_denom == 0:
+            return loss
+
+        if lr > 0.0:
+            global_d_numerator = d_numerator + delta_numerator
+            global_d_denom = d_denom
+
+            d_hat = d_coef * global_d_numerator / global_d_denom
+
+            if d_ema_beta > 0:
+                if k == 0:
+                    d_hat_ema = d_hat
+                else:
+                    d_hat_ema = d_ema_beta * d_hat_ema + (1 - d_ema_beta) * d_hat
+                d_hat_effective = d_hat_ema
             else:
-                d_hat_eff = d_hat
+                d_hat_effective = d_hat
 
-            d_max = max(group['d_max'] * group['d_decay'], d_hat_eff)
-            d_max = min(d_max, group['d_upper_limit'])
+            d_max *= d_decay
+            if d == group['d0']:
+                d = max(d, d_hat_effective)
+            d_max = max(d_max, d_hat_effective)
+            d_max = min(d_max, d_upper_limit)
             d = min(d_max, d * group['growth_rate'])
+            d = min(d, d_upper_limit)
             d = max(d, 1e-6)
 
-        # Phase 3: Apply Updates
+        # Phase 3: apply Prodigy-scaled Adan updates.
         for group in self.param_groups:
-            group['d'], group['d_max'], group['d_numerator'] = d, d_max, (d_numerator + delta_numerator)
-            
+            group['d_numerator'] = global_d_numerator
+            group['d_denom'] = global_d_denom
+            group['d'] = d
+            group['d_max'] = d_max
+            group['d_hat'] = d_hat
+            group['d_hat_ema'] = d_hat_ema
+
+            decay = group['weight_decay']
+            k = group['k']
+            decouple = group['decouple']
+            centralization_mode = group['centralization']
+            cautious_coeff = group['cautious_coeff']
+            update_clip_norm = group['update_clip_norm']
+
             for p in group['params']:
-                if p.grad is None: continue
+                if p.grad is None:
+                    continue
+                grad = p.grad.data
+                self._centralize_gradient(grad, mode=centralization_mode)
+
                 state = self.state[p]
-                m, v, n = state['m'], state['v'], state['n']
-                
-                # Adan's effective update: (m + beta2 * v) / sqrt(n + eps)
-                denom = (n.sqrt() / math.sqrt(bc3)).add_(group['eps'])
-                update = (m / bc1 + beta2 * v / bc2).div_(denom)
-                
-                if group['update_clip_norm'] is not None:
-                    self._clip_update(update, group['update_clip_norm'], p.data)
+                exp_avg = state['exp_avg']
+                exp_avg_diff = state['exp_avg_diff']
+                exp_avg_sq = state['exp_avg_sq']
 
-                # Weight Decay (Decoupled)
-                if group['weight_decay'] != 0 and group['decouple']:
-                    p.data.add_(p.data, alpha=-group['weight_decay'] * dlr)
+                state['step'] += 1
 
-                # Cautious Masking
-                if group['cautious_coeff'] < 1.0:
-                    mask = (update * p.grad.data > 0).to(p.dtype)
-                    if group['cautious_coeff'] > 0.0:
-                        mask.masked_fill_(mask == 0, group['cautious_coeff'])
+                denom = (exp_avg_sq.sqrt() / math.sqrt(bc3)).add_(group['eps'])
+                update = (exp_avg / bc1).add(exp_avg_diff, alpha=beta2 / bc2).div_(denom)
+
+                if update_clip_norm is not None:
+                    self._clip_update(update, update_clip_norm, p.data)
+
+                if decay != 0 and decouple:
+                    p.data.add_(p.data, alpha=-decay * dlr)
+
+                if cautious_coeff < 1.0:
+                    mask = (update * grad > 0).to(p.dtype)
+                    if cautious_coeff > 0.0:
+                        mask.masked_fill_(mask == 0, cautious_coeff)
                     p.data.add_(update * mask, alpha=-dlr)
                 else:
                     p.data.add_(update, alpha=-dlr)
 
-                state['step'] += 1
-            group['k'] += 1
+            group['k'] = k + 1
 
         return loss
+
+
+import torch
+import torch.nn as nn
+
+class DiscoveryLU6(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x):
+        # Using the discovered coefficients
+        # Simplified: 3.09 * (erf(x) + 1) * sigmoid(0.754 * (x - 3.03))
+        sig = torch.sigmoid(0.754 * (x - 3.03))
+        soft_ramp = torch.erf(x) + 1.0
+        return 3.09 * sig * soft_ramp
+
+import torch
+import torch.nn as nn
+
+class TRex(nn.Module):
+    def __init__(self, alpha: float = 1.0):
+        super().__init__()
+        # alpha acts as the strict lower bound for the negative regime
+        self.alpha = alpha
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # For x >= 0: return x
+        # For x < 0: return alpha * tanh(x / alpha)
+        return torch.where(
+            x >= 0.0, 
+            x, 
+            self.alpha * torch.tanh(x / self.alpha)
+        )
+
+import torch
+import torch.nn as nn
+
+class TRexFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, alpha):
+        # Determine masks
+        pos_mask = x >= 0.0
+        
+        # Compute components
+        # We reuse the tanh result during backward to save compute and VRAM
+        tanh_scaled = torch.tanh(x / alpha)
+        out = torch.where(pos_mask, x, alpha * tanh_scaled)
+        
+        # Save tensors needed for backward pass
+        ctx.save_for_backward(pos_mask, tanh_scaled)
+        ctx.alpha = alpha
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        pos_mask, tanh_scaled = ctx.saved_tensors
+        
+        # Gradient of positive space is 1.0
+        # Gradient of negative space is sech^2(x/alpha) = 1.0 - tanh^2(x/alpha)
+        grad_x = torch.where(
+            pos_mask, 
+            torch.ones_like(grad_output), 
+            1.0 - torch.square(tanh_scaled)
+        )
+        
+        # Return grad for input x, and None for the alpha hyperparameter
+        return grad_output * grad_x, None
+
+class TRexFused(nn.Module):
+    def __init__(self, alpha: float = 1.0):
+        super().__init__()
+        self.alpha = alpha
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return TRexFunction.apply(x, self.alpha)
+
 import math # Required for CautiousLamb sqrt
 import torch.nn.functional as F
 import math

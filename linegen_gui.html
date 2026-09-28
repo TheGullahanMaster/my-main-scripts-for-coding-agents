@@ -1,0 +1,1588 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LineGen Studio</title>
+<style>
+:root {
+  color-scheme: light;
+  --bg: #f4f3f0; --surface: #fcfcfb; --surface-2: #f0efec; --border: #dddcd7;
+  --text: #0b0b0b; --text-2: #52514e; --muted: #8a8983; --grid: #e7e6e2;
+  --accent: #2a78d6; --accent-ink: #ffffff; --danger: #c93c3b; --good: #008300;
+  --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s4: #eda100; --s5: #e87ba4; --s6: #008300; --s7: #4a3aa7; --s8: #e34948;
+  --div-neg: #1c5cab; --div-mid: #f0efec; --div-pos: #b7302f;
+  --seq: #cde2fb,#9ec5f4,#6da7ec,#3987e5,#256abf,#184f95,#0d366b;
+  --other: #b9b8b2;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg: #121211; --surface: #1a1a19; --surface-2: #242422; --border: #34342f;
+    --text: #ffffff; --text-2: #c3c2b7; --muted: #8f8e86; --grid: #2c2c29;
+    --accent: #3987e5; --accent-ink: #ffffff; --danger: #e66767; --good: #3fae3f;
+    --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #d55181; --s6: #008300; --s7: #9085e9; --s8: #e66767;
+    --div-neg: #5598e7; --div-mid: #383835; --div-pos: #e66767;
+    --seq: #0d366b,#104281,#1c5cab,#2a78d6,#5598e7,#86b6ef,#cde2fb;
+    --other: #5c5b56;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #121211; --surface: #1a1a19; --surface-2: #242422; --border: #34342f;
+  --text: #ffffff; --text-2: #c3c2b7; --muted: #8f8e86; --grid: #2c2c29;
+  --accent: #3987e5; --accent-ink: #ffffff; --danger: #e66767; --good: #3fae3f;
+  --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #d55181; --s6: #008300; --s7: #9085e9; --s8: #e66767;
+  --div-neg: #5598e7; --div-mid: #383835; --div-pos: #e66767;
+  --seq: #0d366b,#104281,#1c5cab,#2a78d6,#5598e7,#86b6ef,#cde2fb;
+  --other: #5c5b56;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+body { background: var(--bg); color: var(--text); font: 13px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+header { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 10px 16px; background: var(--surface); border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 5; }
+header h1 { font-size: 15px; margin: 0; font-weight: 650; }
+header .meta { color: var(--text-2); font-size: 12px; }
+header .spacer { flex: 1; }
+.status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--good); margin-right: 6px; }
+.status-dot.err { background: var(--danger); }
+.layout { display: grid; grid-template-columns: 330px minmax(0, 1fr); gap: 14px; padding: 14px 16px; align-items: start; }
+@media (max-width: 860px) { .layout { grid-template-columns: minmax(0, 1fr); } }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 12px; margin-bottom: 14px; min-width: 0; }
+.card h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--text-2); margin: 0 0 10px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+.card h2 .grow { flex: 1; }
+.field { margin-bottom: 10px; }
+.field label { display: flex; justify-content: space-between; gap: 8px; font-weight: 550; margin-bottom: 3px; }
+.field label .hint { color: var(--muted); font-weight: 400; font-size: 11px; }
+.field .row { display: flex; gap: 8px; align-items: center; }
+.field input[type=range] { flex: 1; min-width: 0; accent-color: var(--accent); }
+input[type=number], input[type=text], select { background: var(--surface-2); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 4px 6px; font: inherit; min-width: 0; }
+input[type=number] { width: 92px; }
+.field select, .field input[type=text] { width: 100%; }
+.field.out-of-range input[type=number] { border-color: var(--s4); }
+button { background: var(--surface-2); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 5px 10px; font: inherit; cursor: pointer; }
+button:hover { border-color: var(--muted); }
+button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+.btns { display: flex; gap: 6px; flex-wrap: wrap; }
+.outputs .out { padding: 8px 0; border-top: 1px solid var(--grid); }
+.outputs .out:first-child { border-top: 0; padding-top: 0; }
+.outputs .name { color: var(--text-2); font-size: 12px; }
+.outputs .value { font-size: 20px; font-weight: 650; font-variant-numeric: tabular-nums; word-break: break-all; }
+.outputs .target { color: var(--text-2); font-size: 12px; }
+.probrow { display: grid; grid-template-columns: minmax(0, 90px) 1fr 48px; gap: 6px; align-items: center; font-size: 12px; margin-top: 3px; }
+.probrow .lab { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-2); }
+.probrow .bar { height: 8px; background: var(--surface-2); border-radius: 4px; overflow: hidden; }
+.probrow .bar > div { height: 100%; background: var(--s1); border-radius: 4px; }
+.probrow .num { text-align: right; font-variant-numeric: tabular-nums; }
+.tabs { display: flex; gap: 2px; flex-wrap: wrap; border-bottom: 1px solid var(--border); margin-bottom: 14px; }
+.tabs button { border: 0; border-bottom: 2px solid transparent; border-radius: 0; background: none; padding: 8px 12px; color: var(--text-2); }
+.tabs button.active { color: var(--text); border-bottom-color: var(--accent); font-weight: 600; }
+.controls { display: flex; gap: 12px; flex-wrap: wrap; align-items: end; margin-bottom: 12px; }
+.controls .ctl { display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: var(--text-2); }
+.controls .ctl.check { flex-direction: row; align-items: center; gap: 6px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 12px; }
+.chart { position: relative; min-width: 0; }
+.chart canvas { display: block; width: 100%; }
+.chart .title { font-weight: 600; font-size: 12px; margin-bottom: 4px; display: flex; flex-wrap: wrap; gap: 0 8px; align-items: baseline; }
+.chart .title .sub { color: var(--muted); font-weight: 400; }
+.tooltip { position: fixed; pointer-events: none; background: var(--surface); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; font-size: 12px; box-shadow: 0 4px 14px rgba(0,0,0,.15); z-index: 50; display: none; max-width: 320px; font-variant-numeric: tabular-nums; }
+.tooltip .sw { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 12px; color: var(--text-2); margin: 4px 0; }
+.legend .sw { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+.note { color: var(--text-2); font-size: 12px; margin: 0 0 10px; }
+.muted { color: var(--muted); }
+table.data { border-collapse: collapse; width: 100%; font-size: 12px; font-variant-numeric: tabular-nums; }
+table.data th, table.data td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+table.data th { color: var(--text-2); font-weight: 600; }
+.scroll { overflow-x: auto; }
+.strip-row { display: grid; grid-template-columns: 120px minmax(0, 1fr); gap: 8px; align-items: center; margin-bottom: 6px; }
+.strip-row .lab { font-size: 12px; color: var(--text-2); }
+.strip-row .lab b { color: var(--text); font-weight: 600; }
+.two { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; }
+@media (max-width: 1100px) { .two { grid-template-columns: minmax(0, 1fr); } }
+.kv { display: grid; grid-template-columns: auto 1fr; gap: 2px 12px; font-size: 12px; font-variant-numeric: tabular-nums; }
+.kv div:nth-child(odd) { color: var(--text-2); }
+.toast { position: fixed; bottom: 16px; right: 16px; background: var(--danger); color: #fff; padding: 8px 12px; border-radius: 8px; max-width: min(520px, calc(100vw - 32px)); display: none; z-index: 60; white-space: pre-wrap; }
+.empty { color: var(--muted); padding: 24px; text-align: center; }
+.modes { display: flex; gap: 2px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; padding: 2px; }
+.modes button { border: 0; background: none; padding: 4px 14px; border-radius: 6px; color: var(--text-2); }
+.modes button.active { background: var(--surface); color: var(--text); font-weight: 600; box-shadow: 0 1px 2px rgba(0,0,0,.12); }
+[hidden] { display: none !important; }
+.train-grid { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); gap: 14px; padding: 14px 16px; align-items: start; }
+@media (max-width: 1150px) { .train-grid { grid-template-columns: minmax(0, 1fr); } }
+.form-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 10px 12px; }
+.form-grid .ctl, .controls .ctl { min-width: 0; }
+.form-grid select, .form-grid input[type=number], .form-grid input[type=text] { width: 100%; }
+.row-flex { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.row-flex input[type=text] { flex: 1; min-width: 160px; }
+.browser { border: 1px solid var(--border); border-radius: 8px; margin-top: 8px; max-height: 260px; overflow: auto; }
+.browser .item { padding: 4px 10px; cursor: pointer; display: flex; justify-content: space-between; gap: 8px; }
+.browser .item:hover { background: var(--surface-2); }
+.browser .path { padding: 6px 10px; font-size: 12px; color: var(--text-2); border-bottom: 1px solid var(--grid); position: sticky; top: 0; background: var(--surface); word-break: break-all; }
+table.cols td, table.cols th { padding: 3px 6px; }
+table.cols tr.sel td { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+table.cols td.name { cursor: pointer; font-weight: 550; user-select: none; }
+table.cols select { max-width: 190px; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.chip { display: flex; align-items: center; gap: 2px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; padding: 2px 4px 2px 8px; font-size: 12px; }
+.chip input { width: 64px; border: 0; background: transparent; padding: 2px; }
+.chip button { border: 0; background: none; padding: 0 4px; color: var(--muted); }
+.warn { color: var(--danger); font-size: 12px; }
+.state { font-size: 11px; font-weight: 650; text-transform: uppercase; letter-spacing: .05em; padding: 2px 8px; border-radius: 10px; border: 1px solid var(--border); background: var(--surface-2); }
+.state.training, .state.preparing { color: var(--accent); border-color: var(--accent); }
+.state.error { color: var(--danger); border-color: var(--danger); }
+.state.done { color: var(--good); border-color: var(--good); }
+details summary { cursor: pointer; color: var(--text-2); font-size: 12px; margin: 6px 0; }
+.nethead { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 12px 32px; font-size: 12px; }
+.netlegend { display: grid; grid-template-columns: repeat(2, auto); gap: 2px 18px; align-content: start; }
+.netlegend .lg-title { grid-column: span 2; }
+.lg-title { color: var(--text-2); font-weight: 600; text-transform: uppercase; letter-spacing: .05em; font-size: 11px; margin: 2px 0; }
+.lg-row { display: flex; align-items: center; gap: 6px; font-variant-numeric: tabular-nums; }
+.lg-row .ln { display: inline-block; width: 34px; }
+.lg-row .sw { display: inline-block; width: 12px; height: 8px; border-radius: 2px; }
+.layout > aside, .layout > main { min-width: 0; }  /* let wide content (the diagram) scroll instead of widening the page */
+.diagram-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+.diagram-scroll .chart { width: max-content; min-width: 100%; }
+.pill { font-size: 11px; padding: 1px 7px; border-radius: 10px; background: var(--surface-2); border: 1px solid var(--border); color: var(--text-2); }
+.modes { display: flex; gap: 2px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; padding: 2px; }
+.modes button { border: 0; background: none; padding: 4px 14px; border-radius: 6px; color: var(--text-2); }
+.modes button.active { background: var(--surface); color: var(--text); font-weight: 600; box-shadow: 0 1px 2px rgba(0,0,0,.12); }
+[hidden] { display: none !important; }
+.page { padding: 14px 16px; }
+.layout { padding: 0; }
+.layout > aside, .layout > main { min-width: 0; }
+.row-flex { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.form-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 10px 12px; }
+.form-grid select, .form-grid input[type=number], .form-grid input[type=text] { width: 100%; }
+.train-grid { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr); gap: 14px; align-items: start; }
+@media (max-width: 1100px) { .train-grid { grid-template-columns: minmax(0, 1fr); } }
+.browser { border: 1px solid var(--border); border-radius: 8px; max-height: 280px; overflow: auto; }
+.browser .item { padding: 4px 10px; cursor: pointer; display: flex; justify-content: space-between; gap: 8px; }
+.browser .item:hover { background: var(--surface-2); }
+.browser .path { padding: 6px 10px; font-size: 12px; color: var(--text-2); border-bottom: 1px solid var(--grid); position: sticky; top: 0; background: var(--surface); word-break: break-all; }
+.fb { margin-top: 8px; }
+.warn { color: var(--danger); font-size: 12px; }
+.warnpill { color: var(--danger); border-color: var(--danger); }
+.state { font-size: 11px; font-weight: 650; text-transform: uppercase; letter-spacing: .05em; padding: 2px 8px; border-radius: 10px; border: 1px solid var(--border); background: var(--surface-2); }
+.state.training, .state.preparing { color: var(--accent); border-color: var(--accent); }
+.state.error { color: var(--danger); border-color: var(--danger); }
+.state.done, .state.stopped { color: var(--good); border-color: var(--good); }
+details summary { cursor: pointer; color: var(--text-2); font-size: 12px; margin: 6px 0; }
+.progress { height: 6px; background: var(--surface-2); border-radius: 3px; overflow: hidden; margin: 8px 0; }
+.progress > div { height: 100%; width: 0; background: var(--accent); transition: width .5s; }
+.dslayout { display: grid; grid-template-columns: 300px minmax(0, 1fr); gap: 14px; align-items: start; }
+@media (max-width: 860px) { .dslayout { grid-template-columns: minmax(0, 1fr); } }
+.classrow { display: grid; grid-template-columns: 12px minmax(0, 1fr) auto 18px auto auto; gap: 6px; align-items: center; margin-bottom: 4px; }
+.classrow .sw { width: 12px; height: 12px; border-radius: 3px; }
+.classrow .classname { width: 100%; }
+.classrow button { padding: 2px 7px; }
+.key { font-size: 11px; color: var(--muted); border: 1px solid var(--border); border-radius: 4px; text-align: center; }
+.toolbar { gap: 6px; }
+.dsgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(var(--thumb, 112px), 1fr)); gap: 6px; }
+.dstile { position: relative; border: 2px solid transparent; border-radius: 8px; overflow: hidden; background: var(--surface-2); cursor: pointer; aspect-ratio: 1; user-select: none; }
+.dstile img { width: 100%; height: 100%; object-fit: cover; display: block; image-rendering: auto; }
+.dstile.sel { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent); }
+.dstile.sel::after { content: "✓"; position: absolute; top: 4px; right: 6px; color: #fff; background: var(--accent); border-radius: 10px; width: 20px; height: 20px; text-align: center; font-size: 13px; line-height: 20px; }
+.dstile.missing { opacity: .45; outline: 2px dashed var(--danger); }
+.dslabel { position: absolute; left: 0; right: 0; bottom: 0; font-size: 11px; padding: 2px 5px; color: #fff; background: rgba(0,0,0,.45); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dsdup { position: absolute; top: 4px; left: 4px; font-size: 10px; background: var(--danger); color: #fff; padding: 1px 5px; border-radius: 6px; }
+.classbars .probrow { grid-template-columns: minmax(0, 120px) 1fr 56px; }
+.probrow { display: grid; grid-template-columns: minmax(0, 110px) 1fr 52px; gap: 6px; align-items: center; font-size: 12px; margin-top: 3px; padding: 1px 3px; border-radius: 4px; }
+.probrow.sel { background: var(--surface-2); outline: 1px solid var(--border); }
+.probrow .lab { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-2); }
+.probrow .bar { height: 8px; background: var(--surface-2); border-radius: 4px; overflow: hidden; }
+.probrow .bar > div { height: 100%; border-radius: 4px; }
+.probrow .num { text-align: right; font-variant-numeric: tabular-nums; }
+.value { font-size: 22px; font-weight: 650; }
+.auggrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 2px 10px; }
+.samples { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.sample { display: flex; flex-direction: column; align-items: center; font-size: 10px; max-width: 120px; }
+.sample img { width: 96px; height: 96px; object-fit: cover; border-radius: 6px; background: var(--surface-2); }
+.sample span { color: #fff; background: var(--text-2); padding: 0 5px; border-radius: 4px; margin-top: 2px; max-width: 110px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pix { image-rendering: pixelated; }
+.probe { display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-start; }
+.mapgrid { display: grid; gap: 6px; margin-top: 6px; }
+.tile { cursor: pointer; text-align: center; }
+.tilecv { width: 100%; aspect-ratio: 1; image-rendering: pixelated; border-radius: 4px; background: var(--surface-2); display: block; }
+.tilelab { font-size: 10px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#unitBig .tilecv { max-width: 320px; }
+.drop { border: 2px dashed var(--border); border-radius: 8px; min-height: 120px; display: flex; align-items: center; justify-content: center; margin-top: 8px; padding: 6px; text-align: center; }
+.drop.over { border-color: var(--accent); }
+.drop img { max-width: 100%; max-height: 220px; }
+.dreamimg { width: 256px; height: 256px; background: var(--surface-2); border-radius: 8px; object-fit: contain; }
+.modal { position: fixed; inset: 0; background: rgba(0,0,0,.45); display: flex; align-items: center; justify-content: center; z-index: 40; padding: 16px; }
+.modal .card { max-width: 100%; }
+.sketch { width: min(280px, 80vw); height: min(280px, 80vw); border: 1px solid var(--border); border-radius: 6px; touch-action: none; cursor: crosshair; background: #fff; }
+canvas { max-width: 100%; }
+textarea { width: 100%; background: var(--surface-2); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; resize: vertical; }
+.card h3 { font-size: 12px; color: var(--text-2); margin: 14px 0 6px; font-weight: 600; }
+.tokens { font: 13px/1.7 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre-wrap; word-break: break-word; background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; max-height: 420px; overflow-y: auto; }
+.tokens.small { max-height: 200px; margin-bottom: 10px; }
+.tok { border-radius: 3px; cursor: pointer; padding: 0 0.5px; box-decoration-break: clone; -webkit-box-decoration-break: clone; }
+.tok:hover { outline: 1px solid var(--muted); }
+.tok.prompt { color: var(--text-2); text-decoration: underline dotted var(--muted); text-underline-offset: 3px; }
+.tok.sel { outline: 2px solid var(--accent); outline-offset: 0; }
+.cursor { color: var(--accent); animation: blink 1s steps(2) infinite; }
+@keyframes blink { 50% { opacity: 0; } }
+.sample-item { margin-bottom: 14px; }
+.sample-head { margin-bottom: 4px; font-size: 12px; }
+table.alts { border-collapse: collapse; font-size: 12px; margin-top: 4px; font-variant-numeric: tabular-nums; }
+table.alts td { padding: 1px 6px 1px 0; white-space: pre; font-family: ui-monospace, Menlo, Consolas, monospace; }
+table.alts tr.chosen td { font-weight: 700; color: var(--accent); }
+.mbar { display: inline-block; height: 7px; background: var(--s1); border-radius: 3px; vertical-align: middle; }
+pre.preview, pre.console, pre.sampletext { background: var(--surface-2); border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; font-size: 12px; max-height: 260px; overflow: auto; white-space: pre-wrap; word-break: break-word; margin: 6px 0; }
+pre.console { max-height: 340px; font-size: 11px; }
+.feed { max-height: 560px; overflow-y: auto; }
+.feeditem { border-top: 1px solid var(--grid); padding: 6px 0; font-size: 12px; }
+.feeditem:first-child { border-top: 0; }
+.s2s div { font-family: ui-monospace, Menlo, Consolas, monospace; white-space: pre-wrap; word-break: break-word; }
+table.stages input[type=number] { width: 72px; }
+table.stages select { max-width: 170px; }
+.genimg { max-width: 100%; max-height: 320px; image-rendering: pixelated; border-radius: 6px; margin-top: 6px; display: block; }
+.spacer { flex: 1; }
+</style>
+</head>
+<body>
+<header>
+  <h1>LineGen Studio</h1>
+  <nav class="modes" id="modes"><button data-page="train">Train</button><button data-page="sample">Sample &amp; inspect</button></nav>
+  <span class="meta" id="deviceInfo"></span>
+  <span class="spacer"></span>
+  <button id="themeBtn" title="Toggle light / dark">Theme</button>
+</header>
+<div id="trainPage" class="page" hidden></div>
+<div id="samplePage" class="page" hidden></div>
+<div class="tooltip" id="tooltip"></div>
+<div class="toast" id="toast"></div>
+<script>
+"use strict";
+// ───────────────────────── utilities ─────────────────────────
+const $ = (sel, root = document) => root.querySelector(sel);
+const el = (tag, attrs = {}, ...kids) => {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === "class") e.className = v;
+    else if (k === "style") e.style.cssText = v;
+    else if (k.startsWith("on")) e.addEventListener(k.slice(2), v);
+    else if (v !== false && v != null) e.setAttribute(k, v === true ? "" : v);
+  }
+  for (const k of kids.flat()) if (k != null) e.append(k.nodeType ? k : document.createTextNode(k));
+  return e;
+};
+const css = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+function fmt(v, digits = 4) {
+  if (v == null || Number.isNaN(v)) return "–";
+  if (typeof v !== "number") return String(v);
+  const a = Math.abs(v);
+  if (a !== 0 && (a >= 1e5 || a < 1e-3)) return v.toExponential(2);
+  return Number(v.toPrecision(digits)).toString();
+}
+function b64f32(s) {
+  const bin = atob(s), buf = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
+  return new Float32Array(buf.buffer);
+}
+const kv = (...pairs) => el("div", { class: "kv" }, pairs.map(p => el("div", {}, p)));
+// Rebuilding a section and then measuring it (charts read their width) forces a reflow while the page is
+// briefly shorter. Firefox clamps the scroll position right then, so the view jumps up. Keep the page at
+// least as tall as it was until the rebuild is drawn, and restore the scroll position.
+// 1-2-5 step near x, so arrow keys / spinners move number fields by a sensible amount
+function niceStep(x) {
+  if (!(x > 0) || !Number.isFinite(x)) return 1;
+  const m = Math.pow(10, Math.floor(Math.log10(x))), f = x / m;
+  return (f < 1.5 ? 1 : f < 3.5 ? 2 : f < 7.5 ? 5 : 10) * m;
+}
+function keepScroll(fn) {
+  const y = window.scrollY, body = document.body;
+  // controls carry data-fkey; a rebuild replaces them, so give focus back to the new twin
+  const act = document.activeElement, fkey = act && act.dataset ? act.dataset.fkey : null;
+  body.style.minHeight = document.documentElement.scrollHeight + "px";
+  try { return fn(); } finally {
+    if (fkey && !act.isConnected) {
+      const twin = document.querySelector(`[data-fkey="${CSS.escape(fkey)}"]`);
+      if (twin) twin.focus({ preventScroll: true });
+    }
+    if (window.scrollY !== y) window.scrollTo(0, y);
+    requestAnimationFrame(() => { body.style.minHeight = ""; });
+  }
+}
+// Run fn now, or after the user leaves the form field they are typing in (rebuilding would destroy it).
+function whenNotTyping(fn) {
+  const a = document.activeElement;
+  if (a && /^(INPUT|SELECT|TEXTAREA)$/.test(a.tagName) && a.isConnected) a.addEventListener("blur", () => setTimeout(fn, 0), { once: true });
+  else fn();
+}
+const debounce = (fn, ms) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; };
+function toast(msg, ok = false) { const t = $("#toast"); t.textContent = msg; t.style.background = ok ? "var(--good)" : "var(--danger)"; t.style.display = "block"; clearTimeout(toast.t); toast.t = setTimeout(() => t.style.display = "none", ok ? 4000 : 7000); }
+async function api(path, body = {}) {
+  const r = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const j = await r.json().catch(() => ({ error: `HTTP ${r.status}` }));
+  if (!r.ok || j.error) throw new Error(j.error || `HTTP ${r.status}`);
+  return j;
+}
+const store = {
+  get(k, d) { try { const v = localStorage.getItem("linegen." + k); return v == null ? d : JSON.parse(v); } catch { return d; } },
+  set(k, v) { try { localStorage.setItem("linegen." + k, JSON.stringify(v)); } catch { /* storage unavailable */ } },
+};
+const series = () => ["--s1", "--s2", "--s3", "--s4", "--s5", "--s6", "--s7", "--s8"].map(css);
+
+// ───────────────────────── color scales ─────────────────────────
+const hex2rgb = h => { h = h.replace("#", ""); return [0, 2, 4].map(i => parseInt(h.slice(i, i + 2), 16)); };
+const mix = (a, b, t) => a.map((x, i) => Math.round(x + (b[i] - x) * t));
+function seqScale() {
+  const stops = css("--seq").split(",").map(s => hex2rgb(s.trim()));
+  return t => {
+    t = Math.min(1, Math.max(0, Number.isFinite(t) ? t : 0)) * (stops.length - 1);
+    const i = Math.min(stops.length - 2, Math.floor(t));
+    return mix(stops[i], stops[i + 1], t - i);
+  };
+}
+function divScale() {
+  const neg = hex2rgb(css("--div-neg")), mid = hex2rgb(css("--div-mid")), pos = hex2rgb(css("--div-pos"));
+  return t => { // t in [-1, 1]
+    if (!Number.isFinite(t)) t = 0;
+    t = Math.max(-1, Math.min(1, t));
+    return t < 0 ? mix(mid, neg, -t) : mix(mid, pos, t);
+  };
+}
+const rgb = c => `rgb(${c[0]},${c[1]},${c[2]})`;
+
+// ───────────────────────── chart primitives ─────────────────────────
+function niceTicks(lo, hi, n = 5) {
+  if (!(hi > lo)) { hi = lo + 1; }
+  const span = hi - lo, step0 = span / n, mag = Math.pow(10, Math.floor(Math.log10(step0)));
+  const step = [1, 2, 2.5, 5, 10].map(m => m * mag).find(s => span / s <= n) || 10 * mag;
+  const out = [];
+  for (let v = Math.ceil(lo / step) * step; v <= hi + step * 1e-9; v += step) out.push(Math.abs(v) < step * 1e-9 ? 0 : v);
+  return out;
+}
+const tip = $("#tooltip");
+function showTip(html, ev) {
+  if (!html) { tip.style.display = "none"; return; }
+  tip.innerHTML = html; tip.style.display = "block";
+  const r = tip.getBoundingClientRect();
+  let x = ev.clientX + 14, y = ev.clientY + 14;
+  if (x + r.width > innerWidth - 8) x = ev.clientX - r.width - 14;
+  if (y + r.height > innerHeight - 8) y = ev.clientY - r.height - 14;
+  tip.style.left = Math.max(4, x) + "px"; tip.style.top = Math.max(4, y) + "px";
+}
+
+class Chart {
+  constructor(parent, { height = 240, title = "", sub = "" } = {}) {
+    this.root = el("div", { class: "chart" });
+    if (title) this.root.append(el("div", { class: "title" }, title, sub ? el("span", { class: "sub" }, sub) : null));
+    this.legendEl = el("div", { class: "legend" });
+    this.canvas = el("canvas", { role: "img", "aria-label": title || "chart" });
+    this.root.append(this.canvas, this.legendEl);
+    parent.append(this.root);
+    this.height = height; this.canvas.style.height = height + "px";
+    this.canvas.addEventListener("mousemove", ev => { if (this.hover) { const p = this.pos(ev); showTip(this.hover(p.x, p.y), ev); this.hoverAt = p; this.redrawOverlay?.(p); } });
+    this.canvas.addEventListener("mouseleave", () => { showTip(null); this.hoverAt = null; this.redrawOverlay?.(null); });
+    this.canvas.addEventListener("click", ev => { if (this.click) { const p = this.pos(ev); this.click(p.x, p.y); } });
+  }
+  pos(ev) { const r = this.canvas.getBoundingClientRect(); return { x: ev.clientX - r.left, y: ev.clientY - r.top }; }
+  setup() {
+    const dpr = window.devicePixelRatio || 1, w = Math.max(200, this.canvas.clientWidth || this.root.clientWidth || 400), h = this.height;
+    this.canvas.width = Math.round(w * dpr); this.canvas.height = Math.round(h * dpr); this.canvas.style.height = h + "px";
+    const ctx = this.canvas.getContext("2d"); ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.clearRect(0, 0, w, h);
+    this.w = w; this.ctx = ctx;
+    return ctx;
+  }
+  legend(items) {
+    this.legendEl.replaceChildren(...items.map(([name, color]) => el("span", {}, el("span", { class: "sw", style: `background:${color}` }), name)));
+  }
+  // axes frame; returns the plot box and scale helpers
+  frame({ xlo, xhi, ylo, yhi, xLabel = "", yLabel = "", xCats = null, yCats = null, left = 52, bottom = 34, yDown = false, intTicks = false }) {
+    const ctx = this.ctx, W = this.w, H = this.height;
+    const box = { l: left, r: W - 12, t: 8, b: H - bottom };
+    const sx = v => box.l + (v - xlo) / (xhi - xlo || 1) * (box.r - box.l);
+    const sy = v => yDown ? box.t + (v - ylo) / (yhi - ylo || 1) * (box.b - box.t) : box.b - (v - ylo) / (yhi - ylo || 1) * (box.b - box.t);
+    ctx.font = "11px system-ui, sans-serif"; ctx.lineWidth = 1;
+    ctx.strokeStyle = css("--grid"); ctx.fillStyle = css("--muted");
+    ctx.textAlign = "right"; ctx.textBaseline = "middle";
+    const ints = t => intTicks ? t.filter(v => Number.isInteger(v)) : t;
+    const yt = yCats ? yCats.map((_, i) => i) : ints(niceTicks(ylo, yhi, Math.max(2, Math.floor((box.b - box.t) / 38))));
+    for (const v of yt) { const y = sy(v); if (y < box.t - 1 || y > box.b + 1) continue; ctx.beginPath(); ctx.moveTo(box.l, y); ctx.lineTo(box.r, y); ctx.stroke(); ctx.fillText(yCats ? String(yCats[v]).slice(0, 8) : fmt(v, 3), box.l - 6, y); }
+    ctx.textAlign = "center"; ctx.textBaseline = "top";
+    if (xCats) {
+      const every = Math.max(1, Math.ceil(xCats.length / Math.max(1, (box.r - box.l) / 46)));
+      xCats.forEach((c, i) => { if (i % every === 0) ctx.fillText(String(c).slice(0, 10), sx(i), box.b + 6); });
+    } else {
+      for (const v of ints(niceTicks(xlo, xhi, Math.max(2, Math.floor((box.r - box.l) / 70))))) { const x = sx(v); ctx.beginPath(); ctx.moveTo(x, box.t); ctx.lineTo(x, box.b); ctx.stroke(); ctx.fillText(fmt(v, 3), x, box.b + 6); }
+    }
+    ctx.strokeStyle = css("--border"); ctx.beginPath(); ctx.moveTo(box.l, box.b + .5); ctx.lineTo(box.r, box.b + .5); ctx.stroke();
+    ctx.fillStyle = css("--text-2");
+    if (xLabel) { ctx.textBaseline = "bottom"; ctx.fillText(xLabel, (box.l + box.r) / 2, H - 1); }
+    if (yLabel) { ctx.save(); ctx.translate(11, (box.t + box.b) / 2); ctx.rotate(-Math.PI / 2); ctx.textBaseline = "middle"; ctx.fillText(String(yLabel).slice(0, 30), 0, 0); ctx.restore(); }
+    return { box, sx, sy, ix: px => xlo + (px - box.l) / (box.r - box.l) * (xhi - xlo), iy: py => ylo + (yDown ? py - box.t : box.b - py) / (box.b - box.t) * (yhi - ylo) };
+  }
+}
+
+function extent(arrs, pad = 0.06) {
+  let lo = Infinity, hi = -Infinity;
+  for (const a of arrs) for (const v of a) if (v != null && Number.isFinite(v)) { if (v < lo) lo = v; if (v > hi) hi = v; }
+  if (!Number.isFinite(lo)) return [0, 1];
+  if (hi === lo) { const d = Math.abs(lo) * 0.1 || 1; lo -= d; hi += d; }
+  const p = (hi - lo) * pad; return [lo - p, hi + p];
+}
+
+// line chart: x numeric, series [{name, y, color}], optional vline, points, click → x
+function drawLine(chart, { x, lines, xLabel, yLabel, vline = null, points = null, yRange = null, yCats = null, onClickX = null, alphaLines = false }) {
+  const ctx = chart.setup();
+  const xl = [Math.min(...x), Math.max(...x)];
+  const yr = yRange || extent(lines.map(s => s.y).concat(points ? [points.y] : []));
+  const f = chart.frame({ xlo: xl[0], xhi: xl[1], ylo: yr[0], yhi: yr[1], xLabel, yLabel, yCats });
+  const draw = hoverP => {
+    ctx.clearRect(0, 0, chart.w, chart.height);
+    chart.frame({ xlo: xl[0], xhi: xl[1], ylo: yr[0], yhi: yr[1], xLabel, yLabel, yCats });
+    ctx.save(); ctx.beginPath(); ctx.rect(f.box.l, f.box.t - 2, f.box.r - f.box.l, f.box.b - f.box.t + 4); ctx.clip();
+    if (points) {
+      ctx.fillStyle = css("--muted"); ctx.globalAlpha = 0.35;
+      for (let i = 0; i < points.x.length; i++) { ctx.beginPath(); ctx.arc(f.sx(points.x[i]), f.sy(points.y[i]), 2, 0, 7); ctx.fill(); }
+      ctx.globalAlpha = 1;
+    }
+    for (const s of lines) {
+      ctx.strokeStyle = s.color; ctx.lineWidth = s.width || 2; ctx.globalAlpha = s.alpha ?? 1; ctx.lineJoin = "round";
+      ctx.beginPath(); let started = false;
+      for (let i = 0; i < x.length; i++) { const v = s.y[i]; if (v == null || !Number.isFinite(v)) { started = false; continue; } const px = f.sx(x[i]), py = f.sy(v); started ? ctx.lineTo(px, py) : ctx.moveTo(px, py); started = true; }
+      ctx.stroke(); ctx.globalAlpha = 1;
+    }
+    if (vline != null && Number.isFinite(vline)) {
+      ctx.strokeStyle = css("--text"); ctx.setLineDash([4, 3]); ctx.lineWidth = 1.2;
+      ctx.beginPath(); ctx.moveTo(f.sx(vline), f.box.t); ctx.lineTo(f.sx(vline), f.box.b); ctx.stroke(); ctx.setLineDash([]);
+    }
+    if (hoverP && hoverP.x >= f.box.l && hoverP.x <= f.box.r) {
+      ctx.strokeStyle = css("--muted"); ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(hoverP.x, f.box.t); ctx.lineTo(hoverP.x, f.box.b); ctx.stroke();
+      const i = nearestIdx(x, f.ix(hoverP.x));
+      for (const s of lines) if (!alphaLines || s.highlight) { const v = s.y[i]; if (v == null) continue; ctx.fillStyle = s.color; ctx.strokeStyle = css("--surface"); ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(f.sx(x[i]), f.sy(v), 4.5, 0, 7); ctx.fill(); ctx.stroke(); }
+    }
+    ctx.restore();
+  };
+  draw(null);
+  chart.redrawOverlay = draw;
+  chart.hover = (mx, my) => {
+    if (mx < f.box.l || mx > f.box.r) return null;
+    const i = nearestIdx(x, f.ix(mx));
+    const shown = lines.filter(s => !alphaLines || s.highlight).slice(0, 10);
+    const rows = shown.map(s => `<div><span class="sw" style="background:${s.color}"></span>${esc(s.name)}: <b>${yCats ? esc(yCats[Math.round(s.y[i])] ?? fmt(s.y[i])) : fmt(s.y[i])}</b></div>`).join("");
+    return `<div class="muted">${esc(xLabel)} = ${fmt(x[i])}</div>${rows}${onClickX ? '<div class="muted">click to set input</div>' : ""}`;
+  };
+  chart.click = onClickX ? (mx => { if (mx >= f.box.l && mx <= f.box.r) onClickX(f.ix(mx)); }) : null;
+  return f;
+}
+function nearestIdx(arr, v) { let best = 0, bd = Infinity; for (let i = 0; i < arr.length; i++) { const d = Math.abs(arr[i] - v); if (d < bd) { bd = d; best = i; } } return best; }
+
+// categorical x: bars for one series, dot groups for several
+function drawCats(chart, { cats, lines, xLabel, yLabel, current = null, yCats = null, onClickCat = null }) {
+  const ctx = chart.setup();
+  const single = lines.length === 1;
+  const yr = extent(lines.map(s => s.y).concat(single ? [[0]] : []), 0.08);
+  if (single && yr[0] > 0) yr[0] = 0;
+  const f = chart.frame({ xlo: -0.5, xhi: cats.length - 0.5, ylo: yr[0], yhi: yr[1], xLabel, yLabel, xCats: cats, yCats });
+  const bw = Math.max(2, Math.min(40, (f.box.r - f.box.l) / cats.length - 2));
+  cats.forEach((c, i) => {
+    const cx = f.sx(i);
+    if (single) {
+      const v = lines[0].y[i], y0 = f.sy(Math.max(yr[0], 0)), y1 = f.sy(v);
+      ctx.fillStyle = lines[0].color; roundBar(ctx, cx - bw / 2, Math.min(y0, y1), bw, Math.abs(y1 - y0), v >= 0);
+      if (String(c) === String(current)) { ctx.strokeStyle = css("--text"); ctx.lineWidth = 2; ctx.strokeRect(cx - bw / 2 - 2, Math.min(y0, y1) - 2, bw + 4, Math.abs(y1 - y0) + 4); }
+    } else {
+      lines.forEach(s => { ctx.fillStyle = s.color; ctx.strokeStyle = css("--surface"); ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(cx, f.sy(s.y[i]), 4.5, 0, 7); ctx.fill(); ctx.stroke(); });
+      if (String(c) === String(current)) { ctx.strokeStyle = css("--text"); ctx.setLineDash([4, 3]); ctx.beginPath(); ctx.moveTo(cx, f.box.t); ctx.lineTo(cx, f.box.b); ctx.stroke(); ctx.setLineDash([]); }
+    }
+  });
+  const idxAt = mx => Math.round(f.ix(mx));
+  chart.redrawOverlay = null;
+  chart.hover = mx => {
+    const i = idxAt(mx); if (i < 0 || i >= cats.length) return null;
+    return `<div class="muted">${esc(xLabel)} = ${esc(cats[i])}</div>` + lines.slice(0, 10).map(s => `<div><span class="sw" style="background:${s.color}"></span>${esc(s.name)}: <b>${yCats ? esc(yCats[Math.round(s.y[i])] ?? fmt(s.y[i])) : fmt(s.y[i])}</b></div>`).join("") + (onClickCat ? '<div class="muted">click to set input</div>' : "");
+  };
+  chart.click = onClickCat ? (mx => { const i = idxAt(mx); if (i >= 0 && i < cats.length) onClickCat(cats[i]); }) : null;
+}
+function roundBar(ctx, x, y, w, h, up) {
+  const r = Math.min(4, w / 2, h);
+  ctx.beginPath();
+  if (up) { ctx.moveTo(x, y + h); ctx.lineTo(x, y + r); ctx.arcTo(x, y, x + r, y, r); ctx.lineTo(x + w - r, y); ctx.arcTo(x + w, y, x + w, y + r, r); ctx.lineTo(x + w, y + h); }
+  else { ctx.moveTo(x, y); ctx.lineTo(x, y + h - r); ctx.arcTo(x, y + h, x + r, y + h, r); ctx.lineTo(x + w - r, y + h); ctx.arcTo(x + w, y + h, x + w, y + h - r, r); ctx.lineTo(x + w, y); }
+  ctx.closePath(); ctx.fill();
+}
+
+// horizontal signed bars (sensitivity, weights of one neuron)
+function drawHBars(chart, { labels, values, valueLabel = "", colorPos, colorNeg, notes = null, onClick = null }) {
+  chart.height = Math.max(80, labels.length * 22 + 40);
+  const ctx = chart.setup();
+  ctx.font = "11px system-ui, sans-serif";
+  const lw = Math.min(170, Math.max(60, ...labels.map(l => ctx.measureText(String(l)).width + 16)));
+  let lo = Math.min(0, ...values.map(v => v ?? 0)), hi = Math.max(0, ...values.map(v => v ?? 0));
+  if (lo === hi) hi = 1;
+  const pad = (hi - lo) * 0.05; lo -= lo < 0 ? pad : 0; hi += hi > 0 ? pad : 0;
+  const box = { l: lw, r: chart.w - 60, t: 6, b: chart.height - 28 };
+  const sx = v => box.l + (v - lo) / (hi - lo) * (box.r - box.l);
+  ctx.font = "11px system-ui, sans-serif";
+  ctx.strokeStyle = css("--grid"); ctx.fillStyle = css("--muted"); ctx.textAlign = "center"; ctx.textBaseline = "top";
+  for (const v of niceTicks(lo, hi, Math.max(2, Math.floor((box.r - box.l) / 80)))) { ctx.beginPath(); ctx.moveTo(sx(v), box.t); ctx.lineTo(sx(v), box.b); ctx.stroke(); ctx.fillText(fmt(v, 3), sx(v), box.b + 4); }
+  ctx.fillStyle = css("--text-2"); ctx.textBaseline = "bottom"; ctx.fillText(valueLabel, (box.l + box.r) / 2, chart.height - 1);
+  const rowH = (box.b - box.t) / labels.length;
+  labels.forEach((l, i) => {
+    const y = box.t + i * rowH, v = values[i] ?? 0, bh = Math.max(3, Math.min(14, rowH - 4));
+    ctx.fillStyle = css("--text-2"); ctx.textAlign = "right"; ctx.textBaseline = "middle";
+    ctx.fillText(String(l).slice(0, 24), box.l - 8, y + rowH / 2);
+    ctx.fillStyle = v >= 0 ? colorPos : colorNeg;
+    const x0 = sx(0), x1 = sx(v);
+    ctx.fillRect(Math.min(x0, x1), y + (rowH - bh) / 2, Math.max(1, Math.abs(x1 - x0)), bh);
+    ctx.fillStyle = css("--text"); ctx.textAlign = "left"; ctx.fillText(fmt(v, 3), Math.max(x0, x1) + 4 > box.r ? box.r + 4 : Math.max(x0, x1) + 4, y + rowH / 2);
+  });
+  ctx.strokeStyle = css("--border"); ctx.beginPath(); ctx.moveTo(sx(0) + .5, box.t); ctx.lineTo(sx(0) + .5, box.b); ctx.stroke();
+  chart.redrawOverlay = null;
+  const rowAt = my => Math.floor((my - box.t) / rowH);
+  chart.hover = (mx, my) => { const i = rowAt(my); if (i < 0 || i >= labels.length) return null; return `<b>${esc(labels[i])}</b>: ${fmt(values[i])}${notes && notes[i] ? `<div class="muted">${notes[i]}</div>` : ""}`; };
+  chart.click = onClick ? ((mx, my) => { const i = rowAt(my); if (i >= 0 && i < labels.length) onClick(i); }) : null;
+}
+
+// heatmap: z Float32Array row-major [ny][nx]; colorFn(v) → [r,g,b]
+// yDown: data row 0 is drawn at the top (matrices); otherwise at the bottom (maps)
+function drawHeat(chart, { z, nx, ny, xVals, yVals, xLabel, yLabel, colorFn, valueText, xCats = null, yCats = null, marker = null, points = null, onClick = null, left = 52, bottom = 34, square = false, yDown = false, intTicks = false }) {
+  if (square) chart.height = Math.min(420, Math.max(160, Math.round((chart.canvas.clientWidth || 400) * ny / Math.max(nx, 1)) + bottom + 10));
+  const ctx = chart.setup();
+  // axis limits sit half a cell outside the first/last sample so ticks land on cell centres
+  const half = (vals, n) => n > 1 ? (vals[n - 1] - vals[0]) / (n - 1) / 2 : 0.5;
+  const hx = xCats ? 0.5 : half(xVals, nx), hy = yCats ? 0.5 : half(yVals, ny);
+  const xlo = xCats ? -0.5 : xVals[0] - hx, xhi = xCats ? nx - 0.5 : xVals[nx - 1] + hx;
+  const ylo = yCats ? -0.5 : yVals[0] - hy, yhi = yCats ? ny - 0.5 : yVals[ny - 1] + hy;
+  const f = chart.frame({ xlo, xhi, ylo, yhi, xLabel, yLabel, xCats, yCats, left, bottom, yDown, intTicks });
+  const img = document.createElement("canvas"); img.width = nx; img.height = ny;
+  const ictx = img.getContext("2d"), data = ictx.createImageData(nx, ny);
+  for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) {
+    const c = colorFn(z[j * nx + i]), o = ((yDown ? j : ny - 1 - j) * nx + i) * 4;
+    data.data[o] = c[0]; data.data[o + 1] = c[1]; data.data[o + 2] = c[2]; data.data[o + 3] = 255;
+  }
+  ictx.putImageData(data, 0, 0);
+  ctx.imageSmoothingEnabled = false;
+  const cellW = (f.box.r - f.box.l) / nx, cellH = (f.box.b - f.box.t) / ny;
+  ctx.drawImage(img, f.box.l, f.box.t, f.box.r - f.box.l, f.box.b - f.box.t);
+  const toX = f.sx, toY = f.sy;
+  if (points) {
+    ctx.fillStyle = css("--surface"); ctx.strokeStyle = css("--text"); ctx.lineWidth = 1; ctx.globalAlpha = 0.7;
+    for (let k = 0; k < points.x.length; k++) { ctx.beginPath(); ctx.arc(toX(points.x[k]), toY(points.y[k]), 2.2, 0, 7); ctx.fill(); ctx.stroke(); }
+    ctx.globalAlpha = 1;
+  }
+  if (marker) {
+    const mx = toX(marker[0]), my = toY(marker[1]);
+    ctx.strokeStyle = css("--surface"); ctx.lineWidth = 5; crossAt(ctx, mx, my);
+    ctx.strokeStyle = css("--text"); ctx.lineWidth = 2; crossAt(ctx, mx, my);
+  }
+  const cell = (mx, my) => { const i = Math.floor((mx - f.box.l) / cellW), r = Math.floor((my - f.box.t) / cellH), j = yDown ? r : ny - 1 - r; return i >= 0 && i < nx && j >= 0 && j < ny ? [i, j] : null; };
+  chart.redrawOverlay = null;
+  chart.hover = (mx, my) => { const c = cell(mx, my); if (!c) return null; const [i, j] = c; return valueText(i, j, z[j * nx + i]) + (onClick ? '<div class="muted">click to set inputs</div>' : ""); };
+  chart.click = onClick ? ((mx, my) => { const c = cell(mx, my); if (c) onClick(c[0], c[1]); }) : null;
+  return f;
+}
+function crossAt(ctx, x, y) { ctx.beginPath(); ctx.moveTo(x - 7, y - 7); ctx.lineTo(x + 7, y + 7); ctx.moveTo(x + 7, y - 7); ctx.lineTo(x - 7, y + 7); ctx.stroke(); }
+
+function colorbar(parent, { lo, hi, colorFn, label, diverging = false }) {
+  const c = el("canvas", { style: "width:100%;height:12px;border-radius:3px;display:block" });
+  const wrap = el("div", { style: "margin:6px 0 2px" }, c, el("div", { class: "legend", style: "justify-content:space-between" }, el("span", {}, fmt(lo)), el("span", {}, label || ""), el("span", {}, fmt(hi))));
+  parent.append(wrap);
+  requestAnimationFrame(() => {
+    const w = c.clientWidth || 300; c.width = w; c.height = 12; const ctx = c.getContext("2d");
+    for (let i = 0; i < w; i++) { const t = i / (w - 1); ctx.fillStyle = rgb(colorFn(diverging ? t * 2 - 1 : t)); ctx.fillRect(i, 0, 1, 12); }
+  });
+}
+
+// charts need layout width: build into a detached node, then draw after attach
+function later(root, fn) { (root._after ??= []).push(fn); }
+// ───────────────────────── file browser ─────────────────────────
+const baseName = p => String(p).split(/[\\/]/).pop();
+function rankName(name, q) {  // substring first, then letters-in-order ("chkb" -> checkerboard)
+  if (!q) return 0; const n = name.toLowerCase();
+  if (n.includes(q)) return n.startsWith(q) ? 0 : 1;
+  let i = 0; for (const ch of n) if (ch === q[i]) i++; return i === q.length ? 2 : -1;
+}
+function fileBrowser({ start, accept = ["image", "json"], allowDir = false, dirLabel = "Use this folder", onPick, key = "fb" }) {
+  const filter = el("input", { type: "search", placeholder: "Type to filter by name…", "data-fkey": key + ":filter", autocomplete: "off", spellcheck: "false", style: "width:100%" });
+  const box = el("div", { class: "browser" }, el("div", { class: "path" }, "loading…"));
+  const useDir = el("button", { class: "primary", hidden: !allowDir }, dirLabel);
+  const wrap = el("div", { class: "fb" }, el("div", { class: "row-flex", style: "margin:6px 0" }, filter, useDir), box);
+  let listing = null;
+  const go = async dir => {
+    try { listing = await api("/api/fs", { path: dir }); store.set("fbdir", listing.path); filter.value = ""; draw(); }
+    catch (e) { box.replaceChildren(el("div", { class: "path" }, e.message)); }
+  };
+  const matches = (list, q, key) => list.map(x => [rankName(key(x), q), x]).filter(([r]) => r >= 0).sort((a, b) => a[0] - b[0] || key(a[1]).localeCompare(key(b[1]))).map(([, x]) => x);
+  const draw = () => {
+    if (!listing) return;
+    const q = filter.value.trim().toLowerCase();
+    const dirs = matches(listing.dirs, q, n => n), files = matches(listing.files.filter(f => accept.includes(f.kind)), q, f => f.name);
+    box.replaceChildren(el("div", { class: "path" }, listing.path),
+      q ? null : el("div", { class: "item", onclick: () => go(listing.parent) }, "⬑ ..", ""),
+      ...dirs.map(n => el("div", { class: "item", onclick: () => go(listing.path + "/" + n) }, "▸ " + n + "/", "")),
+      ...files.slice(0, 400).map(f => el("div", { class: "item", onclick: () => onPick(listing.path + "/" + f.name, f.kind) }, f.name, el("span", { class: "muted" }, f.kind === "file" ? (f.size >= 1048576 ? (f.size / 1048576).toFixed(1) + " MB" : f.size >= 1024 ? (f.size / 1024).toFixed(1) + " KB" : f.size + " B") : f.kind))),
+      files.length > 400 ? el("div", { class: "item muted" }, `+${files.length - 400} more — type to filter`) : null,
+      dirs.length || files.length ? null : el("div", { class: "item muted" }, q ? "nothing matches" : "no matching files here"));
+  };
+  filter.addEventListener("input", draw);
+  filter.addEventListener("keydown", e => {
+    if (e.key !== "Enter" || !listing) return;
+    const q = filter.value.trim().toLowerCase();
+    const f = matches(listing.files.filter(f => accept.includes(f.kind)), q, f => f.name)[0], d = matches(listing.dirs, q, n => n)[0];
+    if (f) onPick(listing.path + "/" + f.name, f.kind); else if (d) go(listing.path + "/" + d);
+  });
+  useDir.onclick = () => listing && onPick(listing.path, "dir");
+  go(start || store.get("fbdir", null) || G.opts?.cwd);
+  return wrap;
+}
+function pageTabs(id, tabs, current, onPick) {
+  return el("div", { class: "tabs" }, tabs.map(([k, name]) => el("button", { class: k === current ? "active" : "", "data-fkey": id + ":" + k, onclick: () => onPick(k) }, name)));
+}
+// ───────────────────────── app shell ─────────────────────────
+const G = { opts: null, page: "train" };
+const AFTER = [];
+const afterMount = fn => AFTER.push(fn);
+function mount(container, ...nodes) {
+  keepScroll(() => { container.replaceChildren(...nodes); const q = AFTER.splice(0); q.forEach(fn => { try { fn(); } catch (e) { console.error(e); } }); });
+}
+const fmtInt = n => n == null ? "–" : Number(n).toLocaleString();
+const human = n => n == null ? "–" : n >= 1e9 ? (n / 1e9).toFixed(2) + "B" : n >= 1e6 ? (n / 1e6).toFixed(2) + "M" : n >= 1e3 ? (n / 1e3).toFixed(1) + "k" : String(Math.round(n));
+const bytesH = n => n == null ? "–" : n >= 1 << 30 ? (n / (1 << 30)).toFixed(2) + " GB" : n >= 1 << 20 ? (n / (1 << 20)).toFixed(1) + " MB" : n >= 1024 ? (n / 1024).toFixed(1) + " KB" : n + " B";
+const dur = s => { s = Math.max(0, Math.round(s || 0)); const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60); return h ? `${h}h ${m}m` : m ? `${m}m ${s % 60}s` : `${s}s`; };
+const TOKENIZERS = [[-1, "Binary (bits)"], [0, "Byte (0–255)"], [1, "Character"], [2, "Word"], [3, "Tiktoken"], [4, "Custom BPE"]];
+const NORMS = [[0, "None"], [1, "BatchNorm"], [2, "LayerNorm"], [3, "RMSNorm"], [4, "TTanh"], [5, "ETTanh"], [6, "DyT"]];
+const RES_TYPES = [[0, "Add"], [1, "Concat + projection"], [2, "ReZero scalar"], [3, "ReZero vector"]];
+const FFNS = [[0, "Off"], [1, "SwiGLU"], [2, "ReGLU"], [3, "SiLU MLP"]];
+const modelById = id => G.opts.models.find(m => m.id === +id);
+function fld(label, input, hint = null) { if (!input.dataset.fkey) input.dataset.fkey = "f:" + label; return el("label", { class: "ctl", title: hint || "" }, label, input); }
+function numIn(obj, key, attrs = {}, after = null, save = null) {
+  const step = attrs.step ?? (Number.isInteger(+obj[key]) ? 1 : niceStep(Math.abs(+obj[key]) / 10));
+  return el("input", Object.assign({ type: "number", value: obj[key] ?? "", step,
+    onchange: e => { obj[key] = e.target.value === "" ? "" : +e.target.value; (save || saveForms)(); after && after(); } }, attrs, { step }));
+}
+function txtIn(obj, key, attrs = {}, after = null) {
+  return el("input", Object.assign({ type: "text", value: obj[key] ?? "", onchange: e => { obj[key] = e.target.value; saveForms(); after && after(); } }, attrs));
+}
+function selIn(obj, key, options, after = null) {
+  return el("select", { onchange: e => { const v = e.target.value; obj[key] = /^-?\d+$/.test(v) ? +v : v; saveForms(); (after || renderTrain)(); } },
+    options.map(([v, t]) => el("option", { value: v, selected: String(v) === String(obj[key]) }, t)));
+}
+function chk(obj, key, label, after = null) {
+  return el("label", { class: "ctl check" }, el("input", { type: "checkbox", "data-fkey": "c:" + key, checked: !!obj[key], onchange: e => { obj[key] = e.target.checked; saveForms(); (after || renderTrain)(); } }), label);
+}
+function emptyMsg(chart, msg) { const ctx = chart.setup(); ctx.fillStyle = css("--muted"); ctx.font = "12px system-ui"; ctx.textAlign = "center"; ctx.fillText(msg, chart.w / 2, chart.height / 2); chart.hover = null; chart.click = null; chart.redrawOverlay = null; }
+function ema(v, a) { let m = null; return v.map(x => (x == null || !Number.isFinite(x)) ? m : (m = m == null ? x : a * m + (1 - a) * x)); }
+
+// several series with their own x arrays (train loss per step + validation per interval)
+function drawXY(chart, { series: ser, xLabel, yLabel, yRange = null, logY = false }) {
+  const ctx = chart.setup();
+  const tf = v => logY ? (v > 0 ? Math.log10(v) : null) : v;
+  const all = ser.filter(s => !s.noScale).map(s => s.y.map(tf));
+  const xs = ser.flatMap(s => s.x);
+  const xlo = Math.min(...xs), xhi = Math.max(...xs) > xlo ? Math.max(...xs) : xlo + 1;
+  const yr = yRange || extent(all.length ? all : ser.map(s => s.y.map(tf)));
+  const frame = () => chart.frame({ xlo, xhi, ylo: yr[0], yhi: yr[1], xLabel, yLabel: logY ? yLabel + " (log₁₀)" : yLabel });
+  const f = frame();
+  const draw = hp => {
+    ctx.clearRect(0, 0, chart.w, chart.height); frame();
+    ctx.save(); ctx.beginPath(); ctx.rect(f.box.l, f.box.t - 2, f.box.r - f.box.l, f.box.b - f.box.t + 4); ctx.clip();
+    for (const s of ser) {
+      ctx.strokeStyle = s.color; ctx.fillStyle = s.color; ctx.lineWidth = s.width || 2; ctx.globalAlpha = s.alpha ?? 1; ctx.lineJoin = "round";
+      ctx.beginPath(); let started = false;
+      for (let i = 0; i < s.x.length; i++) { const v = tf(s.y[i]); if (v == null || !Number.isFinite(v)) { started = false; continue; } const px = f.sx(s.x[i]), py = f.sy(v); started ? ctx.lineTo(px, py) : ctx.moveTo(px, py); started = true; }
+      ctx.stroke();
+      if (s.dots) for (let i = 0; i < s.x.length; i++) { const v = tf(s.y[i]); if (v == null) continue; ctx.beginPath(); ctx.arc(f.sx(s.x[i]), f.sy(v), 3.2, 0, 7); ctx.fill(); }
+      ctx.globalAlpha = 1;
+    }
+    if (hp && hp.x >= f.box.l && hp.x <= f.box.r) {
+      ctx.strokeStyle = css("--muted"); ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(hp.x, f.box.t); ctx.lineTo(hp.x, f.box.b); ctx.stroke();
+      const xv = f.ix(hp.x);
+      for (const s of ser) { if (s.noHover || !s.x.length) continue; const i = nearestIdx(s.x, xv), v = tf(s.y[i]); if (v == null) continue; ctx.fillStyle = s.color; ctx.strokeStyle = css("--surface"); ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(f.sx(s.x[i]), f.sy(v), 4.5, 0, 7); ctx.fill(); ctx.stroke(); }
+    }
+    ctx.restore();
+  };
+  draw(null);
+  chart.redrawOverlay = draw; chart.click = null;
+  chart.hover = mx => {
+    if (mx < f.box.l || mx > f.box.r) return null;
+    const xv = f.ix(mx);
+    return ser.filter(s => !s.noHover && s.x.length).map(s => { const i = nearestIdx(s.x, xv); return `<div><span class="sw" style="background:${s.color}"></span>${esc(s.name)} @ ${fmt(s.x[i])}: <b>${fmt(s.y[i])}</b></div>`; }).join("");
+  };
+  chart.legend(ser.filter(s => !s.noLegend).map(s => [s.name, s.color]));
+  return f;
+}
+
+// token strip: pieces as inline spans; newlines break lines
+function tokenSpan(piece, i, { bg = null, cls = "", title = null, onClick = null, onHover = null, word = false } = {}) {
+  const vis = piece === "\n" ? "↵" : piece === "\t" ? "⇥" : piece === "" ? "∅" : piece;
+  const s = el("span", { class: "tok " + cls, "data-i": i, style: bg ? `background:${bg}` : "" }, vis + (word ? " " : ""));
+  if (piece.includes("\n") && piece !== "\n") s.textContent = piece.replace(/\n/g, "↵\n");
+  if (onClick) s.addEventListener("click", () => onClick(i));
+  if (onHover) { s.addEventListener("mousemove", ev => showTip(onHover(i), ev)); s.addEventListener("mouseleave", () => showTip(null)); }
+  const frag = el("span", {}, s);
+  if (piece === "\n") frag.append(el("br"));
+  return frag;
+}
+const probColor = p => { const c = hex2rgb(css("--s8")); return `rgba(${c[0]},${c[1]},${c[2]},${(0.55 * Math.pow(1 - Math.max(0, Math.min(1, p)), 1.5)).toFixed(3)})`; };
+const entColor = (h, hmax) => { const c = hex2rgb(css("--s1")); return `rgba(${c[0]},${c[1]},${c[2]},${(0.55 * Math.min(1, h / Math.max(hmax, 1e-6))).toFixed(3)})`; };
+const signColor = (v, m) => { const c = divScale()(v / Math.max(m, 1e-12)); return rgb(c); };
+function altTable(alts, chosen = null) {
+  return `<table class="alts">${alts.map(([t, p]) => `<tr${t === chosen ? ' class="chosen"' : ""}><td>${esc(JSON.stringify(t).slice(1, -1))}</td><td><span class="mbar" style="width:${Math.max(1, Math.round(p * 80))}px"></span></td><td>${(100 * p).toFixed(1)}%</td></tr>`).join("")}</table>`;
+}
+
+// ───────────── file choosing: native dialog on the server's desktop, or upload a copy ─────────────
+async function pickFile(kind, start, title) {
+  try { const r = await api("/api/pick", { kind, start, title }); return r.cancelled ? null : r.path; }
+  catch (e) { toast(e.message); return null; }
+}
+function chooseButton(label, { kind = "file", start = () => null, title = "Choose a file", onPick }) {
+  const b = el("button", { title: "open this computer's file dialog and use the real path (no copy)", onclick: async () => {
+    b.disabled = true; const old = b.textContent; b.textContent = "Waiting for the dialog…";
+    const p = await pickFile(kind, start(), title);
+    b.disabled = false; b.textContent = old;
+    if (p) onPick(p);
+  } }, label);
+  return b;
+}
+function uploadButton(label, { accept = "", onDone }) {
+  const input = el("input", { type: "file", accept, style: "display:none" });
+  const b = el("button", { title: "copy a file from this device into uploads/ in the working folder", onclick: () => input.click() }, label);
+  input.addEventListener("change", () => {
+    const file = input.files[0]; if (!file) return;
+    const xhr = new XMLHttpRequest(), old = b.textContent;
+    b.disabled = true;
+    xhr.upload.onprogress = e => { if (e.lengthComputable) b.textContent = `Uploading ${Math.round(100 * e.loaded / e.total)}%`; };
+    xhr.onloadend = () => {
+      b.disabled = false; b.textContent = old; input.value = "";
+      let r = null; try { r = JSON.parse(xhr.responseText); } catch { /* not JSON */ }
+      if (xhr.status !== 200 || !r || r.error) { toast("Upload failed: " + (r?.error || xhr.status)); return; }
+      toast(`${r.reused ? "Already uploaded" : "Uploaded"}: ${r.path}`, true); onDone(r.path);
+    };
+    xhr.open("POST", "/api/upload?name=" + encodeURIComponent(file.name)); xhr.send(file);
+  });
+  return el("span", {}, b, input);
+}
+const dirOf = p => p ? String(p).replace(/[\\/][^\\/]*$/, "") : null;
+
+// ───────────────────────── Train page ─────────────────────────
+const TF_DEFAULT = {
+  dataset_path: "", dataset_type: 0, tokenizer_mode: 1, tiktoken_encoding: "cl100k_base", custom_bpe_size: 4096, byte_output_text: false,
+  seq2seq_on: false, seq2seq: { delimiter: ",", has_header: true, roles: [] },
+  model: 301, model_type: 0, activation: "", minrnn_act: 0, size_mode: "fixed", embed_dim: 256, target_millions: 2, head_count: 4, layer_count: 4, ngram_context: 4,
+  per_stage_cores: false, separate_encoder: false,
+  stages: [{ seq_len: 128, dim: 256, child_dim: 64, depth: 2, heads: 8, mixer: "", enc_mixer: "" }, { seq_len: 4, dim: 128, child_dim: 64, depth: 2, heads: 8, mixer: "", enc_mixer: "" }],
+  use_norm: 0, res_every: 0, res_type: 0, dropout: 0, use_multiplier: 0, rnn_ffn: 0, indrnn_activation: "relu", relu_gates: false, mogrifier_rounds: 5,
+  unicornn_dt: 0.1, unicornn_alpha: 10, lru_highway: false, rru_middle_multiplier: 2, rru_dropout: 0,
+  seq_len: 256, val_mode: "split", val_split: 0.1, val_path: "", sparse_local_window: 512, sparse_compression_block: 32, sparse_selected_blocks: 16,
+  epoch_count: 10, batch_size: 32, grad_accum_steps: 1, max_grad_norm: 1, use_amp: false, amp_dtype: "fp16", use_compile: false,
+  use_tbptt: false, bptt_window: 64, tbptt_total_len: 0,
+  log_interval: 10, sample_interval: 500, val_interval: 500, save_interval: 10000,
+  train_sample_count: 2, train_sample_len: 200, train_sample_prompt: "", train_sample_temperature: 1.0,
+  optimizer: null, optim_params: {}, lr_scheduler: "none", warmup_steps: 100,
+};
+const T = {
+  F: Object.assign(structuredClone(TF_DEFAULT), store.get("trainForm", {})), O: store.get("overrides", {}), mode: store.get("trainMode", "new"),
+  inspect: null, browse: null, check: null, st: null, since: 0, pts: [], csince: 0, console: [], timer: null, metric: store.get("metric", "lr"), logY: store.get("logY", false),
+};
+const TF = () => T.F;
+function saveForms() { store.set("trainForm", T.F); store.set("overrides", T.O); store.set("trainMode", T.mode); }
+const busy = () => ["preparing", "training", "stopping"].includes(T.st?.state);
+
+async function inspectDataset() {
+  const f = TF();
+  if (!f.dataset_path) { T.inspect = null; return; }
+  try {
+    const delim = f.dataset_type === 1 && f.seq2seq_on ? f.seq2seq.delimiter.replace("\\t", "\t") : null;
+    T.inspect = await api("/api/dataset/inspect", { path: f.dataset_path, delimiter: delim, has_header: f.seq2seq.has_header });
+    T.inspect.key = f.dataset_path + "|" + delim + "|" + f.seq2seq.has_header;
+  } catch (e) { T.inspect = { error: e.message, key: f.dataset_path }; }
+}
+function inspectKey() { const f = TF(); return f.dataset_path + "|" + (f.dataset_type === 1 && f.seq2seq_on ? f.seq2seq.delimiter.replace("\\t", "\t") : null) + "|" + f.seq2seq.has_header; }
+
+async function renderTrain() {
+  const f = TF();
+  if (f.optimizer == null) f.optimizer = G.opts.default_optimizer;
+  if (!modelById(f.model)) f.model = 301;
+  if (f.dataset_path && (!T.inspect || T.inspect.key !== inspectKey())) await inspectDataset();
+  const left = el("div"), right = el("div");
+  left.append(modeCard());
+  if (T.mode === "new") left.append(datasetCard(), modelCard(), trainingCard(), optimizerCard(f, "optimizer", "optim_params"));
+  else left.append(resumeCard());
+  left.append(actionsCard());
+  right.append(monitorCard());
+  mount($("#trainPage"), el("div", { class: "train-grid" }, left, right));
+  drawMonitor(true);
+}
+
+function modeCard() {
+  const run = G.opts.run, card = el("div", { class: "card" }, el("h2", {}, "Run"));
+  const modes = el("div", { class: "modes", style: "display:inline-flex" }, [["new", "New run"], ["resume", "Resume"], ["retry", "Retry (fresh weights)"]].map(([k, n]) =>
+    el("button", { class: T.mode === k ? "active" : "", disabled: k !== "new" && !run, "data-fkey": "mode:" + k, onclick: () => { T.mode = k; saveForms(); renderTrain(); } }, n)));
+  card.append(modes);
+  if (run && !run.error) card.append(el("p", { class: "note", style: "margin:8px 0 0" },
+    `Saved run in the working folder: ${run.model_name} · ${human(run.iterations_done)} steps · ${human(run.train_tokens_done)} tokens · `, el("span", { class: "muted" }, baseName(run.dataset_path || ""))));
+  else if (run?.error) card.append(el("p", { class: "warn" }, "textgen.json could not be read: " + run.error));
+  else card.append(el("p", { class: "note", style: "margin:8px 0 0" }, `No saved run (textgen.json + model.pt) in ${G.opts.cwd}. Training writes them there.`));
+  if (T.mode === "new" && run) card.append(el("p", { class: "warn" }, "A new run overwrites textgen.json and model.pt in the working folder."));
+  return card;
+}
+
+function datasetCard() {
+  const f = TF(), card = el("div", { class: "card" }, el("h2", {}, "Dataset"));
+  const path = el("input", { type: "text", value: f.dataset_path, placeholder: "text / binary / CSV file", "data-fkey": "f:dspath", style: "flex:1;min-width:200px",
+    onchange: async e => { f.dataset_path = e.target.value.trim(); saveForms(); T.inspect = null; T.check = null; await renderTrain(); } });
+  const setDs = async p => { f.dataset_path = p; T.browse = null; T.inspect = null; T.check = null; saveForms(); await renderTrain(); };
+  card.append(el("div", { class: "row-flex" }, path,
+    chooseButton("Choose file…", { start: () => dirOf(f.dataset_path) || store.get("fbdir", null), title: "Choose a dataset", onPick: p => { store.set("fbdir", dirOf(p)); setDs(p); } }),
+    uploadButton("Upload…", { onDone: setDs }),
+    el("button", { onclick: () => { T.browse = T.browse === "ds" ? null : "ds"; renderTrain(); } }, T.browse === "ds" ? "Close" : "Browse…")));
+  if (T.browse === "ds") card.append(fileBrowser({ accept: ["file", "json"], key: "fbds", onPick: async p => { f.dataset_path = p; T.browse = null; T.inspect = null; T.check = null; saveForms(); await renderTrain(); } }));
+  const I = T.inspect;
+  if (I?.error) card.append(el("p", { class: "warn" }, I.error));
+  else if (I) card.append(datasetInfo(I));
+  const tm = +f.tokenizer_mode;
+  card.append(el("div", { class: "form-grid", style: "margin-top:10px" },
+    fld("Dataset type", selIn(f, "dataset_type", [[0, "Corpus (sliding windows)"], [1, "Line mode (one example per line)"]])),
+    fld("Tokenizer", selIn(f, "tokenizer_mode", TOKENIZERS)),
+    tm === 3 ? fld("Tiktoken encoding", selIn(f, "tiktoken_encoding", [["cl100k_base", "cl100k_base"], ["r50k_base", "r50k_base"], ["gpt2", "gpt2"], ["p50k_base", "p50k_base"], ["o200k_base", "o200k_base"]])) : null,
+    tm === 4 ? fld("BPE vocabulary size", numIn(f, "custom_bpe_size", { min: 16 })) : null,
+    tm <= 0 ? fld("Byte output", selIn(f, "byte_output_text", [[false, "Binary files → FileGen/"], [true, "Show as text"]].map(([v, t]) => [String(v), t]), () => { f.byte_output_text = f.byte_output_text === "true" || f.byte_output_text === true; saveForms(); renderTrain(); })) : null,
+    fld("Validation", selIn(f, "val_mode", f.dataset_type === 0 ? [["none", "None"], ["split", "Hold out the end of the file"], ["file", "Separate file"]] : [["none", "None"], ["split", "Hold out random lines"]])),
+    f.val_mode === "split" ? fld("Held-out fraction", numIn(f, "val_split", { min: 0, max: 0.9, step: 0.05 })) : null,
+    f.val_mode === "file" && f.dataset_type === 0 ? fld("Validation file", txtIn(f, "val_path", { placeholder: "path" })) : null));
+  if (f.val_mode === "file" && f.dataset_type === 0) card.append(el("div", { class: "row-flex", style: "margin-top:6px" }, el("span", { class: "muted" }, "Validation file:"),
+    chooseButton("Choose file…", { start: () => dirOf(f.val_path) || dirOf(f.dataset_path), title: "Choose a validation file", onPick: p => { f.val_path = p; saveForms(); renderTrain(); } }),
+    uploadButton("Upload…", { onDone: p => { f.val_path = p; saveForms(); renderTrain(); } })));
+  if (I && !I.error && I.binary && tm > 0) card.append(el("p", { class: "warn" }, "This file looks binary; the Byte or Binary tokenizer reads it as-is."));
+  if (f.dataset_type === 1) card.append(seq2seqBox());
+  return card;
+}
+function datasetInfo(I) {
+  const f = TF(), tm = +f.tokenizer_mode, box = el("div", { style: "margin-top:8px" });
+  const est = tm === -1 ? I.size * 8 : tm === 0 ? I.size : tm === 1 ? I.estimates.chars : tm === 2 ? I.estimates.words : Math.round(I.size / 4);
+  box.append(kv("size", bytesH(I.size), "lines", fmtInt(I.lines) + (I.lines_complete ? "" : ` in the first ${bytesH(I.scanned_bytes)}`),
+    "tokens", (tm >= 3 ? "≈ " : tm === 1 || tm === 2 ? "≈ " : "") + human(est) + ` (${TOKENIZERS.find(t => t[0] === tm)[1].toLowerCase()})`,
+    "line length", `median ${I.line_len.median}, 95% ≤ ${I.line_len.p95}, longest ${fmtInt(I.line_len.max)} bytes` + (I.line_len.empty ? ` · ${fmtInt(I.line_len.empty)} empty` : ""),
+    ...(I.binary ? ["content", "binary"] : ["characters", `${I.charset} distinct in the first 4 MB`]),
+    ...(tm === 4 ? ["BPE vocab", I.bpe_vocab ? "found next to the file (reused)" : "trained when the run starts"] : [])));
+  if (f.dataset_type === 1 && I.line_len.max > 4096) box.append(el("p", { class: "warn" }, `Line mode uses the longest line (${fmtInt(I.line_len.max)} bytes) as the window; very long lines make every batch that long.`));
+  const det = el("details", {}, el("summary", {}, "Preview, line lengths and characters"));
+  if (I.line_hist?.counts?.length > 1) {
+    const holder = el("div"); det.append(holder);
+    const ch = new Chart(holder, { height: 150, title: "Line length", sub: "bytes per line" });
+    det.addEventListener("toggle", () => { if (det.open) drawCats(ch, { cats: I.line_hist.counts.map((_, i) => `${i * I.line_hist.width}`), lines: [{ name: "lines", y: I.line_hist.counts, color: series()[0] }], xLabel: "length ≥", yLabel: "lines" }); });
+  }
+  if (!I.binary) det.append(el("div", { class: "chips", style: "margin:6px 0" }, I.top_chars.map(([c, n]) => el("span", { class: "pill", title: `${n} times in the sample` }, JSON.stringify(c).slice(1, -1) || "␠"))));
+  det.append(el("pre", { class: "preview" }, I.binary ? I.preview.replace(/(.{2})/g, "$1 ").replace(/((?:\S\S ){16})/g, "$1\n") : I.preview));
+  box.append(det);
+  return box;
+}
+function seq2seqBox() {
+  const f = TF(), s = f.seq2seq, I = T.inspect, box = el("div", { style: "margin-top:10px" });
+  box.append(chk(f, "seq2seq_on", "Sequence-to-sequence: learn output columns from input columns of a delimited file", async () => { T.inspect = null; await renderTrain(); }));
+  if (!f.seq2seq_on) return box;
+  const delims = [[",", "Comma"], [":", "Colon"], ["\\t", "Tab"], [";", "Semicolon"], ["|", "Pipe"]];
+  box.append(el("div", { class: "form-grid", style: "margin-top:6px" },
+    fld("Delimiter", el("select", { onchange: async e => { s.delimiter = e.target.value; s.roles = []; saveForms(); T.inspect = null; await renderTrain(); } }, delims.map(([v, n]) => el("option", { value: v, selected: v === s.delimiter }, n)))),
+    el("label", { class: "ctl check" }, el("input", { type: "checkbox", checked: s.has_header, onchange: async e => { s.has_header = e.target.checked; saveForms(); T.inspect = null; await renderTrain(); } }), "First row is a header")));
+  const cols = I?.columns;
+  if (!cols) { box.append(el("p", { class: "note" }, "Pick a dataset to see its columns.")); return box; }
+  if (s.roles.length !== cols.names.length) s.roles = cols.names.map((_, i) => i === cols.names.length - 1 ? 2 : 1);
+  box.append(el("div", { class: "scroll" }, el("table", { class: "data" }, el("tr", {}, el("th", {}, "column"), el("th", {}, "role"), el("th", {}, "examples")),
+    cols.names.map((n, i) => el("tr", {}, el("td", {}, n),
+      el("td", {}, el("select", { onchange: e => { s.roles[i] = +e.target.value; saveForms(); } }, [[0, "ignore"], [1, "input"], [2, "output"]].map(([v, t]) => el("option", { value: v, selected: s.roles[i] === v }, t)))),
+      el("td", { class: "muted" }, cols.examples.map(r => (r[i] ?? "").slice(0, 24)).join(" · ")))))));
+  return box;
+}
+
+function modelCard() {
+  const f = TF(), m = modelById(f.model), card = el("div", { class: "card" }, el("h2", {}, el("span", { class: "grow" }, "Model")));
+  const groups = G.opts.groups.map(g => el("optgroup", { label: g }, G.opts.models.filter(x => x.group === g).map(x => el("option", { value: x.id, selected: x.id === m.id }, `${x.id} · ${x.label}`))));
+  const msel = el("select", { "data-fkey": "f:model", onchange: e => { f.model = +e.target.value; const nm = modelById(f.model); f.activation = nm.activation || ""; if (!nm.megabyte) f.model_type = 0; T.check = null; saveForms(); renderTrain(); } }, groups);
+  card.append(el("div", { class: "form-grid" }, el("label", { class: "ctl", style: "grid-column:1/-1" }, "Architecture", msel)));
+  card.append(el("p", { class: "note", style: "margin:6px 0" }, m.name, el("br"), el("span", { class: "muted" }, m.desc)),
+    el("div", { class: "chips", style: "margin-bottom:8px" }, [m.stateful && "stateful (carries a hidden state)", m.scan && "parallel scan", m.attention && "attention", m.megabyte && "MEGABYTE stage core"].filter(Boolean).map(t => el("span", { class: "pill" }, t))));
+  const mt = +f.model_type, mega = mt === 1 || mt === 2;
+  const g = el("div", { class: "form-grid" });
+  if (m.megabyte) g.append(fld("Topology", selIn(f, "model_type", [[0, "Normal"], ...(m.id !== G.opts.mlp_model_id ? [[1, "MEGABYTE"]] : []), [2, "MEGABYTE bottom-up"]])));
+  if (m.id === 902) g.append(fld("MinRNN activation", selIn(f, "minrnn_act", G.opts.minrnn_acts.map((n, i) => [i, n]))));
+  if (m.id === 903) g.append(fld("MinIndRNN activation", selIn(f, "minrnn_act", G.opts.minindrnn_acts.map((n, i) => [i, n]))));
+  if (m.activation) {
+    if (!f.activation) f.activation = m.activation;
+    g.append(fld("Feed-forward activation", el("select", { onchange: e => { f.activation = e.target.value; saveForms(); } }, G.opts.activations.map(a => el("option", { value: a.name, selected: a.name === f.activation, title: a.desc }, a.name + (a.name === m.activation ? " (default)" : "") + (a.desc ? " — " + a.desc : ""))))));
+  }
+  if (!mega) {
+    g.append(fld("Size", selIn(f, "size_mode", [["fixed", "Fixed width"], ["target", "Match a parameter count"]])));
+    g.append(f.size_mode === "target" ? fld("Target parameters (millions)", numIn(f, "target_millions", { min: 0.001, step: 0.5 })) : fld("Width (embed / hidden)", numIn(f, "embed_dim", { min: 1, step: 8 })));
+    if (m.attention) g.append(fld("Attention heads", numIn(f, "head_count", { min: 1 })));
+    g.append(fld("Layers", numIn(f, "layer_count", { min: 1 })));
+  }
+  if (m.id === 2) g.append(fld("Context tokens (1–32)", numIn(f, "ngram_context", { min: 1, max: 32 })));
+  if (m.id === 409) g.append(fld("Local window", numIn(f, "sparse_local_window", { min: 1 })), fld("Compression block", numIn(f, "sparse_compression_block", { min: 1 })), fld("Selected blocks", numIn(f, "sparse_selected_blocks", { min: 1 })));
+  card.append(g);
+  if (mega) card.append(stageEditor(m, mt));
+  const builtinRnn = mega && f.stages.some(s => [500, 501, 503, 504].includes(+(f.per_stage_cores ? (s.mixer || m.id) : m.id)));
+  if (m.rnn_extras || builtinRnn) {
+    const r = el("div", { class: "form-grid", style: "margin-top:8px" },
+      fld("Normalisation", selIn(f, "use_norm", NORMS)), fld("Residual every N layers (0 = off)", numIn(f, "res_every", { min: 0 })),
+      +f.res_every > 0 ? fld("Residual type", selIn(f, "res_type", RES_TYPES)) : null,
+      fld("Inter-layer dropout", numIn(f, "dropout", { min: 0, max: 0.9, step: 0.05 })),
+      !builtinRnn ? fld("Output multiplier", selIn(f, "use_multiplier", [[0, "Off"], [1, "Scalar"], [2, "Per-dimension"]])) : null,
+      m.custom_rnn && mt === 0 ? fld("Post-layer FFN", selIn(f, "rnn_ffn", FFNS)) : null,
+      m.id === 509 ? fld("IndRNN activation", selIn(f, "indrnn_activation", [["relu", "ReLU (paper)"], ["tanh", "tanh (legacy)"]])) : null,
+      [513, 514].includes(m.id) ? chk(f, "relu_gates", "ReLU gates (experimental)") : null,
+      [515, 516].includes(m.id) ? fld("Mogrifier rounds", numIn(f, "mogrifier_rounds", { min: 0 })) : null,
+      m.id === 602 ? fld("UnICORNN dt", numIn(f, "unicornn_dt", { min: 0, step: 0.01 })) : null,
+      m.id === 602 ? fld("UnICORNN alpha", numIn(f, "unicornn_alpha", { step: 0.5 })) : null,
+      m.id === 519 ? chk(f, "lru_highway", "LRU highway stacking") : null,
+      m.id === 518 ? fld("RRU middle multiplier", numIn(f, "rru_middle_multiplier", { min: 0.1, step: 0.5 })) : null,
+      m.id === 518 ? fld("RRU in-cell dropout", numIn(f, "rru_dropout", { min: 0, step: 0.05 })) : null);
+    card.append(el("details", { open: true }, el("summary", {}, "Recurrent structure"), r));
+  }
+  const chkBtn = el("button", { onclick: async () => { chkBtn.disabled = true; chkBtn.textContent = "Checking…"; try { T.check = await api("/api/train/check", { config: TF() }); } catch (e) { T.check = { error: e.message }; } renderTrain(); } }, "Check size");
+  const C = T.check;
+  card.append(el("div", { class: "row-flex", style: "margin-top:10px" }, chkBtn,
+    C ? (C.error ? el("span", { class: "warn" }, C.error) : el("span", {}, el("b", {}, human(C.params) + " parameters"), ` · vocab ${fmtInt(C.vocab_size)} · width ${C.embed_dim} · window ${fmtInt(C.seq_len)}` + (C.notes.length ? " · " + C.notes.join("; ") : ""))) : el("span", { class: "muted" }, "builds the model on the meta device to count parameters")));
+  return card;
+}
+function stageEditor(m, mt) {
+  const f = TF(), box = el("div", { style: "margin-top:10px" });
+  const cores = G.opts.models.filter(x => x.megabyte);
+  const coreSel = (s, key, fine, enc) => el("select", { onchange: e => { s[key] = +e.target.value; saveForms(); renderTrain(); } },
+    cores.filter(x => x.id !== G.opts.mlp_model_id || (mt === 2 && fine)).map(x => el("option", { value: x.id, selected: +(s[key] || m.id) === x.id }, `${x.id} · ${x.label}`)));
+  const usesHeads = s => (modelById(f.per_stage_cores ? (s.mixer || m.id) : m.id) || m).stage_heads;
+  const n = f.stages.length;
+  box.append(el("div", { class: "row-flex" }, chk(f, "per_stage_cores", "Different core per stage"), mt === 2 ? chk(f, "separate_encoder", "Separate encoder cores (bottom-up)") : null));
+  const head = ["stage", "length / groups", "width", "child embed", "layers", "heads", f.per_stage_cores ? "core" : null, mt === 2 && f.separate_encoder ? "encoder core" : null, ""].filter(x => x != null);
+  box.append(el("div", { class: "scroll" }, el("table", { class: "data stages" }, el("tr", {}, head.map(h => el("th", {}, h))),
+    f.stages.map((s, i) => el("tr", {}, el("td", {}, `${i + 1}${i === 0 ? " coarse" : i === n - 1 ? " fine" : ""}`),
+      el("td", {}, numIn(s, "seq_len", { min: 1, "data-fkey": `st${i}len` }, renderTrain)), el("td", {}, numIn(s, "dim", { min: 1, step: 8, "data-fkey": `st${i}dim` })),
+      el("td", {}, numIn(s, "child_dim", { min: 1, max: s.dim, "data-fkey": `st${i}child` })), el("td", {}, numIn(s, "depth", { min: 1, "data-fkey": `st${i}depth` })),
+      el("td", {}, usesHeads(s) ? numIn(s, "heads", { min: 1, "data-fkey": `st${i}heads` }) : el("span", { class: "muted" }, "–")),
+      f.per_stage_cores ? el("td", {}, coreSel(s, "mixer", i === n - 1)) : null,
+      mt === 2 && f.separate_encoder ? el("td", {}, coreSel(s, "enc_mixer", i === n - 1, true)) : null,
+      el("td", {}, el("button", { disabled: n <= 2, title: "remove stage", onclick: () => { f.stages.splice(i, 1); saveForms(); renderTrain(); } }, "✕")))))));
+  const win = f.stages.reduce((a, s) => a * (+s.seq_len || 1), 1);
+  box.append(el("div", { class: "row-flex", style: "margin-top:6px" }, el("button", { onclick: () => { f.stages.push(structuredClone(f.stages.at(-1))); saveForms(); renderTrain(); } }, "+ stage"),
+    el("span", { class: "note", style: "margin:0" }, `Stage lengths multiply into the token window: ${f.stages.map(s => s.seq_len).join(" × ")} = ${fmtInt(win)} tokens.`)));
+  return box;
+}
+
+function trainingCard() {
+  const f = TF(), m = modelById(f.model), mega = +f.model_type > 0, card = el("div", { class: "card" }, el("h2", {}, "Training"));
+  const tbpttOk = (m.stateful || m.scan) && +f.model_type !== 2;
+  card.append(el("div", { class: "form-grid" },
+    f.dataset_type === 0 && !mega ? fld("Window (tokens per sequence)", numIn(f, "seq_len", { min: 1, step: 32 })) : null,
+    fld("Epochs", numIn(f, "epoch_count", { min: 1 })), fld("Batch size", numIn(f, "batch_size", { min: 1 })),
+    fld("Gradient accumulation", numIn(f, "grad_accum_steps", { min: 1 })), fld("Gradient clip (max norm)", numIn(f, "max_grad_norm", { min: 0, step: 0.1 })),
+    G.opts.cuda ? chk(f, "use_amp", "Mixed precision (AMP)") : null,
+    G.opts.cuda && f.use_amp ? fld("AMP precision", selIn(f, "amp_dtype", [["fp16", "fp16 (loss scaling)"], ...(G.opts.bf16 ? [["bf16", "bf16"]] : [])])) : null,
+    chk(f, "use_compile", "torch.compile"),
+    tbpttOk ? chk(f, "use_tbptt", "Truncated BPTT (carry state across windows)") : null,
+    tbpttOk && f.use_tbptt ? fld("BPTT window", numIn(f, "bptt_window", { min: 1 })) : null,
+    tbpttOk && f.use_tbptt && f.dataset_type === 0 ? fld("Stream length (0 = to EOF)", numIn(f, "tbptt_total_len", { min: 0 })) : null,
+    fld("Learning-rate schedule", selIn(f, "lr_scheduler", [["none", "Constant"], ["cosine_warmup", "Linear warmup, then cosine decay"], ["cosine", "Cosine decay"], ["one_cycle", "One-cycle"]])),
+    f.lr_scheduler === "cosine_warmup" ? fld("Warmup steps", numIn(f, "warmup_steps", { min: 0, step: 50 })) : null));
+  if (f.lr_scheduler !== "none") card.append(el("p", { class: "note", style: "margin:6px 0 0" }, "The schedule spans epochs × steps per epoch and scales the optimizer's learning rate; set a real epoch count or the decay is spread over an almost endless run."));
+  card.append(el("h3", {}, "Monitoring"), el("div", { class: "form-grid" },
+    fld("Log every N steps", numIn(f, "log_interval", { min: 1 })), fld("Validate every N steps", numIn(f, "val_interval", { min: 1 })),
+    fld("Sample every N steps", numIn(f, "sample_interval", { min: 1 })), fld("Save every N steps", numIn(f, "save_interval", { min: 1 })),
+    fld("Samples per preview", numIn(f, "train_sample_count", { min: 0 })), fld("Preview temperature", numIn(f, "train_sample_temperature", { min: 0, step: 0.1 })),
+    f.dataset_type === 0 ? fld("Preview length (tokens)", numIn(f, "train_sample_len", { min: 1, step: 50 })) : null,
+    f.dataset_type === 0 ? fld(+f.tokenizer_mode === 0 ? "Preview prompt (hex, blank = random)" : "Preview prompt (blank = random)", txtIn(f, "train_sample_prompt")) : null));
+  card.append(el("p", { class: "note", style: "margin:8px 0 0" }, "The loss chart gets a point every optimizer step; the other intervals control validation, text previews and checkpoints."));
+  return card;
+}
+function optimizerCard(obj, key, pkey, title = "Optimizer") {
+  const card = el("div", { class: "card" }, el("h2", {}, title));
+  const idx = +obj[key], entry = G.opts.optimizers[idx];
+  obj[pkey] = obj[pkey] || {};
+  const P = obj[pkey];
+  card.append(el("div", { class: "form-grid" }, el("label", { class: "ctl", style: "grid-column:1/-1" }, "Optimizer",
+    el("select", { "data-fkey": "opt:" + key, onchange: e => { obj[key] = +e.target.value; obj[pkey] = {}; saveForms(); renderTrain(); } }, G.opts.optimizers.map((o, i) => el("option", { value: i, selected: i === idx }, `${i} · ${o.name}`))))));
+  const g = el("div", { class: "form-grid", style: "margin-top:8px" });
+  for (const p of entry.params) {
+    const k = p.key, dflt = p.default, label = p.prompt.replace(/\s*\(.*$/, "") || k, hint = p.prompt;
+    let input;
+    if (p.type === "bool") { input = el("input", { type: "checkbox", checked: P[k] ?? dflt, onchange: e => { P[k] = e.target.checked; saveForms(); } }); g.append(el("label", { class: "ctl check", title: hint }, input, label)); continue; }
+    if (p.type === "betas") input = el("input", { type: "text", value: P[k] ?? "", placeholder: String(dflt), onchange: e => { P[k] = e.target.value.trim(); saveForms(); } });
+    else if (p.type === "backend") input = el("select", { onchange: e => { P[k] = e.target.value; saveForms(); } }, ["newton_schulz", "polar_express"].map(b => el("option", { value: b, selected: (P[k] ?? dflt) === b }, b)));
+    else if (p.type === "int" || p.type === "float") input = el("input", { type: "number", value: P[k] ?? "", placeholder: String(dflt), step: p.type === "int" ? 1 : niceStep(Math.abs(+dflt) / 10 || 0.001), onchange: e => { P[k] = e.target.value === "" ? "" : +e.target.value; saveForms(); } });
+    else input = el("input", { type: "text", value: P[k] ?? "", placeholder: String(dflt), onchange: e => { P[k] = e.target.value; saveForms(); } });
+    input.dataset.fkey = "op:" + key + ":" + k;
+    g.append(fld(label, input, hint));
+  }
+  card.append(g, el("p", { class: "note", style: "margin:6px 0 0" }, "Blank fields use the default shown in grey."));
+  return card;
+}
+function resumeCard() {
+  const run = G.opts.run, O = T.O, card = el("div", { class: "card" }, el("h2", {}, T.mode === "resume" ? "Resume the saved run" : "Retry the saved configuration with fresh weights"));
+  if (!run || run.error) { card.append(el("p", { class: "warn" }, "No readable saved run.")); return card; }
+  card.append(kv("model", `${run.model} · ${run.model_name}`, "dataset", run.dataset_path, "size", `width ${run.embed_dim} · ${run.layer_count} layers · window ${run.seq_len}`,
+    "progress", `${fmtInt(run.iterations_done)} steps · ${human(run.train_tokens_done)} tokens`, "optimizer", `${run.optimizer} ${JSON.stringify(run.optim_params)}`,
+    "saved", new Date(run.saved * 1000).toLocaleString()));
+  for (const k of ["epoch_count", "batch_size", "grad_accum_steps", "log_interval", "sample_interval", "val_interval", "save_interval", "train_sample_count", "train_sample_len", "train_sample_prompt", "train_sample_temperature"])
+    if (O[k] == null && run[k] != null) O[k] = run[k];
+  if (O.save_interval == null) O.save_interval = 10000;
+  if (O.lr_scheduler == null) { O.lr_scheduler = run.lr_scheduler || "none"; O.warmup_steps = run.warmup_steps || 100; }
+  if (O.train_sample_temperature == null) O.train_sample_temperature = 1;
+  if (O.use_amp == null) { O.use_amp = !!run.use_amp; O.amp_dtype = run.amp_dtype || "fp16"; }
+  const rnn = run.stateful && +run.model_type !== 2;
+  card.append(el("p", { class: "note", style: "margin:10px 0 6px" }, T.mode === "resume" ? "Architecture and vocabulary are fixed; these settings may change. Training continues from the saved step count (the optimizer state starts fresh, as in the CLI)." : "Architecture, tokenizer and data stay; progress restarts at step 0 with new weights."),
+    el("div", { class: "form-grid" },
+      fld("Epochs (total)", numIn(O, "epoch_count", { min: 1 })), fld("Batch size", numIn(O, "batch_size", { min: 1 })), fld("Gradient accumulation", numIn(O, "grad_accum_steps", { min: 1 })),
+      T.mode === "resume" && rnn ? fld("Window (RNNs may change it)", numIn(O, "seq_len", { min: 1, placeholder: run.seq_len })) : null,
+      fld("Log every", numIn(O, "log_interval", { min: 1 })), fld("Validate every", numIn(O, "val_interval", { min: 1 })), fld("Sample every", numIn(O, "sample_interval", { min: 1 })), fld("Save every", numIn(O, "save_interval", { min: 1 })),
+      fld("Samples per preview", numIn(O, "train_sample_count", { min: 0 })), fld("Preview temperature", numIn(O, "train_sample_temperature", { min: 0, step: 0.1 })),
+      run.dataset_type === 0 ? fld("Preview length", numIn(O, "train_sample_len", { min: 1 })) : null,
+      run.dataset_type === 0 ? fld("Preview prompt", txtIn(O, "train_sample_prompt")) : null,
+      G.opts.cuda ? chk(O, "use_amp", "Mixed precision (AMP)") : null,
+      G.opts.cuda && O.use_amp ? fld("AMP precision", selIn(O, "amp_dtype", [["fp16", "fp16"], ...(G.opts.bf16 ? [["bf16", "bf16"]] : [])])) : null,
+      fld("Learning-rate schedule", selIn(O, "lr_scheduler", [["none", "Constant"], ["cosine_warmup", "Linear warmup, then cosine decay"], ["cosine", "Cosine decay"], ["one_cycle", "One-cycle"]])),
+      O.lr_scheduler === "cosine_warmup" ? fld("Warmup steps", numIn(O, "warmup_steps", { min: 0, step: 50 })) : null));
+  const wrap = el("div", {}, card);
+  if (T.mode === "retry") {
+    if (O.optimizer == null) { const i = G.opts.optimizers.findIndex(o => o.class === run.optimizer); O.optimizer = i >= 0 ? i : G.opts.default_optimizer; O.optim_params = i >= 0 ? Object.fromEntries(Object.entries(run.optim_params || {}).map(([k, v]) => [k, Array.isArray(v) ? v.join(",") : v])) : {}; }
+    wrap.append(optimizerCard(O, "optimizer", "optim_params"));
+  }
+  return wrap;
+}
+function actionsCard() {
+  const card = el("div", { class: "card" });
+  const st = T.st?.state;
+  const label = { new: "Start training", resume: "Resume training", retry: "Start retry" }[T.mode];
+  card.append(el("div", { class: "row-flex" },
+    el("button", { class: "primary", disabled: busy(), onclick: startTraining }, busy() ? "Training…" : label),
+    el("button", { disabled: !busy() || st === "stopping", onclick: async () => { T.st = await api("/api/train/stop"); drawMonitor(); } }, st === "stopping" ? "Stopping…" : "Stop and save"),
+    el("span", { class: "note", style: "margin:0" }, `Writes textgen.json, model.pt and validation_metrics.csv in ${G.opts.cwd}` + (+TF().tokenizer_mode <= 0 ? " (binary previews go to FileGen/)" : "") + ".")));
+  return card;
+}
+async function startTraining() {
+  const body = T.mode === "new" ? { mode: "new", config: TF() } : { mode: T.mode, overrides: T.O };
+  try { T.st = await api("/api/train/start", body); T.since = 0; T.pts = []; T.csince = T.st.console_total || 0; T.console = []; renderTrain(); }
+  catch (e) { toast("Cannot start: " + e.message); }
+}
+
+function monitorCard() {
+  const st = T.st || { state: "idle" };
+  const card = el("div", { class: "card" }, el("h2", {}, el("span", { class: "grow" }, "Training monitor"), el("span", { class: "state " + st.state, id: "trState" }, st.state)));
+  card.append(el("div", { id: "trStats" }), el("div", { class: "progress", title: "epoch progress" }, el("div", { id: "trProgress" })));
+  const lossHead = el("div", { class: "row-flex", style: "justify-content:flex-end" }, el("label", { class: "ctl check" }, el("input", { type: "checkbox", checked: T.logY, onchange: e => { T.logY = e.target.checked; store.set("logY", T.logY); drawMonitor(true); } }), "log scale"));
+  card.append(lossHead);
+  T.lossChart = new Chart(card, { height: 240, title: "Loss", sub: "per optimizer step (faint), smoothed, and validation" });
+  const tabs = el("div", { class: "tabs", style: "margin:10px 0 4px" }, [["lr", "Learning rate"], ["gn", "Gradient norm"], ["tps", "Tokens / s"]].map(([k, n]) => el("button", { class: T.metric === k ? "active" : "", onclick: e => { T.metric = k; store.set("metric", k); for (const b of e.target.parentNode.children) b.classList.toggle("active", b === e.target); drawMonitor(true); } }, n)));
+  card.append(tabs);
+  T.metricChart = new Chart(card, { height: 170 });
+  card.append(el("div", { id: "trValid" }));
+  const samples = el("div", { class: "card" }, el("h2", {}, el("span", { class: "grow" }, "Training samples"), el("span", { class: "pill", id: "trSampleCount" }, "")), el("div", { id: "trSamples", class: "feed" }, el("div", { class: "muted" }, "Previews appear every “sample every” steps.")));
+  const cons = el("div", { class: "card" }, el("details", { open: store.get("consoleOpen", false), ontoggle: e => store.set("consoleOpen", e.target.open) }, el("summary", {}, "Console (linegen output)"), el("pre", { id: "trConsole", class: "console" })));
+  return el("div", {}, card, samples, cons);
+}
+function drawMonitor(full = false) {
+  const st = T.st || { state: "idle" }, info = st.info, pr = st.progress || {};
+  const se = $("#trState"); if (se) { se.className = "state " + st.state; se.textContent = st.state; }
+  const pts = T.pts, last = pts.at(-1);
+  let tps = null;
+  if (pts.length > 2) { const a = pts[Math.max(0, pts.length - 30)], b = last; if (b[5] > a[5]) tps = (b[4] - a[4]) / (b[5] - a[5]); }
+  const box = $("#trStats");
+  if (box) {
+    const lv = st.valid?.at(-1);
+    box.replaceChildren(kv(
+      ...(info ? ["model", `${info.model_name} · ${human(info.params)} parameters · ${info.device}${info.amp ? " · " + info.amp : ""}`,
+        "data", `vocab ${fmtInt(info.vocab_size)} · window ${fmtInt(info.seq_len)} · batch ${info.batch_size}${info.grad_accum_steps > 1 ? "×" + info.grad_accum_steps : ""} · train ${info.train_size ? (info.train_size.examples != null ? fmtInt(info.train_size.examples) + " lines" : human(info.train_size.tokens) + " tokens") : "–"}` + (info.valid_size ? ` · valid ${info.valid_size.examples != null ? fmtInt(info.valid_size.examples) + " lines" : human(info.valid_size.tokens) + " tokens"}` : " · no validation")] : []),
+      "progress", st.detail && st.state !== "training" ? st.detail : pr.step != null ? `step ${fmtInt(pr.step)} · epoch ${pr.epoch} of ${fmtInt(pr.epochs)} · batch ${fmtInt(pr.batch)} / ${fmtInt(pr.batches)}` : "–",
+      "loss", last ? `${fmt(last[1])} now · ${fmt(ema(pts.slice(-200).map(p => p[1]), 0.95).at(-1))} smoothed` + (lv ? ` · validation ${fmt(lv.nll)} (perplexity ${fmt(lv.perplexity)}${lv.accuracy != null ? `, accuracy ${(100 * lv.accuracy).toFixed(1)}%` : ""})` : "") : "–",
+      "speed", tps != null ? `${human(tps)} tokens/s · ${human(last[4])} tokens seen` : "–",
+      "elapsed", dur(st.elapsed) + (st.checkpoints?.length ? ` · last save at step ${fmtInt(st.checkpoints.at(-1).step)}` : "")));
+    if (st.error) box.append(el("p", { class: "warn" }, st.error));
+    if (["done", "stopped"].includes(st.state) && !$("#goSample")) box.append(el("button", { id: "goSample", class: "primary", style: "margin-top:8px", onclick: async () => { showPage("sample"); await loadModel(); } }, "Sample from this model →"));
+  }
+  const bar = $("#trProgress"); if (bar) bar.style.width = pr.batches ? Math.min(100, 100 * pr.batch / pr.batches) + "%" : "0";
+  const pal = series();
+  if ((full || true) && T.lossChart?.canvas.isConnected) {
+    if (pts.length > 1) {
+      const step = Math.max(1, Math.ceil(pts.length / 2000)), xs = [], raw = [], smv = [], sm = ema(pts.map(p => p[1]), Math.min(0.98, 1 - 2 / Math.max(10, Math.sqrt(pts.length) * 2)));
+      for (let i = 0; i < pts.length; i += step) { xs.push(pts[i][0]); raw.push(pts[i][1]); smv.push(sm[i]); }
+      const ser = [{ name: "loss", x: xs, y: raw, color: pal[0], width: 1, alpha: 0.28, noScale: true, noLegend: true }, { name: "smoothed", x: xs, y: smv, color: pal[0] }];
+      const v = st.valid || [];
+      if (v.length) ser.push({ name: "validation", x: v.map(p => p.step), y: v.map(p => p.nll), color: pal[1], dots: true });
+      const y = smv.concat(v.map(p => p.nll)).filter(Number.isFinite);
+      drawXY(T.lossChart, { series: ser, xLabel: "step", yLabel: "loss (nats)", logY: T.logY, yRange: T.logY ? null : extent([y]) });
+    } else emptyMsg(T.lossChart, st.state === "preparing" ? (st.detail || "preparing…") : busy() ? "waiting for the first step…" : "no training in this session yet");
+  }
+  if (T.metricChart?.canvas.isConnected) {
+    if (pts.length > 1) {
+      const step = Math.max(1, Math.ceil(pts.length / 2000)), xs = [], ys = [];
+      for (let i = 0; i < pts.length; i += step) {
+        xs.push(pts[i][0]);
+        if (T.metric === "lr") ys.push(pts[i][3]);
+        else if (T.metric === "gn") ys.push(pts[i][2]);
+        else { const j = Math.max(0, i - 20); ys.push(pts[i][5] > pts[j][5] ? (pts[i][4] - pts[j][4]) / (pts[i][5] - pts[j][5]) : null); }
+      }
+      const name = { lr: "learning rate", gn: "gradient norm (before clipping)", tps: "tokens / s" }[T.metric];
+      drawXY(T.metricChart, { series: [{ name, x: xs, y: T.metric === "gn" ? ema(ys, 0.9) : ys, color: pal[2] }].concat(T.metric === "gn" ? [{ name: "raw", x: xs, y: ys, color: pal[2], alpha: 0.25, width: 1, noLegend: true, noScale: true }] : []), xLabel: "step", yLabel: name });
+    } else emptyMsg(T.metricChart, "");
+  }
+  const vb = $("#trValid");
+  if (vb) {
+    const v = st.valid || [];
+    vb.replaceChildren(v.length ? el("div", { class: "scroll", style: "max-height:220px;overflow-y:auto;margin-top:8px" }, el("table", { class: "data" },
+      el("tr", {}, ["step", "epoch", "loss", "perplexity", "bits/token", "bits/byte", "accuracy", "tokens"].map(h => el("th", {}, h))),
+      v.slice().reverse().map(p => el("tr", {}, el("td", {}, fmtInt(p.step)), el("td", {}, p.epoch), el("td", {}, fmt(p.nll)), el("td", {}, fmt(p.perplexity)), el("td", {}, fmt(p.bits_per_token)),
+        el("td", {}, fmt(p.bits_per_byte)), el("td", {}, p.accuracy != null ? (100 * p.accuracy).toFixed(1) + "%" : "–"), el("td", {}, human(p.tokens))))))
+      : el("p", { class: "note", style: "margin:8px 0 0" }, info && !info.valid_size ? "No validation set in this run." : "Validation results appear every “validate every” steps."));
+  }
+  const sb = $("#trSamples");
+  if (sb && st.samples?.length && sb.dataset.n !== String(st.samples.length) + ":" + st.samples.at(-1).step) {
+    sb.dataset.n = String(st.samples.length) + ":" + st.samples.at(-1).step;
+    $("#trSampleCount").textContent = `${st.samples.length} shown`;
+    sb.replaceChildren(...st.samples.slice().reverse().map(s => el("div", { class: "feeditem" },
+      el("div", { class: "muted" }, `step ${fmtInt(s.step)} · t=${s.temperature}` + (s.stop_reason ? ` · ${s.stop_reason}` : "") + (s.prompt ? ` · prompt ${JSON.stringify(s.prompt.slice(0, 40))}` : "") + (s.file ? ` · saved ${s.file} (${fmtInt(s.bytes)} bytes)` : "")),
+      s.expected != null ? el("div", { class: "s2s" }, el("div", {}, el("b", {}, "input "), s.input.replace(/\t/g, " │ ")), el("div", {}, el("b", {}, "expected "), s.expected.replace(/\t/g, " │ ")), el("div", {}, el("b", {}, "generated "), s.text.replace(/\t/g, " │ ")))
+        : el("pre", { class: "sampletext" }, s.text != null ? s.text : (s.hex || "").replace(/(.{2})/g, "$1 ").slice(0, 1200)))));
+  }
+  const cb = $("#trConsole");
+  if (cb && cb.dataset.n !== String(T.console.length)) {
+    const atEnd = cb.scrollTop + cb.clientHeight >= cb.scrollHeight - 8;
+    cb.dataset.n = String(T.console.length); cb.textContent = T.console.join("\n");
+    if (atEnd) cb.scrollTop = cb.scrollHeight;
+  }
+}
+async function pollTrain() {  // one chain, started at boot
+  clearTimeout(T.timer);
+  try {
+    const since = T.since, st = await api("/api/train/status", { since, console_since: T.csince }), prev = T.st?.state;
+    if (since !== T.since) return;
+    if (st.total < since) { T.pts = []; T.since = 0; T.timer = setTimeout(pollTrain, 0); return; }
+    T.pts.push(...st.points); T.since = st.total; T.st = st;
+    if (st.console?.length) { T.console.push(...st.console); T.console.splice(0, Math.max(0, T.console.length - 1500)); }
+    if (st.console_total != null) T.csince = st.console_total;
+    if (st.run !== undefined) G.opts.run = st.run;
+    if (G.page === "train") { if (prev && prev !== st.state) whenNotTyping(renderTrain); else drawMonitor(); }
+    if (prev && prev !== st.state && ["done", "error", "stopped"].includes(st.state)) toast(st.state === "error" ? "Training failed: " + st.error : `Training ${st.state}; model.pt saved.`, st.state !== "error");
+  } catch { /* server restarting */ }
+  T.timer = setTimeout(pollTrain, busy() ? 1000 : 4000);
+}
+
+// ───────────────────────── Sample page ─────────────────────────
+const S = {
+  info: null, P: Object.assign({ kind: "text", text: "", count: 1, max_tokens: 200, temperature: 0.8, top_k: 0, top_p: 0, rep_penalty: 1, rep_window: 64, color: "p" }, store.get("sampleForm", {})),
+  hl: null,
+  file: null, job: null, samples: [], timer: null, tok: null, A: null, sel: null, tab: store.get("atab", "pred"), browse: null,
+  layer: null, order: "variance", units: 96, inflMethod: store.get("inflMethod", "ablation"), att: 0, head: -1, leaf: null, infl: null, paths: store.get("modelPaths", { config: "", checkpoint: "" }),
+};
+const saveS = () => { store.set("sampleForm", S.P); store.set("modelPaths", S.paths); };
+async function loadModel() {
+  try { S.info = await api("/api/model/load", { config: S.paths.config || null, checkpoint: S.paths.checkpoint || null }); S.A = null; S.tok = null; S.samples = []; S.job = null; toast(`Loaded ${S.info.model_name}`, true); }
+  catch (e) { toast("Load failed: " + e.message); }
+  if (G.page === "sample") renderSample();
+}
+async function renderSample() {
+  if (!S.info) { try { S.info = await api("/api/model/info"); } catch { S.info = { loaded: false }; } }
+  const aside = el("aside"), main = el("main");
+  aside.append(modelInfoCard());
+  if (S.info.loaded) aside.append(settingsCard());
+  if (S.info.loaded) main.append(promptCard(), outputCard(), analysisCard());
+  else main.append(el("div", { class: "card empty" }, "Load a trained model (textgen.json + model.pt) to sample from it and look inside."));
+  mount($("#samplePage"), el("div", { class: "layout" }, aside, main));
+}
+function modelInfoCard() {
+  const I = S.info, card = el("div", { class: "card" }, el("h2", {}, "Model"));
+  if (I.loaded) {
+    card.append(kv("model", `${I.model} · ${I.model_name}`, "parameters", human(I.params), "tokenizer", TOKENIZERS.find(t => t[0] === I.tokenizer_mode)?.[1] + ` · vocab ${fmtInt(I.vocab_size)}`,
+      "mode", (I.line_mode ? "line mode" : "corpus") + (I.seq2seq ? " · seq2seq" : "") + ` · window ${fmtInt(I.seq_len)}`, "sampling path", I.stateful ? "stateful (one token at a time, carried state)" : "sliding window",
+      "trained", `${fmtInt(I.iterations_done)} steps · ${human(I.train_tokens_done)} tokens`, "files", baseName(I.source.config) + " + " + baseName(I.source.checkpoint), "saved", new Date(I.source.saved * 1000).toLocaleString()));
+  } else card.append(el("p", { class: "note" }, I.run ? `Ready to load: ${I.run.model_name} from the working folder.` : "No textgen.json + model.pt in the working folder; pick files below."));
+  const cfgIn = el("input", { type: "text", value: S.paths.config, placeholder: "textgen.json (working folder)", onchange: e => { S.paths.config = e.target.value.trim(); saveS(); } });
+  const ckIn = el("input", { type: "text", value: S.paths.checkpoint, placeholder: "model.pt (working folder)", onchange: e => { S.paths.checkpoint = e.target.value.trim(); saveS(); } });
+  card.append(el("details", { open: !!(S.paths.config || S.paths.checkpoint) || S.browse }, el("summary", {}, "Other files"),
+    el("div", { class: "form-grid", style: "grid-template-columns:1fr" }, fld("Config", cfgIn), fld("Checkpoint", ckIn)),
+    el("div", { class: "row-flex", style: "margin-top:6px" },
+      chooseButton("Choose config…", { kind: "json", start: () => dirOf(S.paths.config) || dirOf(S.paths.checkpoint), title: "Choose textgen.json", onPick: p => { S.paths.config = p; saveS(); renderSample(); } }),
+      chooseButton("Choose checkpoint…", { kind: "checkpoint", start: () => dirOf(S.paths.checkpoint) || dirOf(S.paths.config), title: "Choose model.pt", onPick: p => { S.paths.checkpoint = p; saveS(); renderSample(); } }),
+      el("button", { onclick: () => { S.browse = S.browse ? null : "cfg"; renderSample(); } }, S.browse ? "Close browser" : "Browse…"),
+      el("button", { onclick: () => { S.paths = { config: "", checkpoint: "" }; saveS(); renderSample(); } }, "Use working folder")),
+    S.browse ? fileBrowser({ accept: ["json", "checkpoint"], key: "fbm", onPick: (p, kind) => { if (kind === "json") S.paths.config = p; else S.paths.checkpoint = p; saveS(); renderSample(); } }) : null));
+  card.append(el("div", { class: "row-flex", style: "margin-top:8px" }, el("button", { class: "primary", onclick: loadModel }, I.loaded ? "Reload" : "Load model"),
+    el("span", { class: "muted" }, "Reload picks up the newest checkpoint while training.")));
+  return card;
+}
+function settingsCard() {
+  const P = S.P, I = S.info, card = el("div", { class: "card" }, el("h2", {}, "Sampling"));
+  if (P.max_tokens == null || (I.line_mode && P._line !== true)) { P.max_tokens = I.line_mode ? I.seq_len : 200; P._line = I.line_mode; }
+  const n = (k, a) => numIn(P, k, a, null, saveS);
+  card.append(el("div", { class: "form-grid", style: "grid-template-columns:repeat(auto-fill,minmax(130px,1fr))" },
+    fld("Samples", n("count", { min: 1, max: 64 })), fld(I.line_mode ? "Max tokens (line)" : "Tokens to generate", n("max_tokens", { min: 1, step: 50 })),
+    fld("Temperature (0 = greedy)", n("temperature", { min: 0, step: 0.1 })), fld("Top-k (0 = off)", n("top_k", { min: 0 })), fld("Top-p (0 = off)", n("top_p", { min: 0, max: 1, step: 0.05 })),
+    fld("Repetition penalty (1 = off)", n("rep_penalty", { min: 1, step: 0.05 })), fld("…over the last N tokens", n("rep_window", { min: 1, step: 16 })),
+    fld("Colour tokens by", el("select", { onchange: e => { P.color = e.target.value; saveS(); drawSamples(); } }, [["p", "probability (red = surprising)"], ["h", "uncertainty (blue = unsure)"], ["none", "nothing"]].map(([v, t]) => el("option", { value: v, selected: P.color === v }, t))))));
+  card.append(el("p", { class: "note", style: "margin:8px 0 0" }, "Probabilities shown are the model's own (temperature 1, before repetition penalty, top-k and top-p). The penalty divides the scores of tokens already present in the last N tokens (prompt included)."));
+  return card;
+}
+const tokenizePrompt = debounce(async () => {
+  try { S.tok = await api("/api/tokenize", { prompt: promptSpec() }); } catch (e) { S.tok = { error: e.message }; }
+  const b = $("#tokInfo"); if (b) b.replaceChildren(tokInfo());
+}, 250);
+function promptSpec() { const P = S.P; return S.file ? { kind: "file", data: S.file.data, name: S.file.name } : { kind: P.kind, text: P.text }; }
+function tokInfo() {
+  const t = S.tok;
+  if (!t) return el("span");
+  if (t.error) return el("span", { class: "warn" }, t.error);
+  return el("span", { class: "muted" }, `${fmtInt(t.ids.length)} prompt tokens` + (S.info.line_mode ? " (incl. BOS)" : "") + (t.ids.length === 0 ? " — empty prompt starts from a random token" : ""), ...(t.warnings || []).map(w => el("span", { class: "warn" }, " · " + w)));
+}
+function promptCard() {
+  const P = S.P, I = S.info, card = el("div", { class: "card" }, el("h2", {}, el("span", { class: "grow" }, "Prompt")));
+  if (I.byte_mode) card.querySelector("h2").append(el("div", { class: "modes" }, [["text", "Text (UTF-8)"], ["hex", "Hex bytes"]].map(([k, n]) => el("button", { class: P.kind === k ? "active" : "", onclick: () => { P.kind = k; saveS(); renderSample(); tokenizePrompt(); } }, n))));
+  const s2s = I.seq2seq;
+  const ph = s2s ? `input columns (${s2s.input_cols.map(i => s2s.columns[i]).join(", ")}) separated by ${JSON.stringify(s2s.delimiter)}` : I.line_mode ? "start of a line (blank = let the model start one)" : P.kind === "hex" ? "hex bytes, e.g. 89 50 4e 47" : (I.train_sample_prompt ? "e.g. " + I.train_sample_prompt : "text to continue (blank = random start)");
+  const ta = el("textarea", { rows: 5, placeholder: ph, "data-fkey": "prompt", spellcheck: "false", oninput: e => { P.text = e.target.value; S.file = null; saveS(); tokenizePrompt(); } });
+  ta.value = S.file ? "" : P.text;
+  if (S.file) ta.placeholder = `using uploaded file ${S.file.name} (${bytesH(S.file.size)}) — type to replace it`;
+  const up = el("input", { type: "file", style: "display:none", onchange: async e => {
+    const file = e.target.files[0]; if (!file) return;
+    if (!I.byte_mode) { if (file.size > 4 << 20) { toast("Text prompt files are limited to 4 MB."); return; } P.text = await file.text(); S.file = null; }
+    else { const buf = new Uint8Array(await file.arrayBuffer()); let s = ""; for (let i = 0; i < buf.length; i += 0x8000) s += String.fromCharCode.apply(null, buf.subarray(i, i + 0x8000)); S.file = { name: file.name, size: file.size, data: btoa(s) }; }
+    saveS(); renderSample(); tokenizePrompt();
+  } });
+  const job = S.job, running = job?.state === "running";
+  card.append(ta, el("div", { class: "row-flex", style: "margin-top:8px" },
+    el("button", { class: "primary", disabled: running, onclick: startSample }, running ? "Generating…" : "Generate"),
+    el("button", { disabled: !running, onclick: () => api("/api/sample/stop") }, "Stop"),
+    el("button", { onclick: () => up.click(), title: I.byte_mode ? "use a file's raw bytes as the prompt" : "load a text file into the prompt" }, "Upload file…"), up,
+    el("button", { onclick: () => analyze({ prompt: promptSpec() }), title: "analyze the prompt alone (no generation)" }, "Analyze prompt"),
+    el("span", { id: "tokInfo" }, tokInfo())));
+  if (!S.tok) tokenizePrompt();
+  return card;
+}
+async function startSample() {
+  const P = S.P;
+  try {
+    S.job = await api("/api/sample/start", { prompt: promptSpec(), count: P.count, max_tokens: P.max_tokens, temperature: P.temperature, top_k: P.top_k, top_p: P.top_p, rep_penalty: P.rep_penalty, rep_window: P.rep_window });
+    S.samples = []; mergeSamples(S.job); renderSample(); pollSample();
+  } catch (e) { toast(e.message); }
+}
+function mergeSamples(st) {
+  for (let i = 0; i < st.samples.length; i++) {
+    const s = st.samples[i];
+    if (!S.samples[i]) S.samples[i] = Object.assign({}, s, { tokens: [] });
+    const cur = S.samples[i], toks = cur.tokens;
+    Object.assign(cur, s, { tokens: toks });
+    if (s.from === toks.length) toks.push(...s.tokens);
+  }
+}
+async function pollSample() {
+  clearTimeout(S.timer);
+  if (!S.job) return;
+  try {
+    const st = await api("/api/sample/status", { id: S.job.id, known: S.samples.map(s => s.tokens.length) });
+    const was = S.job.state; S.job = st; mergeSamples(st);
+    if (was !== st.state) { if (st.state === "error") toast(st.error); whenNotTyping(renderSample); } else drawSamples();
+  } catch { /* ignore */ }
+  if (S.job?.state === "running") S.timer = setTimeout(pollSample, 250);
+}
+function outputCard() {
+  const card = el("div", { class: "card" }, el("h2", {}, el("span", { class: "grow" }, "Output"), el("span", { class: "pill", id: "outState" }, S.job ? S.job.state : "")));
+  card.append(el("div", { id: "samplesBox" }));
+  if (S.job?.warnings?.length) card.append(el("p", { class: "warn" }, S.job.warnings.join(" · ")));
+  afterMount(drawSamples);
+  return card;
+}
+const IMG_MAGIC = [["89504e47", "image/png"], ["ffd8ff", "image/jpeg"], ["47494638", "image/gif"], ["424d", "image/bmp"], ["52494646", "image/webp"]];
+function hexBytes(hex) { const b = new Uint8Array(hex.length / 2); for (let i = 0; i < b.length; i++) b[i] = parseInt(hex.substr(i * 2, 2), 16); return b; }
+function drawSamples() {
+  const box = $("#samplesBox"); if (!box) return;
+  const os = $("#outState"); if (os) os.textContent = S.job ? S.job.state : "";
+  if (!S.samples.length) { box.replaceChildren(el("div", { class: "muted" }, "Generated text streams here token by token. Hover a token for the model's alternatives; click it to analyze.")); return; }
+  const I = S.info, word = I.word_tokens;
+  box.replaceChildren(...S.samples.map((s, si) => {
+    const hmax = Math.log2(I.vocab_size);
+    const strip = el("div", { class: "tokens" });
+    s.prompt.forEach((p, i) => strip.append(tokenSpan(p, i, { cls: "prompt", word })));
+    s.tokens.forEach((t, j) => {
+      const bg = S.P.color === "p" ? probColor(t.p) : S.P.color === "h" ? entColor(t.h, hmax) : null;
+      strip.append(tokenSpan(t.t, s.prompt.length + j, { bg, word, cls: S.A?.sample === si && S.sel === s.prompt.length + j - 1 ? "sel" : "",
+        onHover: () => `<div><b>${esc(JSON.stringify(t.t))}</b> · p = ${(100 * t.p).toFixed(2)}% · uncertainty ${t.h.toFixed(2)} bits</div>${altTable(t.alt, t.t)}`,
+        onClick: () => analyzeSample(si, s.prompt.length + j - 1) }));
+    });
+    if (!s.done) strip.append(el("span", { class: "cursor" }, "▍"));
+    const meanP = s.tokens.length ? s.tokens.reduce((a, t) => a - Math.log2(Math.max(t.p, 1e-30)), 0) / s.tokens.length : null;
+    const head = el("div", { class: "row-flex sample-head" }, el("b", {}, `#${si + 1}`), el("span", { class: "muted" }, `${s.tokens.length} tokens` + (s.stop_reason ? ` · ${s.stop_reason}` : "") + (meanP != null ? ` · ${meanP.toFixed(2)} bits/token surprise` : "") + (s.elapsed ? ` · ${(s.tokens.length / s.elapsed).toFixed(1)} tokens/s` : "")),
+      el("span", { class: "spacer", style: "flex:1" }),
+      s.done ? el("button", { onclick: () => analyzeSample(si, null) }, "Analyze") : null,
+      s.done && s.text != null ? el("button", { onclick: () => { navigator.clipboard?.writeText(s.text).then(() => toast("Copied", true), () => toast("Clipboard unavailable")); } }, "Copy text") : null,
+      s.done ? el("button", { onclick: () => { S.P.text = s.text; S.P.kind = "text"; S.file = null; saveS(); renderSample(); tokenizePrompt(); } }, "Use as prompt") : null);
+    const item = el("div", { class: "sample-item" }, head, strip);
+    if (s.done && s.bytes_hex != null) {
+      const bytes = hexBytes(s.bytes_hex), mime = IMG_MAGIC.find(([m]) => s.bytes_hex.startsWith(m))?.[1];
+      const url = URL.createObjectURL(new Blob([bytes], { type: mime || "application/octet-stream" }));
+      item.append(el("div", { class: "row-flex", style: "margin-top:6px" }, el("a", { href: url, download: `sample_${si + 1}.${mime ? mime.split("/")[1] : "bin"}` }, `Download ${fmtInt(bytes.length)} bytes`),
+        mime ? el("span", { class: "muted" }, mime + " header detected") : null), mime ? el("img", { src: url, class: "genimg" }) : null,
+        el("details", {}, el("summary", {}, "Hex"), el("pre", { class: "preview" }, s.bytes_hex.slice(0, 8192).replace(/(.{2})/g, "$1 ").replace(/((?:\S\S ){16})/g, "$1\n"))));
+    }
+    return item;
+  }));
+}
+
+// ───────────── analysis ─────────────
+async function analyzeSample(si, pos) {
+  const s = S.samples[si]; if (!s?.done) return;
+  await analyze({ ids: s.ids }, si, pos);
+}
+async function analyze(body, sample = null, pos = null) {
+  const box = $("#analysisBody"); if (box) box.replaceChildren(el("div", { class: "muted" }, "analyzing…"));
+  try {
+    const A = await api("/api/analyze", Object.assign({ attention: true, states: true }, body));
+    A.sample = sample; S.A = A; S.infl = null;
+    S.sel = pos != null ? Math.max(0, Math.min(A.ids.length - 1, pos - A.offset)) : Math.max(0, A.ids.length - 2);
+    S.layer = A.layers.find(l => l.rows === A.ids.length && l.name !== A.layers[0]?.name)?.name || A.layers[0]?.name || null;
+    S.att = 0; S.head = -1; S.leaf = A.states?.leaves?.[0]?.name || null;
+    if (!["pred", "layers", "attn", "state", "infl"].includes(S.tab) || (S.tab === "attn" && !A.attention.length) || (S.tab === "state" && !A.states?.leaves?.length)) S.tab = "pred";
+    drawSamples();
+    renderAnalysis();
+    $("#analysisCard")?.scrollIntoView({ behavior: "smooth", block: "start" });
+  } catch (e) { toast("Analysis failed: " + e.message); if (box) box.replaceChildren(el("p", { class: "warn" }, e.message)); }
+}
+function analysisCard() {
+  const card = el("div", { class: "card", id: "analysisCard" }, el("h2", {}, el("span", { class: "grow" }, "Inside the model"), el("span", { class: "pill", id: "anaMeta" }, "")));
+  card.append(el("div", { id: "analysisBody" }, el("div", { class: "muted" }, "Generate a sample and click Analyze (or a token), or analyze the prompt alone. The model re-reads the text once and every layer, attention map and recurrent state is recorded.")));
+  if (S.A) afterMount(renderAnalysis);
+  return card;
+}
+function renderAnalysis() {
+  const body = $("#analysisBody"), A = S.A; if (!body || !A) return;
+  $("#anaMeta").textContent = `${A.ids.length} tokens` + (A.offset ? ` (last ${A.ids.length}; ${A.offset} earlier tokens outside the window)` : "");
+  const tabs = [["pred", "Predictions"], ["layers", `Activations (${A.layers.length})`], ...(A.attention.length ? [["attn", `Attention (${A.attention.length})`]] : []),
+    ...(A.states?.leaves?.length ? [["state", "Hidden state"]] : []), ...(A.embedding ? [["infl", "Influence"]] : [])];
+  if (!tabs.some(t => t[0] === S.tab)) S.tab = "pred";
+  const content = el("div");
+  const strip = el("div", { class: "tokens small", id: "anaStrip" });
+  keepScroll(() => body.replaceChildren(pageTabs("atab", tabs, S.tab, k => { S.tab = k; store.set("atab", k); renderAnalysis(); }), strip, content));
+  drawStrip();
+  ({ pred: tabPred, layers: tabLayers, attn: tabAttn, state: tabState, infl: tabInfl })[S.tab](content);
+}
+function stripColors() {
+  const A = S.A, n = A.ids.length;
+  const h = S.tab === "layers" || S.tab === "state" ? hlActive() : null;
+  if (h) {
+    const v = h.vals.values, f = h.vals.first, m = Math.max(h.vals.absmax, 1e-12);
+    if (S.tab === "state" || v.length === n) return Array.from({ length: n }, (_, i) => { const k = i - f; return k >= 0 && k < v.length ? signColor(v[k], m) : null; });
+  }
+  const sc = inflScores();
+  if (S.tab === "infl" && sc) { const m = Math.max(...sc.map(Math.abs), 1e-12); return sc.map((v, i) => i <= S.infl.position ? signColor(v, m) : null); }
+  if (S.tab === "attn" && S.attRow) { const r = S.attRow, m = Math.max(...r, 1e-12), c = hex2rgb(css("--s2")); return Array.from({ length: n }, (_, i) => { const k = i - (n - r.length); return k >= 0 ? `rgba(${c[0]},${c[1]},${c[2]},${(0.75 * r[k] / m).toFixed(3)})` : null; }); }
+  if (S.tab === "layers" && S.layerRms) { const r = S.layerRms, m = Math.max(...r, 1e-12), c = hex2rgb(css("--s3")); return r.length === n ? r.map(v => `rgba(${c[0]},${c[1]},${c[2]},${(0.7 * v / m).toFixed(3)})`) : Array(n).fill(null); }
+  if (S.tab === "state" && S.stateDelta) { const r = S.stateDelta, m = Math.max(...r, 1e-12), c = hex2rgb(css("--s7")); return r.map(v => `rgba(${c[0]},${c[1]},${c[2]},${(0.7 * v / m).toFixed(3)})`); }
+  return A.positions.map((p, i) => i > 0 && A.positions[i - 1].p_next != null ? probColor(A.positions[i - 1].p_next) : null);
+}
+function drawStrip() {
+  const A = S.A, box = $("#anaStrip"); if (!box || !A) return;
+  const colors = stripColors(), word = S.info.word_tokens;
+  box.replaceChildren(...A.pieces.map((p, i) => tokenSpan(p, i, { bg: colors[i], word, cls: i === S.sel ? "sel" : "",
+    onClick: j => { S.sel = j; if (S.tab === "infl") runInfluence(); else renderAnalysis(); },
+    onHover: j => { const pp = A.positions[j], prev = j > 0 ? A.positions[j - 1] : null, h = S.tab === "layers" || S.tab === "state" ? hlActive() : null, hv = h ? h.vals.values[j - h.vals.first] : null;
+      return `<div><b>${esc(JSON.stringify(A.pieces[j]))}</b> at ${j}</div>` + (hv != null ? `<div>u${h.unit} = <b>${fmt(hv)}</b></div>` : "") + (prev?.p_next != null ? `<div>model gave it ${(100 * prev.p_next).toFixed(2)}%</div>` : "") + `<div class="muted">next-token guesses (uncertainty ${pp.h.toFixed(2)} bits):</div>${altTable(pp.top, A.pieces[j + 1])}`; } })));
+}
+function tabPred(root) {
+  const A = S.A, pal = series(), n = A.ids.length;
+  root.append(el("p", { class: "note" }, "Surprise is −log₂ of the probability the model gave each actual next token (0 = certain, high = surprised). Uncertainty is the entropy of its whole prediction. Click a token to see what the model expected after it."));
+  const ch = new Chart(root, { height: 220, title: "Surprise and uncertainty per position", sub: "bits" });
+  const x = Array.from({ length: n }, (_, i) => i);
+  afterMountOrNow(() => drawXY(ch, { series: [{ name: "surprise (actual next token)", x, y: A.nll_bits, color: pal[7] ?? pal[0] }, { name: "uncertainty (entropy)", x, y: A.positions.map(p => p.h), color: pal[0], alpha: 0.7 }], xLabel: "position", yLabel: "bits" }));
+  ch.click = null;
+  const p = A.positions[S.sel];
+  if (p) root.append(el("div", { class: "two", style: "margin-top:10px" },
+    el("div", {}, el("div", { class: "lg-title" }, `after ${JSON.stringify(A.pieces[S.sel])} (position ${S.sel}) the model predicts`), rawHtml(altTable(p.top, A.pieces[S.sel + 1]))),
+    el("div", {}, kv("actual next", S.sel + 1 < n ? JSON.stringify(A.pieces[S.sel + 1]) : "–", "its probability", p.p_next != null ? (100 * p.p_next).toFixed(2) + "%" : "–", "uncertainty", p.h.toFixed(2) + " bits",
+      "mean surprise", (A.nll_bits.filter(v => v != null).reduce((a, b) => a + b, 0) / Math.max(1, n - 1)).toFixed(3) + " bits/token"))));
+}
+function rawHtml(h) { const d = el("div"); d.innerHTML = h; return d; }
+function afterMountOrNow(fn) { requestAnimationFrame(fn); }
+// single-unit text highlighting (Activations and Hidden state tabs)
+const hlKey = () => S.tab === "layers" ? "layer:" + S.layer : "leaf:" + S.leaf;
+const hlActive = () => S.hl && S.hl.key === hlKey() && S.hl.unit != null && S.hl.vals ? S.hl : null;
+async function setHighlight(unit) {
+  const key = hlKey();
+  if (unit == null || unit === "" || !Number.isFinite(+unit)) { S.hl = { key, unit: null }; renderAnalysis(); return; }
+  try { S.hl = { key, unit: +unit, vals: await api("/api/analyze/unit", S.tab === "layers" ? { layer: S.layer, unit: +unit } : { leaf: S.leaf, unit: +unit }) }; }
+  catch (e) { toast(e.message); return; }
+  renderAnalysis();
+}
+function unitPicker(root, { dim, ranked, aligned, noneLabel, what }) {
+  const h = hlActive(), cur = h ? h.unit : null, ids = ranked.slice(0, 256);
+  const rankName = { variance: "most variable", mean: "largest mean", index: "by index" }[S.order];
+  const sel = el("select", { "data-fkey": "hl:sel", onchange: e => setHighlight(e.target.value === "" ? null : +e.target.value) },
+    el("option", { value: "", selected: cur == null }, noneLabel),
+    el("optgroup", { label: `units, ${rankName} first` }, ids.map((u, r) => el("option", { value: u, selected: u === cur }, `u${u}  (#${r + 1})`))),
+    cur != null && !ids.includes(cur) ? el("option", { value: cur, selected: true }, `u${cur}`) : null);
+  const idIn = el("input", { type: "number", min: 0, max: dim - 1, step: 1, value: cur ?? "", placeholder: `0–${dim - 1}`, "data-fkey": "hl:id",
+    onchange: e => { const v = e.target.value; if (v === "" || (+v >= 0 && +v < dim)) setHighlight(v === "" ? null : Math.round(+v)); else toast(`Unit IDs run from 0 to ${dim - 1}.`); } });
+  const at = cur == null ? -1 : ids.indexOf(cur);
+  const step = d => setHighlight(at < 0 ? (d > 0 ? ids[0] : ids.at(-1)) : ids[(at + d + ids.length) % ids.length]);
+  root.append(el("div", { class: "controls" },
+    fld("Highlight the text by", sel), fld(`or ${what} ID`, idIn),
+    el("div", { class: "btns", style: "align-self:flex-end" }, el("button", { title: "previous unit in the ranking", "data-fkey": "hl:prev", onclick: () => step(-1) }, "◀"), el("button", { title: "next unit in the ranking", "data-fkey": "hl:next", onclick: () => step(1) }, "▶"))));
+  if (!aligned) { root.append(el("p", { class: "note" }, "These rows don't line up with the text tokens, so single units can't colour the text here.")); return; }
+  if (!h) return;
+  const v = h.vals, x = v.values.map((_, i) => i + v.first), pal = series();
+  root.append(el("p", { class: "note", style: "margin:0 0 4px" }, `u${h.unit}: red where it is positive, blue where negative (scaled to ±${fmt(v.absmax)}) · mean ${fmt(v.mean)} · std ${fmt(v.std)}. Click a heatmap cell to pick its unit.`));
+  const ch = new Chart(root, { height: 130 });
+  requestAnimationFrame(() => drawXY(ch, { series: [{ name: `u${h.unit}`, x, y: v.values, color: pal[3] }, { name: "selected token", x: [S.sel, S.sel], y: [-v.absmax, v.absmax], color: css("--muted"), width: 1, noHover: true, noLegend: true, noScale: true }], xLabel: "position", yLabel: `u${h.unit}` }));
+}
+async function tabLayers(root) {
+  const A = S.A, n = A.ids.length;
+  if (!A.layers.length) { root.append(el("p", { class: "note" }, "No layer outputs were captured for this architecture.")); return; }
+  const full = A.layers.filter(l => l.rows === n);
+  root.append(el("p", { class: "note" }, "Each layer's output vector at each position. The overview shows how strongly each layer responds per token (RMS, scaled per layer); pick a layer to see its individual units. Positions × units heatmaps use blue for negative and red for positive values."));
+  if (full.length) {
+    const ov = new Chart(root, { height: Math.min(360, 40 + full.length * 18), title: "Layer response per position", sub: "RMS of the output vector, normalized per layer" });
+    const z = new Float32Array(full.length * n);
+    full.forEach((l, j) => { const m = Math.max(...l.rms, 1e-12); l.rms.forEach((v, i) => z[j * n + i] = v / m); });
+    const sq = seqScale();
+    afterMountOrNow(() => drawHeat(ov, { z, nx: n, ny: full.length, xVals: [...Array(n).keys()], yVals: [...Array(full.length).keys()], yCats: full.map(l => l.name.split(".").slice(-2).join(".")), xLabel: "position", yLabel: "", colorFn: v => sq(v), yDown: true, left: 90,
+      valueText: (i, j, v) => `<b>${esc(full[j].name)}</b><div>${esc(JSON.stringify(A.pieces[i]))} (position ${i})</div><div>RMS ${fmt(full[j].rms[i])} (${(100 * v).toFixed(0)}% of the layer's max)</div><div class="muted">click to open this layer at this token</div>`,
+      onClick: (i, j) => { S.layer = full[j].name; S.sel = i; renderAnalysis(); } }));
+  }
+  const L = A.layers.find(l => l.name === S.layer) || A.layers[0]; S.layer = L.name; S.layerRms = L.rows === n ? L.rms : null;
+  drawStrip();
+  root.append(el("div", { class: "controls", style: "margin-top:12px" },
+    fld("Layer", el("select", { onchange: e => { S.layer = e.target.value; renderAnalysis(); } }, A.layers.map(l => el("option", { value: l.name, selected: l.name === L.name }, `${l.name} (${l.rows}×${l.dim}${l.calls > 1 ? `, ${l.calls} calls` : ""})`)))),
+    fld("Units", el("select", { onchange: e => { S.order = e.target.value; renderAnalysis(); } }, [["variance", "most variable"], ["mean", "largest mean"], ["index", "first by index"]].map(([v, t]) => el("option", { value: v, selected: S.order === v }, t)))),
+    fld("How many", numIn(S, "units", { min: 8, max: 512, step: 16 }, () => renderAnalysis(), () => { }))));
+  const pick = el("div"), hm = el("div"); root.append(pick, hm);
+  const fire = el("div"); root.append(fire);
+  try {
+    const d = await api("/api/analyze/layer", { layer: L.name, units: S.units, order: S.order });
+    if (S.A !== A) return;
+    unitPicker(pick, { dim: L.dim, ranked: d.units, aligned: L.rows === n, noneLabel: "whole layer (RMS)", what: "unit" });
+    const z = b64f32(d.z), nu = d.units.length, m = Math.max(d.absmax, 1e-12), dv = divScale();
+    const ch = new Chart(hm, { height: Math.min(460, Math.max(220, 16 + nu * 3)), title: `${L.name}`, sub: `${d.rows} positions × ${nu} of ${L.dim} units` });
+    const zt = new Float32Array(nu * d.rows);
+    for (let r = 0; r < d.rows; r++) for (let u = 0; u < nu; u++) zt[u * d.rows + r] = z[r * nu + u];
+    const lab = r => d.rows === n ? JSON.stringify(A.pieces[r]) : `row ${r}`;
+    requestAnimationFrame(() => { drawHeat(ch, { z: zt, nx: d.rows, ny: nu, xVals: [...Array(d.rows).keys()], yVals: [...Array(nu).keys()], yCats: nu <= 40 ? d.units.map(u => "u" + u) : null, xLabel: "position", yLabel: nu <= 40 ? "" : "units (ranked)", colorFn: v => dv(v / m), yDown: true, left: 58, intTicks: true,
+      marker: d.rows === n ? null : null,
+      valueText: (i, j, v) => `<b>unit ${d.units[j]}</b> at ${esc(lab(i))} (${i})<div>value ${fmt(v)}</div>`,
+      onClick: (i, j) => { if (d.rows === n) S.sel = i; setHighlight(d.units[j]); } });
+      colorbar(hm, { lo: -m, hi: m, colorFn: dv, label: "activation", diverging: true }); });
+  } catch (e) { hm.append(el("p", { class: "warn" }, e.message)); }
+  if (S.sel != null) {
+    try {
+      const u = await api("/api/analyze/position", { position: S.sel, k: 6 });
+      if (S.A !== A) return;
+      fire.append(el("details", { open: true }, el("summary", {}, `Units that stand out at ${JSON.stringify(A.pieces[S.sel])} (position ${S.sel}) — z-score against the same unit at other positions`),
+        el("div", { class: "scroll" }, el("table", { class: "data" }, el("tr", {}, el("th", {}, "layer"), el("th", {}, "units (value, z)")),
+          u.layers.map(l => el("tr", {}, el("td", {}, l.layer), el("td", {}, l.units.map(([i, v, zz]) => el("span", { class: "pill", style: `margin-right:4px;border-color:${zz >= 0 ? css("--div-pos") : css("--div-neg")}` }, `u${i} ${fmt(v, 3)} (${zz >= 0 ? "+" : ""}${zz.toFixed(1)}σ)`)))))))));
+    } catch { /* optional */ }
+  }
+}
+async function tabAttn(root) {
+  const A = S.A, n = A.ids.length, maps = A.attention;
+  const M = maps[Math.min(S.att, maps.length - 1)];
+  root.append(el("p", { class: "note" }, "Each row is a position (query) and shows how much it attends to every earlier position (keys). Click a row or a token to colour the text by what that position looked at." + (A.attention_truncated ? " Only the first maps were kept." : "")));
+  root.append(el("div", { class: "controls" },
+    fld("Map", el("select", { onchange: e => { S.att = +e.target.value; S.head = -1; renderAnalysis(); } }, maps.map((m, i) => el("option", { value: i, selected: m === M }, `${i + 1}. ${m.layer} · ${m.kind} · ${m.tq}×${m.tk}${m.heads > 1 ? ` · ${m.heads} heads` : ""}`)))),
+    fld("Head", el("select", { onchange: e => { S.head = +e.target.value; renderAnalysis(); } }, [el("option", { value: -1, selected: S.head < 0 }, "mean of heads"), ...Array.from({ length: M.kept_heads }, (_, h) => el("option", { value: h, selected: S.head === h }, `head ${h}`))]))));
+  const hm = el("div"); root.append(hm);
+  try {
+    const d = await api("/api/analyze/attention", { index: maps.indexOf(M), head: S.head });
+    if (S.A !== A) return;
+    const z = b64f32(d.z), sq = seqScale();
+    let mx = 0; for (const v of z) if (v > mx) mx = v;
+    const qOff = n - d.tq, kOff = n - d.tk, alignedQ = qOff >= 0, alignedK = kOff >= 0;
+    const selQ = S.sel - qOff;
+    S.attRow = alignedQ && alignedK && selQ >= 0 && selQ < d.tq ? Array.from(z.subarray(selQ * d.tk, (selQ + 1) * d.tk)) : null;
+    drawStrip();
+    if (d.head_entropy?.length > 1) root.insertBefore(el("p", { class: "note" }, "Head focus (mean entropy, lower = sharper): " + d.head_entropy.map((h, i) => `h${i} ${h.toFixed(2)}`).join(" · ")), hm);
+    const ch = new Chart(hm, { height: 360, title: `${M.layer} · ${M.kind}`, sub: S.head < 0 ? "mean over heads" : `head ${S.head}` });
+    const qlab = i => alignedQ ? JSON.stringify(A.pieces[i + qOff]) : `q${i}`, klab = j => alignedK ? JSON.stringify(A.pieces[j + kOff]) : `k${j}`;
+    requestAnimationFrame(() => { drawHeat(ch, { z, nx: d.tk, ny: d.tq, xVals: [...Array(d.tk).keys()], yVals: [...Array(d.tq).keys()], xLabel: "key position (attended to)", yLabel: "query", colorFn: v => sq(Math.pow(v / Math.max(mx, 1e-12), 0.5)), yDown: true, square: true,
+      marker: S.attRow ? [selQ, selQ] : null,
+      valueText: (j, i, v) => `<div>${esc(qlab(i))} (${i}) → ${esc(klab(j))} (${j})</div><div><b>${(100 * v).toFixed(2)}%</b> of its attention</div>`,
+      onClick: (j, i) => { if (alignedQ) { S.sel = i + qOff; renderAnalysis(); } } });
+      colorbar(hm, { lo: 0, hi: mx, colorFn: t => sq(Math.pow(t, 0.5)), label: "attention weight (square-root colour scale)" }); });
+  } catch (e) { hm.append(el("p", { class: "warn" }, e.message)); }
+}
+async function tabState(root) {
+  const A = S.A, st = A.states, n = A.ids.length;
+  const leaf = st.leaves.find(l => l.name === S.leaf) || st.leaves[0]; S.leaf = leaf.name;
+  S.stateDelta = leaf.first === 0 && leaf.delta.length === n ? leaf.delta : null;
+  drawStrip();
+  root.append(el("p", { class: "note" }, "The model was stepped one token at a time and every tensor in its carried state was recorded after each token. “Change” shows how much the state moved when that token was read — tokens that rewrite the memory light up in the text above."));
+  if (st.consistency_tv != null) root.append(el("p", { class: st.consistency_tv > 0.05 ? "warn" : "note" }, `Step-by-step vs. whole-sequence prediction at the last token differ by ${(100 * st.consistency_tv).toFixed(2)}% (total variation)` + (st.consistency_tv > 0.05 ? " — the recurrent path and the parallel path disagree for this model." : " — both paths agree.")));
+  if (st.dropped?.length) root.append(el("p", { class: "note" }, `Growing caches not shown: ${st.dropped.slice(0, 6).join(", ")}${st.dropped.length > 6 ? "…" : ""}`));
+  root.append(el("div", { class: "controls" },
+    fld("State tensor", el("select", { onchange: e => { S.leaf = e.target.value; renderAnalysis(); } }, st.leaves.map(l => el("option", { value: l.name, selected: l === leaf }, `${l.name} [${l.shape.join("×")}]${l.subsampled ? ` (${l.units} sampled units)` : ""}`)))),
+    fld("Units", el("select", { onchange: e => { S.order = e.target.value; renderAnalysis(); } }, [["variance", "most variable"], ["mean", "largest mean"], ["index", "first by index"]].map(([v, t]) => el("option", { value: v, selected: S.order === v }, t)))),
+    fld("How many", numIn(S, "units", { min: 8, max: 512, step: 16 }, () => renderAnalysis(), () => { }))));
+  const pal = series(), x = leaf.rms.map((_, i) => i + leaf.first);
+  const lc = new Chart(root, { height: 170, title: "State size and change per token", sub: "RMS of the state, and RMS of its change from the previous token" });
+  requestAnimationFrame(() => drawXY(lc, { series: [{ name: "state RMS", x, y: leaf.rms, color: pal[6] }, { name: "change", x, y: leaf.delta, color: pal[1] }], xLabel: "position", yLabel: "RMS" }));
+  const pick = el("div"), hm = el("div"); root.append(pick, hm);
+  try {
+    const d = await api("/api/analyze/state", { leaf: leaf.name, units: S.units, order: S.order });
+    if (S.A !== A) return;
+    unitPicker(pick, { dim: leaf.units, ranked: d.units, aligned: true, noneLabel: "state change per token", what: leaf.subsampled ? "sampled-unit" : "unit" });
+    const z = b64f32(d.z), nu = d.units.length, m = Math.max(d.absmax, 1e-12), dv = divScale();
+    const zt = new Float32Array(nu * d.rows);
+    for (let r = 0; r < d.rows; r++) for (let u = 0; u < nu; u++) zt[u * d.rows + r] = z[r * nu + u];
+    const ch = new Chart(hm, { height: Math.min(460, Math.max(220, 16 + nu * 3)), title: leaf.name, sub: `${d.rows} steps × ${nu} units` });
+    requestAnimationFrame(() => { drawHeat(ch, { z: zt, nx: d.rows, ny: nu, xVals: [...Array(d.rows).keys()], yVals: [...Array(nu).keys()], yCats: nu <= 40 ? d.units.map(u => "u" + u) : null, xLabel: "after reading position", yLabel: nu <= 40 ? "" : "units (ranked)", colorFn: v => dv(v / m), yDown: true, left: 58, intTicks: true,
+      valueText: (i, j, v) => `<b>unit ${d.units[j]}</b> after ${esc(JSON.stringify(A.pieces[i + leaf.first]))} (${i + leaf.first})<div>value ${fmt(v)}</div>`,
+      onClick: (i, j) => { S.sel = i + leaf.first; setHighlight(d.units[j]); } });
+      colorbar(hm, { lo: -m, hi: m, colorFn: dv, label: "state value", diverging: true }); });
+  } catch (e) { hm.append(el("p", { class: "warn" }, e.message)); }
+}
+function inflScores() { const I = S.infl; if (!I || I.error) return null; return S.inflMethod === "gradient" && I.grad_x_input ? I.grad_x_input : I.ablation; }
+async function runInfluence(target = null) {
+  const A = S.A;
+  try { S.infl = await api("/api/influence", { ids: A.ids, position: S.sel, target }); }
+  catch (e) { S.infl = { error: e.message, position: S.sel }; }
+  renderAnalysis();
+}
+function tabInfl(root) {
+  const A = S.A, I = S.infl;
+  root.append(el("p", { class: "note" }, "Which earlier tokens made the model expect its next token? Red tokens raised the probability of the target, blue ones lowered it. Click a token to choose the position."));
+  if (!I || I.position !== S.sel) { root.append(el("div", { class: "muted" }, "computing…")); runInfluence(); return; }
+  if (I.error) { root.append(el("p", { class: "warn" }, I.error)); return; }
+  const tops = A.positions[S.sel].top;
+  root.append(el("div", { class: "controls" },
+    fld("Target token", el("select", { onchange: e => runInfluence(e.target.value === "" ? null : +e.target.value) },
+      el("option", { value: "" }, S.sel + 1 < A.ids.length ? `actual next ${JSON.stringify(A.pieces[S.sel + 1])}` : "top prediction"),
+      tops.map(([t, p, id]) => el("option", { value: id, selected: id === I.target && !(S.sel + 1 < A.ids.length && A.ids[S.sel + 1] === id) }, `${JSON.stringify(t)} (${(100 * p).toFixed(1)}%)`)))),
+    fld("Method", el("select", { onchange: e => { S.inflMethod = e.target.value; store.set("inflMethod", S.inflMethod); renderAnalysis(); } },
+      [["ablation", "blank out each token (ablation)"], ["gradient", "gradient × input"]].map(([v, t]) => el("option", { value: v, selected: (S.inflMethod || "ablation") === v, disabled: v === "gradient" && !I.grad_x_input }, t))))));
+  root.append(el("p", { class: "note" }, `After ${JSON.stringify(A.pieces[S.sel])} (position ${S.sel}) the model gives ${JSON.stringify(I.target_piece)} ${(100 * Math.exp(I.logp)).toFixed(2)}%. ` +
+    (S.inflMethod === "gradient" ? "Gradient × input: first-order estimate of each token's effect on log p." : "Ablation: how much log p drops when that token's embedding is replaced by the average embedding (positive = the token helped).")));
+  if (S.inflMethod === "gradient" && I.grad_degenerate) root.append(el("p", { class: "warn" }, "Gradient × input is ≈ 0 for this model: a normalisation right after the embedding cancels it. Use ablation."));
+  if (I.grad_error && S.inflMethod === "gradient") root.append(el("p", { class: "warn" }, "Gradient unavailable: " + I.grad_error));
+  const sc = inflScores();
+  const order = sc.map((v, i) => [v, i]).filter(([, i]) => i <= I.position).sort((a, b) => Math.abs(b[0]) - Math.abs(a[0])).slice(0, 15);
+  const hb = new Chart(root, { title: "Strongest contributors" });
+  requestAnimationFrame(() => drawHBars(hb, { labels: order.map(([, i]) => `${JSON.stringify(A.pieces[i])} @${i}`), values: order.map(([v]) => v),
+    valueLabel: S.inflMethod === "gradient" ? "gradient × input" : "drop in log p when blanked (nats)", colorPos: css("--div-pos"), colorNeg: css("--div-neg"), onClick: k => { S.sel = order[k][1]; runInfluence(); } }));
+}
+
+// ───────────────────────── shell ─────────────────────────
+function showPage(page) {
+  G.page = page; store.set("page", page);
+  for (const b of $("#modes").children) b.classList.toggle("active", b.dataset.page === page);
+  for (const p of ["train", "sample"]) $("#" + p + "Page").hidden = p !== page;
+  history.replaceState(null, "", "#" + page);
+  if (page === "train") renderTrain(); else renderSample();
+}
+async function boot() {
+  const theme = store.get("theme", null); if (theme) document.documentElement.dataset.theme = theme;
+  $("#themeBtn").onclick = () => {
+    const dark = document.documentElement.dataset.theme ? document.documentElement.dataset.theme === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
+    document.documentElement.dataset.theme = dark ? "light" : "dark"; store.set("theme", document.documentElement.dataset.theme); showPage(G.page);
+  };
+  for (const b of $("#modes").children) b.onclick = () => showPage(b.dataset.page);
+  try { G.opts = await api("/api/options"); } catch (e) { toast("Server unreachable: " + e.message); return; }
+  $("#deviceInfo").textContent = `${G.opts.gpu || G.opts.device} · ${G.opts.cwd}`;
+  const want = location.hash.slice(1);
+  showPage(["train", "sample"].includes(want) ? want : store.get("page", "train"));
+  pollTrain();
+  let rw, lastW = innerWidth;
+  addEventListener("resize", () => { clearTimeout(rw); rw = setTimeout(() => { if (innerWidth !== lastW) whenNotTyping(() => { lastW = innerWidth; showPage(G.page); }); }, 150); });
+}
+boot();
+</script>
+</body>
+</html>

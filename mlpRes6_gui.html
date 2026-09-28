@@ -1,0 +1,1718 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MLP Studio</title>
+<style>
+:root {
+  color-scheme: light;
+  --bg: #f4f3f0; --surface: #fcfcfb; --surface-2: #f0efec; --border: #dddcd7;
+  --text: #0b0b0b; --text-2: #52514e; --muted: #8a8983; --grid: #e7e6e2;
+  --accent: #2a78d6; --accent-ink: #ffffff; --danger: #c93c3b; --good: #008300;
+  --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s4: #eda100; --s5: #e87ba4; --s6: #008300; --s7: #4a3aa7; --s8: #e34948;
+  --div-neg: #1c5cab; --div-mid: #f0efec; --div-pos: #b7302f;
+  --seq: #cde2fb,#9ec5f4,#6da7ec,#3987e5,#256abf,#184f95,#0d366b;
+  --other: #b9b8b2;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg: #121211; --surface: #1a1a19; --surface-2: #242422; --border: #34342f;
+    --text: #ffffff; --text-2: #c3c2b7; --muted: #8f8e86; --grid: #2c2c29;
+    --accent: #3987e5; --accent-ink: #ffffff; --danger: #e66767; --good: #3fae3f;
+    --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #d55181; --s6: #008300; --s7: #9085e9; --s8: #e66767;
+    --div-neg: #5598e7; --div-mid: #383835; --div-pos: #e66767;
+    --seq: #0d366b,#104281,#1c5cab,#2a78d6,#5598e7,#86b6ef,#cde2fb;
+    --other: #5c5b56;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #121211; --surface: #1a1a19; --surface-2: #242422; --border: #34342f;
+  --text: #ffffff; --text-2: #c3c2b7; --muted: #8f8e86; --grid: #2c2c29;
+  --accent: #3987e5; --accent-ink: #ffffff; --danger: #e66767; --good: #3fae3f;
+  --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #d55181; --s6: #008300; --s7: #9085e9; --s8: #e66767;
+  --div-neg: #5598e7; --div-mid: #383835; --div-pos: #e66767;
+  --seq: #0d366b,#104281,#1c5cab,#2a78d6,#5598e7,#86b6ef,#cde2fb;
+  --other: #5c5b56;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+body { background: var(--bg); color: var(--text); font: 13px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+header { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 10px 16px; background: var(--surface); border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 5; }
+header h1 { font-size: 15px; margin: 0; font-weight: 650; }
+header .meta { color: var(--text-2); font-size: 12px; }
+header .spacer { flex: 1; }
+.status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--good); margin-right: 6px; }
+.status-dot.err { background: var(--danger); }
+.layout { display: grid; grid-template-columns: 330px minmax(0, 1fr); gap: 14px; padding: 14px 16px; align-items: start; }
+@media (max-width: 860px) { .layout { grid-template-columns: minmax(0, 1fr); } }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 12px; margin-bottom: 14px; min-width: 0; }
+.card h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--text-2); margin: 0 0 10px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+.card h2 .grow { flex: 1; }
+.field { margin-bottom: 10px; }
+.field label { display: flex; justify-content: space-between; gap: 8px; font-weight: 550; margin-bottom: 3px; }
+.field label .hint { color: var(--muted); font-weight: 400; font-size: 11px; }
+.field .row { display: flex; gap: 8px; align-items: center; }
+.field input[type=range] { flex: 1; min-width: 0; accent-color: var(--accent); }
+input[type=number], input[type=text], select { background: var(--surface-2); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 4px 6px; font: inherit; min-width: 0; }
+input[type=number] { width: 92px; }
+.field select, .field input[type=text] { width: 100%; }
+.field.out-of-range input[type=number] { border-color: var(--s4); }
+button { background: var(--surface-2); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 5px 10px; font: inherit; cursor: pointer; }
+button:hover { border-color: var(--muted); }
+button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+.btns { display: flex; gap: 6px; flex-wrap: wrap; }
+.outputs .out { padding: 8px 0; border-top: 1px solid var(--grid); }
+.outputs .out:first-child { border-top: 0; padding-top: 0; }
+.outputs .name { color: var(--text-2); font-size: 12px; }
+.outputs .value { font-size: 20px; font-weight: 650; font-variant-numeric: tabular-nums; word-break: break-all; }
+.outputs .target { color: var(--text-2); font-size: 12px; }
+.probrow { display: grid; grid-template-columns: minmax(0, 90px) 1fr 48px; gap: 6px; align-items: center; font-size: 12px; margin-top: 3px; }
+.probrow .lab { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-2); }
+.probrow .bar { height: 8px; background: var(--surface-2); border-radius: 4px; overflow: hidden; }
+.probrow .bar > div { height: 100%; background: var(--s1); border-radius: 4px; }
+.probrow .num { text-align: right; font-variant-numeric: tabular-nums; }
+.tabs { display: flex; gap: 2px; flex-wrap: wrap; border-bottom: 1px solid var(--border); margin-bottom: 14px; }
+.tabs button { border: 0; border-bottom: 2px solid transparent; border-radius: 0; background: none; padding: 8px 12px; color: var(--text-2); }
+.tabs button.active { color: var(--text); border-bottom-color: var(--accent); font-weight: 600; }
+.controls { display: flex; gap: 12px; flex-wrap: wrap; align-items: end; margin-bottom: 12px; }
+.controls .ctl { display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: var(--text-2); }
+.controls .ctl.check { flex-direction: row; align-items: center; gap: 6px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 12px; }
+.chart { position: relative; min-width: 0; }
+.chart canvas { display: block; width: 100%; }
+.chart .title { font-weight: 600; font-size: 12px; margin-bottom: 4px; display: flex; flex-wrap: wrap; gap: 0 8px; align-items: baseline; }
+.chart .title .sub { color: var(--muted); font-weight: 400; }
+.tooltip { position: fixed; pointer-events: none; background: var(--surface); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; font-size: 12px; box-shadow: 0 4px 14px rgba(0,0,0,.15); z-index: 50; display: none; max-width: 320px; font-variant-numeric: tabular-nums; }
+.tooltip .sw { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 12px; color: var(--text-2); margin: 4px 0; }
+.legend .sw { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+.note { color: var(--text-2); font-size: 12px; margin: 0 0 10px; }
+.muted { color: var(--muted); }
+table.data { border-collapse: collapse; width: 100%; font-size: 12px; font-variant-numeric: tabular-nums; }
+table.data th, table.data td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+table.data th { color: var(--text-2); font-weight: 600; }
+.scroll { overflow-x: auto; }
+.strip-row { display: grid; grid-template-columns: 120px minmax(0, 1fr); gap: 8px; align-items: center; margin-bottom: 6px; }
+.strip-row .lab { font-size: 12px; color: var(--text-2); }
+.strip-row .lab b { color: var(--text); font-weight: 600; }
+.two { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; }
+@media (max-width: 1100px) { .two { grid-template-columns: minmax(0, 1fr); } }
+.kv { display: grid; grid-template-columns: auto 1fr; gap: 2px 12px; font-size: 12px; font-variant-numeric: tabular-nums; }
+.kv div:nth-child(odd) { color: var(--text-2); }
+.toast { position: fixed; bottom: 16px; right: 16px; background: var(--danger); color: #fff; padding: 8px 12px; border-radius: 8px; max-width: min(520px, calc(100vw - 32px)); display: none; z-index: 60; white-space: pre-wrap; }
+.empty { color: var(--muted); padding: 24px; text-align: center; }
+.modes { display: flex; gap: 2px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; padding: 2px; }
+.modes button { border: 0; background: none; padding: 4px 14px; border-radius: 6px; color: var(--text-2); }
+.modes button.active { background: var(--surface); color: var(--text); font-weight: 600; box-shadow: 0 1px 2px rgba(0,0,0,.12); }
+[hidden] { display: none !important; }
+.train-grid { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); gap: 14px; padding: 14px 16px; align-items: start; }
+@media (max-width: 1150px) { .train-grid { grid-template-columns: minmax(0, 1fr); } }
+.form-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 10px 12px; }
+.form-grid .ctl, .controls .ctl { min-width: 0; }
+.form-grid select, .form-grid input[type=number], .form-grid input[type=text] { width: 100%; }
+.row-flex { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.row-flex input[type=text] { flex: 1; min-width: 160px; }
+.browser { border: 1px solid var(--border); border-radius: 8px; margin-top: 8px; max-height: 260px; overflow: auto; }
+.browser .item { padding: 4px 10px; cursor: pointer; display: flex; justify-content: space-between; gap: 8px; }
+.browser .item:hover { background: var(--surface-2); }
+.browser .path { padding: 6px 10px; font-size: 12px; color: var(--text-2); border-bottom: 1px solid var(--grid); position: sticky; top: 0; background: var(--surface); word-break: break-all; }
+table.cols td, table.cols th { padding: 3px 6px; }
+table.cols tr.sel td { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+table.cols td.name { cursor: pointer; font-weight: 550; user-select: none; }
+table.cols select { max-width: 190px; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.chip { display: flex; align-items: center; gap: 2px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; padding: 2px 4px 2px 8px; font-size: 12px; }
+.chip input { width: 64px; border: 0; background: transparent; padding: 2px; }
+.chip button { border: 0; background: none; padding: 0 4px; color: var(--muted); }
+.warn { color: var(--danger); font-size: 12px; }
+.state { font-size: 11px; font-weight: 650; text-transform: uppercase; letter-spacing: .05em; padding: 2px 8px; border-radius: 10px; border: 1px solid var(--border); background: var(--surface-2); }
+.state.training, .state.preparing { color: var(--accent); border-color: var(--accent); }
+.state.error { color: var(--danger); border-color: var(--danger); }
+.state.done { color: var(--good); border-color: var(--good); }
+details summary { cursor: pointer; color: var(--text-2); font-size: 12px; margin: 6px 0; }
+.nethead { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 12px 32px; font-size: 12px; }
+.netlegend { display: grid; grid-template-columns: repeat(2, auto); gap: 2px 18px; align-content: start; }
+.netlegend .lg-title { grid-column: span 2; }
+.lg-title { color: var(--text-2); font-weight: 600; text-transform: uppercase; letter-spacing: .05em; font-size: 11px; margin: 2px 0; }
+.lg-row { display: flex; align-items: center; gap: 6px; font-variant-numeric: tabular-nums; }
+.lg-row .ln { display: inline-block; width: 34px; }
+.lg-row .sw { display: inline-block; width: 12px; height: 8px; border-radius: 2px; }
+.layout > aside, .layout > main { min-width: 0; }  /* let wide content (the diagram) scroll instead of widening the page */
+.diagram-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+.diagram-scroll .chart { width: max-content; min-width: 100%; }
+.pill { font-size: 11px; padding: 1px 7px; border-radius: 10px; background: var(--surface-2); border: 1px solid var(--border); color: var(--text-2); }
+</style>
+</head>
+<body>
+<header>
+  <h1>MLP Studio</h1>
+  <nav class="modes" id="modes"><button data-page="train">Train</button><button data-page="explore">Explore</button></nav>
+  <span class="meta" id="modelMeta">loading…</span>
+  <span class="spacer"></span>
+  <span class="meta" id="statusText"><span class="status-dot"></span>connecting</span>
+  <label class="meta"><input type="checkbox" id="watch" checked> watch model.pt</label>
+  <button id="reloadBtn" title="Reload model.pt from disk now">Reload</button>
+  <button id="themeBtn" title="Toggle light / dark">Theme</button>
+</header>
+
+<div id="trainPage" class="page" hidden></div>
+<div id="noModel" class="page" hidden><div class="card empty" style="margin:14px 16px">No trained model yet (no model.pt / config.json in the working directory). Train one on the <b>Train</b> page; the explorer opens it automatically once the first checkpoint is saved.<div id="noModelErr" class="muted" style="margin-top:8px"></div></div></div>
+<div class="layout page" id="explorePage" hidden>
+  <aside>
+    <div class="card">
+      <h2><span class="grow">Inputs</span></h2>
+      <div id="inputs"></div>
+      <div class="btns">
+        <button id="randRow" title="Load a random row of the training CSV">Random data row</button>
+        <button id="resetBtn">Reset</button>
+        <button id="pinBtn" class="primary" title="Save this input/output pair to History">Pin</button>
+      </div>
+      <p class="note" id="rowNote" style="margin:8px 0 0"></p>
+    </div>
+    <div class="card">
+      <h2><span class="grow">Prediction</span><span class="pill" id="latency"></span></h2>
+      <div class="outputs" id="outputs"></div>
+    </div>
+  </aside>
+
+  <main>
+    <div class="tabs" id="tabs"></div>
+    <section id="view"></section>
+  </main>
+</div>
+<div class="tooltip" id="tooltip"></div>
+<div class="toast" id="toast"></div>
+
+<script>
+"use strict";
+// ───────────────────────── utilities ─────────────────────────
+const $ = (sel, root = document) => root.querySelector(sel);
+const el = (tag, attrs = {}, ...kids) => {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === "class") e.className = v;
+    else if (k === "style") e.style.cssText = v;
+    else if (k.startsWith("on")) e.addEventListener(k.slice(2), v);
+    else if (v !== false && v != null) e.setAttribute(k, v === true ? "" : v);
+  }
+  for (const k of kids.flat()) if (k != null) e.append(k.nodeType ? k : document.createTextNode(k));
+  return e;
+};
+const css = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+function fmt(v, digits = 4) {
+  if (v == null || Number.isNaN(v)) return "–";
+  if (typeof v !== "number") return String(v);
+  const a = Math.abs(v);
+  if (a !== 0 && (a >= 1e5 || a < 1e-3)) return v.toExponential(2);
+  return Number(v.toPrecision(digits)).toString();
+}
+function b64f32(s) {
+  const bin = atob(s), buf = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
+  return new Float32Array(buf.buffer);
+}
+const kv = (...pairs) => el("div", { class: "kv" }, pairs.map(p => el("div", {}, p)));
+// Rebuilding a section and then measuring it (charts read their width) forces a reflow while the page is
+// briefly shorter. Firefox clamps the scroll position right then, so the view jumps up. Keep the page at
+// least as tall as it was until the rebuild is drawn, and restore the scroll position.
+// 1-2-5 step near x, so arrow keys / spinners move number fields by a sensible amount
+function niceStep(x) {
+  if (!(x > 0) || !Number.isFinite(x)) return 1;
+  const m = Math.pow(10, Math.floor(Math.log10(x))), f = x / m;
+  return (f < 1.5 ? 1 : f < 3.5 ? 2 : f < 7.5 ? 5 : 10) * m;
+}
+function keepScroll(fn) {
+  const y = window.scrollY, body = document.body;
+  // controls carry data-fkey; a rebuild replaces them, so give focus back to the new twin
+  const act = document.activeElement, fkey = act && act.dataset ? act.dataset.fkey : null;
+  body.style.minHeight = document.documentElement.scrollHeight + "px";
+  try { return fn(); } finally {
+    if (fkey && !act.isConnected) {
+      const twin = document.querySelector(`[data-fkey="${CSS.escape(fkey)}"]`);
+      if (twin) twin.focus({ preventScroll: true });
+    }
+    if (window.scrollY !== y) window.scrollTo(0, y);
+    requestAnimationFrame(() => { body.style.minHeight = ""; });
+  }
+}
+// Run fn now, or after the user leaves the form field they are typing in (rebuilding would destroy it).
+function whenNotTyping(fn) {
+  const a = document.activeElement;
+  if (a && /^(INPUT|SELECT|TEXTAREA)$/.test(a.tagName) && a.isConnected) a.addEventListener("blur", () => setTimeout(fn, 0), { once: true });
+  else fn();
+}
+const debounce = (fn, ms) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; };
+function toast(msg) { const t = $("#toast"); t.textContent = msg; t.style.display = "block"; clearTimeout(toast.t); toast.t = setTimeout(() => t.style.display = "none", 6000); }
+async function api(path, body = {}) {
+  const r = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const j = await r.json().catch(() => ({ error: `HTTP ${r.status}` }));
+  if (!r.ok || j.error) throw new Error(j.error || `HTTP ${r.status}`);
+  return j;
+}
+const store = {
+  get(k, d) { try { const v = localStorage.getItem("mlpres6." + k); return v == null ? d : JSON.parse(v); } catch { return d; } },
+  set(k, v) { try { localStorage.setItem("mlpres6." + k, JSON.stringify(v)); } catch { /* storage unavailable */ } },
+};
+const series = () => ["--s1", "--s2", "--s3", "--s4", "--s5", "--s6", "--s7", "--s8"].map(css);
+
+// ───────────────────────── color scales ─────────────────────────
+const hex2rgb = h => { h = h.replace("#", ""); return [0, 2, 4].map(i => parseInt(h.slice(i, i + 2), 16)); };
+const mix = (a, b, t) => a.map((x, i) => Math.round(x + (b[i] - x) * t));
+function seqScale() {
+  const stops = css("--seq").split(",").map(s => hex2rgb(s.trim()));
+  return t => {
+    t = Math.min(1, Math.max(0, Number.isFinite(t) ? t : 0)) * (stops.length - 1);
+    const i = Math.min(stops.length - 2, Math.floor(t));
+    return mix(stops[i], stops[i + 1], t - i);
+  };
+}
+function divScale() {
+  const neg = hex2rgb(css("--div-neg")), mid = hex2rgb(css("--div-mid")), pos = hex2rgb(css("--div-pos"));
+  return t => { // t in [-1, 1]
+    if (!Number.isFinite(t)) t = 0;
+    t = Math.max(-1, Math.min(1, t));
+    return t < 0 ? mix(mid, neg, -t) : mix(mid, pos, t);
+  };
+}
+const rgb = c => `rgb(${c[0]},${c[1]},${c[2]})`;
+
+// ───────────────────────── chart primitives ─────────────────────────
+function niceTicks(lo, hi, n = 5) {
+  if (!(hi > lo)) { hi = lo + 1; }
+  const span = hi - lo, step0 = span / n, mag = Math.pow(10, Math.floor(Math.log10(step0)));
+  const step = [1, 2, 2.5, 5, 10].map(m => m * mag).find(s => span / s <= n) || 10 * mag;
+  const out = [];
+  for (let v = Math.ceil(lo / step) * step; v <= hi + step * 1e-9; v += step) out.push(Math.abs(v) < step * 1e-9 ? 0 : v);
+  return out;
+}
+const tip = $("#tooltip");
+function showTip(html, ev) {
+  if (!html) { tip.style.display = "none"; return; }
+  tip.innerHTML = html; tip.style.display = "block";
+  const r = tip.getBoundingClientRect();
+  let x = ev.clientX + 14, y = ev.clientY + 14;
+  if (x + r.width > innerWidth - 8) x = ev.clientX - r.width - 14;
+  if (y + r.height > innerHeight - 8) y = ev.clientY - r.height - 14;
+  tip.style.left = Math.max(4, x) + "px"; tip.style.top = Math.max(4, y) + "px";
+}
+
+class Chart {
+  constructor(parent, { height = 240, title = "", sub = "" } = {}) {
+    this.root = el("div", { class: "chart" });
+    if (title) this.root.append(el("div", { class: "title" }, title, sub ? el("span", { class: "sub" }, sub) : null));
+    this.legendEl = el("div", { class: "legend" });
+    this.canvas = el("canvas", { role: "img", "aria-label": title || "chart" });
+    this.root.append(this.canvas, this.legendEl);
+    parent.append(this.root);
+    this.height = height; this.canvas.style.height = height + "px";
+    this.canvas.addEventListener("mousemove", ev => { if (this.hover) { const p = this.pos(ev); showTip(this.hover(p.x, p.y), ev); this.hoverAt = p; this.redrawOverlay?.(p); } });
+    this.canvas.addEventListener("mouseleave", () => { showTip(null); this.hoverAt = null; this.redrawOverlay?.(null); });
+    this.canvas.addEventListener("click", ev => { if (this.click) { const p = this.pos(ev); this.click(p.x, p.y); } });
+  }
+  pos(ev) { const r = this.canvas.getBoundingClientRect(); return { x: ev.clientX - r.left, y: ev.clientY - r.top }; }
+  setup() {
+    const dpr = window.devicePixelRatio || 1, w = Math.max(200, this.canvas.clientWidth || this.root.clientWidth || 400), h = this.height;
+    this.canvas.width = Math.round(w * dpr); this.canvas.height = Math.round(h * dpr); this.canvas.style.height = h + "px";
+    const ctx = this.canvas.getContext("2d"); ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.clearRect(0, 0, w, h);
+    this.w = w; this.ctx = ctx;
+    return ctx;
+  }
+  legend(items) {
+    this.legendEl.replaceChildren(...items.map(([name, color]) => el("span", {}, el("span", { class: "sw", style: `background:${color}` }), name)));
+  }
+  // axes frame; returns the plot box and scale helpers
+  frame({ xlo, xhi, ylo, yhi, xLabel = "", yLabel = "", xCats = null, yCats = null, left = 52, bottom = 34, yDown = false, intTicks = false }) {
+    const ctx = this.ctx, W = this.w, H = this.height;
+    const box = { l: left, r: W - 12, t: 8, b: H - bottom };
+    const sx = v => box.l + (v - xlo) / (xhi - xlo || 1) * (box.r - box.l);
+    const sy = v => yDown ? box.t + (v - ylo) / (yhi - ylo || 1) * (box.b - box.t) : box.b - (v - ylo) / (yhi - ylo || 1) * (box.b - box.t);
+    ctx.font = "11px system-ui, sans-serif"; ctx.lineWidth = 1;
+    ctx.strokeStyle = css("--grid"); ctx.fillStyle = css("--muted");
+    ctx.textAlign = "right"; ctx.textBaseline = "middle";
+    const ints = t => intTicks ? t.filter(v => Number.isInteger(v)) : t;
+    const yt = yCats ? yCats.map((_, i) => i) : ints(niceTicks(ylo, yhi, Math.max(2, Math.floor((box.b - box.t) / 38))));
+    for (const v of yt) { const y = sy(v); if (y < box.t - 1 || y > box.b + 1) continue; ctx.beginPath(); ctx.moveTo(box.l, y); ctx.lineTo(box.r, y); ctx.stroke(); ctx.fillText(yCats ? String(yCats[v]).slice(0, 8) : fmt(v, 3), box.l - 6, y); }
+    ctx.textAlign = "center"; ctx.textBaseline = "top";
+    if (xCats) {
+      const every = Math.max(1, Math.ceil(xCats.length / Math.max(1, (box.r - box.l) / 46)));
+      xCats.forEach((c, i) => { if (i % every === 0) ctx.fillText(String(c).slice(0, 10), sx(i), box.b + 6); });
+    } else {
+      for (const v of ints(niceTicks(xlo, xhi, Math.max(2, Math.floor((box.r - box.l) / 70))))) { const x = sx(v); ctx.beginPath(); ctx.moveTo(x, box.t); ctx.lineTo(x, box.b); ctx.stroke(); ctx.fillText(fmt(v, 3), x, box.b + 6); }
+    }
+    ctx.strokeStyle = css("--border"); ctx.beginPath(); ctx.moveTo(box.l, box.b + .5); ctx.lineTo(box.r, box.b + .5); ctx.stroke();
+    ctx.fillStyle = css("--text-2");
+    if (xLabel) { ctx.textBaseline = "bottom"; ctx.fillText(xLabel, (box.l + box.r) / 2, H - 1); }
+    if (yLabel) { ctx.save(); ctx.translate(11, (box.t + box.b) / 2); ctx.rotate(-Math.PI / 2); ctx.textBaseline = "middle"; ctx.fillText(String(yLabel).slice(0, 30), 0, 0); ctx.restore(); }
+    return { box, sx, sy, ix: px => xlo + (px - box.l) / (box.r - box.l) * (xhi - xlo), iy: py => ylo + (yDown ? py - box.t : box.b - py) / (box.b - box.t) * (yhi - ylo) };
+  }
+}
+
+function extent(arrs, pad = 0.06) {
+  let lo = Infinity, hi = -Infinity;
+  for (const a of arrs) for (const v of a) if (v != null && Number.isFinite(v)) { if (v < lo) lo = v; if (v > hi) hi = v; }
+  if (!Number.isFinite(lo)) return [0, 1];
+  if (hi === lo) { const d = Math.abs(lo) * 0.1 || 1; lo -= d; hi += d; }
+  const p = (hi - lo) * pad; return [lo - p, hi + p];
+}
+
+// line chart: x numeric, series [{name, y, color}], optional vline, points, click → x
+function drawLine(chart, { x, lines, xLabel, yLabel, vline = null, points = null, yRange = null, yCats = null, onClickX = null, alphaLines = false }) {
+  const ctx = chart.setup();
+  const xl = [Math.min(...x), Math.max(...x)];
+  const yr = yRange || extent(lines.map(s => s.y).concat(points ? [points.y] : []));
+  const f = chart.frame({ xlo: xl[0], xhi: xl[1], ylo: yr[0], yhi: yr[1], xLabel, yLabel, yCats });
+  const draw = hoverP => {
+    ctx.clearRect(0, 0, chart.w, chart.height);
+    chart.frame({ xlo: xl[0], xhi: xl[1], ylo: yr[0], yhi: yr[1], xLabel, yLabel, yCats });
+    ctx.save(); ctx.beginPath(); ctx.rect(f.box.l, f.box.t - 2, f.box.r - f.box.l, f.box.b - f.box.t + 4); ctx.clip();
+    if (points) {
+      ctx.fillStyle = css("--muted"); ctx.globalAlpha = 0.35;
+      for (let i = 0; i < points.x.length; i++) { ctx.beginPath(); ctx.arc(f.sx(points.x[i]), f.sy(points.y[i]), 2, 0, 7); ctx.fill(); }
+      ctx.globalAlpha = 1;
+    }
+    for (const s of lines) {
+      ctx.strokeStyle = s.color; ctx.lineWidth = s.width || 2; ctx.globalAlpha = s.alpha ?? 1; ctx.lineJoin = "round";
+      ctx.beginPath(); let started = false;
+      for (let i = 0; i < x.length; i++) { const v = s.y[i]; if (v == null || !Number.isFinite(v)) { started = false; continue; } const px = f.sx(x[i]), py = f.sy(v); started ? ctx.lineTo(px, py) : ctx.moveTo(px, py); started = true; }
+      ctx.stroke(); ctx.globalAlpha = 1;
+    }
+    if (vline != null && Number.isFinite(vline)) {
+      ctx.strokeStyle = css("--text"); ctx.setLineDash([4, 3]); ctx.lineWidth = 1.2;
+      ctx.beginPath(); ctx.moveTo(f.sx(vline), f.box.t); ctx.lineTo(f.sx(vline), f.box.b); ctx.stroke(); ctx.setLineDash([]);
+    }
+    if (hoverP && hoverP.x >= f.box.l && hoverP.x <= f.box.r) {
+      ctx.strokeStyle = css("--muted"); ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(hoverP.x, f.box.t); ctx.lineTo(hoverP.x, f.box.b); ctx.stroke();
+      const i = nearestIdx(x, f.ix(hoverP.x));
+      for (const s of lines) if (!alphaLines || s.highlight) { const v = s.y[i]; if (v == null) continue; ctx.fillStyle = s.color; ctx.strokeStyle = css("--surface"); ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(f.sx(x[i]), f.sy(v), 4.5, 0, 7); ctx.fill(); ctx.stroke(); }
+    }
+    ctx.restore();
+  };
+  draw(null);
+  chart.redrawOverlay = draw;
+  chart.hover = (mx, my) => {
+    if (mx < f.box.l || mx > f.box.r) return null;
+    const i = nearestIdx(x, f.ix(mx));
+    const shown = lines.filter(s => !alphaLines || s.highlight).slice(0, 10);
+    const rows = shown.map(s => `<div><span class="sw" style="background:${s.color}"></span>${esc(s.name)}: <b>${yCats ? esc(yCats[Math.round(s.y[i])] ?? fmt(s.y[i])) : fmt(s.y[i])}</b></div>`).join("");
+    return `<div class="muted">${esc(xLabel)} = ${fmt(x[i])}</div>${rows}${onClickX ? '<div class="muted">click to set input</div>' : ""}`;
+  };
+  chart.click = onClickX ? (mx => { if (mx >= f.box.l && mx <= f.box.r) onClickX(f.ix(mx)); }) : null;
+  return f;
+}
+function nearestIdx(arr, v) { let best = 0, bd = Infinity; for (let i = 0; i < arr.length; i++) { const d = Math.abs(arr[i] - v); if (d < bd) { bd = d; best = i; } } return best; }
+
+// categorical x: bars for one series, dot groups for several
+function drawCats(chart, { cats, lines, xLabel, yLabel, current = null, yCats = null, onClickCat = null }) {
+  const ctx = chart.setup();
+  const single = lines.length === 1;
+  const yr = extent(lines.map(s => s.y).concat(single ? [[0]] : []), 0.08);
+  if (single && yr[0] > 0) yr[0] = 0;
+  const f = chart.frame({ xlo: -0.5, xhi: cats.length - 0.5, ylo: yr[0], yhi: yr[1], xLabel, yLabel, xCats: cats, yCats });
+  const bw = Math.max(2, Math.min(40, (f.box.r - f.box.l) / cats.length - 2));
+  cats.forEach((c, i) => {
+    const cx = f.sx(i);
+    if (single) {
+      const v = lines[0].y[i], y0 = f.sy(Math.max(yr[0], 0)), y1 = f.sy(v);
+      ctx.fillStyle = lines[0].color; roundBar(ctx, cx - bw / 2, Math.min(y0, y1), bw, Math.abs(y1 - y0), v >= 0);
+      if (String(c) === String(current)) { ctx.strokeStyle = css("--text"); ctx.lineWidth = 2; ctx.strokeRect(cx - bw / 2 - 2, Math.min(y0, y1) - 2, bw + 4, Math.abs(y1 - y0) + 4); }
+    } else {
+      lines.forEach(s => { ctx.fillStyle = s.color; ctx.strokeStyle = css("--surface"); ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(cx, f.sy(s.y[i]), 4.5, 0, 7); ctx.fill(); ctx.stroke(); });
+      if (String(c) === String(current)) { ctx.strokeStyle = css("--text"); ctx.setLineDash([4, 3]); ctx.beginPath(); ctx.moveTo(cx, f.box.t); ctx.lineTo(cx, f.box.b); ctx.stroke(); ctx.setLineDash([]); }
+    }
+  });
+  const idxAt = mx => Math.round(f.ix(mx));
+  chart.redrawOverlay = null;
+  chart.hover = mx => {
+    const i = idxAt(mx); if (i < 0 || i >= cats.length) return null;
+    return `<div class="muted">${esc(xLabel)} = ${esc(cats[i])}</div>` + lines.slice(0, 10).map(s => `<div><span class="sw" style="background:${s.color}"></span>${esc(s.name)}: <b>${yCats ? esc(yCats[Math.round(s.y[i])] ?? fmt(s.y[i])) : fmt(s.y[i])}</b></div>`).join("") + (onClickCat ? '<div class="muted">click to set input</div>' : "");
+  };
+  chart.click = onClickCat ? (mx => { const i = idxAt(mx); if (i >= 0 && i < cats.length) onClickCat(cats[i]); }) : null;
+}
+function roundBar(ctx, x, y, w, h, up) {
+  const r = Math.min(4, w / 2, h);
+  ctx.beginPath();
+  if (up) { ctx.moveTo(x, y + h); ctx.lineTo(x, y + r); ctx.arcTo(x, y, x + r, y, r); ctx.lineTo(x + w - r, y); ctx.arcTo(x + w, y, x + w, y + r, r); ctx.lineTo(x + w, y + h); }
+  else { ctx.moveTo(x, y); ctx.lineTo(x, y + h - r); ctx.arcTo(x, y + h, x + r, y + h, r); ctx.lineTo(x + w - r, y + h); ctx.arcTo(x + w, y + h, x + w, y + h - r, r); ctx.lineTo(x + w, y); }
+  ctx.closePath(); ctx.fill();
+}
+
+// horizontal signed bars (sensitivity, weights of one neuron)
+function drawHBars(chart, { labels, values, valueLabel = "", colorPos, colorNeg, notes = null, onClick = null }) {
+  chart.height = Math.max(80, labels.length * 22 + 40);
+  const ctx = chart.setup();
+  ctx.font = "11px system-ui, sans-serif";
+  const lw = Math.min(170, Math.max(60, ...labels.map(l => ctx.measureText(String(l)).width + 16)));
+  let lo = Math.min(0, ...values.map(v => v ?? 0)), hi = Math.max(0, ...values.map(v => v ?? 0));
+  if (lo === hi) hi = 1;
+  const pad = (hi - lo) * 0.05; lo -= lo < 0 ? pad : 0; hi += hi > 0 ? pad : 0;
+  const box = { l: lw, r: chart.w - 60, t: 6, b: chart.height - 28 };
+  const sx = v => box.l + (v - lo) / (hi - lo) * (box.r - box.l);
+  ctx.font = "11px system-ui, sans-serif";
+  ctx.strokeStyle = css("--grid"); ctx.fillStyle = css("--muted"); ctx.textAlign = "center"; ctx.textBaseline = "top";
+  for (const v of niceTicks(lo, hi, Math.max(2, Math.floor((box.r - box.l) / 80)))) { ctx.beginPath(); ctx.moveTo(sx(v), box.t); ctx.lineTo(sx(v), box.b); ctx.stroke(); ctx.fillText(fmt(v, 3), sx(v), box.b + 4); }
+  ctx.fillStyle = css("--text-2"); ctx.textBaseline = "bottom"; ctx.fillText(valueLabel, (box.l + box.r) / 2, chart.height - 1);
+  const rowH = (box.b - box.t) / labels.length;
+  labels.forEach((l, i) => {
+    const y = box.t + i * rowH, v = values[i] ?? 0, bh = Math.max(3, Math.min(14, rowH - 4));
+    ctx.fillStyle = css("--text-2"); ctx.textAlign = "right"; ctx.textBaseline = "middle";
+    ctx.fillText(String(l).slice(0, 24), box.l - 8, y + rowH / 2);
+    ctx.fillStyle = v >= 0 ? colorPos : colorNeg;
+    const x0 = sx(0), x1 = sx(v);
+    ctx.fillRect(Math.min(x0, x1), y + (rowH - bh) / 2, Math.max(1, Math.abs(x1 - x0)), bh);
+    ctx.fillStyle = css("--text"); ctx.textAlign = "left"; ctx.fillText(fmt(v, 3), Math.max(x0, x1) + 4 > box.r ? box.r + 4 : Math.max(x0, x1) + 4, y + rowH / 2);
+  });
+  ctx.strokeStyle = css("--border"); ctx.beginPath(); ctx.moveTo(sx(0) + .5, box.t); ctx.lineTo(sx(0) + .5, box.b); ctx.stroke();
+  chart.redrawOverlay = null;
+  const rowAt = my => Math.floor((my - box.t) / rowH);
+  chart.hover = (mx, my) => { const i = rowAt(my); if (i < 0 || i >= labels.length) return null; return `<b>${esc(labels[i])}</b>: ${fmt(values[i])}${notes && notes[i] ? `<div class="muted">${notes[i]}</div>` : ""}`; };
+  chart.click = onClick ? ((mx, my) => { const i = rowAt(my); if (i >= 0 && i < labels.length) onClick(i); }) : null;
+}
+
+// heatmap: z Float32Array row-major [ny][nx]; colorFn(v) → [r,g,b]
+// yDown: data row 0 is drawn at the top (matrices); otherwise at the bottom (maps)
+function drawHeat(chart, { z, nx, ny, xVals, yVals, xLabel, yLabel, colorFn, valueText, xCats = null, yCats = null, marker = null, points = null, onClick = null, left = 52, bottom = 34, square = false, yDown = false, intTicks = false }) {
+  if (square) chart.height = Math.min(420, Math.max(160, Math.round((chart.canvas.clientWidth || 400) * ny / Math.max(nx, 1)) + bottom + 10));
+  const ctx = chart.setup();
+  // axis limits sit half a cell outside the first/last sample so ticks land on cell centres
+  const half = (vals, n) => n > 1 ? (vals[n - 1] - vals[0]) / (n - 1) / 2 : 0.5;
+  const hx = xCats ? 0.5 : half(xVals, nx), hy = yCats ? 0.5 : half(yVals, ny);
+  const xlo = xCats ? -0.5 : xVals[0] - hx, xhi = xCats ? nx - 0.5 : xVals[nx - 1] + hx;
+  const ylo = yCats ? -0.5 : yVals[0] - hy, yhi = yCats ? ny - 0.5 : yVals[ny - 1] + hy;
+  const f = chart.frame({ xlo, xhi, ylo, yhi, xLabel, yLabel, xCats, yCats, left, bottom, yDown, intTicks });
+  const img = document.createElement("canvas"); img.width = nx; img.height = ny;
+  const ictx = img.getContext("2d"), data = ictx.createImageData(nx, ny);
+  for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) {
+    const c = colorFn(z[j * nx + i]), o = ((yDown ? j : ny - 1 - j) * nx + i) * 4;
+    data.data[o] = c[0]; data.data[o + 1] = c[1]; data.data[o + 2] = c[2]; data.data[o + 3] = 255;
+  }
+  ictx.putImageData(data, 0, 0);
+  ctx.imageSmoothingEnabled = false;
+  const cellW = (f.box.r - f.box.l) / nx, cellH = (f.box.b - f.box.t) / ny;
+  ctx.drawImage(img, f.box.l, f.box.t, f.box.r - f.box.l, f.box.b - f.box.t);
+  const toX = f.sx, toY = f.sy;
+  if (points) {
+    ctx.fillStyle = css("--surface"); ctx.strokeStyle = css("--text"); ctx.lineWidth = 1; ctx.globalAlpha = 0.7;
+    for (let k = 0; k < points.x.length; k++) { ctx.beginPath(); ctx.arc(toX(points.x[k]), toY(points.y[k]), 2.2, 0, 7); ctx.fill(); ctx.stroke(); }
+    ctx.globalAlpha = 1;
+  }
+  if (marker) {
+    const mx = toX(marker[0]), my = toY(marker[1]);
+    ctx.strokeStyle = css("--surface"); ctx.lineWidth = 5; crossAt(ctx, mx, my);
+    ctx.strokeStyle = css("--text"); ctx.lineWidth = 2; crossAt(ctx, mx, my);
+  }
+  const cell = (mx, my) => { const i = Math.floor((mx - f.box.l) / cellW), r = Math.floor((my - f.box.t) / cellH), j = yDown ? r : ny - 1 - r; return i >= 0 && i < nx && j >= 0 && j < ny ? [i, j] : null; };
+  chart.redrawOverlay = null;
+  chart.hover = (mx, my) => { const c = cell(mx, my); if (!c) return null; const [i, j] = c; return valueText(i, j, z[j * nx + i]) + (onClick ? '<div class="muted">click to set inputs</div>' : ""); };
+  chart.click = onClick ? ((mx, my) => { const c = cell(mx, my); if (c) onClick(c[0], c[1]); }) : null;
+  return f;
+}
+function crossAt(ctx, x, y) { ctx.beginPath(); ctx.moveTo(x - 7, y - 7); ctx.lineTo(x + 7, y + 7); ctx.moveTo(x + 7, y - 7); ctx.lineTo(x - 7, y + 7); ctx.stroke(); }
+
+function colorbar(parent, { lo, hi, colorFn, label, diverging = false }) {
+  const c = el("canvas", { style: "width:100%;height:12px;border-radius:3px;display:block" });
+  const wrap = el("div", { style: "margin:6px 0 2px" }, c, el("div", { class: "legend", style: "justify-content:space-between" }, el("span", {}, fmt(lo)), el("span", {}, label || ""), el("span", {}, fmt(hi))));
+  parent.append(wrap);
+  requestAnimationFrame(() => {
+    const w = c.clientWidth || 300; c.width = w; c.height = 12; const ctx = c.getContext("2d");
+    for (let i = 0; i < w; i++) { const t = i / (w - 1); ctx.fillStyle = rgb(colorFn(diverging ? t * 2 - 1 : t)); ctx.fillRect(i, 0, 1, 12); }
+  });
+}
+
+// ───────────────────────── app state ─────────────────────────
+const TABS = [["response", "Response curves"], ["diagram", "Network diagram"], ["map", "2D map"], ["sens", "Sensitivity"], ["network", "Neuron strips"], ["acts", "Activations"], ["weights", "Weights"], ["data", "Dataset"], ["history", "History"]];
+const hashTab = location.hash.slice(1);
+const S = { meta: null, inputs: {}, targets: null, pred: null, tab: TABS.some(t => t[0] === hashTab) ? hashTab : store.get("tab", "response"), seq: 0, dataStats: null, selNeuron: null };
+const tabState = store.get("tabState", {});
+const ts = (tab, key, def) => (tabState[tab] ??= {})[key] ?? def;
+const setTs = (tab, key, v) => { (tabState[tab] ??= {})[key] = v; store.set("tabState", tabState); };
+const inputSpec = col => S.meta.inputs.find(i => i.col === col);
+const outputSpec = col => S.meta.outputs.find(o => o.col === col);
+const plottableOutputs = () => S.meta.outputs.filter(o => o.plottable);
+const sweepableInputs = () => S.meta.inputs.filter(i => i.sweepable);
+const numericInputs = () => S.meta.inputs.filter(i => i.type === "in");
+
+function selectCtl(label, options, value, onchange) {
+  const s = el("select", { "data-fkey": "ctl:" + label, onchange: e => onchange(e.target.value) }, options.map(([v, t]) => el("option", { value: v, selected: String(v) === String(value) }, t)));
+  return el("label", { class: "ctl" }, label, s);
+}
+function numCtl(label, value, onchange, attrs = {}) {
+  // fires on typing (debounced), arrows and spinners; each distinct value once
+  let last = value ?? null, t;
+  const fire = e => { const v = e.target.value === "" ? null : Number(e.target.value); if (v === last || (v !== null && !Number.isFinite(v))) return; last = v; onchange(v); };
+  return el("label", { class: "ctl" }, label, el("input", Object.assign({ type: "number", value: value ?? "", step: 1, "data-fkey": "ctl:" + label,
+    onchange: e => { clearTimeout(t); fire(e); }, oninput: e => { clearTimeout(t); t = setTimeout(() => fire(e), 350); } }, attrs)));
+}
+function checkCtl(label, value, onchange) {
+  return el("label", { class: "ctl check" }, el("input", { type: "checkbox", "data-fkey": "ctl:" + label, checked: !!value, onchange: e => onchange(e.target.checked) }), label);
+}
+
+// ───────────────────────── inputs panel ─────────────────────────
+function buildInputs() {
+  const box = $("#inputs"); box.replaceChildren();
+  for (const spec of S.meta.inputs) {
+    const f = el("div", { class: "field" });
+    const hint = spec.min != null ? `${fmt(spec.min)} … ${fmt(spec.max)}` : spec.type;
+    f.append(el("label", {}, el("span", {}, spec.col), el("span", { class: "hint" }, hint)));
+    if (spec.type === "in" && spec.min != null) {
+      const span = spec.max - spec.min || 1;
+      const range = el("input", { type: "range", min: spec.min, max: spec.max, step: span / 1000 });
+      const num = el("input", { type: "number", step: niceStep(span / 100) });
+      const sync = v => { range.value = v; num.value = +Number(v).toPrecision(6); f.classList.toggle("out-of-range", v < spec.min || v > spec.max); };
+      range.addEventListener("input", () => { S.inputs[spec.col] = Number(range.value); num.value = +Number(range.value).toPrecision(6); f.classList.remove("out-of-range"); onInputsChanged(); });
+      const commit = () => { const v = Number(num.value); if (num.value === "" || !Number.isFinite(v) || v === S.inputs[spec.col]) return; S.inputs[spec.col] = v; sync(v); onInputsChanged(); };
+      let nt; num.addEventListener("change", () => { clearTimeout(nt); commit(); });
+      num.addEventListener("input", () => { clearTimeout(nt); nt = setTimeout(commit, 250); });  // arrows / spinner / typing
+      f.append(el("div", { class: "row" }, range, num));
+      f._sync = sync;
+    } else if (spec.options) {
+      const s = el("select", { onchange: e => { S.inputs[spec.col] = e.target.value; onInputsChanged(); } }, spec.options.map(o => el("option", { value: o }, o)));
+      f.append(s); f._sync = v => { s.value = v; };
+    } else {
+      const t = el("input", { type: spec.type === "in" ? "number" : "text", step: 0.1, placeholder: spec.type === "inim" ? "image path" : "" });
+      t.addEventListener("change", () => { S.inputs[spec.col] = spec.type === "in" ? Number(t.value) : t.value; onInputsChanged(); });
+      f.append(t); f._sync = v => { t.value = v; };
+    }
+    f.dataset.col = spec.col; box.append(f);
+  }
+  syncInputs();
+}
+function syncInputs() { for (const f of $("#inputs").children) f._sync?.(S.inputs[f.dataset.col]); }
+function setInput(col, v, refresh = true) {
+  const spec = inputSpec(col);
+  if (spec.type === "in") v = Number(v);
+  S.inputs[col] = v; syncInputs(); if (refresh) onInputsChanged();
+}
+function resetInputs() { for (const s of S.meta.inputs) S.inputs[s.col] = s.default; S.targets = null; $("#rowNote").textContent = ""; syncInputs(); onInputsChanged(); }
+
+// ───────────────────────── prediction panel ─────────────────────────
+function renderOutputs() {
+  const box = $("#outputs"); box.replaceChildren();
+  if (!S.pred) return;
+  for (const o of S.pred.outputs) {
+    const d = el("div", { class: "out" }, el("div", { class: "name" }, `${o.col} · ${o.type}`), el("div", { class: "value" }, typeof o.value === "number" ? fmt(o.value, 6) : String(o.value)));
+    if (S.targets && S.targets[o.col] != null) {
+      const t = S.targets[o.col];
+      let extra = "";
+      if (typeof o.value === "number" && typeof t === "number") extra = ` · error ${fmt(o.value - t)}`;
+      else extra = String(o.value) === String(t) ? " · correct" : " · wrong";
+      d.append(el("div", { class: "target" }, `target ${typeof t === "number" ? fmt(t, 6) : t}${extra}`));
+    }
+    if (o.probs) {
+      const top = [...o.probs].sort((a, b) => b[1] - a[1]).slice(0, 6);
+      for (const [lab, p] of top) d.append(el("div", { class: "probrow" }, el("span", { class: "lab", title: lab }, lab), el("span", { class: "bar" }, el("div", { style: `width:${(p * 100).toFixed(1)}%` })), el("span", { class: "num" }, (p * 100).toFixed(1) + "%")));
+      if (o.probs.length > 6) d.append(el("div", { class: "muted", style: "font-size:11px" }, `+${o.probs.length - 6} more classes`));
+    }
+    box.append(d);
+  }
+}
+
+// ───────────────────────── refresh loop ─────────────────────────
+const refreshTab = debounce(() => renderTab(), 60);
+const onInputsChanged = debounce(async () => { store.set("inputs", S.inputs); await predict(); refreshTab(); }, 40);
+async function predict() {
+  const t0 = performance.now(), seq = ++S.seq;
+  try {
+    const p = await api("/api/predict", { inputs: S.inputs });
+    if (seq !== S.seq) return;
+    S.pred = p; $("#latency").textContent = `${Math.round(performance.now() - t0)} ms`;
+    renderOutputs();
+  } catch (e) { toast("Predict failed: " + e.message); }
+}
+
+// ───────────────────────── tabs ─────────────────────────
+function buildTabs() {
+  $("#tabs").replaceChildren(...TABS.map(([id, name]) => el("button", { class: id === S.tab ? "active" : "", onclick: () => { S.tab = id; store.set("tab", id); history.replaceState(null, "", "#" + id); buildTabs(); renderTab(); } }, name)));
+}
+let renderToken = 0;
+async function renderTab() {
+  const token = ++renderToken, view = $("#view");
+  const fresh = el("div");
+  try {
+    await ({ response: tabResponse, diagram: tabDiagram, map: tabMap, sens: tabSens, network: tabNetwork, acts: tabActs, weights: tabWeights, data: tabData, history: tabHistory }[S.tab])(fresh, () => token !== renderToken);
+    // charts sized while detached: redraw once attached
+    if (token === renderToken) keepScroll(() => { view.replaceChildren(...fresh.childNodes); fresh._after?.forEach(fn => fn()); });
+  } catch (e) {
+    if (token === renderToken) { view.replaceChildren(el("div", { class: "card empty" }, "Error: " + e.message)); }
+  }
+}
+// charts need layout width: build into a detached node, then draw after attach
+function later(root, fn) { (root._after ??= []).push(fn); }
+
+// Response curves
+async function tabResponse(root, stale) {
+  const outs = plottableOutputs(), ins = sweepableInputs();
+  if (!outs.length || !ins.length) { root.append(el("div", { class: "card empty" }, "No sweepable input / plottable output pair (numeric or label columns are needed).")); return; }
+  const out = ts("response", "out", outs[0].col), mode = ts("response", "input", "__all__");
+  const outCol = outputSpec(out) ? out : outs[0].col;
+  const ctl = el("div", { class: "controls" },
+    selectCtl("Output", outs.map(o => [o.col, o.col]), outCol, v => { setTs("response", "out", v); renderTab(); }),
+    selectCtl("Input", [["__all__", "All inputs (small multiples)"], ...ins.map(i => [i.col, i.col])], mode, v => { setTs("response", "input", v); renderTab(); }),
+    selectCtl("Resolution", [[100, "100"], [200, "200"], [400, "400"], [800, "800"]], ts("response", "n", 200), v => { setTs("response", "n", +v); renderTab(); }),
+    checkCtl("overlay training data", ts("response", "data", false), v => { setTs("response", "data", v); renderTab(); }));
+  root.append(el("p", { class: "note" }, "Each curve varies one input while every other input stays at its current value (a slice through the model at the current point). Click a curve to move that input there."));
+  root.append(ctl);
+  const cols = mode === "__all__" ? ins.map(i => i.col) : [mode];
+  if (cols.length === 1 && inputSpec(cols[0]).type === "in") {
+    const spec = inputSpec(cols[0]);
+    const st = { step: niceStep((spec.max - spec.min) / 50) };
+    ctl.append(numCtl("x from", ts("response", "lo_" + cols[0], spec.min), v => { setTs("response", "lo_" + cols[0], v); renderTab(); }, st),
+               numCtl("x to", ts("response", "hi_" + cols[0], spec.max), v => { setTs("response", "hi_" + cols[0], v); renderTab(); }, st));
+  }
+  const grid = el("div", { class: cols.length > 1 ? "grid" : "" }); root.append(grid);
+  const results = await Promise.all(cols.map(c => api("/api/sweep1d", { inputs: S.inputs, x: c, out: outCol, n: ts("response", "n", 200), show_data: ts("response", "data", false), lo: ts("response", "lo_" + c, null), hi: ts("response", "hi_" + c, null) })));
+  if (stale()) return;
+  results.forEach(r => {
+    const card = el("div", { class: "card" }); grid.append(card);
+    const chart = new Chart(card, { height: cols.length > 1 ? 220 : 380, title: `${r.x_col} → ${r.out_col}`, sub: r.categorical ? "categorical input" : "" });
+    later(root, () => plotSweep(chart, r));
+  });
+}
+function foldClasses(seriesList, keep = 7) {
+  if (seriesList.length <= 8) return seriesList;
+  const ranked = [...seriesList].sort((a, b) => Math.max(...b.y) - Math.max(...a.y));
+  const top = ranked.slice(0, keep), rest = ranked.slice(keep);
+  const other = { name: `Other (${rest.length})`, y: top[0].y.map((_, i) => rest.reduce((s, r) => s + r.y[i], 0)), other: true };
+  return seriesList.filter(s => top.includes(s)).concat([other]);
+}
+function plotSweep(chart, r) {
+  const pal = series();
+  const lines = foldClasses(r.series).map((s, i) => ({ ...s, color: s.other ? css("--other") : pal[i % 8] }));
+  if (lines.length > 1) chart.legend(lines.map(s => [s.name, s.color]));
+  const yCats = r.y_classes || null;
+  if (r.categorical) {
+    drawCats(chart, { cats: r.x, lines, xLabel: r.x_col, yLabel: r.y_label, current: r.current, yCats, onClickCat: c => setInput(r.x_col, c) });
+  } else {
+    drawLine(chart, { x: r.x, lines, xLabel: r.x_col, yLabel: r.y_label, vline: Number(r.current), points: r.data || null, yRange: r.y_label === "probability" ? [0, 1] : null, yCats, onClickX: v => setInput(r.x_col, v) });
+  }
+}
+
+// 2D map
+async function tabMap(root, stale) {
+  const outs = plottableOutputs(), ins = sweepableInputs();
+  if (ins.length < 2 || !outs.length) { root.append(el("div", { class: "card empty" }, "A 2D map needs at least two sweepable inputs.")); return; }
+  let x = ts("map", "x", ins[0].col), y = ts("map", "y", ins[1].col), out = ts("map", "out", outs[0].col);
+  if (!inputSpec(x)) x = ins[0].col; if (!inputSpec(y) || y === x) y = ins.find(i => i.col !== x).col; if (!outputSpec(out)) out = outs[0].col;
+  const ospec = outputSpec(out);
+  const cls = ts("map", "cls_" + out, "__argmax__");
+  const ctl = el("div", { class: "controls" },
+    selectCtl("X input", ins.map(i => [i.col, i.col]), x, v => { setTs("map", "x", v); renderTab(); }),
+    selectCtl("Y input", ins.map(i => [i.col, i.col]), y, v => { setTs("map", "y", v); renderTab(); }),
+    selectCtl("Output", outs.map(o => [o.col, o.col]), out, v => { setTs("map", "out", v); renderTab(); }));
+  if (ospec.type === "outlabcat") ctl.append(selectCtl("Show", [["__argmax__", "Predicted class"], ...ospec.classes.map(c => [c, `P(${c})`])], cls, v => { setTs("map", "cls_" + out, v); renderTab(); }));
+  ctl.append(selectCtl("Resolution", [[40, "40"], [80, "80"], [120, "120"], [200, "200"]], ts("map", "n", 80), v => { setTs("map", "n", +v); renderTab(); }),
+             checkCtl("overlay training data", ts("map", "data", false), v => { setTs("map", "data", v); renderTab(); }));
+  root.append(el("p", { class: "note" }, "Output over a grid of two inputs, all others held at their current values. The cross marks the current input; click anywhere to move there."), ctl);
+  const r = await api("/api/sweep2d", { inputs: S.inputs, x, y, out, cls, n: ts("map", "n", 80), show_data: ts("map", "data", false) });
+  if (stale()) return;
+  const card = el("div", { class: "card" }); root.append(card);
+  const chart = new Chart(card, { height: 460, title: `${x} × ${y} → ${r.mode === "prob" ? `P(${cls})` : out}` });
+  later(root, () => {
+    const z = b64f32(r.z), pal = series();
+    let colorFn, valueText, cb = null;
+    if (r.mode === "class") {
+      const counts = new Map(); z.forEach(v => counts.set(v, (counts.get(v) || 0) + 1));
+      const ranked = [...counts.entries()].sort((a, b) => b[1] - a[1]).map(e => e[0]);
+      const keep = ranked.length > 8 ? ranked.slice(0, 7) : ranked;
+      const colorOf = new Map(keep.map((k, i) => [k, hex2rgb(pal[i])]));
+      const other = hex2rgb(css("--other"));
+      colorFn = v => colorOf.get(v) || other;
+      valueText = (i, j, v) => `${esc(x)} = ${esc(fmtAxis(r.x, r.x_categorical, i))}<br>${esc(y)} = ${esc(fmtAxis(r.y, r.y_categorical, j))}<br>predicted <b>${esc(r.classes[v] ?? v)}</b>`;
+      chart.legend(keep.map((k, i) => [r.classes[k] ?? k, pal[i]]).concat(ranked.length > keep.length ? [[`Other (${ranked.length - keep.length})`, css("--other")]] : []));
+    } else {
+      const seq = seqScale(), lo = r.mode === "prob" ? 0 : r.zmin, hi = r.mode === "prob" ? 1 : r.zmax;
+      colorFn = v => seq((v - lo) / ((hi - lo) || 1));
+      valueText = (i, j, v) => `${esc(x)} = ${esc(fmtAxis(r.x, r.x_categorical, i))}<br>${esc(y)} = ${esc(fmtAxis(r.y, r.y_categorical, j))}<br>${r.mode === "prob" ? `P(${esc(cls)})` : esc(out)} = <b>${r.classes && ospec.type === "outlab" ? esc(r.classes[Math.round(v)] ?? fmt(v)) : fmt(v)}</b>`;
+      cb = { lo, hi, colorFn: t => seq(t), label: r.mode === "prob" ? `P(${cls})` : out };
+    }
+    const toVal = (vals, cat, v) => cat ? vals.indexOf(String(v)) : Number(v);
+    drawHeat(chart, {
+      z, nx: r.nx, ny: r.ny, xVals: r.x, yVals: r.y, xLabel: x, yLabel: y, colorFn, valueText,
+      xCats: r.x_categorical ? r.x : null, yCats: r.y_categorical ? r.y : null,
+      marker: [toVal(r.x, r.x_categorical, r.current[0]), toVal(r.y, r.y_categorical, r.current[1])],
+      points: r.data || null,
+      onClick: (i, j) => { S.inputs[x] = r.x[i]; S.inputs[y] = r.y[j]; syncInputs(); onInputsChanged(); },
+    });
+    if (cb) colorbar(card, cb);
+  });
+}
+const fmtAxis = (vals, cat, i) => cat ? vals[i] : fmt(vals[i]);
+
+// Sensitivity
+async function tabSens(root, stale) {
+  const outs = plottableOutputs();
+  if (!outs.length) { root.append(el("div", { class: "card empty" }, "No plottable output.")); return; }
+  let out = ts("sens", "out", outs[0].col); if (!outputSpec(out)) out = outs[0].col;
+  const ospec = outputSpec(out), cls = ts("sens", "cls_" + out, "__argmax__");
+  const ctl = el("div", { class: "controls" }, selectCtl("Output", outs.map(o => [o.col, o.col]), out, v => { setTs("sens", "out", v); renderTab(); }));
+  if (ospec.type === "outlabcat") ctl.append(selectCtl("Class", [["__argmax__", "Predicted class"], ...ospec.classes.map(c => [c, c])], cls, v => { setTs("sens", "cls_" + out, v); renderTab(); }));
+  root.append(el("p", { class: "note" }, "How much each input moves this output right now. Numeric inputs: gradient × full training range (a local, linear estimate of the change from sweeping that input end to end). Categorical inputs: the spread between the best and worst category, computed exactly."), ctl);
+  const r = await api("/api/sensitivity", { inputs: S.inputs, out, cls });
+  if (stale()) return;
+  const rows = [...r.rows].sort((a, b) => Math.abs(b.effect ?? 0) - Math.abs(a.effect ?? 0));
+  const card = el("div", { class: "card" }); root.append(card);
+  const chart = new Chart(card, { title: `Effect on ${r.target}`, sub: "sorted by magnitude" });
+  later(root, () => drawHBars(chart, {
+    labels: rows.map(x => x.col), values: rows.map(x => x.effect), valueLabel: `Δ ${r.target}`,
+    colorPos: css("--s1"), colorNeg: css("--s8"),
+    notes: rows.map(x => x.kind === "gradient" ? `local slope: ${fmt(x.per_unit)} per unit of input` : `best: ${esc(x.best)} · worst: ${esc(x.worst)}`),
+  }));
+  card.append(el("div", { class: "legend" }, el("span", {}, el("span", { class: "sw", style: `background:${css("--s1")}` }), "increases output"), el("span", {}, el("span", { class: "sw", style: `background:${css("--s8")}` }), "decreases output"), el("span", { class: "muted" }, "(categorical spreads are always ≥ 0)")));
+}
+
+// Network: per-layer activation strips + neuron inspector
+async function tabNetwork(root, stale) {
+  if (!S.pred) await predict();
+  const p = S.pred; if (!p) return;
+  const key = ts("network", "key", "act_out");
+  root.append(el("p", { class: "note" }, "Every neuron's value for the current input, one row per layer (blue negative, red positive, scaled per row). Click a cell to inspect that neuron."),
+    el("div", { class: "controls" }, selectCtl("Show", [["act_out", "post-activation"], ["act_in", "pre-activation"], ["out", "block output (residual stream)"]], key, v => { setTs("network", "key", v); renderTab(); })));
+  const card = el("div", { class: "card" }); root.append(card);
+  const div = divScale();
+  const strips = [["input (encoded)", p.encoded, null]];
+  p.layers.forEach((l, i) => strips.push([`layer ${i + 1}${p.routers[i] != null ? ` · gate ${fmt(p.routers[i], 2)}` : ""}`, l.skipped ? null : (l[key] || l.out), i]));
+  strips.push(["output (raw)", p.raw, null]);
+  for (const [label, vals, bi] of strips) {
+    const row = el("div", { class: "strip-row" }, el("div", { class: "lab" }, el("b", {}, label), vals ? ` · ${vals.length}` : " · skipped by router"));
+    const holder = el("div"); row.append(holder); card.append(row);
+    if (!vals) continue;
+    const chart = new Chart(holder, {});
+    later(root, () => {
+      const perRow = Math.max(1, Math.min(vals.length, Math.floor((holder.clientWidth || 600) / 7)));
+      const rows = Math.ceil(vals.length / perRow);
+      chart.height = Math.max(14, rows * 12);
+      const m = Math.max(1e-9, ...vals.map(Math.abs));
+      const z = new Float32Array(rows * perRow).fill(NaN);
+      z.set(vals);
+      const idx = (i, j) => j * perRow + i;
+      drawHeat(chart, {
+        z, nx: perRow, ny: rows, xVals: [...Array(perRow).keys()], yVals: [...Array(rows).keys()], left: 0, bottom: 0, yDown: true,
+        colorFn: v => Number.isNaN(v) ? hex2rgb(css("--surface")) : div(v / m),
+        valueText: (i, j, v) => Number.isNaN(v) ? "" : `neuron ${idx(i, j) + 1}: <b>${fmt(v)}</b>${bi == null && label.startsWith("input") ? `<div class="muted">${esc(slotLabel(idx(i, j)))}</div>` : ""}`,
+        onClick: bi == null ? null : (i, j) => { const k = idx(i, j); if (k < vals.length) { S.selNeuron = { block: bi, neuron: k }; renderTab(); } },
+      });
+    });
+  }
+  const sel = S.selNeuron;
+  if (sel && sel.block < p.layers.length && !p.layers[sel.block].skipped) await neuronInspector(root, sel, stale);
+  else root.append(el("div", { class: "card empty" }, "Click a neuron above to see its activation curve and weights."));
+}
+function slotLabel(k) {
+  for (const s of S.meta.inputs) {
+    const [st, w] = S.meta.slots[s.col];
+    if (k >= st && k < st + w) return s.type === "inlabcat" ? `${s.col} = ${s.options[k - st]}` : (w > 1 ? `${s.col}[${k - st}]` : s.col);
+  }
+  return "";
+}
+async function neuronInspector(root, sel, stale) {
+  const l = S.pred.layers[sel.block];
+  const [act, w] = await Promise.all([
+    api("/api/activations", { inputs: S.inputs, block: sel.block, n: 241 }).catch(e => ({ available: false, reason: e.message })),
+    api("/api/neuron", { inputs: S.inputs, block: sel.block, neuron: sel.neuron }),
+  ]);
+  if (stale()) return;
+  const card = el("div", { class: "card" });
+  card.append(el("h2", {}, el("span", { class: "grow" }, `Layer ${sel.block + 1} · neuron ${sel.neuron + 1}`)));
+  const info = kv(
+    "pre-activation", fmt(l.act_in?.[sel.neuron] ?? l.pre?.[sel.neuron]),
+    "post-activation", fmt(l.act_out?.[sel.neuron]),
+    "bias", fmt(w.bias));
+  if (S.dataStats?.blocks?.[sel.block]) {
+    const b = S.dataStats.blocks[sel.block];
+    info.append(...["data pre-act 1–99%", `${fmt(b.p01[sel.neuron])} … ${fmt(b.p99[sel.neuron])}`, "dead on data", `${(b.dead[sel.neuron] * 100).toFixed(1)}%`].map(t => el("div", {}, t)));
+  }
+  card.append(info);
+  const two = el("div", { class: "two", style: "margin-top:10px" }); card.append(two);
+  const c1 = el("div"), c2 = el("div"); two.append(c1, c2);
+  if (act.available) {
+    const chart = new Chart(c1, { height: 240, title: "Activation function", sub: act.shared ? "shared by all neurons" : "this neuron's own curve" });
+    later(root, () => drawActivation(chart, act, sel.neuron, true));
+  } else c1.append(el("p", { class: "note" }, act.reason));
+  if (w.incoming) {
+    const order = w.incoming.map((v, i) => i).sort((a, b) => Math.abs(w.incoming[b]) - Math.abs(w.incoming[a])).slice(0, 20);
+    const chart = new Chart(c2, { title: "Strongest incoming weights", sub: `${Math.min(20, w.incoming.length)} of ${w.incoming.length}` });
+    later(root, () => drawHBars(chart, { labels: order.map(i => w.incoming_labels ? w.incoming_labels[i] : `in ${i + 1}`), values: order.map(i => w.incoming[i]), valueLabel: "weight", colorPos: css("--div-pos"), colorNeg: css("--div-neg") }));
+  }
+  root.append(card);
+}
+
+// EasyNN-style network diagram
+const NODE_BARS = [["net", "Net input", "--s1"], ["act", "Activation", "--s7"], ["bias", "Bias", "--s4"], ["error", "Error", "--s2"]];
+async function tabDiagram(root, stale) {
+  const mode = ts("diagram", "mode", "weights"), maxNodes = ts("diagram", "max", 32);
+  const r = await api("/api/netview", { inputs: S.inputs, targets: S.targets, mode, max_nodes: maxNodes });
+  if (stale()) return;
+  S.netData = r;
+  const head = el("div", { class: "card", style: "padding:10px 12px" });
+  const details = el("div", { id: "netDetails" }), legend = el("div", { class: "netlegend" });
+  const pal = series(), lighten = c => rgb(mix(hex2rgb(c), hex2rgb(css("--surface")), 0.55));
+  const line = (color, dashed = false) => el("span", { class: "ln", style: `border-top:${dashed ? "2px dashed" : "4px solid"} ${color}` });
+  legend.append(
+    el("div", { class: "lg-title" }, "Forward connections"), el("div", { class: "lg-row" }, line(pal[7]), "negative"), el("div", { class: "lg-row" }, line(pal[5]), "positive"), el("div", { class: "lg-row" }, line(css("--muted"), true), "insignificant"),
+    el("div", { class: "lg-title" }, "Backward connections"), el("div", { class: "lg-row" }, line(lighten(pal[7])), "negative"), el("div", { class: "lg-row" }, line(lighten(pal[5])), "positive"));
+  head.append(el("div", { class: "nethead" }, details, legend));
+  root.append(el("div", { class: "controls" },
+    selectCtl("Connections", [["weights", "Weights (effective linear weight)"], ["influence", "Influence at current input (exact derivative)"]], mode, v => { setTs("diagram", "mode", v); renderTab(); }),
+    selectCtl("Nodes per layer", [[16, "16"], [32, "32"], [48, "48"], [96, "96"]], maxNodes, v => { setTs("diagram", "max", +v); renderTab(); }),
+    el("span", { class: "note", style: "margin:0;max-width:640px" }, r.has_error ? "Error = gradient of the loss for the loaded row's targets (backpropagated)." : "Error bars need targets: load a data row (Random data row, or Inspect on a worst-fit row).")), head);
+  const card = el("div", { class: "card", style: "padding:6px" }); root.append(card);
+  const scroller = el("div", { class: "diagram-scroll" }); card.append(scroller);  // narrow screens scroll sideways
+  const chart = new Chart(scroller, {});
+  const notes = el("p", { class: "note", style: "margin:6px 6px 0" }); card.append(notes);
+  const kinds = r.conns.map(c => c?.kind).filter(Boolean);
+  notes.textContent = (kinds.includes("influence") && mode === "weights" ? "Some layer pairs have no fixed weight matrix (normalization-free composition not possible: MoE, hyper, gated or attention blocks), so they show influence instead. " : "") +
+    (mode === "weights" ? "Weights fold each block's second linear layer, ReZero gains and the next norm's scale; normalization's re-centering and skip paths are not included." : "Influence = ∂(destination net input)/∂(source activation) at the current input, including normalization, skips and gates.") +
+    " Click a node to highlight its connections; click empty space to clear.";
+  later(root, () => drawDiagram(chart));
+}
+function drawDiagram(chart) {
+  const r = S.netData; if (!r) return;
+  const layers = r.layers, pal = series();
+  const maxN = Math.max(...layers.map(L => L.skipped ? 1 : L.idx.length));
+  const rowH = Math.max(20, Math.min(56, 900 / maxN));
+  chart.height = Math.round(maxN * rowH + 70);
+  // never squeeze layers closer than a readable gap; wider than the screen -> the wrapper scrolls
+  const avail = chart.root.parentElement.clientWidth || 600;
+  chart.canvas.style.width = Math.max(avail, 330 + layers.length * 170) + "px";
+  const ctx = chart.setup(), W = chart.w, H = chart.height;
+  ctx.font = "11px system-ui, sans-serif";
+  const labelW = (L, f) => L && !L.skipped ? Math.max(0, ...L.labels.map((t, k) => ctx.measureText(f(t, k)).width)) : 0;
+  const first = layers[0], last = layers[layers.length - 1];
+  const padL = Math.min(240, 60 + labelW(first, (t, k) => `${first.idx[k]}. ${String(t).slice(0, 18)}`));
+  const padR = Math.min(280, 70 + labelW(last, (t, k) => `${last.idx[k]}. ${String(t).slice(0, 18)}  ${fmt(last.act[k], 3)}`));
+  const top = 18;
+  const colX = i => padL + (layers.length === 1 ? 0 : i * (W - padL - padR) / (layers.length - 1));
+  const gap = layers.length > 1 ? (W - padL - padR) / (layers.length - 1) : 200;
+  const rx = Math.max(16, Math.min(46, gap * 0.22)), ry = Math.max(7, Math.min(20, rowH * 0.42));
+  const pos = layers.map((L, i) => L.skipped ? [] : L.idx.map((_, k) => [colX(i), top + ry + 4 + (k + (maxN - L.idx.length) / 2) * rowH]));
+  const sel = S.netSel && layers[S.netSel.layer] && !layers[S.netSel.layer].skipped ? S.netSel : null;
+  const selK = sel ? layers[sel.layer].idx.indexOf(sel.node) : -1;
+  const lighten = c => rgb(mix(hex2rgb(c), hex2rgb(css("--surface")), 0.55));
+  // connections
+  r.conns.forEach((c, p) => {
+    if (!c || !c.max) return;
+    const w = b64f32(c.w), mx = c.max, edges = [];
+    for (let b = 0; b < c.rows; b++) for (let a = 0; a < c.cols; a++) { const v = w[b * c.cols + a]; if (Math.abs(v) >= 0.02 * mx) edges.push([Math.abs(v), v, a, b]); }
+    edges.sort((e1, e2) => e1[0] - e2[0]);  // strongest drawn last (on top)
+    const keep = edges.slice(-1500);
+    for (const [aw, v, a, b] of keep) {
+      const [x1, y1] = pos[p][a], [x2, y2] = pos[p + 1][b];
+      const fwd = sel && sel.layer === p && a === selK, bwd = sel && sel.layer === p + 1 && b === selK;
+      const insignificant = aw < 0.1 * mx;
+      let color = v < 0 ? pal[7] : pal[5], alpha = 0.85, width = 0.6 + 5 * aw / mx;
+      if (insignificant) { color = css("--muted"); alpha = 0.35; width = 0.8; }
+      if (bwd) color = insignificant ? color : lighten(v < 0 ? pal[7] : pal[5]);
+      if (sel && !fwd && !bwd) alpha = 0.06;
+      ctx.globalAlpha = alpha; ctx.strokeStyle = color; ctx.lineWidth = width;
+      ctx.setLineDash(insignificant ? [4, 3] : []);
+      ctx.beginPath(); ctx.moveTo(x1 + rx, y1); ctx.lineTo(x2 - rx, y2); ctx.stroke();
+    }
+    ctx.setLineDash([]); ctx.globalAlpha = 1;
+  });
+  // nodes
+  const fills = { input: "--s3", hidden: "--s1", output: "--s5" };
+  const scales = layers.map(L => L.skipped ? null : Object.fromEntries(NODE_BARS.map(([k]) => [k, Math.max(1e-12, ...(L[k] || [0]).map(v => Math.abs(v ?? 0)))])));
+  ctx.font = "11px system-ui, sans-serif";
+  layers.forEach((L, i) => {
+    const x = colX(i);
+    ctx.fillStyle = css("--text-2"); ctx.textAlign = "center"; ctx.textBaseline = "alphabetic";
+    const sub = L.skipped ? "skipped by router" : (L.size > L.idx.length ? `${L.idx.length} most active of ${L.size}` : `${L.size} nodes`);
+    ctx.font = "600 12px system-ui, sans-serif"; ctx.fillText(L.name + (L.function ? ` · ${L.function}` : ""), x, H - 22);
+    ctx.font = "11px system-ui, sans-serif"; ctx.fillStyle = css("--muted"); ctx.fillText(sub, x, H - 8);
+    if (L.skipped) return;
+    const base = hex2rgb(css(fills[L.kind])), fill = rgb(mix(hex2rgb(css("--surface")), base, 0.22));
+    L.idx.forEach((orig, k) => {
+      const [cx, cy] = pos[i][k], isSel = sel && sel.layer === i && k === selK;
+      ctx.beginPath(); ctx.ellipse(cx, cy, rx, ry, 0, 0, 7);
+      ctx.fillStyle = fill; ctx.fill();
+      ctx.lineWidth = isSel ? 3 : 1.2; ctx.strokeStyle = isSel ? css("--text") : rgb(base); ctx.stroke();
+      ctx.strokeStyle = css("--border"); ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(cx, cy - ry + 3); ctx.lineTo(cx, cy + ry - 3); ctx.stroke();
+      const bh = Math.max(1.5, (2 * ry - 6) / 4 - 1), maxLen = rx - 6;
+      NODE_BARS.forEach(([key, , color], b) => {
+        const v = L[key]?.[k]; if (v == null) return;
+        const len = Math.max(0.5, Math.abs(v) / scales[i][key] * maxLen);
+        ctx.fillStyle = css(color); ctx.fillRect(v >= 0 ? cx : cx - len, cy - ry + 3 + b * (bh + 1), len, bh);
+      });
+      // node number beside the node (EasyNN style), names for input/output nodes
+      ctx.textBaseline = "middle";
+      if (L.kind === "input") { ctx.textAlign = "right"; ctx.fillStyle = css("--text"); ctx.fillText(`${orig}. ${String(L.labels[k]).slice(0, 18)}`, cx - rx - 6, cy); }
+      else if (L.kind === "output") { ctx.textAlign = "left"; ctx.fillStyle = css("--text"); ctx.fillText(`${orig}. ${String(L.labels[k]).slice(0, 18)}  ${fmt(L.act[k], 3)}`, cx + rx + 6, cy); }
+      else if (rowH >= 18) { ctx.textAlign = "right"; ctx.fillStyle = css("--muted"); ctx.fillText(`${orig}.`, cx - rx - 3, cy); }
+    });
+  });
+  // interaction
+  const hit = (mx, my) => {
+    for (let i = 0; i < layers.length; i++) if (!layers[i].skipped) for (let k = 0; k < pos[i].length; k++) {
+      const [cx, cy] = pos[i][k], dx = (mx - cx) / rx, dy = (my - cy) / ry; if (dx * dx + dy * dy <= 1.15) return [i, k];
+    }
+    return null;
+  };
+  chart.redrawOverlay = null;
+  chart.hover = (mx, my) => { const h = hit(mx, my); if (!h) return null; const [i, k] = h; return nodeHtml(layers[i], k) + '<div class="muted">click to select</div>'; };
+  chart.click = (mx, my) => { const h = hit(mx, my); S.netSel = h ? { layer: h[0], node: layers[h[0]].idx[h[1]] } : null; keepScroll(() => drawDiagram(chart)); };
+  chart.canvas.style.cursor = "pointer";
+  renderNetDetails(sel ? layers[sel.layer] : null, selK);
+}
+function nodeHtml(L, k) {
+  const rows = NODE_BARS.map(([key, name, color]) => `<div><span class="sw" style="background:${css(color)}"></span>${name}: <b>${L[key] ? fmt(L[key][k]) : "–"}</b></div>`).join("");
+  return `<b>${esc(L.name)} · node ${L.idx[k]}</b><div class="muted">${esc(L.labels[k])}</div>${rows}`;
+}
+function renderNetDetails(L, k) {
+  const box = $("#netDetails"); if (!box) return;
+  const title = L ? `${L.name} · node ${L.idx[k]} (${L.labels[k]})` : "No node selected";
+  box.replaceChildren(el("div", { class: "lg-title" }, "Last selected node"), el("div", { style: "font-weight:600;margin-bottom:4px" }, title),
+    ...NODE_BARS.map(([key, name, color]) => el("div", { class: "lg-row" }, el("span", { class: "sw", style: `background:${css(color)}` }), el("span", { style: "min-width:78px;display:inline-block" }, name), el("b", {}, L && L[key] ? fmt(L[key][k]) : "–"))),
+    el("div", { class: "lg-row muted" }, `Function: ${L ? (L.function || (L.kind === "output" ? "decoded output" : "identity")) : "–"}`));
+}
+
+// Activations: learned activation shapes per layer
+async function tabActs(root, stale) {
+  const blocks = S.meta.blocks;
+  if (!blocks.length) { root.append(el("div", { class: "card empty" }, "Model has no hidden blocks.")); return; }
+  let b = ts("acts", "block", 0); if (b >= blocks.length) b = 0;
+  const neuron = ts("acts", "neuron", null);
+  const ctl = el("div", { class: "controls" },
+    selectCtl("Layer", blocks.map(x => [x.index, `layer ${x.index + 1} · ${x.shape_module || "no activation"}${x.neurons ? ` · ${x.neurons} neurons` : ""}`]), b, v => { setTs("acts", "block", +v); setTs("acts", "neuron", null); renderTab(); }),
+    numCtl("Highlight neuron #", neuron != null ? neuron + 1 : null, v => { setTs("acts", "neuron", v ? v - 1 : null); renderTab(); }, { min: 1, max: blocks[b].neurons || 1, style: "width:80px" }),
+    numCtl("x from", ts("acts", "lo", null), v => { setTs("acts", "lo", v); renderTab(); }, { step: 0.5 }),
+    numCtl("x to", ts("acts", "hi", null), v => { setTs("acts", "hi", v); renderTab(); }, { step: 0.5 }),
+    el("button", { onclick: async () => { await loadDataStats(); renderTab(); }, title: "Run a training-data sample through the model to show where each neuron's inputs actually fall" }, S.dataStats ? "Data ranges loaded" : "Load data ranges"));
+  root.append(el("p", { class: "note" }, "The trained activation, evaluated per neuron (per-neuron activations such as PaWeL draw one curve each). Dots are the current input's (pre, post) values. With data ranges loaded, the shaded band is where the highlighted neuron's inputs fall on the training data (1st–99th percentile)."), ctl);
+  const r = await api("/api/activations", { inputs: S.inputs, block: b, lo: ts("acts", "lo", null), hi: ts("acts", "hi", null), n: 301 });
+  if (stale()) return;
+  if (!r.available) { root.append(el("div", { class: "card empty" }, r.reason)); return; }
+  const card = el("div", { class: "card" }); root.append(card);
+  const chart = new Chart(card, { height: 420, title: `Layer ${b + 1}: ${r.module}${r.wrapper !== r.module ? ` inside ${r.wrapper}` : ""}`, sub: r.shared ? "one shared curve" : `${r.neurons} per-neuron curves` });
+  later(root, () => drawActivation(chart, r, neuron, false, n => { setTs("acts", "neuron", n); renderTab(); }));
+  const lower = el("div", { class: "two" }); root.append(lower);
+  const pcard = el("div", { class: "card" }, el("h2", {}, "Learned parameters")); lower.append(pcard);
+  if (r.params.length) {
+    const t = el("table", { class: "data" }, el("tr", {}, el("th", {}, "name"), el("th", {}, "shape"), el("th", {}, "value / stats")));
+    for (const p of r.params) t.append(el("tr", {}, el("td", {}, p.name), el("td", {}, JSON.stringify(p.shape)), el("td", {}, p.values ? p.values.map(v => fmt(v)).join(", ") : `mean ${fmt(p.mean)} · std ${fmt(p.std)} · [${fmt(p.min)}, ${fmt(p.max)}]`)));
+    pcard.append(el("div", { class: "scroll" }, t));
+  } else pcard.append(el("p", { class: "note" }, "This activation has no trainable parameters."));
+  if (r.data) {
+    const dcard = el("div", { class: "card" }, el("h2", {}, "Dead / saturated neurons on data")); lower.append(dcard);
+    const dead = r.data.dead.map((d, i) => [i, d]).filter(x => x[1] > 0.99);
+    dcard.append(el("p", { class: "note" }, `${dead.length} of ${r.data.dead.length} neurons output exactly 0 for >99% of the ${S.dataStats?.rows ?? ""} sampled rows.`));
+    if (dead.length) dcard.append(el("p", { class: "note" }, "Dead: " + dead.slice(0, 60).map(x => "#" + (x[0] + 1)).join(", ") + (dead.length > 60 ? " …" : "")));
+  }
+}
+function drawActivation(chart, r, highlight, single = false, onPick = null) {
+  const pal = series(), C = r.neurons, n = r.n, xs = r.x, curves = b64f32(r.curves);
+  const col = j => { const y = new Array(n); for (let i = 0; i < n; i++) y[i] = curves[i * C + j]; return y; };
+  const lines = [];
+  if (r.shared) lines.push({ name: r.module, y: col(0), color: pal[0], highlight: true });
+  else if (single && highlight != null) lines.push({ name: `neuron ${highlight + 1}`, y: col(highlight), color: pal[0], highlight: true });
+  else {
+    const step = Math.max(1, Math.ceil(C / 400)); // cap drawn curves
+    for (let j = 0; j < C; j += step) if (j !== highlight) lines.push({ name: `neuron ${j + 1}`, y: col(j), color: css("--muted"), width: 1, alpha: Math.max(0.08, Math.min(0.5, 8 / C)) });
+    if (highlight != null && highlight < C) lines.push({ name: `neuron ${highlight + 1}`, y: col(highlight), color: pal[0], width: 2.5, highlight: true });
+  }
+  const f = drawLine(chart, { x: xs, lines, xLabel: "pre-activation", yLabel: "post-activation", alphaLines: !r.shared && !single });
+  const ctx = chart.ctx;
+  const decorate = () => {
+    ctx.save(); ctx.beginPath(); ctx.rect(f.box.l, f.box.t, f.box.r - f.box.l, f.box.b - f.box.t); ctx.clip();
+    const hn = r.shared ? highlight : highlight;
+    if (r.data && hn != null && r.data.p01[hn] != null) {
+      ctx.fillStyle = pal[0]; ctx.globalAlpha = 0.1;
+      const a = f.sx(r.data.p01[hn]), b = f.sx(r.data.p99[hn]); ctx.fillRect(Math.min(a, b), f.box.t, Math.abs(b - a), f.box.b - f.box.t); ctx.globalAlpha = 1;
+    }
+    if (r.knots && hn != null && !r.shared) {
+      const K = r.knots.k, kx = b64f32(r.knots.x), ky = b64f32(r.knots.y);
+      ctx.fillStyle = css("--surface"); ctx.strokeStyle = pal[0]; ctx.lineWidth = 2;
+      for (let k = 0; k < K; k++) { ctx.beginPath(); ctx.arc(f.sx(kx[hn * K + k]), f.sy(ky[hn * K + k]), 3.5, 0, 7); ctx.fill(); ctx.stroke(); }
+    } else if (r.knots && r.shared) {
+      const K = r.knots.k, kx = b64f32(r.knots.x), ky = b64f32(r.knots.y);
+      ctx.fillStyle = css("--surface"); ctx.strokeStyle = pal[0]; ctx.lineWidth = 2;
+      for (let k = 0; k < K; k++) { ctx.beginPath(); ctx.arc(f.sx(kx[k]), f.sy(ky[k]), 3.5, 0, 7); ctx.fill(); ctx.stroke(); }
+    }
+    const pts = single && highlight != null ? [highlight] : [...Array(C).keys()];
+    for (const j of pts) {
+      const isH = j === highlight;
+      ctx.fillStyle = isH ? css("--text") : pal[1]; ctx.strokeStyle = css("--surface"); ctx.lineWidth = isH ? 2 : 1;
+      ctx.globalAlpha = isH || pts.length < 64 ? 1 : 0.6;
+      ctx.beginPath(); ctx.arc(f.sx(r.current_in[j]), f.sy(r.current_out[j]), isH ? 5 : 3, 0, 7); ctx.fill(); ctx.stroke();
+    }
+    ctx.globalAlpha = 1; ctx.restore();
+  };
+  decorate();
+  const base = chart.redrawOverlay; chart.redrawOverlay = p => { base(p); decorate(); };
+  chart.legend([...(r.shared || single ? [] : [["all neurons", css("--muted")]]), ...(highlight != null || r.shared ? [[r.shared ? r.module : `neuron ${highlight + 1}`, pal[0]]] : []), ["current input", single ? css("--text") : pal[1]]]);
+  if (onPick && !r.shared) {
+    chart.click = (mx, my) => { // pick the neuron whose current dot is closest
+      let best = null, bd = 144;
+      for (let j = 0; j < C; j++) { const dx = f.sx(r.current_in[j]) - mx, dy = f.sy(r.current_out[j]) - my, d = dx * dx + dy * dy; if (d < bd) { bd = d; best = j; } }
+      if (best != null) onPick(best);
+    };
+    const baseHover = chart.hover;
+    chart.hover = (mx, my) => {
+      for (let j = 0; j < C; j++) { const dx = f.sx(r.current_in[j]) - mx, dy = f.sy(r.current_out[j]) - my; if (dx * dx + dy * dy < 36) return `neuron ${j + 1}<br>pre ${fmt(r.current_in[j])} → post <b>${fmt(r.current_out[j])}</b><div class="muted">click to highlight</div>`; }
+      return baseHover(mx, my);
+    };
+  }
+}
+async function loadDataStats() {
+  try { S.dataStats = await api("/api/data_stats"); } catch (e) { toast("Dataset analysis failed: " + e.message); }
+}
+
+// Weights
+async function tabWeights(root, stale) {
+  const ws = S.meta.weights;
+  let name = ts("weights", "name", (ws.find(w => w.shape.length === 2) || ws[0]).name);
+  if (!ws.find(w => w.name === name)) name = ws[0].name;
+  root.append(el("p", { class: "note" }, "Any trained tensor in the network. Matrices larger than 256 per side are shown block-averaged."),
+    el("div", { class: "controls" }, selectCtl("Parameter", ws.map(w => [w.name, `${w.name}  ${JSON.stringify(w.shape)}`]), name, v => { setTs("weights", "name", v); renderTab(); })));
+  const r = await api("/api/weight", { name });
+  if (stale()) return;
+  const card = el("div", { class: "card" }); root.append(card);
+  const m = b64f32(r.matrix), lim = Math.max(1e-12, Math.abs(r.stats.min), Math.abs(r.stats.max));
+  if (r.shape.length <= 1 && r.values) {
+    const chart = new Chart(card, { height: 260, title: name, sub: `${r.values.length} values` });
+    later(root, () => drawLine(chart, { x: r.values.map((_, i) => i + 1), lines: [{ name, y: r.values, color: series()[0] }], xLabel: "index", yLabel: "value" }));
+  } else {
+    const chart = new Chart(card, { title: name, sub: `${r.shape.join(" × ")}${r.downsampled ? ` (shown ${r.downsampled.join(" × ")})` : ""}` });
+    const div = divScale();
+    later(root, () => {
+      drawHeat(chart, { z: m, nx: r.cols, ny: r.rows, xVals: [...Array(r.cols).keys()], yVals: [...Array(r.rows).keys()], xLabel: r.downsampled ? "input block" : "input index", yLabel: r.downsampled ? "output block" : "output index", square: true, yDown: true, intTicks: true,
+        colorFn: v => div(v / lim), valueText: (i, j, v) => `${r.downsampled ? "block " : ""}row ${j}, col ${i}: <b>${fmt(v)}</b>` });
+      colorbar(card, { lo: -lim, hi: lim, colorFn: div, diverging: true, label: "weight" });
+    });
+  }
+  const two = el("div", { class: "two" }); root.append(two);
+  const sc = el("div", { class: "card" }, el("h2", {}, "Statistics")); two.append(sc);
+  const st = r.stats;
+  sc.append(kv("elements", st.numel.toLocaleString(), "mean", fmt(st.mean), "std", fmt(st.std), "min / max", `${fmt(st.min)} / ${fmt(st.max)}`, "mean |w|", fmt(st.abs_mean), "|w| < 1e-3", `${(st.near_zero * 100).toFixed(1)}%`, "Frobenius norm", fmt(st.fro),
+    ...(st.spectral != null ? ["spectral norm", fmt(st.spectral), "stable rank", `${fmt(st.stable_rank, 3)} of ${Math.min(...r.shape)}`] : [])));
+  const hc = el("div", { class: "card" }); two.append(hc);
+  const hchart = new Chart(hc, { height: 200, title: "Distribution" });
+  later(root, () => {
+    const e = r.hist.edges, c = r.hist.counts;
+    const ctx = hchart.setup(); const f = hchart.frame({ xlo: e[0], xhi: e[e.length - 1], ylo: 0, yhi: Math.max(...c) * 1.08 || 1, xLabel: "value", yLabel: "count" });
+    ctx.fillStyle = series()[0];
+    c.forEach((v, i) => { const x0 = f.sx(e[i]) + 1, x1 = f.sx(e[i + 1]) - 1; if (v > 0) roundBar(ctx, x0, f.sy(v), Math.max(1, x1 - x0), f.box.b - f.sy(v), true); });
+    hchart.hover = mx => { const v = f.ix(mx), i = e.findIndex((x, k) => k < c.length && v >= x && v < e[k + 1]); return i < 0 ? null : `${fmt(e[i])} … ${fmt(e[i + 1])}: <b>${c[i]}</b>`; };
+  });
+  if (r.singular_values) {
+    const svc = el("div", { class: "card" }); root.append(svc);
+    const chart = new Chart(svc, { height: 220, title: "Singular values", sub: "how many directions the matrix really uses" });
+    later(root, () => drawLine(chart, { x: r.singular_values.map((_, i) => i + 1), lines: [{ name: "σ", y: r.singular_values, color: series()[0] }], xLabel: "index", yLabel: "σ" }));
+  }
+}
+
+// Dataset: fit + dead neurons
+async function tabData(root, stale) {
+  if (!S.meta.dataset.available) { root.append(el("div", { class: "card empty" }, "Training data not available: " + (S.meta.dataset.error || "config.json has no file_path."))); return; }
+  root.append(el("p", { class: "note" }, `Scores up to 2,000 training rows of ${S.meta.config.file_path} and the held-out validation rows saved by training (${"model_validation.csv"}) with the current model.`));
+  if (!S.dataStats) {
+    root.append(el("div", { class: "card empty" }, el("button", { class: "primary", onclick: async e => { e.target.textContent = "Analyzing…"; e.target.disabled = true; await loadDataStats(); renderTab(); } }, "Analyze training data")));
+    return;
+  }
+  const d = S.dataStats;
+  root.append(el("div", { class: "controls" }, el("span", { class: "pill" }, `${d.rows} training` + (d.val_rows ? ` / ${d.val_rows} held-out validation rows` : " rows (no validation rows saved for this model)") + ` · model v${d.version}`), el("button", { onclick: async () => { S.dataStats = null; await loadDataStats(); renderTab(); } }, "Recompute")));
+  renderFit(root, d, 300, root);
+  if (d.worst?.length) root.append(el("div", { class: "card", style: "margin-top:12px" }, worstTable(d.worst)));
+  const dc = el("div", { class: "card" }, el("h2", {}, "Neuron health per layer")); root.append(dc);
+  const t = el("table", { class: "data" }, el("tr", {}, el("th", {}, "layer"), el("th", {}, "neurons"), el("th", {}, "dead (>99% zero)"), el("th", {}, "near-constant (std < 1e-3)"), el("th", {}, "pre-act range (1–99%)")));
+  d.blocks.forEach((b, i) => {
+    if (!b) { t.append(el("tr", {}, el("td", {}, `${i + 1}`), el("td", { colspan: 4, class: "muted" }, "not available (routed / no activation)"))); return; }
+    const n = b.dead.length, dead = b.dead.filter(x => x > 0.99).length, flat = b.std_out.filter(x => x < 1e-3).length;
+    t.append(el("tr", {}, el("td", {}, `${i + 1}`), el("td", {}, n), el("td", {}, `${dead} (${(100 * dead / n).toFixed(1)}%)`), el("td", {}, `${flat} (${(100 * flat / n).toFixed(1)}%)`), el("td", {}, `${fmt(Math.min(...b.p01))} … ${fmt(Math.max(...b.p99))}`)));
+  });
+  dc.append(el("div", { class: "scroll" }, t));
+}
+
+// History (pinned samples)
+function pinned() { return store.get("history", []); }
+function pin() {
+  if (!S.pred) return;
+  const h = pinned();
+  h.unshift({ t: new Date().toISOString(), inputs: { ...S.inputs }, outputs: Object.fromEntries(S.pred.outputs.map(o => [o.col, o.value])), targets: S.targets, v: S.pred.version });
+  store.set("history", h.slice(0, 200));
+  if (S.tab === "history") renderTab();
+}
+async function tabHistory(root) {
+  const h = pinned();
+  if (!h.length) { root.append(el("div", { class: "card empty" }, "Nothing pinned yet. Use Pin in the Inputs panel to keep an input/prediction pair here.")); return; }
+  const ins = S.meta.inputs.map(i => i.col), outs = S.meta.outputs.map(o => o.col);
+  const card = el("div", { class: "card" }); root.append(card);
+  card.append(el("div", { class: "controls" },
+    el("button", { onclick: () => downloadCSV(h, ins, outs) }, "Export CSV"),
+    el("button", { onclick: () => { if (confirm("Clear all pinned samples?")) { store.set("history", []); renderTab(); } } }, "Clear")));
+  const t = el("table", { class: "data" }, el("tr", {}, el("th", {}, ""), el("th", {}, "model"), ...ins.map(c => el("th", {}, c)), ...outs.map(c => el("th", {}, "→ " + c))));
+  h.forEach(row => t.append(el("tr", {}, el("td", {}, el("button", { onclick: () => { S.inputs = { ...S.inputs, ...row.inputs }; S.targets = row.targets; syncInputs(); onInputsChanged(); } }, "Restore")), el("td", { class: "muted" }, "v" + row.v),
+    ...ins.map(c => el("td", {}, typeof row.inputs[c] === "number" ? fmt(row.inputs[c], 6) : String(row.inputs[c] ?? ""))), ...outs.map(c => el("td", {}, typeof row.outputs[c] === "number" ? fmt(row.outputs[c], 6) : String(row.outputs[c] ?? ""))))));
+  card.append(el("div", { class: "scroll" }, t));
+}
+function downloadCSV(h, ins, outs) {
+  const q = v => { const s = String(v ?? ""); return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; };
+  const lines = [[...ins, ...outs.map(o => "pred_" + o)].map(q).join(",")];
+  for (const r of h) lines.push([...ins.map(c => r.inputs[c]), ...outs.map(c => r.outputs[c])].map(q).join(","));
+  const a = el("a", { href: URL.createObjectURL(new Blob([lines.join("\n")], { type: "text/csv" })), download: "pinned_samples.csv" });
+  document.body.append(a); a.click(); a.remove();
+}
+
+// ───────────────────────── status / reload ─────────────────────────
+function renderMeta() {
+  const m = S.meta, c = m.config;
+  $("#modelMeta").textContent = `${m.params.toLocaleString()} params · ${m.input_dim} → [${(c.hidden_dims || []).join(", ")}] → ${m.output_dim} · ${c.activation?.name ?? "?"} · ${c.residual_type} / ${c.norm_type}`;
+}
+function renderStatus(st) {
+  const t = $("#statusText");
+  if (!st.has_model && !S.meta) { t.replaceChildren(el("span", { class: "status-dot err" }), "no model yet"); t.title = st.load_error || ""; return; }
+  const when = st.model_mtime ? new Date(st.model_mtime * 1000).toLocaleTimeString() : "?";
+  t.replaceChildren(el("span", { class: "status-dot" + (st.load_error ? " err" : "") }), `model v${st.version} · saved ${when} · ${st.device}`);
+  t.title = st.load_error ? "Last reload failed (still serving the previous model): " + st.load_error : st.model_path;
+}
+async function initExplore(keepInputs = false) {
+  S.meta = await api("/api/meta"); S.dataStats = null; renderMeta(); renderStatus(S.meta.status);
+  const saved = keepInputs ? S.inputs : store.get("inputs", {});
+  S.inputs = {};
+  for (const s of S.meta.inputs) S.inputs[s.col] = saved[s.col] ?? s.default;
+  const rr = $("#randRow"); rr.disabled = !S.meta.dataset.available; rr.title = S.meta.dataset.available ? "Load a random row of the training CSV" : (S.meta.dataset.error || "no training data");
+  buildInputs(); buildTabs();
+  if (S.page === "explore") showPage("explore");
+  const eb = $("#exploreBtn"); if (eb) eb.disabled = false;
+  await predict(); if (S.page === "explore") renderTab();
+}
+async function refreshAfterReload() {
+  const before = S.meta ? S.meta.inputs.map(i => i.col + ":" + i.type).join("|") : "";
+  const meta = await api("/api/meta");
+  const after = meta.inputs.map(i => i.col + ":" + i.type).join("|");
+  if (before !== after) { await initExplore(); return; }  // a new training run changed the columns
+  S.meta = meta; S.dataStats = null; renderMeta(); renderStatus(S.meta.status);
+  await predict(); if (S.page === "explore") renderTab();
+}
+async function poll(force = false) {
+  try {
+    const st = await api("/api/status", { force });
+    renderStatus(st);
+    if (!S.meta && st.has_model) await initExplore();
+    else if (st.reloaded) whenNotTyping(refreshAfterReload);
+    else if (force && st.load_error) toast("Reload failed: " + st.load_error);
+    $("#noModelErr").textContent = st.has_model ? "" : (st.load_error || "");
+  } catch (e) { $("#statusText").replaceChildren(el("span", { class: "status-dot err" }), "server unreachable"); }
+}
+
+// ───────────────────────── pages ─────────────────────────
+function showPage(page) {
+  S.page = page; store.set("page", page);
+  for (const b of $("#modes").children) b.classList.toggle("active", b.dataset.page === page);
+  $("#trainPage").hidden = page !== "train";
+  $("#explorePage").hidden = page !== "explore" || !S.meta;
+  $("#noModel").hidden = page !== "explore" || !!S.meta;
+  history.replaceState(null, "", "#" + (page === "train" ? "train" : S.tab));
+  if (page === "train") renderTrain();
+  else if (S.meta) renderTab();
+}
+
+// ───────────────────────── Train page ─────────────────────────
+const TYPE_LABELS = { i: "ignore", in: "input · numeric", inlab: "input · label code", intex: "input · text codes", inim: "input · image",
+  inlabcat: "input · category (one-hot)", intexcat: "input · text (one-hot chars)", out: "output · numeric", outlab: "output · label code",
+  outex: "output · text codes", outlabcat: "output · category (softmax)", outexcat: "output · text (softmax chars)" };
+const DEFAULT_FORM = { path: "", delimiter: "", columns: {}, image_params: {}, hidden_dims: [64, 64], mlp_mode: 0, batch_size: 32,
+  activation: { name: "ReLU", params: {} }, activation_type: 0, layer_routing: "none", optimizer: "Adam", lr: "", optim_params: {},
+  residual_type: "residual", norm_type: "layer", groups: 1, attention_type: "none", num_heads: 2, input_attention_type: "none",
+  moe_mode: 1, use_grn: false, noise_mode: "none", noise_value: 0.1, lsuv: 0, lsuv_max_iter: 10,
+  val_mode: "split", val_pct: 0.1, val_file: "", val_interval: 200, loss_balancing: "normalized", loss_temperature: 20 };
+const T = { opts: null, preview: null, F: Object.assign(structuredClone(DEFAULT_FORM), store.get("trainForm", {})), sel: new Set(), lastClick: null,
+  browse: null, since: 0, steps: [], losses: [], tasks: {}, st: null, timer: null, smooth: store.get("smooth", 0.95), logY: store.get("logY", true), fitSaves: -1, fit: null };
+const saveForm = () => store.set("trainForm", T.F);
+const F = () => T.F;
+
+function trainCtl(label, input) { if (!input.dataset.fkey) input.dataset.fkey = "train:" + label; return el("label", { class: "ctl" }, label, input); }
+const TRAIN_STEPS = { batch_size: 1, groups: 1, num_heads: 1, val_interval: 10, val_pct: 0.05, noise_value: 0.01, loss_temperature: 1, lsuv_max_iter: 1 };
+function tSelect(key, options, onchange = null) {
+  return el("select", { "data-fkey": "train:" + key, onchange: e => { const v = e.target.value; F()[key] = /^-?\d+$/.test(v) && typeof DEFAULT_FORM[key] === "number" ? +v : v; saveForm(); (onchange || (() => renderTrain()))(); } },
+    options.map(([v, t]) => el("option", { value: v, selected: String(v) === String(F()[key]) }, t)));
+}
+function tNumber(key, attrs = {}) {
+  return el("input", Object.assign({ type: "number", step: TRAIN_STEPS[key] ?? 0.01, "data-fkey": "train:" + key, value: F()[key] ?? "", onchange: e => { F()[key] = e.target.value === "" ? "" : +e.target.value; saveForm(); updateSummary(); } }, attrs));
+}
+function tCheck(label, key, onVal = [true, false]) {
+  return el("label", { class: "ctl check" }, el("input", { type: "checkbox", checked: F()[key] === onVal[0], onchange: e => { F()[key] = e.target.checked ? onVal[0] : onVal[1]; saveForm(); } }), label);
+}
+
+async function renderTrain() {
+  if (!T.opts) T.opts = await api("/api/train/options");
+  if (!T.preview && F().path) { try { applyPreview(await api("/api/dataset/preview", { path: F().path, delimiter: F().delimiter || null })); } catch { /* shown when user loads */ } }
+  const page = $("#trainPage");
+  const setup = el("div"), mon = el("div", { class: "monitor" });
+  setup.append(datasetCard(), columnsCard(), networkCard(), trainingCard());
+  mon.append(monitorCard(), fitCard());
+  keepScroll(() => { page.replaceChildren(el("div", { class: "train-grid" }, setup, mon)); drawArch(); drawMonitor(); drawFit(); });
+}
+
+function datasetCard() {
+  const card = el("div", { class: "card" }, el("h2", {}, "1 · Dataset"));
+  const path = el("input", { type: "text", value: F().path, placeholder: "path/to/data.csv", onchange: e => { F().path = e.target.value.trim(); saveForm(); } });
+  const delim = el("select", { onchange: e => { F().delimiter = e.target.value; saveForm(); } },
+    [["", "auto-detect"], [",", "comma ,"], ["\t", "tab"], [";", "semicolon ;"], [" ", "space"]].map(([v, t]) => el("option", { value: v, selected: v === F().delimiter }, t)));
+  const load = async () => {
+    F().path = path.value.trim(); saveForm();
+    try {
+      applyPreview(await api("/api/dataset/preview", { path: F().path, delimiter: F().delimiter || null }));
+      T.sel.clear(); renderTrain();
+    } catch (e) { toast("Could not read dataset: " + e.message); }
+  };
+  card.append(el("div", { class: "row-flex" }, path, el("button", { onclick: () => { T.browse = T.browse ? null : (F().path || T.opts.cwd); renderTrain(); } }, T.browse ? "Close browser" : "Browse…"), delim, el("button", { class: "primary", onclick: load }, "Load")));
+  if (T.browse) {
+    const filter = el("input", { type: "search", value: T.browseFilter || "", placeholder: "Type to filter by name…", style: "width:100%;margin-top:8px", autocomplete: "off", spellcheck: "false" });
+    const box = el("div", { class: "browser" }, el("div", { class: "path" }, "loading…")); card.append(filter, box);
+    const go = dir => { T.browse = dir; T.browseFilter = ""; renderTrain(); };
+    const pick = name => { path.value = T.listing.path + "/" + name; T.browse = null; T.browseFilter = ""; load(); };
+    // substring matches first, then names that contain the typed letters in order ("chkb" -> checkerboard)
+    const rank = (name, q) => { if (!q) return 0; const n = name.toLowerCase(); if (n.includes(q)) return n.startsWith(q) ? 0 : 1;
+      let i = 0; for (const ch of n) if (ch === q[i]) i++; return i === q.length ? 2 : -1; };
+    const matches = (items, q, key) => items.map(x => [rank(key(x), q), x]).filter(([r]) => r >= 0).sort((p1, p2) => p1[0] - p2[0] || key(p1[1]).localeCompare(key(p2[1]))).map(([, x]) => x);
+    const draw = () => {
+      const d = T.listing; if (!d) return;
+      const q = filter.value.trim().toLowerCase();
+      const dirs = matches(d.dirs, q, n => n), files = matches(d.files, q, f => f.name);
+      box.replaceChildren(el("div", { class: "path" }, d.path + (q ? `  ·  ${files.length} of ${d.files.length} files match "${filter.value.trim()}"` : "")),
+        q ? null : el("div", { class: "item", onclick: () => go(d.parent) }, "⬑ ..", ""),
+        ...dirs.map(n => el("div", { class: "item", onclick: () => go(d.path + "/" + n) }, "▸ " + n + "/", "")),
+        ...files.map(f => el("div", { class: "item", onclick: () => pick(f.name) }, f.name, el("span", { class: "muted" }, (f.size / 1024).toFixed(0) + " KB"))),
+        dirs.length || files.length ? null : el("div", { class: "item muted" }, q ? "nothing matches" : "no .csv / .tsv / .txt files here"));
+    };
+    filter.addEventListener("input", () => { T.browseFilter = filter.value; draw(); });
+    filter.addEventListener("keydown", e => {
+      if (e.key !== "Enter" || !T.listing) return;
+      const q = filter.value.trim().toLowerCase(), f = matches(T.listing.files, q, x => x.name)[0], d = matches(T.listing.dirs, q, n => n)[0];
+      if (f) pick(f.name); else if (d) go(T.listing.path + "/" + d);
+    });
+    if (T.listing && T.listing.path === T.browse) draw();
+    api("/api/fs", { path: T.browse }).then(d => { T.listing = d; T.browse = d.path; draw(); })
+      .catch(e => box.replaceChildren(el("div", { class: "path" }, e.message)));
+    if (matchMedia("(pointer: fine)").matches) requestAnimationFrame(() => { filter.focus(); filter.setSelectionRange(filter.value.length, filter.value.length); });
+  }
+  if (T.preview) {
+    const d = { ",": "comma", "\t": "tab", ";": "semicolon", " ": "space" }[T.preview.delimiter] || T.preview.delimiter;
+    card.append(el("p", { class: "note", style: "margin:8px 0 0" }, `${T.preview.n_rows.toLocaleString()} rows · ${T.preview.columns.length} columns · ${d}-separated`));
+    const t = el("table", { class: "data" }, el("tr", {}, T.preview.columns.map(c => el("th", {}, c.name))), T.preview.head.map(r => el("tr", {}, r.map(v => el("td", {}, v.length > 24 ? v.slice(0, 22) + "…" : v)))));
+    card.append(el("details", {}, el("summary", {}, "Preview first rows"), el("div", { class: "scroll" }, t)));
+  }
+  return card;
+}
+
+function applyPreview(p) {
+  T.preview = p; F().path = p.path;
+  const known = new Set(p.columns.map(c => c.name));
+  if (Object.keys(F().columns).some(c => !known.has(c)) || p.columns.some(c => !(c.name in F().columns))) {
+    F().columns = Object.fromEntries(p.columns.map(c => [c.name, c.suggested]));  // different file: start from suggestions
+    if (F().val_mode === "file" && F().val_file) {  // a validation file from another dataset cannot match these columns
+      toast(`Validation file ${F().val_file} was for another dataset; switched to a held-out fraction.`);
+      F().val_file = ""; F().val_mode = "split";
+    }
+  }
+  saveForm();
+}
+
+function columnsCard() {
+  const card = el("div", { class: "card" }, el("h2", {}, "2 · Columns"));
+  if (!T.preview) { card.append(el("p", { class: "note" }, "Load a dataset to assign column roles.")); return card; }
+  const cols = T.preview.columns, types = T.opts.col_types;
+  const typeOf = c => F().columns[c] ?? "i";
+  const setSel = names => { T.sel = new Set(names); renderTrain(); };
+  const bulk = el("select", {}, types.map(t => el("option", { value: t }, TYPE_LABELS[t])));
+  card.append(el("div", { class: "row-flex", style: "margin-bottom:8px" },
+    el("button", { onclick: () => setSel(cols.map(c => c.name)) }, "Select all"),
+    el("button", { onclick: () => setSel([]) }, "None"),
+    el("button", { onclick: () => setSel(cols.filter(c => c.numeric).map(c => c.name)) }, "Numeric"),
+    el("button", { onclick: () => setSel(cols.filter(c => !c.numeric).map(c => c.name)) }, "Text"),
+    el("button", { onclick: () => setSel(cols.filter(c => !T.sel.has(c.name)).map(c => c.name)) }, "Invert"),
+    el("span", { class: "muted" }, `${T.sel.size} selected →`), bulk,
+    el("button", { class: "primary", disabled: !T.sel.size, onclick: () => { for (const n of T.sel) F().columns[n] = bulk.value; saveForm(); renderTrain(); } }, "Set type"),
+    el("button", { title: "Reset every column to the suggested role", onclick: () => { F().columns = Object.fromEntries(cols.map(c => [c.name, c.suggested])); saveForm(); renderTrain(); } }, "Use suggestions")));
+  const nIn = cols.filter(c => typeOf(c.name).startsWith("in")).length, nOut = cols.filter(c => typeOf(c.name).startsWith("out")).length;
+  const warn = [];
+  if (!nIn) warn.push("no input columns"); if (!nOut) warn.push("no output columns");
+  for (const c of cols) {
+    const t = typeOf(c.name);
+    if ((t === "in" || t === "out") && !c.numeric) warn.push(`${c.name} is not numeric but typed ${t}`);
+    if (t === "inim" && !(F().image_params[c.name]?.im_size)) warn.push(`${c.name}: set image size`);
+    if (t !== "i" && c.unique < 2) warn.push(`${c.name} is constant`);
+  }
+  card.append(el("div", { class: "row-flex", style: "margin-bottom:6px" }, el("span", { class: "pill" }, `${nIn} inputs`), el("span", { class: "pill" }, `${nOut} outputs`),
+    el("span", { class: "pill" }, `${cols.length - nIn - nOut} ignored`), warn.length ? el("span", { class: "warn" }, "⚠ " + warn.slice(0, 3).join(" · ")) : null));
+  const t = el("table", { class: "data cols" }, el("tr", {}, el("th", {}, el("input", { type: "checkbox", checked: T.sel.size === cols.length, onchange: e => setSel(e.target.checked ? cols.map(c => c.name) : []) })),
+    el("th", {}, "column"), el("th", {}, "role"), el("th", {}, "unique"), el("th", {}, "missing"), el("th", {}, "values")));
+  cols.forEach((c, idx) => {
+    const selected = T.sel.has(c.name);
+    const toggle = ev => {
+      if (ev.shiftKey && T.lastClick != null) { const [a, b] = [T.lastClick, idx].sort((x, y) => x - y); for (let k = a; k <= b; k++) T.sel.add(cols[k].name); }
+      else if (T.sel.has(c.name)) T.sel.delete(c.name); else T.sel.add(c.name);
+      T.lastClick = idx; renderTrain();
+    };
+    const tsel = el("select", { "data-fkey": "role:" + c.name, onchange: e => { const targets = T.sel.has(c.name) && T.sel.size > 1 ? [...T.sel] : [c.name]; for (const n of targets) F().columns[n] = e.target.value; saveForm(); renderTrain(); } },
+      types.map(ty => el("option", { value: ty, selected: ty === typeOf(c.name) }, TYPE_LABELS[ty])));
+    const vals = c.numeric && c.min != null ? `${fmt(c.min)} … ${fmt(c.max)} (mean ${fmt(c.mean)})` : c.samples.slice(0, 4).join(", ") + (c.unique > 4 ? " …" : "");
+    const img = typeOf(c.name) === "inim" ? el("span", { class: "row-flex", style: "margin-top:3px" },
+      "size", el("input", { type: "number", style: "width:64px", value: F().image_params[c.name]?.im_size ?? 32, onchange: e => { (F().image_params[c.name] ??= {}).im_size = +e.target.value; saveForm(); } }),
+      "patch", el("input", { type: "number", style: "width:56px", value: F().image_params[c.name]?.patch_size ?? 4, onchange: e => { (F().image_params[c.name] ??= {}).patch_size = +e.target.value; saveForm(); } })) : null;
+    if (typeOf(c.name) === "inim") { F().image_params[c.name] ??= { im_size: 32, patch_size: 4 }; }
+    t.append(el("tr", { class: selected ? "sel" : "" },
+      el("td", {}, el("input", { type: "checkbox", checked: selected, onclick: toggle })),
+      el("td", { class: "name", onclick: toggle, title: "click to select, shift+click for a range" }, c.name),
+      el("td", {}, tsel, img), el("td", {}, c.unique.toLocaleString()), el("td", {}, c.missing ? el("span", { class: "warn" }, c.missing) : "0"),
+      el("td", { class: "muted", title: c.samples.join(", ") }, vals.length > 48 ? vals.slice(0, 46) + "…" : vals)));
+  });
+  card.append(el("div", { class: "scroll" }, t));
+  card.append(el("p", { class: "note", style: "margin:8px 0 0" }, "Tip: tick several rows (shift+click for a range) and change one of their role menus — or use “Set type” — to assign them all at once. Rows with missing values in used columns are dropped."));
+  return card;
+}
+
+function networkCard() {
+  const f = F(), card = el("div", { class: "card" }, el("h2", {}, "3 · Network"));
+  const chips = el("div", { class: "chips" });
+  f.hidden_dims.forEach((w, i) => chips.append(el("span", { class: "chip" }, `L${i + 1}`,
+    el("input", { type: "number", min: 1, step: 1, "data-fkey": "train:layer" + i, value: w, onchange: e => { f.hidden_dims[i] = Math.max(1, +e.target.value || 1); saveForm(); drawArch(); } }),
+    el("button", { title: "remove layer", onclick: () => { f.hidden_dims.splice(i, 1); saveForm(); renderTrain(); } }, "×"))));
+  chips.append(el("button", { onclick: () => { f.hidden_dims.push(f.hidden_dims.at(-1) || 64); saveForm(); renderTrain(); } }, "+ layer"));
+  const w = el("input", { type: "number", min: 1, step: 1, "data-fkey": "train:uniform-w", value: f.hidden_dims[0] || 64, style: "width:70px" }), d = el("input", { type: "number", min: 1, step: 1, "data-fkey": "train:uniform-d", value: f.hidden_dims.length || 2, style: "width:56px" });
+  card.append(el("div", { class: "row-flex", style: "margin-bottom:8px" }, el("b", {}, "Hidden layers"), chips),
+    el("div", { class: "row-flex muted", style: "margin-bottom:8px;font-size:12px" }, "uniform:", w, "wide ×", d, "deep",
+      el("button", { onclick: () => { f.hidden_dims = Array(Math.max(1, +d.value)).fill(Math.max(1, +w.value)); saveForm(); renderTrain(); } }, "Set")));
+  const arch = el("canvas", { style: "width:100%;height:70px;display:block;margin-bottom:10px" }); card.append(arch); T.archCanvas = arch;
+  const act = f.activation, pdefs = T.opts.activation_params[act.name] || {};
+  const actSel = el("select", { onchange: e => { f.activation = { name: e.target.value, params: { ...(T.opts.activation_params[e.target.value] || {}) } }; saveForm(); renderTrain(); } },
+    T.opts.activations.map(n => el("option", { value: n, selected: n === act.name }, n === "All" ? "All (Gumbel: learn which activation)" : n)));
+  const grid = el("div", { class: "form-grid" },
+    trainCtl("Activation", actSel),
+    ...Object.entries(pdefs).map(([k, def]) => trainCtl(`${act.name} · ${k}`, el("input", { type: "number", step: Number.isInteger(def) ? 1 : 0.1, value: act.params?.[k] ?? def, onchange: e => { (act.params ??= {})[k] = +e.target.value; saveForm(); } }))),
+    trainCtl("Activation type", tSelect("activation_type", [[0, "Basic"], [1, "Self-gated x·f(x)"], [2, "GLU"], [3, "TAAF (learned affine)"], [4, "ReZero"], [5, "Residual TAAF"], [6, "Bipolar"], [7, "GLU2"]])),
+    trainCtl("Residual", tSelect("residual_type", [["none", "None"], ["highway", "Highway"], ["residual", "Residual"], ["rezero", "ReZero"], ["elementwise_rezero", "Elementwise ReZero"], ["concat", "Concat"], ["densenet", "DenseNet"]])),
+    trainCtl("Normalization", tSelect("norm_type", [["none", "None"], ["batch", "Batch"], ["instance", "Instance"], ["layer", "Layer"], ["group", "Group"], ["rmsnorm", "RMSNorm"]])),
+    f.norm_type === "group" ? trainCtl("Groups", tNumber("groups", { min: 1 })) : null,
+    trainCtl("Block type", tSelect("moe_mode", [[1, "Standard linear"], [2, "MoE · 2 experts"], [4, "MoE · 4 experts"], [8, "MoE · 8 experts"], [0, "Hyper LoRA (x_full)"], [-1, "Hyper LoRA (learned)"], [-2, "Hyper LoRA (mean+std)"], [-3, "Hyper LoRA (mean)"], [-4, "gMLP (spatial gating)"], [-5, "aMLP (gMLP + tiny attn)"]])),
+    trainCtl("In-block attention", tSelect("attention_type", [["none", "None"], ["basic", "Basic"], ["multi", "Multi-head"]])),
+    f.attention_type === "multi" ? trainCtl("Heads", tNumber("num_heads", { min: 1 })) : null,
+    trainCtl("Input attention", tSelect("input_attention_type", [["none", "None"], ["basic", "Basic"], ["cross", "Cross"]])),
+    trainCtl("Architecture", tSelect("mlp_mode", [[0, "MLP"], [1, "GNN (graph blocks)"]])),
+    trainCtl("Regularization", tSelect("noise_mode", [["none", "None"], ["dropout", "Dropout"], ["input noise", "Input noise"], ["output noise", "Output noise"], ["noise injection layers", "Noise injection layers"], ["weight noise", "Weight noise"]])),
+    f.noise_mode !== "none" ? trainCtl(f.noise_mode === "dropout" ? "Dropout rate (0–1)" : "Noise std", tNumber("noise_value", { min: 0 })) : null,
+    trainCtl("Initialization", tSelect("lsuv", [[0, "Default"], [1, "LSUV (variance)"], [2, "LSUV (mean + variance)"]])),
+    el("div", { class: "ctl" }, tCheck("Adaptive layer routing", "layer_routing", ["adaptive", "none"]), tCheck("Global response norm (GRN)", "use_grn")));
+  card.append(grid);
+  return card;
+}
+function drawArch() {
+  const c = T.archCanvas; if (!c || !c.isConnected) return;
+  const dpr = devicePixelRatio || 1, W = c.clientWidth || 500, H = 70; c.width = W * dpr; c.height = H * dpr;
+  const ctx = c.getContext("2d"); ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.clearRect(0, 0, W, H);
+  const cols = T.preview ? T.preview.columns : [], ty = n => F().columns[n] ?? "i";
+  const layers = [["inputs", cols.filter(x => ty(x.name).startsWith("in")).length, css("--s3")], ...F().hidden_dims.map((w, i) => [`L${i + 1}`, w, css("--s1")]), ["outputs", cols.filter(x => ty(x.name).startsWith("out")).length, css("--s2")]];
+  const mx = Math.max(...layers.map(l => l[1]), 1), step = (W - 20) / layers.length;
+  ctx.font = "11px system-ui, sans-serif"; ctx.textAlign = "center";
+  layers.forEach(([name, n, color], i) => {
+    const h = 8 + 40 * Math.sqrt(n / mx), x = 10 + i * step + step / 2, bw = Math.min(46, step - 14);
+    if (i > 0) { ctx.strokeStyle = css("--border"); ctx.beginPath(); ctx.moveTo(x - step + bw / 2, 28); ctx.lineTo(x - bw / 2, 28); ctx.stroke(); }
+    ctx.fillStyle = color; roundBar(ctx, x - bw / 2, 28 - h / 2, bw, h, true);
+    ctx.fillStyle = css("--text-2"); ctx.fillText(`${name} · ${n}`, x, H - 4);
+  });
+}
+
+function trainingCard() {
+  const f = F(), card = el("div", { class: "card" }, el("h2", {}, "4 · Training"));
+  const extras = [];
+  if (f.optimizer === "Adam3") extras.push(trainCtl("Orders (≥3)", el("input", { type: "number", min: 3, value: f.optim_params.order ?? 3, onchange: e => { f.optim_params = { order: +e.target.value }; saveForm(); } })));
+  if (f.optimizer === "Evolution") for (const [k, def, lab] of [["population_size", 20, "Population"], ["sigma", 0.02, "Sigma"], ["eggroll_rank", 0, "EGGROLL rank (0 = full)"]])
+    extras.push(trainCtl(lab, el("input", { type: "number", step: Number.isInteger(def) ? 1 : 0.005, value: f.optim_params[k] ?? def, onchange: e => { f.optim_params = { ...f.optim_params, [k]: +e.target.value }; saveForm(); } })));
+  card.append(el("div", { class: "form-grid" },
+    trainCtl("Optimizer", tSelect("optimizer", T.opts.optimizers.map(o => [o, o]), () => { F().optim_params = {}; saveForm(); renderTrain(); })),
+    trainCtl("Learning rate", el("input", { type: "number", step: 0.0001, placeholder: "optimizer default", value: f.lr, onchange: e => { f.lr = e.target.value; saveForm(); } })),
+    trainCtl("Batch size", tNumber("batch_size", { min: 1 })), ...extras,
+    trainCtl("Validation", tSelect("val_mode", [["split", "Hold out a fraction"], ["file", "Separate CSV"], ["none", "None"]])),
+    f.val_mode === "split" ? trainCtl("Validation fraction", tNumber("val_pct", { min: 0, max: 0.9 })) : null,
+    f.val_mode === "file" ? trainCtl("Validation CSV", el("input", { type: "text", value: f.val_file, onchange: e => { f.val_file = e.target.value; saveForm(); } })) : null,
+    f.val_mode !== "none" ? trainCtl("Validate every (steps)", tNumber("val_interval", { min: 1 })) : null,
+    trainCtl("Loss balancing (multi-output)", tSelect("loss_balancing", [["normalized", "Normalized (÷ trivial-predictor loss)"], ["uwso", "UW-SO (adaptive weights)"], ["legacy", "Legacy (0.1 × Huber + CE)"]])),
+    f.loss_balancing === "uwso" ? trainCtl("UW-SO temperature", tNumber("loss_temperature", { min: 0.01 })) : null));
+  if (T.opts.muon_family.includes(f.optimizer)) card.append(muonPanel(f));
+  if (S.meta) card.append(el("p", { class: "note", style: "margin:8px 0 0" }, `Resume continues ${S.meta.config.hidden_dims ? "[" + S.meta.config.hidden_dims.join(", ") + "]" : "the current model"} on ${String(S.meta.config.file_path).split("/").pop()} from its saved weights, validating on its saved held-out rows. Its optimizer state is restored when you keep ${S.meta.config.optimizer_choice || "the same optimizer"}.`));
+  card.append(el("p", { class: "note", style: "margin:8px 0 0" }, "Exact duplicate rows are removed, and validation rows never share an input combination with training rows; scalings are fitted on training rows only."));
+  const busy = ["preparing", "training", "stopping"].includes(T.st?.state);
+  card.append(el("div", { class: "row-flex", style: "margin-top:12px" },
+    el("button", { class: "primary", disabled: busy || !T.preview, onclick: startTraining }, busy ? "Training…" : "Start training"),
+    el("button", { disabled: busy || !S.meta, onclick: resumeTraining, title: "Continue training the current model (its architecture, columns and held-out validation rows are kept); only the Training options above apply" }, "Resume current model"),
+    el("span", { class: "note", style: "margin:0" }, `Writes model.pt and config.json in ${T.opts.cwd} (replacing any existing ones), exactly like the CLI. ` +
+      (f.val_mode === "none" ? "Without validation the model is saved only when training stops." : "The best validation checkpoint is kept."))));
+  return card;
+}
+function updateSummary() { drawArch(); }
+
+// Every Muon-family option the CLI asks for; defaults come from the server (the CLI's own defaults)
+const MUON_LABELS = { momentum: "Muon momentum", weight_decay: "Weight decay", rank: "Rank (0 = full)", newton_schulz_iter: "Orthogonalization iterations",
+  foreach: "Batched optimizer updates", ns_bfloat16: "BF16 matrix iterations", cautious: "Cautious updates", muon_all: "MuonAll (all parameters)",
+  muon_all_reshape: "MuonAll: near-square reshape", orthogonalization_backend: "Orthogonalization backend", adam_betas: "AdamW fallback betas",
+  adam_eps: "AdamW fallback epsilon", adam_lr_ratio: "AdamW LR ÷ main LR", eps: "Epsilon", nesterov: "Nesterov", beta2: "Beta2",
+  gamma: "Gradient norm cap (γ)", v0: "Initial norm accumulator (v0)", rho: "Averaging decay (ρ)", delta: "Denominator stabilizer (δ)", min_step: "Minimum step (0 = off)" };
+function muonPanel(f) {
+  const defs = T.opts.muon_defaults[f.optimizer] || {}, cur = k => f.optim_params[k] ?? defs[k];
+  const set = (k, v) => { const o = { ...f.optim_params }; if (JSON.stringify(v) === JSON.stringify(defs[k])) delete o[k]; else o[k] = v; f.optim_params = o; saveForm(); };
+  const fkey = k => "train:muon:" + k;
+  const fields = Object.entries(defs).map(([k, d]) => {
+    const lab = MUON_LABELS[k] || k;
+    if (typeof d === "boolean") return el("label", { class: "ctl check" }, el("input", { type: "checkbox", "data-fkey": fkey(k), checked: !!cur(k), onchange: e => set(k, e.target.checked) }), lab);
+    if (k === "orthogonalization_backend") return trainCtl(lab, el("select", { "data-fkey": fkey(k), onchange: e => set(k, e.target.value) },
+      [["polar_express", "Polar Express"], ["newton_schulz", "Newton–Schulz"]].map(([v, t]) => el("option", { value: v, selected: v === cur(k) }, t))));
+    if (Array.isArray(d)) return trainCtl(lab, el("span", { class: "row-flex" }, ...d.map((_, i) => el("input", { type: "number", step: 0.001, style: "width:84px", "data-fkey": fkey(k) + i, value: cur(k)[i],
+      onchange: e => { const b = [...cur(k)]; b[i] = +e.target.value; set(k, b); } }))));
+    const step = Number.isInteger(d) && !String(d).includes(".") && !/eps|delta|min_step|ratio|decay|gamma|v0|rho|beta|momentum/.test(k) ? 1 : niceStep(Math.abs(d) / 10 || 0.001);
+    return trainCtl(lab, el("input", { type: "number", step, "data-fkey": fkey(k), value: cur(k), onchange: e => { if (e.target.value !== "") set(k, step === 1 ? Math.round(+e.target.value) : +e.target.value); } }));
+  });
+  const changed = Object.keys(f.optim_params).filter(k => k in defs).length;
+  return el("details", { open: changed > 0 }, el("summary", {}, `${f.optimizer} options (CLI defaults${changed ? `; ${changed} changed` : ""})`),
+    el("div", { class: "form-grid", style: "margin-top:6px" }, ...fields),
+    changed ? el("button", { style: "margin-top:8px", onclick: () => { f.optim_params = {}; saveForm(); renderTrain(); } }, "Reset to defaults") : null);
+}
+
+async function resumeTraining() {
+  const f = F();
+  const spec = { resume: true, optimizer: f.optimizer, lr: f.lr, batch_size: f.batch_size, optim_params: f.optim_params,
+                 val_interval: f.val_interval, loss_balancing: f.loss_balancing, loss_temperature: f.loss_temperature };
+  try {
+    T.st = await api("/api/train/start", spec); T.since = 0; T.steps = []; T.losses = []; T.tasks = {}; T.fitSaves = -1; T.fit = null;
+    renderTrain();
+  } catch (e) { toast("Cannot resume: " + e.message); }
+}
+async function startTraining() {
+  const f = F();
+  const spec = { ...structuredClone(f), columns: Object.fromEntries(T.preview.columns.map(c => [c.name, f.columns[c.name] ?? "i"])), delimiter: T.preview.delimiter };
+  try {
+    T.st = await api("/api/train/start", spec); T.since = 0; T.steps = []; T.losses = []; T.tasks = {}; T.fitSaves = -1; T.fit = null;
+    renderTrain();
+  } catch (e) { toast("Cannot start: " + e.message); }
+}
+
+function monitorCard() {
+  const st = T.st || { state: "idle" }, busy = ["preparing", "training", "stopping"].includes(st.state);
+  const card = el("div", { class: "card" }, el("h2", {}, el("span", { class: "grow" }, "Training monitor"), el("span", { class: "state " + st.state, id: "trainState" }, st.state)));
+  card.append(el("div", { id: "trainStats" }));
+  const c = new Chart(card, { height: 300, title: "Loss", sub: "raw (faint), smoothed, validation (dots = new best saved)" });
+  T.lossChart = c;
+  card.append(el("div", { class: "row-flex", style: "margin-top:6px" },
+    el("label", { class: "ctl check" }, el("input", { type: "checkbox", checked: T.logY, onchange: e => { T.logY = e.target.checked; store.set("logY", T.logY); drawMonitor(); } }), "log scale"),
+    el("label", { class: "ctl check" }, "smoothing", el("input", { type: "range", min: 0, max: 0.995, step: 0.005, value: T.smooth, oninput: e => { T.smooth = +e.target.value; store.set("smooth", T.smooth); drawMonitor(); } })),
+    el("span", { class: "spacer", style: "flex:1" }),
+    el("button", { disabled: !busy || st.state === "stopping", onclick: async () => { T.st = await api("/api/train/stop"); drawMonitor(); }, title: "Stops after the current step; the best checkpoint is kept (same as Ctrl+C)" }, "Stop"),
+    el("button", { class: "primary", id: "exploreBtn", disabled: !S.meta, onclick: () => showPage("explore") }, "Explore model →")));
+  const tc = el("div", { id: "taskChartBox", hidden: !Object.keys(T.tasks).length }); card.append(tc);
+  T.taskChart = new Chart(tc, { height: 220, title: "Per-output loss", sub: "each output relative to a trivial predictor (1.0 = no better than guessing), smoothed" });
+  if (st.error) card.append(el("p", { class: "warn", style: "white-space:pre-wrap" }, st.error));
+  return card;
+}
+function ema(values, a) { const out = new Array(values.length); let m = null, k = 0; for (let i = 0; i < values.length; i++) { const v = values[i]; if (!Number.isFinite(v)) { out[i] = m; continue; } k++; m = m == null ? v : a * m + (1 - a) * v; out[i] = m / 1; } return out; }
+function decimate(xs, ys, maxN = 1500) {
+  if (xs.length <= maxN) return [xs, ys];
+  const k = Math.ceil(xs.length / maxN), ox = [], oy = [];
+  for (let i = 0; i < xs.length; i += k) { let s = 0, n = 0; for (let j = i; j < Math.min(i + k, xs.length); j++) if (Number.isFinite(ys[j])) { s += ys[j]; n++; } ox.push(xs[Math.min(i + k, xs.length) - 1]); oy.push(n ? s / n : null); }
+  return [ox, oy];
+}
+function drawMonitor() { keepScroll(drawMonitorNow); }
+function drawMonitorNow() {
+  const st = T.st || { state: "idle" };
+  const stEl = $("#trainState"); if (stEl) { stEl.className = "state " + st.state; stEl.textContent = st.state; }
+  const stats = $("#trainStats");
+  if (stats) {
+    const last = T.losses.length ? T.losses[T.losses.length - 1] : null, sm = T.losses.length ? ema(T.losses, T.smooth).at(-1) : null;
+    const best = st.vals?.length ? Math.min(...st.vals.map(v => v[1])) : null, speed = st.elapsed > 0 ? (st.total / st.elapsed) : 0;
+    const ppl = st.last?.ppl ? Object.entries(st.last.ppl).map(([k, v]) => `${k} ${fmt(v, 3)}`).join(", ") : null;
+    stats.replaceChildren(kv("step", `${(st.total ?? 0).toLocaleString()}${st.last?.epoch != null ? ` · epoch ${st.last.epoch}` : ""}`, "elapsed", `${fmtTime(st.elapsed || 0)} · ${speed.toFixed(1)} steps/s`,
+      "loss (last / smoothed)", `${fmt(last)} / ${fmt(sm)}`, "best validation", best == null ? "–" : `${fmt(best)} · ${st.saves} checkpoint${st.saves === 1 ? "" : "s"} saved`,
+      ...(st.last?.lr != null ? ["learning rate", fmt(st.last.lr)] : []), ...(ppl ? ["perplexity", ppl] : []),
+      ...(st.summary ? ["data", `${st.summary.rows.toLocaleString()} training rows → ${st.summary.inputs.length} inputs, ${st.summary.outputs.length} outputs · validation: ${st.summary.validation}`,
+                        ...(st.summary.resumed ? ["run", "resumed from the saved model"] : []),
+                        "cleaning", `${st.summary.duplicates_removed} duplicate rows removed` + (st.summary.val_overlap_removed ? ` · ${st.summary.val_overlap_removed} validation rows dropped (inputs also in training)` : "")] : [])));
+  }
+  const c = T.lossChart; if (!c || !c.canvas.isConnected) return;
+  if (!T.losses.length && !st.vals?.length) { const ctx = c.setup(); ctx.fillStyle = css("--muted"); ctx.font = "12px system-ui"; ctx.textAlign = "center"; ctx.fillText(st.state === "preparing" ? "preparing data…" : "no training yet", c.w / 2, c.height / 2); c.hover = null; return; }
+  const tf = v => v == null ? null : (T.logY ? (v > 0 ? Math.log10(v) : null) : v);
+  const [dx, dy] = decimate(T.steps, T.losses);
+  const [sx, sy] = decimate(T.steps, ema(T.losses, T.smooth));
+  const pal = series();
+  // one x grid: the smoothed/raw series share dx (same decimation); validation drawn as points
+  const lines = [{ name: "loss", y: dy.map(tf), color: pal[0], width: 1, alpha: 0.3 }, { name: "smoothed", y: sy.map(tf), color: pal[0], width: 2, highlight: true }];
+  const vals = st.vals || [];
+  const allY = lines.flatMap(l => l.y).concat(vals.map(v => tf(v[1])));
+  const f = drawLine(c, { x: dx.length ? dx : vals.map(v => v[0]), lines: dx.length ? lines : [], xLabel: "step", yLabel: T.logY ? "log10 loss" : "loss", yRange: extent([allY]) });
+  const ctx = c.ctx;
+  const decorate = () => {
+    if (!vals.length) return;
+    ctx.save(); ctx.strokeStyle = pal[1]; ctx.lineWidth = 2; ctx.beginPath();
+    vals.forEach((v, i) => { const x = f.sx(v[0]), y = f.sy(tf(v[1])); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); }); ctx.stroke();
+    for (const v of vals) { ctx.fillStyle = v[2] ? pal[1] : css("--surface"); ctx.strokeStyle = pal[1]; ctx.beginPath(); ctx.arc(f.sx(v[0]), f.sy(tf(v[1])), 4, 0, 7); ctx.fill(); ctx.stroke(); }
+    ctx.restore();
+  };
+  decorate();
+  const base = c.redrawOverlay; c.redrawOverlay = p => { base(p); decorate(); };
+  const baseHover = c.hover;
+  c.hover = (mx, my) => {
+    for (const v of vals) { const dx2 = f.sx(v[0]) - mx, dy2 = f.sy(tf(v[1])) - my; if (dx2 * dx2 + dy2 * dy2 < 49) return `validation @ step ${v[0]}<br><b>${fmt(v[1])}</b>${v[2] ? "<br>new best → model.pt saved" : ""}`; }
+    return baseHover(mx, my);
+  };
+  c.legend([["loss (raw)", pal[0]], ["smoothed", pal[0]], ["validation", pal[1]]]);
+  drawTasks();
+}
+function drawTasks() {
+  const box = $("#taskChartBox"), c = T.taskChart, cols = Object.keys(T.tasks);
+  if (!box || !c || !cols.length) return;
+  box.hidden = false;
+  const pal = series(), tf = v => v == null ? null : (T.logY ? (v > 0 ? Math.log10(v) : null) : v);
+  let xs = null;
+  const lines = cols.slice(0, 8).map((col, i) => {
+    const [dx, dy] = decimate(T.steps, ema(T.tasks[col].map(v => v ?? NaN), T.smooth)); xs = dx;
+    return { name: col, y: dy.map(tf), color: pal[i], width: 2, highlight: true };
+  });
+  drawLine(c, { x: xs, lines, xLabel: "step", yLabel: T.logY ? "log10 loss ÷ baseline" : "loss ÷ baseline" });
+  c.legend(lines.map(l => [l.name, l.color]));
+}
+const fmtTime = s => s < 60 ? `${s.toFixed(0)} s` : s < 3600 ? `${Math.floor(s / 60)} min ${Math.floor(s % 60)} s` : `${Math.floor(s / 3600)} h ${Math.floor(s % 3600 / 60)} min`;
+
+function fitCard() {
+  const card = el("div", { class: "card", id: "fitCard" }, el("h2", {}, el("span", { class: "grow" }, "Fit: training vs validation"), el("span", { class: "pill", id: "fitVer" }, "")));
+  card.append(el("div", { id: "fitBody" }, el("p", { class: "note" }, "Appears after the first checkpoint is saved; refreshes on every new best model.")));
+  return card;
+}
+async function refreshFit() {
+  if (!S.meta) return;
+  try { T.fit = await api("/api/data_stats"); S.dataStats = T.fit; drawFit(); } catch (e) { T.fit = { error: e.message }; drawFit(); }
+}
+function drawFit() {
+  const body = $("#fitBody"); if (!body || !T.fit) return;
+  if (T.fit.error) { body.replaceChildren(el("p", { class: "note" }, T.fit.error)); return; }
+  $("#fitVer").textContent = `model v${T.fit.version} · ${T.fit.rows} training` + (T.fit.val_rows ? ` / ${T.fit.val_rows} validation rows` : " rows");
+  keepScroll(() => {
+    const holder = el("div"); body.replaceChildren(holder);
+    renderFit(holder, T.fit, 220);
+    if (T.fit.worst?.length) body.append(worstTable(T.fit.worst.slice(0, 10)));
+  });
+}
+// parity plots / confusion matrices, shared with the explorer's Dataset tab
+function renderFit(root, d, height = 300, laterRoot = null) {
+  const grid = el("div", { class: "grid" }); root.append(grid);
+  const jobs = [], pal = series();
+  const metricTable = (rows, hasVal) => el("table", { class: "data", style: "margin-top:4px" },
+    el("tr", {}, el("th", {}, ""), el("th", {}, "training"), hasVal ? el("th", {}, "validation (held out)") : null),
+    ...rows.map(([name, a, b]) => el("tr", {}, el("td", {}, name), el("td", {}, a), hasVal ? el("td", {}, el("b", {}, b)) : null)));
+  for (const fitm of d.fit) {
+    const card = el("div", { class: "card", style: "margin:0" }); grid.append(card);
+    const v = fitm.val;
+    if (fitm.type === "out") {
+      const chart = new Chart(card, { height, title: `${fitm.col}: predicted vs actual`, sub: v ? "blue training, orange validation; diagonal = perfect" : "diagonal = perfect" });
+      card.append(metricTable([["R²", fmt(fitm.r2, 4), v && fmt(v.r2, 4)], ["MAE", fmt(fitm.mae), v && fmt(v.mae)], ["RMSE", fmt(fitm.rmse), v && fmt(v.rmse)], ["rows", fitm.n, v && v.n]], !!v));
+      jobs.push(() => {
+        const sets = [{ name: "training", p: fitm.pred, t: fitm.true, color: pal[0], alpha: v ? 0.25 : 0.45, r: 2.2 }];
+        if (v) sets.push({ name: "validation", p: v.pred, t: v.true, color: pal[1], alpha: 0.8, r: 2.8 });
+        const ctx = chart.setup(), [lo, hi] = extent(sets.flatMap(q => [q.p, q.t]));
+        const f = chart.frame({ xlo: lo, xhi: hi, ylo: lo, yhi: hi, xLabel: "actual", yLabel: "predicted" });
+        ctx.strokeStyle = css("--muted"); ctx.setLineDash([4, 3]); ctx.beginPath(); ctx.moveTo(f.sx(lo), f.sy(lo)); ctx.lineTo(f.sx(hi), f.sy(hi)); ctx.stroke(); ctx.setLineDash([]);
+        for (const q of sets) {
+          ctx.fillStyle = q.color; ctx.globalAlpha = q.alpha;
+          for (let i = 0; i < q.p.length; i++) { ctx.beginPath(); ctx.arc(f.sx(q.t[i]), f.sy(q.p[i]), q.r, 0, 7); ctx.fill(); }
+        }
+        ctx.globalAlpha = 1;
+        if (v) chart.legend(sets.map(q => [q.name, q.color]));
+        chart.hover = (mx, my) => {
+          let best = null, bd = 64;
+          for (const q of sets) for (let i = 0; i < q.p.length; i++) { const dx = f.sx(q.t[i]) - mx, dy = f.sy(q.p[i]) - my, dd = dx * dx + dy * dy; if (dd < bd) { bd = dd; best = [q, i]; } }
+          return best && `<span class="sw" style="background:${best[0].color}"></span>${best[0].name}<br>actual ${fmt(best[0].t[best[1]])}<br>predicted <b>${fmt(best[0].p[best[1]])}</b>`;
+        };
+      });
+    } else {
+      const cm = v || fitm, nc = fitm.labels.length;
+      const chart = new Chart(card, { title: `${fitm.col}: confusion matrix${v ? " (validation)" : ""}`, sub: "rows actual, columns predicted" });
+      card.append(metricTable([["accuracy", `${(fitm.accuracy * 100).toFixed(2)}%`, v && `${(v.accuracy * 100).toFixed(2)}%`], ["rows", fitm.n, v && v.n]], !!v));
+      jobs.push(() => {
+        const z = new Float32Array(nc * nc), seq = seqScale();
+        let mx = 1; for (let a = 0; a < nc; a++) for (let p = 0; p < nc; p++) { const val = cm.confusion[a][p]; z[a * nc + p] = val; mx = Math.max(mx, val); }
+        drawHeat(chart, { z, nx: nc, ny: nc, xVals: [...Array(nc).keys()], yVals: [...Array(nc).keys()], xCats: fitm.labels, yCats: fitm.labels, xLabel: "predicted", yLabel: "actual", square: true, left: 70, yDown: true,
+          colorFn: val => seq(val / mx), valueText: (i, j, val) => `actual <b>${esc(fitm.labels[j])}</b>, predicted <b>${esc(fitm.labels[i])}</b>: ${val}` });
+      });
+    }
+  }
+  if (laterRoot) later(laterRoot, () => jobs.forEach(j => j())); else jobs.forEach(j => j());
+}
+const num = v => typeof v === "number" ? fmt(v) : (v !== "" && Number.isFinite(+v) ? fmt(+v) : v);
+function worstTable(rows) {
+  const outs = Object.keys(rows[0].targets);
+  const t = el("table", { class: "data" }, el("tr", {}, el("th", {}, ""), el("th", {}, "row"), el("th", {}, "badness"), ...outs.flatMap(o => [el("th", {}, o + " actual"), el("th", {}, o + " predicted")])));
+  for (const r of rows) t.append(el("tr", {}, el("td", {}, el("button", { onclick: () => inspectRow(r.index, r.source), title: "Open this row in the explorer" }, "Inspect")), el("td", {}, r.index + 1), el("td", {}, fmt(r.score, 3)),
+    ...outs.flatMap(o => [el("td", {}, num(r.targets[o])), el("td", {}, num(r.preds[o]))])));
+  return el("div", {}, el("h2", { style: "margin-top:12px" }, rows[0].source === "validation" ? "Worst-fit validation rows (held out)" : "Worst-fit training rows"), el("p", { class: "note" }, "Normalized error summed over outputs (numeric: |error| ÷ training range; categorical: 1 − probability of the true class)."), el("div", { class: "scroll" }, t));
+}
+async function inspectRow(index, source = "training") {
+  try {
+    const r = await api("/api/dataset_row", { index, source });
+    S.inputs = { ...S.inputs, ...r.inputs }; S.targets = r.targets;
+    $("#rowNote").textContent = `Loaded ${source} row ${r.index + 1} of ${r.rows}; targets shown under the prediction.`;
+    syncInputs(); showPage("explore"); onInputsChanged();
+  } catch (e) { toast(e.message); }
+}
+
+async function pollTrain() {
+  clearTimeout(T.timer);
+  try {
+    const st = await api("/api/train/status", { since: T.since });
+    const prevState = T.st?.state;
+    if (st.total < T.since) { T.steps = []; T.losses = []; T.tasks = {}; T.since = 0; }  // a new run started elsewhere
+    const before = T.steps.length;
+    T.steps.push(...st.steps); T.losses.push(...st.losses); T.since = st.total; T.st = st;
+    for (const [col, vals] of Object.entries(st.tasks || {})) (T.tasks[col] ??= new Array(before).fill(null)).push(...vals);
+    if (S.page === "train") {
+      drawMonitor();
+      if (prevState && prevState !== st.state) whenNotTyping(renderTrain);
+    }
+    if ((st.saves !== T.fitSaves && st.saves > 0) || (prevState && prevState !== st.state && st.state === "done")) {
+      T.fitSaves = st.saves;
+      await poll(false);  // lets the explorer pick up the new checkpoint first
+      if (S.meta) refreshFit();
+    }
+    if (prevState && prevState !== st.state && ["done", "error"].includes(st.state)) toast(st.state === "done" ? "Training finished; best model saved." : "Training failed: " + st.error);
+  } catch (e) { /* server restarting */ }
+  const active = ["preparing", "training", "stopping"].includes(T.st?.state);
+  T.timer = setTimeout(pollTrain, active ? 1000 : 4000);
+}
+
+// ───────────────────────── boot ─────────────────────────
+async function boot() {
+  const savedTheme = store.get("theme", null); if (savedTheme) document.documentElement.dataset.theme = savedTheme;
+  $("#themeBtn").onclick = () => {
+    const dark = document.documentElement.dataset.theme ? document.documentElement.dataset.theme === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
+    document.documentElement.dataset.theme = dark ? "light" : "dark"; store.set("theme", document.documentElement.dataset.theme); showPage(S.page);
+  };
+  for (const b of $("#modes").children) b.onclick = () => showPage(b.dataset.page);
+  $("#reloadBtn").onclick = () => poll(true);
+  $("#resetBtn").onclick = resetInputs;
+  $("#pinBtn").onclick = pin;
+  $("#randRow").onclick = async () => {
+    try {
+      const r = await api("/api/dataset_row");
+      S.inputs = { ...S.inputs, ...r.inputs }; S.targets = r.targets;
+      $("#rowNote").textContent = `Loaded training row ${r.index + 1} of ${r.rows}; targets shown under the prediction.`;
+      syncInputs(); onInputsChanged();
+    } catch (e) { toast(e.message); }
+  };
+  const watch = $("#watch"); watch.checked = store.get("watch", true); watch.onchange = () => store.set("watch", watch.checked);
+  let app = { has_model: false };
+  try { app = await api("/api/app"); } catch (e) { toast("Server unreachable: " + e.message); }
+  const wanted = location.hash.slice(1);
+  S.page = wanted === "train" ? "train" : TABS.some(t => t[0] === wanted) ? "explore" : (app.start_page ? "explore" : (app.has_model ? store.get("page", "explore") : "train"));
+  if (app.has_model) { try { await initExplore(); } catch (e) { toast("Could not load model: " + e.message); } }
+  showPage(S.page);
+  if (!app.has_model) $("#noModelErr").textContent = app.model_error || "";
+  pollTrain();
+  setInterval(() => { if (watch.checked) poll(false); }, 2000);
+  // Redraw for real width changes only. Mobile Chrome fires resize when the on-screen keyboard or the
+  // address bar appears (height only); rebuilding then destroys the tapped field and closes the keyboard.
+  let rw, lastW = innerWidth;
+  const relayout = () => { if (innerWidth !== lastW) whenNotTyping(() => { lastW = innerWidth; showPage(S.page); }); };
+  addEventListener("resize", () => { clearTimeout(rw); rw = setTimeout(relayout, 150); });
+}
+boot();
+</script>
+</body>
+</html>

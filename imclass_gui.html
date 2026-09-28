@@ -1,0 +1,1294 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ImClass Studio</title>
+<style>
+:root {
+  color-scheme: light;
+  --bg: #f4f3f0; --surface: #fcfcfb; --surface-2: #f0efec; --border: #dddcd7;
+  --text: #0b0b0b; --text-2: #52514e; --muted: #8a8983; --grid: #e7e6e2;
+  --accent: #2a78d6; --accent-ink: #ffffff; --danger: #c93c3b; --good: #008300;
+  --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s4: #eda100; --s5: #e87ba4; --s6: #008300; --s7: #4a3aa7; --s8: #e34948;
+  --div-neg: #1c5cab; --div-mid: #f0efec; --div-pos: #b7302f;
+  --seq: #cde2fb,#9ec5f4,#6da7ec,#3987e5,#256abf,#184f95,#0d366b;
+  --other: #b9b8b2;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg: #121211; --surface: #1a1a19; --surface-2: #242422; --border: #34342f;
+    --text: #ffffff; --text-2: #c3c2b7; --muted: #8f8e86; --grid: #2c2c29;
+    --accent: #3987e5; --accent-ink: #ffffff; --danger: #e66767; --good: #3fae3f;
+    --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #d55181; --s6: #008300; --s7: #9085e9; --s8: #e66767;
+    --div-neg: #5598e7; --div-mid: #383835; --div-pos: #e66767;
+    --seq: #0d366b,#104281,#1c5cab,#2a78d6,#5598e7,#86b6ef,#cde2fb;
+    --other: #5c5b56;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #121211; --surface: #1a1a19; --surface-2: #242422; --border: #34342f;
+  --text: #ffffff; --text-2: #c3c2b7; --muted: #8f8e86; --grid: #2c2c29;
+  --accent: #3987e5; --accent-ink: #ffffff; --danger: #e66767; --good: #3fae3f;
+  --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #d55181; --s6: #008300; --s7: #9085e9; --s8: #e66767;
+  --div-neg: #5598e7; --div-mid: #383835; --div-pos: #e66767;
+  --seq: #0d366b,#104281,#1c5cab,#2a78d6,#5598e7,#86b6ef,#cde2fb;
+  --other: #5c5b56;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+body { background: var(--bg); color: var(--text); font: 13px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+header { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 10px 16px; background: var(--surface); border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 5; }
+header h1 { font-size: 15px; margin: 0; font-weight: 650; }
+header .meta { color: var(--text-2); font-size: 12px; }
+header .spacer { flex: 1; }
+.status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--good); margin-right: 6px; }
+.status-dot.err { background: var(--danger); }
+.layout { display: grid; grid-template-columns: 330px minmax(0, 1fr); gap: 14px; padding: 14px 16px; align-items: start; }
+@media (max-width: 860px) { .layout { grid-template-columns: minmax(0, 1fr); } }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 12px; margin-bottom: 14px; min-width: 0; }
+.card h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--text-2); margin: 0 0 10px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+.card h2 .grow { flex: 1; }
+.field { margin-bottom: 10px; }
+.field label { display: flex; justify-content: space-between; gap: 8px; font-weight: 550; margin-bottom: 3px; }
+.field label .hint { color: var(--muted); font-weight: 400; font-size: 11px; }
+.field .row { display: flex; gap: 8px; align-items: center; }
+.field input[type=range] { flex: 1; min-width: 0; accent-color: var(--accent); }
+input[type=number], input[type=text], select { background: var(--surface-2); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 4px 6px; font: inherit; min-width: 0; }
+input[type=number] { width: 92px; }
+.field select, .field input[type=text] { width: 100%; }
+.field.out-of-range input[type=number] { border-color: var(--s4); }
+button { background: var(--surface-2); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 5px 10px; font: inherit; cursor: pointer; }
+button:hover { border-color: var(--muted); }
+button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+.btns { display: flex; gap: 6px; flex-wrap: wrap; }
+.outputs .out { padding: 8px 0; border-top: 1px solid var(--grid); }
+.outputs .out:first-child { border-top: 0; padding-top: 0; }
+.outputs .name { color: var(--text-2); font-size: 12px; }
+.outputs .value { font-size: 20px; font-weight: 650; font-variant-numeric: tabular-nums; word-break: break-all; }
+.outputs .target { color: var(--text-2); font-size: 12px; }
+.probrow { display: grid; grid-template-columns: minmax(0, 90px) 1fr 48px; gap: 6px; align-items: center; font-size: 12px; margin-top: 3px; }
+.probrow .lab { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-2); }
+.probrow .bar { height: 8px; background: var(--surface-2); border-radius: 4px; overflow: hidden; }
+.probrow .bar > div { height: 100%; background: var(--s1); border-radius: 4px; }
+.probrow .num { text-align: right; font-variant-numeric: tabular-nums; }
+.tabs { display: flex; gap: 2px; flex-wrap: wrap; border-bottom: 1px solid var(--border); margin-bottom: 14px; }
+.tabs button { border: 0; border-bottom: 2px solid transparent; border-radius: 0; background: none; padding: 8px 12px; color: var(--text-2); }
+.tabs button.active { color: var(--text); border-bottom-color: var(--accent); font-weight: 600; }
+.controls { display: flex; gap: 12px; flex-wrap: wrap; align-items: end; margin-bottom: 12px; }
+.controls .ctl { display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: var(--text-2); }
+.controls .ctl.check { flex-direction: row; align-items: center; gap: 6px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 12px; }
+.chart { position: relative; min-width: 0; }
+.chart canvas { display: block; width: 100%; }
+.chart .title { font-weight: 600; font-size: 12px; margin-bottom: 4px; display: flex; flex-wrap: wrap; gap: 0 8px; align-items: baseline; }
+.chart .title .sub { color: var(--muted); font-weight: 400; }
+.tooltip { position: fixed; pointer-events: none; background: var(--surface); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; font-size: 12px; box-shadow: 0 4px 14px rgba(0,0,0,.15); z-index: 50; display: none; max-width: 320px; font-variant-numeric: tabular-nums; }
+.tooltip .sw { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 12px; color: var(--text-2); margin: 4px 0; }
+.legend .sw { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+.note { color: var(--text-2); font-size: 12px; margin: 0 0 10px; }
+.muted { color: var(--muted); }
+table.data { border-collapse: collapse; width: 100%; font-size: 12px; font-variant-numeric: tabular-nums; }
+table.data th, table.data td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+table.data th { color: var(--text-2); font-weight: 600; }
+.scroll { overflow-x: auto; }
+.strip-row { display: grid; grid-template-columns: 120px minmax(0, 1fr); gap: 8px; align-items: center; margin-bottom: 6px; }
+.strip-row .lab { font-size: 12px; color: var(--text-2); }
+.strip-row .lab b { color: var(--text); font-weight: 600; }
+.two { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; }
+@media (max-width: 1100px) { .two { grid-template-columns: minmax(0, 1fr); } }
+.kv { display: grid; grid-template-columns: auto 1fr; gap: 2px 12px; font-size: 12px; font-variant-numeric: tabular-nums; }
+.kv div:nth-child(odd) { color: var(--text-2); }
+.toast { position: fixed; bottom: 16px; right: 16px; background: var(--danger); color: #fff; padding: 8px 12px; border-radius: 8px; max-width: min(520px, calc(100vw - 32px)); display: none; z-index: 60; white-space: pre-wrap; }
+.empty { color: var(--muted); padding: 24px; text-align: center; }
+.modes { display: flex; gap: 2px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; padding: 2px; }
+.modes button { border: 0; background: none; padding: 4px 14px; border-radius: 6px; color: var(--text-2); }
+.modes button.active { background: var(--surface); color: var(--text); font-weight: 600; box-shadow: 0 1px 2px rgba(0,0,0,.12); }
+[hidden] { display: none !important; }
+.train-grid { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); gap: 14px; padding: 14px 16px; align-items: start; }
+@media (max-width: 1150px) { .train-grid { grid-template-columns: minmax(0, 1fr); } }
+.form-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 10px 12px; }
+.form-grid .ctl, .controls .ctl { min-width: 0; }
+.form-grid select, .form-grid input[type=number], .form-grid input[type=text] { width: 100%; }
+.row-flex { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.row-flex input[type=text] { flex: 1; min-width: 160px; }
+.browser { border: 1px solid var(--border); border-radius: 8px; margin-top: 8px; max-height: 260px; overflow: auto; }
+.browser .item { padding: 4px 10px; cursor: pointer; display: flex; justify-content: space-between; gap: 8px; }
+.browser .item:hover { background: var(--surface-2); }
+.browser .path { padding: 6px 10px; font-size: 12px; color: var(--text-2); border-bottom: 1px solid var(--grid); position: sticky; top: 0; background: var(--surface); word-break: break-all; }
+table.cols td, table.cols th { padding: 3px 6px; }
+table.cols tr.sel td { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+table.cols td.name { cursor: pointer; font-weight: 550; user-select: none; }
+table.cols select { max-width: 190px; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.chip { display: flex; align-items: center; gap: 2px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; padding: 2px 4px 2px 8px; font-size: 12px; }
+.chip input { width: 64px; border: 0; background: transparent; padding: 2px; }
+.chip button { border: 0; background: none; padding: 0 4px; color: var(--muted); }
+.warn { color: var(--danger); font-size: 12px; }
+.state { font-size: 11px; font-weight: 650; text-transform: uppercase; letter-spacing: .05em; padding: 2px 8px; border-radius: 10px; border: 1px solid var(--border); background: var(--surface-2); }
+.state.training, .state.preparing { color: var(--accent); border-color: var(--accent); }
+.state.error { color: var(--danger); border-color: var(--danger); }
+.state.done { color: var(--good); border-color: var(--good); }
+details summary { cursor: pointer; color: var(--text-2); font-size: 12px; margin: 6px 0; }
+.nethead { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 12px 32px; font-size: 12px; }
+.netlegend { display: grid; grid-template-columns: repeat(2, auto); gap: 2px 18px; align-content: start; }
+.netlegend .lg-title { grid-column: span 2; }
+.lg-title { color: var(--text-2); font-weight: 600; text-transform: uppercase; letter-spacing: .05em; font-size: 11px; margin: 2px 0; }
+.lg-row { display: flex; align-items: center; gap: 6px; font-variant-numeric: tabular-nums; }
+.lg-row .ln { display: inline-block; width: 34px; }
+.lg-row .sw { display: inline-block; width: 12px; height: 8px; border-radius: 2px; }
+.layout > aside, .layout > main { min-width: 0; }  /* let wide content (the diagram) scroll instead of widening the page */
+.diagram-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+.diagram-scroll .chart { width: max-content; min-width: 100%; }
+.pill { font-size: 11px; padding: 1px 7px; border-radius: 10px; background: var(--surface-2); border: 1px solid var(--border); color: var(--text-2); }
+.modes { display: flex; gap: 2px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; padding: 2px; }
+.modes button { border: 0; background: none; padding: 4px 14px; border-radius: 6px; color: var(--text-2); }
+.modes button.active { background: var(--surface); color: var(--text); font-weight: 600; box-shadow: 0 1px 2px rgba(0,0,0,.12); }
+[hidden] { display: none !important; }
+.page { padding: 14px 16px; }
+.layout { padding: 0; }
+.layout > aside, .layout > main { min-width: 0; }
+.row-flex { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.form-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 10px 12px; }
+.form-grid select, .form-grid input[type=number], .form-grid input[type=text] { width: 100%; }
+.train-grid { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr); gap: 14px; align-items: start; }
+@media (max-width: 1100px) { .train-grid { grid-template-columns: minmax(0, 1fr); } }
+.browser { border: 1px solid var(--border); border-radius: 8px; max-height: 280px; overflow: auto; }
+.browser .item { padding: 4px 10px; cursor: pointer; display: flex; justify-content: space-between; gap: 8px; }
+.browser .item:hover { background: var(--surface-2); }
+.browser .path { padding: 6px 10px; font-size: 12px; color: var(--text-2); border-bottom: 1px solid var(--grid); position: sticky; top: 0; background: var(--surface); word-break: break-all; }
+.fb { margin-top: 8px; }
+.warn { color: var(--danger); font-size: 12px; }
+.warnpill { color: var(--danger); border-color: var(--danger); }
+.state { font-size: 11px; font-weight: 650; text-transform: uppercase; letter-spacing: .05em; padding: 2px 8px; border-radius: 10px; border: 1px solid var(--border); background: var(--surface-2); }
+.state.training, .state.preparing { color: var(--accent); border-color: var(--accent); }
+.state.error { color: var(--danger); border-color: var(--danger); }
+.state.done, .state.stopped { color: var(--good); border-color: var(--good); }
+details summary { cursor: pointer; color: var(--text-2); font-size: 12px; margin: 6px 0; }
+.progress { height: 6px; background: var(--surface-2); border-radius: 3px; overflow: hidden; margin: 8px 0; }
+.progress > div { height: 100%; width: 0; background: var(--accent); transition: width .5s; }
+.dslayout { display: grid; grid-template-columns: 300px minmax(0, 1fr); gap: 14px; align-items: start; }
+@media (max-width: 860px) { .dslayout { grid-template-columns: minmax(0, 1fr); } }
+.classrow { display: grid; grid-template-columns: 12px minmax(0, 1fr) auto 18px auto auto; gap: 6px; align-items: center; margin-bottom: 4px; }
+.classrow .sw { width: 12px; height: 12px; border-radius: 3px; }
+.classrow .classname { width: 100%; }
+.classrow button { padding: 2px 7px; }
+.key { font-size: 11px; color: var(--muted); border: 1px solid var(--border); border-radius: 4px; text-align: center; }
+.toolbar { gap: 6px; }
+.dsgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(var(--thumb, 112px), 1fr)); gap: 6px; }
+.dstile { position: relative; border: 2px solid transparent; border-radius: 8px; overflow: hidden; background: var(--surface-2); cursor: pointer; aspect-ratio: 1; user-select: none; }
+.dstile img { width: 100%; height: 100%; object-fit: cover; display: block; image-rendering: auto; }
+.dstile.sel { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent); }
+.dstile.sel::after { content: "✓"; position: absolute; top: 4px; right: 6px; color: #fff; background: var(--accent); border-radius: 10px; width: 20px; height: 20px; text-align: center; font-size: 13px; line-height: 20px; }
+.dstile.missing { opacity: .45; outline: 2px dashed var(--danger); }
+.dslabel { position: absolute; left: 0; right: 0; bottom: 0; font-size: 11px; padding: 2px 5px; color: #fff; background: rgba(0,0,0,.45); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dsdup { position: absolute; top: 4px; left: 4px; font-size: 10px; background: var(--danger); color: #fff; padding: 1px 5px; border-radius: 6px; }
+.classbars .probrow { grid-template-columns: minmax(0, 120px) 1fr 56px; }
+.probrow { display: grid; grid-template-columns: minmax(0, 110px) 1fr 52px; gap: 6px; align-items: center; font-size: 12px; margin-top: 3px; padding: 1px 3px; border-radius: 4px; }
+.probrow.sel { background: var(--surface-2); outline: 1px solid var(--border); }
+.probrow .lab { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-2); }
+.probrow .bar { height: 8px; background: var(--surface-2); border-radius: 4px; overflow: hidden; }
+.probrow .bar > div { height: 100%; border-radius: 4px; }
+.probrow .num { text-align: right; font-variant-numeric: tabular-nums; }
+.value { font-size: 22px; font-weight: 650; }
+.auggrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 2px 10px; }
+.samples { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.sample { display: flex; flex-direction: column; align-items: center; font-size: 10px; max-width: 120px; }
+.sample img { width: 96px; height: 96px; object-fit: cover; border-radius: 6px; background: var(--surface-2); }
+.sample span { color: #fff; background: var(--text-2); padding: 0 5px; border-radius: 4px; margin-top: 2px; max-width: 110px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pix { image-rendering: pixelated; }
+.probe { display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-start; }
+.mapgrid { display: grid; gap: 6px; margin-top: 6px; }
+.tile { cursor: pointer; text-align: center; }
+.tilecv { width: 100%; aspect-ratio: 1; image-rendering: pixelated; border-radius: 4px; background: var(--surface-2); display: block; }
+.tilelab { font-size: 10px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#unitBig .tilecv { max-width: 320px; }
+.drop { border: 2px dashed var(--border); border-radius: 8px; min-height: 120px; display: flex; align-items: center; justify-content: center; margin-top: 8px; padding: 6px; text-align: center; }
+.drop.over { border-color: var(--accent); }
+.drop img { max-width: 100%; max-height: 220px; }
+.dreamimg { width: 256px; height: 256px; background: var(--surface-2); border-radius: 8px; object-fit: contain; }
+.modal { position: fixed; inset: 0; background: rgba(0,0,0,.45); display: flex; align-items: center; justify-content: center; z-index: 40; padding: 16px; }
+.modal .card { max-width: 100%; }
+.sketch { width: min(280px, 80vw); height: min(280px, 80vw); border: 1px solid var(--border); border-radius: 6px; touch-action: none; cursor: crosshair; background: #fff; }
+canvas { max-width: 100%; }
+</style>
+</head>
+<body>
+<header>
+  <h1>ImClass Studio</h1>
+  <nav class="modes" id="modes"><button data-page="dataset">Dataset</button><button data-page="train">Train</button><button data-page="explore">Explore</button></nav>
+  <span class="meta" id="deviceInfo"></span>
+  <span class="spacer"></span>
+  <button id="themeBtn" title="Toggle light / dark">Theme</button>
+</header>
+<div id="datasetPage" class="page" hidden></div>
+<div id="trainPage" class="page" hidden></div>
+<div id="explorePage" class="page" hidden></div>
+<div class="tooltip" id="tooltip"></div>
+<div class="toast" id="toast"></div>
+<script>
+"use strict";
+// ───────────────────────── utilities ─────────────────────────
+const $ = (sel, root = document) => root.querySelector(sel);
+const el = (tag, attrs = {}, ...kids) => {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === "class") e.className = v;
+    else if (k === "style") e.style.cssText = v;
+    else if (k.startsWith("on")) e.addEventListener(k.slice(2), v);
+    else if (v !== false && v != null) e.setAttribute(k, v === true ? "" : v);
+  }
+  for (const k of kids.flat()) if (k != null) e.append(k.nodeType ? k : document.createTextNode(k));
+  return e;
+};
+const css = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+function fmt(v, digits = 4) {
+  if (v == null || Number.isNaN(v)) return "–";
+  if (typeof v !== "number") return String(v);
+  const a = Math.abs(v);
+  if (a !== 0 && (a >= 1e5 || a < 1e-3)) return v.toExponential(2);
+  return Number(v.toPrecision(digits)).toString();
+}
+function b64f32(s) {
+  const bin = atob(s), buf = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
+  return new Float32Array(buf.buffer);
+}
+const kv = (...pairs) => el("div", { class: "kv" }, pairs.map(p => el("div", {}, p)));
+// Rebuilding a section and then measuring it (charts read their width) forces a reflow while the page is
+// briefly shorter. Firefox clamps the scroll position right then, so the view jumps up. Keep the page at
+// least as tall as it was until the rebuild is drawn, and restore the scroll position.
+// 1-2-5 step near x, so arrow keys / spinners move number fields by a sensible amount
+function niceStep(x) {
+  if (!(x > 0) || !Number.isFinite(x)) return 1;
+  const m = Math.pow(10, Math.floor(Math.log10(x))), f = x / m;
+  return (f < 1.5 ? 1 : f < 3.5 ? 2 : f < 7.5 ? 5 : 10) * m;
+}
+function keepScroll(fn) {
+  const y = window.scrollY, body = document.body;
+  // controls carry data-fkey; a rebuild replaces them, so give focus back to the new twin
+  const act = document.activeElement, fkey = act && act.dataset ? act.dataset.fkey : null;
+  body.style.minHeight = document.documentElement.scrollHeight + "px";
+  try { return fn(); } finally {
+    if (fkey && !act.isConnected) {
+      const twin = document.querySelector(`[data-fkey="${CSS.escape(fkey)}"]`);
+      if (twin) twin.focus({ preventScroll: true });
+    }
+    if (window.scrollY !== y) window.scrollTo(0, y);
+    requestAnimationFrame(() => { body.style.minHeight = ""; });
+  }
+}
+// Run fn now, or after the user leaves the form field they are typing in (rebuilding would destroy it).
+function whenNotTyping(fn) {
+  const a = document.activeElement;
+  if (a && /^(INPUT|SELECT|TEXTAREA)$/.test(a.tagName) && a.isConnected) a.addEventListener("blur", () => setTimeout(fn, 0), { once: true });
+  else fn();
+}
+const debounce = (fn, ms) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; };
+function toast(msg, ok = false) { const t = $("#toast"); t.textContent = msg; t.style.background = ok ? "var(--good)" : "var(--danger)"; t.style.display = "block"; clearTimeout(toast.t); toast.t = setTimeout(() => t.style.display = "none", ok ? 4000 : 7000); }
+async function api(path, body = {}) {
+  const r = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const j = await r.json().catch(() => ({ error: `HTTP ${r.status}` }));
+  if (!r.ok || j.error) throw new Error(j.error || `HTTP ${r.status}`);
+  return j;
+}
+const store = {
+  get(k, d) { try { const v = localStorage.getItem("imclass." + k); return v == null ? d : JSON.parse(v); } catch { return d; } },
+  set(k, v) { try { localStorage.setItem("imclass." + k, JSON.stringify(v)); } catch { /* storage unavailable */ } },
+};
+const series = () => ["--s1", "--s2", "--s3", "--s4", "--s5", "--s6", "--s7", "--s8"].map(css);
+
+// ───────────────────────── color scales ─────────────────────────
+const hex2rgb = h => { h = h.replace("#", ""); return [0, 2, 4].map(i => parseInt(h.slice(i, i + 2), 16)); };
+const mix = (a, b, t) => a.map((x, i) => Math.round(x + (b[i] - x) * t));
+function seqScale() {
+  const stops = css("--seq").split(",").map(s => hex2rgb(s.trim()));
+  return t => {
+    t = Math.min(1, Math.max(0, Number.isFinite(t) ? t : 0)) * (stops.length - 1);
+    const i = Math.min(stops.length - 2, Math.floor(t));
+    return mix(stops[i], stops[i + 1], t - i);
+  };
+}
+function divScale() {
+  const neg = hex2rgb(css("--div-neg")), mid = hex2rgb(css("--div-mid")), pos = hex2rgb(css("--div-pos"));
+  return t => { // t in [-1, 1]
+    if (!Number.isFinite(t)) t = 0;
+    t = Math.max(-1, Math.min(1, t));
+    return t < 0 ? mix(mid, neg, -t) : mix(mid, pos, t);
+  };
+}
+const rgb = c => `rgb(${c[0]},${c[1]},${c[2]})`;
+
+// ───────────────────────── chart primitives ─────────────────────────
+function niceTicks(lo, hi, n = 5) {
+  if (!(hi > lo)) { hi = lo + 1; }
+  const span = hi - lo, step0 = span / n, mag = Math.pow(10, Math.floor(Math.log10(step0)));
+  const step = [1, 2, 2.5, 5, 10].map(m => m * mag).find(s => span / s <= n) || 10 * mag;
+  const out = [];
+  for (let v = Math.ceil(lo / step) * step; v <= hi + step * 1e-9; v += step) out.push(Math.abs(v) < step * 1e-9 ? 0 : v);
+  return out;
+}
+const tip = $("#tooltip");
+function showTip(html, ev) {
+  if (!html) { tip.style.display = "none"; return; }
+  tip.innerHTML = html; tip.style.display = "block";
+  const r = tip.getBoundingClientRect();
+  let x = ev.clientX + 14, y = ev.clientY + 14;
+  if (x + r.width > innerWidth - 8) x = ev.clientX - r.width - 14;
+  if (y + r.height > innerHeight - 8) y = ev.clientY - r.height - 14;
+  tip.style.left = Math.max(4, x) + "px"; tip.style.top = Math.max(4, y) + "px";
+}
+
+class Chart {
+  constructor(parent, { height = 240, title = "", sub = "" } = {}) {
+    this.root = el("div", { class: "chart" });
+    if (title) this.root.append(el("div", { class: "title" }, title, sub ? el("span", { class: "sub" }, sub) : null));
+    this.legendEl = el("div", { class: "legend" });
+    this.canvas = el("canvas", { role: "img", "aria-label": title || "chart" });
+    this.root.append(this.canvas, this.legendEl);
+    parent.append(this.root);
+    this.height = height; this.canvas.style.height = height + "px";
+    this.canvas.addEventListener("mousemove", ev => { if (this.hover) { const p = this.pos(ev); showTip(this.hover(p.x, p.y), ev); this.hoverAt = p; this.redrawOverlay?.(p); } });
+    this.canvas.addEventListener("mouseleave", () => { showTip(null); this.hoverAt = null; this.redrawOverlay?.(null); });
+    this.canvas.addEventListener("click", ev => { if (this.click) { const p = this.pos(ev); this.click(p.x, p.y); } });
+  }
+  pos(ev) { const r = this.canvas.getBoundingClientRect(); return { x: ev.clientX - r.left, y: ev.clientY - r.top }; }
+  setup() {
+    const dpr = window.devicePixelRatio || 1, w = Math.max(200, this.canvas.clientWidth || this.root.clientWidth || 400), h = this.height;
+    this.canvas.width = Math.round(w * dpr); this.canvas.height = Math.round(h * dpr); this.canvas.style.height = h + "px";
+    const ctx = this.canvas.getContext("2d"); ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.clearRect(0, 0, w, h);
+    this.w = w; this.ctx = ctx;
+    return ctx;
+  }
+  legend(items) {
+    this.legendEl.replaceChildren(...items.map(([name, color]) => el("span", {}, el("span", { class: "sw", style: `background:${color}` }), name)));
+  }
+  // axes frame; returns the plot box and scale helpers
+  frame({ xlo, xhi, ylo, yhi, xLabel = "", yLabel = "", xCats = null, yCats = null, left = 52, bottom = 34, yDown = false, intTicks = false }) {
+    const ctx = this.ctx, W = this.w, H = this.height;
+    const box = { l: left, r: W - 12, t: 8, b: H - bottom };
+    const sx = v => box.l + (v - xlo) / (xhi - xlo || 1) * (box.r - box.l);
+    const sy = v => yDown ? box.t + (v - ylo) / (yhi - ylo || 1) * (box.b - box.t) : box.b - (v - ylo) / (yhi - ylo || 1) * (box.b - box.t);
+    ctx.font = "11px system-ui, sans-serif"; ctx.lineWidth = 1;
+    ctx.strokeStyle = css("--grid"); ctx.fillStyle = css("--muted");
+    ctx.textAlign = "right"; ctx.textBaseline = "middle";
+    const ints = t => intTicks ? t.filter(v => Number.isInteger(v)) : t;
+    const yt = yCats ? yCats.map((_, i) => i) : ints(niceTicks(ylo, yhi, Math.max(2, Math.floor((box.b - box.t) / 38))));
+    for (const v of yt) { const y = sy(v); if (y < box.t - 1 || y > box.b + 1) continue; ctx.beginPath(); ctx.moveTo(box.l, y); ctx.lineTo(box.r, y); ctx.stroke(); ctx.fillText(yCats ? String(yCats[v]).slice(0, 8) : fmt(v, 3), box.l - 6, y); }
+    ctx.textAlign = "center"; ctx.textBaseline = "top";
+    if (xCats) {
+      const every = Math.max(1, Math.ceil(xCats.length / Math.max(1, (box.r - box.l) / 46)));
+      xCats.forEach((c, i) => { if (i % every === 0) ctx.fillText(String(c).slice(0, 10), sx(i), box.b + 6); });
+    } else {
+      for (const v of ints(niceTicks(xlo, xhi, Math.max(2, Math.floor((box.r - box.l) / 70))))) { const x = sx(v); ctx.beginPath(); ctx.moveTo(x, box.t); ctx.lineTo(x, box.b); ctx.stroke(); ctx.fillText(fmt(v, 3), x, box.b + 6); }
+    }
+    ctx.strokeStyle = css("--border"); ctx.beginPath(); ctx.moveTo(box.l, box.b + .5); ctx.lineTo(box.r, box.b + .5); ctx.stroke();
+    ctx.fillStyle = css("--text-2");
+    if (xLabel) { ctx.textBaseline = "bottom"; ctx.fillText(xLabel, (box.l + box.r) / 2, H - 1); }
+    if (yLabel) { ctx.save(); ctx.translate(11, (box.t + box.b) / 2); ctx.rotate(-Math.PI / 2); ctx.textBaseline = "middle"; ctx.fillText(String(yLabel).slice(0, 30), 0, 0); ctx.restore(); }
+    return { box, sx, sy, ix: px => xlo + (px - box.l) / (box.r - box.l) * (xhi - xlo), iy: py => ylo + (yDown ? py - box.t : box.b - py) / (box.b - box.t) * (yhi - ylo) };
+  }
+}
+
+function extent(arrs, pad = 0.06) {
+  let lo = Infinity, hi = -Infinity;
+  for (const a of arrs) for (const v of a) if (v != null && Number.isFinite(v)) { if (v < lo) lo = v; if (v > hi) hi = v; }
+  if (!Number.isFinite(lo)) return [0, 1];
+  if (hi === lo) { const d = Math.abs(lo) * 0.1 || 1; lo -= d; hi += d; }
+  const p = (hi - lo) * pad; return [lo - p, hi + p];
+}
+
+// line chart: x numeric, series [{name, y, color}], optional vline, points, click → x
+function drawLine(chart, { x, lines, xLabel, yLabel, vline = null, points = null, yRange = null, yCats = null, onClickX = null, alphaLines = false }) {
+  const ctx = chart.setup();
+  const xl = [Math.min(...x), Math.max(...x)];
+  const yr = yRange || extent(lines.map(s => s.y).concat(points ? [points.y] : []));
+  const f = chart.frame({ xlo: xl[0], xhi: xl[1], ylo: yr[0], yhi: yr[1], xLabel, yLabel, yCats });
+  const draw = hoverP => {
+    ctx.clearRect(0, 0, chart.w, chart.height);
+    chart.frame({ xlo: xl[0], xhi: xl[1], ylo: yr[0], yhi: yr[1], xLabel, yLabel, yCats });
+    ctx.save(); ctx.beginPath(); ctx.rect(f.box.l, f.box.t - 2, f.box.r - f.box.l, f.box.b - f.box.t + 4); ctx.clip();
+    if (points) {
+      ctx.fillStyle = css("--muted"); ctx.globalAlpha = 0.35;
+      for (let i = 0; i < points.x.length; i++) { ctx.beginPath(); ctx.arc(f.sx(points.x[i]), f.sy(points.y[i]), 2, 0, 7); ctx.fill(); }
+      ctx.globalAlpha = 1;
+    }
+    for (const s of lines) {
+      ctx.strokeStyle = s.color; ctx.lineWidth = s.width || 2; ctx.globalAlpha = s.alpha ?? 1; ctx.lineJoin = "round";
+      ctx.beginPath(); let started = false;
+      for (let i = 0; i < x.length; i++) { const v = s.y[i]; if (v == null || !Number.isFinite(v)) { started = false; continue; } const px = f.sx(x[i]), py = f.sy(v); started ? ctx.lineTo(px, py) : ctx.moveTo(px, py); started = true; }
+      ctx.stroke(); ctx.globalAlpha = 1;
+    }
+    if (vline != null && Number.isFinite(vline)) {
+      ctx.strokeStyle = css("--text"); ctx.setLineDash([4, 3]); ctx.lineWidth = 1.2;
+      ctx.beginPath(); ctx.moveTo(f.sx(vline), f.box.t); ctx.lineTo(f.sx(vline), f.box.b); ctx.stroke(); ctx.setLineDash([]);
+    }
+    if (hoverP && hoverP.x >= f.box.l && hoverP.x <= f.box.r) {
+      ctx.strokeStyle = css("--muted"); ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(hoverP.x, f.box.t); ctx.lineTo(hoverP.x, f.box.b); ctx.stroke();
+      const i = nearestIdx(x, f.ix(hoverP.x));
+      for (const s of lines) if (!alphaLines || s.highlight) { const v = s.y[i]; if (v == null) continue; ctx.fillStyle = s.color; ctx.strokeStyle = css("--surface"); ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(f.sx(x[i]), f.sy(v), 4.5, 0, 7); ctx.fill(); ctx.stroke(); }
+    }
+    ctx.restore();
+  };
+  draw(null);
+  chart.redrawOverlay = draw;
+  chart.hover = (mx, my) => {
+    if (mx < f.box.l || mx > f.box.r) return null;
+    const i = nearestIdx(x, f.ix(mx));
+    const shown = lines.filter(s => !alphaLines || s.highlight).slice(0, 10);
+    const rows = shown.map(s => `<div><span class="sw" style="background:${s.color}"></span>${esc(s.name)}: <b>${yCats ? esc(yCats[Math.round(s.y[i])] ?? fmt(s.y[i])) : fmt(s.y[i])}</b></div>`).join("");
+    return `<div class="muted">${esc(xLabel)} = ${fmt(x[i])}</div>${rows}${onClickX ? '<div class="muted">click to set input</div>' : ""}`;
+  };
+  chart.click = onClickX ? (mx => { if (mx >= f.box.l && mx <= f.box.r) onClickX(f.ix(mx)); }) : null;
+  return f;
+}
+function nearestIdx(arr, v) { let best = 0, bd = Infinity; for (let i = 0; i < arr.length; i++) { const d = Math.abs(arr[i] - v); if (d < bd) { bd = d; best = i; } } return best; }
+
+// categorical x: bars for one series, dot groups for several
+function drawCats(chart, { cats, lines, xLabel, yLabel, current = null, yCats = null, onClickCat = null }) {
+  const ctx = chart.setup();
+  const single = lines.length === 1;
+  const yr = extent(lines.map(s => s.y).concat(single ? [[0]] : []), 0.08);
+  if (single && yr[0] > 0) yr[0] = 0;
+  const f = chart.frame({ xlo: -0.5, xhi: cats.length - 0.5, ylo: yr[0], yhi: yr[1], xLabel, yLabel, xCats: cats, yCats });
+  const bw = Math.max(2, Math.min(40, (f.box.r - f.box.l) / cats.length - 2));
+  cats.forEach((c, i) => {
+    const cx = f.sx(i);
+    if (single) {
+      const v = lines[0].y[i], y0 = f.sy(Math.max(yr[0], 0)), y1 = f.sy(v);
+      ctx.fillStyle = lines[0].color; roundBar(ctx, cx - bw / 2, Math.min(y0, y1), bw, Math.abs(y1 - y0), v >= 0);
+      if (String(c) === String(current)) { ctx.strokeStyle = css("--text"); ctx.lineWidth = 2; ctx.strokeRect(cx - bw / 2 - 2, Math.min(y0, y1) - 2, bw + 4, Math.abs(y1 - y0) + 4); }
+    } else {
+      lines.forEach(s => { ctx.fillStyle = s.color; ctx.strokeStyle = css("--surface"); ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(cx, f.sy(s.y[i]), 4.5, 0, 7); ctx.fill(); ctx.stroke(); });
+      if (String(c) === String(current)) { ctx.strokeStyle = css("--text"); ctx.setLineDash([4, 3]); ctx.beginPath(); ctx.moveTo(cx, f.box.t); ctx.lineTo(cx, f.box.b); ctx.stroke(); ctx.setLineDash([]); }
+    }
+  });
+  const idxAt = mx => Math.round(f.ix(mx));
+  chart.redrawOverlay = null;
+  chart.hover = mx => {
+    const i = idxAt(mx); if (i < 0 || i >= cats.length) return null;
+    return `<div class="muted">${esc(xLabel)} = ${esc(cats[i])}</div>` + lines.slice(0, 10).map(s => `<div><span class="sw" style="background:${s.color}"></span>${esc(s.name)}: <b>${yCats ? esc(yCats[Math.round(s.y[i])] ?? fmt(s.y[i])) : fmt(s.y[i])}</b></div>`).join("") + (onClickCat ? '<div class="muted">click to set input</div>' : "");
+  };
+  chart.click = onClickCat ? (mx => { const i = idxAt(mx); if (i >= 0 && i < cats.length) onClickCat(cats[i]); }) : null;
+}
+function roundBar(ctx, x, y, w, h, up) {
+  const r = Math.min(4, w / 2, h);
+  ctx.beginPath();
+  if (up) { ctx.moveTo(x, y + h); ctx.lineTo(x, y + r); ctx.arcTo(x, y, x + r, y, r); ctx.lineTo(x + w - r, y); ctx.arcTo(x + w, y, x + w, y + r, r); ctx.lineTo(x + w, y + h); }
+  else { ctx.moveTo(x, y); ctx.lineTo(x, y + h - r); ctx.arcTo(x, y + h, x + r, y + h, r); ctx.lineTo(x + w - r, y + h); ctx.arcTo(x + w, y + h, x + w, y + h - r, r); ctx.lineTo(x + w, y); }
+  ctx.closePath(); ctx.fill();
+}
+
+// horizontal signed bars (sensitivity, weights of one neuron)
+function drawHBars(chart, { labels, values, valueLabel = "", colorPos, colorNeg, notes = null, onClick = null }) {
+  chart.height = Math.max(80, labels.length * 22 + 40);
+  const ctx = chart.setup();
+  ctx.font = "11px system-ui, sans-serif";
+  const lw = Math.min(170, Math.max(60, ...labels.map(l => ctx.measureText(String(l)).width + 16)));
+  let lo = Math.min(0, ...values.map(v => v ?? 0)), hi = Math.max(0, ...values.map(v => v ?? 0));
+  if (lo === hi) hi = 1;
+  const pad = (hi - lo) * 0.05; lo -= lo < 0 ? pad : 0; hi += hi > 0 ? pad : 0;
+  const box = { l: lw, r: chart.w - 60, t: 6, b: chart.height - 28 };
+  const sx = v => box.l + (v - lo) / (hi - lo) * (box.r - box.l);
+  ctx.font = "11px system-ui, sans-serif";
+  ctx.strokeStyle = css("--grid"); ctx.fillStyle = css("--muted"); ctx.textAlign = "center"; ctx.textBaseline = "top";
+  for (const v of niceTicks(lo, hi, Math.max(2, Math.floor((box.r - box.l) / 80)))) { ctx.beginPath(); ctx.moveTo(sx(v), box.t); ctx.lineTo(sx(v), box.b); ctx.stroke(); ctx.fillText(fmt(v, 3), sx(v), box.b + 4); }
+  ctx.fillStyle = css("--text-2"); ctx.textBaseline = "bottom"; ctx.fillText(valueLabel, (box.l + box.r) / 2, chart.height - 1);
+  const rowH = (box.b - box.t) / labels.length;
+  labels.forEach((l, i) => {
+    const y = box.t + i * rowH, v = values[i] ?? 0, bh = Math.max(3, Math.min(14, rowH - 4));
+    ctx.fillStyle = css("--text-2"); ctx.textAlign = "right"; ctx.textBaseline = "middle";
+    ctx.fillText(String(l).slice(0, 24), box.l - 8, y + rowH / 2);
+    ctx.fillStyle = v >= 0 ? colorPos : colorNeg;
+    const x0 = sx(0), x1 = sx(v);
+    ctx.fillRect(Math.min(x0, x1), y + (rowH - bh) / 2, Math.max(1, Math.abs(x1 - x0)), bh);
+    ctx.fillStyle = css("--text"); ctx.textAlign = "left"; ctx.fillText(fmt(v, 3), Math.max(x0, x1) + 4 > box.r ? box.r + 4 : Math.max(x0, x1) + 4, y + rowH / 2);
+  });
+  ctx.strokeStyle = css("--border"); ctx.beginPath(); ctx.moveTo(sx(0) + .5, box.t); ctx.lineTo(sx(0) + .5, box.b); ctx.stroke();
+  chart.redrawOverlay = null;
+  const rowAt = my => Math.floor((my - box.t) / rowH);
+  chart.hover = (mx, my) => { const i = rowAt(my); if (i < 0 || i >= labels.length) return null; return `<b>${esc(labels[i])}</b>: ${fmt(values[i])}${notes && notes[i] ? `<div class="muted">${notes[i]}</div>` : ""}`; };
+  chart.click = onClick ? ((mx, my) => { const i = rowAt(my); if (i >= 0 && i < labels.length) onClick(i); }) : null;
+}
+
+// heatmap: z Float32Array row-major [ny][nx]; colorFn(v) → [r,g,b]
+// yDown: data row 0 is drawn at the top (matrices); otherwise at the bottom (maps)
+function drawHeat(chart, { z, nx, ny, xVals, yVals, xLabel, yLabel, colorFn, valueText, xCats = null, yCats = null, marker = null, points = null, onClick = null, left = 52, bottom = 34, square = false, yDown = false, intTicks = false }) {
+  if (square) chart.height = Math.min(420, Math.max(160, Math.round((chart.canvas.clientWidth || 400) * ny / Math.max(nx, 1)) + bottom + 10));
+  const ctx = chart.setup();
+  // axis limits sit half a cell outside the first/last sample so ticks land on cell centres
+  const half = (vals, n) => n > 1 ? (vals[n - 1] - vals[0]) / (n - 1) / 2 : 0.5;
+  const hx = xCats ? 0.5 : half(xVals, nx), hy = yCats ? 0.5 : half(yVals, ny);
+  const xlo = xCats ? -0.5 : xVals[0] - hx, xhi = xCats ? nx - 0.5 : xVals[nx - 1] + hx;
+  const ylo = yCats ? -0.5 : yVals[0] - hy, yhi = yCats ? ny - 0.5 : yVals[ny - 1] + hy;
+  const f = chart.frame({ xlo, xhi, ylo, yhi, xLabel, yLabel, xCats, yCats, left, bottom, yDown, intTicks });
+  const img = document.createElement("canvas"); img.width = nx; img.height = ny;
+  const ictx = img.getContext("2d"), data = ictx.createImageData(nx, ny);
+  for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) {
+    const c = colorFn(z[j * nx + i]), o = ((yDown ? j : ny - 1 - j) * nx + i) * 4;
+    data.data[o] = c[0]; data.data[o + 1] = c[1]; data.data[o + 2] = c[2]; data.data[o + 3] = 255;
+  }
+  ictx.putImageData(data, 0, 0);
+  ctx.imageSmoothingEnabled = false;
+  const cellW = (f.box.r - f.box.l) / nx, cellH = (f.box.b - f.box.t) / ny;
+  ctx.drawImage(img, f.box.l, f.box.t, f.box.r - f.box.l, f.box.b - f.box.t);
+  const toX = f.sx, toY = f.sy;
+  if (points) {
+    ctx.fillStyle = css("--surface"); ctx.strokeStyle = css("--text"); ctx.lineWidth = 1; ctx.globalAlpha = 0.7;
+    for (let k = 0; k < points.x.length; k++) { ctx.beginPath(); ctx.arc(toX(points.x[k]), toY(points.y[k]), 2.2, 0, 7); ctx.fill(); ctx.stroke(); }
+    ctx.globalAlpha = 1;
+  }
+  if (marker) {
+    const mx = toX(marker[0]), my = toY(marker[1]);
+    ctx.strokeStyle = css("--surface"); ctx.lineWidth = 5; crossAt(ctx, mx, my);
+    ctx.strokeStyle = css("--text"); ctx.lineWidth = 2; crossAt(ctx, mx, my);
+  }
+  const cell = (mx, my) => { const i = Math.floor((mx - f.box.l) / cellW), r = Math.floor((my - f.box.t) / cellH), j = yDown ? r : ny - 1 - r; return i >= 0 && i < nx && j >= 0 && j < ny ? [i, j] : null; };
+  chart.redrawOverlay = null;
+  chart.hover = (mx, my) => { const c = cell(mx, my); if (!c) return null; const [i, j] = c; return valueText(i, j, z[j * nx + i]) + (onClick ? '<div class="muted">click to set inputs</div>' : ""); };
+  chart.click = onClick ? ((mx, my) => { const c = cell(mx, my); if (c) onClick(c[0], c[1]); }) : null;
+  return f;
+}
+function crossAt(ctx, x, y) { ctx.beginPath(); ctx.moveTo(x - 7, y - 7); ctx.lineTo(x + 7, y + 7); ctx.moveTo(x + 7, y - 7); ctx.lineTo(x - 7, y + 7); ctx.stroke(); }
+
+function colorbar(parent, { lo, hi, colorFn, label, diverging = false }) {
+  const c = el("canvas", { style: "width:100%;height:12px;border-radius:3px;display:block" });
+  const wrap = el("div", { style: "margin:6px 0 2px" }, c, el("div", { class: "legend", style: "justify-content:space-between" }, el("span", {}, fmt(lo)), el("span", {}, label || ""), el("span", {}, fmt(hi))));
+  parent.append(wrap);
+  requestAnimationFrame(() => {
+    const w = c.clientWidth || 300; c.width = w; c.height = 12; const ctx = c.getContext("2d");
+    for (let i = 0; i < w; i++) { const t = i / (w - 1); ctx.fillStyle = rgb(colorFn(diverging ? t * 2 - 1 : t)); ctx.fillRect(i, 0, 1, 12); }
+  });
+}
+
+// charts need layout width: build into a detached node, then draw after attach
+function later(root, fn) { (root._after ??= []).push(fn); }
+// ───────────────────────── shared UI pieces ─────────────────────────
+const G = { opts: null, page: "dataset" };
+const thumbUrl = (path, size = 128) => `/api/thumb?path=${encodeURIComponent(path)}&size=${size}`;
+const classColor = i => series()[i % 8];
+const baseName = p => String(p).split(/[\\/]/).pop();
+function rankName(name, q) {  // substring first, then letters-in-order ("chkb" -> checkerboard)
+  if (!q) return 0; const n = name.toLowerCase();
+  if (n.includes(q)) return n.startsWith(q) ? 0 : 1;
+  let i = 0; for (const ch of n) if (ch === q[i]) i++; return i === q.length ? 2 : -1;
+}
+function fileBrowser({ start, accept = ["image", "json"], allowDir = false, dirLabel = "Use this folder", onPick, key = "fb" }) {
+  const filter = el("input", { type: "search", placeholder: "Type to filter by name…", "data-fkey": key + ":filter", autocomplete: "off", spellcheck: "false", style: "width:100%" });
+  const box = el("div", { class: "browser" }, el("div", { class: "path" }, "loading…"));
+  const useDir = el("button", { class: "primary", hidden: !allowDir }, dirLabel);
+  const wrap = el("div", { class: "fb" }, el("div", { class: "row-flex", style: "margin:6px 0" }, filter, useDir), box);
+  let listing = null;
+  const go = async dir => {
+    try { listing = await api("/api/fs", { path: dir }); store.set("fbdir", listing.path); filter.value = ""; draw(); }
+    catch (e) { box.replaceChildren(el("div", { class: "path" }, e.message)); }
+  };
+  const matches = (list, q, key) => list.map(x => [rankName(key(x), q), x]).filter(([r]) => r >= 0).sort((a, b) => a[0] - b[0] || key(a[1]).localeCompare(key(b[1]))).map(([, x]) => x);
+  const draw = () => {
+    if (!listing) return;
+    const q = filter.value.trim().toLowerCase();
+    const dirs = matches(listing.dirs, q, n => n), files = matches(listing.files.filter(f => accept.includes(f.kind)), q, f => f.name);
+    box.replaceChildren(el("div", { class: "path" }, listing.path),
+      q ? null : el("div", { class: "item", onclick: () => go(listing.parent) }, "⬑ ..", ""),
+      ...dirs.map(n => el("div", { class: "item", onclick: () => go(listing.path + "/" + n) }, "▸ " + n + "/", "")),
+      ...files.slice(0, 400).map(f => el("div", { class: "item", onclick: () => onPick(listing.path + "/" + f.name, f.kind) }, f.name, el("span", { class: "muted" }, f.kind === "image" ? "image" : f.kind))),
+      files.length > 400 ? el("div", { class: "item muted" }, `+${files.length - 400} more — type to filter`) : null,
+      dirs.length || files.length ? null : el("div", { class: "item muted" }, q ? "nothing matches" : "no matching files here"));
+  };
+  filter.addEventListener("input", draw);
+  filter.addEventListener("keydown", e => {
+    if (e.key !== "Enter" || !listing) return;
+    const q = filter.value.trim().toLowerCase();
+    const f = matches(listing.files.filter(f => accept.includes(f.kind)), q, f => f.name)[0], d = matches(listing.dirs, q, n => n)[0];
+    if (f) onPick(listing.path + "/" + f.name, f.kind); else if (d) go(listing.path + "/" + d);
+  });
+  useDir.onclick = () => listing && onPick(listing.path, "dir");
+  go(start || store.get("fbdir", null) || G.opts?.cwd);
+  return wrap;
+}
+function pageTabs(id, tabs, current, onPick) {
+  return el("div", { class: "tabs" }, tabs.map(([k, name]) => el("button", { class: k === current ? "active" : "", "data-fkey": id + ":" + k, onclick: () => onPick(k) }, name)));
+}
+function laterOrNow(root, fn) { if (root.isConnected) fn(); else later(root, fn); }
+
+// overlay: image + map. Non-negative maps: "spotlight" dims what the model ignores (readable on any
+// image colors) or "heat" paints hot regions; signed maps use the diverging scale.
+function drawOverlay(canvas, imageUrl, map, { opacity = 0.6, signed = false, size = 320, style = store.get("overlayStyle", "spotlight") } = {}) {
+  const dpr = devicePixelRatio || 1;
+  canvas.width = size * dpr; canvas.height = size * dpr; canvas.style.width = size + "px"; canvas.style.height = size + "px";
+  const ctx = canvas.getContext("2d"); ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const img = new Image();
+  img.onload = () => {
+    ctx.clearRect(0, 0, size, size); ctx.imageSmoothingEnabled = img.width >= size / 2; ctx.drawImage(img, 0, 0, size, size);
+    if (!map) return;
+    const z = b64f32(map.data), off = document.createElement("canvas"); off.width = map.w; off.height = map.h;
+    const o = off.getContext("2d"), d = o.createImageData(map.w, map.h);
+    let lo = Infinity, hi = -Infinity; for (const v of z) { if (v < lo) lo = v; if (v > hi) hi = v; }
+    const m = Math.max(Math.abs(lo), Math.abs(hi), 1e-12), warm = hex2rgb(css("--s2")), dv = divScale();
+    for (let i = 0; i < z.length; i++) {
+      let c, a;
+      if (signed) { c = dv(z[i] / m); a = 255; }
+      else {
+        const t = hi > lo ? (z[i] - lo) / (hi - lo) : 0;
+        if (style === "spotlight") { c = [0, 0, 0]; a = Math.round(255 * 0.92 * (1 - t)); }
+        else { c = warm; a = Math.round(255 * Math.pow(t, 0.8)); }
+      }
+      d.data.set([c[0], c[1], c[2], a], i * 4);
+    }
+    o.putImageData(d, 0, 0);
+    ctx.globalAlpha = opacity; ctx.imageSmoothingEnabled = true; ctx.drawImage(off, 0, 0, size, size); ctx.globalAlpha = 1;
+  };
+  img.src = imageUrl;
+}
+function probBars(probs, onPick, selected = null, max = 10) {
+  return el("div", {}, probs.slice(0, max).map(([i, name, p]) => el("div", { class: "probrow" + (i === selected ? " sel" : ""), style: "cursor:pointer", onclick: () => onPick && onPick(i), title: "show the map for this class" },
+    el("span", { class: "lab", title: name }, name), el("span", { class: "bar" }, el("div", { style: `width:${(p * 100).toFixed(1)}%;background:${classColor(i)}` })), el("span", { class: "num" }, (p * 100).toFixed(1) + "%"))));
+}
+// grid of small signed maps (activations / kernels)
+function mapGrid(parent, { n, h, w, data, scale, labels, rgb = false, c = 1, onPick, tile = 72 }) {
+  const z = b64f32(data), grid = el("div", { class: "mapgrid", style: `grid-template-columns:repeat(auto-fill,minmax(${tile}px,1fr))` });
+  const dv = divScale(), m = Math.max(scale, 1e-12);
+  for (let k = 0; k < n; k++) {
+    const cv = el("canvas", { width: w, height: h, class: "tilecv" });
+    const ctx = cv.getContext("2d"), d = ctx.createImageData(w, h);
+    for (let i = 0; i < h * w; i++) {
+      let col;
+      if (rgb) col = [0, 1, 2].map(ch => Math.round(255 * (0.5 + 0.5 * z[((k * c + ch) * h * w) + i] / m)));
+      else col = dv(z[k * h * w + i] / m);
+      d.data.set([col[0], col[1], col[2], 255], i * 4);
+    }
+    ctx.putImageData(d, 0, 0);
+    grid.append(el("div", { class: "tile", onclick: () => onPick && onPick(k), title: labels[k] }, cv, el("div", { class: "tilelab" }, labels[k])));
+  }
+  parent.append(grid);
+}
+
+// ───────────────────────── Dataset page ─────────────────────────
+const D = { root: null, jsonPath: "", classes: [], items: [], sel: new Set(), view: "all", q: "", page: 0, per: 200, size: store.get("thumbsize", 112), dirty: false, open: null, anchor: null, dups: null };
+function dsVisible() {
+  const q = D.q.trim().toLowerCase();
+  const out = [];
+  D.items.forEach((it, i) => {
+    if (D.view === "unlabeled" && it.class) return;
+    if (D.view === "missing" && !it.missing) return;
+    if (D.view === "duplicates" && !(D.dups && D.dups.has(i))) return;
+    if (D.view.startsWith("class:") && it.class !== D.view.slice(6)) return;
+    if (q && rankName(it.rel, q) < 0) return;
+    out.push(i);
+  });
+  return out;
+}
+function dsAssign(label) {
+  if (!D.sel.size) { toast("Select images first (click, shift+click, ctrl+click, or Select all)."); return; }
+  for (const i of D.sel) D.items[i].class = label;
+  D.dirty = true; renderDataset();
+}
+async function renderDataset() {
+  const page = $("#datasetPage");
+  const top = el("div", { class: "card" }, el("h2", {}, el("span", { class: "grow" }, "Dataset builder"), D.dirty ? el("span", { class: "pill warnpill" }, "unsaved changes") : null));
+  top.append(el("p", { class: "note" }, "Open a folder of images (subfolders are fine) or an existing dataset .json, assign classes — one by one or in batches — and save a dataset JSON that training accepts just like class folders."));
+  top.append(el("div", { class: "row-flex" },
+    el("button", { onclick: () => { D.open = D.open === "folder" ? null : "folder"; renderDataset(); } }, D.open === "folder" ? "Close" : "Open image folder…"),
+    el("button", { onclick: () => { D.open = D.open === "json" ? null : "json"; renderDataset(); } }, D.open === "json" ? "Close" : "Open dataset .json…"),
+    D.root ? el("span", { class: "muted" }, `${D.items.length} images in ${D.root}`) : null));
+  if (D.open === "folder") top.append(fileBrowser({ accept: [], allowDir: true, dirLabel: "Load images in this folder", key: "dsdir", onPick: async p => {
+    if (D.dirty && !confirm("Discard unsaved labels?")) return;
+    try {
+      const r = await api("/api/builder/scan", { folder: p });
+      Object.assign(D, { root: r.root, jsonPath: r.root + "/dataset.json", classes: [], items: r.items.map(it => ({ ...it, class: null })), sel: new Set(), page: 0, view: "all", open: null, dirty: false, dups: null, suggested: r.suggested_classes });
+      renderDataset();
+    } catch (e) { toast(e.message); }
+  } }));
+  if (D.open === "json") top.append(fileBrowser({ accept: ["json"], key: "dsjson", onPick: async p => {
+    if (D.dirty && !confirm("Discard unsaved labels?")) return;
+    try {
+      const r = await api("/api/builder/load", { path: p });
+      Object.assign(D, { root: r.root, jsonPath: r.path, classes: r.classes, items: r.items, sel: new Set(), page: 0, view: "all", open: null, dirty: false, dups: null, suggested: [] });
+      renderDataset();
+    } catch (e) { toast(e.message); }
+  } }));
+  const body = el("div");
+  if (D.root) {
+    const counts = D.classes.map(c => D.items.filter(it => it.class === c).length);
+    const unlabeled = D.items.filter(it => !it.class).length, missing = D.items.filter(it => it.missing).length;
+    // classes panel
+    const side = el("div", { class: "card" }, el("h2", {}, "Classes"));
+    D.classes.forEach((c, i) => {
+      const name = el("input", { type: "text", value: c, "data-fkey": "ds:class:" + i, class: "classname", title: "rename",
+        onchange: e => { const v = e.target.value.trim(); if (!v || D.classes.includes(v)) { e.target.value = c; toast("Class names must be unique and non-empty."); return; }
+          D.items.forEach(it => { if (it.class === c) it.class = v; }); D.classes[i] = v; if (D.view === "class:" + c) D.view = "class:" + v; D.dirty = true; renderDataset(); } });
+      side.append(el("div", { class: "classrow" }, el("span", { class: "sw", style: `background:${classColor(i)}` }), name,
+        el("span", { class: "pill" }, counts[i]), i < 9 ? el("span", { class: "key", title: `press ${i + 1} to assign the selection` }, i + 1) : el("span"),
+        el("button", { title: "assign selected images to this class", onclick: () => dsAssign(c) }, "→"),
+        el("button", { title: "delete class (its images become unlabeled)", onclick: () => { if (!confirm(`Delete class ${c}? Its ${counts[i]} images become unlabeled.`)) return; D.items.forEach(it => { if (it.class === c) it.class = null; }); D.classes.splice(i, 1); D.dirty = true; renderDataset(); } }, "×")));
+    });
+    const add = el("input", { type: "text", placeholder: "new class name", "data-fkey": "ds:newclass",
+      onkeydown: e => { if (e.key === "Enter") addBtn.click(); } });
+    const addBtn = el("button", { onclick: () => { const v = add.value.trim(); if (!v || D.classes.includes(v)) return toast("Enter a new, unique class name."); D.classes.push(v); D.dirty = true; renderDataset(); } }, "Add");
+    side.append(el("div", { class: "row-flex", style: "margin-top:8px" }, add, addBtn));
+    if (D.suggested && D.suggested.length) side.append(el("button", { style: "margin-top:8px;width:100%", onclick: () => {
+      for (const c of D.suggested) if (!D.classes.includes(c)) D.classes.push(c);
+      D.items.forEach(it => { if (!it.class && it.folder && D.classes.includes(it.folder)) it.class = it.folder; });
+      D.dirty = true; renderDataset(); } }, `Use subfolder names as classes (${D.suggested.length})`));
+    side.append(el("div", { class: "kv", style: "margin-top:10px" }, el("div", {}, "labeled"), el("div", {}, `${D.items.length - unlabeled} of ${D.items.length}`),
+      el("div", {}, "unlabeled"), el("div", {}, unlabeled), ...(missing ? [el("div", {}, "missing files"), el("div", { class: "warn" }, missing)] : []),
+      ...(D.dups ? [el("div", {}, "duplicate images"), el("div", {}, D.dups.size)] : [])));
+    const weak = D.classes.filter((c, i) => counts[i] < 2);
+    if (weak.length) side.append(el("p", { class: "warn" }, `⚠ Needs ≥2 images for a validation split: ${weak.join(", ")}`));
+    // save
+    const savePath = el("input", { type: "text", value: D.jsonPath, "data-fkey": "ds:savepath", style: "width:100%", onchange: e => { D.jsonPath = e.target.value.trim(); } });
+    side.append(el("h2", { style: "margin-top:14px" }, "Save"), savePath, el("div", { class: "row-flex", style: "margin-top:6px" },
+      el("button", { class: "primary", onclick: async () => {
+        try { const r = await api("/api/builder/save", { path: D.jsonPath, classes: D.classes, items: D.items.map(it => ({ path: it.path, class: it.class })), root: D.root });
+          D.dirty = false; toast(`Saved ${r.labeled} labeled of ${r.items} images to ${r.path}`, true); renderDataset(); }
+        catch (e) { toast(e.message); } } }, "Save dataset JSON"),
+      el("button", { disabled: D.dirty || !D.jsonPath, title: D.dirty ? "save first" : "", onclick: () => { F().source = D.jsonPath; saveForm(); showPage("train"); } }, "Train on it →")));
+    // toolbar + grid
+    const vis = dsVisible(), pages = Math.max(1, Math.ceil(vis.length / D.per)); D.page = Math.min(D.page, pages - 1);
+    const shown = vis.slice(D.page * D.per, (D.page + 1) * D.per);
+    const viewSel = el("select", { "data-fkey": "ds:view", onchange: e => { D.view = e.target.value; D.page = 0; renderDataset(); } },
+      [["all", `All (${D.items.length})`], ["unlabeled", `Unlabeled (${unlabeled})`], ...(missing ? [["missing", `Missing files (${missing})`]] : []), ...(D.dups ? [["duplicates", `Duplicates (${D.dups.size})`]] : []), ...D.classes.map((c, i) => ["class:" + c, `${c} (${counts[i]})`])]
+        .map(([v, t]) => el("option", { value: v, selected: v === D.view }, t)));
+    const search = el("input", { type: "search", value: D.q, placeholder: "filter by file name…", "data-fkey": "ds:search", oninput: debounce(e => { D.q = e.target.value; D.page = 0; renderDatasetGrid(); }, 200) });
+    const assignSel = el("select", { "data-fkey": "ds:assign" }, D.classes.map(c => el("option", { value: c }, c)));
+    const tools = el("div", { class: "row-flex toolbar" }, viewSel, search,
+      el("button", { onclick: () => { vis.forEach(i => D.sel.add(i)); renderDatasetGrid(); } }, `Select all ${vis.length}`),
+      el("button", { onclick: () => { shown.forEach(i => D.sel.add(i)); renderDatasetGrid(); } }, "Select page"),
+      el("button", { onclick: () => { D.sel.clear(); renderDatasetGrid(); } }, "None"),
+      el("button", { onclick: () => { vis.forEach(i => D.sel.has(i) ? D.sel.delete(i) : D.sel.add(i)); renderDatasetGrid(); } }, "Invert"),
+      el("span", { class: "muted", id: "selCount" }, `${D.sel.size} selected →`), assignSel,
+      el("button", { class: "primary", disabled: !D.classes.length, onclick: () => dsAssign(assignSel.value) }, "Assign"),
+      el("button", { onclick: () => dsAssign(null) }, "Clear label"),
+      el("button", { title: "Drop the selected images from the dataset (files are not touched)", onclick: () => { if (!D.sel.size) return; if (!confirm(`Remove ${D.sel.size} images from the dataset? Files on disk are not touched.`)) return; D.items = D.items.filter((_, i) => !D.sel.has(i)); D.sel.clear(); D.dups = null; D.dirty = true; renderDataset(); } }, "Remove"),
+      el("button", { title: "Find byte-identical images", onclick: async e => { e.target.disabled = true; e.target.textContent = "Checking…";
+        try { const r = await api("/api/builder/duplicates", { paths: D.items.map(it => it.path) }); const idx = new Map(D.items.map((it, i) => [it.path, i]));
+          D.dups = new Set(r.groups.flatMap(g => g.slice(1).map(p => idx.get(p)))); D.dupGroups = r.groups; toast(`${r.groups.length} groups of identical images; ${D.dups.size} extra copies (view "Duplicates" to select and remove them)`, true); renderDataset(); }
+        catch (err) { toast(err.message); } } }, "Find duplicates"),
+      el("label", { class: "ctl check" }, "size", el("input", { type: "range", min: 64, max: 256, step: 16, value: D.size, oninput: e => { D.size = +e.target.value; store.set("thumbsize", D.size); document.querySelectorAll(".dsgrid").forEach(g => g.style.setProperty("--thumb", D.size + "px")); } })));
+    const main = el("div", {}, el("div", { class: "card" }, tools, el("p", { class: "note", style: "margin:6px 0 0" }, "Click selects, shift+click selects a range, ctrl/⌘+click toggles. Keys: 1–9 assign to class, 0 or Delete clears the label, Ctrl+A selects all shown, Esc clears the selection."),
+      el("div", { id: "dsGridWrap" })));
+    body.append(el("div", { class: "dslayout" }, side, main));
+  }
+  page.replaceChildren(top, body);
+  if (D.root) renderDatasetGrid();
+}
+function renderDatasetGrid() {
+  const wrap = $("#dsGridWrap"); if (!wrap) return;
+  const vis = dsVisible(), pages = Math.max(1, Math.ceil(vis.length / D.per)); D.page = Math.min(D.page, pages - 1);
+  const shown = vis.slice(D.page * D.per, (D.page + 1) * D.per);
+  const grid = el("div", { class: "dsgrid", style: `--thumb:${D.size}px` });
+  shown.forEach((i, k) => {
+    const it = D.items[i], ci = it.class ? D.classes.indexOf(it.class) : -1;
+    const tile = el("div", { class: "dstile" + (D.sel.has(i) ? " sel" : "") + (it.missing ? " missing" : ""), title: it.rel },
+      el("img", { src: it.missing ? "" : thumbUrl(it.path, 256), loading: "lazy", alt: it.rel }),
+      el("div", { class: "dslabel", style: ci >= 0 ? `background:${classColor(ci)}` : "" }, it.class || "unlabeled"),
+      D.dups && D.dups.has(i) ? el("div", { class: "dsdup" }, "copy") : null);
+    tile.addEventListener("click", ev => {
+      if (ev.shiftKey && D.anchor != null) { const a = vis.indexOf(D.anchor), b = vis.indexOf(i); if (a >= 0 && b >= 0) for (let j = Math.min(a, b); j <= Math.max(a, b); j++) D.sel.add(vis[j]); }
+      else if (ev.ctrlKey || ev.metaKey) { D.sel.has(i) ? D.sel.delete(i) : D.sel.add(i); D.anchor = i; }
+      else { D.sel = new Set([i]); D.anchor = i; }
+      renderDatasetGrid();
+    });
+    grid.append(tile);
+  });
+  const nav = el("div", { class: "row-flex", style: "margin:8px 0" },
+    el("button", { disabled: D.page === 0, onclick: () => { D.page--; renderDatasetGrid(); } }, "‹ Prev"),
+    el("span", { class: "muted" }, `page ${D.page + 1} of ${pages} · ${vis.length} images shown`),
+    el("button", { disabled: D.page >= pages - 1, onclick: () => { D.page++; renderDatasetGrid(); } }, "Next ›"));
+  keepScroll(() => wrap.replaceChildren(nav, grid, vis.length > D.per ? nav.cloneNode(true) : el("span")));
+  wrap.lastChild.querySelectorAll?.("button").forEach((b, j) => b.onclick = j === 0 ? () => { D.page--; renderDatasetGrid(); } : () => { D.page++; renderDatasetGrid(); });
+  const sc = $("#selCount"); if (sc) sc.textContent = `${D.sel.size} selected →`;
+}
+document.addEventListener("keydown", e => {
+  if (G.page !== "dataset" || !D.root) return;
+  const a = document.activeElement; if (a && /^(INPUT|SELECT|TEXTAREA)$/.test(a.tagName)) return;
+  if (/^[1-9]$/.test(e.key) && D.classes[+e.key - 1] !== undefined) { e.preventDefault(); dsAssign(D.classes[+e.key - 1]); }
+  else if (e.key === "0" || e.key === "Delete" || e.key === "Backspace") { e.preventDefault(); dsAssign(null); }
+  else if (e.key === "Escape") { D.sel.clear(); renderDatasetGrid(); }
+  else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "a") { e.preventDefault(); dsVisible().forEach(i => D.sel.add(i)); renderDatasetGrid(); }
+});
+addEventListener("beforeunload", e => { if (D.dirty) { e.preventDefault(); e.returnValue = ""; } });
+
+// ───────────────────────── Train page ─────────────────────────
+const DEFAULT_FORM = { source: "", val_mode: "fraction", val_fraction: 0.1, val_source: "", dedupe: true, mode: "new", checkpoint: "", freeze: true,
+  config: null, head_layers: 1, head_dims: "128", activation: 7, slope: 0.01, augments: [], batch_size: 64, epochs: 10, optimizer_id: 1, lr: "", seed: 0, save_dir: "ImClass" };
+const T = { F: Object.assign(structuredClone(DEFAULT_FORM), store.get("trainForm", {})), inspect: null, browse: null, st: null, since: 0, steps: [], losses: [], timer: null, runs: null, preview: null };
+const F = () => T.F, saveForm = () => store.set("trainForm", T.F);
+function fld(label, input) { if (!input.dataset.fkey) input.dataset.fkey = "tr:" + label; return el("label", { class: "ctl" }, label, input); }
+function num(obj, key, attrs = {}, after = null) {
+  return el("input", Object.assign({ type: "number", step: 1, value: obj[key] ?? "", onchange: e => { obj[key] = e.target.value === "" ? "" : +e.target.value; saveForm(); after && after(); } }, attrs));
+}
+function sel(obj, key, options, after = null) {
+  return el("select", { onchange: e => { const v = e.target.value; obj[key] = /^-?\d+$/.test(v) ? +v : v; saveForm(); (after || renderTrain)(); } },
+    options.map(([v, t]) => el("option", { value: v, selected: String(v) === String(obj[key]) }, t)));
+}
+async function inspectSource() {
+  if (!F().source) { T.inspect = null; return; }
+  try { T.inspect = await api("/api/source/inspect", { path: F().source }); } catch (e) { T.inspect = { error: e.message }; }
+}
+async function renderTrain() {
+  if (!F().config) F().config = structuredClone(G.opts.defaults);
+  if (F().source && (!T.inspect || T.inspect.path !== F().source) && !T.inspect?.error) await inspectSource();
+  if (!T.runs) { try { T.runs = await api("/api/runs", { save_dir: F().save_dir }); } catch { T.runs = { runs: [] }; } }
+  const page = $("#trainPage");
+  const left = el("div"), right = el("div");
+  left.append(trainDataCard(), trainModelCard(), trainOptionsCard());
+  right.append(monitorCard());
+  keepScroll(() => { page.replaceChildren(el("div", { class: "train-grid" }, left, right)); drawMonitor(); });
+}
+function trainDataCard() {
+  const f = F(), card = el("div", { class: "card" }, el("h2", {}, "1 · Data"));
+  const src = el("input", { type: "text", value: f.source, placeholder: "folder with class subfolders, or dataset .json", "data-fkey": "tr:source", style: "flex:1;min-width:200px",
+    onchange: async e => { f.source = e.target.value.trim(); saveForm(); T.inspect = null; await renderTrain(); } });
+  card.append(el("div", { class: "row-flex" }, src, el("button", { onclick: () => { T.browse = T.browse === "source" ? null : "source"; renderTrain(); } }, T.browse === "source" ? "Close" : "Browse…")));
+  if (T.browse === "source") card.append(fileBrowser({ accept: ["json"], allowDir: true, dirLabel: "Use this folder", key: "trsrc", onPick: async p => { f.source = p; saveForm(); T.browse = null; T.inspect = null; await renderTrain(); } }));
+  const I = T.inspect;
+  if (I?.error) card.append(el("p", { class: "warn" }, I.error));
+  else if (I?.kind === "unlabeled") card.append(el("p", { class: "warn" }, I.message), el("button", { onclick: async () => { const r = await api("/api/builder/scan", { folder: I.path }); Object.assign(D, { root: r.root, jsonPath: r.root + "/dataset.json", classes: [], items: r.items.map(it => ({ ...it, class: null })), sel: new Set(), page: 0, view: "all", open: null, dirty: false, dups: null, suggested: r.suggested_classes }); showPage("dataset"); } }, "Label them on the Dataset page →"));
+  else if (I) {
+    const mx = Math.max(...I.counts, 1);
+    card.append(el("p", { class: "note", style: "margin:8px 0 4px" }, `${I.kind === "json" ? "Dataset JSON" : "Class folders"} · ${I.total} images · ${I.classes.length} classes` + (I.unlabeled ? ` · ${I.unlabeled} unlabeled (skipped)` : "") + (I.missing ? ` · ${I.missing} missing files (skipped)` : "")),
+      el("div", { class: "classbars" }, I.classes.map((c, i) => el("div", { class: "probrow" }, el("span", { class: "lab", title: c }, c), el("span", { class: "bar" }, el("div", { style: `width:${100 * I.counts[i] / mx}%;background:${classColor(i)}` })), el("span", { class: "num" }, I.counts[i])))),
+      el("details", {}, el("summary", {}, "Sample images"), el("div", { class: "samples" }, I.classes.flatMap((c, i) => (I.samples[c] || []).slice(0, 4).map(p => el("div", { class: "sample" }, el("img", { src: thumbUrl(p, 96), loading: "lazy", title: p }), el("span", { style: `background:${classColor(i)}` }, c)))))));
+  }
+  card.append(el("div", { class: "form-grid", style: "margin-top:10px" },
+    fld("Validation", sel(f, "val_mode", [["fraction", "Hold out a fraction per class"], ["source", "Separate folder / .json"], ["none", "None"]])),
+    f.val_mode === "fraction" ? fld("Fraction", num(f, "val_fraction", { step: 0.05, min: 0, max: 0.9 })) : null,
+    f.val_mode === "source" ? fld("Validation source", el("input", { type: "text", value: f.val_source, onchange: e => { f.val_source = e.target.value.trim(); saveForm(); } })) : null,
+    el("label", { class: "ctl check" }, el("input", { type: "checkbox", "data-fkey": "tr:dedupe", checked: f.dedupe, onchange: e => { f.dedupe = e.target.checked; saveForm(); } }), "Remove duplicate images (identical files), never split across train/validation")));
+  return card;
+}
+function trainModelCard() {
+  const f = F(), c = f.config, iso = G.opts.isotropic.includes(+c.model), card = el("div", { class: "card" }, el("h2", {}, "2 · Model"));
+  const runOpts = (T.runs?.runs || []).map(r => [r.path, `${r.name} · ${r.model || "?"} · ${r.classes ?? "?"} classes${r.best_val_accuracy != null ? ` · best val ${(100 * r.best_val_accuracy).toFixed(1)}%` : ""}`]);
+  card.append(el("div", { class: "form-grid" }, fld("Start from", sel(f, "mode", [["new", "New model (pretrain)"], ["finetune", "Finetune a checkpoint (new head)"], ["continue", "Continue training a checkpoint"]]))));
+  if (f.mode !== "new") {
+    if (!f.checkpoint && runOpts.length) f.checkpoint = runOpts[0][0];
+    card.append(el("div", { class: "form-grid", style: "margin-top:8px" },
+      fld("Checkpoint (run folder or .pt)", runOpts.length ? el("select", { onchange: e => { f.checkpoint = e.target.value; saveForm(); } }, runOpts.map(([v, t]) => el("option", { value: v, selected: v === f.checkpoint }, t)))
+        : el("input", { type: "text", value: f.checkpoint, onchange: e => { f.checkpoint = e.target.value.trim(); saveForm(); } })),
+      f.mode === "finetune" ? el("label", { class: "ctl check" }, el("input", { type: "checkbox", checked: f.freeze, onchange: e => { f.freeze = e.target.checked; saveForm(); } }), "Freeze encoder") : null));
+    card.append(el("p", { class: "note" }, f.mode === "continue" ? "Continues the checkpoint's weights and optimizer state (when the optimizer matches). Validation reuses the run's recorded split, so held-out images stay held out; leave the data source empty to train on the run's own training images." : "Keeps the encoder, replaces the classifier head for the new data's classes."));
+  }
+  if (f.mode === "new") {
+    const m = +c.model;
+    card.append(el("div", { class: "form-grid", style: "margin-top:8px" },
+      fld("Model family", sel(c, "model", G.opts.models.map((n, i) => [i, `${i} · ${n}`]))),
+      fld("Channels", sel(c, "channels", [[1, "1 · grayscale"], [2, "2 · gray + alpha"], [3, "3 · RGB"], [4, "4 · RGBA"]])),
+      fld("Image size (-1 = original)", num(c, "imres", { min: -1 })), fld("Crop", num(c, "crop", { min: 1 })),
+      ...(iso ? [fld("Patch", num(c, "patch", { min: 1 })), fld("Width", num(c, "dim", { min: 2 })), fld("Depth", num(c, "depth", { min: 1 })),
+        ...(m === 3 || m === 4 ? [fld("Heads", num(c, "heads", { min: 1 }))] : []),
+        ...(m === 10 ? [fld("Recurrent cell", sel(c, "rnn_cell", [["gru", "GRU"], ["lstm", "LSTM"], ["rnn", "RNN"]]))] : []),
+        el("label", { class: "ctl check" }, el("input", { type: "checkbox", checked: c.use_grn, onchange: e => { c.use_grn = e.target.checked; saveForm(); } }), "Global response norm")]
+        : [fld("Min width", num(c, "min_dim", { min: 2 })), fld("Max width", num(c, "max_dim", { min: 2 }))])));
+  }
+  if (f.mode !== "continue") {
+    card.append(el("div", { class: "form-grid", style: "margin-top:8px" },
+      fld("Head hidden layers", num(f, "head_layers", { min: 0 }, renderTrain)),
+      f.head_layers > 0 ? fld("Head widths (one or comma list)", el("input", { type: "text", value: f.head_dims, onchange: e => { f.head_dims = e.target.value; saveForm(); } })) : null,
+      f.head_layers > 0 ? fld("Head activation", sel(f, "activation", G.opts.activations.map((n, i) => [i, n]))) : null,
+      f.head_layers > 0 && +f.activation === 4 ? fld("LeakyReLU slope", num(f, "slope", { step: 0.01, min: 0 })) : null));
+  }
+  return card;
+}
+function headDims() {
+  const f = F(); if (!(f.head_layers > 0)) return [];
+  const dims = String(f.head_dims).split(",").map(x => parseInt(x.trim(), 10)).filter(x => x > 0);
+  return dims.length === 1 ? Array(f.head_layers).fill(dims[0]) : dims;
+}
+function trainOptionsCard() {
+  const f = F(), card = el("div", { class: "card" }, el("h2", {}, "3 · Training"));
+  const augs = el("div", { class: "auggrid" }, Object.entries(G.opts.augments).map(([id, name]) => el("label", { class: "ctl check" },
+    el("input", { type: "checkbox", "data-fkey": "tr:aug" + id, checked: f.augments.includes(+id), onchange: e => { f.augments = e.target.checked ? [...new Set([...f.augments, +id])] : f.augments.filter(a => a !== +id); saveForm(); } }), name)));
+  const prev = el("div", { id: "augPreview" });
+  card.append(el("details", { open: f.augments.length > 0 }, el("summary", {}, `Augmentations (${f.augments.length} on)`), augs,
+    el("div", { class: "row-flex", style: "margin-top:6px" }, el("button", { disabled: !T.inspect?.samples, onclick: async () => {
+      const first = Object.values(T.inspect.samples).flat()[0];
+      try { const r = await api("/api/train/augment_preview", { config: F().mode === "new" ? F().config : G.opts.defaults, augments: F().augments, path: first });
+        prev.replaceChildren(el("div", { class: "samples" }, r.images.map(u => el("div", { class: "sample" }, el("img", { src: u, class: "pix" })))), r.note ? el("p", { class: "note" }, r.note) : el("span")); }
+      catch (e) { toast(e.message); } } }, "Preview augmentations"), el("span", { class: "muted" }, "one training image, eight random augmented versions")), prev));
+  card.append(el("div", { class: "form-grid", style: "margin-top:8px" },
+    fld("Optimizer", sel(f, "optimizer_id", G.opts.optimizers.map((n, i) => [i, n]))),
+    fld("Learning rate", el("input", { type: "number", step: 0.0001, min: 0, value: f.lr, placeholder: String(G.opts.optimizer_lrs[f.optimizer_id]), onchange: e => { f.lr = e.target.value; saveForm(); } })),
+    fld("Batch size", num(f, "batch_size", { min: 1 })), fld("Epochs", num(f, "epochs", { min: 1 })),
+    fld("Seed (0 = random)", num(f, "seed", { min: 0 })), fld("Save folder", el("input", { type: "text", value: f.save_dir, onchange: e => { f.save_dir = e.target.value.trim() || "ImClass"; saveForm(); T.runs = null; } }))));
+  const busy = ["preparing", "training", "stopping"].includes(T.st?.state);
+  card.append(el("div", { class: "row-flex", style: "margin-top:12px" },
+    el("button", { class: "primary", disabled: busy, onclick: startTraining }, busy ? "Training…" : "Start training"),
+    el("button", { disabled: !busy || T.st?.state === "stopping", onclick: async () => { T.st = await api("/api/train/stop"); drawMonitor(); } }, "Stop (saves interrupt.pt)"),
+    el("span", { class: "note", style: "margin:0" }, `Runs are saved in ${f.save_dir}/run_… with best.pt, last.pt, history.csv and split.csv.`)));
+  return card;
+}
+async function startTraining() {
+  const f = F();
+  const spec = { mode: f.mode, source: f.source, checkpoint: f.checkpoint, freeze: f.freeze, dedupe: f.dedupe,
+    val_fraction: f.val_mode === "fraction" ? f.val_fraction : 0, val_source: f.val_mode === "source" ? f.val_source : "",
+    config: Object.assign({}, f.config, { head_dims: headDims(), activation: f.activation, slope: f.slope }),
+    head: { dims: headDims(), activation: f.activation, slope: f.slope },
+    augments: f.augments, batch_size: f.batch_size, epochs: f.epochs, optimizer_id: f.optimizer_id, lr: f.lr, seed: f.seed, save_dir: f.save_dir };
+  try { T.st = await api("/api/train/start", spec); T.since = 0; T.steps = []; T.losses = []; T.runs = null; renderTrain(); pollTrain(); }
+  catch (e) { toast("Cannot start: " + e.message); }
+}
+function monitorCard() {
+  const st = T.st || { state: "idle" };
+  const card = el("div", { class: "card" }, el("h2", {}, el("span", { class: "grow" }, "Training monitor"), el("span", { class: "state " + st.state, id: "trState" }, st.state)));
+  card.append(el("div", { id: "trStats" }), el("div", { class: "progress" }, el("div", { id: "trProgress" })));
+  T.lossChart = new Chart(card, { height: 220, title: "Loss per batch", sub: "raw (faint) and smoothed" });
+  T.epochChart = new Chart(card, { height: 200, title: "Accuracy per epoch" });
+  card.append(el("div", { id: "trEpochs" }));
+  const probe = el("div", { class: "card", id: "probeCard" }, el("h2", {}, el("span", { class: "grow" }, "Live probe"), el("span", { class: "pill", id: "probeEpoch" }, "")),
+    el("p", { class: "note" }, "One held-out image, re-explained after every epoch: what the model predicts and where it looks (Grad-CAM)."), el("div", { id: "probeBody" }));
+  return el("div", {}, card, probe);
+}
+function ema(v, a) { let m = null; return v.map(x => (m = m == null ? x : a * m + (1 - a) * x)); }
+function drawMonitor() {
+  const st = T.st || { state: "idle" }, s = st.summary;
+  const se = $("#trState"); if (se) { se.className = "state " + st.state; se.textContent = st.state; }
+  const box = $("#trStats");
+  if (box) {
+    const last = st.epochs?.at(-1);
+    box.replaceChildren(kv(
+      ...(s ? ["data", `${s.train} training / ${s.val} validation images · ${s.classes.length} classes` + (s.duplicates_removed ? ` · ${s.duplicates_removed} duplicates removed` : "") + (s.train_removed_for_validation ? ` · ${s.train_removed_for_validation} removed from training (also in validation)` : ""),
+        "model", `${s.model} · ${s.params.toLocaleString()} parameters · ${s.device} · seed ${s.seed}`] : []),
+      "progress", st.detail || (st.batches_per_epoch ? `epoch ${Math.min(st.epoch_count, Math.floor((st.total - 1) / st.batches_per_epoch) + 1)} of ${st.epoch_count}` : "–"),
+      "elapsed", `${Math.round(st.elapsed || 0)} s`,
+      ...(last ? ["last epoch", `train loss ${fmt(last.train_loss)} · acc ${(100 * last.train_accuracy).toFixed(1)}%` + (last.val_loss != null ? ` · val loss ${fmt(last.val_loss)} · val acc ${(100 * last.val_accuracy).toFixed(1)}% (balanced ${(100 * last.val_balanced_accuracy).toFixed(1)}%)` : "")] : []),
+      ...(st.run ? ["run folder", st.run] : [])));
+    if (st.error) box.append(el("p", { class: "warn" }, st.error));
+  }
+  const pr = $("#trProgress"); if (pr && st.batches_per_epoch) pr.style.width = Math.min(100, 100 * st.total / (st.batches_per_epoch * st.epoch_count)) + "%";
+  const pal = series();
+  if (T.lossChart?.canvas.isConnected) {
+    if (T.losses.length) {
+      const step = Math.max(1, Math.ceil(T.losses.length / 1500)), xs = [], raw = [], sm = [], smooth = ema(T.losses, 0.95);
+      for (let i = 0; i < T.losses.length; i += step) { xs.push(T.steps[i]); raw.push(T.losses[i]); sm.push(smooth[i]); }
+      drawLine(T.lossChart, { x: xs, lines: [{ name: "loss", y: raw, color: pal[0], width: 1, alpha: 0.3 }, { name: "smoothed", y: sm, color: pal[0], highlight: true }], xLabel: "batch", yLabel: "loss" });
+    } else { const ctx = T.lossChart.setup(); ctx.fillStyle = css("--muted"); ctx.font = "12px system-ui"; ctx.textAlign = "center"; ctx.fillText(st.state === "preparing" ? (st.detail || "preparing…") : "no training yet", T.lossChart.w / 2, 100); }
+  }
+  const ep = st.epochs || [];
+  if (T.epochChart?.canvas.isConnected) {
+    if (ep.length) {
+      const lines = [{ name: "train accuracy", y: ep.map(e => e.train_accuracy), color: pal[0], highlight: true }];
+      if (ep[0].val_accuracy != null) lines.push({ name: "val accuracy", y: ep.map(e => e.val_accuracy), color: pal[1], highlight: true }, { name: "val balanced", y: ep.map(e => e.val_balanced_accuracy), color: pal[2], highlight: true });
+      drawLine(T.epochChart, { x: ep.map(e => e.epoch), lines, xLabel: "epoch", yLabel: "accuracy", yRange: [0, 1] });
+      T.epochChart.legend(lines.map(l => [l.name, l.color]));
+    } else { const ctx = T.epochChart.setup(); ctx.fillStyle = css("--muted"); ctx.font = "12px system-ui"; ctx.textAlign = "center"; ctx.fillText("appears after the first epoch", T.epochChart.w / 2, 90); }
+  }
+  const tb = $("#trEpochs");
+  if (tb && ep.length) tb.replaceChildren(el("div", { class: "scroll", style: "max-height:300px;overflow-y:auto" }, el("table", { class: "data" }, el("tr", {}, ["epoch", "train loss", "train acc", "val loss", "val acc", "balanced", ""].map(h => el("th", {}, h))),
+    ...ep.slice().reverse().map(e => el("tr", {}, el("td", {}, e.epoch), el("td", {}, fmt(e.train_loss)), el("td", {}, (100 * e.train_accuracy).toFixed(1) + "%"),
+      el("td", {}, fmt(e.val_loss)), el("td", {}, e.val_accuracy != null ? (100 * e.val_accuracy).toFixed(1) + "%" : "–"), el("td", {}, e.val_balanced_accuracy != null ? (100 * e.val_balanced_accuracy).toFixed(1) + "%" : "–"), el("td", {}, e.best ? "★ best.pt" : ""))))));
+  const pb = $("#probeBody");
+  if (pb && st.probe && pb.dataset.epoch !== String(st.probe.epoch)) {
+    pb.dataset.epoch = st.probe.epoch; $("#probeEpoch").textContent = `epoch ${st.probe.epoch}`;
+    const cv = el("canvas");
+    pb.replaceChildren(el("div", { class: "probe" }, cv, el("div", { style: "flex:1;min-width:160px" }, el("b", {}, `predicts ${st.probe.probs[0][1]}`), probBars(st.probe.probs, null, st.probe.prediction))));
+    drawOverlay(cv, st.probe.image, st.probe.cam, { size: 180 });
+  }
+  if (["done", "stopped"].includes(st.state) && st.run) {
+    const btn = $("#exploreRun") || el("button", { id: "exploreRun", class: "primary", style: "margin-top:8px" }, "Explore this run →");
+    btn.onclick = async () => { await loadModel(st.run); showPage("explore"); };
+    if (!btn.isConnected && box) box.append(btn);
+  }
+}
+async function pollTrain() {  // exactly one polling chain (started at boot)
+  clearTimeout(T.timer);
+  try {
+    const since = T.since, st = await api("/api/train/status", { since }), prev = T.st?.state;
+    if (since !== T.since) return;  // an overlapping response already appended this range
+    if (st.total < since) { T.steps = []; T.losses = []; T.since = 0; T.timer = setTimeout(pollTrain, 0); return; }
+    T.steps.push(...st.steps); T.losses.push(...st.losses); T.since = st.total; T.st = st;
+    if (G.page === "train") { if (prev && prev !== st.state) whenNotTyping(renderTrain); else drawMonitor(); }
+    if (prev && prev !== st.state && ["done", "error", "stopped"].includes(st.state)) { T.runs = null; toast(st.state === "error" ? "Training failed: " + st.error : `Training ${st.state}: ${st.run}`, st.state !== "error"); }
+  } catch { /* server restarting */ }
+  const active = ["preparing", "training", "stopping"].includes(T.st?.state);
+  T.timer = setTimeout(pollTrain, active ? 1000 : 5000);
+}
+
+// ───────────────────────── Explore page ─────────────────────────
+const X = { info: null, img: null, imgLabel: "", truth: null, tab: store.get("xtab", "maps"), target: null, pred: null, busy: false, cam: null, camTimer: null, map: "cam", opacity: 0.6 };
+async function loadModel(path) {
+  try { X.info = await api("/api/model/load", { path }); store.set("lastModel", path); X.pred = null; X.target = null; toast(`Loaded ${X.info.model} · ${X.info.classes.length} classes`, true); }
+  catch (e) { toast(e.message); }
+}
+function setImage(src, label, truth = null) {
+  X.img = src; X.imgLabel = label; X.truth = truth; X.target = null;
+  if (G.page === "explore") refreshExplore();
+}
+const refreshExplore = debounce(async () => { await predictNow(); renderXTab(); }, 80);
+async function predictNow() {
+  if (!X.info || !X.img) return;
+  try { X.pred = await api("/api/predict", { image: X.img, target: X.target }); } catch (e) { toast(e.message); }
+  renderSidebar();
+}
+async function renderExplore() {
+  if (!T.runs) { try { T.runs = await api("/api/runs", { save_dir: F().save_dir }); } catch { T.runs = { runs: [] }; } }
+  if (!X.info && store.get("lastModel", null)) { try { X.info = await api("/api/model/load", { path: store.get("lastModel") }); } catch { store.set("lastModel", null); } }
+  if (!X.info && T.runs.runs.length) await loadModel(T.runs.runs[0].path);
+  const page = $("#explorePage");
+  const side = el("aside", { id: "xSide" }), main = el("main", {}, pageTabs("xtab", [["maps", "Attention maps"], ["acts", "Activation maps"], ["kernels", "Kernels"], ["occl", "Occlusion"], ["dream", "DeepDream"], ["eval", "Evaluation"]], X.tab,
+    k => { X.tab = k; store.set("xtab", k); renderExplore(); }), el("section", { id: "xView" }));
+  keepScroll(() => page.replaceChildren(el("div", { class: "layout" }, side, main)));
+  renderSidebar();
+  if (X.img && X.info && !X.pred) await predictNow();
+  renderXTab();
+}
+function renderSidebar() {
+  const side = $("#xSide"); if (!side) return;
+  const runOpts = (T.runs?.runs || []).map(r => [r.path, `${r.name.replace(/^run_/, "")} · ${r.model || "?"}${r.best_val_accuracy != null ? ` · ${(100 * r.best_val_accuracy).toFixed(1)}%` : ""}`]);
+  const mcard = el("div", { class: "card" }, el("h2", {}, "Model"));
+  const pick = el("select", { "data-fkey": "x:run", style: "width:100%" }, runOpts.length ? runOpts.map(([v, t]) => el("option", { value: v, selected: X.info && X.info.checkpoint.startsWith(v) }, t)) : el("option", {}, "no runs found"));
+  mcard.append(pick, el("div", { class: "row-flex", style: "margin-top:6px" }, el("button", { class: "primary", disabled: !runOpts.length, onclick: async () => { await loadModel(pick.value); renderExplore(); } }, "Load"),
+    el("button", { onclick: () => { X.browseModel = !X.browseModel; renderSidebar(); } }, "Browse .pt…")));
+  if (X.browseModel) mcard.append(fileBrowser({ accept: ["checkpoint"], allowDir: true, dirLabel: "Use this run folder", key: "xpt", onPick: async p => { X.browseModel = false; await loadModel(p); renderExplore(); } }));
+  if (X.info) mcard.append(kv("model", X.info.model, "classes", X.info.classes.length, "input", `${X.info.config.channels}×${X.info.config.crop}×${X.info.config.crop}`, "parameters", X.info.params.toLocaleString(),
+    ...(X.info.epoch ? ["epoch", X.info.epoch] : []), ...(X.info.metrics?.val_accuracy != null ? ["val accuracy", (100 * X.info.metrics.val_accuracy).toFixed(1) + "%"] : [])),
+    el("div", { class: "muted", style: "font-size:11px;word-break:break-all;margin-top:4px" }, X.info.checkpoint));
+  // image sources
+  const icard = el("div", { class: "card" }, el("h2", {}, "Image"));
+  const upload = el("input", { type: "file", accept: "image/*", hidden: true, onchange: e => { const f = e.target.files[0]; if (!f) return; const r = new FileReader(); r.onload = () => setImage({ data: r.result }, f.name); r.readAsDataURL(f); } });
+  icard.append(el("div", { class: "row-flex" },
+    el("button", { onclick: () => { X.browseImg = !X.browseImg; renderSidebar(); } }, X.browseImg ? "Close" : "Browse…"),
+    el("button", { onclick: () => upload.click() }, "Upload"), upload,
+    el("button", { disabled: !X.info?.has_split, title: X.info?.has_split ? "" : "this run recorded no validation split", onclick: async () => { try { const r = await api("/api/random_image"); setImage({ path: r.path }, baseName(r.path), r.label); } catch (e) { toast(e.message); } } }, "Random validation"),
+    el("button", { class: X.cam ? "primary" : "", onclick: () => X.cam ? stopCamera() : startCamera() }, X.cam ? "Stop camera" : "Camera"),
+    el("button", { onclick: openSketch }, "Sketch")));
+  if (X.browseImg) icard.append(fileBrowser({ accept: ["image"], key: "ximg", onPick: p => { setImage({ path: p }, baseName(p)); } }));
+  const drop = el("div", { class: "drop" }, X.img ? el("img", { src: X.img.data || thumbUrl(X.img.path, 256), class: "pix" }) : el("span", { class: "muted" }, "Drop an image here, or pick one above"));
+  drop.addEventListener("dragover", e => { e.preventDefault(); drop.classList.add("over"); });
+  drop.addEventListener("dragleave", () => drop.classList.remove("over"));
+  drop.addEventListener("drop", e => { e.preventDefault(); drop.classList.remove("over"); const f = e.dataTransfer.files[0]; if (!f) return; const r = new FileReader(); r.onload = () => setImage({ data: r.result }, f.name); r.readAsDataURL(f); });
+  icard.append(drop, X.imgLabel ? el("div", { class: "muted", style: "font-size:12px;margin-top:4px" }, X.imgLabel + (X.truth ? ` · true class: ${X.truth}` : "")) : null);
+  // prediction
+  const pcard = el("div", { class: "card" }, el("h2", {}, "Prediction"));
+  if (X.pred) {
+    const top = X.pred.probs[0];
+    pcard.append(el("div", { class: "value" }, top[1]), el("div", { class: "muted" }, `${(100 * top[2]).toFixed(1)}% confident` + (X.truth ? (X.truth === top[1] ? " · correct" : ` · wrong (true: ${X.truth})`) : "")),
+      probBars(X.pred.probs, i => { X.target = i; predictNow().then(renderXTab); }, X.pred.target), el("p", { class: "note", style: "margin:6px 0 0" }, "Click a class to see where the model looks for it."));
+  } else pcard.append(el("p", { class: "note" }, X.info ? "Pick an image." : "Load a model."));
+  side.replaceChildren(mcard, icard, pcard);
+}
+function xEmpty(root, msg) { root.append(el("div", { class: "card empty" }, msg)); }
+let xToken = 0;
+async function renderXTab() {
+  const view = $("#xView"); if (!view) return;
+  const token = ++xToken, fresh = el("div");
+  try {
+    if (!X.info) xEmpty(fresh, "Load a checkpoint (left) — training runs appear there automatically.");
+    else await ({ maps: tabMaps, acts: tabActs, kernels: tabKernels, occl: tabOccl, dream: tabDream, eval: tabEval }[X.tab])(fresh, () => token !== xToken);
+    if (token === xToken) keepScroll(() => { view.replaceChildren(...fresh.childNodes); fresh._after?.forEach(fn => fn()); });
+  } catch (e) { if (token === xToken) view.replaceChildren(el("div", { class: "card empty" }, "Error: " + e.message)); }
+}
+const needImage = root => { if (!X.img) { xEmpty(root, "Pick an image on the left (browse, upload, camera, sketch or a random validation image)."); return true; } return false; };
+async function tabMaps(root) {
+  if (needImage(root) || !X.pred) return;
+  const p = X.pred, names = [["cam", `Grad-CAM for “${X.info.classes[p.target]}”`], ...Object.keys(p.maps).map(k => [k, k.replace(/_/g, " ")])];
+  if (!names.some(([k]) => k === X.map)) X.map = "cam";
+  const map = X.map === "cam" ? p.cam : p.maps[X.map];
+  const card = el("div", { class: "card" });
+  const cv = el("canvas"), raw = el("canvas");
+  card.append(el("div", { class: "controls" },
+    el("label", { class: "ctl" }, "Map", el("select", { "data-fkey": "x:map", onchange: e => { X.map = e.target.value; renderXTab(); } }, names.map(([k, t]) => el("option", { value: k, selected: k === X.map }, t)))),
+    el("label", { class: "ctl" }, "Style", el("select", { "data-fkey": "x:style", onchange: e => { store.set("overlayStyle", e.target.value); renderXTab(); } },
+      [["spotlight", "Spotlight (dim the rest)"], ["heat", "Heat color"]].map(([v, t]) => el("option", { value: v, selected: v === store.get("overlayStyle", "spotlight") }, t)))),
+    el("label", { class: "ctl" }, "Overlay strength", el("input", { type: "range", min: 0, max: 1, step: 0.05, value: X.opacity, "data-fkey": "x:opacity", oninput: e => { X.opacity = +e.target.value; drawOverlay(cv, p.image, map, { opacity: X.opacity, size: 360 }); } }))),
+    el("div", { class: "row-flex", style: "align-items:flex-start;gap:16px" }, el("div", {}, el("div", { class: "muted" }, "overlay"), cv), el("div", {}, el("div", { class: "muted" }, "model input"), raw)),
+    el("p", { class: "note" }, X.map === "cam" ? "Bright (spotlight) or warm (heat) = regions that raise this class's score (Grad-CAM on the last spatial features). Click another class under Prediction to compare." : "Other maps the architecture provides (input saliency; attention rollout/heads, gates or token-mixer responses where available)."));
+  root.append(card);
+  later(root, () => { drawOverlay(cv, p.image, map, { opacity: X.opacity, size: 360 }); drawOverlay(raw, p.image, null, { size: 180 }); });
+  const cmp = el("div", { class: "card" }, el("h2", {}, "Top classes side by side"));
+  root.append(cmp);
+  try {
+    const c = await api("/api/compare", { image: X.img, count: Math.min(4, X.info.classes.length) });
+    const row = el("div", { class: "row-flex", style: "align-items:flex-start" });
+    c.panels.forEach(q => { const k = el("canvas"); row.append(el("div", { style: "text-align:center" }, k, el("div", { class: "muted" }, `${q.name} · ${(100 * q.prob).toFixed(1)}%`))); laterOrNow(root, () => drawOverlay(k, c.image, q.cam, { size: 150, opacity: 0.65 })); });
+    cmp.append(row);
+  } catch (e) { cmp.append(el("p", { class: "warn" }, e.message)); }
+}
+async function tabActs(root, stale) {
+  if (needImage(root)) return;
+  const layers = X.info.layers; let layer = store.get("xlayer", null);
+  if (!layers.some(l => l.name === layer)) layer = layers[Math.min(1, layers.length - 1)].name;
+  const units = store.get("xunits", 64);
+  root.append(el("div", { class: "controls" },
+    el("label", { class: "ctl" }, "Layer", el("select", { "data-fkey": "x:layer", onchange: e => { store.set("xlayer", e.target.value); renderXTab(); } }, layers.map(l => el("option", { value: l.name, selected: l.name === layer }, `${l.name} · ${l.kind}`)))),
+    el("label", { class: "ctl" }, "Units", el("select", { "data-fkey": "x:units", onchange: e => { store.set("xunits", +e.target.value); renderXTab(); } }, [16, 32, 64, 128, 256].map(n => el("option", { value: n, selected: n === units }, n))))));
+  const r = await api("/api/features", { image: X.img, layer, max_units: units });
+  if (stale()) return;
+  const card = el("div", { class: "card" }, el("h2", {}, el("span", { class: "grow" }, `${r.layer}`), el("span", { class: "pill" }, `${r.n} of ${r.total} units, strongest first`)));
+  card.append(el("p", { class: "note" }, `Blue negative, white zero, red positive, one shared scale (±${fmt(r.scale)}). ${X.cam ? "Updating live from the camera." : "Changes with the image — try the camera or sketch pad for live maps."}`));
+  root.append(card);
+  const big = el("div", { id: "unitBig" });
+  later(root, () => mapGrid(card, { n: r.n, h: r.h, w: r.w, data: r.data, scale: r.scale, labels: r.units.map((u, k) => `#${u} · ${fmt(r.means[k], 2)}`), tile: r.h === 1 ? 44 : 76,
+    onPick: k => { const z = b64f32(r.data).slice(k * r.h * r.w, (k + 1) * r.h * r.w); big.replaceChildren(el("h2", {}, `unit ${r.units[k]} · mean ${fmt(r.means[k])}`)); mapGrid(big, { n: 1, h: r.h, w: r.w, data: floatB64(z), scale: r.scale, labels: [""], tile: 280 }); } }));
+  card.append(big);
+}
+function floatB64(arr) { const b = new Uint8Array(new Float32Array(arr).buffer); let s = ""; for (let i = 0; i < b.length; i++) s += String.fromCharCode(b[i]); return btoa(s); }
+async function tabKernels(root, stale) {
+  const convs = X.info.convs;
+  if (!convs.length) return xEmpty(root, "This architecture has no convolution layers.");
+  let layer = store.get("xconv", convs[0]); if (!convs.includes(layer)) layer = convs[0];
+  root.append(el("div", { class: "controls" }, el("label", { class: "ctl" }, "Convolution", el("select", { "data-fkey": "x:conv", onchange: e => { store.set("xconv", e.target.value); renderXTab(); } }, convs.map(c => el("option", { value: c, selected: c === layer }, c))))));
+  const r = await api("/api/kernels", { layer, max_units: 128 });
+  if (stale()) return;
+  const card = el("div", { class: "card" }, el("h2", {}, el("span", { class: "grow" }, r.layer), el("span", { class: "pill" }, `${r.n} of ${r.total} filters · ${r.k}×${r.k} · ${r.in_channels} input channels`)),
+    el("p", { class: "note" }, r.rgb ? "First-layer RGB filters: gray = 0, each channel stretched by the shared scale." : "Each filter averaged over its input channels (blue negative, red positive)."));
+  root.append(card);
+  later(root, () => mapGrid(card, { n: r.n, h: r.k, w: r.k, data: r.data, scale: r.scale, rgb: r.rgb, c: r.c, labels: [...Array(r.n).keys()].map(i => `#${i}`), tile: 56 }));
+}
+async function tabOccl(root, stale) {
+  if (needImage(root)) return;
+  const size = X.info.config.crop, patch = store.get("opatch", Math.max(1, Math.round(size / 6)));
+  root.append(el("div", { class: "controls" },
+    el("label", { class: "ctl" }, "Patch (px)", el("input", { type: "number", min: 1, max: size, step: 1, value: patch, "data-fkey": "x:patch", onchange: e => { store.set("opatch", +e.target.value); renderXTab(); } })),
+    el("span", { class: "note", style: "margin:0" }, `Covers each ${patch}×${patch} square with gray and measures how much the probability of “${X.info.classes[X.pred?.target ?? 0]}” drops. Model-agnostic and exact, unlike gradients.`)));
+  const r = await api("/api/occlusion", { image: X.img, target: X.pred?.target, patch });
+  if (stale()) return;
+  const card = el("div", { class: "card" }), cv = el("canvas");
+  card.append(el("h2", {}, `${r.name}: base probability ${(100 * r.base).toFixed(1)}%`), cv, el("p", { class: "note" }, "Highlighted = covering this area lowers the class probability the most (the evidence the model relies on)."));
+  root.append(card);
+  later(root, () => drawOverlay(cv, r.image, r.map, { size: 360, opacity: 0.7 }));
+}
+let dreamTimer = null;
+async function tabDream(root, stale) {
+  const t = X.targets || (X.targets = await api("/api/dream/targets"));
+  if (stale()) return;
+  const d = store.get("dream", { kind: "class", cls: 0, module: t.encoder[0]?.module || "", unit: 0, head: 0, steps: 200, lr: 0.05, setup: 0, optimizer: 0, suppress: false, fromImage: false });
+  const save = () => store.set("dream", d);
+  const kinds = [["class", "Class"], ...(t.head.length ? [["head", "Head neuron"]] : []), ...(t.encoder.length ? [["encoder", "Encoder unit"]] : [])];
+  const enc = t.encoder.find(e => e.module === d.module) || t.encoder[0];
+  const form = el("div", { class: "form-grid" },
+    el("label", { class: "ctl" }, "Target", el("select", { "data-fkey": "d:kind", onchange: e => { d.kind = e.target.value; save(); renderXTab(); } }, kinds.map(([v, n]) => el("option", { value: v, selected: v === d.kind }, n)))),
+    d.kind === "class" ? el("label", { class: "ctl" }, "Class", el("select", { "data-fkey": "d:cls", onchange: e => { d.cls = +e.target.value; save(); } }, t.classes.map((c, i) => el("option", { value: i, selected: i === d.cls }, c.label.replace(/^class /, ""))))) : null,
+    d.kind === "head" ? el("label", { class: "ctl" }, "Neuron", el("select", { "data-fkey": "d:head", onchange: e => { d.head = +e.target.value; save(); } }, t.head.map((h, i) => el("option", { value: i, selected: i === d.head }, h.label)))) : null,
+    d.kind === "encoder" ? el("label", { class: "ctl" }, "Layer", el("select", { "data-fkey": "d:module", onchange: e => { d.module = e.target.value; d.unit = 0; save(); renderXTab(); } }, t.encoder.map(e => el("option", { value: e.module, selected: e.module === d.module }, `${e.module} (${e.count})`)))) : null,
+    d.kind === "encoder" ? el("label", { class: "ctl" }, `Unit (0–${(enc?.count || 1) - 1})`, el("input", { type: "number", min: 0, max: (enc?.count || 1) - 1, step: 1, value: d.unit, "data-fkey": "d:unit", onchange: e => { d.unit = +e.target.value; save(); } })) : null,
+    el("label", { class: "ctl" }, "Steps", el("input", { type: "number", min: 1, step: 10, value: d.steps, "data-fkey": "d:steps", onchange: e => { d.steps = +e.target.value; save(); } })),
+    el("label", { class: "ctl" }, "Learning rate", el("input", { type: "number", min: 0, step: 0.01, value: d.lr, "data-fkey": "d:lr", onchange: e => { d.lr = +e.target.value; save(); } })),
+    el("label", { class: "ctl" }, "Parameterization", el("select", { "data-fkey": "d:setup", onchange: e => { d.setup = +e.target.value; save(); } }, G.opts.dream_setups.map((n, i) => el("option", { value: i, selected: i === d.setup }, n)))),
+    el("label", { class: "ctl" }, "Optimizer", el("select", { "data-fkey": "d:opt", onchange: e => { d.optimizer = +e.target.value; save(); } }, G.opts.dream_optimizers.map((n, i) => el("option", { value: i, selected: i === d.optimizer }, n)))),
+    el("label", { class: "ctl check" }, el("input", { type: "checkbox", checked: d.suppress, "data-fkey": "d:sup", onchange: e => { d.suppress = e.target.checked; save(); } }), "Suppress the layer's other units"),
+    el("label", { class: "ctl check" }, el("input", { type: "checkbox", checked: d.fromImage, "data-fkey": "d:from", onchange: e => { d.fromImage = e.target.checked; save(); } }), "Start from the current image"));
+  const img = el("img", { class: "pix dreamimg" }), chart = el("div"), status = el("div", { class: "muted" });
+  const card = el("div", { class: "card" }, el("h2", {}, "DeepDream / activation maximization"), el("p", { class: "note" }, "Optimizes an input image to excite the chosen class, neuron or channel; the image updates live."), form,
+    el("div", { class: "row-flex", style: "margin-top:10px" },
+      el("button", { class: "primary", onclick: async () => {
+        const target = d.kind === "class" ? t.classes[d.cls] : d.kind === "head" ? t.head[d.head] : { module: d.module, unit: d.unit, axis: enc.axis };
+        try { await api("/api/dream/start", { ...target, steps: d.steps, lr: d.lr, setup: d.setup, optimizer: d.optimizer, suppress: d.suppress, starter: d.fromImage ? X.img : null }); pollDream(img, chart, status); }
+        catch (e) { toast(e.message); } } }, "Dream"),
+      el("button", { onclick: () => api("/api/dream/stop") }, "Stop")),
+    el("div", { class: "row-flex", style: "align-items:flex-start;margin-top:10px" }, img, el("div", { style: "flex:1;min-width:240px" }, status, chart)));
+  root.append(card);
+  later(root, () => pollDream(img, chart, status));
+}
+async function pollDream(img, chartBox, status) {
+  clearTimeout(dreamTimer);
+  if (!img.isConnected) return;
+  const s = await api("/api/dream/status").catch(() => null); if (!s) return;
+  if (s.image) img.src = s.image;
+  status.textContent = s.state === "idle" ? "not started" : `${s.state} · step ${s.step} of ${s.steps}` + (s.error ? ` · ${s.error}` : "");
+  if (s.values.length > 1) { chartBox.replaceChildren(); const c = new Chart(chartBox, { height: 200, title: "Target activation" }); drawLine(c, { x: s.values.map(v => v[0]), lines: [{ name: "activation", y: s.values.map(v => v[1]), color: series()[1], highlight: true }], xLabel: "step", yLabel: "activation" }); }
+  if (s.state === "running") dreamTimer = setTimeout(() => pollDream(img, chartBox, status), 600);
+}
+async function tabEval(root, stale) {
+  const src = store.get("evalsrc", "");
+  const input = el("input", { type: "text", value: src, placeholder: X.info.has_split ? "empty = this run's validation split" : "folder or dataset .json to evaluate", "data-fkey": "x:evalsrc", style: "flex:1;min-width:220px", onchange: e => store.set("evalsrc", e.target.value.trim()) });
+  const out = el("div");
+  root.append(el("div", { class: "card" }, el("h2", {}, "Evaluate"), el("div", { class: "row-flex" }, input, el("button", { class: "primary", onclick: async e => {
+    e.target.disabled = true; e.target.textContent = "Evaluating…";
+    try { X.evalResult = await api("/api/evaluate", { source: input.value.trim() || null }); renderXTab(); } catch (err) { toast(err.message); e.target.disabled = false; e.target.textContent = "Evaluate"; } } }, "Evaluate")),
+    el("p", { class: "note" }, "Accuracy, per-class accuracy, confusion matrix and the most confidently wrong images (click one to inspect it).")), out);
+  const r = X.evalResult; if (!r) return;
+  const k = r.classes.length;
+  const card = el("div", { class: "card" }, el("h2", {}, `${r.source}: ${r.n} images`), kv("accuracy", (100 * r.accuracy).toFixed(2) + "%", "balanced accuracy", (100 * r.balanced_accuracy).toFixed(2) + "%", "misclassified", r.wrong.length + (r.wrong.length === 200 ? "+" : "")));
+  const two = el("div", { class: "two" }), c1 = el("div"), c2 = el("div"); two.append(c1, c2); card.append(two); out.append(card);
+  const bars = new Chart(c1, { title: "Per-class accuracy" }), cm = new Chart(c2, { title: "Confusion matrix", sub: "rows true, columns predicted" });
+  later(root, () => {
+    drawHBars(bars, { labels: r.classes, values: r.per_class, valueLabel: "accuracy", colorPos: series()[0], colorNeg: series()[7] });
+    const z = new Float32Array(k * k), seq = seqScale(); let mx = 1;
+    r.confusion.forEach((row, a) => row.forEach((v, p) => { z[a * k + p] = v; mx = Math.max(mx, v); }));
+    drawHeat(cm, { z, nx: k, ny: k, xVals: [...Array(k).keys()], yVals: [...Array(k).keys()], xCats: r.classes, yCats: r.classes, xLabel: "predicted", yLabel: "true", square: true, left: 80, yDown: true,
+      colorFn: v => seq(v / mx), valueText: (i, j, v) => `true <b>${esc(r.classes[j])}</b>, predicted <b>${esc(r.classes[i])}</b>: ${v}` });
+  });
+  if (r.wrong.length) out.append(el("div", { class: "card" }, el("h2", {}, "Most confidently wrong"), el("div", { class: "samples" }, r.wrong.slice(0, 60).map(w => el("div", { class: "sample", style: "cursor:pointer", title: w.path, onclick: () => { setImage({ path: w.path }, baseName(w.path), w.true); X.tab = "maps"; renderExplore(); } },
+    el("img", { src: thumbUrl(w.path, 112), loading: "lazy" }), el("span", {}, `${w.true} → ${w.pred} ${(100 * w.confidence).toFixed(0)}%`))))));
+}
+
+// camera: frames go to the model a few times a second while the Explore page is open
+async function startCamera() {
+  if (!navigator.mediaDevices?.getUserMedia) return toast("Camera needs a secure page (http://127.0.0.1 or https) and browser support.");
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" }, audio: false });
+    const video = el("video", { autoplay: true, playsinline: true, muted: true }); video.srcObject = stream; await video.play();
+    X.cam = { stream, video };
+    const grab = el("canvas");
+    const tick = async () => {
+      if (!X.cam) return;
+      if (G.page === "explore" && !X.busy && video.videoWidth) {
+        const s = Math.min(video.videoWidth, video.videoHeight), side = 256;
+        grab.width = side; grab.height = side;
+        grab.getContext("2d").drawImage(video, (video.videoWidth - s) / 2, (video.videoHeight - s) / 2, s, s, 0, 0, side, side);
+        X.img = { data: grab.toDataURL("image/jpeg", 0.85) }; X.imgLabel = "camera (live)"; X.truth = null;
+        X.busy = true;
+        try { await predictNow(); if (["maps", "acts"].includes(X.tab)) await renderXTab(); } finally { X.busy = false; }
+      }
+      X.camTimer = setTimeout(tick, 400);
+    };
+    renderSidebar(); tick();
+  } catch (e) { toast("Camera: " + e.message); }
+}
+function stopCamera() { if (X.cam) { X.cam.stream.getTracks().forEach(t => t.stop()); clearTimeout(X.camTimer); X.cam = null; renderSidebar(); } }
+
+// sketch pad: draw, and the model predicts as you go
+function openSketch() {
+  const size = 280, cv = el("canvas", { width: size, height: size, class: "sketch" }), ctx = cv.getContext("2d");
+  let ink = "#000000", bg = "#ffffff", brush = 18, drawing = false, last = null;
+  const clear = () => { ctx.fillStyle = bg; ctx.fillRect(0, 0, size, size); };
+  clear();
+  const pt = e => { const r = cv.getBoundingClientRect(), t = e.touches ? e.touches[0] : e; return [(t.clientX - r.left) * size / r.width, (t.clientY - r.top) * size / r.height]; };
+  const send = debounce(() => setImage({ data: cv.toDataURL("image/png") }, "sketch"), 150);
+  const start = e => { drawing = true; last = pt(e); e.preventDefault(); move(e); };
+  const move = e => { if (!drawing) return; e.preventDefault(); const p = pt(e); ctx.strokeStyle = ink; ctx.lineWidth = brush; ctx.lineCap = "round"; ctx.beginPath(); ctx.moveTo(...last); ctx.lineTo(...p); ctx.stroke(); last = p; send(); };
+  const end = () => { drawing = false; };
+  cv.addEventListener("mousedown", start); cv.addEventListener("mousemove", move); addEventListener("mouseup", end);
+  cv.addEventListener("touchstart", start, { passive: false }); cv.addEventListener("touchmove", move, { passive: false }); cv.addEventListener("touchend", end);
+  const dlg = el("div", { class: "modal" }, el("div", { class: "card" }, el("h2", {}, el("span", { class: "grow" }, "Sketch pad"), el("button", { onclick: () => dlg.remove() }, "Close")),
+    cv, el("div", { class: "row-flex", style: "margin-top:8px" },
+      el("label", { class: "ctl check" }, "brush", el("input", { type: "range", min: 2, max: 60, value: brush, oninput: e => { brush = +e.target.value; } })),
+      el("button", { onclick: () => { [ink, bg] = [bg, ink]; clear(); send(); } }, "Invert colors"),
+      el("button", { onclick: () => { clear(); send(); } }, "Clear")),
+    el("p", { class: "note" }, "The prediction and maps update as you draw.")));
+  document.body.append(dlg);
+}
+
+// ───────────────────────── pages / boot ─────────────────────────
+function showPage(page) {
+  G.page = page; store.set("page", page);
+  for (const b of $("#modes").children) b.classList.toggle("active", b.dataset.page === page);
+  for (const p of ["dataset", "train", "explore"]) $("#" + p + "Page").hidden = p !== page;
+  history.replaceState(null, "", "#" + page);
+  if (page === "dataset") renderDataset(); else if (page === "train") renderTrain(); else renderExplore();
+}
+async function boot() {
+  const theme = store.get("theme", null); if (theme) document.documentElement.dataset.theme = theme;
+  $("#themeBtn").onclick = () => {
+    const dark = document.documentElement.dataset.theme ? document.documentElement.dataset.theme === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
+    document.documentElement.dataset.theme = dark ? "light" : "dark"; store.set("theme", document.documentElement.dataset.theme); showPage(G.page);
+  };
+  for (const b of $("#modes").children) b.onclick = () => showPage(b.dataset.page);
+  try { G.opts = await api("/api/options"); } catch (e) { toast("Server unreachable: " + e.message); return; }
+  $("#deviceInfo").textContent = `device: ${G.opts.device} · ${G.opts.cwd}`;
+  const want = location.hash.slice(1);
+  showPage(["dataset", "train", "explore"].includes(want) ? want : store.get("page", "dataset"));
+  pollTrain();
+  let rw, lastW = innerWidth;
+  addEventListener("resize", () => { clearTimeout(rw); rw = setTimeout(() => { if (innerWidth !== lastW) whenNotTyping(() => { lastW = innerWidth; showPage(G.page); }); }, 150); });
+}
+boot();
+</script>
+</body>
+</html>

@@ -72,6 +72,81 @@ from pau import PAU      # PAU activation (if needed)
 from lamb import *  # Lamb, GoLU, and AdamMHD
 #from hypergrad import SGDHD
 
+
+class PaWeL(nn.Module):
+    """torchpwl.PWL for MLPs: one learnable piecewise-linear function per neuron.
+
+    Same parameters, initialization and math as torchpwl.PWL (x_positions [C, K],
+    slopes [C, K+1], biases [C]; K breakpoints, K+1 segments, outer segments extend
+    linearly), but channels live on the LAST dim, so [N, C] (or [..., C]) works
+    directly without the conv-style [N, C, 1, 1] reshape. C is taken from the first
+    forward pass or from a loaded checkpoint. Legacy lamb.PaWeL checkpoints (one
+    shared keypoint set, x_points/y_points) are converted to the identical function.
+    """
+    def __init__(self, breakpoints=32, num_channels=None):
+        super().__init__()
+        self.num_breakpoints = int(breakpoints)
+        if self.num_breakpoints < 1:
+            raise ValueError("PaWeL needs at least 1 breakpoint.")
+        self.num_channels = None
+        for name in ("x_positions", "slopes", "biases"):
+            self.register_parameter(name, None)
+        self.register_buffer("_anchor", torch.empty(0), persistent=False)  # tracks .to(device)
+        if num_channels is not None:
+            self._build(num_channels)
+
+    def _build(self, num_channels):
+        c, k = int(num_channels), self.num_breakpoints
+        kw = dict(device=self._anchor.device, dtype=self._anchor.dtype)
+        self.num_channels = c
+        self.x_positions = nn.Parameter(torch.empty(c, k, **kw))
+        self.slopes = nn.Parameter(torch.ones(c, k + 1, **kw))
+        self.biases = nn.Parameter(torch.empty(c, **kw))
+        with torch.no_grad():
+            nn.init.normal_(self.x_positions, std=2.0)
+            self.biases.copy_(torch.sort(self.x_positions, dim=1)[0][:, 0])
+
+    def breakpoint_values(self):
+        """Sorted breakpoint x positions [C, K] and the function value at each [C, K]."""
+        xp = torch.sort(self.x_positions, dim=1)[0]
+        steps = (xp[:, 1:] - xp[:, :-1]) * self.slopes[:, 1:self.num_breakpoints]
+        ys = torch.cat([self.biases.unsqueeze(1), self.biases.unsqueeze(1) + torch.cumsum(steps, dim=1)], dim=1)
+        return xp, ys
+
+    def forward(self, x):
+        if self.x_positions is None:
+            self._build(x.size(-1))
+        c = self.num_channels
+        if c != 1 and x.size(-1) != c:
+            raise ValueError(f"PaWeL was built for {c} channels, got input with {x.size(-1)}.")
+        xs = x.reshape(1, -1) if c == 1 else x.reshape(-1, c).t()  # [C, N]
+        xp, ys = self.breakpoint_values()
+        j = torch.searchsorted(xp.contiguous(), xs.contiguous(), right=True) - 1  # last breakpoint <= x
+        anchor = j.clamp(min=0)
+        out = (torch.gather(ys, 1, anchor)
+               + (xs - torch.gather(xp, 1, anchor)) * torch.gather(self.slopes, 1, j + 1))
+        return out.reshape(x.shape) if c == 1 else out.t().reshape(x.shape)
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        old_x, old_y = prefix + "x_points", prefix + "y_points"
+        if old_x in state_dict and old_y in state_dict:
+            xp, order = torch.sort(state_dict.pop(old_x).reshape(1, -1), dim=1)
+            yp = state_dict.pop(old_y).reshape(1, -1)[:, order[0]]
+            seg = (yp[:, 1:] - yp[:, :-1]) / (xp[:, 1:] - xp[:, :-1] + 1e-6)
+            slopes = torch.cat([seg[:, :1], seg, seg[:, -1:]], dim=1)
+            c = self.num_channels or 1
+            state_dict[prefix + "x_positions"] = xp.expand(c, -1).clone()
+            state_dict[prefix + "slopes"] = slopes.expand(c, -1).clone()
+            state_dict[prefix + "biases"] = yp[:, 0].expand(c).clone()
+        key = prefix + "x_positions"
+        if key in state_dict:
+            shape = state_dict[key].shape
+            if shape[1] != self.num_breakpoints:
+                self.num_breakpoints = int(shape[1]); self.num_channels = None
+            if self.num_channels != shape[0]:
+                self._build(shape[0])
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+
 class SelfGatedActivation(nn.Module):
     """Self-gated: f(x) = x * af(x)"""
     def __init__(self, activation_fn):
@@ -183,7 +258,7 @@ def _get_all_activation_list():
     """Build the list of (name, factory) for every non-Custom activation.
     Called at module init time so new activations added to the map are picked up."""
     amap = _build_activation_map()
-    exclude = {"Custom", "All"}
+    exclude = {"Custom", "All", "Maxout"}
     return [(name, factory) for name, factory in amap.items() if name not in exclude]
 
 
@@ -203,17 +278,27 @@ class GumbelActivationSelector(nn.Module):
         self._act_names = None
 
     def _lazy_build(self, hidden_size, device, dtype):
-        act_list = _get_all_activation_list()
-        self._act_names = [name for name, _ in act_list]
-        n = len(act_list)
-        activations = []
-        for name, factory in act_list:
+        # Keep only candidates that build and give finite values and gradients on a fixed
+        # probe; one NaN candidate poisons the whole weighted mix (0 * NaN = NaN). The probe
+        # is deterministic, so training and checkpoint loading build the same list.
+        probe = torch.randn(64, hidden_size, generator=torch.Generator().manual_seed(0)) * 3
+        names, activations, dropped = [], [], []
+        for name, factory in _get_all_activation_list():
             try:
-                # Some activations need hidden_size (MVPOG, PaWeL etc.)
                 act = factory()
+                x = probe.clone().requires_grad_(True)
+                with torch.enable_grad():  # first forward usually runs under no_grad (dry run)
+                    y = act(x)
+                    y.sum().backward()
+                ok = y.shape == x.shape and bool(torch.isfinite(y).all()) and bool(torch.isfinite(x.grad).all())
+                for p in act.parameters(): p.grad = None
             except Exception:
-                act = nn.Identity()
-            activations.append(act)
+                ok = False
+            if ok: names.append(name); activations.append(act)
+            else: dropped.append(name)
+        if dropped: print(f"  Gumbel 'All': skipping candidates that fail or produce NaN/inf: {', '.join(dropped)}")
+        self._act_names = names
+        n = len(activations)
         self.activations = nn.ModuleList(activations)
         self.logits = nn.Parameter(torch.zeros(n, device=device, dtype=dtype))
         self.log_temp = nn.Parameter(torch.tensor(float(np.log(self.init_temp)),
@@ -234,17 +319,11 @@ class GumbelActivationSelector(nn.Module):
 
         temp = self.log_temp.exp().clamp(min=0.01)
 
-        if self.training:
-            # Gumbel-Softmax (straight-through variant)
-            weights = F.gumbel_softmax(self.logits, tau=temp, hard=False)
-        else:
-            # At eval time, use hard argmax (crystallized choice)
-            weights = F.softmax(self.logits / temp, dim=0)
-            # Use hard selection
-            idx = weights.argmax()
-            hard = torch.zeros_like(weights)
-            hard[idx] = 1.0
-            weights = hard
+        if not self.training:
+            # Eval: run only the crystallized choice (0 * inf from other candidates would be NaN)
+            return self.activations[int(self.logits.argmax())](x)
+        # Gumbel-Softmax (straight-through variant)
+        weights = F.gumbel_softmax(self.logits, tau=temp, hard=False)
 
         # Apply each activation and combine
         result = torch.zeros_like(x)
@@ -509,6 +588,31 @@ class MoELinear(nn.Module):
         if squeeze: output = output.squeeze(0)
         return output
 
+class MaxoutActivation(nn.Module):
+    """Configuration marker for true Maxout, implemented by MaxoutLinear."""
+    def __init__(self, pieces=2):
+        super().__init__()
+        if pieces < 2: raise ValueError("Maxout requires at least two pieces.")
+        self.pieces = pieces
+
+    def forward(self, x):
+        return x
+
+class MaxoutLinear(nn.Module):
+    """Maximum over learned affine projections for every output feature."""
+    def __init__(self, in_features, out_features, pieces=2, bias=True):
+        super().__init__()
+        self.in_features = in_features; self.out_features = out_features; self.pieces = pieces
+        self.weight = nn.Parameter(torch.empty(pieces, out_features, in_features))
+        self.bias = nn.Parameter(torch.empty(pieces, out_features)) if bias else None
+        nn.init.kaiming_uniform_(self.weight, a=0, mode='fan_in', nonlinearity='relu')
+        if self.bias is not None: nn.init.zeros_(self.bias)
+
+    def forward(self, x):
+        values = torch.einsum('...i,poi->...po', x, self.weight)
+        if self.bias is not None: values = values + self.bias
+        return values.max(dim=-2).values
+
 class LoRAHyperLinear(nn.Module):
     def __init__(self, in_features, out_features, rank=8, alpha=1.0, context_mode="x_full", context_dim=None, per_sample=True):
         super().__init__()
@@ -597,17 +701,31 @@ def functional_norm(x, norm_type, groups=1, eps=1e-5, batch_params=None):
 ##############################################
 # Residual Block
 ##############################################
+class FeatureGRN(nn.Module):
+    """GRN for a tabular feature vector, normalized within each example."""
+    def __init__(self, features):
+        super().__init__()
+        self.gamma = nn.Parameter(torch.zeros(features))
+        self.beta = nn.Parameter(torch.zeros(features))
+
+    def forward(self, x):
+        response = x.float().abs()
+        relative = (response / (response.mean(dim=-1, keepdim=True) + 1e-6)).to(x.dtype)
+        return x + self.gamma.to(x.dtype) * x * relative + self.beta.to(x.dtype)
+
+
 class ResidualBlock(nn.Module):
     def __init__(self, in_dim, out_dim, activation_cls, residual_type="residual",
                  norm_type="layer", groups=1, attention_type="none", num_heads=1,
                  moe_experts=1, use_noise_injection_layers=False, noise_injection_std=0.0,
-                 hyper_context="x_full", hyper_context_dim=64, hyper_film_per_sample=False,
+                 hyper_context="x_full", hyper_context_dim=64, hyper_film_per_sample=False, use_grn=False,
                  hyper_per_sample=True, hyper_low_rank_k=None):
         super().__init__()
         self.residual_type = residual_type.lower(); self.norm_type = norm_type.lower()
         self.attention_type = attention_type.lower(); self.use_moe = moe_experts > 1
         self.use_hyper = moe_experts < 1 and moe_experts > -4
         self.in_dim = in_dim; self.out_dim = out_dim
+        self.grn = FeatureGRN(in_dim + out_dim if self.residual_type == "concat" else out_dim) if use_grn else nn.Identity()
         self.noise = use_noise_injection_layers; self.std = noise_injection_std; self.groups = groups
         self.use_sgu = (moe_experts == -4 or moe_experts == -5)
         self.use_tiny_attn = (moe_experts == -5)
@@ -628,8 +746,12 @@ class ResidualBlock(nn.Module):
         elif self.norm_type == "rmsnorm": self.norm = RMSNorm(norm_dim)
         else: raise ValueError(f"Unknown norm_type: {norm_type}")
 
+        activation_probe = activation_cls()
+        self.use_maxout = isinstance(activation_probe, MaxoutActivation)
         lin1_out_dim = out_dim * 2 if self.use_sgu else out_dim
-        if self.use_moe:
+        if self.use_maxout:
+            self.linear1 = MaxoutLinear(in_dim, out_dim, pieces=activation_probe.pieces)
+        elif self.use_moe:
             self.linear1 = MoELinear(in_dim, lin1_out_dim, num_experts=moe_experts, activation=nn.Identity())
         elif self.use_hyper:
             self.linear1 = LoRAHyperLinear(in_dim, lin1_out_dim, rank=(hyper_low_rank_k or 8), alpha=1.0,
@@ -638,7 +760,7 @@ class ResidualBlock(nn.Module):
         else:
             self.linear1 = nn.Linear(in_dim, lin1_out_dim, bias=True)
 
-        if not self.use_sgu: self.activation = activation_cls()
+        if not self.use_sgu and not self.use_maxout: self.activation = activation_probe
         else: self.activation = None
         act_name = activation_cls.__name__ if hasattr(activation_cls, '__name__') else activation_cls().__class__.__name__
         if self.use_sgu: self.sgu = SpatialGatingUnit(lin1_out_dim)
@@ -650,7 +772,7 @@ class ResidualBlock(nn.Module):
         if self.use_tiny_attn: self.tiny_attn = TinyAttention(out_dim, attn_dim=64)
         else: self.tiny_attn = None
 
-        if not self.use_hyper and not self.use_sgu:
+        if not self.use_hyper and not self.use_sgu and not self.use_maxout:
             self._init_weights(self.linear1, act_name)
             if self.linear2 is not None: self._init_weights(self.linear2, "Linear")
 
@@ -709,7 +831,7 @@ class ResidualBlock(nn.Module):
         if self.linear2 is not None: z = self.linear2(z)
         if self.use_tiny_attn: z = z + self.tiny_attn(z)
         if self.attn is not None: z = self.attn(z)
-        return self._apply_residual_nonhyper(z, x)
+        return self.grn(self._apply_residual_nonhyper(z, x))
 
     def output_dim(self):
         if self.residual_type == "concat": return self.in_dim + self.out_dim
@@ -822,10 +944,11 @@ class InputFeatureGraph(nn.Module):
 class GNNResidualBlock(nn.Module):
     """A residual block that includes GNN message passing on latent features."""
     def __init__(self, in_dim, out_dim, activation_cls, residual_type="residual",
-                 norm_type="layer", groups=1):
+                 norm_type="layer", groups=1, use_grn=False):
         super().__init__()
         self.residual_type = residual_type.lower()
         self.in_dim = in_dim; self.out_dim = out_dim
+        self.grn = FeatureGRN(in_dim + out_dim if self.residual_type == "concat" else out_dim) if use_grn else nn.Identity()
 
         # Pre-norm
         if norm_type == "none": self.norm = nn.Identity()
@@ -892,16 +1015,16 @@ class GNNResidualBlock(nn.Module):
         if self.linear2 is not None: z = self.linear2(z)
         
         # Residual
-        if self.residual_type == "none": return z
+        if self.residual_type == "none": return self.grn(z)
         elif self.residual_type == "highway":
             skip = self.skip(x); gate = torch.sigmoid(self.gate(x))
-            return gate * z + (1 - gate) * skip
+            return self.grn(gate * z + (1 - gate) * skip)
         elif self.residual_type == "rezero":
-            return self.gamma * z + self.skip(x) * self.beta
+            return self.grn(self.gamma * z + self.skip(x) * self.beta)
         elif self.residual_type == "concat":
-            return torch.cat([x, z], dim=-1)
+            return self.grn(torch.cat([x, z], dim=-1))
         else:
-            return z + self.skip(x)
+            return self.grn(z + self.skip(x))
 
     def output_dim(self):
         if self.residual_type == "concat": return self.in_dim + self.out_dim
@@ -914,7 +1037,7 @@ class GNNMLPO(nn.Module):
     Now includes an Input Feature Graph to learn relationships between raw inputs.
     """
     def __init__(self, input_dim, hidden_dims, output_dim, activation_cls, residual_type="residual",
-                 norm_type="layer", groups=1, dropout_prob=0.0):
+                 norm_type="layer", groups=1, dropout_prob=0.0, use_grn=False):
         super().__init__()
         self.residual_type = residual_type.lower()
         self.dropout_prob = dropout_prob
@@ -932,7 +1055,7 @@ class GNNMLPO(nn.Module):
         for hd in hidden_dims:
             block_res = "none" if self.residual_type == "densenet" else residual_type
             block = GNNResidualBlock(current_dim, hd, activation_cls, block_res,
-                                     norm_type=norm_type, groups=groups)
+                                     norm_type=norm_type, groups=groups, use_grn=use_grn)
             self.blocks.append(block)
             if self.residual_type == "concat": current_dim = current_dim + hd
             elif self.residual_type == "densenet": current_dim = current_dim + hd
@@ -973,10 +1096,16 @@ class MLPO(nn.Module):
                  norm_type="layer", groups=1, attention_type="none", num_heads=1,
                  input_attention_type="none", moe_mode=1, dropout_prob=0.0,
                  use_noise_injection_layers=False, noise_injection_std=0.01,
-                 final_lora_rank=8, final_lora_alpha=1.0, final_hyper_context_dim=64, final_lora_per_sample=True):
+                 final_lora_rank=8, final_lora_alpha=1.0, final_hyper_context_dim=64, final_lora_per_sample=True,
+                 layer_routing="none", use_grn=False):
         super().__init__()
         self.residual_type = residual_type.lower(); self.dropout_prob = dropout_prob
         self.use_noise_injection_layers = use_noise_injection_layers; self.moe_mode = moe_mode
+        self.layer_routing = layer_routing
+        if layer_routing not in ("none", "adaptive"):
+            raise ValueError("layer_routing must be 'none' or 'adaptive'.")
+        if layer_routing == "adaptive" and (self.residual_type != "residual" or moe_mode != 1):
+            raise ValueError("Adaptive layer routing requires standard residual blocks with MoE mode 1 (off).")
 
         self.input_attention_type = input_attention_type.lower()
         if self.input_attention_type == "basic": self.input_attn = BasicSelfAttention(input_dim)
@@ -990,6 +1119,8 @@ class MLPO(nn.Module):
         self.noise_injection = NoiseInjectionLayer(std=noise_injection_std) if use_noise_injection_layers else None
 
         self.blocks = nn.ModuleList()
+        self.layer_routers = nn.ModuleList()
+        self._last_router_probs = []
         current_dim = input_dim
         for i, hidden_dim in enumerate(hidden_dims):
             block_in_dim = current_dim
@@ -999,8 +1130,12 @@ class MLPO(nn.Module):
             block = ResidualBlock(block_in_dim, hidden_dim, activation_cls, block_res,
                 norm_type=norm_type, groups=groups, attention_type=attention_type, num_heads=num_heads,
                 moe_experts=moe_mode, use_noise_injection_layers=use_noise_injection_layers,
-                noise_injection_std=noise_injection_std)
+                noise_injection_std=noise_injection_std, use_grn=use_grn)
             self.blocks.append(block)
+            if self.layer_routing == "adaptive":
+                router = nn.Linear(block_in_dim, 1)
+                nn.init.zeros_(router.weight); nn.init.zeros_(router.bias)
+                self.layer_routers.append(router)
             if self.residual_type == "concat": current_dim = block_in_dim + hidden_dim
             elif self.residual_type == "densenet": current_dim = current_dim + hidden_dim
             else: current_dim = hidden_dim
@@ -1014,6 +1149,9 @@ class MLPO(nn.Module):
             elif m in [-4, -5]: return "learned"
             else: return "x_full"
 
+        is_maxout = any(getattr(block, 'use_maxout', False) for block in self.blocks)
+        if is_maxout and moe_mode != 1:
+            raise ValueError("True Maxout cannot be combined with MoE/Hyper/gMLP modes.")
         if moe_mode > 1:
             self.final_linear = MoELinear(final_in_dim, output_dim, num_experts=moe_mode, activation=None)
             self._final_is_param_linear = False
@@ -1061,13 +1199,43 @@ class MLPO(nn.Module):
             out = torch.cat(outputs, dim=-1)
         else:
             out = x
-            for block in self.blocks:
-                out = block(out)
+            self._last_router_probs = []
+            for block_idx, block in enumerate(self.blocks):
+                if self.layer_routing == "adaptive":
+                    gate_prob = torch.sigmoid(self.layer_routers[block_idx](out))
+                    self._last_router_probs.append(gate_prob)
+                    skip = block.skip(out)
+                    if self.training:
+                        out = gate_prob * block(out) + (1.0 - gate_prob) * skip
+                    else:
+                        active = gate_prob.squeeze(-1) >= 0.5
+                        if out.dim() == 1:
+                            out = block(out) if active.item() else skip
+                        else:
+                            routed = skip.clone()
+                            if active.any(): routed[active] = block(out[active])
+                            out = routed
+                else:
+                    out = block(out)
                 if self.training:
                     if self.dropout_prob > 0.0: out = F.dropout(out, p=self.dropout_prob, training=True)
                     elif self.noise_injection is not None: out = self.noise_injection(out)
         out = self.final_linear(out) + self.final_skip(out)
         return out
+
+    def routing_loss(self):
+        """Encourage binary per-sample gates with roughly half the blocks active."""
+        if self.layer_routing != "adaptive" or not self._last_router_probs:
+            return next(self.parameters()).new_zeros(())
+        probs = torch.cat([p.reshape(-1) for p in self._last_router_probs])
+        target_penalty = (probs.mean() - 0.5).pow(2)
+        binary_penalty = (probs * (1.0 - probs)).mean()
+        return 0.1 * target_penalty + 0.01 * binary_penalty
+
+    def routing_usage(self):
+        if self.layer_routing != "adaptive" or not self._last_router_probs:
+            return None
+        return torch.cat([p.detach().reshape(-1) for p in self._last_router_probs]).mean().item()
 
     def get_all_learned_parameters(self):
         params = []
@@ -1081,60 +1249,102 @@ class MLPO(nn.Module):
 # NEW: Combined Loss (Huber + CrossEntropy)
 ##############################################
 class CombinedLoss(nn.Module):
-    def __init__(self, output_layout, column_weights=None):
-        """
-        column_weights: dict {col_name: torch.Tensor} 
-        containing the class weights for categorical columns.
-        """
+    """Loss over all output columns (Huber for numeric, cross-entropy for categorical).
+
+    With several output columns their losses live on different scales and the largest one
+    dominates the shared weights. `balancing` decides how they are combined:
+      "normalized" (default): each column's loss is divided by the loss of a trivial predictor
+          on the training data (mean value / class frequencies), then averaged. Every term is
+          unitless (1.0 = no better than guessing), weights are fixed, and the validation value
+          means the same thing all run long, so best-checkpoint selection stays sound.
+      "uwso": Soft Optimal Uncertainty Weighting (Kirchdorfer et al., GCPR 2024, Eq. 4):
+          w_k = softmax_k((1 / sg[L_k]) / T), L = sum_k w_k L_k. Adaptive; T needs tuning.
+          Validation still reports the "normalized" value so checkpoints stay comparable.
+      "legacy": the previous behaviour, mean(0.1 * Huber, CE).
+    A single output column is returned unweighted in every mode.
+    """
+    BALANCING = ("normalized", "uwso", "legacy")
+
+    def __init__(self, output_layout, column_weights=None, balancing="normalized", temperature=20.0):
         super().__init__()
+        if balancing not in self.BALANCING: raise ValueError(f"balancing must be one of {self.BALANCING}")
         self.output_layout = output_layout
         self.column_weights = column_weights if column_weights is not None else {}
         self.huber = nn.HuberLoss()
-        # We remove self.ce and use F.cross_entropy dynamically
-        
-    def forward(self, predictions, targets):
+        self.balancing = balancing; self.temperature = float(temperature)
+        self.baselines = None          # per-column trivial-predictor loss, set by calibrate()
+        self.last_task_losses = {}     # column -> latest normalized loss (for logging / GUI)
+
+    def _task_losses(self, predictions, targets):
         losses = []
-        
         for entry in self.output_layout:
             col_name = entry['col']
             pred_slice = predictions[:, entry['start']:entry['end']]
             tgt_slice = targets[:, entry['tgt_start']:entry['tgt_end']]
-            
+            weight = self.column_weights.get(col_name)
+            if weight is not None and weight.device != predictions.device:
+                weight = weight.to(predictions.device)
             if entry['type'] in ['out', 'outlab', 'outex']:
-                losses.append(self.huber(pred_slice, tgt_slice)*0.1)
-            
+                losses.append(self.huber(pred_slice, tgt_slice))
             elif entry['type'] == 'outlabcat':
-                tgt_idx = tgt_slice.squeeze(-1).long()
-                
-                # Retrieve dynamic weights for this specific column
-                weight = self.column_weights.get(col_name)
-                # Ensure weight is on the same device as prediction
-                if weight is not None and weight.device != predictions.device:
-                    weight = weight.to(predictions.device)
-
-                losses.append(F.cross_entropy(pred_slice, tgt_idx, weight=weight))
-            
+                losses.append(F.cross_entropy(pred_slice, tgt_slice.squeeze(-1).long(), weight=weight))
             elif entry['type'] == 'outexcat':
-                num_classes = entry['num_classes']
-                max_len = entry['max_len']
-                tgt_idx = tgt_slice.long()
-                
-                pred_reshaped = pred_slice.view(-1, max_len, num_classes).reshape(-1, num_classes)
-                tgt_reshaped = tgt_idx.reshape(-1)
+                num_classes, max_len = entry['num_classes'], entry['max_len']
+                losses.append(F.cross_entropy(pred_slice.reshape(-1, max_len, num_classes).reshape(-1, num_classes),
+                                              tgt_slice.long().reshape(-1), weight=weight))
+        return losses
 
-                # Retrieve dynamic weights
-                weight = self.column_weights.get(col_name)
-                # For outexcat (text), index 0 is often padding. 
-                # You might want to manually set weight[0] = 0 to ignore padding, 
-                # or rely on the computed frequency (padding is frequent -> low weight).
-                if weight is not None and weight.device != predictions.device:
-                    weight = weight.to(predictions.device)
+    @torch.no_grad()
+    def calibrate(self, data, max_rows=20000):
+        """Measure each column's loss for a trivial predictor. `data`: a Dataset or a target tensor."""
+        if torch.is_tensor(data):
+            targets = data.float().cpu()
+        else:
+            n = len(data)
+            idx = list(range(n)) if n <= max_rows else np.random.default_rng(0).choice(n, max_rows, replace=False).tolist()
+            loader = DataLoader(torch.utils.data.Subset(data, idx), batch_size=1024, shuffle=False)
+            targets = torch.cat([t.float() for _, t in loader], 0)
+        pred_dim = max(e['end'] for e in self.output_layout)
+        preds = torch.zeros(len(targets), pred_dim)
+        for e in self.output_layout:
+            tgt = targets[:, e['tgt_start']:e['tgt_end']]
+            if e['type'] in ['out', 'outlab', 'outex']:
+                preds[:, e['start']:e['end']] = tgt.mean(0)
+            elif e['type'] == 'outlabcat':
+                counts = torch.bincount(tgt.squeeze(-1).long().clamp(min=0), minlength=e['num_classes'])[:e['num_classes']].float() + 1.0
+                preds[:, e['start']:e['end']] = torch.log(counts / counts.sum())
+            elif e['type'] == 'outexcat':
+                nc, ml = e['num_classes'], e['max_len']
+                logits = torch.stack([torch.log((torch.bincount(tgt[:, i].long().clamp(0, nc - 1), minlength=nc)[:nc].float() + 1.0)
+                                                / (len(tgt) + nc)) for i in range(ml)])
+                preds[:, e['start']:e['end']] = logits.reshape(1, -1)
+        cpu_weights = {k: v.cpu() for k, v in self.column_weights.items()}
+        saved, self.column_weights = self.column_weights, cpu_weights
+        try: base = self._task_losses(preds, targets)
+        finally: self.column_weights = saved
+        self.baselines = [max(float(b), 1e-8) for b in base]
+        return dict(zip([e['col'] for e in self.output_layout], self.baselines))
 
-                losses.append(F.cross_entropy(pred_reshaped, tgt_reshaped, weight=weight))
-        
+    def forward(self, predictions, targets):
+        losses = self._task_losses(predictions, targets)
         if not losses:
             return torch.tensor(0.0, device=predictions.device)
-        return sum(losses) / len(losses)
+        if len(losses) == 1:
+            self.last_task_losses = {self.output_layout[0]['col']: float(losses[0].detach())}
+            return losses[0]
+        if self.balancing == "legacy":
+            scaled = [l * 0.1 if e['type'] in ['out', 'outlab', 'outex'] else l for l, e in zip(losses, self.output_layout)]
+            return sum(scaled) / len(scaled)
+        if self.baselines is None:
+            print("CombinedLoss: not calibrated on training data; using the first batch as the baseline.")
+            self.calibrate(targets.detach())
+        normalized = [l / b for l, b in zip(losses, self.baselines)]
+        self.last_task_losses = {e['col']: float(n.detach()) for e, n in zip(self.output_layout, normalized)}
+        if self.balancing == "uwso" and self.training:
+            inv = torch.stack([1.0 / l.detach().clamp(min=1e-12) for l in losses]) / self.temperature
+            weights = torch.softmax(inv, 0)
+            return sum(w * l for w, l in zip(weights, losses))
+        return sum(normalized) / len(normalized)
 
 
 ##############################################
@@ -1327,13 +1537,18 @@ def calculate_dims(cols, col_types, scalings, vocabularies=None):
 ##############################################
 class CustomDataset(Dataset):
     def __init__(self, csv_file, delimiter=',', input_cols=[], output_cols=[], col_types={},
-                 vocabularies={}, scalings={}, image_params={}):
-        print(f"Loading dataset from {csv_file}...")
-        try:
-            self.df = pd.read_csv(csv_file, delimiter=delimiter)
-        except Exception as e:
-            print(f"Error reading CSV: {e}")
-            self.df = pd.DataFrame() # Empty fallback
+                 vocabularies={}, scalings={}, image_params={}, df=None, keep_raw=False):
+        """df: optional already-loaded rows (e.g. the training part of a split) instead of reading csv_file.
+        keep_raw: keep the cleaned, unscaled rows in self.raw_df (aligned with the dataset's rows)."""
+        if df is not None:
+            self.df = df.reset_index(drop=True).copy()
+        else:
+            print(f"Loading dataset from {csv_file}...")
+            try:
+                self.df = pd.read_csv(csv_file, delimiter=delimiter)
+            except Exception as e:
+                print(f"Error reading CSV: {e}")
+                self.df = pd.DataFrame() # Empty fallback
 
         self.input_cols = input_cols
         self.output_cols = output_cols
@@ -1347,6 +1562,7 @@ class CustomDataset(Dataset):
         if not self.df.empty:
             self.validate_and_clean_data()
         
+        self.raw_df = self.df.copy() if keep_raw else None
         # Proceed with setup only if data remains
         if not self.df.empty:
             self.setup_vocabularies()
@@ -1682,6 +1898,196 @@ class CustomDataset(Dataset):
 ##############################################
 # Noise injection and LSUV (unchanged)
 ##############################################
+##############################################
+# Leak-free train / validation preparation
+##############################################
+def _row_group_keys(df, cols, col_types):
+    """One hash per row over `cols`; numeric columns compare by value at 12 significant digits
+    (1 == 1.0, and a CSV round trip of a float cannot break the match)."""
+    norm = {}
+    for c in cols:
+        v = df[c]
+        if col_types.get(c) in ('in', 'out'):
+            v = pd.to_numeric(v, errors='coerce').astype(float).map(lambda x: format(x, '.12g'))
+        norm[c] = v.astype(str)
+    return pd.util.hash_pandas_object(pd.DataFrame(norm, index=df.index), index=False)
+
+
+def dedupe_rows(df, input_cols, output_cols, col_types):
+    """Drop rows that repeat an earlier row in every used column. Returns (df, removed)."""
+    used = list(dict.fromkeys(list(input_cols) + list(output_cols)))
+    dup = _row_group_keys(df, used, col_types).duplicated().values
+    return df[~dup], int(dup.sum())
+
+
+def group_split_mask(keys, val_frac, seed=0):
+    """Validation mask of about val_frac of the rows; rows with identical inputs stay on one side."""
+    counts = keys.value_counts()
+    order = counts.index.to_numpy().copy(); np.random.default_rng(seed).shuffle(order)
+    chosen, total, target = [], 0, val_frac * len(keys)
+    for k in order:
+        if total >= target: break
+        chosen.append(k); total += int(counts[k])
+    return keys.isin(set(chosen)).values
+
+
+def group_kfold_ids(keys, k, seed=0):
+    """Fold id per row; rows with identical inputs share a fold, folds balanced by row count."""
+    counts = keys.value_counts()
+    order = counts.index.to_numpy().copy(); np.random.default_rng(seed).shuffle(order)
+    sizes, fold_of = [0] * k, {}
+    for key in order:
+        f = int(np.argmin(sizes)); fold_of[key] = f; sizes[f] += int(counts[key])
+    return keys.map(fold_of).to_numpy()
+
+
+def prepare_train_val(csv_file, delimiter, input_cols, output_cols, col_types, vocabularies, image_params,
+                      val_frac=0.0, val_file=None, seed=0, val_delimiter=None, scalings=None, val_is_holdout=False):
+    """Deduplicated training set and a validation set that shares no row and no input
+    combination with it. Scalings are fit on the training rows only.
+    scalings: reuse these (resuming a model) instead of fitting them on the training rows.
+    val_is_holdout: val_file lists rows OF csv_file that were held out; drop them from training
+    (instead of dropping validation rows that also occur in training).
+    Returns (train_dataset, val_dataset or None, report)."""
+    used = list(dict.fromkeys(list(input_cols) + list(output_cols)))
+    def require_columns(frame, path):
+        missing = [c for c in used if c not in frame.columns]
+        if missing:
+            raise ValueError(f"{path} has no column(s) {missing}; its columns are {list(frame.columns)[:12]}. "
+                             f"Check the delimiter, or pick the right {'validation ' if path != csv_file else ''}file.")
+    df = pd.read_csv(csv_file, delimiter=delimiter)
+    require_columns(df, csv_file)
+    n_raw = len(df)
+    df, dups = dedupe_rows(df, input_cols, output_cols, col_types)
+    report = {"rows_read": n_raw, "duplicates_removed": dups}
+    keys = _row_group_keys(df, input_cols, col_types)
+    val_df = None
+    if val_file:
+        val_df = pd.read_csv(val_file, delimiter=val_delimiter or delimiter)
+        require_columns(val_df, val_file)
+        val_df, report["val_duplicates_removed"] = dedupe_rows(val_df, input_cols, output_cols, col_types)
+        vkeys = _row_group_keys(val_df, input_cols, col_types)
+        if val_is_holdout:
+            held = keys.isin(set(vkeys)).values
+            report["train_rows_held_out"] = int(held.sum()); report["val_rows_also_in_training"] = 0
+            df = df[~held]
+        else:
+            overlap = vkeys.isin(set(keys)).values
+            report["val_rows_also_in_training"] = int(overlap.sum())
+            val_df = val_df[~overlap]
+    elif val_frac > 0:
+        mask = group_split_mask(keys, val_frac, seed)
+        val_df, df = df[mask], df[~mask]
+    print(f"Data: {n_raw} rows read, {dups} exact duplicates removed.")
+    train_ds = CustomDataset(csv_file, delimiter, input_cols, output_cols, col_types, vocabularies, scalings or {}, image_params, df=df)
+    val_ds = None
+    if val_df is not None:
+        if report.get("train_rows_held_out"):
+            print(f"Held-out validation rows kept out of training: {report['train_rows_held_out']}.")
+        elif "val_rows_also_in_training" in report:
+            print(f"Validation file: {report['val_duplicates_removed']} duplicates and "
+                  f"{report['val_rows_also_in_training']} rows whose inputs also occur in training removed.")
+        val_ds = CustomDataset(val_file or csv_file, val_delimiter or delimiter, input_cols, output_cols, col_types,
+                               vocabularies, train_ds.scalings, image_params, df=val_df, keep_raw=True)
+        if len(val_ds) == 0: raise ValueError("Validation set is empty after removing rows shared with training.")
+    report.update(train=len(train_ds), val=len(val_ds) if val_ds is not None else 0)
+    print(f"Split: {report['train']} training rows, {report['val']} held-out validation rows "
+          f"(no shared rows or input combinations; scalings from training rows only).")
+    return train_ds, val_ds, report
+
+
+VALIDATION_ROWS_FILE = "model_validation.csv"
+
+
+def save_validation_rows(val_loader, path=VALIDATION_ROWS_FILE):
+    """Write the held-out validation rows (raw values) next to model.pt so the explorer can score them.
+    Without a validation set the file is rewritten empty, so an earlier run's rows are never mistaken
+    for this model's."""
+    raw = getattr(getattr(val_loader, "dataset", None), "raw_df", None) if val_loader is not None else None
+    if raw is not None: raw.to_csv(path, index=False, float_format="%.17g")  # exact float round trip
+    elif os.path.exists(path): open(path, "w").close()
+
+
+def prepare_resume(config_path="config.json", model_path="model.pt"):
+    """main() arguments that continue training the saved model: architecture and data encoding from
+    config.json, training rows = its dataset minus the held-out rows saved in model_validation.csv.
+    Returns (main_kwargs, val_dataset or None, report)."""
+    with open(config_path) as f: cfg = json.load(f)
+    if not os.path.isfile(model_path): raise FileNotFoundError(f"No trained model at {model_path}")
+    if isinstance(cfg.get("hidden_dims"), dict): raise ValueError("Auto-grow models cannot be resumed.")
+    path = cfg.get("file_path")
+    if not path or not os.path.isfile(path): raise FileNotFoundError(f"Training data {path!r} from config.json not found")
+    col_types = cfg["col_types"]; vocab = cfg.get("vocabularies", {}); image_params = cfg.get("image_params", {})
+    input_cols = [c for c, v in col_types.items() if 'in' in v]; output_cols = [c for c, v in col_types.items() if 'out' in v]
+    delim = _gui_detect_delimiter(path, input_cols + output_cols)
+    vfile = os.path.join(os.path.dirname(os.path.abspath(model_path)), VALIDATION_ROWS_FILE)
+    if not (os.path.isfile(vfile) and os.path.getsize(vfile) > 0):
+        vfile = None
+        print("Resume: this model has no saved held-out rows; continuing without validation "
+              "(a new random split would put already-trained rows into validation).")
+    train_ds, val_ds, report = prepare_train_val(path, delim, input_cols, output_cols, col_types, vocab, image_params,
+                                                 val_file=vfile, val_is_holdout=True, scalings=cfg["scalings"])
+    act_cfg = cfg.get("activation", {"name": "ReLU", "params": {}}); name, params = act_cfg.get("name", "ReLU"), act_cfg.get("params", {})
+    amap = _build_activation_map()
+    if name == "Custom":
+        custom = _rebuild_custom_activation_from_config(params)
+        def base(): return custom()
+    elif name in amap:
+        def base(): return amap[name](**params)
+    else:
+        def base(): return nn.ReLU()
+    base.activation_config = act_cfg
+    at = cfg.get("activation_type", 0)
+    kwargs = dict(csv_file=path, delimiter=delim, input_cols=input_cols, output_cols=output_cols, col_types=col_types,
+                  vocabularies=vocab, scalings=cfg["scalings"], image_params=image_params, hidden_dims=cfg["hidden_dims"],
+                  batch_size=cfg.get("batch_size", 32), activation_cls=wrap_activation(base, at), activation_type=at,
+                  residual_type=cfg.get("residual_type", "residual"), norm_type=cfg.get("norm_type", "layer"),
+                  groups=cfg.get("groups"), attention_type=cfg.get("attention_type", "none"), num_heads=cfg.get("num_heads"),
+                  input_attention_type=cfg.get("input_attention_type", "none"), moe_mode=cfg.get("moe_mode", 1),
+                  noise_mode=cfg.get("noise_mode", "none"), noise_params=cfg.get("noise_params", {}),
+                  base_activation_cls_for_config=base, mlp_mode=cfg.get("mlp_mode", 0),
+                  layer_routing=cfg.get("layer_routing", "none"), use_grn=cfg.get("use_grn", False),
+                  optimizer_choice=cfg.get("optimizer_choice", "Adam"), train_dataset=train_ds, resume_from=model_path)
+    return kwargs, val_ds, report
+
+
+def ask_validation_and_prepare(file_path, delimiter, input_cols, output_cols, col_types, vocabularies,
+                               image_params, batch_size, ask_interval=True):
+    """CLI validation prompts + prepare_train_val. Returns (train_ds, val_loader, val_interval)."""
+    print("\n--- Validation Setup ---")
+    val_file = input("Enter validation CSV path (empty for percentage split): ").strip()
+    val_frac = 0.0
+    if val_file and not os.path.isfile(val_file):
+        print("Invalid file, falling back to percentage split."); val_file = ""
+    if not val_file:
+        try: val_frac = float(input("Validation split % (0.0-1.0, e.g. 0.1): ").strip())
+        except ValueError: val_frac = 0.0
+    train_ds, val_ds, _ = prepare_train_val(file_path, delimiter, input_cols, output_cols, col_types,
+                                            vocabularies, image_params, val_frac=val_frac, val_file=val_file or None)
+    val_loader, val_interval = None, 1000
+    if val_ds is not None:
+        val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+        if ask_interval: val_interval = int(input("Validation interval (steps): ").strip())
+    else:
+        print("Validation skipped.")
+    return train_ds, val_loader, val_interval
+
+
+def ask_loss_balancing(output_cols, col_types):
+    """Only asked when several outputs include a categorical one (where CombinedLoss is used)."""
+    if len(output_cols) < 2 or not any(col_types[c] in ('outlabcat', 'outexcat') for c in output_cols):
+        return "normalized", 20.0
+    print("\nLoss balancing across outputs:")
+    print("  1: Normalized (each output's loss / trivial-predictor loss) [default]")
+    print("  2: UW-SO (adaptive soft optimal uncertainty weighting)")
+    print("  3: Legacy (0.1 x Huber + cross-entropy)")
+    choice = input("Enter 1-3: ").strip()
+    if choice == "2":
+        t = input("UW-SO softmax temperature (default 20): ").strip()
+        return "uwso", float(t) if t else 20.0
+    return ("legacy" if choice == "3" else "normalized"), 20.0
+
+
 def ask_noise_injection():
     print("Choose noise injection mode during training:")
     print("1: Dropout (with user defined percentage)")
@@ -1816,7 +2222,7 @@ def ask_lsuv_init():
 # Training loop (UPDATED: CombinedLoss support)
 ##############################################
 def validate_model(model, val_loader, criterion, device):
-    model.eval()
+    model.eval(); criterion.eval()  # CombinedLoss reports its fixed (normalized) value in eval mode
     total_val_loss = 0.0
     with torch.no_grad():
         for v_inputs, v_targets in val_loader:
@@ -1824,19 +2230,64 @@ def validate_model(model, val_loader, criterion, device):
             v_outputs = model(v_inputs)
             loss = criterion(v_outputs, v_targets)
             total_val_loss += loss.item()
-    model.train()
+    model.train(); criterion.train()
     return total_val_loss / len(val_loader)
+
+OPTIMIZER_STATE_FILE = "model_optimizer.pt"
+
+
+def save_checkpoint(model, optimizer, optimizer_choice, path="model.pt"):
+    """model.pt as before, plus the optimizer state so training can be resumed seamlessly."""
+    torch.save(model.state_dict(), path)
+    if hasattr(optimizer, "state_dict"):
+        try: torch.save({"optimizer": optimizer_choice, "state": optimizer.state_dict()}, OPTIMIZER_STATE_FILE)
+        except Exception as e: print(f"  (optimizer state not saved: {e})")
+
+
+def restore_optimizer(optimizer, optimizer_choice, custom_lr=None):
+    """Load the saved optimizer state when it belongs to the same optimizer; a new custom LR wins."""
+    if not os.path.exists(OPTIMIZER_STATE_FILE) or not hasattr(optimizer, "load_state_dict"):
+        print("Resume: no saved optimizer state, starting the optimizer fresh."); return False
+    saved = torch.load(OPTIMIZER_STATE_FILE, map_location="cpu")
+    if saved.get("optimizer") != optimizer_choice:
+        print(f"Resume: saved optimizer state is for {saved.get('optimizer')}, not {optimizer_choice}; starting it fresh."); return False
+    fresh_lrs = [g.get("lr") for g in optimizer.param_groups]
+    try: optimizer.load_state_dict(saved["state"])
+    except Exception as e:
+        print(f"Resume: optimizer state does not fit ({e}); starting it fresh."); return False
+    if custom_lr is not None:
+        for g, lr in zip(optimizer.param_groups, fresh_lrs): g["lr"] = lr
+    print("Resume: optimizer state restored" + (" (with the new learning rate)." if custom_lr is not None else "."))
+    return True
+
+
+def materialize_lazy_modules(model, input_dim, device):
+    """Run one eval-mode forward so lazily built modules (PaWeL, GLU, Gumbel) own their
+    parameters before an optimizer is created from model.parameters()."""
+    was_training = model.training
+    model.eval()
+    with torch.no_grad():
+        model(torch.zeros(2, input_dim, device=device))
+    model.train(was_training)
+
 
 def main(csv_file, delimiter=',', input_cols=[], output_cols=[], col_types={}, vocabularies={}, scalings={}, image_params={},
          optimizer_choice="Adam", hidden_dims=[100, 50], batch_size=32, activation_cls=nn.ReLU, activation_type=0,
          residual_type="residual", norm_type="layer", groups=1, attention_type="none", num_heads=1,
          input_attention_type="none", moe_mode=1, noise_mode="none", noise_params={}, base_activation_cls_for_config=None,
          use_lsuv=False, lsuv_max_iter=10, lsuv_normalize_mean=False,
-         val_loader=None, val_interval=1000, custom_lr=None, mlp_mode=0):
+         val_loader=None, val_interval=1000, custom_lr=None, mlp_mode=0, layer_routing="none", use_grn=False,
+         optim_params=None, progress_callback=None, train_dataset=None,
+         loss_balancing="normalized", loss_temperature=20.0, resume_from=None):
+    """progress_callback(dict) is called every step and after each validation (GUI);
+    returning True stops training exactly like Ctrl+C (best model is kept).
+    train_dataset: the prepared training rows (see prepare_train_val); None reads all of csv_file.
+    resume_from: a state dict file (model.pt) to continue training from; the architecture arguments
+    must match it (see prepare_resume)."""
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    dataset = CustomDataset(csv_file, delimiter, input_cols, output_cols, col_types, vocabularies, scalings, image_params)
+    dataset = train_dataset if train_dataset is not None else CustomDataset(csv_file, delimiter, input_cols, output_cols, col_types, vocabularies, scalings, image_params)
     train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
     # --- NEW: Calculate Class Weights ---
     print("Calculating class weights for dynamic loss balancing...")
@@ -1857,32 +2308,41 @@ def main(csv_file, delimiter=',', input_cols=[], output_cols=[], col_types={}, v
         # GNN mode
         dropout_prob = noise_params.get("dropout_pct", 0.0) if noise_mode == "dropout" else 0.0
         model = GNNMLPO(input_dims, hidden_dims, output_dims, activation_cls, residual_type,
-                        norm_type=norm_type, groups=groups, dropout_prob=dropout_prob).to(device)
+                        norm_type=norm_type, groups=groups, dropout_prob=dropout_prob, use_grn=use_grn).to(device)
     elif noise_mode == "dropout":
         dropout_prob = noise_params.get("dropout_pct", 0.0)
         model = MLPO(input_dims, hidden_dims, output_dims, activation_cls, residual_type,
                      norm_type=norm_type, groups=groups, attention_type=attention_type, num_heads=num_heads,
-                     input_attention_type=input_attention_type, moe_mode=moe_mode, dropout_prob=dropout_prob).to(device)
+                     input_attention_type=input_attention_type, moe_mode=moe_mode, dropout_prob=dropout_prob,
+                     layer_routing=layer_routing, use_grn=use_grn).to(device)
     elif noise_mode == "noise injection layers":
         injection_std = noise_params.get("std", 0.1)
         model = MLPO(input_dims, hidden_dims, output_dims, activation_cls, residual_type,
                      norm_type=norm_type, groups=groups, attention_type=attention_type, num_heads=num_heads,
                      input_attention_type=input_attention_type, moe_mode=moe_mode,
-                     use_noise_injection_layers=True, noise_injection_std=injection_std).to(device)
+                     use_noise_injection_layers=True, noise_injection_std=injection_std,
+                     layer_routing=layer_routing, use_grn=use_grn).to(device)
     else:
         model = MLPO(input_dims, hidden_dims, output_dims, activation_cls, residual_type,
                      norm_type=norm_type, groups=groups, attention_type=attention_type, num_heads=num_heads,
-                     input_attention_type=input_attention_type, moe_mode=moe_mode).to(device)
+                     input_attention_type=input_attention_type, moe_mode=moe_mode,
+                     layer_routing=layer_routing, use_grn=use_grn).to(device)
 
-    if use_lsuv:
+    materialize_lazy_modules(model, input_dims, device)
+    if resume_from:
+        model.load_state_dict(torch.load(resume_from, map_location=device))
+        print(f"Resume: continuing from the weights in {resume_from}.")
+    elif use_lsuv:  # LSUV would overwrite resumed weights
         lsuv_init(model, train_loader, device, max_iter=lsuv_max_iter, normalize_mean=lsuv_normalize_mean, verbose=True)
 
-    optimizer = select_optimizer(optimizer_choice, model, custom_lr=custom_lr)
+    optimizer = select_optimizer(optimizer_choice, model, custom_lr=custom_lr, optim_params=optim_params)
+    if resume_from: restore_optimizer(optimizer, optimizer_choice, custom_lr)
     if optimizer_choice == "RAdamScheduleFree": optimizer.train()
     
     # Use CombinedLoss if categorical outputs exist, else plain HuberLoss
     if has_categorical:
-        criterion = CombinedLoss(output_layout, column_weights=class_weights)
+        criterion = CombinedLoss(output_layout, column_weights=class_weights, balancing=loss_balancing, temperature=loss_temperature)
+        print(f"Loss baselines (trivial predictor): {criterion.calibrate(dataset)}")
         print(f"Using CombinedLoss with dynamic weighting.")
     else:
         criterion = nn.HuberLoss()
@@ -1893,7 +2353,9 @@ def main(csv_file, delimiter=',', input_cols=[], output_cols=[], col_types={}, v
     config_activation_cls = base_activation_cls_for_config if base_activation_cls_for_config else activation_cls
     save_config(csv_file, col_types, hidden_dims, vocabularies, scalings, image_params,
                 optimizer_choice, batch_size, config_activation_cls, activation_type, residual_type,
-                norm_type, groups, attention_type, num_heads, input_attention_type, moe_mode, noise_mode, noise_params, mlp_mode=mlp_mode)
+                norm_type, groups, attention_type, num_heads, input_attention_type, moe_mode, noise_mode, noise_params,
+                mlp_mode=mlp_mode, layer_routing=layer_routing, use_grn=use_grn)
+    save_validation_rows(val_loader)
         
     try:
         for epoch in range(10000000):
@@ -1909,7 +2371,7 @@ def main(csv_file, delimiter=',', input_cols=[], output_cols=[], col_types={}, v
                         outputs = model(noisy_inputs)
                         if noise_mode == "output noise":
                             outputs = outputs + torch.randn_like(outputs) * noise_params.get("std", 0.1)
-                        loss = criterion(outputs, targets)
+                        loss = criterion(outputs, targets) + model.routing_loss()
                         return loss
                 else:
                     def closure():
@@ -1917,7 +2379,7 @@ def main(csv_file, delimiter=',', input_cols=[], output_cols=[], col_types={}, v
                         outputs = model(noisy_inputs)
                         if noise_mode == "output noise":
                             outputs = outputs + torch.randn_like(outputs) * noise_params.get("std", 0.1)
-                        loss = criterion(outputs, targets)
+                        loss = criterion(outputs, targets) + model.routing_loss()
                         loss.backward()
                         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                         return loss
@@ -1932,6 +2394,8 @@ def main(csv_file, delimiter=',', input_cols=[], output_cols=[], col_types={}, v
                 if step % 1 == 0:
                     d_val = optimizer.param_groups[0].get('d', 0)
                     log_msg = f'Step={step}, epoch={epoch}, loss={loss.item():.6f}, Prodigy chosen LR={d_val:.2e}'
+                    routing_usage = model.routing_usage()
+                    if routing_usage is not None: log_msg += f' | routed_active={routing_usage:.2%}'
                     # Perplexity logging for categorical outputs
                     if has_categorical and step % 1 == 0:
                         with torch.no_grad():
@@ -1942,17 +2406,27 @@ def main(csv_file, delimiter=',', input_cols=[], output_cols=[], col_types={}, v
                             if ppl_parts:
                                 log_msg += f' | {" ".join(ppl_parts)} | global_ppl={global_ppl:.2f}'
                     print(log_msg)
+                if progress_callback is not None:
+                    info = {"step": step, "epoch": epoch, "loss": loss.item(), "lr": optimizer.param_groups[0].get("lr")}
+                    if routing_usage is not None: info["routed_active"] = routing_usage
+                    if has_categorical: info["ppl"] = ppl_metrics
+                    if getattr(criterion, "last_task_losses", None): info["tasks"] = dict(criterion.last_task_losses)
+                    if progress_callback(info): raise KeyboardInterrupt
 
                 if val_loader is not None and step % val_interval == 0:
                     current_val_loss = validate_model(model, val_loader, criterion, device)
                     print(f"--- Validation Check (Step {step}) ---")
                     print(f"    Current Val Loss: {current_val_loss:.6f}")
                     print(f"    Best Val Loss:    {best_val_loss:.6f}")
-                    if current_val_loss < best_val_loss:
+                    improved = current_val_loss < best_val_loss
+                    if improved:
                         best_val_loss = current_val_loss
-                        torch.save(model.state_dict(), 'model.pt')
+                        save_checkpoint(model, optimizer, optimizer_choice)
                         print("    >>> NEW BEST MODEL SAVED <<<")
                     else: print("    (No improvement)")
+                    if progress_callback is not None and progress_callback(
+                            {"step": step, "val_loss": current_val_loss, "best_val_loss": best_val_loss, "saved": improved}):
+                        raise KeyboardInterrupt
                     print("-------------------------------------")
 
                 step += 1
@@ -1964,13 +2438,13 @@ def main(csv_file, delimiter=',', input_cols=[], output_cols=[], col_types={}, v
             final_val_loss = validate_model(model, val_loader, criterion, device)
             print(f"Final Val Loss: {final_val_loss:.6f} vs Best: {best_val_loss:.6f}")
             if final_val_loss < best_val_loss:
-                print("Interrupted model is better. Saving..."); torch.save(model.state_dict(), 'model.pt')
+                print("Interrupted model is better. Saving..."); save_checkpoint(model, optimizer, optimizer_choice)
             else: print("Interrupted model is WORSE. Discarding unsaved changes.")
         else:
-            print("No validation set. Saving current state."); torch.save(model.state_dict(), 'model.pt')
+            print("No validation set. Saving current state."); save_checkpoint(model, optimizer, optimizer_choice)
     
     if val_loader is None and not os.path.exists('model.pt'):
-        torch.save(model.state_dict(), 'model.pt')
+        save_checkpoint(model, optimizer, optimizer_choice)
     if os.path.exists('model.pt'):
         model.load_state_dict(torch.load('model.pt'))
         print("Loaded best model state from 'model.pt'.")
@@ -1978,7 +2452,8 @@ def main(csv_file, delimiter=',', input_cols=[], output_cols=[], col_types={}, v
     config_activation_cls = base_activation_cls_for_config if base_activation_cls_for_config else activation_cls
     save_config(csv_file, col_types, hidden_dims, vocabularies, scalings, image_params,
                 optimizer_choice, batch_size, config_activation_cls, activation_type, residual_type,
-                norm_type, groups, attention_type, num_heads, input_attention_type, moe_mode, noise_mode, noise_params, mlp_mode=mlp_mode)
+                norm_type, groups, attention_type, num_heads, input_attention_type, moe_mode, noise_mode, noise_params,
+                mlp_mode=mlp_mode, layer_routing=layer_routing, use_grn=use_grn)
 
 
 ##############################################
@@ -2065,7 +2540,7 @@ def main_auto_grow(csv_file, delimiter=',', input_cols=[], output_cols=[], col_t
                    input_attention_type="none", moe_mode=1, noise_mode="none", noise_params={},
                    base_activation_cls_for_config=None, use_lsuv=False, lsuv_max_iter=10,
                    lsuv_normalize_mean=False, val_loader=None, val_interval=1000, custom_lr=None,
-                   mlp_mode=0):
+                   mlp_mode=0, train_dataset=None, loss_balancing="normalized", loss_temperature=20.0):
     """Training with auto-growing architecture.
     Starts with 1 neuron, 1 layer. Adds neurons/layers when loss stagnates."""
 
@@ -2074,7 +2549,7 @@ def main_auto_grow(csv_file, delimiter=',', input_cols=[], output_cols=[], col_t
     max_layers = auto_config["max_layers"]
     patience = auto_config["patience"]
 
-    dataset = CustomDataset(csv_file, delimiter, input_cols, output_cols, col_types, vocabularies, scalings, image_params)
+    dataset = train_dataset if train_dataset is not None else CustomDataset(csv_file, delimiter, input_cols, output_cols, col_types, vocabularies, scalings, image_params)
     train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
     print("Calculating class weights for dynamic loss balancing...")
     class_weights = dataset.compute_class_weights(device=device)
@@ -2087,7 +2562,8 @@ def main_auto_grow(csv_file, delimiter=',', input_cols=[], output_cols=[], col_t
     output_dims = output_pred_dim
 
     if has_categorical:
-        criterion = CombinedLoss(output_layout, column_weights=class_weights)
+        criterion = CombinedLoss(output_layout, column_weights=class_weights, balancing=loss_balancing, temperature=loss_temperature)
+        criterion.calibrate(dataset)
     else:
         criterion = nn.HuberLoss()
 
@@ -2132,6 +2608,7 @@ def main_auto_grow(csv_file, delimiter=',', input_cols=[], output_cols=[], col_t
     loss_window = deque(maxlen=100)
 
     config_activation_cls = base_activation_cls_for_config if base_activation_cls_for_config else activation_cls
+    save_validation_rows(val_loader)
     save_config(csv_file, col_types, hidden_dims, vocabularies, scalings, image_params,
                 optimizer_choice, batch_size, config_activation_cls, activation_type, residual_type,
                 norm_type, groups, attention_type, num_heads, input_attention_type, moe_mode, noise_mode, noise_params, mlp_mode=mlp_mode)
@@ -2598,7 +3075,7 @@ def _evolution_crossover(parent1, parent2, max_hidden_dim, max_layers):
 
 def _evolution_evaluate(individual, csv_file, delimiter, input_cols, output_cols, col_types,
                          vocabularies, scalings, image_params, batch_size, optimizer_choice,
-                         custom_lr, eval_steps, device, val_loader=None):
+                         custom_lr, eval_steps, device, val_loader=None, train_dataset=None):
     """Evaluate an individual by training for eval_steps and returning loss."""
     act_map = _build_activation_map()
     act_name = individual["activation_name"]
@@ -2614,8 +3091,8 @@ def _evolution_evaluate(individual, csv_file, delimiter, input_cols, output_cols
     noise_params = individual["noise_params"]
     norm_type = individual["norm_type"]
 
-    dataset = CustomDataset(csv_file, delimiter, input_cols, output_cols, col_types,
-                           vocabularies, scalings, image_params)
+    dataset = train_dataset if train_dataset is not None else CustomDataset(
+        csv_file, delimiter, input_cols, output_cols, col_types, vocabularies, scalings, image_params)
     train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
     input_dims = calculate_input_dim(input_cols, col_types, scalings, vocabularies)
@@ -2624,7 +3101,7 @@ def _evolution_evaluate(individual, csv_file, delimiter, input_cols, output_cols
 
     class_weights = dataset.compute_class_weights(device=device)
     if has_categorical:
-        criterion = CombinedLoss(output_layout, column_weights=class_weights)
+        criterion = CombinedLoss(output_layout, column_weights=class_weights); criterion.calibrate(dataset)
     else:
         criterion = nn.HuberLoss()
 
@@ -2716,7 +3193,7 @@ def _evolution_evaluate(individual, csv_file, delimiter, input_cols, output_cols
 def run_evolution(csv_file, delimiter, input_cols, output_cols, col_types, vocabularies,
                   scalings, image_params, batch_size, optimizer_choice, custom_lr,
                   max_hidden_dim, max_layers, population_size=20, generations=30,
-                  eval_steps=500, val_loader=None,
+                  eval_steps=500, val_loader=None, train_dataset=None,
                   evolve_set=None, fixed_overrides=None,
                   fixed_hidden_dims=None, fixed_activation=None, fixed_activation_type=None):
     """Run evolutionary NAS to find the best architecture, then train it fully.
@@ -2784,7 +3261,7 @@ def run_evolution(csv_file, delimiter, input_cols, output_cols, col_types, vocab
                     fitness = _evolution_evaluate(
                         ind, csv_file, delimiter, input_cols, output_cols, col_types,
                         vocabularies, scalings, image_params, batch_size, optimizer_choice,
-                        custom_lr, eval_steps, device, val_loader)
+                        custom_lr, eval_steps, device, val_loader, train_dataset=train_dataset)
                     ind["fitness"] = fitness
                     print(f" -> fitness={fitness:.6f}")
 
@@ -3030,12 +3507,101 @@ class EvolutionaryOptimizer:
     def eval(self): pass
 
 
-def select_optimizer(optimizer_choice, model, custom_lr=None):
-    """Select optimizer. If custom_lr is provided, it overrides the default LR."""
+def prompt_muon_options(optimizer_choice, use_defaults=False):
+    """Configure the shared Muon family using its current constructor options.
+    use_defaults=True returns the prompt defaults without reading stdin (GUI)."""
+    def ask(label, default, convert=float):
+        while not use_defaults:
+            raw = input(f"{label} [{default}]: ").strip()
+            if not raw:
+                return default
+            try:
+                if convert is bool:
+                    if raw.lower() not in ('1', '0', 'true', 'false', 'yes', 'no', 'y', 'n'):
+                        raise ValueError
+                    return raw.lower() in ('1', 'true', 'yes', 'y')
+                return convert(raw)
+            except ValueError:
+                print("Invalid value; please try again.")
+        return default
+
+    options = dict(
+        momentum=ask("Muon momentum", .95),
+        weight_decay=ask("Weight decay", 0. if optimizer_choice in ("AdaGO", "AdamGO", "RMSGO", "AdaDeltaGO") else .1),
+        rank=ask("Rank (0=full, >0=approximate)", 0, int),
+        newton_schulz_iter=ask("Orthogonalization iterations", 5, int),
+        foreach=ask("Batch optimizer updates?", True, bool),
+        ns_bfloat16=ask("BF16 matrix iterations?", False, bool),
+        cautious=ask("Cautious updates?", False, bool),
+        muon_all=ask("MuonAll (all parameters)?", False, bool),
+        muon_all_reshape=ask("MuonAll: use near-square vector reshape?", False, bool),
+    )
+    options['orthogonalization_backend'] = (
+        'polar_express' if ask("Use Polar Express backend?", True, bool) else 'newton_schulz')
+    options['adam_betas'] = (ask("AdamW fallback beta1", .9), ask("AdamW fallback beta2", .95 if optimizer_choice in ("AdaGO", "AdamGO", "RMSGO", "AdaDeltaGO") else .999))
+    options['adam_eps'] = ask("AdamW fallback epsilon", 1e-8)
+    # GO matrix LRs (0.05) are far too large for Adam: default 4.2e-4 at lr 0.05.
+    options['adam_lr_ratio'] = ask("AdamW fallback LR as a fraction of the main LR",
+                                   4.2e-4 / .05 if optimizer_choice in ("AdaGO", "AdamGO", "RMSGO", "AdaDeltaGO") else 1.)
+    if optimizer_choice == "AdaMuon":
+        options['eps'] = ask("AdaMuon epsilon", 1e-8)
+        options['nesterov'] = ask("AdaMuon Nesterov (off=paper Algorithm 1)?", False, bool)
+    elif optimizer_choice == "NorMuon":
+        options['eps'] = ask("NorMuon epsilon", 1e-8)
+        options['beta2'] = ask("Row variance decay (beta2)", .95)
+    elif optimizer_choice in ("AdaGO", "RMSGO"):
+        options['gamma'] = ask("Gradient norm cap (gamma)", 1.)
+        options['v0'] = ask("Initial norm accumulator (v0)", 1.)
+        options['eps'] = ask("Minimum step (epsilon)", 5e-4)
+        if optimizer_choice == "RMSGO":
+            options['beta2'] = ask("Norm variance decay (beta2)", .99)
+    elif optimizer_choice == "AdaDeltaGO":
+        options['gamma'] = ask("Gradient norm cap (gamma)", 1.)
+        options['rho'] = ask("Averaging decay (rho)", .9)
+        options['eps'] = ask("RMS stabilizer (epsilon)", 1e-6)
+    elif optimizer_choice == "AdamGO":
+        options['beta2'] = ask("Norm variance decay (beta2)", .999)
+        options['gamma'] = ask("Gradient norm cap (gamma)", 1.)
+        options['delta'] = ask("Denominator stabilizer (delta)", 1e-8)
+        options['min_step'] = ask("Minimum step (0=disabled)", 0.)
+    return options
+
+
+def mlpres_muon_param_groups(model):
+    """Keep embeddings, vectors and both output branches on AdamW."""
+    heads = [getattr(model, name, None) for name in ('final_linear', 'final_skip')]
+    # Per-neuron PWL tables are [C, K] but are not weight matrices: keep them off Muon too.
+    heads += [m for m in model.modules() if hasattr(m, 'x_positions') and hasattr(m, 'slopes')]  # PaWeL / torchpwl
+    adamw_params = [p for head in heads if head is not None for p in head.parameters()]
+    return muon_param_groups(model, adamw_params)
+
+
+def select_optimizer(optimizer_choice, model, custom_lr=None, optim_params=None):
+    """Select optimizer; custom_lr overrides its default learning rate.
+
+    Muon-family optim_params accepts the shared constructor flags (including
+    cautious, muon_all, muon_all_reshape and orthogonalization_backend). None prompts; {} uses defaults.
+    """
     _lr = custom_lr  # None means use default
     if optimizer_choice == "Adam": optimizer = optim.Adam(model.parameters(), lr=_lr if _lr is not None else 0.0004)
+    elif optimizer_choice in ("Muon", "AdaMuon", "NorMuon", "AdaGO", "AdamGO", "RMSGO", "AdaDeltaGO"):
+        options = dict(prompt_muon_options(optimizer_choice) if optim_params is None else optim_params)
+        if _lr is not None:
+            options['lr'] = _lr
+        optimizer_cls = (AdaDeltaGO if optimizer_choice == "AdaDeltaGO" else RMSGO if optimizer_choice == "RMSGO" else AdamGO if optimizer_choice == "AdamGO" else AdaGO if optimizer_choice == "AdaGO" else
+                         {"Muon": Muon, "AdaMuon": AdaMuon, "NorMuon": NorMuon}[optimizer_choice])
+        # AdamW-fallback LR = main LR * adam_lr_ratio (absent = legacy shared LR);
+        # a ratio keeps custom and LR-finder rates proportional.
+        ratio = options.pop('adam_lr_ratio', 1.)
+        if isinstance(ratio, bool) or not math.isfinite(ratio) or ratio <= 0:
+            raise ValueError(f"adam_lr_ratio must be a finite positive number, got {ratio!r}")
+        optimizer = optimizer_cls(mlpres_muon_param_groups(model), **options)
+        if not options.get('muon_all', False):
+            for group in optimizer.param_groups:
+                if not group['use_muon']:
+                    group['lr'] *= ratio
     elif optimizer_choice == "Adam3":
-        order = max(int(input("Enter amount of orders (3 is minimum): ")), 3)
+        order = max(int(optim_params.get("order", 3) if optim_params is not None else input("Enter amount of orders (3 is minimum): ")), 3)
         optimizer = ThreeAdam(model.parameters(), lr=0.004, order=order)
     elif optimizer_choice == "AdamHD": optimizer = AdamAdaHD(model.parameters(), lr=0.000)
     elif optimizer_choice == "SGD": optimizer = CSGD(model.parameters(), momentum=0.9, lr=0.01)
@@ -3053,19 +3619,25 @@ def select_optimizer(optimizer_choice, model, custom_lr=None):
     elif optimizer_choice == "RAdamScheduleFree": optimizer = RAdamScheduleFree(model.parameters(), lr=_lr if _lr is not None else 0.0004)
     elif optimizer_choice == "AdEMAMix": optimizer = AdEMAMix(model.parameters(), lr=_lr if _lr is not None else 0.001)
     elif optimizer_choice == "Adam3":
-        order = max(int(input("Enter amount of orders (3 is minimum): ")), 3)
+        order = max(int(optim_params.get("order", 3) if optim_params is not None else input("Enter amount of orders (3 is minimum): ")), 3)
         optimizer = ThreeAdam(model.parameters(), lr=0.004, order=order)
     elif optimizer_choice == "AdamDelta": optimizer = AdamDelta(model.parameters())
     elif optimizer_choice == "AutoAdam": optimizer = AutoAdam(model.parameters())
     elif optimizer_choice == "NormAdam": optimizer = NormAdam(model.parameters())
     elif optimizer_choice == "SWATS": optimizer = SWATS(model.parameters(), lr=0.001)
     elif optimizer_choice == "AdaBoundW": optimizer = AdaBoundW(model.parameters(), lr=0.001)
-    elif optimizer_choice == "CLion": optimizer = CLion(model.parameters(), lr=0.0001)
+    elif optimizer_choice == "CLion": optimizer = CLion(model.parameters(), lr=_lr if _lr is not None else 0.0001)
     elif optimizer_choice == "Signum": optimizer = CSignum(model.parameters(), lr=0.01)
     elif optimizer_choice == "SRprop": optimizer = SRprop(model.parameters(), lr=0.01)
     elif optimizer_choice == "IRprop": optimizer = MiniBatch_iRpropPlus(model.parameters(), lr=0.001)
     elif optimizer_choice == "Adan": optimizer = Adan(model.parameters(), lr=_lr if _lr is not None else 0.001)
     elif optimizer_choice == "Prodigy": optimizer = Prodigy(model.parameters(), lr=_lr if _lr is not None else 1.0, weight_decay=0.0)
+    elif optimizer_choice == "Evolution" and optim_params is not None:
+        rank = int(optim_params.get("eggroll_rank") or 0)
+        optimizer = EvolutionaryOptimizer(model.parameters(), lr=_lr if _lr is not None else 0.01,
+                                          sigma=float(optim_params.get("sigma", 0.02)),
+                                          population_size=int(optim_params.get("population_size", 20)),
+                                          antithetic=True, rank_transform=True, eggroll_rank=rank or None)
     elif optimizer_choice == "Evolution":
         print("\n--- Evolution Strategy Setup ---")
         pop_str = input("  Population size (default 20): ").strip()
@@ -3762,7 +4334,7 @@ def run_export(config_path="config.json", model_path="model.pt"):
             attention_type=config.get("attention_type", "none"),
             num_heads=config.get("num_heads", 1),
             input_attention_type=config.get("input_attention_type", "none"),
-            moe_mode=config.get("moe_mode", 1)).to(device)
+            moe_mode=config.get("moe_mode", 1), layer_routing=config.get("layer_routing", "none")).to(device)
     
     # Lazy init
     with torch.no_grad():
@@ -3798,7 +4370,8 @@ def convert_to_serializable(obj):
 
 def save_config(file_path, col_types, hidden_dims, vocabularies, scalings, image_params,
                 optimizer_choice, batch_size, activation_cls, activation_type, residual_type,
-                norm_type, groups, attention_type, num_heads, input_attention_type, moe_mode, noise_mode, noise_params, mlp_mode=0):
+                norm_type, groups, attention_type, num_heads, input_attention_type, moe_mode, noise_mode, noise_params,
+                mlp_mode=0, layer_routing="none", use_grn=False):
     try: activation_config = activation_cls.activation_config
     except AttributeError:
         activation_name = activation_cls.__name__ if hasattr(activation_cls, '__name__') else "ReLU"
@@ -3813,7 +4386,7 @@ def save_config(file_path, col_types, hidden_dims, vocabularies, scalings, image
         "attention_type": attention_type, "num_heads": num_heads,
         "input_attention_type": input_attention_type, "moe_mode": moe_mode,
         "noise_mode": noise_mode, "noise_params": noise_params,
-        "mlp_mode": mlp_mode,
+        "mlp_mode": mlp_mode, "layer_routing": layer_routing, "use_grn": use_grn,
     }
     with open("config.json", "w") as f: json.dump(convert_to_serializable(config), f, indent=2)
 
@@ -4021,7 +4594,7 @@ def ask_optimizer():
                "13":"NAdam","14":"SparseAdam","15":"RAdamScheduleFree","16":"AdEMAMix",
                "17":"Adam3","18":"AdamDelta","19":"AutoAdam","20":"NormAdam","21":"SWATS",
                "22":"AdaBoundW","23":"CLion","24":"Signum","25":"SRprop","26":"IRprop", "27": "Adan", "28": "Prodigy",
-               "29": "Evolution"}
+               "29": "Evolution", "30": "Muon", "31": "AdaMuon", "32": "NorMuon", "33": "AdaGO", "34": "AdamGO", "35": "RMSGO", "36": "AdaDeltaGO"}
     print("Choose optimizer:")
     for key, name in options.items(): print(f"{key}: {name}")
     choice = input("Enter the number or name: ").strip()
@@ -4096,6 +4669,10 @@ def ask_moe_mode():
             moe = int(input("\nMoE mode (1=off, >1=#experts, 0=x_full, -1=learned, -2=x_mean_std, -3=x_mean, -4=gMLP, -5=aMLP): ").strip())
             return moe
         except ValueError: print("Enter a valid integer.")
+
+def ask_layer_routing():
+    choice = input("Adaptive layer routing after activation? (y/N): ").strip().lower()
+    return "adaptive" if choice in ("y", "yes", "1") else "none"
 
 def ask_mlp_mode():
     print("\nChoose MLP mode:")
@@ -4202,6 +4779,108 @@ def plot_pwl(activation_layer, neuron_idx, layer_idx, input_or_activation_value)
     os.makedirs("MVPs", exist_ok=True); plt.savefig(f"MVPs/layer-{layer_idx+1}-neuron-{neuron_idx+1}.png"); plt.close()
 
 
+def build_model_from_config(config, input_dims, output_dim, device, hidden_dims=None):
+    """Rebuild the (untrained) network described by config.json; caller loads model.pt."""
+    if hidden_dims is None: hidden_dims = config["hidden_dims"]
+    activation_config = config.get("activation", {"name": "ReLU", "params": {}})
+    activation_name = activation_config.get("name", "ReLU")
+    activation_params = activation_config.get("params", {})
+    residual_type = config.get("residual_type", "residual")
+    norm_type = config.get("norm_type", "layer")
+    groups = config.get("groups", 1)
+    attention_type = config.get("attention_type", "none")
+    num_heads = config.get("num_heads", 1)
+    input_attention_type = config.get("input_attention_type", "none")
+    moe_mode = config.get("moe_mode", 1)
+    noise_mode = config.get("noise_mode", "none")
+    noise_params = config.get("noise_params", {})
+    
+    activation_map = _build_activation_map()
+    if activation_name == "Custom":
+        cls = _rebuild_custom_activation_from_config(activation_params)
+        activation_cls = lambda: cls()
+    elif activation_name in activation_map:
+        activation_cls = lambda: activation_map[activation_name](**activation_params)
+    else: activation_cls = nn.ReLU
+    
+    activation_type = config.get("activation_type", 0)
+    activation_cls = wrap_activation(activation_cls, activation_type)
+    mlp_mode = config.get("mlp_mode", 0)
+
+    if mlp_mode == 1:
+        model = GNNMLPO(input_dims, hidden_dims, output_dim, activation_cls, residual_type,
+            norm_type=norm_type, groups=groups,
+            dropout_prob=noise_params.get("dropout_pct", 0.0) if noise_mode == "dropout" else 0.0,
+            use_grn=config.get("use_grn", False)).to(device)
+    else:
+        model = MLPO(input_dims, hidden_dims, output_dim, activation_cls, residual_type,
+            norm_type=norm_type, groups=groups, attention_type=attention_type, num_heads=num_heads,
+            input_attention_type=input_attention_type, moe_mode=moe_mode,
+            dropout_prob=noise_params.get("dropout_pct", 0.0) if noise_mode == "dropout" else 0.0,
+            use_noise_injection_layers=(noise_mode == "noise injection layers"), layer_routing=config.get("layer_routing", "none"),
+            noise_injection_std=noise_params.get("std", 0.0), use_grn=config.get("use_grn", False)).to(device)
+    return model
+
+
+def encode_sample_input(sample_input, col_types, vocabularies, scalings, image_params):
+    """Raw per-column input values (in col_types order) -> flat model input vector."""
+    processed_input = []
+    input_idx = 0
+    for col_name, col_type in col_types.items():
+        if col_type not in ["in", "inlab", "intex", "inim", "inlabcat", "intexcat"]:
+            continue
+        value = sample_input[input_idx]
+        
+        if col_type == "inlabcat":
+            vocab = vocabularies[col_name]; vocab_size = len(vocab)
+            mapped = vocab.get(str(value), 0)
+            onehot = [0.0] * vocab_size
+            if 0 <= mapped < vocab_size: onehot[mapped] = 1.0
+            processed_input.extend(onehot)
+            
+        elif col_type == "intexcat":
+            vocab = vocabularies[col_name]; vocab_size = len(vocab)
+            max_len = scalings[col_name]['max_len']
+            for i in range(max_len):
+                onehot = [0.0] * vocab_size
+                if i < len(str(value)):
+                    token_idx = vocab.get(str(value)[i], 0)
+                    if 0 < token_idx <= vocab_size: onehot[token_idx - 1] = 1.0
+                processed_input.extend(onehot)
+        
+        elif col_type == "inlab":
+            mapped = vocabularies[col_name].get(str(value), value)
+            processed_input.append(float(mapped))
+        elif col_type == "intex":
+            vocab = vocabularies[col_name]; max_len = scalings[col_name]['max_len']
+            seq = [vocab.get(ch, 0) for ch in str(value)]
+            if len(seq) < max_len: seq += [0] * (max_len - len(seq))
+            else: seq = seq[:max_len]
+            processed_input.extend(seq)
+        elif col_type == "inim":
+            im_size = image_params[col_name]["im_size"]; patch_size = image_params[col_name]["patch_size"]
+            try: img = Image.open(value).convert("L")
+            except: img = Image.new("L", (im_size, im_size))
+            img = img.resize((im_size, im_size)); img_array = np.array(img)
+            if patch_size == 1: patches = [img_array]
+            else:
+                n_patches = im_size // patch_size; patches = []
+                for i in range(n_patches):
+                    for j in range(n_patches):
+                        patches.append(img_array[i*patch_size:(i+1)*patch_size, j*patch_size:(j+1)*patch_size])
+            codes = []
+            for patch in patches:
+                pc, ec, bc = compute_patch_codes(patch); codes.extend([pc, ec, bc])
+            processed_input.extend(codes)
+        else:
+            if col_name in scalings and 'min' in scalings[col_name]:
+                smin = scalings[col_name]['min']; smax = scalings[col_name]['max']
+                value = 2 * (float(value) - smin) / (smax - smin) - 1
+            processed_input.append(float(value))
+        input_idx += 1
+    return processed_input
+
+
 ##############################################
 # STREAMLINED Sampling/Inference with fast plots
 ##############################################
@@ -4233,105 +4912,15 @@ def load_and_sample_model(sample_input, hidden_dims, vocabularies, col_types, ou
     input_dims = sum(calc_dim(col) for col in input_cols)
         
     config = load_config()
-    activation_config = config.get("activation", {"name": "ReLU", "params": {}})
-    activation_name = activation_config.get("name", "ReLU")
-    activation_params = activation_config.get("params", {})
-    residual_type = config.get("residual_type", "residual")
-    norm_type = config.get("norm_type", "layer")
-    groups = config.get("groups", 1)
-    attention_type = config.get("attention_type", "none")
-    num_heads = config.get("num_heads", 1)
-    input_attention_type = config.get("input_attention_type", "none")
-    moe_mode = config.get("moe_mode", 1)
-    noise_mode = config.get("noise_mode", "none")
-    noise_params = config.get("noise_params", {})
-    
-    activation_map = _build_activation_map()
-    if activation_name == "Custom":
-        cls = _rebuild_custom_activation_from_config(activation_params)
-        activation_cls = lambda: cls()
-    elif activation_name in activation_map:
-        activation_cls = lambda: activation_map[activation_name](**activation_params)
-    else: activation_cls = nn.ReLU
-    
-    activation_type = config.get("activation_type", 0)
-    activation_cls = wrap_activation(activation_cls, activation_type)
-    mlp_mode = config.get("mlp_mode", 0)
-
-    if mlp_mode == 1:
-        model = GNNMLPO(input_dims, hidden_dims, output_dim, activation_cls, residual_type,
-            norm_type=norm_type, groups=groups,
-            dropout_prob=noise_params.get("dropout_pct", 0.0) if noise_mode == "dropout" else 0.0).to(device)
-    else:
-        model = MLPO(input_dims, hidden_dims, output_dim, activation_cls, residual_type,
-            norm_type=norm_type, groups=groups, attention_type=attention_type, num_heads=num_heads,
-            input_attention_type=input_attention_type, moe_mode=moe_mode,
-            dropout_prob=noise_params.get("dropout_pct", 0.0) if noise_mode == "dropout" else 0.0,
-            use_noise_injection_layers=(noise_mode == "noise injection layers"),
-            noise_injection_std=noise_params.get("std", 0.0)).to(device)
-    
+    model = build_model_from_config(config, input_dims, output_dim, device, hidden_dims)
     print("Performing dry run to initialize lazy layers...")
-    with torch.no_grad():
-        dummy_input = torch.zeros(1, input_dims).to(device); model(dummy_input)
-    model.load_state_dict(torch.load('model.pt')); print(model); model.eval()
+    materialize_lazy_modules(model, input_dims, device)
+    model.load_state_dict(torch.load('model.pt', map_location=device)); print(model); model.eval()
     os.makedirs("MVPs", exist_ok=True)
         
     with torch.no_grad():
         # ─── Process input ───
-        processed_input = []
-        input_idx = 0
-        for col_name, col_type in col_types.items():
-            if col_type not in ["in", "inlab", "intex", "inim", "inlabcat", "intexcat"]:
-                continue
-            value = sample_input[input_idx]
-            
-            if col_type == "inlabcat":
-                vocab = vocabularies[col_name]; vocab_size = len(vocab)
-                mapped = vocab.get(str(value), 0)
-                onehot = [0.0] * vocab_size
-                if 0 <= mapped < vocab_size: onehot[mapped] = 1.0
-                processed_input.extend(onehot)
-                
-            elif col_type == "intexcat":
-                vocab = vocabularies[col_name]; vocab_size = len(vocab)
-                max_len = scalings[col_name]['max_len']
-                for i in range(max_len):
-                    onehot = [0.0] * vocab_size
-                    if i < len(str(value)):
-                        token_idx = vocab.get(str(value)[i], 0)
-                        if 0 < token_idx <= vocab_size: onehot[token_idx - 1] = 1.0
-                    processed_input.extend(onehot)
-            
-            elif col_type == "inlab":
-                mapped = vocabularies[col_name].get(str(value), value)
-                processed_input.append(float(mapped))
-            elif col_type == "intex":
-                vocab = vocabularies[col_name]; max_len = scalings[col_name]['max_len']
-                seq = [vocab.get(ch, 0) for ch in str(value)]
-                if len(seq) < max_len: seq += [0] * (max_len - len(seq))
-                else: seq = seq[:max_len]
-                processed_input.extend(seq)
-            elif col_type == "inim":
-                im_size = image_params[col_name]["im_size"]; patch_size = image_params[col_name]["patch_size"]
-                try: img = Image.open(value).convert("L")
-                except: img = Image.new("L", (im_size, im_size))
-                img = img.resize((im_size, im_size)); img_array = np.array(img)
-                if patch_size == 1: patches = [img_array]
-                else:
-                    n_patches = im_size // patch_size; patches = []
-                    for i in range(n_patches):
-                        for j in range(n_patches):
-                            patches.append(img_array[i*patch_size:(i+1)*patch_size, j*patch_size:(j+1)*patch_size])
-                codes = []
-                for patch in patches:
-                    pc, ec, bc = compute_patch_codes(patch); codes.extend([pc, ec, bc])
-                processed_input.extend(codes)
-            else:
-                if col_name in scalings and 'min' in scalings[col_name]:
-                    smin = scalings[col_name]['min']; smax = scalings[col_name]['max']
-                    value = 2 * (float(value) - smin) / (smax - smin) - 1
-                processed_input.append(float(value))
-            input_idx += 1
+        processed_input = encode_sample_input(sample_input, col_types, vocabularies, scalings, image_params)
             
         x = torch.tensor(processed_input, dtype=torch.float).unsqueeze(0).to(device)
         model_output = model(x)
@@ -4425,7 +5014,7 @@ def load_and_sample_model(sample_input, hidden_dims, vocabularies, col_types, ou
             else:
                 output_mapping_plot.append((col_name, None, entry['start'], entry['end'], 'scalar', 1))
         
-        # Input ranges
+        # Default ranges for non-numeric scalar inputs (e.g. integer-encoded labels).
         global_input_ranges = {}
         for (col_name, sub_index, value, global_idx, width, kind) in input_mapping:
             if kind == 'scalar' and col_types[col_name] in ["inlab", "intex"]:
@@ -4453,8 +5042,53 @@ def load_and_sample_model(sample_input, hidden_dims, vocabularies, col_types, ou
 
         PLOT_RESOLUTION_1D = plot_settings.get('resolution_1d', 400) if isinstance(plot_option, str) else 400
         PLOT_RESOLUTION_2D = plot_settings.get('resolution_2d', 150) if isinstance(plot_option, str) else 150
-        PLOT_RANGE_MODE = plot_settings.get('range_mode', 'scaled')
-        PLOT_RANGE_CUSTOM = plot_settings.get('custom_range', None)
+        PLOT_INPUT_RANGES = plot_settings.get('input_ranges', {})
+
+        def _has_numeric_scaling(col_name):
+            return col_name in scalings and 'min' in scalings[col_name] and 'max' in scalings[col_name]
+
+        def _to_display_units(value, col_name):
+            if _has_numeric_scaling(col_name):
+                smin = scalings[col_name]['min']
+                smax = scalings[col_name]['max']
+                return (value + 1.0) / 2.0 * (smax - smin) + smin
+            return value
+
+        def _to_model_units(value, col_name):
+            if _has_numeric_scaling(col_name):
+                smin = scalings[col_name]['min']
+                smax = scalings[col_name]['max']
+                denom = smax - smin
+                return 0.0 if denom == 0 else 2.0 * (value - smin) / denom - 1.0
+            return value
+
+        def _plot_range(col_name, global_idx, sample_value):
+            if _has_numeric_scaling(col_name):
+                xmin, xmax = PLOT_INPUT_RANGES.get(
+                    col_name, (scalings[col_name]['min'], scalings[col_name]['max']))
+            else:
+                xmin, xmax = global_input_ranges.get(global_idx, (-1.0, 1.0))
+
+            xmin, xmax = sorted((float(xmin), float(xmax)))
+            span = xmax - xmin
+            if span == 0:
+                span = max(abs(xmin), 1.0)
+                xmin -= span * 0.5
+                xmax += span * 0.5
+
+            # Keep an out-of-range sample visible with a small amount of context.
+            padding = span * 0.05
+            if sample_value < xmin:
+                xmin = sample_value - padding
+            elif sample_value > xmax:
+                xmax = sample_value + padding
+            return xmin, xmax
+
+        def _decode_plot_output(raw_out, col_name, out_kind, num_classes):
+            values = _get_categorical_plot_value(raw_out, out_kind, num_classes)
+            if out_kind != 'categorical' and _has_numeric_scaling(col_name):
+                values = _to_display_units(values, col_name)
+            return values
         
         def generate_1d_plot_fast(in_entry, out_entry, base_input_np):
             col_in, sub_in, val_in, gidx_in, width_in, kind_in = in_entry
@@ -4493,7 +5127,7 @@ def load_and_sample_model(sample_input, hidden_dims, vocabularies, col_types, ou
                     modified[gidx_in + cat_idx] = 1.0
                     inp_t = torch.tensor(modified, dtype=torch.float32).unsqueeze(0).to(device)
                     with torch.no_grad(): raw = model(inp_t)[0, ostart:oend].cpu().numpy()
-                    results.append(_get_categorical_plot_value(raw.reshape(1, -1), okind, onc)[0])
+                    results.append(_decode_plot_output(raw.reshape(1, -1), col_out, okind, onc)[0])
                     bar_labels.append(cat_name)
                 
                 fig, ax = plt.subplots(figsize=(max(6, len(results)*0.6), 5), dpi=120)
@@ -4526,27 +5160,19 @@ def load_and_sample_model(sample_input, hidden_dims, vocabularies, col_types, ou
                 
             else:
                 # Line Plot
-                if PLOT_RANGE_CUSTOM is not None:
-                    xmin, xmax = PLOT_RANGE_CUSTOM
-                    if PLOT_RANGE_MODE == 'unscaled' and col_in in scalings and 'min' in scalings[col_in]:
-                        smin = scalings[col_in]['min']; smax = scalings[col_in]['max']
-                        xmin = 2 * (xmin - smin) / (smax - smin) - 1
-                        xmax = 2 * (xmax - smin) / (smax - smin) - 1
-                elif gidx_in in global_input_ranges:
-                    xmin, xmax = global_input_ranges[gidx_in]
-                else: xmin, xmax = -1, 1
+                sample_display = _to_display_units(val_in, col_in)
+                xmin, xmax = _plot_range(col_in, gidx_in, sample_display)
                 xs = np.linspace(xmin, xmax, PLOT_RESOLUTION_1D)
-                vary_list = [[v] for v in xs]
+                vary_list = [[_to_model_units(v, col_in)] for v in xs]
                 
                 raw_out = _batch_model_eval(base_input_np, [gidx_in], vary_list, ostart, oend)
-                ys = _get_categorical_plot_value(raw_out, okind, onc)
+                ys = _decode_plot_output(raw_out, col_out, okind, onc)
                 
                 fig, ax = plt.subplots(figsize=(8, 5), dpi=120)
                 ax.plot(xs, ys, '-', color='#2563eb', linewidth=1.5)
                 
                 # MARK SAMPLE INPUT (Vertical Line)
-                # val_in is the scalar float
-                ax.axvline(x=val_in, color='red', linestyle='--', linewidth=1.5, label='Sample Input', alpha=0.8)
+                ax.axvline(x=sample_display, color='red', linestyle='--', linewidth=1.5, label='Sample Input', alpha=0.8)
                 ax.legend()
                 
                 if out_class_labels is not None:
@@ -4573,14 +5199,16 @@ def load_and_sample_model(sample_input, hidden_dims, vocabularies, col_types, ou
             
             if kind1 != 'scalar' or kind2 != 'scalar': return
             
-            g1 = np.linspace(*(global_input_ranges.get(idx1, (-1, 1))), PLOT_RESOLUTION_2D)
-            g2 = np.linspace(*(global_input_ranges.get(idx2, (-1, 1))), PLOT_RESOLUTION_2D)
+            sample1_display = _to_display_units(val1, col1)
+            sample2_display = _to_display_units(val2, col2)
+            g1 = np.linspace(*_plot_range(col1, idx1, sample1_display), PLOT_RESOLUTION_2D)
+            g2 = np.linspace(*_plot_range(col2, idx2, sample2_display), PLOT_RESOLUTION_2D)
             X, Y = np.meshgrid(g1, g2)
             
             flat_x = X.ravel(); flat_y = Y.ravel()
-            vary_list = list(zip(flat_x, flat_y))
+            vary_list = list(zip(_to_model_units(flat_x, col1), _to_model_units(flat_y, col2)))
             raw_out = _batch_model_eval(base_input_np, [idx1, idx2], vary_list, ostart, oend)
-            Z_flat = _get_categorical_plot_value(raw_out, okind, onc)
+            Z_flat = _decode_plot_output(raw_out, col_out, okind, onc)
             Z = Z_flat.reshape(X.shape)
             
             fig, ax = plt.subplots(figsize=(8, 6), dpi=120)
@@ -4607,8 +5235,7 @@ def load_and_sample_model(sample_input, hidden_dims, vocabularies, col_types, ou
                 plt.colorbar(im, ax=ax, label=out_label)
             
             # MARK SAMPLE INPUT (Cross)
-            # val1, val2 are scalar floats
-            ax.scatter([val1], [val2], color='red', marker='x', s=100, linewidth=2.5, label='Sample', zorder=10)
+            ax.scatter([sample1_display], [sample2_display], color='red', marker='x', s=100, linewidth=2.5, label='Sample', zorder=10)
             # Optional: Add small legend for the marker
             # ax.legend(loc='upper right') 
             
@@ -4895,9 +5522,10 @@ def plot_all_neurons(model, processed_input, scalings, col_types, vocabularies,
             
             if activation is not None and not bd['use_sgu']:
                 # Evaluate activation on sweep values
+                # Sweep as [R, C] so per-neuron activations (PaWeL) use this neuron's own curve
                 x_sweep = torch.tensor(x_range, dtype=torch.float32).to(device)
                 with torch.no_grad():
-                    y_sweep = activation(x_sweep).cpu().numpy()
+                    y_sweep = activation(x_sweep.unsqueeze(1).expand(-1, len(pre_vals)).contiguous())[:, neuron_idx].cpu().numpy()
                 
                 fig, ax = plt.subplots(figsize=(6, 4), dpi=100)
                 ax.plot(x_range, y_sweep, '-', color='#2563eb', linewidth=1.5, label='Activation')
@@ -4972,7 +5600,7 @@ def _build_activation_map():
         "SiLULU": SiLULU, "Reciprocal": Reciprocal, "TTanh": TTanh,
         "TSoftsign": TSoftsign, "TSigma": TSigma, "TReLU": TReLU, "ATanU": ATanU,
         "SALU": SALU, "SMU": SMU, "ELU": nn.ELU, "RReLU": nn.RReLU, "PolyMorph": PolyMorph,
-        "All": GumbelActivationSelector,
+        "All": GumbelActivationSelector, "Maxout": lambda **p: MaxoutActivation(**p),
     }
 
 def ask_activation():
@@ -4992,6 +5620,7 @@ def ask_activation():
     print("72: Snake  73: ELU  74: RReLU  75: PolyMorph  76: OGDRA")
     print("77: CUSTOM (define your own)")
     print("78: ALL (Gumbel Softmax learnable selection)")
+    print("79: Maxout (learned maximum of affine pieces)")
     choice = input("Enter number: ").strip().lower()
 
     simple = {
@@ -5057,6 +5686,13 @@ def ask_activation():
         init_temp = float(temp_str) if temp_str else 1.0
         def act(): return GumbelActivationSelector(init_temp=init_temp)
         act.activation_config = {"name": "All", "params": {"init_temp": init_temp}}
+        return act
+    elif choice == "79":
+        pieces_str = input("Maxout pieces per hidden output (default 2): ").strip()
+        pieces = int(pieces_str) if pieces_str else 2
+        if pieces < 2: raise ValueError("Maxout requires at least two pieces.")
+        def act(): return MaxoutActivation(pieces=pieces)
+        act.activation_config = {"name": "Maxout", "params": {"pieces": pieces}}
         return act
     else: print("Invalid, defaulting to ReLU."); return nn.ReLU
 
@@ -5290,34 +5926,26 @@ def run_benchmark(csv_file, delimiter, input_cols, output_cols, col_types, vocab
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    dataset = CustomDataset(csv_file, delimiter, input_cols, output_cols, col_types, vocabularies, {}, image_params)
-    scalings = dataset.scalings
-
-    # ── Validation setup ──
+    # ── Data: deduplicated, and with loss_calc_mode 2 a truly held-out validation set ──
     val_loader = None
+    vfile = None; vfrac = 0.0
     if loss_calc_mode == 2:
-        # NEW: Try external validation file first
         if val_file_path and os.path.isfile(val_file_path):
-            print(f"Using external validation file: {val_file_path}")
-            vd = val_delimiter if val_delimiter else delimiter
-            val_dataset = CustomDataset(val_file_path, vd, input_cols, output_cols,
-                                       col_types, vocabularies, scalings, image_params)
-            val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-            train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+            print(f"Using external validation file: {val_file_path}"); vfile = val_file_path
         else:
-            # Fallback to percentage split
             if val_file_path:
                 print(f"File '{val_file_path}' not found/invalid. Falling back to percentage split.")
             if valid_eval_percentage is None:
                 valid_eval_percentage = float(input("Validation percentage (0.0-1.0): ").strip())
-            total_indices = list(range(len(dataset))); random.shuffle(total_indices)
-            val_size = max(1, min(3000, int(valid_eval_percentage * len(dataset))))
-            val_indices = total_indices[:val_size]; train_indices = total_indices[val_size:]
-            from torch.utils.data import SubsetRandomSampler
-            train_loader = DataLoader(dataset, batch_size=batch_size, sampler=SubsetRandomSampler(train_indices))
-            val_loader = DataLoader(dataset, batch_size=batch_size, sampler=SubsetRandomSampler(val_indices))
-    else:
-        train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+            vfrac = valid_eval_percentage
+    dataset, val_dataset, _ = prepare_train_val(csv_file, delimiter, input_cols, output_cols, col_types, vocabularies,
+                                                image_params, val_frac=vfrac, val_file=vfile, val_delimiter=val_delimiter)
+    scalings = dataset.scalings
+    train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    if val_dataset is not None:
+        if len(val_dataset) > 3000:  # keep evaluation fast, as before
+            val_dataset = torch.utils.data.Subset(val_dataset, np.random.default_rng(0).choice(len(val_dataset), 3000, replace=False).tolist())
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
     input_dims = calculate_input_dim(input_cols, col_types, scalings, vocabularies)
     
@@ -5393,6 +6021,7 @@ def run_benchmark(csv_file, delimiter, input_cols, output_cols, col_types, vocab
                 dropout_prob=noise_params.get("dropout_pct", 0.0) if noise_mode == "dropout" else 0.0,
                 use_noise_injection_layers=(noise_mode == "noise injection layers"),
                 noise_injection_std=noise_params.get("std", 0.0)).to(device)
+            materialize_lazy_modules(model, input_dims, device)
             if use_lsuv:
                 lsuv_init(model, train_loader, device, max_iter=lsuv_max_iter,
                          normalize_mean=lsuv_normalize_mean, verbose=False)
@@ -5400,6 +6029,7 @@ def run_benchmark(csv_file, delimiter, input_cols, output_cols, col_types, vocab
             if optimizer_choice == "RAdamScheduleFree": optimizer.train()
             
             criterion = CombinedLoss(output_layout) if has_categorical else nn.HuberLoss()
+            if has_categorical: criterion.calibrate(dataset)
             step = 0; EVAL_INTERVAL = 500
             pbar = tqdm(total=num_steps, desc=f"{combo_name[:30]:<30}", leave=True)
             
@@ -5527,7 +6157,7 @@ def run_inverse_design():
                      config.get("residual_type", "residual"), norm_type=config.get("norm_type", "layer"),
                      groups=config.get("groups", 1), attention_type=config.get("attention_type", "none"),
                      num_heads=config.get("num_heads", 1), input_attention_type=config.get("input_attention_type", "none"),
-                     moe_mode=config.get("moe_mode", 1)).to(device)
+                     moe_mode=config.get("moe_mode", 1), layer_routing=config.get("layer_routing", "none")).to(device)
     
     with torch.no_grad(): model(torch.zeros(1, input_dims).to(device))
     model.load_state_dict(torch.load('model.pt', map_location=device)); model.eval()
@@ -5745,7 +6375,7 @@ def run_test_eval(model, test_csv, delimiter, input_cols, output_cols, col_types
     
     class_weights = dataset.compute_class_weights(device=device)
     if has_categorical:
-        criterion = CombinedLoss(output_layout, column_weights=class_weights)
+        criterion = CombinedLoss(output_layout, column_weights=class_weights); criterion.calibrate(dataset)
     else:
         criterion = nn.HuberLoss()
     
@@ -5919,7 +6549,7 @@ def run_feature_importance(model, csv_file, delimiter, input_cols, output_cols, 
     
     class_weights = dataset.compute_class_weights(device=device)
     if has_categorical:
-        criterion = CombinedLoss(output_layout, column_weights=class_weights)
+        criterion = CombinedLoss(output_layout, column_weights=class_weights); criterion.calibrate(dataset)
     else:
         criterion = nn.HuberLoss()
     
@@ -6154,7 +6784,7 @@ def run_error_analysis(model, csv_file, delimiter, input_cols, output_cols, col_
 
     class_weights = dataset.compute_class_weights(device=device)
     if has_categorical:
-        criterion = CombinedLoss(output_layout, column_weights=class_weights)
+        criterion = CombinedLoss(output_layout, column_weights=class_weights); criterion.calibrate(dataset)
     else:
         criterion = nn.HuberLoss(reduction='none')
 
@@ -6322,7 +6952,7 @@ def run_lr_finder(csv_file, delimiter, input_cols, output_cols, col_types,
     
     class_weights = dataset.compute_class_weights(device=device)
     if has_categorical:
-        criterion = CombinedLoss(output_layout, column_weights=class_weights)
+        criterion = CombinedLoss(output_layout, column_weights=class_weights); criterion.calibrate(dataset)
     else:
         criterion = nn.HuberLoss()
     
@@ -6460,12 +7090,15 @@ def run_cross_validation(csv_file, delimiter, input_cols, output_cols, col_types
     if noise_params is None:
         noise_params = {}
     
+    raw = pd.read_csv(csv_file, delimiter=delimiter)
+    raw, dups = dedupe_rows(raw, input_cols, output_cols, col_types)
+    print(f"  Exact duplicate rows removed: {dups}")
     dataset = CustomDataset(csv_file, delimiter, input_cols, output_cols,
-                           col_types, vocabularies, scalings, image_params)
+                           col_types, vocabularies, scalings, image_params, df=raw)
     
     n = len(dataset)
-    indices = list(range(n))
-    _random.shuffle(indices)
+    # rows with identical inputs share a fold, so no validation fold sees a training input
+    fold_ids = group_kfold_ids(_row_group_keys(dataset.df, input_cols, col_types), k_folds)
     
     fold_size = n // k_folds
     fold_results = []
@@ -6485,10 +7118,8 @@ def run_cross_validation(csv_file, delimiter, input_cols, output_cols, col_types
         print(f"\n  --- Fold {fold+1}/{k_folds} ---")
         
         # Split indices
-        val_start = fold * fold_size
-        val_end = val_start + fold_size if fold < k_folds - 1 else n
-        val_indices = indices[val_start:val_end]
-        train_indices = indices[:val_start] + indices[val_end:]
+        val_indices = np.flatnonzero(fold_ids == fold).tolist()
+        train_indices = np.flatnonzero(fold_ids != fold).tolist()
         
         train_subset = torch.utils.data.Subset(dataset, train_indices)
         val_subset = torch.utils.data.Subset(dataset, val_indices)
@@ -6498,7 +7129,7 @@ def run_cross_validation(csv_file, delimiter, input_cols, output_cols, col_types
         
         class_weights = dataset.compute_class_weights(device=device)
         if has_categorical:
-            criterion = CombinedLoss(output_layout, column_weights=class_weights)
+            criterion = CombinedLoss(output_layout, column_weights=class_weights); criterion.calibrate(train_subset)
         else:
             criterion = nn.HuberLoss()
         
@@ -6552,11 +7183,1240 @@ def run_cross_validation(csv_file, delimiter, input_cols, output_cols, col_types
 
 
 ##############################################
+# Interactive sampling GUI (local web server, stdlib only)
+##############################################
+_GUI_INPUT_TYPES = ["in", "inlab", "intex", "inim", "inlabcat", "intexcat"]
+_GUI_OUTPUT_TYPES = ["out", "outlab", "outex", "outlabcat", "outexcat"]
+_GUI_HTML = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mlpRes6_gui.html")
+
+
+def _gui_b64(arr):
+    import base64
+    return base64.b64encode(np.ascontiguousarray(np.nan_to_num(np.asarray(arr, dtype=np.float32))).tobytes()).decode("ascii")
+
+
+def _gui_float(v):
+    v = float(v)
+    return v if math.isfinite(v) else None
+
+
+def _gui_clean(obj):
+    """NaN/inf -> None recursively (a diverged model must not break strict JSON)."""
+    if isinstance(obj, float): return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict): return {k: _gui_clean(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)): return [_gui_clean(v) for v in obj]
+    return obj
+
+
+def _gui_shape_module(block):
+    """The elementwise activation whose shape is worth plotting, or None (SGU / Maxout)."""
+    act = getattr(block, "activation", None)
+    if isinstance(act, GLUActivation): return act.activation_fn   # GLU projection mixes channels
+    if isinstance(act, GLU2Activation): return act.activation_fn1
+    return act
+
+
+class InteractiveSampler:
+    """Owns the trained model for the GUI server; every public method returns JSON-ready data."""
+
+    def __init__(self, model_path="model.pt", config_path="config.json"):
+        import threading
+        self.lock = threading.RLock()
+        self.model_path = model_path; self.config_path = config_path
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.version = 0; self.model_mtime = None; self.load_error = None
+        self._dataset = None; self._dataset_error = None; self._data_stats = None
+        self._load_model()
+
+    # ─── loading ───
+    def _load_config(self):
+        with open(self.config_path) as f: self.config = json.load(f)
+        cfg = self.config
+        self.col_types = cfg["col_types"]; self.scalings = cfg["scalings"]
+        self.vocabs = cfg.get("vocabularies", {}); self.image_params = cfg.get("image_params", {})
+        self.input_cols = [c for c, t in self.col_types.items() if t in _GUI_INPUT_TYPES]
+        self.output_cols = [c for c, t in self.col_types.items() if t in _GUI_OUTPUT_TYPES]
+        self.input_dim = calculate_input_dim(self.input_cols, self.col_types, self.scalings, self.vocabs)
+        self.output_layout, self.output_dim, _ = build_output_layout(self.output_cols, self.col_types, self.scalings, self.vocabs)
+        self.layout_by_col = {e["col"]: e for e in self.output_layout}
+        self.slots, start = {}, 0
+        for c in self.input_cols:
+            w = calculate_input_dim([c], self.col_types, self.scalings, self.vocabs)
+            self.slots[c] = (start, w); start += w
+
+    def _load_model(self):
+        snapshot = dict(self.__dict__)
+        try: self._load_model_unchecked()
+        except Exception:
+            self.__dict__.update(snapshot)  # all-or-nothing: never pair a new config with the old model
+            raise
+
+    def _load_model_unchecked(self):
+        old_path = getattr(self, "config", {}).get("file_path")
+        self._load_config()  # a new training run may have changed columns or architecture
+        if self.config.get("file_path") != old_path: self._dataset = None; self._dataset_error = None
+        model = build_model_from_config(self.config, self.input_dim, self.output_dim, self.device)
+        materialize_lazy_modules(model, self.input_dim, self.device)
+        sig = self._file_sig()
+        model.load_state_dict(torch.load(self.model_path, map_location=self.device))
+        model.eval()
+        self.model = model; self.model_mtime = os.path.getmtime(self.model_path); self._sig = sig; self.version += 1
+        self.load_error = None; self._data_stats = None
+
+    def _file_sig(self):
+        """(mtime_ns, size) of model.pt and config.json: two saves within one timestamp tick still differ in size."""
+        return tuple((st.st_mtime_ns, st.st_size) for st in (os.stat(self.model_path), os.stat(self.config_path)))
+
+    def check_reload(self, force=False):
+        """Reload model.pt if it changed on disk (e.g. a training run saved a better model)."""
+        with self.lock:
+            try:
+                changed = self._file_sig() != self._sig
+            except OSError as e:
+                self.load_error = str(e); return False
+            if not (changed or force): return False
+            try:
+                self._load_model(); return True
+            except Exception as e:  # half-written file, or config/model from different runs: keep the old model
+                self._sig = self._file_sig()  # retry on the next change, not on every poll
+                self.load_error = f"{type(e).__name__}: {e}"; return False
+
+    # ─── units / encoding ───
+    def _scaled(self, col):
+        s = self.scalings.get(col, {})
+        return isinstance(s, dict) and "min" in s and "max" in s
+
+    def _to_display(self, col, v):
+        if not self._scaled(col): return v
+        s = self.scalings[col]; return (v + 1.0) / 2.0 * (s["max"] - s["min"]) + s["min"]
+
+    def _to_model(self, col, v):
+        if not self._scaled(col): return v
+        s = self.scalings[col]; denom = (s["max"] - s["min"]) or 1.0
+        return 2.0 * (v - s["min"]) / denom - 1.0
+
+    def _labels(self, col):
+        vocab = self.vocabs.get(col, {})
+        return sorted(vocab, key=lambda k: vocab[k])
+
+    def _default_input(self, col):
+        ct = self.col_types[col]
+        if ct in ("inlab", "inlabcat"): return self._labels(col)[0]
+        if ct == "in" and self._scaled(col):
+            df = self._get_dataset()
+            if df is not None and col in df:
+                vals = pd.to_numeric(df[col], errors="coerce").dropna()
+                if len(vals): return float(vals.median())
+            s = self.scalings[col]; return (s["min"] + s["max"]) / 2.0
+        return 0.0 if ct == "in" else ""
+
+    def _encode(self, inputs):
+        raw = [inputs.get(c, self._default_input(c)) for c in self.input_cols]
+        return np.asarray(encode_sample_input(raw, self.col_types, self.vocabs, self.scalings, self.image_params),
+                          dtype=np.float32)
+
+    def _sweep_values(self, col, lo=None, hi=None, n=200):
+        """Display-unit values to sweep for one input (numeric grid or category labels)."""
+        ct = self.col_types[col]
+        if ct in ("inlab", "inlabcat"): return self._labels(col), True
+        if ct != "in": raise ValueError(f"Input '{col}' ({ct}) cannot be swept.")
+        if lo is None or hi is None:
+            if self._scaled(col): lo, hi = self.scalings[col]["min"], self.scalings[col]["max"]
+            else: lo, hi = -1.0, 1.0
+        lo, hi = sorted((float(lo), float(hi)))
+        if hi == lo: hi = lo + 1.0
+        return np.linspace(lo, hi, int(n)).tolist(), False
+
+    def _apply(self, batch, col, values):
+        """Write one input's display-unit values into rows of a model-unit batch (in place)."""
+        start, width = self.slots[col]; ct = self.col_types[col]
+        if ct == "inlabcat":
+            batch[:, start:start + width] = 0.0
+            for i, v in enumerate(values):
+                k = self.vocabs[col].get(str(v), 0)
+                if 0 <= k < width: batch[i, start + k] = 1.0
+        elif ct == "inlab":
+            batch[:, start] = [float(self.vocabs[col].get(str(v), 0)) for v in values]
+        else:
+            batch[:, start] = self._to_model(col, np.asarray(values, dtype=np.float64))
+
+    def _run(self, batch_np, chunk=4096):
+        outs = []
+        with torch.no_grad():
+            for i in range(0, len(batch_np), chunk):
+                x = torch.as_tensor(batch_np[i:i + chunk], dtype=torch.float32, device=self.device)
+                outs.append(self.model(x).float().cpu())
+        return torch.cat(outs, 0)
+
+    # ─── outputs ───
+    def _decode(self, raw):
+        items = []
+        for e in self.output_layout:
+            col, ct = e["col"], e["type"]; sl = raw[e["start"]:e["end"]]
+            inv = {v: k for k, v in self.vocabs.get(col, {}).items()}
+            item = {"col": col, "type": ct}
+            if ct == "outlabcat":
+                probs = torch.softmax(sl, 0).tolist(); k = int(sl.argmax())
+                item["value"] = inv.get(k, k)
+                item["probs"] = [[str(inv.get(i, i)), p] for i, p in enumerate(probs)]
+            elif ct == "outexcat":
+                logits = sl.view(e["max_len"], e["num_classes"])
+                item["value"] = "".join(inv.get(i, "") for i in logits.argmax(-1).tolist())
+                item["confidence"] = torch.softmax(logits, -1).max(-1).values.tolist()
+            elif ct == "outex":
+                item["value"] = "".join(inv.get(round(v), "") for v in sl.tolist())
+            elif ct == "outlab":
+                code = round(sl[0].item()); item["value"] = inv.get(code, code); item["raw"] = sl[0].item()
+            else:
+                item["value"] = _gui_float(self._to_display(col, sl[0].item()))
+            items.append(item)
+        return items
+
+    def _series(self, out, col):
+        """Plottable series for one output column over a batch of raw model outputs."""
+        e = self.layout_by_col[col]; sl = out[:, e["start"]:e["end"]]
+        if e["type"] == "outlabcat":
+            probs = torch.softmax(sl, -1).numpy()
+            return [{"name": lab, "y": probs[:, i].tolist()} for i, lab in enumerate(self._labels(col))
+                    if i < probs.shape[1]], "probability"
+        if e["type"] == "outlab":
+            return [{"name": col, "y": sl[:, 0].tolist()}], "label code"
+        if e["type"] == "out":
+            return [{"name": col, "y": self._to_display(col, sl[:, 0].numpy().astype(np.float64)).tolist()}], col
+        raise ValueError(f"Output '{col}' ({e['type']}) cannot be plotted.")
+
+    def _target_scalar(self, out, col, cls):
+        """One number per row to map/differentiate: display value, class probability, or label code."""
+        e = self.layout_by_col[col]; sl = out[:, e["start"]:e["end"]]
+        if e["type"] == "outlabcat":
+            if cls in (None, "", "__argmax__"): return sl.argmax(-1).float()
+            return torch.softmax(sl, -1)[:, self.vocabs[col].get(str(cls), 0)]
+        if e["type"] == "out" and self._scaled(col):
+            s = self.scalings[col]; return (sl[:, 0] + 1.0) / 2.0 * (s["max"] - s["min"]) + s["min"]
+        return sl[:, 0]
+
+    # ─── tracing ───
+    def _trace(self, x):
+        """Forward x and capture per-block tensors (pre-activation, activation in/out, block output)."""
+        blocks = list(getattr(self.model, "blocks", []))
+        rec = [dict() for _ in blocks]; handles = []
+
+        def hook(i, key, use_input=False):
+            def fn(_mod, inp, out):
+                if key not in rec[i]:  # first call only (GLU2 calls its activation twice)
+                    t = inp[0] if use_input else out
+                    if torch.is_tensor(t): rec[i][key] = t.detach().float()
+            return fn
+        for i, blk in enumerate(blocks):
+            handles.append(blk.register_forward_hook(hook(i, "out")))
+            if getattr(blk, "linear1", None) is not None:
+                handles.append(blk.linear1.register_forward_hook(hook(i, "pre")))
+            sm = _gui_shape_module(blk)
+            if sm is not None:
+                handles.append(sm.register_forward_hook(hook(i, "act_in", True)))
+                handles.append(sm.register_forward_hook(hook(i, "act_out")))
+        try:
+            with torch.no_grad(): out = self.model(x)
+        finally:
+            for h in handles: h.remove()
+        return out, rec
+
+    # ─── API ───
+    def meta(self):
+        with self.lock:
+            df = self._get_dataset()
+            inputs = []
+            for c in self.input_cols:
+                ct = self.col_types[c]; spec = {"col": c, "type": ct, "default": self._default_input(c)}
+                if ct in ("inlab", "inlabcat"): spec["options"] = self._labels(c)
+                if self._scaled(c): spec["min"] = self.scalings[c]["min"]; spec["max"] = self.scalings[c]["max"]
+                if ct in ("intex", "intexcat"): spec["max_len"] = self.scalings[c].get("max_len")
+                spec["sweepable"] = ct in ("in", "inlab", "inlabcat")
+                inputs.append(spec)
+            outputs = []
+            for e in self.output_layout:
+                spec = {"col": e["col"], "type": e["type"], "plottable": e["type"] in ("out", "outlab", "outlabcat")}
+                if e["type"] in ("outlab", "outlabcat"): spec["classes"] = self._labels(e["col"])
+                if self._scaled(e["col"]): spec["min"] = self.scalings[e["col"]]["min"]; spec["max"] = self.scalings[e["col"]]["max"]
+                outputs.append(spec)
+            x0 = torch.zeros(1, self.input_dim, device=self.device)
+            _, rec = self._trace(x0)
+            blocks = []
+            for i, blk in enumerate(getattr(self.model, "blocks", [])):
+                sm = _gui_shape_module(blk)
+                blocks.append({
+                    "index": i, "kind": type(blk).__name__,
+                    "in_dim": getattr(blk, "in_dim", None), "out_dim": getattr(blk, "out_dim", None),
+                    "neurons": int(rec[i]["act_in"].shape[-1]) if "act_in" in rec[i] else
+                               (int(rec[i]["pre"].shape[-1]) if "pre" in rec[i] else None),
+                    "activation": type(blk.activation).__name__ if getattr(blk, "activation", None) is not None else None,
+                    "shape_module": type(sm).__name__ if sm is not None else None,
+                    "params": sum(p.numel() for p in blk.parameters()),
+                })
+            cfg = self.config
+            return {
+                "inputs": inputs, "outputs": outputs, "blocks": blocks,
+                "input_dim": self.input_dim, "output_dim": self.output_dim,
+                "slots": {c: list(v) for c, v in self.slots.items()},
+                "params": sum(p.numel() for p in self.model.parameters()),
+                "weights": [{"name": n, "shape": list(p.shape)} for n, p in self.model.named_parameters()],
+                "config": {k: cfg.get(k) for k in ("hidden_dims", "activation", "activation_type", "residual_type",
+                                                   "norm_type", "moe_mode", "mlp_mode", "layer_routing", "use_grn",
+                                                   "optimizer_choice", "file_path")},
+                "dataset": {"available": df is not None, "rows": 0 if df is None else len(df), "error": self._dataset_error},
+                "status": self.status(),
+            }
+
+    def status(self):
+        return {"version": self.version, "model_path": os.path.abspath(self.model_path),
+                "model_mtime": self.model_mtime, "load_error": self.load_error, "device": str(self.device)}
+
+    def predict(self, inputs):
+        with self.lock:
+            base = self._encode(inputs)
+            x = torch.as_tensor(base, device=self.device).unsqueeze(0)
+            out, rec = self._trace(x)
+            raw = out[0].float().cpu()
+            layers = []
+            for i, r in enumerate(rec):
+                layer = {"index": i, "skipped": "out" not in r}
+                for key in ("pre", "act_in", "act_out", "out"):
+                    if key in r: layer[key] = r[key].reshape(-1).cpu().tolist()
+                layers.append(layer)
+            routers = [p.reshape(-1)[0].item() for p in getattr(self.model, "_last_router_probs", []) or []]
+            return {"outputs": self._decode(raw), "raw": raw.tolist(), "encoded": base.tolist(),
+                    "layers": layers, "routers": routers, "version": self.version}
+
+    def sweep1d(self, inputs, x_col, out_col, lo=None, hi=None, n=200, show_data=False):
+        with self.lock:
+            values, categorical = self._sweep_values(x_col, lo, hi, n)
+            batch = np.tile(self._encode(inputs), (len(values), 1))
+            self._apply(batch, x_col, values)
+            series, y_label = self._series(self._run(batch), out_col)
+            res = {"x": values, "categorical": categorical, "series": series, "y_label": y_label,
+                   "current": inputs.get(x_col, self._default_input(x_col)), "x_col": x_col, "out_col": out_col}
+            if self.layout_by_col[out_col]["type"] == "outlab": res["y_classes"] = self._labels(out_col)
+            if show_data and not categorical and self.layout_by_col[out_col]["type"] == "out":
+                res["data"] = self._data_points(x_col, out_col)
+            return res
+
+    def sweep2d(self, inputs, x_col, y_col, out_col, cls=None, n=80, ranges=None, show_data=False):
+        with self.lock:
+            ranges = ranges or {}
+            n = int(max(8, min(int(n), 300)))
+            xs, xcat = self._sweep_values(x_col, *(ranges.get(x_col) or (None, None)), n=n)
+            ys, ycat = self._sweep_values(y_col, *(ranges.get(y_col) or (None, None)), n=n)
+            batch = np.tile(self._encode(inputs), (len(xs) * len(ys), 1))
+            self._apply(batch, x_col, [x for _ in ys for x in xs])   # row-major: y outer, x inner
+            self._apply(batch, y_col, [y for y in ys for _ in xs])
+            z = self._target_scalar(self._run(batch), out_col, cls).numpy()
+            e = self.layout_by_col[out_col]
+            res = {"x": xs, "y": ys, "x_categorical": xcat, "y_categorical": ycat,
+                   "nx": len(xs), "ny": len(ys), "z": _gui_b64(z),
+                   "zmin": _gui_float(np.nanmin(z)), "zmax": _gui_float(np.nanmax(z)),
+                   "mode": ("class" if e["type"] == "outlabcat" and cls in (None, "", "__argmax__") else
+                            "prob" if e["type"] == "outlabcat" else "value"),
+                   "current": [inputs.get(x_col, self._default_input(x_col)), inputs.get(y_col, self._default_input(y_col))]}
+            if e["type"] in ("outlab", "outlabcat"): res["classes"] = self._labels(out_col)
+            if show_data and not xcat and not ycat:
+                pts = self._data_points(x_col, y_col)
+                if pts: res["data"] = pts
+            return res
+
+    def sensitivity(self, inputs, out_col, cls=None):
+        """Local effect of each input on one output at the current point."""
+        with self.lock:
+            base = self._encode(inputs)
+            e = self.layout_by_col[out_col]
+            if e["type"] == "outlabcat" and cls in (None, "", "__argmax__"):
+                with torch.no_grad():
+                    logits = self.model(torch.as_tensor(base, device=self.device).unsqueeze(0)).float().cpu()[0, e["start"]:e["end"]]
+                cls = self._labels(out_col)[int(logits.argmax())]
+            x = torch.as_tensor(base, device=self.device).unsqueeze(0).requires_grad_(True)
+            with torch.enable_grad():
+                y = self._target_scalar(self.model(x).float().cpu(), out_col, cls)
+                grad = torch.autograd.grad(y.sum(), x)[0][0].cpu().numpy()
+            rows = []
+            for c in self.input_cols:
+                start, width = self.slots[c]; ct = self.col_types[c]
+                if ct == "in":
+                    span = (self.scalings[c]["max"] - self.scalings[c]["min"]) if self._scaled(c) else 2.0
+                    g = float(grad[start])  # d target / d model-unit input
+                    rows.append({"col": c, "kind": "gradient", "effect": _gui_float(g * 2.0),
+                                 "per_unit": _gui_float(g * 2.0 / span if span else g)})
+                elif ct in ("inlab", "inlabcat"):
+                    labels = self._labels(c)
+                    batch = np.tile(base, (len(labels), 1)); self._apply(batch, c, labels)
+                    t = self._target_scalar(self._run(batch), out_col, cls).numpy()
+                    rows.append({"col": c, "kind": "categorical", "effect": _gui_float(t.max() - t.min()),
+                                 "best": labels[int(t.argmax())], "worst": labels[int(t.argmin())],
+                                 "values": [[l, _gui_float(v)] for l, v in zip(labels, t)]})
+            target = ("P(" + str(cls) + ")" if e["type"] == "outlabcat" else out_col)
+            return {"rows": rows, "target": target, "out_col": out_col, "cls": cls}
+
+    def activation_shapes(self, inputs, block, lo=None, hi=None, n=241):
+        with self.lock:
+            blocks = list(getattr(self.model, "blocks", []))
+            block = int(block); blk = blocks[block]; sm = _gui_shape_module(blk)
+            if sm is None:
+                return {"available": False, "reason": "This block has no standalone activation (SGU / Maxout)."}
+            x = torch.as_tensor(self._encode(inputs), device=self.device).unsqueeze(0)
+            _, rec = self._trace(x)
+            if "act_in" not in rec[block]:
+                return {"available": False, "reason": "Block was skipped by the layer router for this input."}
+            cur_in = rec[block]["act_in"].reshape(-1).cpu().numpy(); cur_out = rec[block]["act_out"].reshape(-1).cpu().numpy()
+            C = cur_in.shape[0]
+            stats = self.data_stats(compute=False)
+            bstats = stats["blocks"][block] if stats and block < len(stats["blocks"]) else None
+            if lo is None or hi is None:
+                lo_a, hi_a = float(cur_in.min()), float(cur_in.max())
+                if bstats: lo_a, hi_a = min(lo_a, min(bstats["p01"])), max(hi_a, max(bstats["p99"]))
+                pad = max(0.5, 0.15 * (hi_a - lo_a)); lo, hi = min(-3.0, lo_a - pad), max(3.0, hi_a + pad)
+            xs = torch.linspace(float(lo), float(hi), int(n), device=self.device)
+            with torch.no_grad():
+                ys = sm(xs.unsqueeze(1).expand(-1, C).contiguous())
+            if ys.shape != (len(xs), C):
+                return {"available": False, "reason": f"{type(sm).__name__} is not an elementwise activation."}
+            ys = ys.float().cpu().numpy()
+            shared = bool(np.allclose(ys, ys[:, :1], atol=1e-6))
+            params = []
+            wrapper = blk.activation
+            owners = [("activation", sm)] if wrapper is sm else [("wrapper", wrapper), ("activation", sm)]
+            for owner_name, owner in owners:
+                for name, p in owner.named_parameters():
+                    if owner is wrapper and wrapper is not sm and name.startswith("activation_fn"):
+                        continue  # listed under the inner activation
+                    v = p.detach().float().cpu()
+                    entry = {"name": f"{owner_name}.{name}", "shape": list(v.shape)}
+                    if v.numel() <= 8: entry["values"] = [_gui_float(t) for t in v.reshape(-1).tolist()]
+                    else: entry.update(mean=_gui_float(v.mean()), std=_gui_float(v.std()), min=_gui_float(v.min()), max=_gui_float(v.max()))
+                    params.append(entry)
+            res = {"available": True, "block": block, "module": type(sm).__name__, "wrapper": type(wrapper).__name__,
+                   "neurons": C, "n": int(n), "x": xs.cpu().tolist(), "curves": _gui_b64(ys), "shared": shared,
+                   "current_in": cur_in.tolist(), "current_out": cur_out.tolist(), "params": params,
+                   "data": bstats}
+            knots = self._pwl_knots(sm, C)
+            if knots is not None: res["knots"] = knots
+            return res
+
+    def _pwl_knots(self, sm, C):
+        """PaWeL breakpoints mapped through TAAF-style wrappers onto the plotted curve."""
+        inner = sm
+        while not isinstance(inner, PaWeL) and isinstance(getattr(inner, "activation_fn", None), nn.Module):
+            inner = inner.activation_fn
+        if not isinstance(inner, PaWeL) or inner.num_channels not in (1, C): return None
+        with torch.no_grad():
+            kx = inner.breakpoint_values()[0].expand(C, -1)          # [C, K] in the PaWeL's own input units
+            if inner is not sm and hasattr(sm, "alpha") and hasattr(sm, "beta") and isinstance(sm, (TAAFWrapper, ResidualTAAFWrapper)):
+                if abs(float(sm.alpha)) < 1e-12: return None
+                kx = (kx - sm.beta) / sm.alpha                          # TAAF feeds alpha * x + beta
+            ky = sm(kx.t().contiguous()).t()                             # exact y of the full activation there
+        return {"k": int(kx.shape[1]), "x": _gui_b64(kx.float().cpu().numpy()), "y": _gui_b64(ky.float().cpu().numpy())}
+
+    # ─── EasyNN-style network diagram ───
+    def _node_modules(self, blk):
+        """(module whose input is a hidden node's net input, module whose output is its activation)."""
+        sm = _gui_shape_module(blk)
+        if sm is not None: return sm, sm, True
+        return blk.linear1, blk.linear1, False  # SGU / Maxout: linear1 output is the node
+
+    def _node_importance(self):
+        """Mean |node value| per diagram layer over a fixed data sample; cached per model version so the
+        diagram shows the same nodes whatever the current input is."""
+        if getattr(self, "_imp_cache", (None,))[0] == self.version: return self._imp_cache[1]
+        X = None
+        df = self._get_dataset()
+        if df is not None:
+            enc, _ = self._encode_rows(df.sample(min(256, len(df)), random_state=0))
+            if enc: X = torch.as_tensor(np.asarray(enc, dtype=np.float32), device=self.device)
+        if X is None: X = torch.as_tensor(self._encode({}), device=self.device).unsqueeze(0)
+        out, rec = self._trace(X)
+        imp = [X.abs().mean(0).cpu()]
+        for r in rec:
+            t = r.get("act_out", r.get("pre"))
+            imp.append(t.abs().reshape(-1, t.shape[-1]).mean(0).cpu() if t is not None and t.shape[0] == X.shape[0] else None)
+        imp.append(out.abs().mean(0).float().cpu())
+        self._imp_cache = (self.version, imp)
+        return imp
+
+    def _target_vector(self, targets):
+        """Model-unit targets per output entry (None where a target is missing or text)."""
+        out = {}
+        for e in self.output_layout:
+            col, ct = e["col"], e["type"]; t = (targets or {}).get(col)
+            if t is None or t == "": continue
+            try:
+                if ct == "out": out[col] = torch.tensor([[self._to_model(col, float(t))]], dtype=torch.float32)
+                elif ct in ("outlabcat", "outlab"):
+                    k = self.vocabs[col].get(str(t))
+                    if k is not None: out[col] = torch.tensor([k])
+            except (TypeError, ValueError):
+                pass
+        return out
+
+    def _static_weights(self, pairs):
+        """Effective linear weight per adjacent node-layer pair, or None where it is not a fixed matrix.
+        Folds in each block's second linear layer, ReZero gains and the next norm's scale;
+        normalization's re-centering, skip paths and gates are nonlinear and left out."""
+        m = self.model; blocks = list(getattr(m, "blocks", []))
+        if not isinstance(m, MLPO) or not blocks: return [None] * pairs
+        rt = m.residual_type
+        def norm_scale(blk, width):
+            w = getattr(blk.norm, "weight", None)
+            if w is None: w = getattr(blk.norm, "scale", None)
+            return w.detach().float().cpu() if w is not None and w.numel() == width else torch.ones(width)
+        def feeds(i):
+            """d(block i's contribution to the next stream)/d(block i's activation), or None."""
+            blk = blocks[i]
+            if blk.attn is not None or blk.tiny_attn is not None or not isinstance(blk.grn, nn.Identity): return None
+            if blk.residual_type == "highway" or getattr(blk, "use_sgu", False) or getattr(blk, "use_maxout", False): return None
+            if _gui_shape_module(blk) is not blk.activation: return None  # GLU: projection in between
+            if blk.linear2 is None: M = torch.eye(blk.out_dim)
+            elif isinstance(blk.linear2, nn.Linear): M = blk.linear2.weight.detach().float().cpu()
+            else: return None
+            if blk.residual_type in ("rezero", "elementwise rezero", "elementwise_rezero"):
+                g = blk.gamma.detach().float().cpu(); M = (g.reshape(-1, 1) if g.dim() else g) * M
+            return M
+        def cols(i):
+            """Column slice of the stream after block i that holds block i's transform output."""
+            if rt == "concat": total = blocks[i].output_dim(); return slice(total - blocks[i].out_dim, total)
+            if rt == "densenet":
+                start = self.input_dim + sum(b.out_dim for b in blocks[:i]); return slice(start, start + blocks[i].out_dim)
+            return slice(0, blocks[i].out_dim)
+        res = []
+        blk0 = blocks[0]
+        ok0 = (m.input_attn is None and isinstance(blk0.linear1, nn.Linear) and _gui_shape_module(blk0) is blk0.activation)
+        res.append(blk0.linear1.weight.detach().float().cpu() * norm_scale(blk0, self.input_dim) if ok0 else None)
+        for i in range(len(blocks)):
+            M = feeds(i)
+            if i + 1 < len(blocks):
+                nb = blocks[i + 1]
+                if M is None or not isinstance(nb.linear1, nn.Linear) or _gui_shape_module(nb) is not nb.activation:
+                    res.append(None); continue
+                W = nb.linear1.weight.detach().float().cpu() * norm_scale(nb, nb.in_dim)
+                res.append(W[:, cols(i)] @ M)
+            else:
+                if M is None or not isinstance(m.final_linear, nn.Linear): res.append(None); continue
+                W = m.final_linear.weight.detach().float().cpu().clone()
+                if isinstance(m.final_skip, nn.Linear): W = W + m.final_skip.weight.detach().float().cpu()
+                else: W = W + torch.eye(W.shape[0], W.shape[1])
+                res.append(W[:, cols(i)] @ M)
+        return res[:pairs]
+
+    def _influence(self, x_row, src, dst_dim, dst_capture):
+        """Exact Jacobian d(dst node values)/d(src node values) at this input, one batched backward.
+        src: None for the input layer, else a block index whose activation output is the source."""
+        K = dst_dim; X = x_row.detach().repeat(K, 1)
+        holder, handles = {}, []
+        if src is None:
+            X.requires_grad_(True); holder["leaf"] = X
+        else:
+            mod = self._node_modules(self.model.blocks[src])[1]
+            def swap(_m, _inp, out):
+                if "leaf" in holder: return out
+                leaf = out.detach().clone().requires_grad_(True); holder["leaf"] = leaf; return leaf
+            handles.append(mod.register_forward_hook(swap))
+        handles += dst_capture(holder)
+        try:
+            with torch.enable_grad():
+                out = self.model(X)
+                if "dst" not in holder: holder["dst"] = out
+                if "leaf" not in holder or not holder["dst"].requires_grad: return None
+                sel = (holder["dst"].reshape(K, -1)[:, :K] * torch.eye(K, device=X.device)).sum()
+                g, = torch.autograd.grad(sel, holder["leaf"], allow_unused=True)
+        finally:
+            for h in handles: h.remove()
+        return None if g is None else g.reshape(K, -1).float().cpu()
+
+    def network_view(self, inputs, targets=None, mode="weights", max_nodes=48):
+        with self.lock:
+            m = self.model; blocks = list(getattr(m, "blocks", []))
+            x = torch.as_tensor(self._encode(inputs), device=self.device).unsqueeze(0).requires_grad_(True)
+            caps = [dict() for _ in blocks]; handles = []
+            for i, blk in enumerate(blocks):
+                net_mod, act_mod, has_act = self._node_modules(blk)
+                def hin(_m, inp, out, i=i, has_act=has_act):
+                    if "net" not in caps[i]:
+                        t = inp[0] if has_act else out; t.retain_grad(); caps[i]["net"] = t
+                def hout(_m, inp, out, i=i):
+                    if "act" not in caps[i]: caps[i]["act"] = out
+                handles += [net_mod.register_forward_hook(hin), act_mod.register_forward_hook(hout)]
+            try:
+                with torch.enable_grad():
+                    out = m(x); out.retain_grad()
+                    tv = self._target_vector(targets); loss = None
+                    for e in self.output_layout:
+                        if e["col"] not in tv: continue
+                        sl = out[:, e["start"]:e["end"]]; t = tv[e["col"]].to(self.device)
+                        term = F.cross_entropy(sl, t) if e["type"] == "outlabcat" else F.huber_loss(sl, t.float().reshape(sl.shape))
+                        loss = term if loss is None else loss + term
+                    if loss is not None: loss.backward()
+            finally:
+                for h in handles: h.remove()
+            vec = lambda t: t.detach().reshape(-1).float().cpu()
+            grad = lambda t: (vec(t.grad) if loss is not None and t.grad is not None else None)
+            # nodes
+            layers = [{"kind": "input", "name": "Input layer", "net": vec(x), "act": vec(x), "bias": None,
+                       "error": grad(x), "labels": [self._slot_label(j) for j in range(self.input_dim)]}]
+            for i, blk in enumerate(blocks):
+                c = caps[i]
+                if "net" not in c:
+                    layers.append({"kind": "hidden", "name": f"Hidden layer {i + 1}", "skipped": True}); continue
+                net, act = vec(c["net"]), vec(c["act"])
+                bias = None
+                if isinstance(blk.linear1, nn.Linear) and blk.linear1.bias is not None and _gui_shape_module(blk) is blk.activation \
+                        and blk.linear1.bias.numel() == net.numel():
+                    bias = vec(blk.linear1.bias)
+                fn = type(_gui_shape_module(blk)).__name__ if _gui_shape_module(blk) is not None else type(blk.linear1).__name__
+                layers.append({"kind": "hidden", "name": f"Hidden layer {i + 1}", "net": net, "act": act, "bias": bias,
+                               "error": grad(c["net"]), "function": fn, "labels": [f"neuron {k + 1}" for k in range(net.numel())]})
+            raw = vec(out); acts = raw.clone(); labels = []
+            for e in self.output_layout:
+                col, ct, a, b = e["col"], e["type"], e["start"], e["end"]
+                if ct == "outlabcat":
+                    acts[a:b] = torch.softmax(raw[a:b], 0); labels += [f"{col} = {l}" for l in self._labels(col)][:b - a]
+                elif ct == "out":
+                    acts[a] = float(self._to_display(col, raw[a].item())); labels.append(col)
+                elif ct == "outexcat":
+                    acts[a:b] = torch.softmax(raw[a:b].reshape(e["max_len"], -1), -1).reshape(-1)
+                    labels += [f"{col}[{p}]#{k}" for p in range(e["max_len"]) for k in range(e["num_classes"])]
+                else: labels += [col if b - a == 1 else f"{col}[{p}]" for p in range(b - a)]
+            fb = m.final_linear.bias if isinstance(m.final_linear, nn.Linear) else None
+            layers.append({"kind": "output", "name": "Output layer", "net": raw, "act": acts,
+                           "bias": vec(fb) if fb is not None else None, "error": grad(out), "labels": labels})
+            # node subset per layer (most active first when a layer is too wide to draw)
+            for L in layers:
+                if L.get("skipped"): continue
+                n = L["net"].numel(); L["size"] = n
+                if n <= max_nodes: L["idx"] = list(range(n))
+                else:  # stable across inputs: ranked by typical activity, not by this input's values
+                    imp = self._node_importance()[layers.index(L)]
+                    if imp is None or imp.numel() != n: imp = torch.arange(n, 0, -1).float()
+                    L["idx"] = sorted(torch.topk(imp, max_nodes).indices.tolist())
+            # connections between adjacent drawable layers
+            static = self._static_weights(len(layers) - 1) if mode == "weights" else [None] * (len(layers) - 1)
+            conns = []
+            for p in range(len(layers) - 1):
+                A, B = layers[p], layers[p + 1]
+                if A.get("skipped") or B.get("skipped"): conns.append(None); continue
+                W, kind = static[p], "weight"
+                if W is None or tuple(W.shape) != (B["size"], A["size"]):
+                    kind = "influence"
+                    if p + 1 < len(layers) - 1:
+                        mod = self._node_modules(blocks[p])[0]; has_act = self._node_modules(blocks[p])[2]
+                        def cap(holder, mod=mod, has_act=has_act):
+                            def f(_m, inp, out):
+                                if "dst" not in holder: holder["dst"] = inp[0] if has_act else out
+                            return [mod.register_forward_hook(f)]
+                    else:
+                        cap = lambda holder: []
+                    W = self._influence(x, None if p == 0 else p - 1, B["size"], cap)
+                if W is None: conns.append(None); continue
+                sub = W[B["idx"]][:, A["idx"]]
+                conns.append({"kind": kind, "w": _gui_b64(sub.numpy()), "rows": len(B["idx"]), "cols": len(A["idx"]),
+                              "max": _gui_float(sub.abs().max()) if sub.numel() else 0.0})
+            def pack(L):
+                if L.get("skipped"): return L
+                sel = L["idx"]
+                pick = lambda t: None if t is None else [_gui_float(t[k]) for k in sel]
+                return {"kind": L["kind"], "name": L["name"], "size": L["size"], "idx": sel, "function": L.get("function"),
+                        "labels": [L["labels"][k] if k < len(L["labels"]) else str(k) for k in sel],
+                        "net": pick(L["net"]), "act": pick(L["act"]), "bias": pick(L["bias"]), "error": pick(L["error"])}
+            return {"layers": [pack(L) for L in layers], "conns": conns, "has_error": loss is not None,
+                    "mode": mode, "version": self.version, "activation": self.config.get("activation", {}).get("name")}
+
+    def neuron(self, inputs, block, neuron):
+        """Incoming and outgoing weights of one hidden neuron (linear1 row, linear2 column)."""
+        with self.lock:
+            blk = self.model.blocks[int(block)]; j = int(neuron); res = {"block": int(block), "neuron": j}
+            lin1 = blk.linear1
+            if isinstance(lin1, nn.Linear) and j < lin1.weight.shape[0]:
+                res["incoming"] = lin1.weight[j].detach().float().cpu().tolist(); res["bias"] = _gui_float(lin1.bias[j]) if lin1.bias is not None else None
+                if int(block) == 0 and getattr(self.model, "input_attn", None) is None and not isinstance(getattr(self.model, "input_graph", None), InputFeatureGraph):
+                    res["incoming_labels"] = [self._slot_label(i) for i in range(len(res["incoming"]))]
+            lin2 = getattr(blk, "linear2", None)
+            if isinstance(lin2, nn.Linear) and j < lin2.weight.shape[1]:
+                res["outgoing"] = lin2.weight[:, j].detach().float().cpu().tolist()
+            return res
+
+    def _slot_label(self, idx):
+        for c, (start, w) in self.slots.items():
+            if start <= idx < start + w:
+                ct = self.col_types[c]
+                if ct == "inlabcat": return f"{c}={self._labels(c)[idx - start]}" if idx - start < len(self._labels(c)) else c
+                return c if w == 1 else f"{c}[{idx - start}]"
+        return str(idx)
+
+    def weight(self, name, max_side=256):
+        with self.lock:
+            params = dict(self.model.named_parameters())
+            if name not in params: raise KeyError(f"No parameter named {name!r}")
+            p = params[name].detach().float().cpu()
+            flat = p.reshape(-1).numpy()
+            m = p.reshape(1, -1) if p.dim() <= 1 else p.reshape(p.shape[0], -1)
+            rows, cols = m.shape; down = None
+            if rows > max_side or cols > max_side:
+                oh, ow = min(rows, max_side), min(cols, max_side)
+                m = F.adaptive_avg_pool2d(m.unsqueeze(0).unsqueeze(0), (oh, ow))[0, 0]; down = [oh, ow]
+            hist, edges = np.histogram(flat, bins=60)
+            res = {"name": name, "shape": list(p.shape), "rows": int(m.shape[0]), "cols": int(m.shape[1]),
+                   "downsampled": down, "matrix": _gui_b64(m.numpy()),
+                   "stats": {"mean": _gui_float(flat.mean()), "std": _gui_float(flat.std()), "min": _gui_float(flat.min()),
+                             "max": _gui_float(flat.max()), "abs_mean": _gui_float(np.abs(flat).mean()),
+                             "fro": _gui_float(np.sqrt((flat.astype(np.float64) ** 2).sum())), "numel": int(flat.size),
+                             "near_zero": _gui_float((np.abs(flat) < 1e-3).mean())},
+                   "hist": {"counts": hist.tolist(), "edges": edges.tolist()}}
+            if p.dim() == 2 and min(p.shape) <= 2048:
+                sv = torch.linalg.svdvals(p.double()).numpy()
+                res["singular_values"] = sv[:512].tolist()
+                res["stats"]["spectral"] = _gui_float(sv[0])
+                res["stats"]["stable_rank"] = _gui_float((sv ** 2).sum() / (sv[0] ** 2)) if sv[0] > 0 else None
+            if p.dim() == 1 and len(flat) <= 4096: res["values"] = flat.tolist()
+            return res
+
+    # ─── dataset features ───
+    def _get_dataset(self):
+        if self._dataset is not None or self._dataset_error is not None: return self._dataset
+        path = self.config.get("file_path")
+        try:
+            if not path or not os.path.exists(path): raise FileNotFoundError(f"training file {path!r} not found")
+            with open(path, "r", errors="replace") as f: header = f.readline()
+            wanted = set(self.input_cols + self.output_cols)
+            # config.json does not record the delimiter: pick the one whose header names the most columns
+            delim = max([",", "\t", ";", " "], key=lambda d: len(wanted & {h.strip() for h in header.split(d)}))
+            df = pd.read_csv(path, delimiter=delim)
+            missing = [c for c in wanted if c not in df.columns]
+            if missing: raise ValueError(f"columns missing from {path}: {missing}")
+            self._dataset = df.dropna(subset=list(wanted)).reset_index(drop=True)
+        except Exception as e:
+            self._dataset_error = f"{type(e).__name__}: {e}"
+        return self._dataset
+
+    def _data_points(self, x_col, y_col, limit=1500):
+        df = self._get_dataset()
+        if df is None: return None
+        sub = df[[x_col, y_col]].apply(pd.to_numeric, errors="coerce").dropna()
+        if len(sub) > limit: sub = sub.sample(limit, random_state=0)
+        return {"x": sub[x_col].tolist(), "y": sub[y_col].tolist()}
+
+    def dataset_row(self, index=None, source="training"):
+        with self.lock:
+            df = self._get_validation() if source == "validation" else self._get_dataset()
+            if df is None: raise ValueError("No validation rows saved for this model." if source == "validation"
+                                            else (self._dataset_error or "No dataset available."))
+            i = int(np.random.randint(len(df))) if index is None else int(index) % len(df)
+            row = df.iloc[i]
+
+            def plain(v):
+                return v.item() if hasattr(v, "item") else v
+            return {"index": i, "rows": len(df),
+                    "inputs": {c: (str(row[c]) if self.col_types[c] in ("inlab", "inlabcat", "intex", "intexcat", "inim") else plain(row[c]))
+                               for c in self.input_cols},
+                    "targets": {c: (str(row[c]) if self.col_types[c] != "out" else plain(row[c])) for c in self.output_cols}}
+
+    def _get_validation(self):
+        """The held-out rows saved by training next to model.pt (None if absent or empty)."""
+        path = os.path.join(os.path.dirname(os.path.abspath(self.model_path)), VALIDATION_ROWS_FILE)
+        try: mtime = os.path.getmtime(path)
+        except OSError: return None
+        if getattr(self, "_val_cache", (None, None))[0] != mtime:
+            try: df = pd.read_csv(path)
+            except Exception: df = None  # empty file = no validation set
+            if df is not None and (len(df) == 0 or any(c not in df.columns for c in self.input_cols + self.output_cols)): df = None
+            self._val_cache = (mtime, df)
+        return self._val_cache[1]
+
+    def _encode_rows(self, rows):
+        enc, keep = [], []
+        for idx, row in rows.iterrows():
+            try:
+                raw = [row[c] if self.col_types[c] == "in" else str(row[c]) for c in self.input_cols]
+                enc.append(encode_sample_input(raw, self.col_types, self.vocabs, self.scalings, self.image_params)); keep.append(idx)
+            except Exception:
+                continue
+        return enc, keep
+
+    def _fit_metrics(self, rows, out):
+        """Per-output prediction quality on `rows` (raw values) given raw model outputs; plus a per-row badness score."""
+        res, score, shown = {}, np.zeros(len(rows)), {}
+        for e in self.output_layout:
+            col, ct = e["col"], e["type"]
+            if ct == "out":
+                pred = self._to_display(col, out[:, e["start"]].numpy().astype(np.float64))
+                true = pd.to_numeric(rows[col], errors="coerce").to_numpy(dtype=np.float64)
+                span = (self.scalings[col]["max"] - self.scalings[col]["min"]) if self._scaled(col) else 1.0
+                score += np.nan_to_num(np.abs(pred - true) / (span or 1.0), nan=1.0); shown[col] = pred
+                ok = np.isfinite(true); err = pred[ok] - true[ok]; ss = ((true[ok] - true[ok].mean()) ** 2).sum()
+                res[col] = {"pred": pred[ok].tolist(), "true": true[ok].tolist(), "n": int(ok.sum()),
+                            "mae": _gui_float(np.abs(err).mean()) if len(err) else None,
+                            "rmse": _gui_float(np.sqrt((err ** 2).mean())) if len(err) else None,
+                            "r2": _gui_float(1 - (err ** 2).sum() / ss) if ss > 0 else None}
+            elif ct == "outlabcat":
+                labels = self._labels(col); logits = out[:, e["start"]:e["end"]]; pred = logits.argmax(-1).numpy()
+                true = np.array([self.vocabs[col].get(str(v), -1) for v in rows[col]])
+                probs = torch.softmax(logits, -1).numpy()
+                score += 1.0 - np.where(true >= 0, probs[np.arange(len(true)), np.clip(true, 0, None)], 0.0)
+                shown[col] = [labels[k] if k < len(labels) else k for k in pred]
+                nc = len(labels); cm = np.zeros((nc, nc), dtype=int)
+                for t, p in zip(true, pred):
+                    if 0 <= t < nc and 0 <= p < nc: cm[t, p] += 1
+                res[col] = {"accuracy": _gui_float((pred == true).mean()), "labels": labels, "confusion": cm.tolist(), "n": int(len(true))}
+        return res, score, shown
+
+    def data_stats(self, compute=True, limit=2000):
+        """Per-neuron activation statistics (training rows) and prediction quality on training rows and on
+        the held-out validation rows saved by training (cached per model version)."""
+        with self.lock:
+            if self._data_stats is not None and self._data_stats["version"] == self.version: return self._data_stats
+            if not compute: return None
+            df = self._get_dataset()
+            if df is None: raise ValueError(self._dataset_error or "No dataset available.")
+            if any(self.col_types[c] == "inim" for c in self.input_cols): limit = min(limit, 300)
+            vdf = self._get_validation()
+            used = self.input_cols + self.output_cols
+            train_df = df
+            if vdf is not None:  # training rows = file rows that are not validation rows
+                vkeys = set(_row_group_keys(vdf, used, self.col_types))
+                train_df = df[~_row_group_keys(df, used, self.col_types).isin(vkeys).values]
+            sub = train_df.sample(min(limit, len(train_df)), random_state=0) if len(train_df) > limit else train_df
+            enc, keep = self._encode_rows(sub)
+            if not enc: raise ValueError("No dataset rows could be encoded.")
+            X = torch.as_tensor(np.asarray(enc, dtype=np.float32), device=self.device)
+            outs, recs = [], []
+            for i in range(0, len(X), 512):
+                o, r = self._trace(X[i:i + 512]); outs.append(o.float().cpu()); recs.append(r)
+            out = torch.cat(outs, 0)
+            blocks = []
+            for b in range(len(recs[0])):
+                if not all("act_in" in r[b] and r[b]["act_in"].shape[0] == min(512, len(X) - k * 512) for k, r in enumerate(recs)):
+                    blocks.append(None); continue
+                a_in = torch.cat([r[b]["act_in"] for r in recs], 0).cpu(); a_out = torch.cat([r[b]["act_out"] for r in recs], 0).cpu()
+                q = torch.nanquantile(a_in, torch.tensor([0.01, 0.5, 0.99]), dim=0)
+                finite = q[torch.isfinite(q)]
+                hist_lo, hist_hi = (float(finite.min()), float(finite.max())) if finite.numel() else (-1.0, 1.0)
+                if hist_hi <= hist_lo: hist_hi = hist_lo + 1.0
+                edges = torch.linspace(hist_lo, hist_hi, 41)
+                a_fin = torch.nan_to_num(a_in, nan=hist_lo - 1.0, posinf=hist_hi + 1.0, neginf=hist_lo - 1.0)  # out of range -> not counted
+                hist = torch.stack([torch.histc(a_fin[:, j], bins=40, min=hist_lo, max=hist_hi) for j in range(a_in.shape[1])])
+                blocks.append({"p01": q[0].tolist(), "p50": q[1].tolist(), "p99": q[2].tolist(),
+                               "mean_out": a_out.mean(0).tolist(), "std_out": a_out.std(0).tolist() if len(a_out) > 1 else [0.0] * a_out.shape[1],
+                               "dead": (a_out.abs() < 1e-6).float().mean(0).tolist(),
+                               "hist_edges": edges.tolist(), "hist": _gui_b64(hist.numpy()), "hist_shape": list(hist.shape)})
+            train_rows = df.loc[keep]
+            tr_fit, tr_score, tr_shown = self._fit_metrics(train_rows, out)
+            val_fit, val_rows, source = {}, None, "training"
+            if vdf is not None:
+                vsub = vdf.sample(min(limit, len(vdf)), random_state=0) if len(vdf) > limit else vdf
+                venc, vkeep = self._encode_rows(vsub)
+                if venc:
+                    with torch.no_grad():
+                        vout = self._run(np.asarray(venc, dtype=np.float32))
+                    val_rows = vdf.loc[vkeep]
+                    val_fit, v_score, v_shown = self._fit_metrics(val_rows, vout)
+                    source = "validation"
+            fit = []
+            for e in self.output_layout:
+                if e["col"] in tr_fit:
+                    fit.append(dict(tr_fit[e["col"]], col=e["col"], type=e["type"], val=val_fit.get(e["col"])))
+            # worst rows come from the held-out rows when there are any: that is where generalization fails
+            w_rows, w_score, w_shown, w_keep = ((val_rows, v_score, v_shown, vkeep) if source == "validation"
+                                                else (train_rows, tr_score, tr_shown, keep))
+            worst = []
+            for i in np.argsort(-w_score)[:30]:
+                r = w_rows.iloc[int(i)]
+                worst.append({"index": int(w_keep[int(i)]), "source": source, "score": _gui_float(w_score[i]),
+                              "inputs": {c: str(r[c]) for c in self.input_cols},
+                              "targets": {c: str(r[c]) for c in w_shown},
+                              "preds": {c: (_gui_float(v[i]) if isinstance(v, np.ndarray) else str(v[i])) for c, v in w_shown.items()}})
+            self._data_stats = {"version": self.version, "rows": len(enc), "val_rows": 0 if val_rows is None else len(val_rows),
+                                "blocks": blocks, "fit": fit, "worst": worst, "worst_source": source}
+            return self._data_stats
+
+
+_GUI_COL_TYPES = ["i", "in", "inlab", "intex", "inim", "inlabcat", "intexcat", "out", "outlab", "outex", "outlabcat", "outexcat"]
+_GUI_OPTIMIZERS = ["Adam", "AdamHD", "SGD", "SGDHD", "Lamb", "Adagrad", "Adadelta", "AdamW", "RMSprop", "Rprop", "ASGD",
+                   "Adamax", "NAdam", "SparseAdam", "RAdamScheduleFree", "AdEMAMix", "Adam3", "AdamDelta", "AutoAdam",
+                   "NormAdam", "SWATS", "AdaBoundW", "CLion", "Signum", "SRprop", "IRprop", "Adan", "Prodigy",
+                   "Evolution", "Muon", "AdaMuon", "NorMuon", "AdaGO", "AdamGO", "RMSGO", "AdaDeltaGO"]
+_GUI_MUON_FAMILY = ("Muon", "AdaMuon", "NorMuon", "AdaGO", "AdamGO", "RMSGO", "AdaDeltaGO")
+
+
+def _gui_muon_params(opt, overrides):
+    """CLI defaults for a Muon-family optimizer with the GUI's overrides applied (same types as the CLI)."""
+    params = prompt_muon_options(opt, use_defaults=True)
+    for k, v in (overrides or {}).items():
+        if k not in params or v is None or v == "": continue
+        d = params[k]
+        if isinstance(d, bool): params[k] = bool(v)
+        elif isinstance(d, int): params[k] = int(v)
+        elif isinstance(d, float): params[k] = float(v)
+        elif isinstance(d, tuple): params[k] = tuple(float(x) for x in v)
+        else: params[k] = v
+    return params
+# activation name -> constructor params the CLI asks for (saved to config.json and used on load)
+_GUI_ACT_PARAMS = {"ScaledTanh": {"scale": 1.7}, "LeakyReLU": {"negative_slope": 0.01}, "PSiLU": {"init": 1.0},
+                   "RaPAU": {"n": 5, "m": 4}, "PaWeL": {"breakpoints": 32}, "CapActi2": {"down": -1.0, "up": 1.0},
+                   "All": {"init_temp": 1.0}, "Maxout": {"pieces": 2}}
+_GUI_IMAGE_EXT = (".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tif", ".tiff", ".webp")
+
+
+def _gui_detect_delimiter(path, wanted=()):
+    """config.json does not record the delimiter: pick the one that splits the header best."""
+    with open(path, "r", errors="replace") as f: header = f.readline()
+    wanted = set(wanted)
+    return max([",", "\t", ";", " "], key=lambda d: (len(wanted & {h.strip() for h in header.split(d)}), len(header.split(d))))
+
+
+def gui_list_dir(path=None):
+    path = os.path.abspath(os.path.expanduser(path or os.getcwd()))
+    if os.path.isfile(path): path = os.path.dirname(path)
+    dirs, files = [], []
+    for name in sorted(os.listdir(path), key=str.lower):
+        if name.startswith("."): continue
+        full = os.path.join(path, name)
+        if os.path.isdir(full): dirs.append(name)
+        elif name.lower().endswith((".csv", ".tsv", ".txt", ".dat")): files.append({"name": name, "size": os.path.getsize(full)})
+    return {"path": path, "parent": os.path.dirname(path), "dirs": dirs, "files": files}
+
+
+def gui_preview_dataset(path, delimiter=None, rows=15):
+    """Column statistics and a suggested type per column, for the training GUI."""
+    path = os.path.abspath(os.path.expanduser(path))
+    delim = delimiter or _gui_detect_delimiter(path)
+    df = pd.read_csv(path, delimiter=delim)
+    cols = []
+    for c in df.columns:
+        s = df[c]; nun = int(s.nunique(dropna=True)); numeric = bool(pd.api.types.is_numeric_dtype(s))
+        info = {"name": str(c), "numeric": numeric, "unique": nun, "missing": int(s.isna().sum()),
+                "samples": [str(v) for v in s.dropna().unique()[:6]]}
+        if numeric and s.notna().any():
+            info.update(min=_gui_float(s.min()), max=_gui_float(s.max()), mean=_gui_float(s.mean()))
+        if not numeric:
+            strs = s.dropna().astype(str)
+            info["max_len"] = int(strs.str.len().max()) if len(strs) else 0
+            info["image"] = bool(len(strs)) and float(strs.str.lower().str.endswith(_GUI_IMAGE_EXT).mean()) > 0.8
+        if nun < 2: sug = "i"                                   # constant: the CLI ignores these too
+        elif info.get("image"): sug = "inim"
+        elif numeric: sug = "in"
+        elif nun <= 64: sug = "inlabcat"
+        else: sug = "intexcat" if info.get("max_len", 0) <= 32 else "intex"
+        info["suggested"] = sug
+        cols.append(info)
+    active = [c for c in cols if c["suggested"] not in ("i", "inim")]
+    if active:  # last usable column is the usual target
+        last = active[-1]; last["suggested"] = {"in": "out", "inlabcat": "outlabcat", "intex": "outex", "intexcat": "outexcat"}[last["suggested"]]
+    head = df.head(rows)
+    return {"path": path, "delimiter": delim, "n_rows": int(len(df)), "columns": cols,
+            "head": [[("" if pd.isna(v) else str(v)) for v in r] for r in head.itertuples(index=False)]}
+
+
+class TrainingSession:
+    """Runs the regular main() training loop in a background thread for the GUI."""
+
+    def __init__(self):
+        import threading
+        from array import array
+        self.lock = threading.Lock(); self.thread = None
+        self.state = "idle"; self.error = None; self.spec = None; self.summary = None
+        self.steps = array("l"); self.losses = array("f"); self.vals = []; self.last = {}; self.tasks = {}
+        self.started = self.finished = None; self.stop_requested = False; self.saves = 0
+
+    def _callback(self, info):
+        from array import array
+        with self.lock:
+            if "val_loss" in info:
+                self.vals.append([info["step"], info["val_loss"], bool(info.get("saved"))])
+                if info.get("saved"): self.saves += 1
+            else:
+                self.steps.append(int(info["step"])); self.losses.append(float(info["loss"]))
+                for col, v in (info.get("tasks") or {}).items():  # per-output normalized loss, aligned with steps
+                    arr = self.tasks.setdefault(col, array("f", [float("nan")] * (len(self.steps) - 1)))
+                    arr.append(float(v))
+                self.last = {k: v for k, v in info.items() if k not in ("step", "loss", "tasks")}
+                self.last["epoch"] = info.get("epoch")
+            if self.state == "preparing": self.state = "training"
+            return self.stop_requested
+
+    def stop(self):
+        with self.lock:
+            if self.state in ("preparing", "training"): self.stop_requested = True; self.state = "stopping"
+        return self.status(len(self.steps))
+
+    def status(self, since=0, max_points=4000):
+        import time
+        with self.lock:
+            since = max(0, min(int(since or 0), len(self.steps)))
+            st, lo = list(self.steps[since:]), list(self.losses[since:])
+            tasks = {c: list(a[since:]) for c, a in self.tasks.items()}
+            if len(st) > max_points:  # coarse catch-up after a page reload: bucket means
+                k = -(-len(st) // max_points)
+                st = [st[min(i + k, len(st)) - 1] for i in range(0, len(st), k)]
+                lo = [float(np.mean(lo[i:i + k])) for i in range(0, len(lo), k)]
+                tasks = {c: [float(np.nanmean(v[i:i + k])) for i in range(0, len(v), k)] for c, v in tasks.items()}
+            end = self.finished or time.time()
+            return {"state": self.state, "error": self.error, "summary": self.summary, "total": len(self.steps),
+                    "steps": st, "losses": lo, "tasks": tasks, "vals": list(self.vals), "last": dict(self.last), "saves": self.saves,
+                    "elapsed": (end - self.started) if self.started else 0.0, "cwd": os.getcwd()}
+
+    def start(self, spec):
+        import threading, time
+        with self.lock:
+            if self.state in ("preparing", "training", "stopping"): raise RuntimeError("A training run is already active.")
+        args = self._resume_args(spec) if spec.get("resume") else self._build_args(spec)  # errors surface immediately
+        from array import array
+        with self.lock:
+            self.state = "preparing"; self.error = None; self.spec = spec; self.stop_requested = False
+            self.steps = array("l"); self.losses = array("f"); self.vals = []; self.last = {}; self.saves = 0; self.tasks = {}
+            self.started = time.time(); self.finished = None
+        self.thread = threading.Thread(target=self._run, args=(spec, args), daemon=True, name="mlp-training")
+        self.thread.start()
+        return self.status()
+
+    def _resume_args(self, spec):
+        """Continue the saved model: only training options come from the form."""
+        if not (os.path.exists("model.pt") and os.path.exists("config.json")):
+            raise FileNotFoundError("No trained model (model.pt / config.json) in the working directory to resume.")
+        with open("config.json") as f: cfg = json.load(f)
+        opt = spec.get("optimizer") or cfg.get("optimizer_choice", "Adam")
+        if opt not in _GUI_OPTIMIZERS: raise ValueError(f"Unknown optimizer {opt!r}")
+        optim_params = dict(spec.get("optim_params") or {})
+        if opt in _GUI_MUON_FAMILY: optim_params = _gui_muon_params(opt, optim_params)
+        balancing = spec.get("loss_balancing", "normalized")
+        if balancing not in CombinedLoss.BALANCING: raise ValueError(f"Unknown loss balancing {balancing!r}")
+        lr = spec.get("lr")
+        return {"resume": True, "interval": int(spec.get("val_interval", 200)),
+                "overrides": dict(optimizer_choice=opt, custom_lr=float(lr) if lr not in (None, "") else None,
+                                  batch_size=int(spec.get("batch_size") or cfg.get("batch_size", 32)), optim_params=optim_params,
+                                  loss_balancing=balancing, loss_temperature=float(spec.get("loss_temperature") or 20.0))}
+
+    def _build_args(self, spec):
+        path = os.path.abspath(os.path.expanduser(spec["path"]))
+        if not os.path.isfile(path): raise FileNotFoundError(f"Dataset not found: {path}")
+        delim = spec.get("delimiter") or _gui_detect_delimiter(path)
+        col_types = {c: t for c, t in spec["columns"].items()}
+        bad = [t for t in col_types.values() if t not in _GUI_COL_TYPES]
+        if bad: raise ValueError(f"Unknown column types: {bad}")
+        input_cols = [c for c, v in col_types.items() if 'in' in v]
+        output_cols = [c for c, v in col_types.items() if 'out' in v]
+        if not input_cols: raise ValueError("Mark at least one column as an input.")
+        if not output_cols: raise ValueError("Mark at least one column as an output.")
+        hidden = [int(h) for h in spec.get("hidden_dims", [])]
+        if not hidden or min(hidden) < 1: raise ValueError("Add at least one hidden layer with width >= 1.")
+        act = spec.get("activation", {"name": "ReLU"}); name = act.get("name", "ReLU")
+        amap = _build_activation_map()
+        if name not in amap or name == "Custom": raise ValueError(f"Unknown activation {name!r}")
+        params = {k: v for k, v in (act.get("params") or {}).items() if k in _GUI_ACT_PARAMS.get(name, {})}
+        for k, v in _GUI_ACT_PARAMS.get(name, {}).items():
+            params[k] = type(v)(params.get(k, v))
+        factory_cls = amap[name]
+        def base_act(): return factory_cls(**params)
+        base_act.activation_config = {"name": name, "params": params}
+        activation_type = int(spec.get("activation_type", 0))
+        residual = spec.get("residual_type", "residual"); moe_mode = int(spec.get("moe_mode", 1))
+        mlp_mode = int(spec.get("mlp_mode", 0)); routing = spec.get("layer_routing", "none")
+        is_maxout = name == "Maxout"
+        if is_maxout and activation_type != 0: raise ValueError("True Maxout must use the basic activation type.")
+        if is_maxout and moe_mode != 1: raise ValueError("True Maxout requires MoE mode 1 (off).")
+        if routing == "adaptive" and (mlp_mode != 0 or residual != "residual" or moe_mode != 1):
+            raise ValueError("Adaptive layer routing requires regular MLP mode, standard residuals, and MoE mode 1.")
+        norm = spec.get("norm_type", "layer"); groups = int(spec.get("groups") or 1) if norm == "group" else None
+        attention = spec.get("attention_type", "none"); heads = int(spec.get("num_heads") or 1) if attention == "multi" else None
+        noise_mode = spec.get("noise_mode", "none")
+        noise_params = ({"dropout_pct": float(spec.get("noise_value", 0.1))} if noise_mode == "dropout" else
+                        {} if noise_mode == "none" else {"std": float(spec.get("noise_value", 0.1))})
+        opt = spec.get("optimizer", "Adam")
+        if opt not in _GUI_OPTIMIZERS: raise ValueError(f"Unknown optimizer {opt!r}")
+        optim_params = dict(spec.get("optim_params") or {})
+        if opt in _GUI_MUON_FAMILY: optim_params = _gui_muon_params(opt, optim_params)
+        lr = spec.get("lr"); lr = float(lr) if lr not in (None, "") else None
+        lsuv = int(spec.get("lsuv", 0))
+        balancing = spec.get("loss_balancing", "normalized")
+        if balancing not in CombinedLoss.BALANCING: raise ValueError(f"Unknown loss balancing {balancing!r}")
+        return dict(path=path, delim=delim, col_types=col_types, input_cols=input_cols, output_cols=output_cols,
+                    image_params={c: {"im_size": int(p["im_size"]), "patch_size": int(p["patch_size"])}
+                                  for c, p in (spec.get("image_params") or {}).items() if col_types.get(c) == "inim"},
+                    kwargs=dict(hidden_dims=hidden, optimizer_choice=opt, batch_size=int(spec.get("batch_size", 32)),
+                                activation_cls=wrap_activation(base_act, activation_type), activation_type=activation_type,
+                                residual_type=residual, norm_type=norm, groups=groups, attention_type=attention,
+                                num_heads=heads, input_attention_type=spec.get("input_attention_type", "none"),
+                                moe_mode=moe_mode, noise_mode=noise_mode, noise_params=noise_params,
+                                base_activation_cls_for_config=base_act, use_lsuv=lsuv > 0,
+                                lsuv_max_iter=int(spec.get("lsuv_max_iter", 10)), lsuv_normalize_mean=lsuv == 2,
+                                custom_lr=lr, mlp_mode=mlp_mode, layer_routing=routing,
+                                use_grn=bool(spec.get("use_grn", False)), optim_params=optim_params,
+                                loss_balancing=balancing, loss_temperature=float(spec.get("loss_temperature") or 20.0)),
+                    val=dict(mode=spec.get("val_mode", "split"), pct=float(spec.get("val_pct", 0.1)),
+                             file=spec.get("val_file"), interval=int(spec.get("val_interval", 200))))
+
+    def _run(self, spec, a):
+        import time
+        try:
+            if a.get("resume"):
+                kwargs, vds, rep = prepare_resume("config.json", "model.pt")
+                kwargs.update(a["overrides"])
+                val_loader = DataLoader(vds, batch_size=kwargs["batch_size"], shuffle=False) if vds is not None else None
+                with self.lock:
+                    self.summary = {"rows": len(kwargs["train_dataset"]), "inputs": kwargs["input_cols"], "outputs": kwargs["output_cols"],
+                                    "duplicates_removed": rep["duplicates_removed"], "val_overlap_removed": 0, "resumed": True,
+                                    "validation": "none (no saved held-out rows)" if val_loader is None
+                                                  else f"{len(vds)} saved held-out rows every {a['interval']} steps"}
+                main(val_loader=val_loader, val_interval=max(1, a["interval"]), progress_callback=self._callback, **kwargs)
+                with self.lock: self.state = "done"
+                return
+            col_types = a["col_types"]; vocabularies = {}; image_params = dict(a["image_params"])
+            for c, t in col_types.items():
+                if t in ("i", "inim"): continue  # inim sizes come from the GUI instead of stdin
+                _setup_vocab_for_col(c, t, a["path"], a["delim"], vocabularies, image_params)
+            bs = a["kwargs"]["batch_size"]; v = a["val"]; vpath = None
+            if v["mode"] == "file":
+                vpath = os.path.abspath(os.path.expanduser(v["file"] or ""))
+                if not os.path.isfile(vpath): raise FileNotFoundError(f"Validation file not found: {vpath}")
+            ds, vds, rep = prepare_train_val(a["path"], a["delim"], a["input_cols"], a["output_cols"], col_types,
+                                             vocabularies, image_params, val_file=vpath,
+                                             val_frac=v["pct"] if v["mode"] == "split" else 0.0)
+            scalings, vocabularies = ds.scalings, ds.vocabularies
+            val_loader = DataLoader(vds, batch_size=bs, shuffle=False) if vds is not None else None
+            with self.lock:
+                self.summary = {"rows": len(ds), "inputs": a["input_cols"], "outputs": a["output_cols"],
+                                "duplicates_removed": rep["duplicates_removed"] + rep.get("val_duplicates_removed", 0),
+                                "val_overlap_removed": rep.get("val_rows_also_in_training", 0),
+                                "validation": "none" if val_loader is None else f"{len(vds)} held-out rows every {v['interval']} steps"}
+            main(a["path"], delimiter=a["delim"], input_cols=a["input_cols"], output_cols=a["output_cols"],
+                 col_types=col_types, vocabularies=vocabularies, scalings=scalings, image_params=image_params,
+                 val_loader=val_loader, val_interval=max(1, v["interval"]), progress_callback=self._callback,
+                 train_dataset=ds, **a["kwargs"])
+            with self.lock: self.state = "done"
+        except Exception as e:
+            traceback.print_exc()
+            with self.lock: self.state = "error"; self.error = f"{type(e).__name__}: {e}"
+        finally:
+            with self.lock: self.finished = time.time()
+
+
+def gui_train_options():
+    amap = _build_activation_map()
+    return {"col_types": _GUI_COL_TYPES, "optimizers": _GUI_OPTIMIZERS, "muon_family": list(_GUI_MUON_FAMILY),
+            "muon_defaults": {o: prompt_muon_options(o, use_defaults=True) for o in _GUI_MUON_FAMILY},
+            "activations": [n for n in amap if n != "Custom"], "activation_params": _GUI_ACT_PARAMS,
+            "cwd": os.getcwd()}
+
+
+def run_gui(host="127.0.0.1", port=8765, open_browser=True, model_path="model.pt", config_path="config.json", start_page=None):
+    """Serve the training + exploration GUI at http://host:port until Ctrl+C."""
+    import threading, webbrowser
+    from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+    from urllib.parse import urlparse, parse_qs
+
+    session = TrainingSession()
+    holder = {"sampler": None, "error": None}
+    holder_lock = threading.Lock()
+
+    def sampler(required=True):
+        """The explorer's model; (re)created once model.pt and config.json exist."""
+        with holder_lock:
+            if holder["sampler"] is None and os.path.exists(model_path) and os.path.exists(config_path):
+                try:
+                    holder["sampler"] = InteractiveSampler(model_path, config_path); holder["error"] = None
+                    print(f"  Explorer loaded {os.path.abspath(model_path)}")
+                except Exception as e:
+                    holder["error"] = f"{type(e).__name__}: {e}"
+            s = holder["sampler"]
+        if s is None and required:
+            raise ValueError(holder["error"] or "No trained model yet (model.pt / config.json not found). Train one first.")
+        return s
+
+    def status(b):
+        s = sampler(required=False)
+        if s is None: return {"version": 0, "load_error": holder["error"], "reloaded": False, "has_model": False}
+        reloaded = s.check_reload(force=bool(b.get("force")))
+        return dict(s.status(), reloaded=reloaded, has_model=True)
+
+    routes = {
+        "/api/app": lambda b: {"has_model": sampler(required=False) is not None, "model_error": holder["error"],
+                               "training": session.status(10 ** 12)["state"], "cwd": os.getcwd(), "start_page": start_page},
+        "/api/meta": lambda b: sampler().meta(),
+        "/api/status": status,
+        "/api/predict": lambda b: sampler().predict(b.get("inputs", {})),
+        "/api/sweep1d": lambda b: sampler().sweep1d(b.get("inputs", {}), b["x"], b["out"], b.get("lo"), b.get("hi"),
+                                                    b.get("n", 200), b.get("show_data", False)),
+        "/api/sweep2d": lambda b: sampler().sweep2d(b.get("inputs", {}), b["x"], b["y"], b["out"], b.get("cls"),
+                                                    b.get("n", 80), b.get("ranges"), b.get("show_data", False)),
+        "/api/sensitivity": lambda b: sampler().sensitivity(b.get("inputs", {}), b["out"], b.get("cls")),
+        "/api/activations": lambda b: sampler().activation_shapes(b.get("inputs", {}), b["block"], b.get("lo"), b.get("hi"), b.get("n", 241)),
+        "/api/neuron": lambda b: sampler().neuron(b.get("inputs", {}), b["block"], b["neuron"]),
+        "/api/netview": lambda b: sampler().network_view(b.get("inputs", {}), b.get("targets"), b.get("mode", "weights"), int(b.get("max_nodes", 48))),
+        "/api/weight": lambda b: sampler().weight(b["name"], b.get("max_side", 256)),
+        "/api/dataset_row": lambda b: sampler().dataset_row(b.get("index"), b.get("source", "training")),
+        "/api/data_stats": lambda b: sampler().data_stats(),
+        "/api/fs": lambda b: gui_list_dir(b.get("path")),
+        "/api/dataset/preview": lambda b: gui_preview_dataset(b["path"], b.get("delimiter")),
+        "/api/train/options": lambda b: gui_train_options(),
+        "/api/train/start": lambda b: session.start(b),
+        "/api/train/stop": lambda b: session.stop(),
+        "/api/train/status": lambda b: session.status(b.get("since", 0)),
+    }
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args): pass  # keep the terminal quiet
+
+        def _send(self, code, body, ctype="application/json"):
+            data = body if isinstance(body, bytes) else json.dumps(_gui_clean(body), allow_nan=False, default=str).encode()
+            self.send_response(code); self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data))); self.send_header("Cache-Control", "no-store")
+            self.end_headers(); self.wfile.write(data)
+
+        def _handle(self, body):
+            path = urlparse(self.path).path
+            if path in ("/", "/index.html"):
+                with open(_GUI_HTML, "rb") as f: return self._send(200, f.read(), "text/html; charset=utf-8")
+            if path not in routes: return self._send(404, {"error": f"unknown route {path}"})
+            try:
+                self._send(200, routes[path](body))
+            except Exception as e:
+                if not isinstance(e, (ValueError, KeyError, FileNotFoundError, RuntimeError)): traceback.print_exc()
+                self._send(400, {"error": f"{type(e).__name__}: {e}"})
+
+        def do_GET(self):
+            q = parse_qs(urlparse(self.path).query)
+            self._handle({k: v[0] for k, v in q.items()})
+
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length") or 0)
+            try: body = json.loads(self.rfile.read(n) or b"{}")
+            except ValueError: return self._send(400, {"error": "invalid JSON body"})
+            self._handle(body)
+
+    s = sampler(required=False)
+    print(f"  Working directory: {os.getcwd()}")
+    print(f"  Trained model: {'found' if s else 'none yet (' + (holder['error'] or 'train one in the GUI') + ')'}")
+    server = None
+    for p in range(int(port), int(port) + 20):
+        try: server = ThreadingHTTPServer((host, p), Handler); break
+        except OSError: continue
+    if server is None: raise OSError(f"No free port in {port}-{int(port) + 19}")
+    url = f"http://{host}:{server.server_address[1]}/" + (f"#{start_page}" if start_page else "")
+    print(f"\n  GUI running at {url}\n  (Ctrl+C to stop; model.pt is reloaded automatically when it changes)", flush=True)
+    if open_browser: threading.Timer(0.5, lambda: webbrowser.open(url)).start()
+    try: server.serve_forever()
+    except KeyboardInterrupt: print("\nStopping GUI.")
+    finally: server.server_close()
+
+
+def run_sampling_gui(host="127.0.0.1", port=8765, open_browser=True, model_path="model.pt", config_path="config.json"):
+    """Serve the GUI opened on the explorer (sampling) page."""
+    run_gui(host, port, open_browser, model_path, config_path, start_page="response")
+
+
+##############################################
 ##############################################
 # Main runner
 ##############################################
 if __name__ == "__main__":
     print("\n=== PyTorch MLP Surrogate Suite ===")
+    if input("Interface: 1 = CLI (menus below), 2 = GUI (train + explore in the browser) [1]: ").strip() == "2":
+        port_str = input("Port (Enter = 8765): ").strip()
+        run_gui(port=int(port_str) if port_str else 8765)
+        raise SystemExit(0)
     print("0: Train (New Model)")
     print("1: Sample (Run Inference)")
     print("2: Benchmark (Hyperparameter Search)")
@@ -6571,8 +8431,9 @@ if __name__ == "__main__":
     print("11: Cross-Validation (K-Fold)")
     print("12: Input Sensitivity (Per-Output Gradient Analysis)")
     print("13: Error Analysis (Top-N Worst Examples)")
+    print("14: Resume Training (continue the current model)")
     
-    choice = input("\nEnter choice [0-13]: ").strip().lower()
+    choice = input("\nEnter choice [0-14]: ").strip().lower()
     
     if choice in ["train", "t", "0"]:
         file_path = input("Enter file path: ").strip()
@@ -6589,7 +8450,10 @@ if __name__ == "__main__":
         mlp_mode = ask_mlp_mode()
         batch_size = ask_batch_size()
         base_activation_cls = ask_activation()
+        layer_routing = ask_layer_routing()
         activation_type = ask_activation_type()
+        if isinstance(base_activation_cls(), MaxoutActivation) and activation_type != 0:
+            raise ValueError("True Maxout must use the basic activation type.")
         wrapped_activation_cls = wrap_activation(base_activation_cls, activation_type)
         optimizer_choice = ask_optimizer()
         custom_lr = ask_learning_rate()
@@ -6599,39 +8463,22 @@ if __name__ == "__main__":
         attention_type, num_heads = ask_attention_type()
         input_attention_type = ask_input_attention_type()
         moe_mode = ask_moe_mode()
+        use_grn = input("Use Global Response Normalization (GRN)? [y/N]: ").strip().lower() in ('y', 'yes', '1', 'true')
+        if layer_routing == "adaptive" and (mlp_mode != 0 or residual_type.lower() != "residual" or moe_mode != 1):
+            raise ValueError("Adaptive layer routing requires regular MLP mode, standard residuals, and MoE mode 1.")
+        if isinstance(base_activation_cls(), MaxoutActivation) and moe_mode != 1:
+            raise ValueError("True Maxout requires MoE mode 1 (off).")
         use_lsuv, lsuv_max_iter, lsuv_normalize_mean = ask_lsuv_init()
 
-        print("\nAnalyzing training data to establish scalings...")
-        train_ds_pre = CustomDataset(file_path, delimiter, input_cols, output_cols,
-                                     col_types, vocabularies, {}, image_params)
-        scalings = train_ds_pre.scalings
-        vocabularies = train_ds_pre.vocabularies
-        print("Scalings established.")
-
-        val_loader = None; val_interval = 1000
-        print("\n--- Validation Setup ---")
-        val_file_path = input("Enter validation CSV path (empty for percentage split): ").strip()
-        
-        if val_file_path and os.path.isfile(val_file_path):
-            print(f"Using external file: {val_file_path}")
-            val_dataset = CustomDataset(val_file_path, delimiter, input_cols, output_cols,
-                                      col_types, vocabularies, scalings, image_params)
-            val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-            val_interval = int(input("Validation interval (steps): ").strip())
-        else:
-            if val_file_path: print("Invalid file, falling back to percentage split.")
-            try: val_pct = float(input("Validation split % (0.0-1.0, e.g. 0.1): ").strip())
-            except ValueError: val_pct = 0.0
-            if val_pct > 0.0:
-                val_size = int(len(train_ds_pre) * val_pct)
-                train_size = len(train_ds_pre) - val_size
-                train_subset, val_subset = torch.utils.data.random_split(train_ds_pre, [train_size, val_size])
-                val_loader = DataLoader(val_subset, batch_size=batch_size, shuffle=False)
-                val_interval = int(input("Validation interval (steps): ").strip())
-            else: print("Validation skipped.")
+        loss_balancing, loss_temperature = ask_loss_balancing(output_cols, col_types)
+        train_ds, val_loader, val_interval = ask_validation_and_prepare(
+            file_path, delimiter, input_cols, output_cols, col_types, vocabularies, image_params, batch_size)
+        scalings = train_ds.scalings; vocabularies = train_ds.vocabularies
 
         # Route to auto-grow or regular training
         is_auto = isinstance(hidden_dims, dict) and hidden_dims.get("mode") == "auto"
+        if is_auto and layer_routing != "none":
+            raise ValueError("Adaptive layer routing is not supported by auto-grow training.")
         if is_auto:
             main_auto_grow(file_path, delimiter=delimiter, input_cols=input_cols, output_cols=output_cols,
                  col_types=col_types, vocabularies=vocabularies, scalings=scalings, image_params=image_params,
@@ -6645,7 +8492,8 @@ if __name__ == "__main__":
                  use_lsuv=use_lsuv, lsuv_max_iter=lsuv_max_iter or 10,
                  lsuv_normalize_mean=lsuv_normalize_mean if lsuv_normalize_mean is not None else False,
                  val_loader=val_loader, val_interval=val_interval,
-                 custom_lr=custom_lr, mlp_mode=mlp_mode)
+                 custom_lr=custom_lr, mlp_mode=mlp_mode, train_dataset=train_ds,
+                 loss_balancing=loss_balancing, loss_temperature=loss_temperature)
         else:
             main(file_path, delimiter=delimiter, input_cols=input_cols, output_cols=output_cols,
                  col_types=col_types, vocabularies=vocabularies, scalings=scalings, image_params=image_params,
@@ -6659,9 +8507,15 @@ if __name__ == "__main__":
                  use_lsuv=use_lsuv, lsuv_max_iter=lsuv_max_iter or 10,
                  lsuv_normalize_mean=lsuv_normalize_mean if lsuv_normalize_mean is not None else False,
                  val_loader=val_loader, val_interval=val_interval,
-                 custom_lr=custom_lr, mlp_mode=mlp_mode)
+                 custom_lr=custom_lr, mlp_mode=mlp_mode, layer_routing=layer_routing,
+                 use_grn=use_grn, train_dataset=train_ds,
+                 loss_balancing=loss_balancing, loss_temperature=loss_temperature)
 
     elif choice in ["sample", "s", "1"]:
+        if input("Launch interactive GUI (local web server)? (y/N): ").strip().lower() == 'y':
+            port_str = input("Port (Enter = 8765): ").strip()
+            run_sampling_gui(port=int(port_str) if port_str else 8765)
+            raise SystemExit(0)
         config = load_config()
         sample_input = []
         for col in config["col_types"]:
@@ -6682,14 +8536,31 @@ if __name__ == "__main__":
                     try: 
                         res = int(res_str); plot_settings['resolution_1d'] = res; plot_settings['resolution_2d'] = res
                     except: pass
-                print("Plot range mode: 0: Auto  1: Custom (scaled)  2: Custom (unscaled)")
-                range_choice = input("Choice: ").strip()
-                if range_choice in ["1", "2"]:
-                    try:
-                        rmin = float(input("  Range min: ").strip()); rmax = float(input("  Range max: ").strip())
-                        plot_settings['custom_range'] = (rmin, rmax)
-                        plot_settings['range_mode'] = 'scaled' if range_choice == "1" else 'unscaled'
-                    except: print("  Invalid range, using auto.")
+                numeric_inputs = [
+                    col for col, col_type in config['col_types'].items()
+                    if col_type == 'in' and col in config['scalings']
+                    and 'min' in config['scalings'][col] and 'max' in config['scalings'][col]
+                ]
+                if numeric_inputs:
+                    print("Plot range per numeric input (Enter = training range; format: MIN MAX or MIN,MAX):")
+                    input_ranges = {}
+                    for col in numeric_inputs:
+                        smin = config['scalings'][col]['min']
+                        smax = config['scalings'][col]['max']
+                        entered_range = input(f"  {col} [{smin:.4g} to {smax:.4g}]: ").strip()
+                        if not entered_range:
+                            continue
+                        parts = entered_range.replace(',', ' ').split()
+                        if len(parts) != 2:
+                            print("    Invalid range; using training range.")
+                            continue
+                        try:
+                            rmin, rmax = sorted((float(parts[0]), float(parts[1])))
+                            input_ranges[col] = (rmin, rmax)
+                        except ValueError:
+                            print("    Invalid range; using training range.")
+                    if input_ranges:
+                        plot_settings['input_ranges'] = input_ranges
         
         if plot_option == "3":
             print("\n⚠ WARNING: This will plot EVERY neuron in the network.")
@@ -6863,41 +8734,18 @@ if __name__ == "__main__":
         if "activation_type" not in evolve_set:
             fixed_activation_type = ask_activation_type()
 
-        print("\nAnalyzing training data to establish scalings...")
-        train_ds_pre = CustomDataset(file_path, delimiter, input_cols, output_cols,
-                                     col_types, vocabularies, {}, image_params)
-        scalings = train_ds_pre.scalings
-        vocabularies = train_ds_pre.vocabularies
-        print("Scalings established.")
-
-        # Validation setup for evolution fitness tracking
-        evo_val_loader = None
-        print("\n--- Validation Setup (for fitness tracking) ---")
-        val_file_path = input("Enter validation CSV path (empty for percentage split): ").strip()
-
-        if val_file_path and os.path.isfile(val_file_path):
-            print(f"Using external file: {val_file_path}")
-            val_dataset = CustomDataset(val_file_path, delimiter, input_cols, output_cols,
-                                       col_types, vocabularies, scalings, image_params)
-            evo_val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-        else:
-            if val_file_path: print("Invalid file, falling back to percentage split.")
-            try: val_pct = float(input("Validation split % (0.0-1.0, e.g. 0.1): ").strip())
-            except ValueError: val_pct = 0.0
-            if val_pct > 0.0:
-                val_size = int(len(train_ds_pre) * val_pct)
-                train_size = len(train_ds_pre) - val_size
-                _, val_subset = torch.utils.data.random_split(train_ds_pre, [train_size, val_size])
-                evo_val_loader = DataLoader(val_subset, batch_size=batch_size, shuffle=False)
-            else:
-                print("No validation set. Evolution will track training loss.")
+        # Validation for evolution fitness tracking (deduplicated, truly held out)
+        evo_train_ds, evo_val_loader, _ = ask_validation_and_prepare(
+            file_path, delimiter, input_cols, output_cols, col_types, vocabularies, image_params,
+            batch_size, ask_interval=False)
+        scalings = evo_train_ds.scalings; vocabularies = evo_train_ds.vocabularies
 
         # Run evolution
         best_individual = run_evolution(
             file_path, delimiter, input_cols, output_cols, col_types, vocabularies,
             scalings, image_params, batch_size, optimizer_choice, custom_lr,
             max_hidden_dim, max_layers, population_size, generations, eval_steps,
-            evo_val_loader, evolve_set=evolve_set, fixed_overrides=fixed_overrides,
+            evo_val_loader, train_dataset=evo_train_ds, evolve_set=evolve_set, fixed_overrides=fixed_overrides,
             fixed_hidden_dims=fixed_hidden_dims, fixed_activation=fixed_activation,
             fixed_activation_type=fixed_activation_type)
 
@@ -6927,25 +8775,10 @@ if __name__ == "__main__":
                 custom_lr = evolved_lr
                 print(f"  Using evolved learning rate: {evolved_lr:.6f}")
 
-            # Re-setup validation for full training
-            val_loader = None; val_interval = 1000
-            print("\n--- Validation Setup (for training) ---")
-            val_file_path2 = input("Enter validation CSV path (empty for percentage split): ").strip()
-            if val_file_path2 and os.path.isfile(val_file_path2):
-                val_dataset = CustomDataset(val_file_path2, delimiter, input_cols, output_cols,
-                                           col_types, vocabularies, scalings, image_params)
-                val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-                val_interval = int(input("Validation interval (steps): ").strip())
-            else:
-                if val_file_path2: print("Invalid file, falling back to percentage split.")
-                try: val_pct2 = float(input("Validation split % (0.0-1.0, e.g. 0.1): ").strip())
-                except ValueError: val_pct2 = 0.0
-                if val_pct2 > 0.0:
-                    val_size = int(len(train_ds_pre) * val_pct2)
-                    train_size = len(train_ds_pre) - val_size
-                    _, val_subset = torch.utils.data.random_split(train_ds_pre, [train_size, val_size])
-                    val_loader = DataLoader(val_subset, batch_size=batch_size, shuffle=False)
-                    val_interval = int(input("Validation interval (steps): ").strip())
+            # Re-setup validation for full training (deduplicated, truly held out)
+            final_train_ds, val_loader, val_interval = ask_validation_and_prepare(
+                file_path, delimiter, input_cols, output_cols, col_types, vocabularies, image_params, batch_size)
+            scalings = final_train_ds.scalings
 
             use_lsuv, lsuv_max_iter, lsuv_normalize_mean = ask_lsuv_init()
 
@@ -6962,7 +8795,7 @@ if __name__ == "__main__":
                  use_lsuv=use_lsuv, lsuv_max_iter=lsuv_max_iter or 10,
                  lsuv_normalize_mean=lsuv_normalize_mean if lsuv_normalize_mean is not None else False,
                  val_loader=val_loader, val_interval=val_interval,
-                 custom_lr=custom_lr, mlp_mode=0)
+                 custom_lr=custom_lr, mlp_mode=0, train_dataset=final_train_ds)
 
     elif choice in ["test", "testeval", "7"]:
         # Mode 7: Test Set Evaluation
@@ -7010,7 +8843,8 @@ if __name__ == "__main__":
         else:
             model = MLPO(input_dims, hidden_dims, output_pred_dim, activation_cls, residual_type,
                          norm_type=norm_type, groups=1, attention_type=attention_type,
-                         num_heads=num_heads, input_attention_type="none", moe_mode=moe_mode).to(device)
+                         num_heads=num_heads, input_attention_type="none", moe_mode=moe_mode,
+                         layer_routing=config.get("layer_routing", "none")).to(device)
         with torch.no_grad(): model(torch.zeros(1, input_dims).to(device))
         model.load_state_dict(torch.load("model.pt", map_location=device))
         
@@ -7061,7 +8895,8 @@ if __name__ == "__main__":
         else:
             model = MLPO(input_dims, hidden_dims, output_pred_dim, activation_cls, residual_type,
                          norm_type=norm_type, groups=1, attention_type=attention_type,
-                         num_heads=num_heads, input_attention_type="none", moe_mode=moe_mode).to(device)
+                         num_heads=num_heads, input_attention_type="none", moe_mode=moe_mode,
+                         layer_routing=config.get("layer_routing", "none")).to(device)
         with torch.no_grad(): model(torch.zeros(1, input_dims).to(device))
         if os.path.exists("model.pt"):
             model.load_state_dict(torch.load("model.pt", map_location=device))
@@ -7106,7 +8941,8 @@ if __name__ == "__main__":
         else:
             model = MLPO(input_dims, hidden_dims, output_pred_dim, activation_cls, residual_type,
                          norm_type=norm_type, groups=1, attention_type=attention_type,
-                         num_heads=num_heads, input_attention_type="none", moe_mode=moe_mode).to(device)
+                         num_heads=num_heads, input_attention_type="none", moe_mode=moe_mode,
+                         layer_routing=config.get("layer_routing", "none")).to(device)
         with torch.no_grad(): model(torch.zeros(1, input_dims).to(device))
         model.load_state_dict(torch.load("model.pt", map_location=device))
         
@@ -7246,7 +9082,8 @@ if __name__ == "__main__":
         else:
             model = MLPO(input_dims, hidden_dims, output_pred_dim, activation_cls, residual_type,
                          norm_type=norm_type, groups=1, attention_type=attention_type,
-                         num_heads=num_heads, input_attention_type="none", moe_mode=moe_mode).to(device)
+                         num_heads=num_heads, input_attention_type="none", moe_mode=moe_mode,
+                         layer_routing=config.get("layer_routing", "none")).to(device)
         with torch.no_grad(): model(torch.zeros(1, input_dims).to(device))
         model.load_state_dict(torch.load("model.pt", map_location=device))
         
@@ -7300,7 +9137,8 @@ if __name__ == "__main__":
         else:
             model = MLPO(input_dims, hidden_dims, output_pred_dim, activation_cls, residual_type,
                          norm_type=norm_type, groups=1, attention_type=attention_type,
-                         num_heads=num_heads, input_attention_type="none", moe_mode=moe_mode).to(device)
+                         num_heads=num_heads, input_attention_type="none", moe_mode=moe_mode,
+                         layer_routing=config.get("layer_routing", "none")).to(device)
         model.load_state_dict(torch.load("model.pt", map_location=device))
         
         data_csv = input("Enter data CSV path (for error analysis): ").strip()
@@ -7314,6 +9152,25 @@ if __name__ == "__main__":
         run_error_analysis(model, data_csv, delimiter, input_cols_l, output_cols_l,
                           col_types_loaded, vocabularies_l, scalings_l,
                           config.get("image_params", {}), batch_size, device, max_display)
+
+    elif choice in ["resume", "r", "14"]:
+        kwargs, val_ds, _ = prepare_resume("config.json", "model.pt")
+        print(f"Resuming: {kwargs['hidden_dims']} {kwargs['base_activation_cls_for_config'].activation_config['name']} "
+              f"on {kwargs['csv_file']} (last optimizer: {kwargs['optimizer_choice']}).")
+        if input("Keep the same optimizer? (Y/n): ").strip().lower() == "n":
+            kwargs["optimizer_choice"] = ask_optimizer()
+        if kwargs["optimizer_choice"] in ("Muon", "AdaMuon", "NorMuon", "AdaGO", "AdamGO", "RMSGO", "AdaDeltaGO"):
+            kwargs["optim_params"] = prompt_muon_options(kwargs["optimizer_choice"], use_defaults=True)
+        kwargs["custom_lr"] = ask_learning_rate()
+        bs = input(f"Batch size (Enter = {kwargs['batch_size']}): ").strip()
+        if bs: kwargs["batch_size"] = int(bs)
+        val_loader, val_interval = None, 1000
+        if val_ds is not None:
+            val_loader = DataLoader(val_ds, batch_size=kwargs["batch_size"], shuffle=False)
+            vi = input("Validation interval (steps, Enter = 1000): ").strip()
+            val_interval = int(vi) if vi else 1000
+        kwargs["loss_balancing"], kwargs["loss_temperature"] = ask_loss_balancing(kwargs["output_cols"], kwargs["col_types"])
+        main(val_loader=val_loader, val_interval=val_interval, **kwargs)
 
     else:
         print("Invalid choice.")

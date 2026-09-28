@@ -4,13 +4,16 @@
 import os
 import sys
 import json
+import csv
 import time
 import math
+import copy
+import itertools
 import random
 import shutil
 import pathlib
 from dataclasses import dataclass, asdict
-from typing import Optional, List, Tuple, Dict, Set
+from typing import Optional, List, Tuple, Dict, Set, Callable, FrozenSet
 import collections
 
 import numpy as np
@@ -24,6 +27,7 @@ import torch._inductor.config
 import struct
 import re
 import binascii
+import hashlib
 from tqdm import tqdm
 
 # Enable TF32 for Matrix Multiplications (Linear Layers)
@@ -39,6 +43,7 @@ torch._inductor.config.debug = False
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 CHECKPOINT_PATH = "model.pt"
 CONFIG_PATH = "textgen.json"
+VALIDATION_CSV_PATH = "validation_metrics.csv"
 BOS_TOKEN = "<BOS>"
 # at top near BOS_TOKEN
 EOS_TOKEN = "<EOS>"
@@ -229,67 +234,36 @@ def print_model_menu() -> None:
     bar = "─" * (W - 4)
     print(f"\n  {_c(_CY, _B, '┌─')} {_c(_WH, _B, 'Model Selection')} {_c(_CY, '─' * (W - 22) + '┐')}")
 
-    groups = [
-        ("MLPs", [
-            (0,  "MLP (basic)",          "One-hot window → feedforward, no embedding lookup"),
-            (1,  "MLP (residual)",        "Transformer-style FF blocks, no attention or recurrence"),
-        ]),
-        ("Classic RNNs  (step-by-step, stateful)", [
-            (2,  "RNN – Tanh",            "Vanilla Elman RNN with tanh activation"),
-            (3,  "RNN – ReLU",            "Vanilla Elman RNN with ReLU activation"),
-            (4,  "GRU",                   "Gated Recurrent Unit"),
-            (5,  "LSTM",                  "Long Short-Term Memory"),
-            (6,  "IndRNN",                "Independently Recurrent NN (diagonal hidden-to-hidden)"),
-            (7,  "IndyGRU",               "IndRNN-style GRU"),
-            (8,  "ATanU-LSTM",            "LSTM with ArcTan unit activation"),
-            (18, "JANET",                 "Forget-gate-only LSTM (simplified)"),
-            (23, "Liquid / LTC",          "Liquid Time-Constant Neural Network"),
-        ]),
-        ("Non-recurrent  (attention / conv / mixer)", [
-            (9,  "Temporal ConvNet",      "Causal dilated 1-D TCN"),
-            (10, "GPT-2 Transformer",     "Decoder-only transformer, SDPA / Flash-Attn"),
-            (19, "HyperMixer",            "MLP-Mixer variant with hypernetwork token mixing"),
-            (21, "gMLP",                  "Gated MLP with spatial gating unit (causal)"),
-            (22, "aMLP",                  "gMLP + tiny self-attention gate"),
-            (24, "MLP-Mixer (causal)",    "Patch-style MLP mixer adapted for sequences"),
-            (25, "Modern Transformer",    "Llama-3 style: RMSNorm, SwiGLU, RoPE, GQA"),
-            (31, "MEGABYTE",              "Patch-based hierarchical byte-level LM"),
-            (34, "KAN-Transformer",       "Transformer with Chebyshev KAN feed-forward"),
-            (37, "DCT-Former",            "DCT-based spectral attention transformer"),
-        ]),
-        ("xLSTM", [
-            (11, "xLSTM – sLSTM only",   "Exponential gating scalar LSTM blocks"),
-            (12, "xLSTM – mLSTM only",   "Matrix-memory mLSTM blocks"),
-            (13, "xLSTM – mixed m:s",    "Interleaved mLSTM + sLSTM (7:1 default)"),
-        ]),
-        ("State-Space / Linear Recurrence  (scan / parallel)", [
-            (14, "Mamba",                 "Selective state-space model (S6 scan)"),
-            (15, "minGRU",               "Parallelized minimal GRU (log-space scan)"),
-            (16, "minLSTM",              "Parallelized minimal LSTM (log-space scan)"),
-            (17, "RWKV",                  "Receptance Weighted Key Value (scan)"),
-            (20, "GateLoop",              "Data-controlled linear recurrence"),
-            (26, "MinRNN ★",             "Parallelized vanilla RNN — multiple activation options"),
-            (27, "Griffin / RG-LRU",      "Real-gated linear recurrent unit"),
-            (28, "DeltaNet",              "Delta-rule linear recurrence"),
-            (29, "RetNet",                "Retentive network (multi-scale retention)"),
-            (30, "HGRN",                  "Hierarchical Gated Recurrent Network"),
-            (32, "MinIndRNN ★",          "Parallelized IndRNN — many activation choices"),
-            (33, "MinJANET",             "Parallelized JANET forget-gate model"),
-            (35, "Linear Transformer",    "Linear attention recurrent form"),
-            (36, "H3",                    "Hungry Hungry Hippos SSM"),
-            (38, "MinIndyGRU",            "Parallelized IndyGRU (scan)"),
-            (39, "MinIndyLSTM",           "Parallelized IndyLSTM (scan)"),
-        ]),
-    ]
+    # ``MODEL_SPECS`` is built after all model definitions, but is available by
+    # the time this interactive function is called.  Keeping presentation data
+    # on the specs prevents the menu from becoming a second registry.
+    groups = []
+    for group_name in MODEL_MENU_GROUP_ORDER:
+        specs = [spec for spec in MODEL_SPECS.values() if spec.menu_group == group_name]
+        if specs:
+            groups.append((group_name, [
+                (spec.id, spec.menu_label, spec.menu_description) for spec in specs
+            ]))
 
     for gname, models in groups:
         cli_blank_row()
         cli_group(gname, W - 4)
         for mid, mname, mdesc in models:
-            cli_opt(mid, mname, mdesc, kw=3, lw=26)
+            cli_opt(mid, mname, mdesc, kw=4, lw=26)
 
     cli_blank_row()
     print(f"  {_c(_CY, '└' + '─' * (W - 4) + '┘')}")
+
+
+def print_megabyte_compatible_models() -> None:
+    """Show the exact selections that have a validated hierarchy-stage core."""
+    compatible = [
+        f"{model_id} ({MODEL_SPECS[model_id].name})"
+        for model_id in sorted(HIERARCHICAL_MODEL_MIXERS)
+    ]
+    print(f"  │  {_c(_DIM, 'MEGABYTE-compatible models:')}")
+    print(f"  │  {_c(_GR, ', '.join(compatible))}")
+    print(f"  │  {_c(_DIM, f'{MLP_MODEL_ID} (MLP) is a bottom-up fine-patch decoder core; an MLP encoder must use the matching fine stage.')}")
 
 def ensure_filegen_clean():
     """Clear and recreate FileGen/."""
@@ -658,7 +632,7 @@ class CustomBPEVocab(BaseVocab):
     def tokens(self):
         return list(range(self._size))
 class WordVocab(BaseVocab):
-    """Whitespace-split word-level tokenizer (+ optional BOS)."""
+    """Whitespace-split word-level tokenizer (+ BOS/EOS/PAD in line mode)."""
     def __init__(self, lines: List[str], line_mode: bool):
         self.line_mode = line_mode
         words = set()
@@ -666,62 +640,102 @@ class WordVocab(BaseVocab):
             words.update(s.split())
         self.tokens = sorted(list(words))
         if line_mode:
-            if BOS_TOKEN in self.tokens:
-                self.tokens.remove(BOS_TOKEN)
-            self.tokens = [BOS_TOKEN] + self.tokens
+            for sp in (BOS_TOKEN, EOS_TOKEN, PAD_TOKEN):
+                if sp in self.tokens:
+                    self.tokens.remove(sp)
+            self.tokens = [BOS_TOKEN, EOS_TOKEN, PAD_TOKEN] + self.tokens
         self.stoi = {w:i for i,w in enumerate(self.tokens)}
         self.itos = {i:w for w,i in self.stoi.items()}
         self.bos_id = self.stoi[BOS_TOKEN] if line_mode else None
+        self.eos_id = self.stoi[EOS_TOKEN] if line_mode else None
+        self.pad_id = self.stoi[PAD_TOKEN] if line_mode else None
 
     def encode(self, s: str) -> List[int]:
-        if self.line_mode and s.startswith(BOS_TOKEN):
+        if not self.line_mode:
+            return [self.stoi[w] for w in s.split()]
+
+        if s.startswith(BOS_TOKEN):
             # keep BOS as the very first token, then split the rest
             rest = s[len(BOS_TOKEN):].lstrip()
-            return [self.bos_id] + [self.stoi[w] for w in rest.split()]
+            words = rest.split()
         else:
-            return [self.stoi[w] for w in s.split()]
+            words = s.split()
+        return [self.bos_id] + [self.stoi[w] for w in words if w != EOS_TOKEN] + [self.eos_id]
 
     def decode(self, ids: List[int]) -> str:
         if not self.line_mode:
             return " ".join(self.itos[i] for i in ids)
         out = []
-        first = True
         for i in ids:
             if i == self.bos_id:
                 # keep BOS literal; caller can hide it
                 out.append(BOS_TOKEN)
+            elif i == self.eos_id:
+                out.append(EOS_TOKEN)
+            elif i == self.pad_id:
+                continue
             else:
                 out.append(self.itos[i])
-            first = False
         return " ".join(out)
 
     @property
     def size(self): return len(self.tokens)
 
 class BinaryVocab(BaseVocab):
-    """Binary tokens {0,1} (+ BOS if line mode)."""
+    """Binary tokens {0,1} (+ BOS/EOS/PAD in line mode)."""
     def __init__(self, line_mode: bool):
         self.line_mode = line_mode
-        self.tokens = [BOS_TOKEN, "0", "1"] if line_mode else ["0", "1"]
+        self.tokens = [BOS_TOKEN, EOS_TOKEN, PAD_TOKEN, "0", "1"] if line_mode else ["0", "1"]
         self.stoi = {t:i for i,t in enumerate(self.tokens)}
         self.itos = {i:t for t,i in self.stoi.items()}
         self.bos_id = self.stoi[BOS_TOKEN] if line_mode else None
+        self.eos_id = self.stoi[EOS_TOKEN] if line_mode else None
+        self.pad_id = self.stoi[PAD_TOKEN] if line_mode else None
 
-    def encode(self, s: str) -> List[int]:
-        # Keep only 0/1; ignore other characters
+    def encode(self, s) -> List[int]:
+        """Encode binary text, or expand each raw byte to its eight bits."""
         ids = []
+        if isinstance(s, (bytes, bytearray, memoryview)):
+            for byte in bytes(s):
+                ids.extend(self.stoi[bit] for bit in f"{byte:08b}")
+            return [self.bos_id] + ids + [self.eos_id] if self.line_mode else ids
+
+        if not isinstance(s, str):
+            raise TypeError("BinaryVocab.encode expects binary text or bytes")
         if self.line_mode and s.startswith(BOS_TOKEN):
-            ids.append(self.bos_id)
             s = s[len(BOS_TOKEN):]
         for ch in s:
             if ch in ("0","1"):
                 ids.append(self.stoi[ch])
-        return ids
+        return [self.bos_id] + ids + [self.eos_id] if self.line_mode else ids
 
     def decode(self, ids: List[int]) -> str:
         if not self.line_mode:
             return "".join(self.itos[i] for i in ids)
-        return "".join(BOS_TOKEN if i==self.bos_id else self.itos[i] for i in ids)
+        parts = []
+        for i in ids:
+            if i == self.bos_id:
+                parts.append(BOS_TOKEN)
+            elif i == self.eos_id:
+                parts.append(EOS_TOKEN)
+            elif i == self.pad_id:
+                continue
+            else:
+                parts.append(self.itos[i])
+        return "".join(parts)
+
+    def to_bytes(self, ids: List[int]) -> bytes:
+        """Pack generated bit tokens into bytes for FileGen output.
+
+        A final incomplete byte is zero-padded on the right. Special line-mode
+        tokens are omitted, so the result always contains only generated bits.
+        """
+        bits = [self.itos[token_id] for token_id in ids if self.itos.get(token_id) in ("0", "1")]
+        if not bits:
+            return bytes()
+        padding = (-len(bits)) % 8
+        bits.extend("0" for _ in range(padding))
+        return bytes(int("".join(bits[index:index + 8]), 2) for index in range(0, len(bits), 8))
 
     @property
     def size(self): return len(self.tokens)
@@ -733,15 +747,22 @@ def _hex_to_bytes(s: str) -> bytes:
     s = re.sub(r'\s+', '', s)
     s = re.sub(r'0x', '', s, flags=re.IGNORECASE)
     if len(s) % 2 == 1:
-        s = '0' + s  # odd nibble → pad on the left
+        raise ValueError(
+            f"hex byte input must contain an even number of digits (received {len(s)})"
+        )
     return bytes.fromhex(s)
 
 class ByteVocab(BaseVocab):
-    """0..255 bytes (+ BOS if line mode)."""
+    """0..255 bytes (+ BOS/EOS/PAD in line mode)."""
     def __init__(self, line_mode: bool):
         self.line_mode = line_mode
         self.bos_id = 256 if line_mode else None
-        self._size = 257 if line_mode else 256
+        self.eos_id = 257 if line_mode else None
+        self.pad_id = 258 if line_mode else None
+        self._size = 259 if line_mode else 256
+
+    def _with_line_specials(self, ids: List[int]) -> List[int]:
+        return [self.bos_id] + ids + [self.eos_id] if self.line_mode else ids
 
     def encode(self, s) -> List[int]:
         """
@@ -757,26 +778,24 @@ class ByteVocab(BaseVocab):
             if not (0 <= s <= 255):
                 raise ValueError("ByteVocab.encode int must be in [0,255]")
             ids = [s]
-            return ([self.bos_id] + ids) if self.line_mode else ids
+            return self._with_line_specials(ids)
 
         # list/tuple of ints
         if isinstance(s, (list, tuple)) and all(isinstance(x, int) for x in s):
             ids = [x for x in s if 0 <= x <= 255]
-            return ([self.bos_id] + ids) if self.line_mode else ids
+            return self._with_line_specials(ids)
 
         # bytes-like
         if isinstance(s, (bytes, bytearray, memoryview)):
             b = bytes(s)
             ids = list(b)
-            return ([self.bos_id] + ids) if self.line_mode else ids
+            return self._with_line_specials(ids)
 
         # strings (latin1 vs hex)
         if isinstance(s, str):
             # Handle BOS_TOKEN literally at the front in line_mode
-            add_bos = False
             if self.line_mode and s.startswith(BOS_TOKEN):
                 s = s[len(BOS_TOKEN):]
-                add_bos = True
 
             # explicit "hex:" prefix OR looks like hex (with optional 0x and spaces)
             looks_hex = s.lower().startswith("hex:") or bool(HEX_RE.match(s))
@@ -788,24 +807,22 @@ class ByteVocab(BaseVocab):
                 except ValueError:
                     raise ValueError("Invalid hex string for ByteVocab.encode")
                 ids = list(b)
-                if self.line_mode and add_bos:
-                    return [self.bos_id] + ids
-                return ([self.bos_id] + ids) if (self.line_mode and not add_bos) else ids
+                return self._with_line_specials(ids)
 
             # fallback: latin1
             ids = list(s.encode("latin1", "ignore"))
-            return ([self.bos_id] + ids) if self.line_mode else ids
+            return self._with_line_specials(ids)
 
         raise TypeError("ByteVocab.encode expects bytes, str, int, or list[int]")
 
     def decode(self, ids: List[int]) -> str:
         if self.line_mode:
-            ids = [i for i in ids if i != self.bos_id]
+            ids = [i for i in ids if i not in (self.bos_id, self.eos_id, self.pad_id)]
         return bytes([i for i in ids if 0 <= i <= 255]).decode("latin1", "ignore")
 
     def to_bytes(self, ids: List[int]) -> bytes:
         if self.line_mode:
-            ids = [i for i in ids if i != self.bos_id]
+            ids = [i for i in ids if i not in (self.bos_id, self.eos_id, self.pad_id)]
         return bytes([i for i in ids if 0 <= i <= 255])
 
     @property
@@ -815,14 +832,226 @@ class ByteVocab(BaseVocab):
     @property
     def tokens(self):
         # for random sampling in callers that expect a tokens list
-        return list(range(257)) if self.line_mode else list(range(256))
+        return list(range(self._size))
 
 
+# ========= Sequence-to-sequence line datasets =========
+# Seq2seq mode rewrites a delimited file (CSV/TSV/...) into one example per
+# line: the chosen input columns first, then the output columns, all joined by
+# tabs.  Everything up to and including the tab after the last input column is
+# the source.  It is fed to the model like a prompt but masked out of the loss,
+# so training and validation score only the output columns and the final EOS.
+SEQ2SEQ_JOINER = "\t"
+SEQ2SEQ_DELIMITERS = {0: ",", 1: ":", 2: "\t"}
 
 
+def _seq2seq_split_row(text: str, delimiter: str) -> List[str]:
+    """Split one row; single-character delimiters honour CSV quoting."""
+    if len(delimiter) == 1:
+        return next(csv.reader([text], delimiter=delimiter), [])
+    return text.split(delimiter)
+
+
+def _seq2seq_rows(path: str, delimiter: str):
+    """Yield the rows of a delimited file (surrogateescape keeps raw bytes intact)."""
+    with open(path, "r", encoding="utf-8", errors="surrogateescape", newline="") as f:
+        if len(delimiter) == 1:
+            csv.field_size_limit(min(sys.maxsize, 2**31 - 1))
+            yield from csv.reader(f, delimiter=delimiter)
+        else:
+            for line in f:
+                yield line.rstrip("\r\n").split(delimiter)
+
+
+def seq2seq_prepared_path(spec: dict, source_path: str) -> str:
+    """A prepared-file name unique to the source file's version and the column spec."""
+    src = os.path.abspath(source_path)
+    st = os.stat(src)
+    key = json.dumps([src, st.st_size, st.st_mtime_ns, spec["delimiter"], spec["has_header"],
+                      spec["input_cols"], spec["output_cols"]])
+    p = pathlib.Path(src)
+    return str(p.with_name(f"{p.stem}.seq2seq-{hashlib.sha1(key.encode()).hexdigest()[:10]}.txt"))
+
+
+def prepare_seq2seq_dataset(spec: dict, source_path: Optional[str] = None,
+                            out_path: Optional[str] = None) -> str:
+    """Write the tab-joined, inputs-then-outputs line file for ``spec``; return its path.
+
+    Rows are dropped (and counted) when their column count differs from the
+    header, or when a kept field contains a tab or line break, because either
+    would move the source/target boundary.
+    """
+    source_path = source_path or spec["source_path"]
+    out_path = out_path or seq2seq_prepared_path(spec, source_path)
+    if os.path.exists(out_path):
+        pinfo(f"Seq2seq: using prepared dataset {out_path}")
+        return out_path
+
+    width = len(spec["columns"])
+    keep = list(spec["input_cols"]) + list(spec["output_cols"])
+    written = 0
+    skipped = collections.Counter()
+    tmp_path = out_path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8", errors="surrogateescape", newline="\n") as out:
+        for n, row in enumerate(tqdm(_seq2seq_rows(source_path, spec["delimiter"]), desc="Seq2seq rows")):
+            if n == 0 and spec["has_header"]:
+                continue
+            if not any(field.strip() for field in row):
+                skipped["blank row"] += 1
+                continue
+            if len(row) != width:
+                skipped[f"not {width} columns"] += 1
+                continue
+            fields = [row[i] for i in keep]
+            if any(ch in field for field in fields for ch in "\t\r\n"):
+                skipped["tab or line break inside a field"] += 1
+                continue
+            out.write(SEQ2SEQ_JOINER.join(fields) + "\n")
+            written += 1
+    if written == 0:
+        os.remove(tmp_path)
+        raise ValueError(f"Seq2seq: no usable rows in {source_path} (skipped: {dict(skipped)})")
+    os.replace(tmp_path, out_path)
+    pok(f"Seq2seq: wrote {written:,} examples to {out_path}")
+    for reason, count in skipped.items():
+        pwarn(f"Seq2seq: skipped {count:,} rows ({reason})")
+    return out_path
+
+
+def ensure_seq2seq_dataset(cfg) -> None:
+    """Recreate a seq2seq run's prepared file if it was deleted."""
+    spec = cfg.get("seq2seq")
+    if spec and not os.path.exists(cfg["dataset_path"]):
+        pwarn(f"Seq2seq: {cfg['dataset_path']} is missing; rebuilding it from {spec['source_path']}")
+        prepare_seq2seq_dataset(spec, out_path=cfg["dataset_path"])
+
+
+def prompt_seq2seq_config(dataset_path: str) -> Optional[dict]:
+    """Ask whether to train seq2seq and, if so, the delimiter and each column's role."""
+    cli_section("Sequence-to-sequence", 64)
+    print(f"  │  {_c(_DIM, 'Seq2seq reads a delimited file and trains the model to produce the')}")
+    print(f"  │  {_c(_DIM, 'output columns from the input columns. Inputs are fed as a prompt')}")
+    print(f"  │  {_c(_DIM, 'but excluded from the loss. Outputs are moved to the end of each line.')}")
+    print(f"  │")
+    if prompt_int("Seq2seq mode  (0=off 1=on)", valid={0, 1}, default=0) == 0:
+        cli_section_end(64)
+        return None
+
+    print(f"  │")
+    cli_opt(0, "Comma", ",")
+    cli_opt(1, "Colon", ":")
+    cli_opt(2, "Tab", "\\t")
+    cli_opt(3, "Custom", "Any string; type \\t for a tab")
+    print(f"  │")
+    choice = prompt_int("Delimiter", valid={0, 1, 2, 3}, default=0)
+    delimiter = SEQ2SEQ_DELIMITERS.get(choice, "")
+    while not delimiter:
+        # Read raw so a space (or other whitespace) delimiter survives.
+        delimiter = input(prompt_label("Custom delimiter")).replace("\\t", "\t")
+    has_header = prompt_int("First row is a header  (0=no 1=yes)", valid={0, 1}, default=1) == 1
+
+    rows = _seq2seq_rows(dataset_path, delimiter)
+    first, second = next(rows, None), next(rows, None)
+    rows.close()
+    if not first:
+        raise ValueError(f"Seq2seq: {dataset_path} is empty")
+    if len(first) < 2:
+        raise ValueError(f"Seq2seq: delimiter {delimiter!r} finds only one column in the first row; "
+                         "at least one input and one output column are needed")
+    names = ([field.strip() or f"column {i}" for i, field in enumerate(first)] if has_header
+             else [f"column {i}" for i in range(len(first))])
+    example_row = second if has_header else first
+
+    print(f"  │")
+    print(f"  │  {_c(_DIM, f'{len(names)} columns. Type: 0 = ignore, 1 = input, 2 = output.')}")
+    while True:
+        roles = []
+        for i, name in enumerate(names):
+            example = example_row[i] if example_row and i < len(example_row) else ""
+            if len(example) > 40:
+                example = example[:40] + "…"
+            print(f"  │  {_c(_CY, f'[{i}]')} {_c(_WH, name)}  {_c(_DIM, f'e.g. {example!r}')}")
+            roles.append(prompt_int(f"Type of column {i}", valid={0, 1, 2},
+                                    default=2 if i == len(names) - 1 else 1))
+        input_cols = [i for i, r in enumerate(roles) if r == 1]
+        output_cols = [i for i, r in enumerate(roles) if r == 2]
+        if input_cols and output_cols:
+            break
+        pwarn("Choose at least one input column and one output column.")
+    cli_section_end(64)
+    return {
+        "source_path": os.path.abspath(dataset_path),
+        "delimiter": delimiter,
+        "has_header": has_header,
+        "columns": names,
+        "input_cols": input_cols,
+        "output_cols": output_cols,
+    }
+
+
+def _encode_line_body(vocab: BaseVocab, text) -> List[int]:
+    """Encode text without the BOS/EOS that line-mode vocabularies add."""
+    ids = vocab.encode(text)
+    return ids[1:-1] if vocab.line_mode else ids
+
+
+def encode_seq2seq_line(vocab: BaseVocab, line, input_count: int) -> Tuple[List[int], int]:
+    """Encode a prepared seq2seq line as BOS + source + target + EOS.
+
+    Source and target are tokenized separately so a subword tokenizer cannot
+    merge across the boundary; prompting with only the source then reproduces
+    the training token prefix exactly.  Returns ``(ids, source_len)``, where
+    ``source_len`` counts the source tokens after BOS (their targets are masked).
+    """
+    joiner = SEQ2SEQ_JOINER.encode() if isinstance(line, (bytes, bytearray)) else SEQ2SEQ_JOINER
+    cut = -1
+    for _ in range(input_count):
+        cut = line.find(joiner, cut + 1)
+        if cut < 0:
+            raise ValueError(f"Seq2seq line has fewer than {input_count} tab-separated "
+                             f"input columns: {line[:80]!r}")
+    source = _encode_line_body(vocab, line[:cut + 1])
+    target = _encode_line_body(vocab, line[cut + 1:])
+    return [vocab.bos_id] + source + target + [vocab.eos_id], len(source)
+
+
+def encode_seq2seq_prompt(vocab: BaseVocab, spec: dict, text: str) -> List[int]:
+    """BOS + source tokens for input columns typed with the dataset's delimiter."""
+    fields = _seq2seq_split_row(text, spec["delimiter"])
+    names = [spec["columns"][i] for i in spec["input_cols"]]
+    if len(fields) != len(names):
+        raise ValueError(f"Expected {len(names)} input column(s) ({', '.join(names)}) separated by "
+                         f"{spec['delimiter']!r}; got {len(fields)}")
+    source = SEQ2SEQ_JOINER.join(fields) + SEQ2SEQ_JOINER
+    if isinstance(vocab, (ByteVocab, BinaryVocab)):
+        source = source.encode("utf-8", "surrogateescape")
+    return [vocab.bos_id] + _encode_line_body(vocab, source)
+
+
+def seq2seq_visible(text: str) -> str:
+    """Show the tab joiner between columns readably."""
+    return text.replace(SEQ2SEQ_JOINER, " │ ")
 
 
 # ========= Datasets =========
+def pad_line_examples(examples: List[Tuple[List[int], int]], pad_id: int):
+    """Next-token (x, y) tensors for encoded lines; each line's first
+    ``masked`` targets (a seq2seq source) are set to PAD so the loss skips them."""
+    width = max(1, max(len(ids) for ids, _ in examples) - 1)
+    x = torch.full((len(examples), width), pad_id, dtype=torch.long)
+    y = torch.full((len(examples), width), pad_id, dtype=torch.long)
+    for row, (ids, masked) in enumerate(examples):
+        if len(ids) < 2:
+            continue
+        seq = torch.tensor(ids, dtype=torch.long)
+        n = len(ids) - 1
+        x[row, :n] = seq[:-1]
+        y[row, :n] = seq[1:]
+        if masked:
+            y[row, :min(masked, n)] = pad_id
+    return x.to(DEVICE), y.to(DEVICE)
+
+
 class ClassicCorpus:
     def __init__(self, text: str, vocab: CharVocab, seq_len: int):
         self.vocab = vocab
@@ -878,74 +1107,101 @@ class LineTBPTTStream:
     Windowed TBPTT: returns (x, y, reset_mask) each step with shape (B, W).
 
     - All streams start at BOS on the first step.
-    - When a stream would exceed the line (need W+1 tokens for y), we re-sample a new line and start at BOS,
-      and mark reset_mask[b]=True for that step.
+    - The last, shorter piece of every line is PAD-padded rather than discarded, so its EOS target is trained.
+    - A stream is reset before its next line starts, and reset_mask marks that new-line window.
+
+    `dataset` may be an IndexedLineDataset (or subset), avoiding a full in-memory
+    materialization of a large line corpus. `lines_enc` remains supported for the
+    legacy in-memory LineDataset.
     """
-    def __init__(self, lines_enc: List[List[int]], window: int, batch_size: int, bos_id: int):
+    def __init__(self, window: int, batch_size: int, bos_id: int, pad_id: int,
+                 lines_enc: Optional[List[List[int]]] = None,
+                 dataset: Optional['IndexedLineDataset'] = None):
         self.bos_id = bos_id
+        self.pad_id = pad_id
         self.W = max(1, int(window))
         self.B = int(batch_size)
 
-        # Keep only lines with at least two tokens (BOS + 1 char)
-        self.lines: List[torch.Tensor] = [torch.tensor(l, dtype=torch.long) for l in lines_enc if len(l) >= 2]
-        if len(self.lines) == 0:
-            # degenerate fallback: one fake line of just BOS BOS to avoid crashes
-            self.lines = [torch.tensor([bos_id, bos_id], dtype=torch.long)]
-
-        # Precompute eligible lines (len >= W+1 so we can form x and y of length W)
-        self._refresh_eligible()
+        self.dataset = dataset
+        self.lines: List[torch.Tensor] = []
+        if dataset is None:
+            self.lines = [torch.tensor(line, dtype=torch.long) for line in (lines_enc or [])
+                          if len(line) >= 2]
+            if not self.lines:
+                # Degenerate fallback: a complete empty line, BOS -> EOS.
+                self.lines = [torch.tensor([bos_id, bos_id], dtype=torch.long)]
+        elif len(dataset.offsets) == 0:
+            raise ValueError("Line-mode TBPTT needs at least one non-empty indexed line")
 
         # Per-stream (line_idx, pos)
         self.line_idx = torch.zeros(self.B, dtype=torch.long)
         self.pos = torch.zeros(self.B, dtype=torch.long)
         self._init_streams()
 
-    def _refresh_eligible(self):
-        need = self.W + 1
-        self.eligible = [i for i, t in enumerate(self.lines) if t.numel() >= need]
-        if not self.eligible:
-            # If none satisfy current W, fall back to the longest line(s)
-            maxL = max(t.numel() for t in self.lines)
-            self.eligible = [i for i, t in enumerate(self.lines) if t.numel() == maxL]
-            # and clamp W to maxL-1 to ensure windows exist
-            self.W = max(1, maxL - 1)
+        # An epoch in line mode means one pass over *tokens*, not one TBPTT
+        # window per line.  The old training loop used ``num_lines / batch``
+        # steps, which processes only the first window of an average line per
+        # epoch.  For a 512-token line and a 64-token TBPTT window this made an
+        # RNN receive roughly one eighth as much training signal as models that
+        # train on whole lines.
+        self.total_transitions = sum(
+            max(0, self._get_line(i).numel() - 1)
+            for i in range(len(self.dataset.offsets) if self.dataset is not None else len(self.lines))
+        )
 
     def _pick_line(self) -> int:
-        return random.choice(self.eligible)
+        return random.randrange(len(self.dataset.offsets)) if self.dataset is not None \
+            else random.randrange(len(self.lines))
+
+    def _get_example(self, line_idx: int) -> Tuple[torch.Tensor, int]:
+        """Encoded line and its count of masked leading targets (seq2seq source)."""
+        if self.dataset is not None:
+            ids, masked = self.dataset.get_encoded_example(line_idx)
+            return torch.tensor(ids, dtype=torch.long), masked
+        return self.lines[line_idx], 0
+
+    def _get_line(self, line_idx: int) -> torch.Tensor:
+        return self._get_example(line_idx)[0]
 
     def _init_streams(self):
-        # All streams begin at BOS of a random eligible line
+        # All streams begin at BOS of a random line.
         for b in range(self.B):
             self.line_idx[b] = self._pick_line()
             self.pos[b] = 0
 
     def get_next(self, device):
         B = self.B; W = self.W
-        x = torch.empty(B, W, dtype=torch.long)
-        y = torch.empty(B, W, dtype=torch.long)
+        x = torch.full((B, W), self.pad_id, dtype=torch.long)
+        y = torch.full((B, W), self.pad_id, dtype=torch.long)
         reset = torch.zeros(B, dtype=torch.bool)
 
         for b in range(B):
             li = int(self.line_idx[b].item())
-            line = self.lines[li]
+            line, masked = self._get_example(li)
             L = line.numel()
             p = int(self.pos[b].item())
 
-            # If we can't take a full W+1 from current position, reset to BOS of a new line
-            if p + W >= L:
+            # The previous call consumed this line's final transition. Start a
+            # fresh line now, resetting recurrent state before its BOS token.
+            if p >= L - 1:
                 li = self._pick_line()
-                line = self.lines[li]; L = line.numel()
+                line, masked = self._get_example(li); L = line.numel()
                 p = 0
                 self.line_idx[b] = li
                 self.pos[b] = 0
                 reset[b] = True
 
-            # Slice window
-            x[b] = line[p : p + W]
-            y[b] = line[p + 1 : p + W + 1]
+            # Keep the final short chunk and pad it. In particular, EOS is a
+            # valid target even when it falls before a full TBPTT window.
+            n = min(W, L - p - 1)
+            x[b, :n] = line[p : p + n]
+            y[b, :n] = line[p + 1 : p + n + 1]
+            # Seq2seq source targets (line positions < masked) carry no loss.
+            if masked > p:
+                y[b, :min(n, masked - p)] = self.pad_id
 
             # Advance
-            self.pos[b] = p + W
+            self.pos[b] = p + n
 
         return x.to(device), y.to(device), reset.to(device)
 
@@ -955,19 +1211,31 @@ class MemmapClassicDataset:
     def __init__(self, txt_path: str, vocab: BaseVocab, seq_len: int, split_range=(0.0, 1.0)):
         self.seq_len = seq_len
         self.vocab = vocab
-        self.bin_path = str(pathlib.Path(txt_path).with_suffix(".bin"))
+        src_path = pathlib.Path(txt_path)
+        self.bin_path = str(src_path.with_name(f"{src_path.stem}.{self._cache_signature(vocab)}.bin"))
         
-        if not os.path.exists(self.bin_path):
+        cache_is_stale = (
+            os.path.exists(self.bin_path)
+            and os.path.getmtime(self.bin_path) < os.path.getmtime(txt_path)
+        )
+        if not os.path.exists(self.bin_path) or cache_is_stale:
+            if cache_is_stale:
+                print(f"[Dataset] Source changed; rebuilding {self.bin_path} ...")
             print(f"[Dataset] Pre-tokenizing {txt_path} -> {self.bin_path} ...")
             self._tokenize_and_save(txt_path)
         else:
             print(f"[Dataset] Found existing {self.bin_path}, loading...")
 
-        self.dtype = np.uint16 if vocab.size < 65535 else np.int32
+        self.dtype = np.uint16 if vocab.size <= 65536 else np.int32
         self.full_data = np.memmap(self.bin_path, dtype=self.dtype, mode='r')
         
         # === NEW: Slice the memmap logically ===
         total_len = len(self.full_data)
+        if total_len < self.seq_len + 1:
+            raise ValueError(
+                f"Dataset has only {total_len} tokens, but seq_len={self.seq_len} "
+                "requires at least seq_len + 1 tokens."
+            )
         start_pct, end_pct = split_range
         self.start_idx = int(start_pct * total_len)
         self.end_idx = int(end_pct * total_len)
@@ -980,19 +1248,46 @@ class MemmapClassicDataset:
             
         print(f"[Dataset] Loaded segment {split_range} ({readable_num(self.end_idx - self.start_idx)} tokens).")
 
+    @staticmethod
+    def _cache_signature(vocab: BaseVocab) -> str:
+        payload = {
+            "class": vocab.__class__.__name__,
+            "size": int(vocab.size),
+            "line_mode": bool(getattr(vocab, "line_mode", False)),
+            "bos_id": getattr(vocab, "bos_id", None),
+            "eos_id": getattr(vocab, "eos_id", None),
+            "pad_id": getattr(vocab, "pad_id", None),
+        }
+        if isinstance(vocab, TiktokenVocab):
+            payload["encoding"] = getattr(vocab.enc, "name", None)
+            payload["n_base"] = vocab.n_base
+        elif isinstance(vocab, CustomBPEVocab):
+            payload["vocab_path"] = getattr(vocab, "vocab_path", "")
+            payload["merges"] = sorted((str(k), v) for k, v in vocab.merges.items())
+        elif hasattr(vocab, "tokens"):
+            payload["tokens"] = list(getattr(vocab, "tokens"))
+        raw = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        return "tok-" + hashlib.sha256(raw).hexdigest()[:12]
+
     # ... (keep _tokenize_and_save exactly as it was) ...
     def _tokenize_and_save(self, txt_path):
         # [Use your existing code here, no changes needed]
         # Just ensure you copy the method from your file into this class
-        dtype = np.uint16 if self.vocab.size < 65535 else np.int32
+        dtype = np.uint16 if self.vocab.size <= 65536 else np.int32
         file_size = os.path.getsize(txt_path)
         temp_path = self.bin_path + ".tmp"
         CHUNK_SIZE = 1024 * 1024 
         
+        # Byte and binary tokenizers must receive the original bytes.  Reading
+        # through UTF-8 with ``errors='ignore'`` silently dropped arbitrary
+        # binary data before it ever reached ByteVocab.
+        raw_input = isinstance(self.vocab, (ByteVocab, BinaryVocab))
+        input_kwargs = {} if raw_input else {"encoding": "utf-8", "errors": "ignore"}
+        empty_buffer = b"" if raw_input else ""
         with open(temp_path, "wb") as f_out:
-            with open(txt_path, "r", encoding="utf-8", errors="ignore") as f_in:
+            with open(txt_path, "rb" if raw_input else "r", **input_kwargs) as f_in:
                 with tqdm(total=file_size, unit="B", unit_scale=True, desc="Tokenizing") as pbar:
-                    buffer = ""
+                    buffer = empty_buffer
                     while True:
                         chunk = f_in.read(CHUNK_SIZE)
                         if not chunk:
@@ -1001,7 +1296,7 @@ class MemmapClassicDataset:
                                 f_out.write(np.array(ids, dtype=dtype).tobytes())
                             break
                         buffer += chunk
-                        pbar.update(len(chunk.encode('utf-8')))
+                        pbar.update(len(chunk) if raw_input else len(chunk.encode('utf-8')))
                         
                         if hasattr(self.vocab, "enc") or isinstance(self.vocab, TiktokenVocab): 
                             last_nl = buffer.rfind('\n')
@@ -1013,11 +1308,11 @@ class MemmapClassicDataset:
                             elif len(buffer) > 10 * CHUNK_SIZE:
                                 ids = self.vocab.encode(buffer)
                                 f_out.write(np.array(ids, dtype=dtype).tobytes())
-                                buffer = ""
+                                buffer = empty_buffer
                         else:
                             ids = self.vocab.encode(buffer)
                             f_out.write(np.array(ids, dtype=dtype).tobytes())
-                            buffer = ""
+                            buffer = empty_buffer
 
         if os.path.exists(self.bin_path): os.remove(self.bin_path)
         os.rename(temp_path, self.bin_path)
@@ -1049,19 +1344,22 @@ class MemmapClassicDataset:
     
     @property
     def ids(self):
-        # Return only the slice if requested via property (for TBPTT)
-        # Fix: Cast to int64 because torch.from_numpy doesn't support uint16
-        chunk = self.full_data[self.start_idx : self.end_idx]
-        return torch.from_numpy(chunk.astype(np.int64))
+        # Return only the slice if requested via property (for TBPTT).
+        # This stays a memmap view: converting the whole split to int64 here
+        # would load it into RAM at 8 bytes per token.  TBPTTClassicStream
+        # converts one window at a time instead.
+        return self.full_data[self.start_idx : self.end_idx]
 
 class IndexedLineDataset:
     """
     Efficient Line-based dataset that indexes file offsets instead of loading lines.
     Allows random access to 10GB+ line-based files with minimal RAM.
     """
-    def __init__(self, txt_path: str, vocab: BaseVocab):
+    def __init__(self, txt_path: str, vocab: BaseVocab, seq2seq_inputs: int = 0):
         self.path = txt_path
         self.vocab = vocab
+        # >0: lines are prepared seq2seq examples with this many input columns.
+        self.seq2seq_inputs = int(seq2seq_inputs)
         # FIX: Explicitly add .npy so numpy doesn't silently append it later
         self.index_path = str(pathlib.Path(txt_path).with_suffix(".idx.npy"))
         
@@ -1071,7 +1369,9 @@ class IndexedLineDataset:
         else:
             print(f"[Dataset] Loading line index {self.index_path} ...")
         
-        self.offsets = np.load(self.index_path) 
+        self.offsets = np.load(self.index_path)
+        if len(self.offsets) == 0:
+            raise ValueError("Line-mode dataset contains no non-empty lines.")
         print(f"[Dataset] Indexed {readable_num(len(self.offsets))} lines.")
         self.max_len = int(np.max(self.offsets[:, 1])) if len(self.offsets) > 0 else 0
         self.f = open(self.path, "rb")
@@ -1108,36 +1408,30 @@ class IndexedLineDataset:
 
     def get_batch(self, batch_size: int):
         idx = np.random.randint(0, len(self.offsets), size=batch_size)
-        batch_tokens = []
-        max_batch_len = 0
-        
-        for i in idx:
-            off, length = self.offsets[i]
-            self.f.seek(off)
-            line_bytes = self.f.read(length)
-            
-            if isinstance(self.vocab, ByteVocab):
-                line_content = line_bytes.rstrip(b'\n\r')
-                enc = self.vocab.encode(line_content)
-            else:
-                line_content = line_bytes.decode("utf-8", "ignore").rstrip('\n\r')
-                enc = self.vocab.encode(line_content)
-                
-            batch_tokens.append(enc)
-            max_batch_len = max(max_batch_len, len(enc))
-            
+        examples = [self.get_encoded_example(int(i)) for i in idx]
         pad_id = self.vocab.pad_id if self.vocab.pad_id is not None else 0
-        x_tensor = torch.full((batch_size, max_batch_len - 1), pad_id, dtype=torch.long)
-        y_tensor = torch.full((batch_size, max_batch_len - 1), pad_id, dtype=torch.long)
-        
-        for i, seq in enumerate(batch_tokens):
-            if len(seq) < 2: continue 
-            seq_t = torch.tensor(seq, dtype=torch.long)
-            l = len(seq) - 1
-            x_tensor[i, :l] = seq_t[:-1]
-            y_tensor[i, :l] = seq_t[1:]
-            
-        return x_tensor.to(DEVICE), y_tensor.to(DEVICE)
+        return pad_line_examples(examples, pad_id)
+
+    def get_encoded_example(self, index: int) -> Tuple[List[int], int]:
+        """Encoded line (with BOS/EOS) and how many leading targets to mask.
+
+        The mask count is the seq2seq source length, or 0 for ordinary lines.
+        """
+        off, length = self.offsets[index]
+        self.f.seek(int(off))
+        line_bytes = self.f.read(int(length))
+
+        if isinstance(self.vocab, (ByteVocab, BinaryVocab)):
+            line = line_bytes.rstrip(b'\n\r')
+        else:
+            line = line_bytes.decode("utf-8", "ignore").rstrip('\n\r')
+        if self.seq2seq_inputs:
+            return encode_seq2seq_line(self.vocab, line, self.seq2seq_inputs)
+        return self.vocab.encode(line), 0
+
+    def get_encoded_line(self, index: int) -> List[int]:
+        """Read and encode one indexed line, including its BOS/EOS markers."""
+        return self.get_encoded_example(index)[0]
         
     def close(self):
         self.f.close()
@@ -1146,84 +1440,43 @@ class IndexedLineDatasetSubset(IndexedLineDataset):
     def __init__(self, parent: IndexedLineDataset, indices: np.ndarray):
         self.path = parent.path
         self.vocab = parent.vocab
-        self.f = open(self.path, "rb") 
+        self.seq2seq_inputs = parent.seq2seq_inputs
+        self.f = open(self.path, "rb")
         self.offsets = parent.offsets[indices]
         self.max_len = parent.max_len
 
 
 
-# ========= Model selection menu (with separators) =========
-MODEL_MENU = """
-# ==== MLPs ====
-0 - MLP (basic)
-1 - MLP (residual)
-
-# ==== RNNs ====
-2 - RNN (tanh)
-3 - RNNReLU
-4 - GRU
-5 - LSTM
-6 - IndRNN
-7 - IndyGRU
-8 - ATanULSTM
-18 - JANET (forget-gate LSTM)
-23 - Liquid Neural Network (LTC)
-
-# ==== Non-recurrents ====
-9  - Temporal ConvNet
-10 - GPT transformer
-19 - HyperMixer
-21 - gMLP
-22 - aMLP
-24 - MLPMixer (Causal)
-25 - Modern Transformer (Llama3-style)
-31 - MEGABYTE
-34 - KAN-Transformer (Chebyshev)
-
-# ==== xLSTM ====
-11 - xLSTM (sLSTM only)
-12 - xLSTM (mLSTM only)
-13 - xLSTM (mixed m:s)
-
-# ==== Space State Machines / Linear Recurrence ====
-14 - Mamba (selective scan)
-15 - minGRU (scan)
-16 - minLSTM (scan)
-17 - RWKV (scan)
-20 - GateLoop (scan)
-26 - MinRNN (scan - Multi-Act)
-27 - Griffin (RG-LRU)
-28 - DeltaNet
-29 - RetNet
-30 - HGRN
-32 - MinIndRNN (scan)
-33 - MinJANET (scan)
-35 - Linear Transformer (Recurrent)
-36 - H3 (Hungry Hungry Hippos)
-37 - DCT-Former
-38 - MinIndyGRU (scan)
-39 - MinIndyLSTM (scan)
-"""
-
 # Update set of Scan models
 ACT_MENU = activation_menu_text()
 ACT_NAMES = activation_names()
 
-RNN_MODEL_IDS = {2,3,4,5,6,7,8,11,12,13,14,15,16,17,18,20,23,26,27,28,29,30,32,33,35,36,38,39}
-# Add 35 and 36 to this set
-SCAN_MODEL_IDS = {14, 15, 16, 17, 20, 26, 27, 28, 29, 30, 32, 33, 35, 36, 38, 39}
-# Models that actually use head_count (attention heads or xLSTM heads)
-ATTN_MODEL_IDS = {10, 11, 12, 13, 19, 25, 29}
+ACTIVATION_DESCRIPTIONS = {
+    "relu": "Fast, sparse positive activations",
+    "gelu": "Transformer default; smooth Gaussian gate",
+    "silu": "Smooth swish / sigmoid-weighted linear unit",
+    "mish": "Smooth self-regularising activation",
+    "swiglu": "SiLU-gated feed-forward block",
+    "geglu": "GELU-gated feed-forward block",
+    "miglu": "Mish-gated feed-forward block",
+    "tanh": "Bounded symmetric activation",
+    "sigmoid": "Bounded 0–1 activation",
+    "elu": "Smooth negative branch",
+    "lrelu": "Leaky ReLU (slope 0.2)",
+    "leaky_relu": "Leaky ReLU (default slope)",
+    "linear": "No non-linearity",
+}
 class TBPTTClassicStream:
     """
     Streaming TBPTT over a single long 1D tensor `ids`.
     Guarantees every (x,y) window has length exactly W, by choosing starts that have >= W+1 tokens left.
     One stream (b=0) always starts at position 0.
     """
-    def __init__(self, ids: torch.Tensor, window: int, batch_size: int, total_len: int):
-        assert ids.dim() == 1, "ids must be 1D"
+    def __init__(self, ids, window: int, batch_size: int, total_len: int):
+        # ``ids`` is a 1D torch tensor or a (memmap-backed) NumPy array.
+        assert ids.ndim == 1, "ids must be 1D"
         self.ids = ids
-        self.N = ids.numel()
+        self.N = len(ids)
         self.W = max(1, int(window))
         self.B = int(batch_size)
         self.total_len = max(0, int(total_len))
@@ -1299,8 +1552,11 @@ class TBPTTClassicStream:
                 reset[b] = True
 
             # Now guaranteed: e - p >= need
-            x[b] = self.ids[p : p + W]
-            y[b] = self.ids[p + 1 : p + W + 1]
+            window = self.ids[p : p + W + 1]
+            if not torch.is_tensor(window):
+                window = torch.from_numpy(np.asarray(window, dtype=np.int64))
+            x[b] = window[:-1]
+            y[b] = window[1:]
             self.pos[b] = p + W
 
             # If we exactly hit the boundary, next step will have to reset
@@ -1336,16 +1592,12 @@ def reset_rnn_state(state, reset_mask, model, msel):
 
     # --- CustomRNNWrapper with IndRNN/IndyGRU/JANET/LiquidRNN/ExtATanULSTM ---
     if isinstance(model, CustomRNNWrapper):
-        core = model.rnn
-        # ExtATanULSTM returns (hn, cn) tuple of (num_layers, B, H)
-        if isinstance(core, ExtATanULSTM):
-            hn, cn = state
-            hn[:, reset_mask, :] = 0
-            cn[:, reset_mask, :] = 0
-            return (hn, cn)
-        # IndRNN, IndyGRU, JANET, LiquidRNN all return stacked (num_layers, B, H)
-        if state is not None:
-            state[:, reset_mask, :] = 0
+        # Every custom cell packs its state as (num_layers, B, H) tensors, or a
+        # tuple of them for two-state cells (LSTM-style (h, c), UnICORNN (y, z)).
+        if state is None:
+            return None
+        for part in (state if isinstance(state, tuple) else (state,)):
+            part[:, reset_mask, :] = 0
         return state
 
     # --- xLSTM: list of dict states (per block) ---
@@ -1429,23 +1681,157 @@ def detach_state(state):
     return state
 
 def build_model(cfg, vocab_size):
+    normalize_model_config(cfg)
     msel = cfg["model_selection"]
+    try:
+        spec = MODEL_SPECS[msel]
+    except KeyError as exc:
+        raise ValueError(f"Bad model selection: {msel}") from exc
+    if spec.factory_key != msel:
+        raise RuntimeError(f"Model registry factory mismatch for selection {msel}")
     embed = cfg["embed_dim"]
     layers = cfg["layer_count"]
     seq_len = cfg["seq_len"]
     heads = cfg.get("head_count", 4)
+    if cfg["model_type"] in {MODEL_TYPE_MEGABYTE, MODEL_TYPE_MEGABYTE_BOTTOM_UP}:
+        stage_mixer = (
+            cfg.get("_legacy_megabyte_mixer")
+            or cfg.get("megabyte_stage_mixers")
+            or HIERARCHICAL_MODEL_MIXERS.get(msel)
+        )
+        if stage_mixer is None:
+            raise ValueError(
+                f"model selection {msel} ({spec.name}) has no MEGABYTE stage adapter"
+            )
+        stage_dims = cfg.get("megabyte_stage_dims")
+        stage_depths = cfg.get("megabyte_stage_depths")
+        stage_heads = cfg.get("megabyte_stage_heads")
+        stage_seq_lens = cfg.get("megabyte_stage_seq_lens")
+        stage_child_embed_dims = cfg.get("megabyte_stage_child_embed_dims")
+        if stage_child_embed_dims is None:
+            raise ValueError(
+                "This MEGABYTE configuration predates bounded child embeddings and its checkpoint "
+                "cannot be loaded safely. Start a new training run."
+            )
+        if not all(value is not None for value in (stage_dims, stage_depths, stage_heads, stage_seq_lens)):
+            raise ValueError(
+                "This MEGABYTE configuration is missing its per-stage topology. Start a new training run."
+            )
+        if cfg["model_type"] == MODEL_TYPE_MEGABYTE_BOTTOM_UP and cfg.get("megabyte_bottom_up_version") != 6:
+            raise ValueError(
+                "This bottom-up MEGABYTE checkpoint predates gated direct parent-context version 6 and "
+                "cannot be loaded safely. Start a new training run."
+            )
+        selected_stage_mixers = (
+            (stage_mixer,) if isinstance(stage_mixer, (str, int)) else tuple(stage_mixer)
+        )
+        for config_key in (
+            "megabyte_bottom_up_encoder_stage_mixers",
+            "megabyte_bottom_up_decoder_stage_mixers",
+        ):
+            mixers = cfg.get(config_key, ())
+            selected_stage_mixers += (mixers,) if isinstance(mixers, (str, int)) else tuple(mixers)
+        uses_builtin_rnn_stage = any(
+            resolve_megabyte_stage_mixer(mixer) in {"rnn", "rnn_relu", "gru", "lstm"}
+            for mixer in selected_stage_mixers
+        )
+        if uses_builtin_rnn_stage and cfg.get("megabyte_fused_rnn_version") != 2:
+            raise ValueError(
+                "This MEGABYTE RNN checkpoint predates parent-conditioned stage-state wiring "
+                "and cannot be loaded safely. Start a new training run."
+            )
+        return MegaByteLM(
+            vocab_size,
+            stage_dims=stage_dims,
+            stage_depths=stage_depths,
+            stage_heads=stage_heads,
+            stage_seq_lens=stage_seq_lens,
+            stage_child_embed_dims=stage_child_embed_dims,
+            stage_mixer=stage_mixer,
+            hierarchy_mode=(
+                "bottom_up" if cfg["model_type"] == MODEL_TYPE_MEGABYTE_BOTTOM_UP else "top_down"
+            ),
+            bottom_up_encoder_stage_mixer=cfg.get("megabyte_bottom_up_encoder_stage_mixers"),
+            bottom_up_decoder_stage_mixer=cfg.get("megabyte_bottom_up_decoder_stage_mixers"),
+            fused_rnn_norm_type=int(cfg.get("megabyte_fused_rnn_norm_type", 0)),
+            fused_rnn_res_every=int(cfg.get("megabyte_fused_rnn_res_every", 0)),
+            fused_rnn_res_type=int(cfg.get("megabyte_fused_rnn_res_type", 0)),
+            fused_rnn_dropout=float(cfg.get("megabyte_fused_rnn_dropout", 0.0)),
+        ).to(DEVICE)
     RNN_MAP = {
-        6: "indrnn",
-        7: "indygru",
-        18: "janet",
-        8: "atanulstm"
+        509: "indrnn",
+        513: "indygru",
+        510: "janet",
+        502: "atanulstm",
+        601: "liquid",
+        515: "mogrifier_lstm",
+        506: "irnn",
+        602: "unicornn",
+        514: "indylstm",
+        519: "lru",
+        518: "rru",
+        516: "mogrifier_gru",
+        511: "exprnn",
+        507: "ugrnn",
     }
     if msel in RNN_MAP:
         cell_type_str = RNN_MAP[msel]
-        # Ensure vocab_size and embed are passed correctly
-        return CustomRNNWrapper(cell_type_str, vocab_size, embed, cfg["layer_count"]).to(DEVICE)
+        opts = cfg.get("rnn_cell_options", {})
+        cell_kwargs = {
+            "indrnn": {"activation": opts.get("indrnn_activation", "relu")},
+            "indygru": {"relu_gates": bool(opts.get("relu_gates", False))},
+            "indylstm": {"relu_gates": bool(opts.get("relu_gates", False))},
+            "mogrifier_lstm": {"rounds": int(opts.get("mogrifier_rounds", 5))},
+            "mogrifier_gru": {"rounds": int(opts.get("mogrifier_rounds", 5))},
+            "unicornn": {"dt": float(opts.get("unicornn_dt", 0.1)), "alpha": float(opts.get("unicornn_alpha", 10.0))},
+            "lru": {"highway": bool(opts.get("lru_highway", False))},
+            "rru": {"middle_multiplier": float(opts.get("rru_middle_multiplier", 2.0)),
+                    "dropout": float(opts.get("rru_dropout", 0.0))},
+        }.get(cell_type_str, {})
+        depth_options = {
+            "use_norm": int(cfg.get("use_norm", 0)), "res_every": int(cfg.get("res_every", 0)),
+            "res_type": int(cfg.get("res_type", 0)), "dropout": float(cfg.get("dropout", 0.0)),
+            "use_multiplier": int(cfg.get("use_multiplier", 0)), "ffn": int(cfg.get("rnn_ffn", 0)),
+        }
+        return CustomRNNWrapper(cell_type_str, vocab_size, embed, cfg["layer_count"],
+                                depth_options=depth_options, **cell_kwargs).to(DEVICE)
+    if msel == 1009:  # Mamba-3
+        return Mamba3LM(vocab_size, embed, layers).to(DEVICE)
+    if msel == 1010:  # Mamba-3 MIMO
+        return Mamba3LM(vocab_size, embed, layers, mimo_rank=int(cfg.get("mamba3_mimo_rank", 4))).to(DEVICE)
+    if msel in (907, 908):  # ParaGRU / ParaLSTM (ParaRNN)
+        return ParaRNNLM(vocab_size, embed, layers, kind="gru" if msel == 907 else "lstm",
+                         newton_iters=int(cfg.get("pararnn_newton_iters", 3))).to(DEVICE)
+    if msel == 520:  # M2RNN
+        return M2RNNLM(vocab_size, embed, layers).to(DEVICE)
+    if msel == 300:  # Original Transformer (Vaswani et al., 2017)
+        return OriginalTransformerLM(
+            vocab_size, embed, layers, heads, seq_len,
+            act_name=cfg.get("activation_name", "relu"), dropout=float(cfg.get("dropout", 0.1)),
+        ).to(DEVICE)
+    if msel == 306:  # Trinity-style 2026 Transformer
+        return TrinityTransformerLM(
+            vocab_size, embed, layers, heads, seq_len,
+            window=cfg.get("swa_window"), act_name=cfg.get("activation_name", "swiglu"),
+        ).to(DEVICE)
+    if msel == 517:  # SRU++
+        return SRUppLM(vocab_size, embed, layers, max_cache=max(1, int(seq_len))).to(DEVICE)
 
-    if msel == 0:
+    if msel == 505:
+        return QRNNLM(vocab_size, embed, layers, kernel_size=int(cfg.get("qrnn_kernel_size", 2))).to(DEVICE)
+    if msel == 508:
+        return SRULM(vocab_size, embed, layers).to(DEVICE)
+    if msel == 302:
+        return SwitchMoELM(
+            vocab_size, embed, layers, heads, seq_len,
+            n_experts=int(cfg.get("moe_num_experts", 4)),
+            ff_mult=int(cfg.get("ff_mult", 4)),
+            dropout=float(cfg.get("dropout", 0.0)),
+        ).to(DEVICE)
+    if msel == 1201:
+        return JambaLiteLM(vocab_size, embed, layers, heads).to(DEVICE)
+
+    if msel == 1:
         # Basic MLP now uses rolling one-hot window input (MLPOG-style), needs seq_len
         return OneHotWindowMLPClassifier(
             vocab_size=vocab_size,
@@ -1455,10 +1841,10 @@ def build_model(cfg, vocab_size):
             act_name=cfg["activation_name"]
         ).to(DEVICE)
 
-    if msel == 1:
+    if msel == 5:
         return ResidualMLPClassifier(vocab_size, embed, layers, cfg["activation_name"]).to(DEVICE)
 
-    if msel == 2:
+    if msel == 500:
         return BuiltinRNNWrapper(
             vocab_size, embed, layers, 'rnn_tanh',
             tie_weights=bool(cfg.get("tie_weights", True)),
@@ -1469,7 +1855,7 @@ def build_model(cfg, vocab_size):
             use_multiplier=int(cfg.get("use_multiplier", 0))
         ).to(DEVICE)
 
-    if msel == 3:
+    if msel == 504:
         return BuiltinRNNWrapper(
             vocab_size, embed, layers, 'rnn_relu',
             tie_weights=bool(cfg.get("tie_weights", True)),
@@ -1480,7 +1866,7 @@ def build_model(cfg, vocab_size):
             use_multiplier=int(cfg.get("use_multiplier", 0))
         ).to(DEVICE)
 
-    if msel == 4:
+    if msel == 503:
         return BuiltinRNNWrapper(
             vocab_size, embed, layers, 'gru',
             tie_weights=bool(cfg.get("tie_weights", True)),
@@ -1491,7 +1877,7 @@ def build_model(cfg, vocab_size):
             use_multiplier=int(cfg.get("use_multiplier", 0))
         ).to(DEVICE)
 
-    if msel == 5:
+    if msel == 501:
         return BuiltinRNNWrapper(
             vocab_size, embed, layers, 'lstm',
             tie_weights=bool(cfg.get("tie_weights", True)),
@@ -1502,9 +1888,25 @@ def build_model(cfg, vocab_size):
             use_multiplier=int(cfg.get("use_multiplier", 0))
         ).to(DEVICE)
 
-    if msel == 9:
+    if msel == 102:
         return TemporalConvNet(vocab_size, embed, layers, act_name=cfg["activation_name"], k=3).to(DEVICE)
-    if msel == 10:
+    if msel in (101, 100):
+        return AutoregressiveConvLM(vocab_size, embed, layers, "wavenet" if msel == 101 else "pixelcnn").to(DEVICE)
+    if msel == 104:
+        return HyenaLM(vocab_size, embed, layers, seq_len).to(DEVICE)
+    if msel == 103:
+        return CausalConvNeXtLM(vocab_size, embed, layers).to(DEVICE)
+    if msel == 208:
+        return ToeplitzMLPMixerLM(vocab_size, embed, layers, seq_len).to(DEVICE)
+    if msel == 209:
+        return GrassmannMixerLM(vocab_size, embed, layers).to(DEVICE)
+    if msel == 2:
+        return NeuralNGramLM(vocab_size, embed, layers, int(cfg.get("ngram_context", 4))).to(DEVICE)
+    if msel == 0:
+        return MarkovBigramLM(vocab_size).to(DEVICE)
+    if msel in (3, 4):
+        return MaskedAutoregressiveMLP(vocab_size, embed, layers, seq_len, "nade" if msel == 3 else "made").to(DEVICE)
+    if msel == 301:
         # GPT-2 style decoder-only LM
         cfg_gpt2 = GPT2Config(
             vocab_size=vocab_size,
@@ -1521,31 +1923,26 @@ def build_model(cfg, vocab_size):
         )
         act_name = cfg.get("activation_name", "gelu")
         return GPT2ForLM(cfg_gpt2, act_name=act_name).to(DEVICE)
-    if msel in (11,12,13):
+    if msel in (800, 801, 802):
         # Heads = cfg['head_count']; act = cfg['activation_name']
         # Mixed ratio (a:b) taken from cfg or defaults to 7:1
         a = int(cfg.get("xlstm_m_blocks", 7))
         b = int(cfg.get("xlstm_s_blocks", 1))
-        kind = "s" if msel==11 else ("m" if msel==12 else "mix")
-        return XlstmLM(
-            vocab_size=vocab_size,
-            dim=embed,
-            n_blocks=layers,
-            num_heads=heads,
-            act_name=cfg["activation_name"],
-            kind=kind,
-            m_to_s=(a,b),
-            up_mult_m=cfg.get("xlstm_m_up_mult", 2.0),
-        ).to(DEVICE)
-    if msel == 14:  # Mamba (selective scan)
+        kind = "s" if msel == 800 else ("m" if msel == 801 else "mix")
+        # Paper-faithful xLSTM blocks (NX-AI xlstm): mLSTM blocks with sLSTM
+        # blocks interleaved at the a:b ratio (xLSTM[7:1] by default).
+        return XLSTMFullLM(vocab_size, embed, layers, num_heads=heads, kind=kind, m_to_s=(a, b)).to(DEVICE)
+    if msel == 1006:  # Mamba (selective scan)
         return ScanLM(
             vocab_size=vocab_size,
             dim=embed,
             kind="mamba",
             n_blocks=cfg["layer_count"],
         ).to(DEVICE)
+    if msel == 1007:  # Mamba selective SSM
+        return ScanLM(vocab_size, embed, kind="mamba_ssm", n_blocks=layers).to(DEVICE)
 
-    if msel == 15:  # minGRU (scan)
+    if msel == 900:  # minGRU (scan)
         return ScanLM(
             vocab_size=vocab_size,
             dim=embed,
@@ -1553,21 +1950,21 @@ def build_model(cfg, vocab_size):
             n_blocks=cfg["layer_count"],
         ).to(DEVICE)
 
-    if msel == 16:  # minLSTM (scan)
+    if msel == 901:  # minLSTM (scan)
         return ScanLM(
             vocab_size=vocab_size,
             dim=embed,
             kind="minlstm",
             n_blocks=cfg["layer_count"],
         ).to(DEVICE)
-    if msel == 17:  # RWKV (scan)
+    if msel == 1102:  # RWKV (scan)
         return ScanLM(
             vocab_size=vocab_size,
             dim=embed,
             kind="rwkv",
             n_blocks=cfg["layer_count"],
         ).to(DEVICE)
-    if msel == 19:
+    if msel == 207:
         return HyperMixerLM(
             vocab_size=vocab_size,
             d_model=embed,
@@ -1581,81 +1978,127 @@ def build_model(cfg, vocab_size):
             n_heads=int(cfg.get("head_count", 4)),
             causal=bool(cfg.get("causal", True)),
         ).to(DEVICE)
-    if msel == 20:  # GateLoop (scan)
+    if msel == 1104:  # GateLoop (scan)
         return ScanLM(
             vocab_size=vocab_size,
             dim=embed,
             kind="gateloop",
             n_blocks=cfg["layer_count"],
         ).to(DEVICE)
-    if msel == 21:  # gMLP
-        return gMLPLanguageModel(vocab_size, embed, layers, embed*4, seq_len).to(DEVICE)
-    if msel == 22:  # aMLP
-        return aMLPLanguageModel(vocab_size, embed, layers, embed*4, seq_len, d_attn=64).to(DEVICE)
-    if msel == 23: # Liquid
-        return CustomRNNWrapper("liquid", vocab_size, embed, layers).to(DEVICE)
+    if msel == 200:  # gMLP
+        return gMLPLanguageModel(vocab_size, embed, layers, embed*4, seq_len, act_name=cfg["activation_name"]).to(DEVICE)
+    if msel == 201:  # aMLP
+        return aMLPLanguageModel(vocab_size, embed, layers, embed*4, seq_len, d_attn=64, act_name=cfg["activation_name"]).to(DEVICE)
 
-    if msel == 24: # Causal MLPMixer
-        return CausalMLPMixer(vocab_size, embed, layers, seq_len).to(DEVICE)
+    if msel == 202: # Causal MLPMixer
+        return CausalMLPMixer(vocab_size, embed, layers, seq_len, act_name=cfg["activation_name"]).to(DEVICE)
     
-    if msel == 25: # Modern Transformer
-        return ModernTransformer(vocab_size, embed, layers, heads).to(DEVICE)
-    if msel == 27: # Griffin
+    if msel == 304: # Modern Transformer
+        return ModernTransformer(vocab_size, embed, layers, heads, act_name=cfg["activation_name"]).to(DEVICE)
+    if msel == 409:
+        return SparseModernTransformerLM(
+            vocab_size, embed, layers, heads, seq_len,
+            local_window=int(cfg.get("sparse_local_window", min(512, max(1, seq_len)))),
+            compression_block=int(cfg.get("sparse_compression_block", 32)),
+            selected_blocks=int(cfg.get("sparse_selected_blocks", 16)),
+            act_name=cfg.get("activation_name", "swiglu"),
+        ).to(DEVICE)
+    if msel == 1200: # Griffin
         return GriffinLM(vocab_size, embed, layers).to(DEVICE)
 
-    if msel == 28: # DeltaNet
-        return DeltaNetLM(vocab_size, embed, layers).to(DEVICE)
+    if msel == 1101: # DeltaNet (fla-faithful)
+        return LinearRecurrentLM(vocab_size, embed, layers, "deltanet").to(DEVICE)
 
-    if msel == 29: # RetNet
-        return RetNetLM(vocab_size, embed, layers, heads).to(DEVICE)
+    if msel == 1103: # RetNet (multi-scale retention, fla-faithful)
+        return LinearRecurrentLM(vocab_size, embed, layers, "retnet").to(DEVICE)
 
-    if msel == 30: # HGRN
+    if msel == 1105: # HGRN
         return HGRN_LM(vocab_size, embed, layers).to(DEVICE)
         
-    if msel == 31: # MEGABYTE
-        return MegaByteLM(vocab_size, embed, layers, patch_size=4).to(DEVICE)
-    if msel == 26: # MinRNN (Generalized)
+    if msel == 902: # MinRNN (Generalized)
         return ScanLM(vocab_size, embed, kind="minrnn", n_blocks=layers, minrnn_act=cfg.get("minrnn_act", 0)).to(DEVICE)
 
-    if msel == 32: # MinIndRNN
+    if msel == 903: # MinIndRNN
         return ScanLM(vocab_size, embed, kind="minindrnn", n_blocks=layers, minrnn_act=cfg.get("minrnn_act", 0)).to(DEVICE)
 
-    if msel == 33: # MinJANET
+    if msel == 904: # MinJANET
         return ScanLM(vocab_size, embed, kind="minjanet", n_blocks=layers).to(DEVICE)
 
-    if msel == 34: # KAN-Transformer
-        return KAN_LM(vocab_size, embed, layers).to(DEVICE)
+    if msel == 305: # KAN-Transformer
+        return KAN_LM(vocab_size, embed, layers, n_heads=heads, act_name=cfg["activation_name"]).to(DEVICE)
 
-    if msel == 35: # Linear Transformer
+    if msel == 1100: # Linear Transformer
         return LinearTransformerLM(vocab_size, embed, layers).to(DEVICE)
 
-    if msel == 36: # H3
+    if msel == 1004: # H3
         return H3LM(vocab_size, embed, layers).to(DEVICE)
 
-    if msel == 37: # DCT-Former
-        return DCTFormerLM(vocab_size, embed, layers, seq_len).to(DEVICE)
+    if msel == 303: # DCT-Former
+        return DCTFormerLM(vocab_size, embed, layers, seq_len, act_name=cfg["activation_name"]).to(DEVICE)
     
-    if msel == 38: # MinIndyGRU
+    if msel == 905: # MinIndyGRU
         return ScanLM(vocab_size, embed, kind="minindygru", n_blocks=layers).to(DEVICE)
 
-    if msel == 39: # MinIndyLSTM
+    if msel == 906: # MinIndyLSTM
         return ScanLM(vocab_size, embed, kind="minindylstm", n_blocks=layers).to(DEVICE)
 
+    if msel == 407: # Recurrent Interface Model
+        return RecurrentInterfaceLM(
+            vocab_size,
+            embed,
+            layers,
+            dropout=float(cfg.get("dropout", 0.0)),
+            num_latents=int(cfg.get("rin_num_latents", 8)),
+            num_heads=int(cfg.get("rin_num_heads", cfg.get("head_count", 4))),
+        ).to(DEVICE)
 
-    raise ValueError("Bad model selection")
+    recurrent_kinds = {512: "nru", 600: "lmu", 603: "cfc"}
+    if msel in recurrent_kinds:
+        return StatefulCellLM(
+            vocab_size, embed, layers, recurrent_kinds[msel],
+            dropout=float(cfg.get("dropout", 0.0)), lmu_theta=seq_len,
+        ).to(DEVICE)
+
+    if msel == 1108:  # RWKV-7 "Goose"
+        return RWKV7LM(vocab_size, embed, layers).to(DEVICE)
+    modern_kinds = {1107: "gated_deltanet", 1008: "mamba2", 1106: "hgrn2"}
+    if msel in modern_kinds:
+        return LinearRecurrentLM(vocab_size, embed, layers, modern_kinds[msel]).to(DEVICE)
+    if msel == 400:
+        return TransformerXLLM(vocab_size, embed, layers, heads=heads, mem_len=int(cfg.get("txl_mem_len", 128))).to(DEVICE)
+    if msel == 408:
+        return TitansLM(vocab_size, embed, layers, heads=heads, memory_slots=int(cfg.get("titans_memory_slots", 32))).to(DEVICE)
+
+    ssm_kinds = {1000: "s4", 1002: "s4d", 1003: "s5", 1001: "dss", 1005: "lru"}
+    if msel in ssm_kinds:
+        return StructuredSSMLM(vocab_size, embed, layers, ssm_kinds[msel]).to(DEVICE)
+    memory_kinds = {401: "compressive", 406: "memorizing", 402: "knn", 405: "retro"}
+    if msel in memory_kinds:
+        return CausalMemoryLM(vocab_size, embed, layers, memory_kinds[msel]).to(DEVICE)
+    if msel in (403, 404):
+        return SparseCausalTransformerLM(vocab_size, embed, layers, heads, seq_len, "longformer" if msel == 403 else "bigbird").to(DEVICE)
+    if msel in (700, 701):
+        return LatentRecurrentLM(vocab_size, embed, layers, "vrnn" if msel == 700 else "srnn").to(DEVICE)
+
+    mlp_variants = {206: "pnlp", 205: "dyna", 204: "wave", 203: "ccs"}
+    if msel in mlp_variants:
+        return CausalMLPFamilyLM(vocab_size, embed, layers, seq_len, mlp_variants[msel], dropout=float(cfg.get("dropout", 0.0)), act_name=cfg["activation_name"]).to(DEVICE)
+
+
+    raise RuntimeError(f"Registered model {msel} has no construction branch")
 
 @torch.no_grad()
 def sample_step(logits, temperature=1.0, top_k=0, top_p=0.0,
                 repetition_penalty=1.0, last_tokens=None):
     """
     Advanced sampling with top-k, top-p (nucleus), and repetition penalty.
+    The penalty applies once to each distinct token in ``last_tokens``,
+    also for greedy decoding (temperature 0).
     """
-    if temperature <= 0: 
-        return torch.argmax(logits, dim=-1)
-    
     # Apply repetition penalty
     if repetition_penalty != 1.0 and last_tokens is not None and len(last_tokens) > 0:
-        penalty_ids = torch.tensor(last_tokens, dtype=torch.long, device=logits.device)
+        logits = logits.clone()
+        penalty_ids = torch.tensor(sorted(set(int(t) for t in last_tokens)), dtype=torch.long, device=logits.device)
         if logits.dim() == 1:
             for pid in penalty_ids:
                 if logits[pid] > 0:
@@ -1667,7 +2110,10 @@ def sample_step(logits, temperature=1.0, top_k=0, top_p=0.0,
                 mask_pos = logits[:, pid] > 0
                 logits[:, pid] = torch.where(mask_pos, logits[:, pid] / repetition_penalty,
                                               logits[:, pid] * repetition_penalty)
-    
+
+    if temperature <= 0:
+        return torch.argmax(logits, dim=-1)
+
     logits = logits / temperature
     
     # Top-k filtering
@@ -1696,6 +2142,19 @@ def sample_step(logits, temperature=1.0, top_k=0, top_p=0.0,
             return torch.randint(0, vocab_size, (1,), device=logits.device).squeeze(-1)
 
     return torch.multinomial(probs, num_samples=1).squeeze(-1)
+def sample_next(logits, cfg, history):
+    """Sample the token after ``logits[:, -1]`` with the cfg's sampling settings.
+
+    The repetition penalty (``_rep_penalty``) covers the distinct tokens among
+    the last ``_rep_window`` (default 64) tokens of ``history``: prompt and
+    generated text alike."""
+    penalty = float(cfg.get("_rep_penalty", 1.0))
+    recent = history[-max(1, int(cfg.get("_rep_window", 64))):] if penalty != 1.0 else None
+    return sample_step(logits[:, -1, :], cfg.get("temperature", 1.0), top_k=cfg.get("_top_k", 0),
+                       top_p=cfg.get("_top_p", 0.0), repetition_penalty=penalty,
+                       last_tokens=recent).item()
+
+
 @torch.no_grad()
 def _init_scan_state_from_prompt(scan_model: ScanLM, idx_prompt: torch.Tensor):
     """
@@ -1718,14 +2177,19 @@ def _init_scan_state_from_prompt(scan_model: ScanLM, idx_prompt: torch.Tensor):
     return states
 
 @torch.no_grad()
-def generate_classic(model, cfg, vocab: CharVocab, prompt_ids: List[int], max_len: int, stream=True):
+def generate_classic(model, cfg, vocab: CharVocab, prompt_ids: List[int], max_len: int, stream=True,
+                     on_token=None):
+    """on_token(token_id, raw_logits_row) after every sampled token (GUI); returning True stops."""
     msel = cfg["model_selection"]
     seq_len = cfg["seq_len"]
     model.eval()
     out_ids = list(prompt_ids)
 
-    # === RNN / SCAN PATH ===
-    if msel in SCAN_MODEL_IDS or msel in RNN_MODEL_IDS:
+    # === STATEFUL / MEGABYTE CACHE PATH ===
+    uses_megabyte_cache = isinstance(model, MegaByteLM) and model.is_incremental
+    if uses_megabyte_cache or ((msel in SCAN_MODEL_IDS or msel in RNN_MODEL_IDS) and (
+        not is_bottom_up_megabyte(cfg) or getattr(model, "is_incremental", False)
+    )):
         # [Logic preserved from your provided file, ensuring robustness]
         state = None
         
@@ -1736,7 +2200,7 @@ def generate_classic(model, cfg, vocab: CharVocab, prompt_ids: List[int], max_le
             ctx_ids = prompt_ids[:-1]
             x_ctx = torch.tensor([ctx_ids], dtype=torch.long, device=DEVICE)
             
-            if msel in SCAN_MODEL_IDS:
+            if isinstance(model, ScanLM):
                 state = _init_scan_state_from_prompt(model, x_ctx)
             else:
                 _, state = model(x_ctx, None)
@@ -1753,11 +2217,14 @@ def generate_classic(model, cfg, vocab: CharVocab, prompt_ids: List[int], max_le
         for _ in range(max_len):
             x = torch.tensor([[cur]], dtype=torch.long, device=DEVICE)
             logits, state = model(x, state)
-            nxt = sample_step(logits[:, -1, :], cfg.get("temperature", 1.0), top_k=cfg.get("_top_k", 0), top_p=cfg.get("_top_p", 0.0), repetition_penalty=cfg.get("_rep_penalty", 1.0)).item()
+            raw = logits[0, -1].detach().float().clone() if on_token is not None else None
+            nxt = sample_next(logits, cfg, out_ids)
             out_ids.append(nxt)
             if stream:
                 sys.stdout.write(vocab.decode([nxt])); sys.stdout.flush()
             cur = nxt
+            if on_token is not None and on_token(nxt, raw):
+                break
 
     # === SLIDING WINDOW PATH (MLP / Transformers / Mixers) ===
     else:
@@ -1782,7 +2249,8 @@ def generate_classic(model, cfg, vocab: CharVocab, prompt_ids: List[int], max_le
             logits = model(x)
             
             # Sample from the last position
-            nxt = sample_step(logits[:, -1, :], cfg.get("temperature", 1.0), top_k=cfg.get("_top_k", 0), top_p=cfg.get("_top_p", 0.0), repetition_penalty=cfg.get("_rep_penalty", 1.0)).item()
+            raw = logits[0, -1].detach().float().clone() if on_token is not None else None
+            nxt = sample_next(logits, cfg, out_ids)
             out_ids.append(nxt)
             
             if stream:
@@ -1790,70 +2258,150 @@ def generate_classic(model, cfg, vocab: CharVocab, prompt_ids: List[int], max_le
             
             # Slide window
             cur_ctx.append(nxt)
+            if on_token is not None and on_token(nxt, raw):
+                break
 
     if stream: print()
     return out_ids
 
 
 @torch.no_grad()
-def generate_line_mode(model, cfg, vocab: BaseVocab, prompt_ids: List[int], limit_len: int):
+def benchmark_megabyte_sampling_cache(model: MegaByteLM, prompt_ids: List[int], steps: int = 256):
+    """Measure incremental MEGABYTE sampling against the former window replay.
+
+    This is intentionally a callable utility rather than an interactive-menu
+    option: it is useful for a loaded MEGABYTE checkpoint and keeps benchmark
+    results tied to the exact model, device, and hierarchy being sampled.
+    """
+    if not isinstance(model, MegaByteLM) or not model.is_incremental:
+        raise ValueError("benchmark requires an incremental MegaByteLM")
+    if not prompt_ids:
+        raise ValueError("benchmark requires at least one prompt token")
+    model.eval()
+    device = next(model.parameters()).device
+    seed = torch.tensor([prompt_ids], dtype=torch.long, device=device)
+    token = seed[:, -1:]
+    agreement_steps = min(steps, model.max_seq_len - seed.size(1))
+    if agreement_steps < 1:
+        raise ValueError("benchmark prompt must leave room for one in-window agreement step")
+
+    def run_incremental(forced_tokens=None):
+        _, cache = model(seed, None)
+        logits_stream = []
+        run_steps = len(forced_tokens) if forced_tokens is not None else steps
+        current = forced_tokens[0] if forced_tokens is not None else token
+        for step in range(run_steps):
+            logits, cache = model(current, cache)
+            logits_stream.append(logits[:, -1])
+            current = (
+                forced_tokens[step + 1] if forced_tokens is not None and step + 1 < run_steps
+                else logits[:, -1].argmax(dim=-1, keepdim=True)
+            )
+        return torch.stack(logits_stream, dim=1), cache
+
+    def run_replay(run_steps=steps, forced_tokens=None):
+        history = seed
+        current = token
+        logits_stream, inputs = [], []
+        for step in range(run_steps):
+            history = torch.cat((history, current), dim=1)
+            logits = model._forward_full(history[:, -model.max_seq_len:])
+            logits_stream.append(logits[:, -1])
+            inputs.append(current)
+            current = (
+                forced_tokens[step] if forced_tokens is not None
+                else logits[:, -1].argmax(dim=-1, keepdim=True)
+            )
+        return torch.stack(logits_stream, dim=1), inputs
+
+    # Compare a forced, in-window continuation so sampling cannot hide a
+    # numerical divergence by taking different argmax branches.
+    replay_logits, forced_tokens = run_replay(agreement_steps)
+    incremental_logits, _ = run_incremental(forced_tokens)
+    if not torch.allclose(incremental_logits, replay_logits, rtol=2e-5, atol=2e-5):
+        max_error = (incremental_logits - replay_logits).abs().max().item()
+        raise AssertionError(f"MEGABYTE cache logits diverged from replay (max error {max_error:.3e})")
+
+    def measure(fn):
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+            torch.cuda.reset_peak_memory_stats(device)
+        started = time.perf_counter()
+        result = fn()
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+            memory = torch.cuda.max_memory_allocated(device)
+        else:
+            memory = None
+        return steps / (time.perf_counter() - started), memory, result
+
+    incremental_rate, incremental_memory, (_, cache) = measure(run_incremental)
+    replay_rate, replay_memory, _ = measure(run_replay)
+    return {
+        "incremental_tokens_per_second": incremental_rate,
+        "replay_tokens_per_second": replay_rate,
+        "speedup": incremental_rate / replay_rate if replay_rate else float("inf"),
+        "incremental_peak_cuda_bytes": incremental_memory,
+        "replay_peak_cuda_bytes": replay_memory,
+        "cache_stages": model.num_stages,
+        "replay_window_tokens": model.max_seq_len,
+        "agreement_steps": agreement_steps,
+    }
+
+
+@torch.no_grad()
+def generate_line_mode(model, cfg, vocab: BaseVocab, prompt_ids: List[int], limit_len: int,
+                       return_stop_reason: bool = False, on_token=None):
+    """on_token(token_id, raw_logits_row) after every sampled token (GUI); returning True stops."""
     msel = cfg["model_selection"]
     seq_len = cfg["seq_len"]
     bos = vocab.bos_id
     eos = getattr(vocab, "eos_id", None)
 
     model.eval()
-    out_ids = list(prompt_ids)
     stop = False
 
-    # 1. Prepare Priming Sequence
-    # In line mode, we generally want to start from BOS if input is empty.
-    # We also strip any trailing EOS from the input so the model can continue generating.
+    # ``vocab.encode`` appends EOS in line mode.  EOS terminates a training
+    # example, so it must not be part of a prompt that we intend to continue.
+    # Keep the returned IDs aligned with what the model actually consumed too;
+    # previously the stale EOS was displayed between the prompt and generated
+    # text.
     priming = list(prompt_ids)
     if eos is not None and priming and priming[-1] == eos:
         priming = priming[:-1]
+    if not priming:
+        priming = [bos]
+    out_ids = list(priming)
     
-    # === RNN / SCAN PATH ===
-    if msel in SCAN_MODEL_IDS or msel in RNN_MODEL_IDS:
-        state = None
-        cur = priming[-1] if priming else bos
-        
-        # Determine history for state initialization
-        # If we have [BOS, 'H', 'e'], we run state on [BOS, 'H'] and feed 'e' as cur.
-        history = priming[:-1] if len(priming) > 0 else []
-        
-        # If prompt was totally empty, cur=BOS. History empty. 
-        # If prompt was just BOS, cur=BOS. History empty. (Assuming BOS isn't duplicated)
-        
-        if len(history) > 0:
-            x_ctx = torch.tensor([history], dtype=torch.long, device=DEVICE)
-            if msel in SCAN_MODEL_IDS:
-                state = _init_scan_state_from_prompt(model, x_ctx)
-            else:
-                _, state = model(x_ctx, None)
-
+    # === STATEFUL / MEGABYTE CACHE PATH ===
+    uses_megabyte_cache = isinstance(model, MegaByteLM) and model.is_incremental
+    if uses_megabyte_cache or ((msel in SCAN_MODEL_IDS or msel in RNN_MODEL_IDS) and (
+        not is_bottom_up_megabyte(cfg) or getattr(model, "is_incremental", False)
+    )):
+        # Prime through the model's normal forward path.  This is deliberately
+        # not split into a history pass plus a separate one-token pass: ScanLM
+        # has distinct parallel (training) and sequential (eval) implementations
+        # and a split path can leave its carried state out of sync with the logits
+        # used during training.
+        x = torch.tensor([priming], dtype=torch.long, device=DEVICE)
+        logits, state = model(x, None)
         for _ in range(limit_len):
-            x = torch.tensor([[cur]], dtype=torch.long, device=DEVICE)
-            logits, state = model(x, state)
-            nxt = sample_step(logits[:, -1, :], cfg.get("temperature", 1.0), top_k=cfg.get("_top_k", 0), top_p=cfg.get("_top_p", 0.0), repetition_penalty=cfg.get("_rep_penalty", 1.0)).item()
+            raw = logits[0, -1].detach().float().clone() if on_token is not None else None
+            nxt = sample_next(logits, cfg, out_ids)
             out_ids.append(nxt)
-            cur = nxt
+            if on_token is not None and on_token(nxt, raw) and not (eos is not None and nxt == eos):
+                break
             if eos is not None and nxt == eos:
                 stop = True; break
+            x = torch.tensor([[nxt]], dtype=torch.long, device=DEVICE)
+            logits, state = model(x, state)
 
     # === SLIDING WINDOW PATH (MLP / Transformers / Mixers) ===
     else:
         # 1. Initialize Context
         # If priming exists, take the last seq_len tokens.
         # If priming is empty (empty prompt), start with [BOS].
-        if len(priming) > 0:
-            cur_ctx = priming[-seq_len:]
-        else:
-            cur_ctx = [bos]
-            # Note: We don't append BOS to out_ids here because usually 
-            # prompt_ids already contained it, or the caller handles it.
-            # If prompt_ids was truly empty, we might want to ensure BOS is in output,
-            # but usually line mode prompts start with BOS.
+        cur_ctx = priming[-seq_len:]
 
         for _ in range(limit_len):
             # Ensure context doesn't exceed seq_len
@@ -1863,38 +2411,151 @@ def generate_line_mode(model, cfg, vocab: BaseVocab, prompt_ids: List[int], limi
             logits = model(x)
             
             # Sample
-            nxt = sample_step(logits[:, -1, :], cfg.get("temperature", 1.0), top_k=cfg.get("_top_k", 0), top_p=cfg.get("_top_p", 0.0), repetition_penalty=cfg.get("_rep_penalty", 1.0)).item()
+            raw = logits[0, -1].detach().float().clone() if on_token is not None else None
+            nxt = sample_next(logits, cfg, out_ids)
             out_ids.append(nxt)
             
             # Slide window
             cur_ctx.append(nxt)
             
             if eos is not None and nxt == eos:
+                if on_token is not None:
+                    on_token(nxt, raw)
                 stop = True; break
+            if on_token is not None and on_token(nxt, raw):
+                break
 
     # Remove the trailing EOS from the result if present (optional, standardizes output)
     if stop and len(out_ids) > 0 and eos is not None and out_ids[-1] == eos:
         out_ids = out_ids[:-1]
         
+    if return_stop_reason:
+        return out_ids, ("EOS" if stop else f"max_len={limit_len}")
     return out_ids
 
 # ========= Training =========
-def train_loop(cfg, model, optimizer, dataset, valid_ds, vocab, line_mode):
-    iters = 0; total_tokens = 0; last_log = time.time(); losses = []
+def loss_metrics(total_nll: float, token_count: int, cfg, correct_tokens: Optional[int] = None) -> Dict[str, float]:
+    """Convert token-weighted negative log-likelihood into comparable metrics."""
+    nll = total_nll / max(1, token_count)
+    bits_per_token = nll / math.log(2)
+    metrics = {
+        "nll": nll,
+        "nats_per_token": nll,
+        "bits_per_token": bits_per_token,
+        "perplexity": math.exp(min(nll, 20)),
+    }
+    tokenizer_mode = int(cfg.get("tokenizer_mode", 1))
+    if tokenizer_mode == -1:
+        metrics["bits_per_byte"] = bits_per_token * 8
+    elif tokenizer_mode == 0:
+        # One byte-level token represents exactly one byte, so BPB is the
+        # comparable headline metric and numerically equals BPC here.
+        metrics["bpc"] = bits_per_token
+        metrics["bits_per_byte"] = bits_per_token
+    elif tokenizer_mode == 1:
+        metrics["bpc"] = bits_per_token
+    if correct_tokens is not None:
+        metrics["accuracy"] = correct_tokens / max(1, token_count)
+    return metrics
+
+
+def format_loss_metrics(metrics: Dict[str, float], *, include_accuracy: bool = False) -> str:
+    """Format the metrics appropriate to the active tokenizer without hiding NLL."""
+    parts = [f"nll/nats {metrics['nll']:.4f}"]
+    if "bits_per_byte" in metrics:
+        parts.append(f"bpb {metrics['bits_per_byte']:.4f}")
+    elif "bpc" in metrics:
+        parts.append(f"bpc {metrics['bpc']:.4f}")
+    else:
+        parts.append(f"bits/tok {metrics['bits_per_token']:.4f}")
+    parts.append(f"ppl {metrics['perplexity']:.2f}")
+    if include_accuracy and "accuracy" in metrics:
+        parts.append(f"acc {metrics['accuracy']:.1%}")
+    return " | ".join(parts)
+
+
+def append_validation_metrics(
+    cfg, metrics: Dict[str, float], *, step: int, epoch: int, train_tokens: int,
+) -> None:
+    """Append one validation observation with stable, spreadsheet-friendly columns."""
+    path = pathlib.Path(cfg.get("validation_csv_path", VALIDATION_CSV_PATH))
+    fields = (
+        "step", "epoch", "train_tokens", "valid_tokens", "nll", "nats_per_token", "bits_per_token",
+        "bpc", "bits_per_byte", "perplexity", "accuracy",
+    )
+    new_file = not path.exists() or path.stat().st_size == 0
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not new_file:
+        with path.open(newline="", encoding="utf-8") as handle:
+            existing_rows = list(csv.DictReader(handle))
+            existing_fields = tuple(existing_rows[0].keys()) if existing_rows else ()
+        if existing_fields != fields:
+            # Upgrade the original ambiguous `tokens` column to `valid_tokens`
+            # without losing prior observations. Old rows cannot recover exact
+            # train-token totals because those were not recorded at the time.
+            with path.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fields)
+                writer.writeheader()
+                for old_row in existing_rows:
+                    writer.writerow({
+                        field: old_row.get(field, old_row.get("tokens", "") if field == "valid_tokens" else "")
+                        for field in fields
+                    })
+            new_file = False
+    row = {field: metrics.get(field, "") for field in fields}
+    row.update({"step": step, "epoch": epoch, "train_tokens": train_tokens,
+                "valid_tokens": metrics.get("tokens", "")})
+    with path.open("a", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        if new_file:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+def training_steps_per_epoch(cfg, dataset, *, line_stream=None, tbptt_stream=None) -> int:
+    """Return updates needed to traverse the configured training-token budget once."""
+    batch_size = max(1, int(cfg["batch_size"]))
+    if bool(cfg.get("use_tbptt", False)) and cfg["dataset_type"] == 1:
+        return max(1, math.ceil(line_stream.total_transitions / max(1, batch_size * line_stream.W)))
+    if bool(cfg.get("use_tbptt", False)):
+        stream_tokens = tbptt_stream.total_len or max(0, tbptt_stream.N - 1)
+        return max(1, math.ceil(stream_tokens / max(1, batch_size * tbptt_stream.W)))
+    if cfg["dataset_type"] == 1:
+        example_count = len(dataset.offsets) if hasattr(dataset, "offsets") else len(dataset.data)
+        return max(1, math.ceil(example_count / batch_size))
+    if hasattr(dataset, "start_idx") and hasattr(dataset, "end_idx"):
+        corpus_tokens = max(0, dataset.end_idx - dataset.start_idx - 1)
+        return max(1, math.ceil(corpus_tokens / max(1, batch_size * cfg["seq_len"])))
+    example_count = len(dataset.data) if hasattr(dataset, "data") else batch_size
+    return max(1, math.ceil(example_count / batch_size))
+
+
+def train_loop(cfg, model, optimizer, dataset, valid_ds, vocab, line_mode, progress_callback=None):
+    """progress_callback(event_dict) receives step/valid/sample/checkpoint
+    events (GUI monitor); returning True stops and saves like Ctrl+C."""
+    def notify(event):
+        if progress_callback is not None and progress_callback(event):
+            raise KeyboardInterrupt
+    update_steps = max(0, int(cfg.get("iterations_done", 0)))
+    iters = update_steps * max(1, int(cfg.get("grad_accum_steps", 1)))
+    train_tokens_done = max(0, int(cfg.get("train_tokens_done", 0)))
+    interval_tokens = 0; last_log = time.time(); losses = []
     pad_id = None
     if hasattr(vocab, "pad_id"): pad_id = vocab.pad_id
     
     criterion = nn.CrossEntropyLoss(ignore_index=pad_id if pad_id is not None else -100)
-    is_scan = cfg["model_selection"] in SCAN_MODEL_IDS
+    is_bottom_up = is_bottom_up_megabyte(cfg)
+    is_scan = cfg["model_selection"] in SCAN_MODEL_IDS and not is_bottom_up
 
     # ---- Advanced training features ----
-    use_amp = bool(cfg.get("use_amp", False)) and DEVICE == "cuda"
+    use_amp, amp_dtype, scaler = amp_settings(cfg)
     grad_accum_steps = max(1, int(cfg.get("grad_accum_steps", 1)))
     max_grad_norm = float(cfg.get("max_grad_norm", 1.0))
     log_interval = int(cfg.get("log_interval", 50))
     sample_interval = int(cfg.get("sample_interval", 500))
     val_interval = int(cfg.get("val_interval", 500))
     save_interval = int(cfg.get("save_interval", 10000))
+    loss_window = max(10, log_interval)
     
     # Early stopping
     use_early_stop = bool(cfg.get("early_stopping", False))
@@ -1902,9 +2563,7 @@ def train_loop(cfg, model, optimizer, dataset, valid_ds, vocab, line_mode):
     best_valid_loss = float('inf')
     patience_counter = 0
     
-    # AMP scaler
-    scaler = torch.amp.GradScaler('cuda') if use_amp else None
-    if use_amp: print("\u26a1 Mixed Precision (AMP) enabled")
+    if use_amp: print(f"\u26a1 Mixed Precision (AMP) enabled ({str(amp_dtype).replace('torch.', '')})")
     if grad_accum_steps > 1: print(f"\U0001f4e6 Gradient accumulation: {grad_accum_steps} steps (effective batch = {cfg['batch_size'] * grad_accum_steps})")
 
     use_tbptt = bool(cfg.get("use_tbptt", False))
@@ -1912,39 +2571,75 @@ def train_loop(cfg, model, optimizer, dataset, valid_ds, vocab, line_mode):
     bptt_window = int(cfg.get("bptt_window", 0)) or max(1, cfg["seq_len"])
 
     tbptt_stream = None
+    line_stream = None
     if use_tbptt and cfg["dataset_type"] == 0:
-        # dataset.ids handles the conversion from memmap to torch tensor if needed
+        # dataset.ids may be a memmap view; the stream converts per window
         ids_ref = dataset.ids if hasattr(dataset, "ids") else dataset.data
         tbptt_stream = TBPTTClassicStream(
             ids_ref, window=bptt_window,
             batch_size=cfg["batch_size"], total_len=cfg.get("tbptt_total_len", 0))
     elif use_tbptt and cfg["dataset_type"] == 1:
         line_stream = LineTBPTTStream(
-            lines_enc=dataset.lines_enc, window=bptt_window,
-            batch_size=cfg["batch_size"], bos_id=vocab.bos_id)
+            dataset=dataset, window=bptt_window,
+            batch_size=cfg["batch_size"], bos_id=vocab.bos_id,
+            pad_id=vocab.pad_id)
+
+    # LR schedule over optimizer updates (the factor is recomputed from the
+    # update count, so a resumed run continues where its schedule left off).
+    lr_schedule = str(cfg.get("lr_scheduler", "none") or "none")
+    warmup_steps = max(0, int(cfg.get("warmup_steps", 0) or 0))
+    base_lrs = []
+    for group in optimizer.param_groups:
+        group.setdefault("initial_lr", group["lr"])
+        base_lrs.append(group["initial_lr"])
+    total_updates = 1
+    if lr_schedule != "none":
+        batches = training_steps_per_epoch(
+            cfg, dataset, line_stream=line_stream if use_tbptt else None,
+            tbptt_stream=tbptt_stream if use_tbptt else None,
+        )
+        total_updates = max(1, math.ceil(batches / grad_accum_steps) * int(cfg["epoch_count"]))
+        print(f"LR schedule: {lr_schedule}" + (f", {warmup_steps} warmup steps" if lr_schedule == "cosine_warmup" else "")
+              + f", over {total_updates:,} updates")
+        if total_updates > 10**9:
+            pwarn("The epoch count is effectively unlimited, so the decay is spread over "
+                  f"{total_updates:,} updates and the LR stays near its base value.")
+
+    def apply_lr_schedule():
+        if lr_schedule == "none":
+            return
+        factor = bench_lr_factor(lr_schedule, update_steps / total_updates, update_steps, warmup_steps)
+        for group, base in zip(optimizer.param_groups, base_lrs):
+            group["lr"] = base * factor
 
     print(f"Training on {DEVICE} ... (Ctrl+C to save & exit)")
+    if update_steps:
+        print(f"[Resume] Continuing from optimizer step {update_steps:,}.")
     try:
         rnn_state = None
-        for epoch in range(cfg["epoch_count"]):
+        optimizer.zero_grad(set_to_none=True)
+        epoch_count = int(cfg["epoch_count"])
+        starting_epoch = 0
+        for epoch in range(epoch_count):
             model.train()
             
-            # === FIX: Robust size calculation for Numpy (memmap) vs Torch ===
-            if hasattr(dataset, "data"):
-                # len() works on both Numpy arrays and Torch tensors
-                ds_len = len(dataset.data)
-            elif hasattr(dataset, "offsets"): 
-                # IndexedLineDataset uses offsets
-                ds_len = len(dataset.offsets)
-            elif hasattr(dataset, "lines_enc"):
-                ds_len = len(dataset.lines_enc)
-            else:
-                ds_len = 1000 * cfg["batch_size"] # Fallback
+            steps_per_epoch = training_steps_per_epoch(
+                cfg, dataset, line_stream=line_stream if use_tbptt else None,
+                tbptt_stream=tbptt_stream if use_tbptt else None,
+            )
 
-            steps_per_epoch = max(1, math.ceil(ds_len / cfg["batch_size"]))
-            # ==============================================================
+            if epoch == 0:
+                starting_epoch = update_steps // steps_per_epoch
+            if epoch < starting_epoch:
+                continue
+            remaining_steps = steps_per_epoch
+            if epoch == starting_epoch:
+                remaining_steps -= update_steps % steps_per_epoch
+                if remaining_steps == 0:
+                    continue
 
-            for _ in range(steps_per_epoch):
+            for batch_index in range(remaining_steps):
+                apply_lr_schedule()
                 # ===== Batching =====
                 if use_tbptt:
                     if cfg["dataset_type"] == 0:
@@ -1956,22 +2651,42 @@ def train_loop(cfg, model, optimizer, dataset, valid_ds, vocab, line_mode):
                     reset_mask = None
 
                 # ===== Forward / Backward =====
-                if use_tbptt and (is_scan or cfg["model_selection"] in RNN_MODEL_IDS):
-                    # Detach and selective reset across TBPTT windows
-                    rnn_state = detach_state(rnn_state)
-                    if rnn_state is not None and reset_mask is not None:
-                        rnn_state = reset_rnn_state(rnn_state, reset_mask, model, cfg["model_selection"])
-                    logits, rnn_state = model(x, rnn_state)
-                else:
-                    if is_scan:
-                        # Parallel training path (stateless)
-                        logits, _ = model(x)
-                    elif cfg["model_selection"] in RNN_MODEL_IDS:
-                        logits, rnn_state = model(x, None)
+                # Individual numerically sensitive model operations can opt
+                # out with their own autocast(enabled=False) guards.
+                with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
+                    if use_tbptt and (is_scan or (
+                        cfg["model_selection"] in RNN_MODEL_IDS and not is_bottom_up
+                    )):
+                        # Detach and selective reset across TBPTT windows
+                        # MEGABYTE normally trains through its vectorized full
+                        # hierarchy.  TBPTT is the explicit exception: seed its
+                        # sampler cache once so subsequent windows can carry it.
+                        if rnn_state is None and isinstance(model, MegaByteLM) and model.is_incremental:
+                            rnn_state = model.init_incremental_cache(x)
+                        rnn_state = detach_state(rnn_state)
+                        if rnn_state is not None and reset_mask is not None:
+                            rnn_state = reset_rnn_state(rnn_state, reset_mask, model, cfg["model_selection"])
+                        logits, rnn_state = model(x, rnn_state)
                     else:
-                        logits = model(x)
+                        if is_scan:
+                            # Parallel training path (stateless)
+                            logits, _ = model(x)
+                        elif cfg["model_selection"] in RNN_MODEL_IDS and not is_bottom_up:
+                            logits, rnn_state = model(x, None)
+                        else:
+                            out = model(x)
+                            logits = out[0] if isinstance(out, tuple) else out
 
-                loss = criterion(logits.reshape(-1, logits.size(-1)), y.reshape(-1))
+                    loss = criterion(logits.reshape(-1, logits.size(-1)), y.reshape(-1))
+                    aux_loss = getattr(model, "aux_loss", None)
+                    if aux_loss is not None:
+                        loss = loss + float(cfg.get("moe_aux_loss_weight", 0.01)) * aux_loss
+
+                # A seq2seq TBPTT window can lie wholly inside the masked
+                # sources.  Its forward pass has advanced the carried state;
+                # with no targets the mean loss is NaN, so skip the update.
+                if pad_id is not None and not bool((y != pad_id).any()):
+                    continue
 
                 # NaN/Inf guard — skip the step entirely to avoid poisoning optimizer state
                 if torch.isnan(loss) or torch.isinf(loss):
@@ -1983,60 +2698,140 @@ def train_loop(cfg, model, optimizer, dataset, valid_ds, vocab, line_mode):
                     iters += 1
                     continue
 
-                optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
+                # Scale each micro-batch so one optimizer update has the same
+                # gradient magnitude as a single large batch.  The setting was
+                # previously collected in the UI but never applied.
+                scaled_loss = loss / grad_accum_steps
+                if scaler is not None:
+                    scaler.scale(scaled_loss).backward()
+                else:
+                    scaled_loss.backward()
+                is_update = (
+                    (iters + 1) % grad_accum_steps == 0
+                    or batch_index + 1 == remaining_steps
+                )
+                if is_update:
+                    if scaler is not None:
+                        # Clipping must see true gradient magnitudes, not the
+                        # values multiplied by GradScaler's dynamic scale.
+                        scaler.unscale_(optimizer)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                    if scaler is not None:
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+                    update_steps += 1
 
+                valid_targets = int((y != (pad_id if pad_id is not None else -100)).sum().item())
                 iters += 1; losses.append(loss.item())
-                total_tokens += x.numel()
-                if iters % log_interval == 0:
-                    avg_loss = sum(losses[-100:]) / min(100, len(losses))
-                    tok_s = total_tokens / max(1e-6, (time.time() - last_log))
+                train_tokens_done += valid_targets
+                cfg["train_tokens_done"] = train_tokens_done
+                interval_tokens += valid_targets
+                if is_update and progress_callback is not None:
+                    notify({
+                        "event": "step", "step": update_steps, "epoch": epoch + 1,
+                        "epochs": epoch_count, "batch": batch_index + 1,
+                        "batches": remaining_steps, "loss": losses[-1],
+                        "grad_norm": float(grad_norm), "lr": optimizer.param_groups[0]['lr'],
+                        "tokens": train_tokens_done, "time": time.time(),
+                    })
+                if is_update and update_steps % log_interval == 0:
+                    current_loss = losses[-1]
+                    avg_loss = sum(losses[-loss_window:]) / min(loss_window, len(losses))
+                    elapsed = max(1e-6, time.time() - last_log)
+                    tok_s = interval_tokens / elapsed
+                    it_s = log_interval / elapsed
                     lr_now = optimizer.param_groups[0]['lr']
-                    ppl_str = f"ppl {math.exp(min(avg_loss, 20)):.1f}" if avg_loss < 20 else "ppl inf"
-                    print(f"[e{epoch+1} iter {readable_num(iters)}] loss {avg_loss:.4f} | {ppl_str} | lr {lr_now:.2e} | tok/s ~{int(tok_s)}")
-                    last_log = time.time(); total_tokens = 0
+                    metrics = loss_metrics(avg_loss, 1, cfg)
+                    print(
+                        f"[e{epoch+1} step {readable_num(update_steps)}] current loss {current_loss:.4f} | "
+                        f"loss {avg_loss:.4f} (smooth/{loss_window}) | {format_loss_metrics(metrics)} | "
+                        f"tokens {train_tokens_done:,} | tok/s {int(tok_s)} | "
+                        f"it/s {it_s:.2f} | s/it {1 / it_s:.3f} | lr {lr_now:.2e}"
+                    )
+                    last_log = time.time(); interval_tokens = 0
 
                 # ----- Validation (keeps your existing heuristics) -----
                 want_valid = (valid_ds is not None)
-                if want_valid and iters % val_interval == 0:
-                    vloss = eval_valid_loss(
-                        model, cfg, valid_ds, vocab,
-                        line_mode=(cfg["dataset_type"]==1),
-                        max_samples=1000
-                    )
+                if is_update and want_valid and update_steps % val_interval == 0:
+                    with schedule_free_eval(optimizer):
+                        vloss = eval_valid_loss(
+                            model, cfg, valid_ds, vocab,
+                            line_mode=(cfg["dataset_type"]==1),
+                            max_samples=1000, return_metrics=True,
+                        )
                     if vloss is not None:
-                        print(f"[valid @ {readable_num(iters)}] loss {vloss:.4f}")
+                        if isinstance(vloss, dict):
+                            append_validation_metrics(
+                                cfg, vloss, step=update_steps, epoch=epoch + 1,
+                                train_tokens=train_tokens_done,
+                            )
+                            print(f"[valid @ {readable_num(update_steps)}] loss {vloss['nll']:.4f} | {format_loss_metrics(vloss, include_accuracy=True)} | valid tokens {int(vloss['tokens']):,}")
+                        else:
+                            print(f"[valid @ {readable_num(update_steps)}] loss {vloss:.4f}")
+                        notify({"event": "valid", "step": update_steps, "epoch": epoch + 1,
+                                "metrics": vloss if isinstance(vloss, dict) else {"nll": float(vloss)}})
 
-                if iters % sample_interval == 0:
-                    with torch.no_grad():
-                        do_training_sample(cfg, model, vocab, line_mode)
-                if iters % save_interval == 0:
-                    cfg["iterations_done"] = iters
-                    torch.save(model.state_dict(), CHECKPOINT_PATH)
+                if is_update and update_steps % sample_interval == 0:
+                    with torch.no_grad(), schedule_free_eval(optimizer):
+                        samples = do_training_sample(cfg, model, vocab, line_mode, iteration=update_steps,
+                                                     examples_ds=valid_ds or dataset)
+                    notify({"event": "samples", "step": update_steps, "samples": samples or []})
+                if is_update and update_steps % save_interval == 0:
+                    cfg["iterations_done"] = update_steps
+                    with schedule_free_eval(optimizer):
+                        torch.save(model.state_dict(), CHECKPOINT_PATH)
                     save_json(CONFIG_PATH, cfg)
                     print(f"\n[checkpoint] saved {CHECKPOINT_PATH} + {CONFIG_PATH}")
+                    notify({"event": "checkpoint", "step": update_steps})
 
-        cfg["iterations_done"] = iters
-        torch.save(model.state_dict(), CHECKPOINT_PATH)
+        cfg["iterations_done"] = update_steps
+        with schedule_free_eval(optimizer):
+            torch.save(model.state_dict(), CHECKPOINT_PATH)
         save_json(CONFIG_PATH, cfg)
         print(f"\n[checkpoint] saved {CHECKPOINT_PATH} + {CONFIG_PATH}")
     except KeyboardInterrupt:
         print("\n[interrupt] saving...")
-        cfg["iterations_done"] = iters
-        torch.save(model.state_dict(), CHECKPOINT_PATH)
+        cfg["iterations_done"] = update_steps
+        with schedule_free_eval(optimizer):
+            torch.save(model.state_dict(), CHECKPOINT_PATH)
         save_json(CONFIG_PATH, cfg)
 
 
-def do_training_sample(cfg, model, vocab, line_mode):
+def do_training_sample(cfg, model, vocab, line_mode, iteration=None, examples_ds=None):
+    """Print training previews; also returns them as dicts for the GUI."""
     was_training = model.training
+    original_temperature = cfg.get("temperature", 1.0)
+    samples = []
     try:
         model.eval()
+        if cfg.get("seq2seq") and examples_ds is not None and hasattr(examples_ds, "get_encoded_example"):
+            # Seq2seq previews: prompt with a real example's inputs and show
+            # the generated outputs next to the expected ones.
+            cfg["temperature"] = float(cfg.get("train_sample_temperature", original_temperature))
+            for i in range(int(cfg.get("train_sample_count", 1))):
+                ids, source_len = examples_ds.get_encoded_example(random.randrange(len(examples_ds.offsets)))
+                prompt_ids = ids[:1 + source_len]
+                out, stop_reason = generate_line_mode(
+                    model, cfg, vocab, prompt_ids, limit_len=cfg["seq_len"], return_stop_reason=True,
+                )
+                print(f"[sample t={cfg['temperature']} #{i+1}]  ({stop_reason})")
+                print(f"  input    : {seq2seq_visible(vocab.decode(prompt_ids[1:]))}")
+                print(f"  expected : {seq2seq_visible(vocab.decode(ids[1 + source_len:-1]))}")
+                print(f"  generated: {seq2seq_visible(vocab.decode(out[len(prompt_ids):]))}\n")
+                samples.append({
+                    "temperature": cfg["temperature"], "stop_reason": stop_reason,
+                    "input": vocab.decode(prompt_ids[1:]),
+                    "expected": vocab.decode(ids[1 + source_len:-1]),
+                    "text": vocab.decode(out[len(prompt_ids):]),
+                })
+            return samples
         tmode = int(cfg.get("tokenizer_mode", 1))
         byte_text = bool(cfg.get("byte_output_text", False))
         out_dir = pathlib.Path("FileGen")
-        if tmode == 0:
+        if tmode in {-1, 0}:
             out_dir.mkdir(parents=True, exist_ok=True)
 
         # Retrieve new settings
@@ -2044,7 +2839,11 @@ def do_training_sample(cfg, model, vocab, line_mode):
         sample_count = int(cfg.get("train_sample_count", 1))
         custom_prompt_str = cfg.get("train_sample_prompt", "")
 
-        temps = [1.0, 0.5, 0.25]
+        # Training previews are diagnostics, not a three-temperature benchmark.
+        # A single configured temperature makes each output independently
+        # interpretable and avoids the low-temperature sample looking like a
+        # mysterious, consistently truncated "third line".
+        temps = [float(cfg.get("train_sample_temperature", original_temperature))]
 
         # --- Helper to determine prompt IDs ---
         def get_train_prompt_ids():
@@ -2080,7 +2879,7 @@ def do_training_sample(cfg, model, vocab, line_mode):
                 
                 # Visual Logging
                 if not line_mode:
-                    if tmode == 0:
+                    if tmode in {-1, 0}:
                         p_vis = bytes(vocab.to_bytes(prompt_ids)).hex()
                     else:
                         p_vis = vocab.decode(prompt_ids)
@@ -2090,33 +2889,49 @@ def do_training_sample(cfg, model, vocab, line_mode):
                     print(f"[sample t={temp} #{i+1}]")
 
                 # Generate
+                stop_reason = None
                 if line_mode:
-                    out = generate_line_mode(
-                        model, cfg, vocab, prompt_ids, limit_len=cfg["seq_len"]
+                    out, stop_reason = generate_line_mode(
+                        model, cfg, vocab, prompt_ids, limit_len=cfg["seq_len"],
+                        return_stop_reason=True,
                     )
+                    print(f"  [line sample ended: {stop_reason}]")
                 else:
                     out = generate_classic(
                         model, cfg, vocab, prompt_ids, max_len=sample_len, stream=False
                     )
 
                 # Output / Save
-                if tmode == 0: # Byte mode
+                if tmode in {-1, 0}: # Binary / byte mode
                     data = vocab.to_bytes(out) if hasattr(vocab, "to_bytes") else bytes()
                     
+                    sample = {"temperature": temp, "stop_reason": stop_reason,
+                              "prompt": bytes(vocab.to_bytes(prompt_ids)).hex() if not line_mode else "",
+                              "hex": data[:4096].hex(), "bytes": len(data)}
+                    samples.append(sample)
                     if byte_text:
                         text_rep = vocab.decode(out[1:] if line_mode else out)
                         print(f"{text_rep}\n")
+                        sample["text"] = text_rep
                     else:
-                        iter_num = cfg.get('iterations_done', 0)
+                        # Training samples run between checkpoints, so the
+                        # persisted config can be thousands of updates stale.
+                        iter_num = cfg.get("iterations_done", 0) if iteration is None else iteration
                         fname = f"train_iter{iter_num}_t{temp}_{i+1}.bin"
                         (out_dir / fname).write_bytes(data)
                         print(f"   -> Saved {fname} ({len(data)} bytes)")
+                        sample["file"] = str(out_dir / fname)
                 else: # Text mode
                     disp_ids = out[1:] if (line_mode and len(out) > 0) else out
                     text = vocab.decode(disp_ids)
                     print(f"{text}\n")
+                    samples.append({"temperature": temp, "stop_reason": stop_reason,
+                                    "prompt": "" if line_mode else vocab.decode(prompt_ids),
+                                    "text": text})
+        return samples
 
     finally:
+        cfg["temperature"] = original_temperature
         if was_training:
             model.train()
 
@@ -2137,8 +2952,10 @@ class RunConfig:
     epoch_count: int
     batch_size: int
     learning_rate: float
+    model_type: int = 0  # 0=flat, 1=top-down MEGABYTE, 2=bottom-up MEGABYTE
     temperature: float = 1.0
     iterations_done: int = 0
+    train_tokens_done: int = 0
     vocab_tokens: Optional[List[str]] = None
     line_max_len: Optional[int] = None
     tokenizer_mode: int = 1  # -1=binary, 0=byte, 1=char, 2=word
@@ -2146,6 +2963,9 @@ class RunConfig:
     res_every: int = 0    # 0 disables; otherwise every n layers
     res_type: int = 0     # 0=add, 1=concat(+proj), 2=ReZero scalar, 3=ReZero elementwise
     dropout: float = 0.0  # inter-layer dropout prob
+    sparse_local_window: int = 512
+    sparse_compression_block: int = 32
+    sparse_selected_blocks: int = 16
     use_multiplier: int = 0 #
     train_sample_len: int = 200     # Length of generated samples during training (corpus mode)
     train_sample_count: int = 1     # Number of samples per temperature
@@ -2159,7 +2979,7 @@ def read_dataset(path: str, dataset_type: int, tokenizer_mode: int = 1):
       - for char/word/binary: list[str]
       - for byte tokenizer (0): list[bytes]  (raw)
     """
-    if tokenizer_mode == 0:
+    if tokenizer_mode in {-1, 0}:
         # byte mode → read raw bytes
         if dataset_type == 0:
             with open(path, "rb") as f:
@@ -2178,16 +2998,19 @@ def read_dataset(path: str, dataset_type: int, tokenizer_mode: int = 1):
                 return [ln.rstrip("\n") for ln in f.readlines()]
 
 
-def prompt_int(msg, valid=None, default=None):
+def prompt_int(msg, valid=None, default=None, minimum=None):
     label = prompt_label(msg, default)
     while True:
         s = input(label).strip()
         if s == "" and default is not None: return default
         try:
             v = int(s)
-            if (valid is None) or (v in valid): return v
+            if (valid is None or v in valid) and (minimum is None or v >= minimum): return v
         except: pass
-        print(f"  {_c(_RD, '✗')} Please enter a valid integer{(' in ' + str(valid)) if valid else ''}.")
+        constraint = f" in {valid}" if valid else ""
+        if minimum is not None:
+            constraint += f" of at least {minimum}"
+        print(f"  {_c(_RD, '✗')} Please enter a valid integer{constraint}.")
 
 def prompt_float(msg, default=None):
     label = prompt_label(msg, default)
@@ -2202,6 +3025,25 @@ def prompt_str(msg, default=None):
     s = input(label).strip()
     if s == "" and default is not None: return default
     return s
+
+
+def prompt_activation(default="gelu", model_name=None):
+    """Present the shared activation menu with architecture-aware defaults."""
+    names = activation_names()
+    if default not in names:
+        default = "gelu"
+
+    cli_section("Activation Function", 64)
+    if model_name:
+        print(f"  │  {_c(_DIM, f'{model_name} default: {default.upper()}')}")
+    print(f"  │  {_c(_DIM, 'Gated options use a true GLU feed-forward block where supported.')}")
+    print(f"  │")
+    for index, name in enumerate(names):
+        cli_opt(index, name.upper(), ACTIVATION_DESCRIPTIONS.get(name, "Architecture-specific activation"), kw=3, lw=14)
+    print(f"  │")
+    choice = prompt_int("Activation", valid=set(range(len(names))), default=names.index(default))
+    cli_section_end(64)
+    return names[choice]
 
 def build_config_new():
     # ── Dataset ────────────────────────────────────────────────────────────────
@@ -2232,23 +3074,41 @@ def build_config_new():
         tke = prompt_str("Tiktoken encoding  (gpt2 / r50k_base / cl100k_base)", default="cl100k_base")
     elif tokenizer_mode == 4:
         vocab_size_bpe = prompt_int("BPE vocabulary size", default=4096)
-    elif tokenizer_mode == 0:
+    elif tokenizer_mode in {-1, 0}:
         print(f"  │")
-        print(f"  │  {_c(_DIM, 'Byte output mode:')}")
+        print(f"  │  {_c(_DIM, 'Binary / byte output mode:')}")
         cli_opt(0, "Binary → FileGen/", "Write raw binary files (images, audio, etc.)")
-        cli_opt(1, "Print as text",     "Decode output as latin-1 and print to terminal")
+        cli_opt(1, "Print tokens",      "Print byte text or raw bit tokens to the terminal")
         print(f"  │")
         byte_out = prompt_int("Output mode", valid={0,1}, default=0)
     cli_section_end(64)
 
+    seq2seq = prompt_seq2seq_config(dataset_path) if dataset_type == 1 else None
+    if seq2seq:
+        # Train on the rearranged copy; the original file is left untouched.
+        dataset_path = prepare_seq2seq_dataset(seq2seq)
+
     # ── Model ──────────────────────────────────────────────────────────────────
     print_model_menu()
+    print_megabyte_compatible_models()
 
-    msel = prompt_int("Model #", valid=set(range(99)))
+    # The training UI accepts exactly the same registered IDs as benchmarks.
+    msel = prompt_int("Model #", valid=MODEL_IDS)
+
+    print(f"  │")
+    cli_opt(0, "Normal", "Use the selected model as a flat language model")
+    if msel in HIERARCHICAL_MODEL_MIXERS:
+        if msel != MLP_MODEL_ID:
+            cli_opt(1, "MEGABYTE", "Use the selected processor at every hierarchy stage")
+        cli_opt(2, "MEGABYTE-Bottom up", "Encode fine→coarse, then decode coarse→fine")
+        model_type = prompt_int("Model type", valid=({0, 2} if msel == MLP_MODEL_ID else {0, 1, 2}), default=0)
+    else:
+        print(f"  │  {_c(_DIM, 'MEGABYTE is unavailable for this model; no stage adapter is registered.')}")
+        model_type = MODEL_TYPE_NORMAL
 
     # MinRNN / MinIndRNN activation sub-menus
     minrnn_act = 0
-    if msel == 26:
+    if msel == 902:
         print()
         cli_section("MinRNN Activation", 64)
         cli_opt(0, "Tanh",       "Original MinRNN formulation")
@@ -2260,7 +3120,7 @@ def build_config_new():
         cli_section_end(64)
         minrnn_act = prompt_int("Activation", valid={0,1,2,3,4,5})
 
-    if msel == 32:
+    if msel == 903:
         print()
         cli_section("MinIndRNN Activation", 64)
         print(f"  │  {_c(_DIM, 'Applied to the input projection inside the parallel IndRNN scan.')}")
@@ -2290,40 +3150,171 @@ def build_config_new():
         cli_section_end(64)
         minrnn_act = prompt_int("Activation", valid=set(range(18)))
 
-    # Activation for MLPs / TCN
-    activation_name = "linear"
-    if msel in (0, 1, 9, 10, 19):
-        print()
-        cli_section("Activation Function", 64)
-        names = activation_names()
-        for i, n in enumerate(names):
-            cli_opt(i, n, kw=3, lw=20)
-        cli_section_end(64)
-        a_idx = prompt_int("Activation #", valid=set(range(len(names))))
-        activation_name = names[a_idx]
+    # Every non-recurrent architecture now exposes its feed-forward activation.
+    # Recurrent models retain their architecture-defined nonlinearities.
+    activation_name = "gelu"
+    if msel in NON_RNN_ACTIVATION_IDS:
+        activation_name = prompt_activation(
+            MODEL_DEFAULT_ACTIVATIONS[msel],
+            MODEL_NAMES.get(msel, f"Model {msel}"),
+        )
 
     # ── Architecture ───────────────────────────────────────────────────────────
     cli_section("Architecture", 64)
-    print(f"  │")
-    print(f"  │  {_c(_DIM, 'Embedding / hidden dim — size of every vector in the model.')}")
-    print(f"  │  {_c(_DIM, 'Larger = more capacity, more VRAM, slower training.')}")
-    embed_dim  = prompt_int("Embedding / hidden dim")
-
-    head_count = 4
-    if msel in ATTN_MODEL_IDS:
+    target_params = None
+    megabyte_stage_dims = None
+    megabyte_stage_depths = None
+    megabyte_stage_heads = None
+    megabyte_stage_seq_lens = None
+    megabyte_stage_child_embed_dims = None
+    megabyte_stage_mixers = None
+    megabyte_bottom_up_encoder_stage_mixers = None
+    megabyte_bottom_up_decoder_stage_mixers = None
+    if model_type in {MODEL_TYPE_MEGABYTE, MODEL_TYPE_MEGABYTE_BOTTOM_UP}:
+        hierarchy_label = "MEGABYTE-Bottom up" if model_type == MODEL_TYPE_MEGABYTE_BOTTOM_UP else "MEGABYTE"
+        print(f"  │  {_c(_DIM, f'{hierarchy_label} stage lengths multiply')}")
+        print(f"  │  {_c(_DIM, 'into the token window used for training; each stage has its own width,')}")
+        print(f"  │  {_c(_DIM, 'depth, and (where applicable) attention-head count.')}")
+        if model_type == MODEL_TYPE_MEGABYTE_BOTTOM_UP:
+            print(f"  │  {_c(_DIM, 'It first composes immediate child representations fine→coarse, then decodes.')}")
         print(f"  │")
-        print(f"  │  {_c(_DIM, 'Head count — splits embed_dim into parallel attention heads.')}")
-        print(f"  │  {_c(_DIM, 'Must divide embed_dim evenly. More heads = finer-grained attention.')}")
-        head_count = prompt_int("Attention head count", default=4)
+        stage_count = prompt_int("MEGABYTE stage count  (2 or more)", minimum=2, default=2)
+        window_mlp_selected = model_type == MODEL_TYPE_MEGABYTE_BOTTOM_UP and msel == MLP_MODEL_ID
+        if window_mlp_selected:
+            print(f"  │  {_c(_DIM, 'Window MLP is valid only at the fine decoder stage, so choose decoder cores per stage.')}")
+            per_stage_cores = 1
+        else:
+            cli_opt(0, "Same core", "Use the selected model at every hierarchy stage")
+            cli_opt(1, "Per-stage cores", "Select a compatible model ID for each stage")
+            core_label = "Decoder/shared stage core selection" if model_type == MODEL_TYPE_MEGABYTE_BOTTOM_UP else "Stage core selection"
+            per_stage_cores = prompt_int(core_label, valid={0, 1}, default=0)
+        if per_stage_cores:
+            print_megabyte_compatible_models()
+            megabyte_stage_mixers = [
+                prompt_int(
+                    f"Core model ID for stage {stage + 1}",
+                    valid=(
+                        HIERARCHICAL_MODEL_MIXERS
+                        if model_type != MODEL_TYPE_MEGABYTE_BOTTOM_UP or stage == stage_count - 1
+                        else set(HIERARCHICAL_MODEL_MIXERS) - {MLP_MODEL_ID}
+                    ),
+                )
+                for stage in range(stage_count)
+            ]
+        else:
+            megabyte_stage_mixers = [msel] * stage_count
+        if model_type == MODEL_TYPE_MEGABYTE_BOTTOM_UP:
+            print(f"  │")
+            print(f"  │  {_c(_DIM, 'Encoder/decoder cores default to the same schedule. Separate schedules let')}")
+            print(f"  │  {_c(_DIM, 'the fine encoder and decoder use different sequence processors.')}")
+            print(f"  │  {_c(_DIM, f'Window MLP (model {MLP_MODEL_ID}) may be the fine decoder stage; it emits')}")
+            print(f"  │  {_c(_DIM, 'one complete fine patch before the next patch begins.')}")
+            cli_opt(0, "Shared schedule", "Use the decoder schedule for the encoder too")
+            cli_opt(1, "Separate encoder", "Choose an independent encoder core schedule")
+            separate_encoder = prompt_int("Encoder/decoder mixer schedule", valid={0, 1}, default=0)
+            if separate_encoder:
+                if window_mlp_selected:
+                    print(f"  │  {_c(_DIM, 'An MLP encoder also needs the fine decoder MLP, so choose encoder cores per stage.')}")
+                    per_stage_encoder = 1
+                else:
+                    cli_opt(0, "Same encoder core", "Use the selected model at every encoder stage")
+                    cli_opt(1, "Per-stage encoder cores", "Select a compatible model ID for each encoder stage")
+                    per_stage_encoder = prompt_int("Encoder core selection", valid={0, 1}, default=0)
+                if per_stage_encoder:
+                    print_megabyte_compatible_models()
+                    megabyte_bottom_up_encoder_stage_mixers = [
+                        prompt_int(
+                            f"Encoder model ID for stage {stage + 1}",
+                            valid=(
+                                HIERARCHICAL_MODEL_MIXERS
+                                if (
+                                    stage == stage_count - 1
+                                    and megabyte_stage_mixers[-1] == MLP_MODEL_ID
+                                )
+                                else set(HIERARCHICAL_MODEL_MIXERS) - {MLP_MODEL_ID}
+                            ),
+                        )
+                        for stage in range(stage_count)
+                    ]
+                else:
+                    megabyte_bottom_up_encoder_stage_mixers = [msel] * stage_count
+                megabyte_bottom_up_decoder_stage_mixers = list(megabyte_stage_mixers)
+        dims, child_embed_dims, depths, heads_per_stage, lengths = [], [], [], [], []
+        for stage in range(stage_count):
+            label = f"Stage {stage + 1} {'(coarse)' if stage == 0 else '(fine)' if stage == stage_count - 1 else ''}".rstrip()
+            print(f"  │")
+            print(f"  │  {_c(_WH, _B, label)}")
+            lengths.append(prompt_int("  Sequence length / groups", default=128 if stage == 0 else 4))
+            stage_dim = prompt_int("  Hidden dimension", default=256 if stage == 0 else 128)
+            dims.append(stage_dim)
+            child_embed_dims.append(prompt_int(
+                f"  Child token embedding dimension  (1–{stage_dim})",
+                valid=range(1, stage_dim + 1),
+                default=min(64, stage_dim),
+            ))
+            depths.append(prompt_int("  Layer count", default=2))
+            if megabyte_mixer_uses_heads(megabyte_stage_mixers[stage]):
+                heads_per_stage.append(prompt_int("  Attention head count", default=8))
+            else:
+                heads_per_stage.append(1)
+        megabyte_stage_dims = dims
+        megabyte_stage_depths = depths
+        megabyte_stage_heads = heads_per_stage
+        megabyte_stage_seq_lens = lengths
+        megabyte_stage_child_embed_dims = child_embed_dims
+        embed_dim = dims[0]
+        layer_count = sum(depths)
+        head_count = heads_per_stage[0]
+    else:
+        print(f"  │")
+        print(f"  │  {_c(_DIM, 'Embedding / hidden dim — size of every vector in the model.')}")
+        print(f"  │  {_c(_DIM, 'Larger = more capacity, more VRAM, slower training.')}")
+        cli_opt(0, "Fixed width",      "Enter the hidden dimension yourself")
+        cli_opt(1, "Match parameters", "Pick the width that gives a target parameter count")
+        if prompt_int("Model size", valid={0, 1}, default=0) == 1:
+            target_params = int(prompt_float("Target parameters  (millions)", default=2.0) * 1e6)
+            embed_dim = 256   # replaced once the vocabulary and window are known
+        else:
+            embed_dim = prompt_int("Embedding / hidden dim")
 
-    print(f"  │")
-    print(f"  │  {_c(_DIM, 'Layer count — number of stacked blocks / cells.')}")
-    print(f"  │  {_c(_DIM, 'Deeper models learn longer-range patterns at higher compute cost.')}")
-    layer_count = prompt_int("Layer count")
+        head_count = 4
+        if msel in ATTN_MODEL_IDS:
+            print(f"  │")
+            print(f"  │  {_c(_DIM, 'Head count — splits embed_dim into parallel attention heads.')}")
+            print(f"  │  {_c(_DIM, 'Must divide embed_dim evenly. More heads = finer-grained attention.')}")
+            head_count = prompt_int("Attention head count", default=4)
 
-    # Classic RNN extras
+        print(f"  │")
+        print(f"  │  {_c(_DIM, 'Layer count — number of stacked blocks / cells.')}")
+        print(f"  │  {_c(_DIM, 'Deeper models learn longer-range patterns at higher compute cost.')}")
+        layer_count = prompt_int("Layer count")
+
+    ngram_context = 4
+    if msel == 2:
+        print(f"  │")
+        print(f"  │  {_c(_DIM, 'N-gram context — preceding tokens used for each next-token prediction.')}")
+        print(f"  │  {_c(_DIM, 'Stored as a flat [batch, time, context] window, never nested tensor dimensions.')}")
+        print(f"  │  {_c(_DIM, 'Maximum 32 prevents excessive flattened MLP inputs and memory use.')}")
+        ngram_context = prompt_int("Previous tokens / characters  (1–32)", valid=set(range(1, 33)), default=4)
+
+    sparse_local_window = 512
+    sparse_compression_block = 32
+    sparse_selected_blocks = 16
+
+    # Built-in RNN extras, including any RNN stages selected for MEGABYTE.
     use_norm = 0; res_every = 0; res_type = 0; rnn_dropout = 0.0; use_multiplier = 0
-    if msel in (2,3,4,5,6,7,8,18,23):
+    rnn_ffn = 0; rnn_cell_options = {}
+    custom_rnn_ids = (502, 506, 507, 509, 510, 511, 513, 514, 515, 516, 518, 519, 601, 602)
+    megabyte_builtin_rnn = (
+        model_type in {MODEL_TYPE_MEGABYTE, MODEL_TYPE_MEGABYTE_BOTTOM_UP}
+        and any(resolve_megabyte_stage_mixer(mixer) in {"rnn", "rnn_relu", "gru", "lstm"}
+                for mixer in (
+                    list(megabyte_stage_mixers)
+                    + list(megabyte_bottom_up_encoder_stage_mixers or ())
+                    + list(megabyte_bottom_up_decoder_stage_mixers or ())
+                ))
+    )
+    if msel in (500, 504, 503, 501, 407) + custom_rnn_ids or megabyte_builtin_rnn:
         print(f"  │")
         print(f"  │  {_c(_DIM, 'RNN structure options — extra stabilisation for step-by-step RNNs.')}")
         print(f"  │")
@@ -2354,14 +3345,41 @@ def build_config_new():
         print(f"  │  {_c(_DIM, 'Dropout — randomly zeros inter-layer activations during training,')}")
         print(f"  │  {_c(_DIM, 'acting as regularisation. 0.1–0.3 for most tasks; 0 to disable.')}")
         rnn_dropout = prompt_float("Inter-layer dropout  (0.0 = off)", default=0.0)
-        print(f"  │")
-        print(f"  │  {_c(_DIM, 'Output multiplier — a learnable gate on the final hidden→logit')}")
-        print(f"  │  {_c(_DIM, 'projection. Can help calibrate output scale, especially early.')}")
-        cli_opt(0, "Off",           "No multiplier — standard behaviour")
-        cli_opt(1, "Scalar",        "One learnable scalar multiplies all outputs")
-        cli_opt(2, "Per-dim vector","One learnable value per hidden dimension")
-        print(f"  │")
-        use_multiplier = prompt_int("Multiplier", default=0)
+        if not megabyte_builtin_rnn:
+            print(f"  │")
+            print(f"  │  {_c(_DIM, 'Output multiplier — a learnable gate on the final hidden→logit')}")
+            print(f"  │  {_c(_DIM, 'projection. Can help calibrate output scale, especially early.')}")
+            cli_opt(0, "Off",           "No multiplier — standard behaviour")
+            cli_opt(1, "Scalar",        "One learnable scalar multiplies all outputs")
+            cli_opt(2, "Per-dim vector","One learnable value per hidden dimension")
+            print(f"  │")
+            use_multiplier = prompt_int("Multiplier", default=0)
+        if msel in custom_rnn_ids and model_type == MODEL_TYPE_NORMAL:
+            print(f"  │")
+            print(f"  │  {_c(_DIM, 'Post-layer feed-forward block after every recurrent layer:')}")
+            cli_opt(0, "Off",    "Recurrent layers only")
+            cli_opt(1, "SwiGLU", "Pre-norm SwiGLU FFN with residual")
+            cli_opt(2, "ReGLU",  "Pre-norm ReGLU FFN with residual")
+            cli_opt(3, "SiLU",   "Pre-norm SiLU MLP with residual (experimental)")
+            rnn_ffn = prompt_int("Post-layer FFN", valid={0, 1, 2, 3}, default=0)
+        if msel == 509:
+            print(f"  │  {_c(_DIM, 'IndRNN activation: ReLU (paper-style, u in [0,1], |u|<=1) or tanh (legacy).')}")
+            act = prompt_str("IndRNN activation  (relu/tanh)", default="relu").strip().lower()
+            rnn_cell_options["indrnn_activation"] = "tanh" if act.startswith("t") else "relu"
+        if msel in (513, 514):
+            yn = prompt_str("Experimental ReLU gates instead of sigmoid  (y/n)", default="n").lower()
+            rnn_cell_options["relu_gates"] = yn in ("y", "yes", "1")
+        if msel in (515, 516):
+            rnn_cell_options["mogrifier_rounds"] = prompt_int("Mogrifier rounds  (0 = plain LSTM/GRU)", default=5)
+        if msel == 602:
+            rnn_cell_options["unicornn_dt"] = prompt_float("UnICORNN time step dt", default=0.1)
+            rnn_cell_options["unicornn_alpha"] = prompt_float("UnICORNN alpha (oscillator frequency)", default=10.0)
+        if msel == 519:
+            yn = prompt_str("LRU highway stacking (h~ = layer input for layers >= 2)  (y/n)", default="n").lower()
+            rnn_cell_options["lru_highway"] = yn in ("y", "yes", "1")
+        if msel == 518:
+            rnn_cell_options["rru_middle_multiplier"] = prompt_float("RRU middle-layer size multiplier", default=2.0)
+            rnn_cell_options["rru_dropout"] = prompt_float("RRU in-cell dropout", default=0.0)
     cli_section_end(64)
 
     # ── Sequence / Data ────────────────────────────────────────────────────────
@@ -2369,8 +3387,12 @@ def build_config_new():
     print(f"  │")
     if dataset_type == 0:
         print(f"  │  {_c(_DIM, 'Sequence length — tokens per training window.')}")
-        print(f"  │  {_c(_DIM, 'Longer = more context, more memory. Typical: 128–2048.')}")
-        seq_len = prompt_int("Sequence length  (tokens per window)")
+        if model_type in {MODEL_TYPE_MEGABYTE, MODEL_TYPE_MEGABYTE_BOTTOM_UP}:
+            seq_len = math.prod(megabyte_stage_seq_lens)
+            print(f"  │  {_c(_DIM, f'MEGABYTE stage lengths set this automatically to {seq_len} tokens.')}")
+        else:
+            print(f"  │  {_c(_DIM, 'Longer = more context, more memory. Typical: 128–2048.')}")
+            seq_len = prompt_int("Sequence length  (tokens per window)")
         print(f"  │")
         print(f"  │  {_c(_DIM, 'Validation file — a separate held-out text file for measuring')}")
         print(f"  │  {_c(_DIM, 'generalisation. Leave blank to auto-split the training file.')}")
@@ -2390,6 +3412,18 @@ def build_config_new():
         print(f"  │  {_c(_DIM, 'Lines are shuffled before splitting. Set 0 to use all for training.')}")
         val_split = prompt_float("Validation split fraction  (0 = disable)", default=0.0)
     cli_section_end(64)
+
+    if msel == 409:
+        sparse_default = min(512, max(1, seq_len))
+        cli_section("Sparse Modern Transformer", 64)
+        print(f"  │  {_c(_DIM, 'Local attention preserves recent detail; completed blocks provide')}")
+        print(f"  │  {_c(_DIM, 'compressed global routing and selected raw-token retrieval.')}")
+        sparse_local_window = prompt_int("Local causal window", default=sparse_default)
+        sparse_compression_block = prompt_int("Compression block size", default=32)
+        sparse_selected_blocks = prompt_int("Selected completed blocks", default=16)
+        if min(sparse_local_window, sparse_compression_block, sparse_selected_blocks) < 1:
+            raise ValueError("Sparse Modern Transformer settings must be positive")
+        cli_section_end(64)
 
     # ── Training ───────────────────────────────────────────────────────────────
     cli_section("Training", 64)
@@ -2437,12 +3471,15 @@ def build_config_new():
     print(f"  │  {_c(_DIM, 'without extra VRAM. e.g. accum=4, batch=32 → effective batch 128.')}")
     grad_accum    = prompt_int("Gradient accumulation steps  (1 = off)", default=1)
     use_amp_val   = 0
+    amp_dtype_val = "fp16"
     if DEVICE == "cuda":
         print(f"  │")
-        print(f"  │  {_c(_DIM, 'Automatic Mixed Precision (AMP) — runs forward pass in float16,')}")
+        print(f"  │  {_c(_DIM, 'Automatic Mixed Precision (AMP) — runs forward pass in fp16 or bf16,')}")
         print(f"  │  {_c(_DIM, 'keeping master weights in float32. Halves VRAM and speeds up')}")
         print(f"  │  {_c(_DIM, 'matmuls on Ampere+ GPUs (RTX 30xx / A100 and newer).')}")
         use_amp_val = prompt_int("Mixed precision / AMP  (0=off 1=on)", valid={0,1}, default=0)
+        if use_amp_val:
+            amp_dtype_val = prompt_amp_dtype()
 
     print(f"  │")
     print(f"  │  {_c(_DIM, 'LR scheduler — adjusts learning rate over the course of training.')}")
@@ -2474,15 +3511,16 @@ def build_config_new():
         patience_val = prompt_int("Patience  (checks without improvement)", default=10)
 
     print(f"  │")
-    print(f"  │  {_c(_DIM, 'Logging / sampling / validation intervals — how often (in steps)')}")
+    print(f"  │  {_c(_DIM, 'Logging / sampling / validation intervals — how often (in optimizer-update steps)')}")
     print(f"  │  {_c(_DIM, 'each event fires. Lower = more feedback, slightly more overhead.')}")
-    log_interval        = prompt_int("Log loss every N steps", default=10)
-    sample_interval_val = prompt_int("Sample text every N steps", default=500)
-    val_interval_val    = prompt_int("Run validation every N steps", default=500)
+    log_interval        = prompt_int("Log loss every N update steps", default=10)
+    sample_interval_val = prompt_int("Sample text every N update steps", default=500)
+    val_interval_val    = prompt_int("Run validation every N update steps", default=500)
+    use_compile_val     = prompt_int("Enable torch.compile  (0=off 1=on)", valid={0,1}, default=0)
 
     # TBPTT (recurrent / scan only)
     use_tbptt = False; bptt_window = 0; tbptt_total_len = 0
-    if msel in RNN_MODEL_IDS or msel in SCAN_MODEL_IDS:
+    if not is_bottom_up_megabyte({"model_type": model_type}) and (msel in RNN_MODEL_IDS or msel in SCAN_MODEL_IDS):
         print(f"  │")
         print(f"  │  {_c(_DIM, 'Truncated BPTT (TBPTT) — instead of fitting one sequence per step,')}")
         print(f"  │  {_c(_DIM, 'the model processes a long stream and back-props through a short')}")
@@ -2517,6 +3555,7 @@ def build_config_new():
         epoch_count=epoch_count,
         batch_size=batch_size,
         learning_rate=learning_rate,
+        model_type=model_type,
         tokenizer_mode=tokenizer_mode,
         use_norm=use_norm,
         res_every=res_every,
@@ -2528,14 +3567,20 @@ def build_config_new():
         train_sample_prompt=train_sample_prompt,
     ).to_dict()
 
+    cfg["model_id_scheme"]   = MODEL_ID_SCHEME
+    cfg["line_seq_len_cap"]  = None   # line mode: window = longest line
+    if seq2seq: cfg["seq2seq"] = seq2seq
     if classic_val_path: cfg["classic_val_path"] = classic_val_path
     cfg["val_split"]         = val_split
     cfg["use_tbptt"]         = use_tbptt
     cfg["bptt_window"]       = bptt_window
     cfg["tbptt_total_len"]   = tbptt_total_len
     cfg["minrnn_act"]        = minrnn_act
+    cfg["rnn_ffn"]           = rnn_ffn
+    cfg["rnn_cell_options"]  = rnn_cell_options
     cfg["grad_accum_steps"]  = grad_accum
     cfg["use_amp"]           = bool(use_amp_val)
+    cfg["amp_dtype"]         = amp_dtype_val
     cfg["lr_scheduler"]      = lr_scheduler
     cfg["warmup_steps"]      = warmup_steps
     cfg["early_stopping"]    = bool(early_stop)
@@ -2543,30 +3588,116 @@ def build_config_new():
     cfg["log_interval"]      = log_interval
     cfg["sample_interval"]   = sample_interval_val
     cfg["val_interval"]      = val_interval_val
+    cfg["use_compile"]       = bool(use_compile_val)
+    cfg["ngram_context"]      = ngram_context
+    if target_params:
+        cfg["target_params"]  = target_params
+    cfg["sparse_local_window"] = sparse_local_window
+    cfg["sparse_compression_block"] = sparse_compression_block
+    cfg["sparse_selected_blocks"] = sparse_selected_blocks
+    if megabyte_stage_dims is not None:
+        cfg["megabyte_stage_dims"] = megabyte_stage_dims
+        cfg["megabyte_stage_depths"] = megabyte_stage_depths
+        cfg["megabyte_stage_heads"] = megabyte_stage_heads
+        cfg["megabyte_stage_seq_lens"] = megabyte_stage_seq_lens
+        cfg["megabyte_stage_child_embed_dims"] = megabyte_stage_child_embed_dims
+        cfg["megabyte_stage_mixers"] = megabyte_stage_mixers
+        if megabyte_bottom_up_encoder_stage_mixers is not None:
+            cfg["megabyte_bottom_up_encoder_stage_mixers"] = megabyte_bottom_up_encoder_stage_mixers
+            cfg["megabyte_bottom_up_decoder_stage_mixers"] = megabyte_bottom_up_decoder_stage_mixers
+        if megabyte_builtin_rnn:
+            cfg["megabyte_fused_rnn_version"] = 2
+            cfg["megabyte_fused_rnn_norm_type"] = use_norm
+            cfg["megabyte_fused_rnn_res_every"] = res_every
+            cfg["megabyte_fused_rnn_res_type"] = res_type
+            cfg["megabyte_fused_rnn_dropout"] = rnn_dropout
+        if model_type == MODEL_TYPE_MEGABYTE_BOTTOM_UP:
+            cfg["megabyte_bottom_up_version"] = 6
 
     cfg["optimizer"]         = optim_cfg["optimizer"]
     cfg["optim_params"]      = optim_cfg["optim_params"]
 
     if tokenizer_mode == 3: cfg["tiktoken_encoding"] = tke
-    if tokenizer_mode == 0: cfg["byte_output_text"]  = bool(byte_out == 1)
+    if tokenizer_mode in {-1, 0}: cfg["byte_output_text"] = bool(byte_out == 1)
     if tokenizer_mode == 4: cfg["custom_bpe_size"]   = vocab_size_bpe
     return cfg
 
 
+def validation_token_capacity(ds, line_mode: bool) -> Optional[int]:
+    """Return the finite held-out target-token budget when the dataset exposes one."""
+    if hasattr(ds, "start_idx") and hasattr(ds, "end_idx"):
+        return max(0, int(ds.end_idx) - int(ds.start_idx) - 1)
+    if line_mode and hasattr(ds, "offsets"):
+        # Indexed line validation scores distinct lines without replacement,
+        # so it cannot exceed the held-out set and needs no cap.
+        return None
+    if line_mode and hasattr(ds, "data"):
+        pad_id = getattr(ds.vocab, "pad_id", None)
+        return int((ds.data[:, 1:] != pad_id).sum().item()) if pad_id is not None else int(ds.data[:, 1:].numel())
+    return None
+
+
 @torch.no_grad()
-def eval_valid_loss(model, cfg, ds, vocab, line_mode, max_samples=1000):
+def eval_valid_loss(model, cfg, ds, vocab, line_mode, max_samples=1000, seed=None, return_metrics=False):
+    """Return mean token cross-entropy over a bounded dataset sample.
+
+    ``reduction='sum'`` plus an explicit token count prevents short, padded
+    line batches from receiving the same weight as full batches.  Supplying a
+    seed makes repeated validation checks use the same random held-out sample,
+    which is essential when selecting the best checkpoint by validation loss.
+    """
     is_scan = cfg["model_selection"] in SCAN_MODEL_IDS
-    
-    # === FIX: Ignore PAD tokens in validation loss ===
+
     pad_id = getattr(vocab, "pad_id", -100)
     if pad_id is None: pad_id = -100
-    criterion = nn.CrossEntropyLoss(ignore_index=pad_id)
-    
+    criterion = nn.CrossEntropyLoss(ignore_index=pad_id, reduction="sum")
     total_loss = 0.0
     total_tokens = 0
-
-    # Save original state
+    total_correct = 0
+    token_capacity = validation_token_capacity(ds, line_mode)
     orig_training = model.training
+
+    def forward_for_validation(x):
+        # Incremental MEGABYTE models use their token-by-token sampler in
+        # eval mode.  Validation scores independent full windows, so preserve
+        # eval semantics while using the vectorized hierarchy used in training.
+        if isinstance(model, MegaByteLM) and model.is_incremental:
+            return model._forward_full(x)
+        if is_scan or cfg["model_selection"] in RNN_MODEL_IDS:
+            out = model(x)
+            return out[0] if isinstance(out, tuple) else out
+        return model(x)
+
+    def accumulate(logits, targets):
+        """Add only the remaining held-out tokens, never exceeding file capacity."""
+        nonlocal total_loss, total_tokens, total_correct
+        target_mask = targets != pad_id
+        if token_capacity is not None:
+            remaining = token_capacity - total_tokens
+            if remaining <= 0:
+                return False
+            if int(target_mask.sum().item()) > remaining:
+                keep = target_mask.flatten().nonzero().flatten()[:remaining]
+                target_mask = torch.zeros_like(target_mask, dtype=torch.bool)
+                target_mask.flatten()[keep] = True
+        masked_targets = targets.masked_fill(~target_mask, pad_id)
+        loss = criterion(logits.reshape(-1, logits.size(-1)), masked_targets.reshape(-1))
+        total_loss += loss.item()
+        total_tokens += int(target_mask.sum().item())
+        total_correct += int(((logits.argmax(dim=-1) == targets) & target_mask).sum().item())
+        return token_capacity is None or total_tokens < token_capacity
+
+    # Dataset batchers use Python, NumPy, and Torch RNGs.  Preserve their state
+    # so validation neither changes training batches nor varies across checks.
+    rng_state = None
+    if seed is not None:
+        rng_state = (random.getstate(), np.random.get_state(), torch.get_rng_state())
+        cuda_rng_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
     
     try:
         # Scan models: keep in train() mode to use the fast parallel scan path.
@@ -2578,28 +3709,19 @@ def eval_valid_loss(model, cfg, ds, vocab, line_mode, max_samples=1000):
             model.eval() 
 
         # 1. New IndexedLineDataset (Disk-based)
-        if line_mode and hasattr(ds, 'offsets'): 
-            batch_size = min(32, cfg["batch_size"])  # Smaller for speed
-            steps = max(1, min(max_samples // batch_size, 30))  # Cap at 30 batches
-            
-            for _ in range(steps):
-                x, y = ds.get_batch(batch_size)
-                
-                if is_scan or cfg["model_selection"] in RNN_MODEL_IDS:
-                    out = model(x) # State is usually reset or None for random batches
-                    logits = out[0] if isinstance(out, tuple) else out
-                else:
-                    logits = model(x)
-
-                # Flatten and compute
-                loss = criterion(logits.reshape(-1, logits.size(-1)), y.reshape(-1))
-                
-                # Weighted average by number of non-pad tokens (more accurate)
-                # or just numel() if we want simple batch averaging. 
-                # Using numel() is standard but strictly speaking we should mask pads.
-                # For consistency with train_loop, numel() is fine as long as loss is masked.
-                total_loss += loss.item() * x.numel()
-                total_tokens += x.numel()
+        if line_mode and hasattr(ds, 'offsets'):
+            # Score up to max_samples distinct lines, each exactly once.  No
+            # line can be counted twice however small the held-out set, so no
+            # token cap (and no pass encoding the whole file) is needed.
+            # Length-sorted batches keep padding, and so memory, near the
+            # size of the lines actually in each batch.
+            batch_size = max(1, min(32, cfg["batch_size"]))
+            picked = random.sample(range(len(ds.offsets)), min(len(ds.offsets), max_samples))
+            examples = sorted((ds.get_encoded_example(i) for i in picked), key=lambda e: len(e[0]))
+            for start in range(0, len(examples), batch_size):
+                x, y = pad_line_examples(examples[start:start + batch_size], pad_id)
+                logits = forward_for_validation(x)
+                accumulate(logits, y)
 
         # 2. Old LineDataset (Memory-based)
         elif line_mode and hasattr(ds, 'data'):
@@ -2612,41 +3734,66 @@ def eval_valid_loss(model, cfg, ds, vocab, line_mode, max_samples=1000):
                 x = ds.data[idx][i:i+BATCH,:-1].to(DEVICE)
                 y = ds.data[idx][i:i+BATCH,1:].to(DEVICE)
                 
-                if is_scan or cfg["model_selection"] in RNN_MODEL_IDS:
-                    out = model(x)
-                    logits = out[0] if isinstance(out, tuple) else out
-                else:
-                    logits = model(x)
+                logits = forward_for_validation(x)
                     
-                loss = criterion(logits.reshape(-1, logits.size(-1)), y.reshape(-1))
-                total_loss += loss.item() * x.numel()
-                total_tokens += x.numel()
+                if not accumulate(logits, y):
+                    break
         
         # 3. Classic mode (Memmap or Standard)
         else:
-            steps = 20 # 20 batches is usually enough for a quick check
             bs = min(64, cfg["batch_size"])
+            steps = max(1, math.ceil(max_samples / bs))
             for _ in range(steps):
                 x, y = ds.get_batch(bs)
-                if is_scan or cfg["model_selection"] in RNN_MODEL_IDS:
-                    out = model(x)
-                    logits = out[0] if isinstance(out, tuple) else out
-                else:
-                    logits = model(x)
+                logits = forward_for_validation(x)
                 
-                loss = criterion(logits.reshape(-1, logits.size(-1)), y.reshape(-1))
-                total_loss += loss.item() * x.numel()
-                total_tokens += x.numel()
+                if not accumulate(logits, y):
+                    break
 
     finally:
-        # Restore original state (Train/Eval)
-        if orig_training:
-            model.train()
+        # Restore the caller's mode exactly.  In particular, validation of a
+        # scan model temporarily switches to train mode for its parallel path.
+        model.train(orig_training)
+        if rng_state is not None:
+            random.setstate(rng_state[0])
+            np.random.set_state(rng_state[1])
+            torch.set_rng_state(rng_state[2])
+            if cuda_rng_state is not None:
+                torch.cuda.set_rng_state_all(cuda_rng_state)
 
-    return (total_loss / max(1, total_tokens)) if total_tokens > 0 else None
+    if total_tokens == 0:
+        return None
+    metrics = loss_metrics(total_loss, total_tokens, cfg, total_correct)
+    metrics["tokens"] = total_tokens
+    return metrics if return_metrics else metrics["nll"]
 
 
-def load_or_make_vocab(cfg, txt_path: str) -> BaseVocab:
+def _restore_token_vocab(tokens, line_mode: bool, tokenizer_mode: int) -> BaseVocab:
+    tokens = list(tokens)
+    if tokenizer_mode == 2:
+        v = WordVocab.__new__(WordVocab)
+    else:
+        v = CharVocab.__new__(CharVocab)
+
+    if line_mode:
+        body = [t for t in tokens if t not in (BOS_TOKEN, EOS_TOKEN, PAD_TOKEN)]
+        tokens = [BOS_TOKEN, EOS_TOKEN, PAD_TOKEN] + body
+
+    v.line_mode = line_mode
+    v.tokens = tokens
+    v.stoi = {tok: i for i, tok in enumerate(v.tokens)}
+    v.itos = {i: tok for tok, i in v.stoi.items()}
+    v.bos_id = v.stoi.get(BOS_TOKEN) if line_mode else None
+    v.eos_id = v.stoi.get(EOS_TOKEN) if line_mode else None
+    v.pad_id = v.stoi.get(PAD_TOKEN) if line_mode else None
+    return v
+
+
+def load_or_make_vocab(cfg, txt_path: str, save_config: bool = True) -> BaseVocab:
+    """Build or restore the vocabulary.  ``save_config=False`` is for callers
+    whose ``cfg`` is a throwaway stub, not the run config in CONFIG_PATH."""
+    if txt_path == cfg.get("dataset_path"):
+        ensure_seq2seq_dataset(cfg)
     line_mode = (cfg["dataset_type"] == 1)
     tmode = int(cfg.get("tokenizer_mode", 1))
 
@@ -2675,16 +3822,7 @@ def load_or_make_vocab(cfg, txt_path: str) -> BaseVocab:
     # 2. Check if vocab is already in the config (this prevents recreation)
     if cfg.get("vocab_tokens") and len(cfg["vocab_tokens"]) > 0:
         print(f"[Vocab] Loading {len(cfg['vocab_tokens'])} tokens from config...")
-        # === FIX: Reconstruct CharVocab directly from token list ===
-        v = CharVocab.__new__(CharVocab)
-        v.line_mode = line_mode
-        v.tokens = cfg["vocab_tokens"]
-        v.stoi = {ch: i for i, ch in enumerate(v.tokens)}
-        v.itos = {i: ch for ch, i in v.stoi.items()}
-        v.bos_id = v.stoi.get(BOS_TOKEN) if line_mode else None
-        v.eos_id = v.stoi.get(EOS_TOKEN) if line_mode else None
-        v.pad_id = v.stoi.get(PAD_TOKEN) if line_mode else None
-        return v
+        return _restore_token_vocab(cfg["vocab_tokens"], line_mode, tmode)
 
     # 3. If not found, scan the file to build it
     print(f"[Vocab] Scanning {txt_path} to build vocabulary...")
@@ -2699,12 +3837,16 @@ def load_or_make_vocab(cfg, txt_path: str) -> BaseVocab:
     vocab_list = sorted(list(unique_tokens))
     print(f"[Vocab] Found {len(vocab_list)} unique tokens.")
     
-    v = CharVocab(vocab_list, line_mode)
+    if tmode == 2:
+        v = WordVocab(vocab_list, line_mode)
+    else:
+        v = CharVocab(vocab_list, line_mode)
     
     # 4. Save immediately to config
     cfg["vocab_tokens"] = v.tokens
-    save_json(CONFIG_PATH, cfg)
-    print(f"[Vocab] Saved tokens to {CONFIG_PATH}")
+    if save_config:
+        save_json(CONFIG_PATH, cfg)
+        print(f"[Vocab] Saved tokens to {CONFIG_PATH}")
     
     return v
 
@@ -2738,8 +3880,9 @@ def build_datasets(cfg, vocab):
     
     else:
         # === Line Mode ===
-        full_ds = IndexedLineDataset(path, vocab)
-        
+        spec = cfg.get("seq2seq")
+        full_ds = IndexedLineDataset(path, vocab, seq2seq_inputs=len(spec["input_cols"]) if spec else 0)
+
         # Use existing indices/logic but parameterize the split
         n = len(full_ds.offsets)
         if val_split > 0.0:
@@ -2761,8 +3904,12 @@ def build_datasets(cfg, vocab):
             cfg["valid_examples"] = 0
         
         cfg["line_max_len"] = full_ds.max_len
-        # Ensure seq_len doesn't exceed the longest line in the file
-        cfg["seq_len"] = min(full_ds.max_len, 2048) 
+        # The window is the longest line's byte length, which bounds its token
+        # count for every tokenizer except Binary (8 tokens per byte).  Configs saved before the cap was
+        # removed have no "line_seq_len_cap" key and keep the old 2048 limit,
+        # because their checkpoints' position-dependent weights were sized to it.
+        cap = cfg.get("line_seq_len_cap", 2048)
+        cfg["seq_len"] = full_ds.max_len if cap is None else min(full_ds.max_len, cap)
         
         return train_ds, valid_ds
 
@@ -2773,7 +3920,7 @@ def resume_adjustments(cfg, _model):
     print(f"  │  {_c(_DIM, 'Update training settings before continuing from the checkpoint.')}")
     print(f"  │  {_c(_DIM, 'Architecture and vocabulary cannot be changed on resume.')}")
 
-    if cfg["model_selection"] in RNN_MODEL_IDS:
+    if cfg["model_selection"] in RNN_MODEL_IDS and not is_bottom_up_megabyte(cfg):
         print(f"  │")
         print(f"  │  {_c(_DIM, 'Sequence length — RNNs allow changing this on resume because')}")
         print(f"  │  {_c(_DIM, 'the weights do not depend on a fixed context window size.')}")
@@ -2806,6 +3953,53 @@ def resume_adjustments(cfg, _model):
                 cfg["dataset_type"] = int(dt.strip())
                 cfg["_changed_dataset"] = True
     cli_section_end(64)
+    return cfg
+
+
+def retry_adjustments(cfg):
+    """Tune a saved configuration while deliberately starting fresh weights."""
+    cli_section("Retry Hyperparameters", 64)
+    print(f"  │  {_c(_DIM, 'Architecture, tokenizer, datasets, and validation setup are retained.')}")
+    print(f"  │  {_c(_DIM, 'Progress is reset; no saved model weights are loaded.')}")
+    print(f"  │")
+    cfg["epoch_count"] = prompt_int("Epoch count", default=cfg.get("epoch_count", 1))
+    cfg["batch_size"] = prompt_int("Batch size", default=cfg.get("batch_size", 1))
+    cfg["grad_accum_steps"] = prompt_int(
+        "Gradient accumulation steps  (1 = off)", default=cfg.get("grad_accum_steps", 1),
+    )
+    if DEVICE == "cuda":
+        cfg["use_amp"] = bool(prompt_int(
+            "Mixed precision / AMP  (0=off 1=on)", valid={0, 1}, default=int(cfg.get("use_amp", False)),
+        ))
+        if cfg["use_amp"]:
+            cfg["amp_dtype"] = prompt_amp_dtype(cfg.get("amp_dtype", "fp16"))
+    cfg["log_interval"] = prompt_int("Log loss every N update steps", default=cfg.get("log_interval", 10))
+    cfg["sample_interval"] = prompt_int("Sample every N update steps", default=cfg.get("sample_interval", 500))
+    cfg["val_interval"] = prompt_int("Run validation every N update steps", default=cfg.get("val_interval", 500))
+    cfg["save_interval"] = prompt_int("Save every N update steps", default=cfg.get("save_interval", 10_000))
+    cli_section_end(64)
+    optimizer_cfg = prompt_optimizer_config(cfg)
+    cfg["optimizer"] = optimizer_cfg["optimizer"]
+    cfg["optim_params"] = optimizer_cfg["optim_params"]
+    cfg["learning_rate"] = optimizer_cfg["optim_params"].get("lr", cfg.get("learning_rate", 0.0))
+    cfg["iterations_done"] = 0
+    cfg["train_tokens_done"] = 0
+    # Retry creates fresh weights, so it may safely adopt the current
+    # bottom-up decoder topology; regular resume deliberately cannot.
+    if cfg.get("model_type") == MODEL_TYPE_MEGABYTE_BOTTOM_UP:
+        cfg["megabyte_bottom_up_version"] = 6
+    selected_stage_mixers = cfg.get("megabyte_stage_mixers", ())
+    if isinstance(selected_stage_mixers, (str, int)):
+        selected_stage_mixers = (selected_stage_mixers,)
+    for config_key in (
+        "megabyte_bottom_up_encoder_stage_mixers",
+        "megabyte_bottom_up_decoder_stage_mixers",
+    ):
+        mixers = cfg.get(config_key, ())
+        selected_stage_mixers += (mixers,) if isinstance(mixers, (str, int)) else tuple(mixers)
+    if any(resolve_megabyte_stage_mixer(mixer) in {"rnn", "rnn_relu", "gru", "lstm"}
+           for mixer in selected_stage_mixers):
+        cfg["megabyte_fused_rnn_version"] = 2
     return cfg
 
 
@@ -2898,7 +4092,8 @@ OPTIMIZER_REGISTRY = [
             {"key": "lr", "prompt": "Learning rate", "type": "float", "default": 1e-3},
             {"key": "betas", "prompt": "Betas", "type": "betas", "default": (0.9, 0.999)},
             {"key": "eps", "prompt": "Epsilon", "type": "float", "default": 1e-6},
-            {"key": "weight_decay", "prompt": "Weight decay", "type": "float", "default": 1.0},
+            {"key": "weight_decay", "prompt": "Weight decay", "type": "float", "default": 0.0},
+            {"key": "adam", "prompt": "Adam fallback mode (0=off 1=on)", "type": "bool", "default": False},
         ],
     },
     {
@@ -2918,8 +4113,36 @@ OPTIMIZER_REGISTRY = [
         "defaults": {"lr": 1e-4},
         "params": [
             {"key": "lr", "prompt": "Learning rate", "type": "float", "default": 1e-4},
-            {"key": "betas", "prompt": "Betas", "type": "betas", "default": (0.9, 0.99)},
+            {"key": "betas", "prompt": "Betas", "type": "betas", "default": (0.95, 0.98)},
             {"key": "weight_decay", "prompt": "Weight decay", "type": "float", "default": 0.0},
+        ],
+    },
+    {
+        "name": "nSGDA",
+        "class": "nsgda",
+        "defaults": {"lr": 5e-2},
+        "params": [
+            {"key": "lr", "prompt": "Learning rate", "type": "float", "default": 5e-2},
+        ],
+    },
+    {
+        "name": "LayerWise nSGDA",
+        "class": "layerwise_nsgda",
+        "defaults": {"lr": 5e-2},
+        "params": [
+            {"key": "lr", "prompt": "Learning rate", "type": "float", "default": 5e-2},
+            {"key": "momentum", "prompt": "Momentum", "type": "float", "default": 0.9},
+            {"key": "cautious", "prompt": "Use cautious mask (0=off 1=on)", "type": "bool", "default": True},
+        ],
+    },
+    {
+        "name": "Ada-nSGDA",
+        "class": "ada_nsgda",
+        "defaults": {"lr": 1e-4},
+        "params": [
+            {"key": "lr", "prompt": "Learning rate", "type": "float", "default": 1e-4},
+            {"key": "betas", "prompt": "Betas", "type": "betas", "default": (0.0, 0.99)},
+            {"key": "eps", "prompt": "Epsilon", "type": "float", "default": 1e-8},
         ],
     },
     {
@@ -3079,7 +4302,194 @@ OPTIMIZER_REGISTRY = [
             {"key": "l1", "prompt": "Use L1 regularization (0=off 1=on)", "type": "bool", "default": False},
         ],
     },
+    {
+        "name": "ModernCLion",
+        "class": "modern_clion",
+        "defaults": {"lr": 1e-4},
+        "params": [
+            {"key": "lr", "prompt": "Learning rate", "type": "float", "default": 1e-4},
+            {"key": "betas", "prompt": "Betas", "type": "betas", "default": (0.9, 0.99)},
+            {"key": "weight_decay", "prompt": "Weight decay", "type": "float", "default": 0.0},
+            {"key": "nu", "prompt": "CLion threshold nu", "type": "float", "default": 1e-15},
+        ],
+    },
+    {
+        "name": "EqualizedAdamW",
+        "class": "equalized_adamw",
+        "defaults": {"lr": 1e-3},
+        "params": [
+            {"key": "lr", "prompt": "Learning rate", "type": "float", "default": 1e-3},
+            {"key": "betas", "prompt": "Betas", "type": "betas", "default": (0.9, 0.999)},
+            {"key": "eps", "prompt": "Epsilon", "type": "float", "default": 1e-8},
+            {"key": "weight_decay", "prompt": "Weight decay", "type": "float", "default": 0.0},
+            {"key": "lr_multiplier", "prompt": "Equalized LR multiplier", "type": "float", "default": 1.0},
+        ],
+    },
+    {
+        "name": "Muon",
+        "class": "muon",
+        "defaults": {"lr": 4.2e-4},
+        "params": [
+            {"key": "lr", "prompt": "Learning rate", "type": "float", "default": 4.2e-4},
+            {"key": "momentum", "prompt": "Momentum", "type": "float", "default": 0.95},
+            {"key": "rank", "prompt": "Muon rank (0=full Muon)", "type": "int", "default": 0},
+            {"key": "muon_all", "prompt": "MuonAll (all parameters)", "type": "bool", "default": False},
+            {"key": "muon_all_reshape", "prompt": "MuonAll: use near-square vector reshape?", "type": "bool", "default": False},
+            {"key": "cautious", "prompt": "Cautious updates (0=off 1=on)", "type": "bool", "default": False},
+            {"key": "orthogonalization_backend", "prompt": "Backend (newton_schulz / polar_express)", "type": "backend", "default": "polar_express"},
+            {"key": "weight_decay", "prompt": "Weight decay", "type": "float", "default": 0.1},
+            {"key": "newton_schulz_iter", "prompt": "Orthogonalization iterations", "type": "int", "default": 5},
+            {"key": "adam_betas", "prompt": "AdamW fallback betas", "type": "betas", "default": (0.9, 0.999)},
+            {"key": "adam_eps", "prompt": "AdamW fallback epsilon", "type": "float", "default": 1e-8},
+            {"key": "foreach", "prompt": "Batch optimizer updates (0=off 1=on)", "type": "bool", "default": True},
+            {"key": "ns_bfloat16", "prompt": "BF16 matrix iterations (0=off 1=on)", "type": "bool", "default": False},
+        ],
+    },
+    {
+        "name": "AdaMuon",
+        "class": "adamuon",
+        "defaults": {"lr": 4.2e-4},
+        "params": [
+            {"key": "lr", "prompt": "Learning rate", "type": "float", "default": 4.2e-4},
+            {"key": "eps", "prompt": "AdaMuon epsilon", "type": "float", "default": 1e-8},
+            {"key": "nesterov", "prompt": "Nesterov (off=paper Algorithm 1)", "type": "bool", "default": False},
+            {"key": "momentum", "prompt": "Momentum", "type": "float", "default": 0.95},
+            {"key": "rank", "prompt": "AdaMuon rank (0=paper, >0=approximate)", "type": "int", "default": 0},
+            {"key": "muon_all", "prompt": "MuonAll (all parameters)", "type": "bool", "default": False},
+            {"key": "muon_all_reshape", "prompt": "MuonAll: use near-square vector reshape?", "type": "bool", "default": False},
+            {"key": "cautious", "prompt": "Cautious updates (0=off 1=on)", "type": "bool", "default": False},
+            {"key": "orthogonalization_backend", "prompt": "Backend (newton_schulz / polar_express)", "type": "backend", "default": "polar_express"},
+            {"key": "weight_decay", "prompt": "Weight decay", "type": "float", "default": 0.1},
+            {"key": "newton_schulz_iter", "prompt": "Orthogonalization iterations", "type": "int", "default": 5},
+            {"key": "adam_betas", "prompt": "AdamW fallback betas", "type": "betas", "default": (0.9, 0.999)},
+            {"key": "adam_eps", "prompt": "AdamW fallback epsilon", "type": "float", "default": 1e-8},
+            {"key": "foreach", "prompt": "Batch optimizer updates (0=off 1=on)", "type": "bool", "default": True},
+            {"key": "ns_bfloat16", "prompt": "BF16 matrix iterations (0=off 1=on)", "type": "bool", "default": False},
+        ],
+    },
+    {
+        "name": "NorMuon", "class": "normuon", "defaults": {"lr": 4.2e-4},
+        "params": [
+            {"key": "lr", "prompt": "Learning rate", "type": "float", "default": 4.2e-4},
+            {"key": "momentum", "prompt": "Momentum (beta1)", "type": "float", "default": .95},
+            {"key": "beta2", "prompt": "Row variance decay (beta2)", "type": "float", "default": .95},
+            {"key": "eps", "prompt": "NorMuon epsilon", "type": "float", "default": 1e-8},
+            {"key": "rank", "prompt": "Rank (0=full, >0=approximate)", "type": "int", "default": 0},
+            {"key": "muon_all", "prompt": "MuonAll (all parameters)", "type": "bool", "default": False},
+            {"key": "muon_all_reshape", "prompt": "MuonAll: use near-square vector reshape?", "type": "bool", "default": False},
+            {"key": "cautious", "prompt": "Cautious updates (0=off 1=on)", "type": "bool", "default": False},
+            {"key": "orthogonalization_backend", "prompt": "Backend (newton_schulz / polar_express)", "type": "backend", "default": "polar_express"},
+            {"key": "weight_decay", "prompt": "Weight decay", "type": "float", "default": .1},
+            {"key": "newton_schulz_iter", "prompt": "Orthogonalization iterations", "type": "int", "default": 5},
+            {"key": "adam_betas", "prompt": "AdamW fallback betas", "type": "betas", "default": (.9, .999)},
+            {"key": "adam_eps", "prompt": "AdamW fallback epsilon", "type": "float", "default": 1e-8},
+            {"key": "foreach", "prompt": "Batch optimizer updates (0=off 1=on)", "type": "bool", "default": True},
+            {"key": "ns_bfloat16", "prompt": "BF16 matrix iterations (0=off 1=on)", "type": "bool", "default": False},
+        ],
+    },
+    {
+        "name": "AdaGO", "class": "adago", "defaults": {"lr": .05},
+        "params": [
+            {"key": "lr", "prompt": "Learning rate", "type": "float", "default": .05},
+            {"key": "adam_lr", "prompt": "AdamW fallback learning rate (embeddings, heads, vectors)", "type": "float", "default": 4.2e-4},
+            {"key": "momentum", "prompt": "Momentum", "type": "float", "default": .95},
+            {"key": "gamma", "prompt": "Gradient norm cap (gamma)", "type": "float", "default": 1.},
+            {"key": "v0", "prompt": "Initial norm accumulator (v0)", "type": "float", "default": 1.},
+            {"key": "eps", "prompt": "Minimum step (epsilon)", "type": "float", "default": 5e-4},
+            {"key": "rank", "prompt": "Rank (0=full, >0=approximate)", "type": "int", "default": 0},
+            {"key": "muon_all", "prompt": "MuonAll (all parameters)", "type": "bool", "default": False},
+            {"key": "muon_all_reshape", "prompt": "MuonAll: use near-square vector reshape?", "type": "bool", "default": False},
+            {"key": "cautious", "prompt": "Cautious updates (0=off 1=on)", "type": "bool", "default": False},
+            {"key": "orthogonalization_backend", "prompt": "Backend (newton_schulz / polar_express)", "type": "backend", "default": "polar_express"},
+            {"key": "weight_decay", "prompt": "Weight decay", "type": "float", "default": 0.},
+            {"key": "newton_schulz_iter", "prompt": "Orthogonalization iterations", "type": "int", "default": 5},
+            {"key": "adam_betas", "prompt": "AdamW fallback betas", "type": "betas", "default": (.9, .95)},
+            {"key": "adam_eps", "prompt": "AdamW fallback epsilon", "type": "float", "default": 1e-8},
+            {"key": "foreach", "prompt": "Batch optimizer updates (0=off 1=on)", "type": "bool", "default": True},
+            {"key": "ns_bfloat16", "prompt": "BF16 matrix iterations (0=off 1=on)", "type": "bool", "default": False},
+        ],
+    },
+    {
+        "name": "AdamGO", "class": "adamgo", "defaults": {"lr": .05},
+        "params": [
+            {"key": "lr", "prompt": "Learning rate", "type": "float", "default": .05},
+            {"key": "adam_lr", "prompt": "AdamW fallback learning rate (embeddings, heads, vectors)", "type": "float", "default": 4.2e-4},
+            {"key": "momentum", "prompt": "Momentum", "type": "float", "default": .95},
+            {"key": "gamma", "prompt": "Gradient norm cap (gamma)", "type": "float", "default": 1.},
+            {"key": "beta2", "prompt": "Norm variance decay (beta2)", "type": "float", "default": .999},
+            {"key": "delta", "prompt": "Denominator stabilizer (delta)", "type": "float", "default": 1e-8},
+            {"key": "min_step", "prompt": "Minimum step (0=disabled)", "type": "float", "default": 0.},
+            {"key": "rank", "prompt": "Rank (0=full, >0=approximate)", "type": "int", "default": 0},
+            {"key": "muon_all", "prompt": "MuonAll (all parameters)", "type": "bool", "default": False},
+            {"key": "muon_all_reshape", "prompt": "MuonAll: use near-square vector reshape?", "type": "bool", "default": False},
+            {"key": "cautious", "prompt": "Cautious updates (0=off 1=on)", "type": "bool", "default": False},
+            {"key": "orthogonalization_backend", "prompt": "Backend (newton_schulz / polar_express)", "type": "backend", "default": "polar_express"},
+            {"key": "weight_decay", "prompt": "Weight decay", "type": "float", "default": 0.},
+            {"key": "newton_schulz_iter", "prompt": "Orthogonalization iterations", "type": "int", "default": 5},
+            {"key": "adam_betas", "prompt": "AdamW fallback betas", "type": "betas", "default": (.9, .95)},
+            {"key": "adam_eps", "prompt": "AdamW fallback epsilon", "type": "float", "default": 1e-8},
+            {"key": "foreach", "prompt": "Batch optimizer updates (0=off 1=on)", "type": "bool", "default": True},
+            {"key": "ns_bfloat16", "prompt": "BF16 matrix iterations (0=off 1=on)", "type": "bool", "default": False},
+        ],
+    },
+    {
+        "name": "RMSGO", "class": "rmsgo", "defaults": {"lr": .05},
+        "params": [
+            {"key": "beta2", "prompt": "Norm variance decay (beta2)", "type": "float", "default": .99},
+            {"key": "lr", "prompt": "Learning rate", "type": "float", "default": .05},
+            {"key": "adam_lr", "prompt": "AdamW fallback learning rate (embeddings, heads, vectors)", "type": "float", "default": 4.2e-4},
+            {"key": "momentum", "prompt": "Momentum", "type": "float", "default": .95},
+            {"key": "gamma", "prompt": "Gradient norm cap (gamma)", "type": "float", "default": 1.},
+            {"key": "v0", "prompt": "Initial norm accumulator (v0)", "type": "float", "default": 1.},
+            {"key": "eps", "prompt": "Minimum step (epsilon)", "type": "float", "default": 5e-4},
+            {"key": "rank", "prompt": "Rank (0=full, >0=approximate)", "type": "int", "default": 0},
+            {"key": "muon_all", "prompt": "MuonAll (all parameters)", "type": "bool", "default": False},
+            {"key": "muon_all_reshape", "prompt": "MuonAll: use near-square vector reshape?", "type": "bool", "default": False},
+            {"key": "cautious", "prompt": "Cautious updates (0=off 1=on)", "type": "bool", "default": False},
+            {"key": "orthogonalization_backend", "prompt": "Backend (newton_schulz / polar_express)", "type": "backend", "default": "polar_express"},
+            {"key": "weight_decay", "prompt": "Weight decay", "type": "float", "default": 0.},
+            {"key": "newton_schulz_iter", "prompt": "Orthogonalization iterations", "type": "int", "default": 5},
+            {"key": "adam_betas", "prompt": "AdamW fallback betas", "type": "betas", "default": (.9, .95)},
+            {"key": "adam_eps", "prompt": "AdamW fallback epsilon", "type": "float", "default": 1e-8},
+            {"key": "foreach", "prompt": "Batch optimizer updates (0=off 1=on)", "type": "bool", "default": True},
+            {"key": "ns_bfloat16", "prompt": "BF16 matrix iterations (0=off 1=on)", "type": "bool", "default": False},
+        ],
+    },
+    {
+        "name": "AdaDeltaGO", "class": "adadeltago", "defaults": {"lr": .05},
+        "params": [
+            {"key": "rho", "prompt": "Averaging decay (rho)", "type": "float", "default": .9},
+            {"key": "lr", "prompt": "Learning rate", "type": "float", "default": .05},
+            {"key": "adam_lr", "prompt": "AdamW fallback learning rate (embeddings, heads, vectors)", "type": "float", "default": 4.2e-4},
+            {"key": "momentum", "prompt": "Momentum", "type": "float", "default": .95},
+            {"key": "gamma", "prompt": "Gradient norm cap (gamma)", "type": "float", "default": 1.},
+            {"key": "eps", "prompt": "RMS stabilizer (epsilon)", "type": "float", "default": 1e-6},
+            {"key": "rank", "prompt": "Rank (0=full, >0=approximate)", "type": "int", "default": 0},
+            {"key": "muon_all", "prompt": "MuonAll (all parameters)", "type": "bool", "default": False},
+            {"key": "muon_all_reshape", "prompt": "MuonAll: use near-square vector reshape?", "type": "bool", "default": False},
+            {"key": "cautious", "prompt": "Cautious updates (0=off 1=on)", "type": "bool", "default": False},
+            {"key": "orthogonalization_backend", "prompt": "Backend (newton_schulz / polar_express)", "type": "backend", "default": "polar_express"},
+            {"key": "weight_decay", "prompt": "Weight decay", "type": "float", "default": 0.},
+            {"key": "newton_schulz_iter", "prompt": "Orthogonalization iterations", "type": "int", "default": 5},
+            {"key": "adam_betas", "prompt": "AdamW fallback betas", "type": "betas", "default": (.9, .95)},
+            {"key": "adam_eps", "prompt": "AdamW fallback epsilon", "type": "float", "default": 1e-8},
+            {"key": "foreach", "prompt": "Batch optimizer updates (0=off 1=on)", "type": "bool", "default": True},
+            {"key": "ns_bfloat16", "prompt": "BF16 matrix iterations (0=off 1=on)", "type": "bool", "default": False},
+        ],
+    },
+    {
+        "name": "RAdamScheduleFree",
+        "class": "radam_schedulefree",
+        "defaults": {"lr": 2.5e-3},
+        "params": [
+            {"key": "lr", "prompt": "Learning rate  (no warmup or scheduler needed)", "type": "float", "default": 2.5e-3},
+            {"key": "betas", "prompt": "Betas", "type": "betas", "default": (0.9, 0.999)},
+            {"key": "eps", "prompt": "Epsilon", "type": "float", "default": 1e-8},
+            {"key": "weight_decay", "prompt": "Weight decay", "type": "float", "default": 0.0},
+        ],
+    },
 ]
+
 
 def _get_optimizer_names():
     return [o["name"] for o in OPTIMIZER_REGISTRY]
@@ -3098,9 +4508,14 @@ def _parse_optim_param(raw_str, ptype, default):
     if ptype == "betas":
         parts = [float(x.strip()) for x in raw_str.split(",")]
         return tuple(parts)
+    if ptype == "backend":
+        backend = raw_str.strip().casefold()
+        if backend not in ("newton_schulz", "polar_express"):
+            raise ValueError("Backend must be newton_schulz or polar_express")
+        return backend
     return raw_str
 
-def prompt_optimizer_config():
+def prompt_optimizer_config(saved_config=None):
     """Interactive optimizer selection + per-optimizer param prompts.
     Returns dict: {"optimizer": str, "optim_params": {key: value, ...}}
     """
@@ -3110,24 +4525,74 @@ def prompt_optimizer_config():
         desc = ", ".join(f"{p['key']}={p['default']}" for p in entry["params"][:3])
         cli_opt(i, entry["name"], desc)
     print(f"  │")
-    choice = prompt_int("Optimizer", valid=set(range(len(OPTIMIZER_REGISTRY))), default=24)
+    saved_config = saved_config or {}
+    saved_optimizer = saved_config.get("optimizer")
+    default_choice = next(
+        (index for index, candidate in enumerate(OPTIMIZER_REGISTRY)
+         if candidate["class"] == saved_optimizer),
+        24,
+    )
+    choice = prompt_int("Optimizer", valid=set(range(len(OPTIMIZER_REGISTRY))), default=default_choice)
     entry = OPTIMIZER_REGISTRY[choice]
 
     print(f"  │")
     opt_name = entry["name"]
     print(f"  │  {_c(_DIM, f'Configure {opt_name} parameters  (press Enter for default):')}")
     optim_params = {}
+    saved_params = saved_config.get("optim_params", {}) if entry["class"] == saved_optimizer else {}
     for p in entry["params"]:
-        label = prompt_label(p["prompt"], p["default"])
+        default = saved_params.get(p["key"], p["default"])
+        label = prompt_label(p["prompt"], default)
         raw = input(label).strip()
-        optim_params[p["key"]] = _parse_optim_param(raw, p["type"], p["default"])
+        optim_params[p["key"]] = _parse_optim_param(raw, p["type"], default)
 
     cli_section_end(64)
     return {"optimizer": entry["class"], "optim_params": optim_params}
 
 
+def layerwise_param_groups(model: nn.Module):
+    groups = []
+    seen = set()
+    for module in model.modules():
+        params = []
+        for p in module.parameters(recurse=False):
+            if p.requires_grad and id(p) not in seen:
+                params.append(p)
+                seen.add(id(p))
+        if params:
+            groups.append({"params": params})
+    leftover = [p for p in model.parameters() if p.requires_grad and id(p) not in seen]
+    if leftover:
+        groups.append({"params": leftover})
+    return groups or [{"params": [p for p in model.parameters() if p.requires_grad]}]
+
+
+def linegen_muon_param_groups(model, optim_groups):
+    """Keep token/position embeddings and vocabulary heads on AdamW.
+
+    Preserve the existing decay groups; internal attention output projections
+    remain Muon matrices. The shared helper handles tied embedding/head weights.
+    """
+    adamw_params = []
+    for name, param in model.named_parameters():
+        parts = name.split('.')
+        if any('embed' in part or part in {'pos', 'head', 'lm_head'} for part in parts):
+            adamw_params.append(param)
+    root = model
+    while hasattr(root, '_orig_mod'):
+        root = root._orig_mod
+    # A few LM families call their vocabulary projection `out`; the one-hot
+    # MLP and NeuralNGramLM put it at the end of a top-level Sequential.
+    if isinstance(getattr(root, 'out', None), nn.Linear):
+        adamw_params.extend(root.out.parameters())
+    if isinstance(getattr(root, 'mlp', None), nn.Sequential) and len(root.mlp):
+        adamw_params.extend(root.mlp[-1].parameters())
+    return muon_param_groups(model, adamw_params, optim_groups)
+
+
 def build_optimizer(model, cfg):
-    wd = cfg.get("optim_params", {}).get("weight_decay", 0.0)
+    wd = cfg.get("optim_params", {}).get(
+        "weight_decay", 0.1 if cfg.get("optimizer") in {"muon", "adamuon", "normuon"} else 0.0)
     decay_params = []
     no_decay_params = []
 
@@ -3160,13 +4625,65 @@ def build_optimizer(model, cfg):
     optimizer_key = cfg.get("optimizer", "prodigy")
     op = cfg.get("optim_params", {})
 
-    if optimizer_key == "prodigy":
+    if optimizer_key in {"muon", "adamuon", "normuon", "adago", "adamgo", "rmsgo", "adadeltago"}:
+        optimizer_cls = (AdaDeltaGO if optimizer_key == 'adadeltago' else RMSGO if optimizer_key == 'rmsgo' else AdamGO if optimizer_key == 'adamgo' else AdaGO if optimizer_key == 'adago' else NorMuon if optimizer_key == 'normuon'
+                         else AdaMuon if optimizer_key == 'adamuon' else Muon)
+        adaptive = ({'eps': op.get('eps', 1e-8), 'nesterov': op.get('nesterov', False)}
+                    if optimizer_key == 'adamuon' else {})
+        if optimizer_key == 'normuon':
+            adaptive = {'eps': op.get('eps', 1e-8), 'beta2': op.get('beta2', .95)}
+        if optimizer_key == 'adago':
+            adaptive = {'eps': op.get('eps', 5e-4), 'gamma': op.get('gamma', 1.), 'v0': op.get('v0', 1.)}
+        if optimizer_key == 'rmsgo':
+            adaptive = {'eps': op.get('eps', 5e-4), 'gamma': op.get('gamma', 1.), 'v0': op.get('v0', 1.)}
+            adaptive['beta2'] = op.get('beta2', .99)
+        if optimizer_key == 'adadeltago':
+            adaptive = {'rho': op.get('rho', .9), 'gamma': op.get('gamma', 1.), 'eps': op.get('eps', 1e-6)}
+        if optimizer_key == 'adamgo':
+            adaptive = {'beta2': op.get('beta2', .999), 'gamma': op.get('gamma', 1.),
+                        'delta': op.get('delta', 1e-8), 'min_step': op.get('min_step', 0.)}
+        optimizer = optimizer_cls(
+            linegen_muon_param_groups(model, optim_groups),
+            lr=op.get("lr", .05 if optimizer_key in {"adago", "adamgo", "rmsgo", "adadeltago"} else 4.2e-4), momentum=op.get("momentum", 0.95),
+            weight_decay=wd, newton_schulz_iter=op.get("newton_schulz_iter", 5),
+            adam_betas=tuple(op.get("adam_betas", (0.9, 0.95 if optimizer_key in {"adago", "adamgo", "rmsgo", "adadeltago"} else 0.999))),
+            adam_eps=op.get("adam_eps", 1e-8), foreach=op.get("foreach", True),
+            ns_bfloat16=op.get("ns_bfloat16", False),
+            rank=op.get("rank", 0),
+            cautious=op.get("cautious", False),
+            muon_all=op.get("muon_all", False),
+            muon_all_reshape=op.get("muon_all_reshape", False),
+            orthogonalization_backend=op.get("orthogonalization_backend", "polar_express"),
+            **adaptive,
+        )
+        # Separate AdamW-fallback LR; GO matrix LRs (0.05) are far too large
+        # for Adam. Absent = legacy shared LR. MuonAll has no fallback groups.
+        adam_lr = op.get("adam_lr")
+        if adam_lr is not None and not op.get("muon_all", False):
+            if isinstance(adam_lr, bool) or not math.isfinite(adam_lr) or adam_lr <= 0:
+                raise ValueError(f"adam_lr must be a finite positive number, got {adam_lr!r}")
+            for group in optimizer.param_groups:
+                if not group["use_muon"]:
+                    group["lr"] = adam_lr
+        return optimizer
+    elif optimizer_key == "prodigy":
         return Prodigy(optim_groups, lr=op.get("lr", 1.0), slice_p=op.get("slice_p", 8))
     elif optimizer_key == "adam":
         betas = op.get("betas", (0.9, 0.999))
         if isinstance(betas, list): betas = tuple(betas)
         return torch.optim.Adam(optim_groups, lr=op.get("lr", 3e-4),
                                 betas=betas, eps=op.get("eps", 1e-8))
+    elif optimizer_key == "equalized_adamw":
+        betas = op.get("betas", (0.9, 0.999))
+        if isinstance(betas, list): betas = tuple(betas)
+        return EqualizedAdamW(
+            optim_groups,
+            lr=op.get("lr", 1e-3),
+            betas=betas,
+            eps=op.get("eps", 1e-8),
+            weight_decay=op.get("weight_decay", 0.0),
+            lr_multiplier=op.get("lr_multiplier", 1.0),
+        )
     elif optimizer_key == "sgd":
         return torch.optim.SGD(optim_groups, lr=op.get("lr", 1e-2),
                                momentum=op.get("momentum", 0.9),
@@ -3194,7 +4711,8 @@ def build_optimizer(model, cfg):
     elif optimizer_key == "lamb":
         betas = op.get("betas", (0.9, 0.999))
         if isinstance(betas, list): betas = tuple(betas)
-        return Lamb(optim_groups, lr=op.get("lr", 1e-3), betas=betas, eps=op.get("eps", 1e-6))
+        return Lamb(optim_groups, lr=op.get("lr", 1e-3), betas=betas,
+                    eps=op.get("eps", 1e-6), adam=op.get("adam", False))
         
     elif optimizer_key == "grokfast_adamw":
         betas = op.get("betas", (0.9, 0.99))
@@ -3202,10 +4720,35 @@ def build_optimizer(model, cfg):
         return GrokFastAdamW(optim_groups, lr=op.get("lr", 1e-4), betas=betas, eps=op.get("eps", 1e-8), grokfast=op.get("grokfast", True))
         
     elif optimizer_key == "clion":
+        betas = op.get("betas", (0.95, 0.98))
+        if isinstance(betas, list): betas = tuple(betas)
+        return CLion(optim_groups, lr=op.get("lr", 1e-4), betas=betas,
+                     weight_decay=op.get("weight_decay", 0.0))
+
+    elif optimizer_key == "modern_clion":
         betas = op.get("betas", (0.9, 0.99))
         if isinstance(betas, list): betas = tuple(betas)
-        return CLion(optim_groups, lr=op.get("lr", 1e-4), betas=betas)
-        
+        return ModernCLion(optim_groups, lr=op.get("lr", 1e-4), betas=betas,
+                           weight_decay=op.get("weight_decay", 0.0),
+                           nu=op.get("nu", 1e-15))
+
+    elif optimizer_key == "nsgda":
+        return NSGDA(model.parameters(), lr=op.get("lr", 5e-2))
+
+    elif optimizer_key == "layerwise_nsgda":
+        return NSGDA(
+            layerwise_param_groups(model),
+            lr=op.get("lr", 5e-2),
+            momentum=op.get("momentum", 0.9),
+            cautious=op.get("cautious", True),
+        )
+
+    elif optimizer_key == "ada_nsgda":
+        betas = op.get("betas", (0.0, 0.99))
+        if isinstance(betas, list): betas = tuple(betas)
+        return AdaNSGDA(model.parameters(), lr=op.get("lr", 1e-4),
+                        betas=betas, eps=op.get("eps", 1e-8))
+	        
     elif optimizer_key == "cadamw":
         betas = op.get("betas", (0.9, 0.999))
         if isinstance(betas, list): betas = tuple(betas)
@@ -3285,33 +4828,80 @@ def build_optimizer(model, cfg):
             eps=op.get("eps", 1e-8), 
             l1=l1s,#op.get("l1", False)
         )
+    elif optimizer_key == "radam_schedulefree":
+        betas = op.get("betas", (0.9, 0.999))
+        if isinstance(betas, list): betas = tuple(betas)
+        optimizer = RAdamScheduleFree(optim_groups, lr=op.get("lr", 2.5e-3), betas=betas, eps=op.get("eps", 1e-8))
+        optimizer.train()  # step() requires train mode; evaluation and saving swap to x
+        return optimizer
     else:
         raise ValueError(f"Unknown optimizer: {optimizer_key}")
+AMP_DTYPES = {"fp16": torch.float16, "bf16": torch.bfloat16}
+
+
+def amp_settings(cfg):
+    """Return (enabled, autocast dtype, GradScaler or None) for a config.
+
+    ``amp_dtype`` defaults to fp16 so configs saved before the option existed
+    keep their behaviour.  bf16 has fp32's exponent range and needs no loss
+    scaling; it falls back to fp16 on GPUs without bf16 support.
+    """
+    use_amp = bool(cfg.get("use_amp", False)) and DEVICE == "cuda"
+    name = str(cfg.get("amp_dtype", "fp16")).lower()
+    if name not in AMP_DTYPES:
+        raise ValueError(f"Unknown AMP dtype {name!r}; expected one of {sorted(AMP_DTYPES)}")
+    if use_amp and name == "bf16" and not torch.cuda.is_bf16_supported():
+        pwarn("bf16 AMP is not supported on this GPU; using fp16")
+        name = "fp16"
+    dtype = AMP_DTYPES[name]
+    scaler = torch.amp.GradScaler("cuda") if use_amp and dtype == torch.float16 else None
+    return use_amp, dtype, scaler
+
+
+def prompt_amp_dtype(default="fp16"):
+    """Ask for the autocast precision; returns 'fp16' or 'bf16'."""
+    print(f"  │  {_c(_DIM, 'fp16 uses loss scaling; bf16 (Ampere+) keeps the fp32 exponent range and needs none.')}")
+    choice = prompt_int("AMP precision  (0=fp16 1=bf16)", valid={0, 1}, default=int(default == "bf16"))
+    return "bf16" if choice == 1 else "fp16"
+
+
 def wrap_model_with_compile(model, cfg):
-    msel = cfg["model_selection"]
-    
-    # 1. Skip Scan Models (Vectorized cumsum/prod are already efficient)
-    # Compiling these often leads to overhead with no gain on 11.7
-    if msel in SCAN_MODEL_IDS:
-        print("ℹ️ Scan Model detected: Skipping torch.compile (using Eager mode)")
+    """Best-effort family-aware compilation with a safe eager fallback.
+
+    All zoo models must accept tensor inputs and return tensors or fixed nested
+    tensor state.  Individual recurrent time loops may still graph-break under
+    older PyTorch releases, so we deliberately do not require a full graph.
+    """
+    if not cfg.get("use_compile", False):
         return model
-
-    # 2. Modern Transformers (Attention-heavy)
-    # Mode: max-autotune enables CUDA Graphs and optimized SDPA (Flash Attention)
-    if msel in {10, 25}: # GPT and Modern Transformer
-        print("🚀 Transformer detected: Compiling with mode='max-autotune'")
-        return torch.compile(model, mode="max-autotune")
-
-    # 3. Custom RNNs (Loop-heavy)
-    # Mode: max-autotune is best for these custom cells as it generates 
-    # optimized Triton kernels for your specific math (ATanU, etc.)
-    if msel in RNN_MODEL_IDS:
-        print("⚡ Custom RNN detected: Compiling with mode='reduce-overhead'")
-        return torch.compile(model, mode="default")
-
-    # 4. Fallback for MLPs / TCN
-    print("✨ Generic model detected: Compiling with mode='reduce-overhead'")
-    return torch.compile(model, mode="reduce-overhead")
+    # Inductor compiles lazily on the first forward.  A wrapping-time try/except
+    # alone cannot catch unsupported Triton/CUDA kernel images, so ask Dynamo to
+    # retain the eager graph whenever a backend compilation fails.
+    torch._dynamo.config.suppress_errors = True
+    msel = cfg["model_selection"]
+    if msel in {301, 304, 305, 400, 300, 306}:
+        family, mode, dynamic = "transformer", "max-autotune", True
+    elif msel in SCAN_MODEL_IDS:
+        family, mode, dynamic = "scan/SSM", "reduce-overhead", True
+    elif msel in RNN_MODEL_IDS and not is_bottom_up_megabyte(cfg):
+        family, mode, dynamic = "recurrent", "reduce-overhead", True
+    else:
+        family, mode, dynamic = "MLP/mixer", "reduce-overhead", True
+    try:
+        # `aot_eager` is the portable default.  Select `inductor` explicitly in
+        # the saved config only on a CUDA/Triton combination known to support
+        # the installed GPU; otherwise it can fail with an invalid kernel image.
+        backend = cfg.get("compile_backend", "aot_eager")
+        print(f"🚀 torch.compile: {family}, backend={backend}, mode={mode}, dynamic={dynamic}")
+        kwargs = dict(backend=backend, dynamic=dynamic, fullgraph=False)
+        # `mode` is an Inductor option; passing it to aot_eager itself causes
+        # a deferred backend error on PyTorch 2.4.
+        if backend == "inductor":
+            kwargs["mode"] = mode
+        return torch.compile(model, **kwargs)
+    except Exception as exc:
+        print(f"⚠️ torch.compile unavailable for {family}: {exc}; using eager mode")
+        return model
 # ========= NEW MODES =========
 
 def run_interactive_chat(cfg, model, vocab):
@@ -3358,7 +4948,15 @@ def run_interactive_chat(cfg, model, vocab):
         cfg["temperature"] = temp
         cfg["_top_k"] = top_k; cfg["_top_p"] = top_p; cfg["_rep_penalty"] = rep_penalty
         
-        if line_mode:
+        if line_mode and cfg.get("seq2seq"):
+            # Seq2seq: the user types the input columns; reply with the outputs.
+            try:
+                p_ids = encode_seq2seq_prompt(vocab, cfg["seq2seq"], user_input)
+            except ValueError as exc:
+                pwarn(str(exc)); continue
+            out_ids = generate_line_mode(model, cfg, vocab, p_ids, limit_len=gen_len)
+            print(f"Model> {seq2seq_visible(vocab.decode(out_ids[len(p_ids):]))}\n")
+        elif line_mode:
             p_ids = vocab.encode(BOS_TOKEN + user_input)
             out_ids = generate_line_mode(model, cfg, vocab, p_ids, limit_len=gen_len)
             text = vocab.decode(out_ids[1:]) if len(out_ids) > 1 else ""
@@ -3377,7 +4975,7 @@ def run_perplexity_eval():
     if not os.path.exists(CONFIG_PATH):
         pwarn("No config found — train a model first."); return
 
-    cfg = load_json(CONFIG_PATH)
+    cfg = load_run_config()
     vocab = load_or_make_vocab(cfg, cfg["dataset_path"])
     model = build_model(cfg, vocab.size)
     model.to(DEVICE)
@@ -3393,6 +4991,9 @@ def run_perplexity_eval():
     print(f"  │  {_c(_DIM, 'Evaluation file — the text file to measure perplexity on.')}")
     print(f"  │  {_c(_DIM, 'Should be held-out data the model has never seen during training.')}")
     print(f"  │  {_c(_DIM, 'Defaults to the training file if left blank.')}")
+    if cfg.get("seq2seq"):
+        print(f"  │  {_c(_DIM, 'Seq2seq: another file must have the same columns and delimiter;')}")
+        print(f"  │  {_c(_DIM, 'only the output columns are scored.')}")
     eval_path = prompt_str("Evaluation file path", default=cfg["dataset_path"])
 
     print(f"  │")
@@ -3412,7 +5013,11 @@ def run_perplexity_eval():
     criterion = nn.CrossEntropyLoss(ignore_index=pad_id, reduction='sum')
 
     if line_mode:
-        eval_ds = IndexedLineDataset(eval_path, vocab)
+        spec = cfg.get("seq2seq")
+        if spec and eval_path != cfg["dataset_path"]:
+            # A different file is raw delimited data with the training columns.
+            eval_path = prepare_seq2seq_dataset(spec, source_path=eval_path)
+        eval_ds = IndexedLineDataset(eval_path, vocab, seq2seq_inputs=len(spec["input_cols"]) if spec else 0)
     else:
         eval_ds = MemmapClassicDataset(eval_path, vocab, cfg["seq_len"])
 
@@ -3449,7 +5054,7 @@ def run_model_stats():
     cli_banner("Model Statistics", "Parameter counts and layer breakdown", width=64)
     if not os.path.exists(CONFIG_PATH):
         pwarn("No config found — train a model first."); return
-    cfg = load_json(CONFIG_PATH)
+    cfg = load_run_config()
     vocab = load_or_make_vocab(cfg, cfg["dataset_path"])
     model = build_model(cfg, vocab.size)
 
@@ -3518,7 +5123,7 @@ def run_token_analysis():
         cfg_dummy["tiktoken_encoding"] = prompt_str("Tiktoken encoding", default="cl100k_base")
     cli_section_end(64)
 
-    vocab = load_or_make_vocab(cfg_dummy, dataset_path)
+    vocab = load_or_make_vocab(cfg_dummy, dataset_path, save_config=False)
 
     max_read = 10 * 1024 * 1024
     with open(dataset_path, "r", encoding="utf-8", errors="ignore") as f:
@@ -3576,7 +5181,7 @@ def run_export():
     cli_banner("Export", "Save model in various portable formats", width=64)
     if not os.path.exists(CONFIG_PATH):
         pwarn("No config found — train a model first."); return
-    cfg = load_json(CONFIG_PATH)
+    cfg = load_run_config()
     vocab = load_or_make_vocab(cfg, cfg["dataset_path"])
     model = build_model(cfg, vocab.size)
     model.to(DEVICE)
@@ -3613,7 +5218,7 @@ def run_export():
     elif choice == 0:
         try:
             dummy = torch.randint(0, vocab.size, (1, cfg["seq_len"]), device=DEVICE)
-            if cfg["model_selection"] in RNN_MODEL_IDS:
+            if cfg["model_selection"] in RNN_MODEL_IDS and not is_bottom_up_megabyte(cfg):
                 scripted = torch.jit.trace(model, (dummy, None))
             else:
                 scripted = torch.jit.trace(model, dummy)
@@ -3652,10 +5257,10 @@ def run_hyperparam_sweep():
 
     cfg_dummy = {"dataset_type": dataset_type, "tokenizer_mode": tokenizer_mode, "custom_bpe_size": 4096}
     if tokenizer_mode == 3: cfg_dummy["tiktoken_encoding"] = "cl100k_base"
-    vocab = load_or_make_vocab(cfg_dummy, dataset_path)
+    vocab = load_or_make_vocab(cfg_dummy, dataset_path, save_config=False)
 
     print_model_menu()
-    msel = prompt_int("Model #", valid=set(range(99)))
+    msel = prompt_int("Model #", valid=MODEL_IDS)
 
     cli_section("Sweep Grid", 64)
     print(f"  │")
@@ -3686,10 +5291,11 @@ def run_hyperparam_sweep():
     cli_section_end(64)
 
     cfg_data = {"dataset_path": dataset_path, "dataset_type": dataset_type, "seq_len": seq_len,
-                "vocab_tokens": getattr(vocab, "tokens", None), "val_split": 0.1, "valid_examples": 0}
+                "vocab_tokens": getattr(vocab, "tokens", None), "val_split": 0.1, "valid_examples": 0,
+                "line_seq_len_cap": None}
     train_ds, valid_ds = build_datasets(cfg_data, vocab)
     if dataset_type == 1:
-        cfg_data["seq_len"] = min(train_ds.max_len, 2048)
+        cfg_data["seq_len"] = train_ds.max_len
         seq_len = cfg_data["seq_len"]
 
     configs = [{"embed_dim": e, "layer_count": l, "learning_rate": lr, "batch_size": b}
@@ -3739,7 +5345,7 @@ def run_speed_benchmark():
     cli_banner("Speed Benchmark", "Forward + backward pass throughput in tokens / second", width=64)
     if not os.path.exists(CONFIG_PATH):
         pwarn("No config found — train a model first."); return
-    cfg = load_json(CONFIG_PATH)
+    cfg = load_run_config()
     vocab = load_or_make_vocab(cfg, cfg["dataset_path"])
 
     cli_section("Settings", 64)
@@ -3782,16 +5388,20 @@ def run_speed_benchmark():
             dy = torch.randint(0, vocab.size, (batch_size, seq_len), device=DEVICE)
             crit = nn.CrossEntropyLoss()
             for _ in range(warmup):
-                if msel in RNN_MODEL_IDS: lg = model(dx, None)[0]
+                if msel in RNN_MODEL_IDS and not is_bottom_up_megabyte(cfg_t): lg = model(dx, None)[0]
                 elif msel in SCAN_MODEL_IDS: out = model(dx); lg = out[0] if isinstance(out, tuple) else out
-                else: lg = model(dx)
+                else:
+                    out = model(dx)
+                    lg = out[0] if isinstance(out, tuple) else out
                 crit(lg.reshape(-1, lg.size(-1)), dy.reshape(-1)).backward(); opt.step(); opt.zero_grad(set_to_none=True)
             if DEVICE == "cuda": torch.cuda.synchronize()
             t0 = time.perf_counter()
             for _ in range(measure):
-                if msel in RNN_MODEL_IDS: lg = model(dx, None)[0]
+                if msel in RNN_MODEL_IDS and not is_bottom_up_megabyte(cfg_t): lg = model(dx, None)[0]
                 elif msel in SCAN_MODEL_IDS: out = model(dx); lg = out[0] if isinstance(out, tuple) else out
-                else: lg = model(dx)
+                else:
+                    out = model(dx)
+                    lg = out[0] if isinstance(out, tuple) else out
                 crit(lg.reshape(-1, lg.size(-1)), dy.reshape(-1)).backward(); opt.step(); opt.zero_grad(set_to_none=True)
             if DEVICE == "cuda": torch.cuda.synchronize()
             elapsed = time.perf_counter() - t0
@@ -3833,20 +5443,30 @@ def interactive_train():
     cli_opt("7 / e", "Export",       "Export to TorchScript / ONNX / quantized int8")
     cli_opt("8 / h", "Sweep",        "Hyperparameter grid search over a single model")
     cli_opt("9 / v", "Speed",        "Measure throughput in tokens / second")
+    cli_opt("g",     "GUI",          "Browser interface: train, sample, inspect activations")
     cli_blank_row()
     print(f"  {_c(_CY, '└' + '─' * (W - 2) + '┘')}\n")
 
     cont = prompt_str("Selection").lower().strip()
     
-    if cont in ("train","t","0"):
+    if cont in ("gui", "g"):
+        from linegen_gui import run_gui
+        run_gui(port=prompt_int("Port", default=8767))
+    elif cont in ("train","t","0"):
         # Training Mode
         resume = False
+        retry = False
         if os.path.exists(CONFIG_PATH) and os.path.exists(CHECKPOINT_PATH):
-            if prompt_str("Resume previous run? (y/n): ").lower() == "y":
+            choice = prompt_str("Resume previous run?  (y = resume, r = retry config with fresh weights, n = new): ").lower()
+            if choice == "y":
                 resume = True
+            elif choice == "r":
+                retry = True
 
-        if resume:
-            cfg = load_json(CONFIG_PATH)
+        if resume or retry:
+            cfg = load_run_config()
+            if retry:
+                cfg = retry_adjustments(cfg)
             # 1. Load Vocab & Save it immediately to prevent sync issues
             vocab = load_or_make_vocab(cfg, cfg["dataset_path"])
             cfg["vocab_tokens"] = getattr(vocab, "tokens", None)
@@ -3858,8 +5478,11 @@ def interactive_train():
             #if torch.__version__.startswith("2."):
             #    model = wrap_model_with_compile(model, cfg)
             
-            print(f"[Resume] Loading checkpoint {CHECKPOINT_PATH}...")
-            model.load_state_dict(torch.load(CHECKPOINT_PATH, map_location=DEVICE))
+            if resume:
+                print(f"[Resume] Loading checkpoint {CHECKPOINT_PATH}...")
+                model.load_state_dict(torch.load(CHECKPOINT_PATH, map_location=DEVICE))
+            else:
+                print("[Retry] Starting fresh model weights from the saved configuration.")
         else:
             cfg = build_config_new()
             # 1. Load Vocab & Save it immediately
@@ -3868,11 +5491,19 @@ def interactive_train():
             save_json(CONFIG_PATH, cfg)
 
             dataset, valid = build_datasets(cfg, vocab)
+            if cfg.get("target_params"):
+                # The vocabulary and (line mode) window are known only now.
+                dim, fitted = fit_width_to_params(cfg, vocab.size, cfg["target_params"], cfg.get("head_count", 4))
+                cfg["embed_dim"] = dim
+                pinfo(f"Width {dim} gives {readable_num(fitted or 0)} parameters "
+                      f"(target {readable_num(cfg['target_params'])})")
+                save_json(CONFIG_PATH, cfg)
             model = build_model(cfg, vocab.size)
             model.to(DEVICE)
             #if torch.__version__.startswith("2."):
             #    model = wrap_model_with_compile(model, cfg)
         
+        model = wrap_model_with_compile(model, cfg)
         # Print model stats
         total_params = sum(p.numel() for p in model.parameters())
         print(f"\n  Model: {MODEL_NAMES.get(cfg['model_selection'], '?')} | Params: {readable_num(total_params)} | Vocab: {vocab.size}")
@@ -3888,7 +5519,7 @@ def interactive_train():
             print("No config found. Train first.")
             return
 
-        cfg = load_json(CONFIG_PATH)
+        cfg = load_run_config()
         vocab = load_or_make_vocab(cfg, cfg["dataset_path"])
         
         # Build model with vocab size from config (now correctly reconstructed)
@@ -3899,7 +5530,7 @@ def interactive_train():
         
         print(f"[Sample] Loading {CHECKPOINT_PATH}...")
         model.load_state_dict(torch.load(CHECKPOINT_PATH, map_location=DEVICE))
-
+        model = wrap_model_with_compile(model, cfg)
         model.to(DEVICE)
         run_sampling_ui(cfg, model, vocab)
 
@@ -3909,7 +5540,7 @@ def interactive_train():
     elif cont in ("chat","c","3"):
         if not os.path.exists(CONFIG_PATH):
             print("No config found. Train first."); return
-        cfg = load_json(CONFIG_PATH)
+        cfg = load_run_config()
         vocab = load_or_make_vocab(cfg, cfg["dataset_path"])
         model = build_model(cfg, vocab.size); model.to(DEVICE)
         print(f"Loading {CHECKPOINT_PATH}...")
@@ -3945,8 +5576,8 @@ def get_prompt_batch(cfg, vocab: CharVocab):
     print(f"  │")
     cli_opt(0, "Random token",  "Pick a random token from the vocabulary as the seed")
     cli_opt(1, "'BEGIN'",       "Use the literal text 'BEGIN' as the prompt")
-    cli_opt(2, "File",          "Load prompts line-by-line from a text file")
-    cli_opt(3, "Custom",        "Type your own prompt text (or hex if byte mode)")
+    cli_opt(2, "File",          "Load text prompts, or raw bytes / hex from a file in byte mode")
+    cli_opt(3, "Custom",        "Type a prompt (hex in byte mode; use File for long byte prompts)")
     print(f"  │")
     cli_section_end(64)
     smode = prompt_int("Prompt mode", valid={0,1,2,3})
@@ -3959,12 +5590,39 @@ def get_prompt_batch(cfg, vocab: CharVocab):
     elif smode == 2:
         f = prompt_str("Path to prompt file")
         if not os.path.exists(f): pwarn("File not found."); return []
+        byte_mode = int(cfg.get("tokenizer_mode", 1)) in {-1, 0}
+        if byte_mode and not line_mode:
+            raw = pathlib.Path(f).read_bytes()
+            # A file containing only ASCII hex is a convenient alternative to
+            # pasting a long prompt; otherwise keep raw binary bytes untouched.
+            try:
+                text = raw.decode("ascii").strip()
+            except UnicodeDecodeError:
+                return [raw]
+            if text.lower().startswith("hex:"):
+                text = text[4:].lstrip()
+            if HEX_RE.fullmatch(text):
+                try:
+                    return [_hex_to_bytes(text)]
+                except ValueError as exc:
+                    pwarn(f"Invalid hex prompt file: {exc}.")
+                    return []
+            return [raw]
         if line_mode:
             with open(f,"r",encoding="utf-8") as r: prompts = [BOS_TOKEN + ln.rstrip("\n") for ln in r.readlines()]
         else:
             with open(f,"r",encoding="utf-8") as r: prompts = [r.read()]
     else:
         p = prompt_str("Custom prompt")
+        if not line_mode and int(cfg.get("tokenizer_mode", 1)) in {-1, 0}:
+            try:
+                return [_hex_to_bytes(p)]
+            except ValueError as exc:
+                pwarn(
+                    f"Invalid hex prompt: {exc}. For long byte prompts, use "
+                    "Prompt mode 2 with a raw .bmp or ASCII .hex file."
+                )
+                return []
         prompts = [BOS_TOKEN + p] if line_mode else [p]
     return prompts
 
@@ -3976,7 +5634,7 @@ def _visible_decode_prompt(vocab, ids: List[int], line_mode: bool) -> str:
 
 def run_sampling_ui(cfg, model, vocab):
     model.eval()
-    if int(cfg.get("tokenizer_mode",1)) == 0:
+    if int(cfg.get("tokenizer_mode", 1)) in {-1, 0}:
         ensure_filegen_clean()
 
     cli_banner("Sample", "Generate text from the trained model", width=64)
@@ -4033,6 +5691,12 @@ def run_sampling_ui(cfg, model, vocab):
         want_capture = yn in ("y", "yes", "1")
     cli_section_end(64)
 
+    seq2seq = cfg.get("seq2seq") if line_mode else None
+    if seq2seq:
+        inputs = ", ".join(seq2seq["columns"][c] for c in seq2seq["input_cols"])
+        outputs_names = ", ".join(seq2seq["columns"][c] for c in seq2seq["output_cols"])
+        pinfo(f"Seq2seq: give the input columns ({inputs}) separated by {seq2seq['delimiter']!r}; "
+              f"the model writes {outputs_names}.")
     prompts = get_prompt_batch(cfg, vocab)
     if not prompts: return
 
@@ -4042,14 +5706,22 @@ def run_sampling_ui(cfg, model, vocab):
 
     for i in range(count):
         prompt = prompts[i % len(prompts)]
-        p_ids = vocab.encode(prompt)
+        if seq2seq:
+            try:
+                p_ids = encode_seq2seq_prompt(vocab, seq2seq, prompt[len(BOS_TOKEN):]
+                                              if prompt.startswith(BOS_TOKEN) else prompt)
+            except ValueError as exc:
+                pwarn(str(exc))
+                continue
+        else:
+            p_ids = vocab.encode(prompt)
 
-        if tmode == 0:
-            p_bytes = prompt if isinstance(prompt, (bytes, bytearray, memoryview)) else bytes(str(prompt), "latin1", "ignore")
-            print(bold(f"--- PROMPT (hex) ---\n{p_bytes.hex()}"))
+        if tmode in {-1, 0}:
+            prompt_bytes = vocab.to_bytes(p_ids) if hasattr(vocab, "to_bytes") else bytes()
+            print(bold(f"--- PROMPT (hex) ---\n{prompt_bytes.hex()}"))
         else:
             vis = _visible_decode_prompt(vocab, p_ids, line_mode)
-            print(bold(f"--- PROMPT ---\n{vis}"))
+            print(bold(f"--- PROMPT ---\n{seq2seq_visible(vis) if seq2seq else vis}"))
 
         # ===== NEW: begin capture (builtins only) =====
         if want_capture:
@@ -4059,7 +5731,7 @@ def run_sampling_ui(cfg, model, vocab):
             # Force stream=False if capturing, so we have the ids for saving
             out_ids = generate_line_mode(model, cfg, vocab, p_ids, limit_len=max_len)
             # Trim leading BOS for readable text output
-            if tmode == 0:
+            if tmode in {-1, 0}:
                 data = vocab.to_bytes(out_ids) if hasattr(vocab, "to_bytes") else bytes()
                 if byte_text:
                     print(f"--- sample {i+1} ---\n{vocab.decode(out_ids[1:]) if len(out_ids)>1 else ''}")
@@ -4068,10 +5740,10 @@ def run_sampling_ui(cfg, model, vocab):
                     print(f"[saved] FileGen/sample_{i+1:03d} ({len(data)} bytes)")
             else:
                 text = vocab.decode(out_ids[1:]) if len(out_ids)>1 else ""
-                outputs.append(text)
+                outputs.append(seq2seq_visible(text) if seq2seq else text)
         else:
             # Classic
-            if tmode == 0:
+            if tmode in {-1, 0}:
                 out_ids = generate_classic(model, cfg, vocab, p_ids, max_len=max_len, stream=False)
                 if byte_text:
                     print(f"--- sample {i+1} ---\n{vocab.decode(out_ids)}")
@@ -4095,7 +5767,12 @@ def run_sampling_ui(cfg, model, vocab):
             # In out_ids, the number of newly generated tokens is:
             #   - classic: len(out_ids) - len(p_ids)
             #   - line:    len(out_ids) - len(p_ids)
-            gen_only = out_ids[len(p_ids):]
+            # Line generation removes the tokenizer-added terminal EOS before
+            # priming, so its returned prefix is one token shorter than p_ids.
+            prompt_len = len(p_ids)
+            if line_mode and getattr(vocab, "eos_id", None) is not None and p_ids and p_ids[-1] == vocab.eos_id:
+                prompt_len -= 1
+            gen_only = out_ids[prompt_len:]
             # visible per-step tokens (hide BOS visually in line mode)
             step_tokens = []
             for tok_id in gen_only:
@@ -4122,6 +5799,7 @@ def train_for_iterations(cfg, model, optimizer, dataset, valid_ds, vocab, line_m
     model.train()
     iters = 0
     losses = []
+    loss_window = max(10, int(cfg.get("log_interval", 1)))
 
     # simple minibatch fetcher (no TBPTT in benchmarks)
     def fetch():
@@ -4141,12 +5819,13 @@ def train_for_iterations(cfg, model, optimizer, dataset, valid_ds, vocab, line_m
     with tqdm(total=iters_total, desc=desc, ncols=100, leave=False) as pbar:
         while iters < iters_total:
             x, y = fetch()
-            if msel in RNN_MODEL_IDS:
+            if msel in RNN_MODEL_IDS and not is_bottom_up_megabyte(cfg):
                 logits = model(x, None)[0]
             elif msel in SCAN_MODEL_IDS:
                 out = model(x); logits = out[0] if isinstance(out, tuple) else out
             else:
-                logits = model(x)
+                out = model(x)
+                logits = out[0] if isinstance(out, tuple) else out
             loss = criterion(logits.reshape(-1, logits.size(-1)), y.reshape(-1))
 
             if torch.isnan(loss) or torch.isinf(loss):
@@ -4167,7 +5846,8 @@ def train_for_iterations(cfg, model, optimizer, dataset, valid_ds, vocab, line_m
 
             # update progress bar with current + rolling avg loss
             avg = sum(losses) / max(1, len(losses))
-            pbar.set_postfix(loss=f"{l:.5f}", avg=f"{avg:.5f}")
+            metrics = loss_metrics(avg, 1, cfg)
+            pbar.set_postfix(current=f"{l:.5f}", loss=f"{avg:.5f}", metric=format_loss_metrics(metrics))
             pbar.update(1)
 
             iters += 1
@@ -4192,57 +5872,360 @@ def train_for_iterations(cfg, model, optimizer, dataset, valid_ds, vocab, line_m
 #  MODEL DEFINITIONS (User Spec)
 # ==============================================================================
 
-MODEL_NAMES = {
-    # ==== MLPs ====
-    0: "MLP (one-hot encoding window instead of embeddings, Mish activation)",
-    1: "MLP (MLP Block from Transformer, no attention, Mish activation)",
-    
-    # ==== RNNs ====
-    2: "Recurrent Neural Network (Vanilla Tanh)",
-    3: "Recurrent Neural Network (ReLU)",
-    4: "Gated Recurrent Unit",
-    5: "Long Short-Term Memory",
-    6: "Independently Recurrent Neural Network (IndRNN)",
-    7: "IndyGRU",
-    8: "ATanU activated LSTM",
-    18: "JANET (forget-gate LSTM)",
-    23: "Liquid Neural Network (LTC)",
-
-    # ==== Non-recurrents (Transformers/Convs) ====
-    9: "Temporal ConvNet, Mish activation",
-    10: "GPT-2 Decoder-only Transformer",
-    19: "HyperMixer",
-    21: "gMLP, causal",
-    22: "aMLP, causal (gMLP with TinyAttention)",
-    24: "MLPMixer (Causal)",
-    25: "Modern Transformer (Llama3 Decoder-only Transformer)",
-    31: "MEGABYTE",
-    34: "KAN-Transformer (Chebyshev)",
-    37: "DCT-Former",
-
-    # ==== xLSTM ====
-    11: "xLSTM (sLSTM only)",
-    12: "xLSTM (mLSTM only)",
-    13: "xLSTM (mixed m:s)",
-
-    # ==== Space State Machines / Linear Recurrence ====
-    14: "Mamba (selective scan)",
-    15: "minGRU (Parallelized GRU)",
-    16: "minLSTM (Parallelized LSTM)",
-    17: "RWKV (scan)",
-    20: "GateLoop (scan)",
-    26: "MinRNN (Parallelized Vanilla RNN)",
-    27: "Griffin (RG-LRU)",
-    28: "DeltaNet",
-    29: "RetNet",
-    30: "HGRN",
-    32: "MinIndRNN (Parallelized IndRNN)",
-    33: "MinJANET (Parallelized JANET)",
-    35: "Linear Transformer (Recurrent)",
-    36: "H3 (Hungry Hungry Hippos)",
-    38: "MinIndyGRU (Parallelized IndyGRU)",
-    39: "MinIndyLSTM (Parallelized IndyLSTM)"
+# Every selectable model.  IDs come in blocks of 100, one block per family
+# (ID // 100 indexes MODEL_GROUPS), and run chronologically inside a block by
+# MODEL_ORIGINS, so a newer model is appended to the end of its family
+# without renumbering anything else.
+MODEL_GROUPS = {
+    0: "Classical baselines & MLPs",
+    1: "Convolutional",
+    2: "MLP & token mixers",
+    3: "Transformers  (full attention)",
+    4: "Sparse, long-context & memory Transformers",
+    5: "Gated & vanilla RNNs  (sequential, stateful)",
+    6: "Continuous-time & oscillator RNNs",
+    7: "Latent-variable RNNs",
+    8: "xLSTM",
+    9: "Parallel-trained RNNs  (scan / Newton)",
+    10: "State-space models",
+    11: "Linear attention & gated linear RNNs",
+    12: "Hybrids  (attention + recurrence)",
 }
+
+# (id, full name, menu label, menu description), ordered by ID.
+MODEL_REGISTRY = (
+    # ==== Classical baselines & MLPs ====
+    (0, 'Markov bigram (trainable transition baseline)', 'Markov bigram', 'Trainable first-order token transition baseline'),
+    (1, 'MLP (one-hot encoding window instead of embeddings, Mish activation)', 'MLP (one-hot window)', 'One-hot context window → feedforward, no embedding'),
+    (2, 'Neural n-gram MLP (Bengio et al., flat bounded context)', 'Neural n-gram', 'Flat bounded previous-token context fed to an MLP'),
+    (3, 'NADE (causal autoregressive density estimator)', 'NADE', 'Neural autoregressive density-estimation MLP'),
+    (4, 'MADE (causal masked autoregressive estimator)', 'MADE', 'Masked autoencoder distribution-estimation MLP'),
+    (5, 'Residual MLP (Transformer MLP blocks, no attention, Mish activation)', 'MLP (residual)', 'Transformer-style FF blocks, no attention or recurrence'),
+    # ==== Convolutional ====
+    (100, 'PixelCNN-style (causal masked convolution)', 'PixelCNN-style', 'Masked causal-convolution LM for token sequences'),
+    (101, 'WaveNet (causal gated dilated convolution)', 'WaveNet', 'Gated causal dilated-convolution LM'),
+    (102, 'Temporal ConvNet (causal dilated TCN, Mish activation)', 'Temporal ConvNet', 'Causal dilated 1-D TCN'),
+    (103, 'Causal ConvNeXt-1D (large-kernel depthwise convolution)', 'Causal ConvNeXt-1D', 'Modern large-kernel causal depthwise convolution'),
+    (104, 'Hyena (gated FFT long convolution)', 'Hyena', 'Gated FFT causal long-convolution LM'),
+    # ==== MLP & token mixers ====
+    (200, 'gMLP (causal spatial gating unit)', 'gMLP', 'Gated MLP with spatial gating unit (causal)'),
+    (201, 'aMLP (causal gMLP with tiny attention)', 'aMLP', 'gMLP + tiny self-attention gate'),
+    (202, 'MLP-Mixer (causal)', 'MLP-Mixer (causal)', 'Patch-style MLP mixer adapted for sequences'),
+    (203, 'CCS token-mixing MLP (causal circulant)', 'CCS-MLP', 'Circulant channel-specific causal MLP'),
+    (204, 'WaveMLP (causal phase-modulated mixer)', 'WaveMLP', 'Phase-modulated causal MLP mixer'),
+    (205, 'DynaMixer (causal content-gated mixer)', 'DynaMixer', 'Content-gated causal MLP mixer'),
+    (206, 'pNLP-Mixer (causal)', 'pNLP-Mixer', 'All-MLP NLP token/channel mixer (causal)'),
+    (207, 'HyperMixer (hypernetwork token mixing)', 'HyperMixer', 'MLP-Mixer variant with hypernetwork token mixing'),
+    (208, 'Toeplitz MLP Mixer (causal, experimental)', 'Toeplitz MLP Mixer', 'Experimental global causal FFT Toeplitz mixer'),
+    (209, 'Grassmann-flow mixer (causal, experimental)', 'Grassmann mixer', 'Experimental causal local geometric pair mixer'),
+    # ==== Transformers  (full attention) ====
+    (300, 'Original Transformer (Vaswani et al. 2017, decoder-only)', 'Original Transformer', 'Vaswani 2017 decoder: post-LN, sinusoidal, ReLU FFN'),
+    (301, 'GPT-2 decoder-only Transformer', 'GPT-2 Transformer', 'Decoder-only pre-LN transformer, learned positions'),
+    (302, 'Switch Transformer (top-1 sparse MoE)', 'Switch Transformer', 'Top-1 routed sparse mixture-of-experts FFN'),
+    (303, 'DCT-Former (spectral attention)', 'DCT-Former', 'DCT-based spectral attention transformer'),
+    (304, 'Llama-3 style Transformer (RMSNorm, SwiGLU, RoPE)', 'Llama-3 Transformer', 'RMSNorm, SwiGLU, RoPE (Llama-3 style)'),
+    (305, 'KAN-Transformer (Chebyshev KAN feed-forward)', 'KAN-Transformer', 'Transformer with Chebyshev KAN feed-forward'),
+    (306, 'Trinity-style Transformer (2026 SOTA dense: gated GQA, QK-norm, 3:1 local/global)', 'Trinity Transformer 2026', 'GQA, QK-norm, gated attn, 3:1 SWA/global, sandwich'),
+    # ==== Sparse, long-context & memory Transformers ====
+    (400, 'Transformer-XL (segment-recurrent attention memory)', 'Transformer-XL', 'Segment recurrence with attention memory'),
+    (401, 'Compressive Transformer', 'Compressive Transformer', 'Causal attention with compressed recurrent memory'),
+    (402, 'kNN-LM (in-context recurrent memory)', 'kNN-LM', 'Causal nearest-neighbour recurrent memory (in-context)'),
+    (403, 'Longformer (causal sparse attention)', 'Longformer (causal)', 'Sliding-window causal sparse-attention Transformer'),
+    (404, 'BigBird (causal sparse attention)', 'BigBird (causal)', 'Block/global causal sparse-attention Transformer'),
+    (405, 'RETRO-style (in-context recurrent retrieval memory)', 'RETRO-style', 'Causal retrieval-augmented recurrent memory (in-context)'),
+    (406, 'Memorizing Transformer', 'Memorizing Transformer', 'Causal attention with recurrent key-value memory'),
+    (407, 'Recurrent Interface Network (RIN)', 'Recurrent Interface', 'Stateful recurrent interface-gated latent LM'),
+    (408, 'Titans (attention + neural long-term memory)', 'Titans', 'Short attention + learned long-term memory'),
+    (409, 'Sparse Modern Transformer (NSA-inspired)', 'Sparse Transformer (NSA)', 'Local + compressed + selected-block sparse attention'),
+    # ==== Gated & vanilla RNNs  (sequential, stateful) ====
+    (500, 'Elman RNN (vanilla tanh)', 'RNN – Tanh', 'Vanilla Elman RNN with tanh activation'),
+    (501, 'Long Short-Term Memory (LSTM)', 'LSTM', 'Long Short-Term Memory'),
+    (502, 'ATanU-activated LSTM', 'ATanU-LSTM', 'LSTM with ArcTan unit activation'),
+    (503, 'Gated Recurrent Unit (GRU)', 'GRU', 'Gated Recurrent Unit'),
+    (504, 'Elman RNN (ReLU)', 'RNN – ReLU', 'Vanilla Elman RNN with ReLU activation'),
+    (505, 'QRNN (causal convolution + f-pooling)', 'QRNN', 'Causal convolution + recurrent f-pooling'),
+    (506, 'Intersection RNN (+RNN, Collins et al.)', 'Intersection RNN (+RNN)', 'Recurrent tanh gate + ReLU depth highway (Collins 2017)'),
+    (507, 'UGRNN (update-gate RNN, Collins et al.)', 'UGRNN', 'Update-gate RNN: single coupled gate (Collins 2017)'),
+    (508, 'SRU (Simple Recurrent Unit)', 'SRU', 'Simple Recurrent Unit: elementwise light recurrence'),
+    (509, 'Independently Recurrent Neural Network (IndRNN)', 'IndRNN', 'Independently Recurrent NN (diagonal hidden-to-hidden)'),
+    (510, 'JANET (forget-gate LSTM)', 'JANET', 'Forget-gate-only LSTM (simplified)'),
+    (511, 'expRNN (orthogonal, matrix exponential)', 'expRNN', 'Orthogonal recurrence via matrix exponential, modReLU'),
+    (512, 'NRU (Non-saturating Recurrent Unit)', 'NRU', 'Non-saturating additive-memory RNN'),
+    (513, 'IndyGRU (independently recurrent GRU)', 'IndyGRU', 'GRU with diagonal (independent) recurrent weights'),
+    (514, 'IndyLSTM (independently recurrent LSTM)', 'IndyLSTM', 'LSTM with diagonal (independent) recurrent weights'),
+    (515, 'Mogrifier LSTM', 'Mogrifier LSTM', 'Context-modulated LSTM recurrent cell'),
+    (516, 'Mogrifier GRU', 'Mogrifier GRU', 'Mogrifier input/state gating before a GRU step'),
+    (517, 'SRU++ (SRU with causal attention)', 'SRU++', 'SRU with a light causal attention input (Lei 2021)'),
+    (518, 'RRU (Residual Recurrent Unit)', 'RRU', 'Residual Recurrent Unit — gate-free ReZero recurrence'),
+    (519, 'Light Recurrent Unit (LRU)', 'Light Recurrent Unit', 'Single forget-gate RNN, input-only candidate (LRU 2024)'),
+    (520, 'M2RNN (nonlinear matrix-valued-state RNN, 2026 SOTA)', 'M2RNN', 'Nonlinear matrix-state RNN, sequential (Dao et al. 2026)'),
+    # ==== Continuous-time & oscillator RNNs ====
+    (600, 'LMU (Legendre Memory Unit)', 'LMU', 'Legendre-memory recurrent unit'),
+    (601, 'Liquid Time-Constant network (LTC)', 'Liquid / LTC', 'Liquid Time-Constant Neural Network'),
+    (602, 'UnICORNN (undamped oscillatory RNN)', 'UnICORNN', 'Undamped independent oscillators, symplectic Euler'),
+    (603, 'CfC (Closed-form Continuous-time)', 'CfC', 'Closed-form continuous-time RNN'),
+    # ==== Latent-variable RNNs ====
+    (700, 'VRNN (variational recurrent neural network prior)', 'VRNN', 'Variational recurrent neural-network prior LM'),
+    (701, 'SRNN (stochastic recurrent neural network prior)', 'SRNN', 'Stochastic recurrent neural-network prior LM'),
+    # ==== xLSTM ====
+    (800, 'xLSTM (sLSTM blocks only)', 'xLSTM – sLSTM blocks', 'Paper sLSTM blocks (conv, head GroupNorm, gated FFN)'),
+    (801, 'xLSTM (mLSTM blocks only)', 'xLSTM – mLSTM blocks', 'Paper mLSTM blocks (up-proj, conv, skip, head norm)'),
+    (802, 'xLSTM (full, xLSTM[a:b] mLSTM+sLSTM, 7:1)', 'xLSTM (full)', 'xLSTM[a:b]: mLSTM + sLSTM blocks, 7:1 default'),
+    # ==== Parallel-scan minimal RNNs ====
+    (900, 'minGRU (parallel-scan GRU)', 'minGRU', 'Parallelized minimal GRU (log-space scan)'),
+    (901, 'minLSTM (parallel-scan LSTM)', 'minLSTM', 'Parallelized minimal LSTM (log-space scan)'),
+    (902, 'MinRNN (parallel-scan vanilla RNN)', 'MinRNN ★', 'Parallelized vanilla RNN — multiple activation options'),
+    (903, 'MinIndRNN (parallel-scan IndRNN)', 'MinIndRNN ★', 'Parallelized IndRNN — many activation choices'),
+    (904, 'MinJANET (parallel-scan JANET)', 'MinJANET', 'Parallelized JANET forget-gate model'),
+    (905, 'MinIndyGRU (parallel-scan IndyGRU)', 'MinIndyGRU', 'Parallelized IndyGRU (scan)'),
+    (906, 'MinIndyLSTM (parallel-scan IndyLSTM)', 'MinIndyLSTM', 'Parallelized IndyLSTM (scan)'),
+    (907, 'ParaGRU (ParaRNN: nonlinear GRU trained by parallel Newton)', 'ParaGRU (ParaRNN)', 'Nonlinear diagonal GRU, Newton + parallel scan (2025)'),
+    (908, 'ParaLSTM (ParaRNN: nonlinear CIFG LSTM trained by parallel Newton)', 'ParaLSTM (ParaRNN)', 'Nonlinear peephole CIFG LSTM, Newton + 2x2 scan (2025)'),
+    # ==== State-space models ====
+    (1000, 'S4 (structured state-space model)', 'S4', 'Structured state-space reference recurrence'),
+    (1001, 'DSS (diagonal state-space sequence model)', 'DSS', 'Diagonal state-space sequence model'),
+    (1002, 'S4D (diagonal structured state-space model)', 'S4D', 'Diagonal structured state-space recurrence'),
+    (1003, 'S5 (simplified state-space model)', 'S5', 'Simplified state-space sequence model'),
+    (1004, 'H3 (Hungry Hungry Hippos)', 'H3', 'Hungry Hungry Hippos SSM'),
+    (1005, 'LRU (linear recurrent unit)', 'LRU', 'Linear recurrent unit state-space model'),
+    (1006, 'Mamba (selective scan)', 'Mamba', 'Selective state-space model (S6 scan)'),
+    (1007, 'Mamba selective SSM (stage core)', 'Mamba SSM (stage core)', 'Selective SSM core without the Mamba block wrapper'),
+    (1008, 'Mamba-2 (structured state-space duality)', 'Mamba-2', 'Structured state-space duality recurrence'),
+    (1009, 'Mamba-3 SISO (trapezoidal + complex/RoPE)', 'Mamba-3 (SISO)', 'Trapezoidal, complex (RoPE) SSM, BC-norm (2026)'),
+    (1010, 'Mamba-3 MIMO (rank 4, 2026 SOTA SSM)', 'Mamba-3 (MIMO)', 'Rank-4 multi-input multi-output Mamba-3 (2026 SOTA)'),
+    # ==== Linear attention & gated linear RNNs ====
+    (1100, 'Linear Transformer (recurrent form)', 'Linear Transformer', 'Linear attention recurrent form'),
+    (1101, 'DeltaNet (delta-rule linear attention)', 'DeltaNet', 'Delta-rule linear recurrence'),
+    (1102, 'RWKV-4 (scan)', 'RWKV-4', 'Receptance Weighted Key Value (scan)'),
+    (1103, 'RetNet (multi-scale retention)', 'RetNet', 'Retentive network (multi-scale retention)'),
+    (1104, 'GateLoop (scan)', 'GateLoop', 'Data-controlled linear recurrence'),
+    (1105, 'HGRN (hierarchical gated recurrent network)', 'HGRN', 'Hierarchical Gated Recurrent Network'),
+    (1106, 'HGRN2 (outer-product state expansion)', 'HGRN2', 'Outer-product gated recurrent memory'),
+    (1107, 'Gated DeltaNet', 'Gated DeltaNet', 'Gated delta-rule matrix memory'),
+    (1108, 'RWKV-7 Goose', 'RWKV-7 Goose', 'Dynamic state-evolution recurrence'),
+    # ==== Hybrids  (attention + recurrence) ====
+    (1200, 'Griffin (RG-LRU + local attention)', 'Griffin / RG-LRU', 'Real-gated linear recurrence + local attention'),
+    (1201, 'Jamba-lite (1:3 attention/Mamba hybrid)', 'Jamba-lite', '1:3 attention/Mamba hybrid'),
+)
+
+# Saved configs record the ID scheme they use.  Anything without it predates
+# the family-block renumbering (Sept 2026); LEGACY_MODEL_IDS maps those old
+# IDs to the current ones and ``migrate_model_ids`` applies it on load.
+MODEL_ID_SCHEME = 2
+LEGACY_MODEL_IDS = {
+    0: 1, 1: 5, 2: 500, 3: 504, 4: 503, 5: 501, 6: 509, 7: 513, 8: 502, 9: 102, 10: 301, 11: 800,
+    12: 801, 13: 802, 14: 1006, 15: 900, 16: 901, 17: 1102, 18: 510, 19: 207, 20: 1104, 21: 200, 22:
+    201, 23: 601, 24: 202, 25: 304, 26: 902, 27: 1200, 28: 1101, 29: 1103, 30: 1105, 32: 903, 33:
+    904, 34: 305, 35: 1100, 36: 1004, 37: 303, 38: 905, 39: 906, 40: 407, 41: 1107, 42: 1008, 43:
+    1106, 44: 400, 45: 408, 46: 1108, 47: 515, 48: 512, 49: 600, 50: 603, 51: 206, 52: 205, 53: 204,
+    54: 203, 55: 101, 56: 100, 57: 3, 58: 4, 59: 1000, 60: 1002, 61: 1003, 62: 1001, 63: 1005, 64:
+    401, 65: 406, 66: 403, 67: 404, 68: 402, 69: 405, 70: 700, 71: 701, 72: 104, 73: 103, 74: 208,
+    75: 209, 76: 2, 77: 0, 90: 505, 91: 508, 92: 302, 93: 1201, 94: 409, 95: 1007, 96: 506, 97: 602,
+    98: 514, 99: 519, 100: 518, 101: 517, 102: 516, 103: 511, 104: 1009
+}
+MLP_MODEL_ID = 1   # one-hot window MLP: the bottom-up MEGABYTE fine-patch decoder core
+
+@dataclass(frozen=True)
+class ModelSpec:
+    """The single metadata contract for a selectable LineGen model.
+
+    ``factory_key`` deliberately mirrors the persisted integer ID for now:
+    construction remains in the long-standing ``build_model`` compatibility
+    function, while all callers derive routing and UI behaviour from this
+    record.  It gives the construction dispatcher a verified registry lookup
+    without changing checkpoint/config serialization.
+    """
+    id: int
+    name: str
+    menu_group: str
+    menu_label: str
+    menu_description: str
+    stateful: bool = False
+    scan: bool = False
+    attention: bool = False
+    activation_default: Optional[str] = None
+    megabyte_mixer: Optional[str] = None
+    factory_key: Optional[int] = None
+
+
+MODEL_MENU_GROUP_ORDER = tuple(MODEL_GROUPS.values())
+_STATEFUL_MODEL_IDS = frozenset({
+    400, 401, 402, 405, 406, 407, 408, 500, 501, 502, 503, 504, 505, 506, 507, 508, 509, 510, 511,
+    512, 513, 514, 515, 516, 517, 518, 519, 520, 600, 601, 602, 603, 700, 701, 800, 801, 802, 900,
+    901, 902, 903, 904, 905, 906, 907, 908, 1000, 1001, 1002, 1003, 1004, 1005, 1006, 1008, 1009, 1010,
+    1100, 1101, 1102, 1103, 1104, 1105, 1106, 1107, 1108, 1200, 1201
+})
+_SCAN_MODEL_IDS = frozenset({
+    900, 901, 902, 903, 904, 905, 906, 1004, 1006, 1007, 1100, 1101, 1102, 1103, 1104, 1105, 1200,
+    1201
+})
+_ATTENTION_MODEL_IDS = frozenset({
+    207, 300, 301, 302, 304, 305, 306, 400, 403, 404, 407, 408, 409, 800, 801, 802, 1103, 1201
+})
+_ACTIVATION_DEFAULTS = {
+    1: "mish", 5: "mish", 102: "mish", 200: "gelu", 201: "gelu", 202: "gelu", 203: "gelu", 204:
+    "gelu", 205: "gelu", 206: "gelu", 207: "gelu", 300: "relu", 301: "gelu", 303: "swiglu", 304:
+    "swiglu", 305: "mish", 306: "swiglu", 409: "swiglu"
+}
+MODEL_TYPE_NORMAL = 0
+MODEL_TYPE_MEGABYTE = 1
+MODEL_TYPE_MEGABYTE_BOTTOM_UP = 2
+
+
+def is_bottom_up_megabyte(cfg) -> bool:
+    """Whether this config needs the hourglass model's full-window interface."""
+    return int(cfg.get("model_type", MODEL_TYPE_NORMAL)) == MODEL_TYPE_MEGABYTE_BOTTOM_UP
+
+# A hierarchy needs a stage-level processor, not a complete LM with its own
+# embeddings and vocabulary head.  These adapters deliberately cover only
+# processors that MegaByteStageMixer can execute at every scale.
+HIERARCHICAL_MODEL_MIXERS = {
+    1: "mlp", 200: "gmlp", 201: "amlp", 202: "mlpmixer", 207: "hypermixer", 208: "toeplitz", 301:
+    "gpt2", 304: "modern", 500: "rnn", 501: "lstm", 502: "atanulstm", 503: "gru", 504: "rnn_relu",
+    505: "qrnn", 506: "irnn", 508: "sru", 509: "indrnn", 510: "janet", 511: "exprnn", 512: "nru",
+    513: "indygru", 514: "indylstm", 515: "mogrifier_lstm", 516: "mogrifier_gru", 517: "srupp", 518:
+    "rru", 519: "light_ru", 600: "lmu", 601: "liquid", 602: "unicornn", 603: "cfc", 800: "xlstm_s",
+    801: "xlstm_m", 802: "xlstm", 900: "mingru", 901: "minlstm", 903: "minindrnn", 905:
+    "minindygru", 906: "minindylstm", 1000: "s4", 1001: "dss", 1002: "s4d", 1003: "s5", 1005:
+    "lru_ssm", 1006: "mamba", 1007: "mamba_ssm", 1008: "mamba2", 1009: "mamba3", 1101: "deltanet",
+    1102: "rwkv", 1103: "retnet", 1106: "hgrn2", 1107: "gated_deltanet", 1108: "rwkv7"
+}
+
+
+@dataclass(frozen=True)
+class HierarchyCoreCapability:
+    """The core contract used by MEGABYTE routing and setup presentation."""
+    mixer: str
+    causal: bool = True
+    incremental: bool = False
+    uses_heads: bool = False
+
+
+_INCREMENTAL_HIERARCHY_MIXERS = frozenset({
+    "gru", "rnn", "rnn_relu", "lstm", "mingru", "minlstm", "minindrnn",
+    "minindygru", "minindylstm", "mamba", "rwkv", "indrnn", "indygru",
+    "janet", "atanulstm", "liquid", "mogrifier", "nru", "lmu", "cfc",
+    "qrnn", "sru", "mamba_ssm", "deltanet", "gated_deltanet", "rwkv7",
+    "modern", "transformer",
+    "mogrifier_lstm", "mogrifier_gru", "irnn", "unicornn", "indylstm", "light_ru",
+    "rru", "exprnn", "srupp", "mamba3", "xlstm", "xlstm_m", "xlstm_s",
+    "retnet", "mamba2", "hgrn2", "s4", "s4d", "s5", "dss", "lru_ssm",
+})
+_HEAD_HIERARCHY_MIXERS = frozenset({"transformer", "gpt2", "modern", "hypermixer", "xlstm", "xlstm_m", "xlstm_s"})
+HIERARCHICAL_CORE_CAPABILITIES = {
+    model_id: HierarchyCoreCapability(
+        mixer=mixer,
+        incremental=mixer in _INCREMENTAL_HIERARCHY_MIXERS,
+        uses_heads=mixer in _HEAD_HIERARCHY_MIXERS,
+    )
+    for model_id, mixer in HIERARCHICAL_MODEL_MIXERS.items()
+}
+# Retired MEGABYTE-specific selections, in pre-renumbering IDs: the stage
+# mixer and the (old) flat model ID each one now maps to.
+LEGACY_MEGABYTE_MIXERS = {
+    31: "transformer", 78: "gru", 79: "rnn", 80: "rnn_relu", 81: "lstm",
+    82: "mingru", 83: "minlstm", 84: "mlpmixer", 85: "hypermixer", 86: "toeplitz",
+    87: "minindrnn", 88: "minindygru", 89: "minindylstm",
+}
+LEGACY_MEGABYTE_MODEL_SELECTIONS = {
+    31: 10, 78: 4, 79: 2, 80: 3, 81: 5, 82: 15, 83: 16, 84: 24,
+    85: 19, 86: 74, 87: 32, 88: 38, 89: 39,
+}
+
+
+def megabyte_mixer_uses_heads(mixer: str) -> bool:
+    if isinstance(mixer, int):
+        mixer = HIERARCHICAL_MODEL_MIXERS.get(mixer)
+    return mixer in _HEAD_HIERARCHY_MIXERS
+
+
+def migrate_model_ids(cfg):
+    """Translate a config saved before the family-block renumbering, in place.
+
+    Configs carry ``model_id_scheme`` since; one without it uses the old IDs,
+    including the retired MEGABYTE-specific selections.  Call this only on
+    configs read from disk: in-memory configs already use current IDs."""
+    if cfg.get("model_id_scheme") == MODEL_ID_SCHEME:
+        return cfg
+    selection = cfg.get("model_selection")
+    if selection in LEGACY_MEGABYTE_MODEL_SELECTIONS:
+        cfg["model_type"] = MODEL_TYPE_MEGABYTE
+        cfg["_legacy_megabyte"] = True
+        cfg["_legacy_megabyte_mixer"] = LEGACY_MEGABYTE_MIXERS[selection]
+        selection = LEGACY_MEGABYTE_MODEL_SELECTIONS[selection]
+    if selection is not None:
+        if selection not in LEGACY_MODEL_IDS:
+            raise ValueError(f"config names unknown legacy model ID {selection}")
+        cfg["model_selection"] = LEGACY_MODEL_IDS[selection]
+    for key in ("megabyte_stage_mixers", "megabyte_bottom_up_encoder_stage_mixers",
+                "megabyte_bottom_up_decoder_stage_mixers"):
+        mixers = cfg.get(key)
+        if isinstance(mixers, int):
+            cfg[key] = LEGACY_MODEL_IDS[mixers]
+        elif isinstance(mixers, (list, tuple)):
+            cfg[key] = [LEGACY_MODEL_IDS[m] if isinstance(m, int) else m for m in mixers]
+    cfg["model_id_scheme"] = MODEL_ID_SCHEME
+    return cfg
+
+
+def load_run_config(path=None):
+    """Read a saved run config, translating pre-renumbering model IDs."""
+    return migrate_model_ids(load_json(CONFIG_PATH if path is None else path))
+
+
+def normalize_model_config(cfg):
+    """Validate the topology field (legacy MEGABYTE IDs are translated on load).
+
+    Every config reaching here holds current IDs, so it is stamped with the
+    scheme: saving it later can never make a reload re-translate it."""
+    cfg.setdefault("model_id_scheme", MODEL_ID_SCHEME)
+    cfg["model_type"] = int(cfg.get("model_type", MODEL_TYPE_NORMAL))
+    if cfg["model_type"] not in {
+        MODEL_TYPE_NORMAL, MODEL_TYPE_MEGABYTE, MODEL_TYPE_MEGABYTE_BOTTOM_UP,
+    }:
+        raise ValueError(f"unknown model type: {cfg['model_type']}")
+MODEL_SPECS = {
+    model_id: ModelSpec(
+        id=model_id,
+        name=name,
+        menu_group=MODEL_GROUPS[model_id // 100],
+        menu_label=label,
+        menu_description=description,
+        stateful=model_id in _STATEFUL_MODEL_IDS,
+        scan=model_id in _SCAN_MODEL_IDS,
+        attention=model_id in _ATTENTION_MODEL_IDS,
+        activation_default=_ACTIVATION_DEFAULTS.get(model_id),
+        megabyte_mixer=HIERARCHICAL_MODEL_MIXERS.get(model_id),
+        factory_key=model_id,
+    )
+    for model_id, name, label, description in MODEL_REGISTRY
+}
+if len(MODEL_SPECS) != len(MODEL_REGISTRY):
+    raise RuntimeError("MODEL_REGISTRY lists a model ID twice")
+_unregistered = (_STATEFUL_MODEL_IDS | _SCAN_MODEL_IDS | _ATTENTION_MODEL_IDS
+                 | set(_ACTIVATION_DEFAULTS) | set(HIERARCHICAL_MODEL_MIXERS)) - set(MODEL_SPECS)
+if _unregistered or set(LEGACY_MODEL_IDS.values()) - set(MODEL_SPECS):
+    raise RuntimeError(f"Model tables name unregistered IDs: {sorted(_unregistered)}")
+
+# Compatibility aliases for external callers and saved-run tooling.  These are
+# derived, so adding a model cannot make routing and menu data disagree.
+MODEL_NAMES = {model_id: spec.name for model_id, spec in MODEL_SPECS.items()}
+MODEL_IDS = frozenset(MODEL_SPECS)
+RNN_MODEL_IDS = frozenset(spec.id for spec in MODEL_SPECS.values() if spec.stateful)
+SCAN_MODEL_IDS = frozenset(spec.id for spec in MODEL_SPECS.values() if spec.scan)
+ATTN_MODEL_IDS = frozenset(spec.id for spec in MODEL_SPECS.values() if spec.attention)
+NON_RNN_ACTIVATION_IDS = frozenset(
+    spec.id for spec in MODEL_SPECS.values() if spec.activation_default is not None
+)
+MODEL_DEFAULT_ACTIVATIONS = {
+    spec.id: spec.activation_default for spec in MODEL_SPECS.values()
+    if spec.activation_default is not None
+}
+MEGABYTE_MODEL_MIXERS = {
+    spec.id: spec.megabyte_mixer for spec in MODEL_SPECS.values()
+    if spec.megabyte_mixer is not None
+}
+MODEL_MENU = "\n".join(f"{model_id} - {MODEL_NAMES[model_id]}" for model_id in sorted(MODEL_IDS))
 
 # Used to trigger the "RNN Specific Settings" menu (residuals, norms, etc)
 # These are models that are likely implemented via the BuiltinRNNWrapper or similar loops
@@ -4251,18 +6234,13 @@ def build_config_benchmark():
     dataset_type = prompt_int("Dataset type: standard/0 or line/1? ", valid={0,1})
     tokenizer_mode = prompt_int("Tokenizer (-1=binary, 0=byte, 1=char, 2=word): ", valid={-1,0,1,2})
 
-    print(activation_menu_text())
-    names = activation_names()
-    a_idx = prompt_int("Activation #: ", valid=set(range(len(names))))
-    activation_name = names[a_idx]
+    activation_name = prompt_activation("mish", "MLP baseline")
 
     embed_dim  = prompt_int("Embed dim (also hidden dim / TCN channels / Transformer d_model): ")
     layer_count = prompt_int("Layer count: ")
 
-    # Only ask if this model actually uses attention heads
+    # This legacy helper builds the MLP baseline (MLP_MODEL_ID), so it has no heads.
     head_count = 4
-    if msel in ATTN_MODEL_IDS:
-        head_count = prompt_int("Head count: ", default=4)
 
     if dataset_type == 0:
         seq_len = prompt_int("Seq len (classic corpus): ")
@@ -4274,12 +6252,11 @@ def build_config_benchmark():
     batch_size  = prompt_int("Batch size: ")
     learning_rate = prompt_float("Learning rate (Adam): ")
     iters_total = prompt_int("Benchmark iteration count (total SGD steps per model): ")
-    loss_window = prompt_int("Average-of-last-N loss window (used if no validation): ", default=200)
 
     cfg = RunConfig(
         dataset_path=dataset_path,
         dataset_type=dataset_type,
-        model_selection=0,
+        model_selection=MLP_MODEL_ID,
         activation_name=activation_name,
         embed_dim=embed_dim,
         head_count=head_count,
@@ -4299,7 +6276,6 @@ def build_config_benchmark():
     cfg["tbptt_total_len"] = 0
 
     cfg["_bench_iters"] = iters_total
-    cfg["_bench_loss_window"] = loss_window
     return cfg
 
 
@@ -4307,120 +6283,1019 @@ def build_config_benchmark():
 #  BENCHMARKING SUITE (Updated)
 # ==============================================================================
 
-STRICT_RNN_IDS = {2, 3, 4, 5, 6, 7, 8, 18, 23} 
+# Only these models consume the residual/norm/dropout/multiplier settings
+# exposed by benchmark mode: the built-in cells and every CustomRNNWrapper cell
+# (build_model's RNN_MAP).  Only the custom cells have the post-layer FFN.
+BENCH_CUSTOM_RNN_IDS = frozenset({502, 506, 507, 509, 510, 511, 513, 514, 515, 516, 518, 519, 601, 602})
+BENCH_RNN_STRUCTURE_IDS = frozenset({500, 501, 503, 504}) | BENCH_CUSTOM_RNN_IDS
 
-# Group Definitions for the Menu
+# Group definitions.  IDs are deliberately explicit so the grouping remains
+# readable, while groups 0/1 are derived from MODEL_NAMES and can never omit a
+# newly registered model.
 BENCH_GROUPS = {
-    # Feedforwards / Attention / Convs
-    2: [0, 1, 9, 10, 19, 21, 22, 24, 25, 31, 34, 37], 
-    
-    # Strict RNNs (The ones that usually crash without careful initialization)
-    3: [2, 3, 4, 5, 6, 7, 8, 18, 23],
-    
-    # Scan / Linear Recurrence / SSMs / xLSTM (Modern Sequence Models)
-    4: [11, 12, 13, 14, 15, 16, 17, 20, 26, 27, 28, 29, 30, 32, 33, 35, 36, 38, 39],
-    
-    # "Standard Only" (Excludes the very experimental custom RNNs and xLSTMs)
-    # Keeping MLP, GPT, Standard RNNs, Mamba, RWKV
-    5: [0, 1, 2, 3, 4, 5, 9, 10, 24, 21, 22, 19, 25, 31, 34, 14, 17, 26, 15, 16, 32, 38, 39, 33] 
+    # Stateless / fixed-context models: MLPs, convolutions, attention, and mixers.
+    2: [
+        0, 1, 2, 3, 4, 5, 100, 101, 102, 103, 104, 200, 201, 202, 203, 204, 205, 206, 207, 208, 209,
+        300, 301, 302, 303, 304, 305, 306, 403, 404, 409
+    ],
+
+    # Conventional and continuous-time recurrent cells.
+    3: [
+        500, 501, 502, 503, 504, 505, 506, 507, 508, 509, 510, 511, 512, 513, 514, 515, 516, 517,
+        518, 519, 520, 600, 601, 602, 603, 700, 701
+    ],
+
+    # xLSTM, scan/SSM, recurrent-attention, and modern memory models.
+    4: [
+        400, 401, 402, 405, 406, 407, 408, 800, 801, 802, 900, 901, 902, 903, 904, 905, 906, 907, 908,
+        1000,
+        1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008, 1009, 1010, 1100, 1101, 1102, 1103, 1104,
+        1105, 1106, 1107, 1108, 1200, 1201
+    ],
+
+    # A compact, broadly representative comparison set.
+    5: [
+        0, 1, 2, 5, 102, 103, 104, 200, 201, 202, 203, 204, 205, 206, 208, 300, 301, 304, 305, 306,
+        400, 407, 408, 409, 500, 501, 503, 504, 520, 900, 901, 902, 907, 1006, 1008, 1010, 1100, 1102,
+        1103, 1107, 1108, 1200
+    ],
 }
-# Group 0 and 1 are dynamic (ALL)
+
+# Keep the curated benchmark groups and the train menu in lockstep.  Groups may
+# overlap conceptually, but together they must cover every registered model and
+# may never contain an unknown selection ID.
+_BENCH_GROUP_MODEL_IDS = set().union(*BENCH_GROUPS.values())
+if _BENCH_GROUP_MODEL_IDS != set(MODEL_IDS):
+    missing = sorted(set(MODEL_IDS) - _BENCH_GROUP_MODEL_IDS)
+    unknown = sorted(_BENCH_GROUP_MODEL_IDS - set(MODEL_IDS))
+    raise RuntimeError(f"Benchmark/train model registry mismatch: missing={missing}, unknown={unknown}")
+
+# First public version (usually the arXiv preprint) of the idea each model
+# implements, as (year, month).  Benchmarks run oldest-first, so a run replays
+# the field's history; the month only orders models within a year.  Variants
+# that add an existing recipe to an older cell (Min*, Mogrifier GRU) take the
+# recipe's date.
+MODEL_ORIGINS = {
+    0: (1913, 1),       # Markov chain over letters (Markov)
+    1: (1986, 10),      # backprop-trained MLP (Rumelhart, Hinton & Williams)
+    500: (1990, 4),     # Elman RNN
+    501: (1997, 11),    # LSTM (Hochreiter & Schmidhuber)
+    502: (1997, 11),    # LSTM with an arctan unit; no separate source found
+    2: (2000, 12),      # neural probabilistic LM (Bengio et al., NIPS 2000)
+    3: (2011, 4),       # NADE
+    503: (2014, 6),     # GRU
+    4: (2015, 2),       # MADE
+    504: (2015, 4),     # ReLU RNN (IRNN, Le et al.)
+    700: (2015, 6),     # VRNN
+    100: (2016, 1),     # PixelCNN (Pixel RNN paper)
+    701: (2016, 5),     # SRNN (Fraccaro et al.)
+    101: (2016, 9),     # WaveNet
+    505: (2016, 11),    # QRNN
+    506: (2016, 11),    # Intersection RNN (Collins et al.)
+    507: (2016, 11),    # UGRNN (Collins et al., same paper as the +RNN)
+    5: (2017, 6),       # Transformer feed-forward block
+    300: (2017, 6),     # Transformer (Vaswani et al.), decoder-only
+    508: (2017, 9),     # SRU
+    509: (2018, 3),     # IndRNN
+    102: (2018, 3),     # TCN (Bai et al.)
+    510: (2018, 4),     # JANET
+    511: (2019, 1),     # expRNN
+    400: (2019, 1),     # Transformer-XL
+    301: (2019, 2),     # GPT-2
+    512: (2019, 2),     # NRU
+    513: (2019, 3),     # IndyGRU (Gonnet & Deselaers)
+    514: (2019, 3),     # IndyLSTM (Gonnet & Deselaers)
+    515: (2019, 9),     # Mogrifier LSTM
+    516: (2019, 9),     # Mogrifier GRU
+    401: (2019, 11),    # Compressive Transformer
+    402: (2019, 11),    # kNN-LM
+    600: (2019, 12),    # LMU
+    403: (2020, 4),     # Longformer
+    601: (2020, 6),     # Liquid time-constant network
+    1100: (2020, 6),    # Linear Transformer (Katharopoulos et al.)
+    404: (2020, 7),     # BigBird
+    302: (2021, 1),     # Switch Transformer
+    1101: (2021, 2),    # DeltaNet (Schlag et al.)
+    517: (2021, 2),     # SRU++
+    602: (2021, 3),     # UnICORNN
+    200: (2021, 5),     # gMLP
+    201: (2021, 5),     # aMLP
+    202: (2021, 5),     # MLP-Mixer
+    603: (2021, 6),     # CfC
+    203: (2021, 6),     # CCS token-mixing MLP (Yu et al.)
+    518: (2021, 8),     # RRU (Zakovskis et al.)
+    1000: (2021, 10),   # S4
+    204: (2021, 11),    # Wave-MLP
+    405: (2021, 12),    # RETRO
+    205: (2022, 1),     # DynaMixer
+    103: (2022, 1),     # ConvNeXt
+    206: (2022, 2),     # pNLP-Mixer
+    207: (2022, 3),     # HyperMixer
+    303: (2022, 3),     # DCT-Former
+    1001: (2022, 3),    # DSS
+    406: (2022, 3),     # Memorizing Transformer
+    1002: (2022, 6),    # S4D
+    1003: (2022, 8),    # S5
+    1004: (2022, 12),   # H3
+    407: (2022, 12),    # RIN (Jabri et al.)
+    104: (2023, 2),     # Hyena
+    1005: (2023, 3),    # LRU (Orvieto et al.)
+    1102: (2023, 5),    # RWKV (RWKV-4 paper)
+    208: (2023, 5),     # Toeplitz neural network token mixing
+    1103: (2023, 7),    # RetNet
+    1104: (2023, 11),   # GateLoop
+    1105: (2023, 11),   # HGRN
+    1006: (2023, 12),   # Mamba
+    1007: (2023, 12),   # Mamba selective SSM
+    1200: (2024, 2),    # Griffin
+    1201: (2024, 3),    # Jamba
+    304: (2024, 4),     # Llama 3
+    305: (2024, 4),     # KAN
+    1106: (2024, 4),    # HGRN2
+    800: (2024, 5),     # xLSTM
+    801: (2024, 5),
+    802: (2024, 5),
+    1008: (2024, 5),    # Mamba-2
+    519: (2024, 6),     # Light Recurrent Unit (Electronics 2024; month unknown)
+    900: (2024, 10),    # minGRU / minLSTM ("Were RNNs All We Needed?")
+    901: (2024, 10),
+    902: (2024, 10),
+    903: (2024, 10),
+    904: (2024, 10),
+    905: (2024, 10),
+    906: (2024, 10),
+    1107: (2024, 12),   # Gated DeltaNet
+    408: (2024, 12),    # Titans
+    409: (2025, 2),     # Native Sparse Attention
+    1108: (2025, 3),    # RWKV-7 Goose
+    907: (2025, 10),    # ParaRNN (Danieli et al., arXiv 2510.21450)
+    908: (2025, 10),
+    209: (2025, 12),    # experimental Grassmann-flow mixer; no source date found
+    1009: (2026, 1),    # Mamba-3 (Lahoti et al., 2026)
+    1010: (2026, 1),    # Mamba-3 MIMO (same paper as Mamba-3 SISO)
+    306: (2026, 2),     # Arcee Trinity technical report
+    520: (2026, 3),     # M2RNN (Mishra et al., arXiv 2603.14360)
+}
+if set(MODEL_ORIGINS) != set(MODEL_IDS):
+    raise RuntimeError(
+        f"Every model needs a MODEL_ORIGINS date: missing={sorted(set(MODEL_IDS) - set(MODEL_ORIGINS))}, "
+        f"unknown={sorted(set(MODEL_ORIGINS) - set(MODEL_IDS))}"
+    )
+
+# ------------------------------------------------------------------ per-model options
+_MINRNN_ACT_NAMES = ["tanh", "relu", "silu", "gelu", "sigmoid", "g_act"]
+_MININDRNN_ACT_NAMES = [
+    "tanh", "relu", "silu", "prelu0", "prelu", "lrelu0.2", "lrelu0.01", "gelu", "bentid",
+    "sine", "cosine", "snake", "stepsine", "stepcos", "mish", "cone", "relu2", "g_act",
+]
+
+
+def _bench_opt(key, label, kind, default, choices=None, names=None, cell=False, short=None,
+               lo=None, hi=None):
+    """One benchmarkable model option.  ``cell`` options live in
+    ``rnn_cell_options`` (read by build_model's custom RNN path); the others
+    are top-level config keys.  ``kind`` is choice, bool, int or float."""
+    if kind == "bool":
+        choices = [False, True]
+    return dict(key=key, label=label, kind=kind, default=default, choices=choices, names=names,
+                cell=cell, short=short or key, lo=lo, hi=hi)
+
+
+# The same options the training menu exposes, keyed by model ID.
+BENCH_VARIANTS = {
+    902: [_bench_opt("minrnn_act", "MinRNN activation", "choice", 0, list(range(6)), _MINRNN_ACT_NAMES,
+                    short="act")],
+    903: [_bench_opt("minrnn_act", "MinIndRNN activation", "choice", 0, list(range(18)), _MININDRNN_ACT_NAMES,
+                    short="act")],
+    509: [_bench_opt("indrnn_activation", "IndRNN activation", "choice", "relu", ["relu", "tanh"],
+                   cell=True, short="act")],
+    513: [_bench_opt("relu_gates", "ReLU gates instead of sigmoid", "bool", False, cell=True, short="relu_gates")],
+    514: [_bench_opt("relu_gates", "ReLU gates instead of sigmoid", "bool", False, cell=True, short="relu_gates")],
+    515: [_bench_opt("mogrifier_rounds", "Mogrifier rounds (0 = plain LSTM)", "int", 5, cell=True,
+                    short="rounds", lo=0)],
+    516: [_bench_opt("mogrifier_rounds", "Mogrifier rounds (0 = plain GRU)", "int", 5, cell=True,
+                     short="rounds", lo=0)],
+    602: [_bench_opt("unicornn_dt", "UnICORNN time step dt", "float", 0.1, cell=True, short="dt", lo=0.0),
+         _bench_opt("unicornn_alpha", "UnICORNN alpha", "float", 10.0, cell=True, short="alpha")],
+    519: [_bench_opt("lru_highway", "LRU highway stacking", "bool", False, cell=True, short="highway")],
+    518: [_bench_opt("rru_middle_multiplier", "RRU middle-layer multiplier", "float", 2.0, cell=True,
+                     short="mid", lo=0.0),
+          _bench_opt("rru_dropout", "RRU in-cell dropout", "float", 0.0, cell=True, short="cell_drop",
+                     lo=0.0, hi=1.0)],
+    2: [_bench_opt("ngram_context", "N-gram context tokens", "int", 4, short="ctx", lo=1, hi=32)],
+    409: [_bench_opt("sparse_local_window", "Sparse local window (auto = min(512, seq))", "int", None,
+                    short="window", lo=1),
+         _bench_opt("sparse_compression_block", "Sparse compression block", "int", 32, short="block", lo=1),
+         _bench_opt("sparse_selected_blocks", "Sparse selected blocks", "int", 16, short="selected", lo=1)],
+    407: [_bench_opt("rin_num_latents", "RIN latent count", "int", 8, short="latents", lo=1)],
+    505: [_bench_opt("qrnn_kernel_size", "QRNN kernel size", "int", 2, short="kernel", lo=1)],
+    302: [_bench_opt("moe_num_experts", "Switch experts", "int", 4, short="experts", lo=1)],
+    400: [_bench_opt("txl_mem_len", "Transformer-XL memory length", "int", 128, short="mem", lo=1)],
+    408: [_bench_opt("titans_memory_slots", "Titans memory slots", "int", 32, short="slots", lo=1)],
+}
+
+
+def _bench_value_text(opt, value):
+    if value is None:
+        return "auto"
+    if opt["kind"] == "bool":
+        return "on" if value else "off"
+    if opt["names"]:
+        return opt["names"][value]
+    return f"{value:g}" if isinstance(value, float) else str(value)
+
+
+def _bench_parse_values(opt, raw):
+    """Parse one value, a comma list, or 'all'; raise ValueError when invalid."""
+    raw = raw.strip()
+    if not raw:
+        return [opt["default"]]
+    if raw.lower() == "all":
+        if opt["choices"] is None:
+            raise ValueError("'all' only works for options with a fixed set of choices")
+        return list(opt["choices"])
+    values = []
+    for token in (t.strip() for t in raw.split(",")):
+        if not token:
+            continue
+        if opt["kind"] == "bool":
+            if token.lower() in {"1", "y", "yes", "on", "true"}:
+                value = True
+            elif token.lower() in {"0", "n", "no", "off", "false"}:
+                value = False
+            else:
+                raise ValueError(f"{token!r} is not on/off")
+        elif opt["kind"] == "choice":
+            if opt["names"] and token.lower() in opt["names"]:
+                value = opt["names"].index(token.lower())
+            elif isinstance(opt["choices"][0], int) and token.lstrip("-").isdigit():
+                value = int(token)
+            else:
+                value = token.lower()
+            if value not in opt["choices"]:
+                raise ValueError(f"{token!r} is not one of {opt['names'] or opt['choices']}")
+        else:
+            value = int(token) if opt["kind"] == "int" else float(token)
+            if opt["lo"] is not None and value < opt["lo"]:
+                raise ValueError(f"{token} is below the minimum {opt['lo']}")
+            if opt["hi"] is not None and value > opt["hi"]:
+                raise ValueError(f"{token} is above the maximum {opt['hi']}")
+        if value not in values:
+            values.append(value)
+    if not values:
+        raise ValueError("no value given")
+    return values
+
+
+def _prompt_bench_variants(base_ids, ultra):
+    """Return {model_id: [overrides, ...]}; each overrides dict becomes one row."""
+    present = [mid for mid in base_ids if mid in BENCH_VARIANTS]
+    if not present:
+        return {}
+    chosen = {}
+    customise = 0
+    if not ultra:
+        cli_section("Per-model Options", 64)
+        print(f"  │  {_c(_DIM, f'{len(present)} selected models have their own options (activation, gates, …).')}")
+        print(f"  │  {_c(_DIM, 'Enter one value, a comma list to benchmark each as its own row,')}")
+        print(f"  │  {_c(_DIM, 'or all for every choice.')}")
+        print(f"  │")
+        customise = prompt_int("Use defaults (0) or customise / sweep (1)", valid={0, 1}, default=0)
+    for mid in present:
+        if customise:
+            print(f"  │")
+            print(f"  │  {_c(_WH, _B, MODEL_NAMES[mid])}")
+        for opt in BENCH_VARIANTS[mid]:
+            if ultra:
+                values = list(opt["choices"]) if opt["kind"] in {"choice", "bool"} else [opt["default"]]
+            elif not customise:
+                values = [opt["default"]]
+            else:
+                if opt["names"]:
+                    print(f"  │  {_c(_DIM, 'choices: ' + ', '.join(f'{i}={n}' for i, n in enumerate(opt['names'])))}")
+                elif opt["kind"] == "choice":
+                    print(f"  │  {_c(_DIM, 'choices: ' + ', '.join(map(str, opt['choices'])))}")
+                while True:
+                    raw = prompt_str(f"  {opt['label']}", default=_bench_value_text(opt, opt["default"]))
+                    if raw == _bench_value_text(opt, opt["default"]):
+                        raw = ""
+                    try:
+                        values = _bench_parse_values(opt, raw)
+                        break
+                    except ValueError as exc:
+                        print(f"  {_c(_RD, '✗')} {exc}")
+            chosen[(mid, opt["key"])] = values
+    variants = {}
+    for mid in present:
+        opts = BENCH_VARIANTS[mid]
+        rows = []
+        for combo in itertools.product(*(chosen[(mid, o["key"])] for o in opts)):
+            overrides, cell = {}, {}
+            for opt, value in zip(opts, combo):
+                if value is None:
+                    continue
+                (cell if opt["cell"] else overrides)[opt["key"]] = value
+            if cell:
+                overrides["rnn_cell_options"] = cell
+            rows.append(overrides)
+        variants[mid] = rows
+    return variants
+
+
+def _bench_variant_label(task):
+    """Short label: choice and on/off options always, numbers when changed."""
+    mid, overrides = task["id"], task["overrides"]
+    values = dict(overrides.get("rnn_cell_options", {}))
+    values.update({k: v for k, v in overrides.items() if k != "rnn_cell_options"})
+    parts = [
+        f"{opt['short']}={_bench_value_text(opt, values[opt['key']])}"
+        for opt in BENCH_VARIANTS.get(mid, [])
+        if opt["key"] in values
+        and (opt["kind"] in {"choice", "bool"} or values[opt["key"]] != opt["default"])
+    ]
+    return f" [{', '.join(parts)}]" if parts else ""
+
+
+def _bench_short_name(record, width=40):
+    """Compact name: the acronym for long names such as 'Independently
+    Recurrent Neural Network (IndRNN)', then the variant and structure tags."""
+    base = MODEL_NAMES.get(record["id"], str(record["id"]))
+    match = re.match(r"(.*?) \((.*?)\)", base)
+    if match and len(match.group(1)) > 20 and len(match.group(2)) <= 16:
+        short = match.group(2)
+    else:
+        short = base.split(" (")[0]
+    tags = record["name"][len(base):].strip() if record["name"].startswith(base) else ""
+    text = f"{short} {tags}".strip()
+    return text if len(text) <= width else text[:width - 1] + "…"
+
+
+def _prompt_bench_filters(base_ids):
+    cli_section("Filters", 64)
+    print(f"  │  {_c(_DIM, 'Years use each model’s first publication, e.g. 2015-2023, 2020-, -1999.')}")
+    print(f"  │")
+    while True:
+        raw = prompt_str("Years  (blank = all)", default="").strip()
+        match = re.fullmatch(r"(\d{4})?\s*(-)?\s*(\d{4})?", raw)
+        if raw and match and (match.group(1) or match.group(3)):
+            lo = int(match.group(1)) if match.group(1) else 0
+            hi = int(match.group(3)) if match.group(3) else (9999 if match.group(2) else lo)
+            if not match.group(1):
+                lo = 0
+            break
+        if not raw:
+            lo, hi = 0, 9999
+            break
+        print(f"  {_c(_RD, '✗')} Use a year or a range such as 2015-2023.")
+    raw = prompt_str("Exclude model IDs  (comma-separated, blank = none)", default="")
+    excluded = {int(x) for x in re.findall(r"\d+", raw)}
+    kept = [mid for mid in base_ids if lo <= MODEL_ORIGINS[mid][0] <= hi and mid not in excluded]
+    cli_section_end(64)
+    if not kept:
+        raise ValueError("The filters removed every model.")
+    if len(kept) != len(base_ids):
+        pinfo(f"{len(kept)} of {len(base_ids)} models kept by the filters")
+    return kept
+
 
 def get_bench_model_list():
     W = 64
     print(f"\n  {_c(_CY, _B, '┌─')} {_c(_WH, _B, 'Benchmark Group')} {_c(_CY, '─' * (W - 22) + '┐')}")
-    cli_opt(0, "All models",         "Every architecture; ask once for MinRNN/IndRNN activation")
-    cli_opt(1, "Ultra (all × acts)", "All models + every activation variant for MinRNN/IndRNN")
-    cli_opt(2, "Feedforwards",        "MLPs, Transformers, TCN, Mixer variants only")
-    cli_opt(3, "Classic RNNs",        "Vanilla RNN, GRU, LSTM, IndRNN, JANET, LTC…")
-    cli_opt(4, "Scan / SSM",          "Mamba, RWKV, minGRU/LSTM, GateLoop, RetNet…")
-    cli_opt(5, "Standard set",        "Excludes custom RNNs and xLSTM variants")
+    cli_opt(0, "All models",         "Every architecture currently registered in the model zoo")
+    cli_opt(1, "Ultra (all × options)", "All models; every activation / on-off option as its own row")
+    cli_opt(2, "Fixed-context",      "MLPs, convolution, Transformers, and mixer variants")
+    cli_opt(3, "Classic RNNs",        "Vanilla RNN, GRU/LSTM, IndRNN, LTC, Mogrifier, NRU…")
+    cli_opt(4, "Modern recurrent",   "xLSTM, SSMs, scans, recurrent attention, and memory models")
+    cli_opt(5, "Core comparison",    "Representative models across the current architecture families")
     cli_opt(6, "Custom list",         "Enter comma-separated model IDs manually")
     cli_blank_row()
     print(f"  {_c(_CY, '└' + '─' * (W - 2) + '┘')}\n")
 
     choice = prompt_int("Group", valid={0,1,2,3,4,5,6})
-
-    minrnn_acts   = [0]
-    minindrnn_acts = [0]
-    tasks = []
-
     if choice in [0, 1]:
-        base_ids = list(set(BENCH_GROUPS[2] + BENCH_GROUPS[3] + BENCH_GROUPS[4]))
+        base_ids = sorted(MODEL_NAMES)
     elif choice in BENCH_GROUPS:
         base_ids = BENCH_GROUPS[choice]
-    elif choice == 6:
+    else:
         print_model_menu()
-        raw = prompt_str("Model IDs  (comma-separated, e.g. 0,10,14)")
-        base_ids = [int(x.strip()) for x in raw.split(",") if x.strip().isdigit()]
-    else:
-        base_ids = []
+        raw = prompt_str("Model IDs  (comma-separated, e.g. 1,301,1006)")
+        base_ids = list(dict.fromkeys(int(x.strip()) for x in raw.split(",") if x.strip().isdigit()))
+        unknown = sorted(set(base_ids) - set(MODEL_IDS))
+        if unknown:
+            raise ValueError(f"Unknown model IDs: {unknown}. Choose IDs shown in the model menu.")
 
-    test_all_acts = (choice == 1)
-
-    if choice == 6 and (26 in base_ids or 32 in base_ids):
-        test_all_acts = (prompt_int("Test all activations for MinRNN/IndRNN?  (1=yes 0=no)", valid={0,1}) == 1)
-
-    if test_all_acts:
-        minrnn_range    = range(6)
-        minindrnn_range = range(18)
-    else:
-        if 26 in base_ids:
-            cli_section("MinRNN Activation", 64)
-            cli_opt(0,"Tanh"); cli_opt(1,"ReLU"); cli_opt(2,"SiLU")
-            cli_opt(3,"GELU"); cli_opt(4,"Sigmoid"); cli_opt(5,"g_act")
-            cli_section_end(64)
-            a = prompt_int("Select for MinRNN", valid=set(range(6)))
-            minrnn_range = [a]
-        else:
-            minrnn_range = [0]
-
-        if 32 in base_ids:
-            cli_section("MinIndRNN Activation", 64)
-            for idx, name in enumerate(["Tanh","ReLU","SiLU","PReLU 0","PReLU def",
-                                        "LReLU 0.2","LReLU 0.01","GELU","BentId",
-                                        "Sine","Cosine","Snake","StepSine","StepCos",
-                                        "Mish","Cone","ReLU²","g_act"]):
-                cli_opt(idx, name, kw=3, lw=14)
-            cli_section_end(64)
-            a = prompt_int("Select for MinIndRNN", valid=set(range(18)))
-            minindrnn_range = [a]
-        else:
-            minindrnn_range = [0]
-
-    for mid in base_ids:
-        if mid == 26:
-            for act in minrnn_range:
-                tasks.append((mid, {"minrnn_act": act}))
-        elif mid == 32:
-            for act in minindrnn_range:
-                tasks.append((mid, {"minrnn_act": act}))
-        else:
-            tasks.append((mid, {}))
-
+    base_ids = _prompt_bench_filters(base_ids)
+    variants = _prompt_bench_variants(base_ids, ultra=(choice == 1))
+    tasks = [
+        {"id": mid, "overrides": overrides}
+        for mid in base_ids for overrides in variants.get(mid, [{}])
+    ]
+    # Oldest idea first; a stable sort keeps each model's variants together.
+    tasks.sort(key=lambda task: (MODEL_ORIGINS[task["id"]], task["id"]))
     return tasks
 
-def bench_train_loop(cfg, model, optimizer, train_ds, valid_ds, vocab, line_mode, total_iters, fitness_mode, nan_skip):
+
+def _prompt_bench_hierarchy(tasks):
+    """Optional MEGABYTE layout shared by every compatible model in the run."""
+    compatible = [t for t in tasks if t["id"] in HIERARCHICAL_MODEL_MIXERS and t["id"] != MLP_MODEL_ID]
+    if not compatible:
+        return {"model_type": MODEL_TYPE_NORMAL}
+    cli_section("Hierarchy", 64)
+    cli_opt(0, "Flat", "Every model as an ordinary language model")
+    cli_opt(1, "MEGABYTE", "Each compatible model at every hierarchy stage")
+    cli_opt(2, "MEGABYTE-Bottom up", "Encode fine→coarse, then decode coarse→fine")
+    print(f"  │")
+    model_type = prompt_int("Model type", valid={0, 1, 2}, default=0)
+    if model_type == MODEL_TYPE_NORMAL:
+        cli_section_end(64)
+        return {"model_type": MODEL_TYPE_NORMAL}
+    skipped = len(tasks) - len(compatible)
+    if skipped:
+        pwarn(f"{skipped} selected rows have no MEGABYTE stage adapter and will be skipped")
+    print(f"  │  {_c(_DIM, 'Stage lengths multiply into the training window; the benchmarked')}")
+    print(f"  │  {_c(_DIM, 'model is the core at every stage.  Heads apply only to attention cores.')}")
+    print(f"  │")
+    stage_count = prompt_int("MEGABYTE stage count  (2 or more)", minimum=2, default=2)
+    layout = {"model_type": model_type, "stage_seq_lens": [], "stage_dims": [],
+              "stage_child_embed_dims": [], "stage_depths": [], "stage_heads": []}
+    for stage in range(stage_count):
+        label = f"Stage {stage + 1} {'(coarse)' if stage == 0 else '(fine)' if stage == stage_count - 1 else ''}".rstrip()
+        print(f"  │")
+        print(f"  │  {_c(_WH, _B, label)}")
+        layout["stage_seq_lens"].append(prompt_int("  Sequence length / groups", default=128 if stage == 0 else 4))
+        dim = prompt_int("  Hidden dimension", default=256 if stage == 0 else 128)
+        layout["stage_dims"].append(dim)
+        layout["stage_child_embed_dims"].append(prompt_int(
+            f"  Child token embedding dimension  (1–{dim})", valid=range(1, dim + 1), default=min(64, dim)))
+        layout["stage_depths"].append(prompt_int("  Layer count", default=2))
+        layout["stage_heads"].append(prompt_int("  Attention head count", default=8))
+    cli_section_end(64)
+    return layout
+
+
+# ------------------------------------------------------------------ settings
+# Version 2: model IDs in family blocks (version-1 files are translated on load).
+BENCH_SETTINGS_VERSION = 2
+BENCH_RESULTS_ROOT = "benchmark_results"
+
+
+def collect_bench_settings():
+    """Ask every benchmark question once; the answers form a JSON preset."""
+    s = {"version": BENCH_SETTINGS_VERSION}
+
+    # ── Dataset & tokenizer ────────────────────────────────────────────────────
+    cli_section("Dataset", 64)
+    print(f"  │")
+    s["dataset_path"] = prompt_str("Dataset file path")
+    print(f"  │")
+    print(f"  │  {_c(_DIM, 'Dataset type:')}")
+    cli_opt(0, "Standard (corpus)", "Sliding-window over a continuous text stream")
+    cli_opt(1, "Line mode",         "One example per line with BOS/EOS padding")
+    print(f"  │")
+    s["dataset_type"] = prompt_int("Dataset type", valid={0,1})
+    print(f"  │")
+    print(f"  │  {_c(_DIM, 'Tokenizer:')}")
+    cli_opt(-1, "Binary"); cli_opt(0, "Byte"); cli_opt(1, "Char")
+    cli_opt( 2, "Word");   cli_opt(3, "Tiktoken"); cli_opt(4, "BPE")
+    print(f"  │")
+    s["tokenizer_mode"] = prompt_int("Tokenizer", valid={-1,0,1,2,3,4})
+    cli_section_end(64)
+    s["seq2seq"] = prompt_seq2seq_config(s["dataset_path"]) if s["dataset_type"] == 1 else None
+
+    # ── Models ─────────────────────────────────────────────────────────────────
+    tasks = get_bench_model_list()
+    s["hierarchy"] = _prompt_bench_hierarchy(tasks)
+    hierarchical = s["hierarchy"]["model_type"] != MODEL_TYPE_NORMAL
+    if hierarchical:
+        tasks = [t for t in tasks if t["id"] in HIERARCHICAL_MODEL_MIXERS and t["id"] != MLP_MODEL_ID]
+    s["tasks"] = tasks
+    ids = {t["id"] for t in tasks}
+
+    # Ask once per architecture, not once per variant.
+    s["activations"] = {}
+    activation_models = sorted(ids & NON_RNN_ACTIVATION_IDS)
+    if activation_models:
+        cli_section("Non-recurrent Activations", 64)
+        print(f"  │  {_c(_DIM, 'Choose each architecture default or a user-defined activation.')}")
+        print(f"  │")
+        for mid in activation_models:
+            default = MODEL_DEFAULT_ACTIVATIONS[mid]
+            label = MODEL_NAMES.get(mid, f"Model {mid}")
+            cli_opt(mid, label, f"default: {default.upper()}", kw=4, lw=26)
+            mode = prompt_int("Use default (0) or customise (1)", valid={0, 1}, default=0)
+            s["activations"][str(mid)] = default if mode == 0 else prompt_activation(default, label)
+        cli_section_end(64)
+
+    # ── Architecture ───────────────────────────────────────────────────────────
+    cli_section("Architecture Defaults", 64)
+    print(f"  │  {_c(_DIM, 'Applied to every model in the run.')}")
+    print(f"  │")
+    s["size_mode"], s["target_params"] = "fixed", 0
+    s["embed_dim"], s["layer_count"], s["head_count"], s["seq_len"] = 256, 4, 4, 0
+    if hierarchical:
+        pinfo("Width, depth, heads and window come from the MEGABYTE stages")
+    else:
+        cli_opt(0, "Fixed width",     "Every model uses the same hidden dimension")
+        cli_opt(1, "Match parameters", "Scale each model's hidden dimension to a parameter budget")
+        print(f"  │")
+        if prompt_int("Model size", valid={0, 1}, default=0) == 1:
+            s["size_mode"] = "params"
+            s["target_params"] = int(prompt_float("Target parameters  (millions)", default=2.0) * 1e6)
+        else:
+            s["embed_dim"] = prompt_int("Embedding / hidden dim", default=256)
+        s["layer_count"] = prompt_int("Layer count", default=4)
+        if ids & ATTN_MODEL_IDS:
+            s["head_count"] = prompt_int("Attention / xLSTM head count", default=4)
+        if s["dataset_type"] == 0:
+            s["seq_len"] = prompt_int("Sequence length", default=128)
+    s["batch_size"] = prompt_int("Batch size", default=32)
+    print(f"  │")
+    print(f"  │  {_c(_DIM, 'Stop each model after:')}")
+    cli_opt(0, "Maximum steps",   "A fixed number of optimizer updates")
+    cli_opt(1, "Maximum seconds", "A fixed wall-clock time budget")
+    print(f"  │")
+    if prompt_int("Benchmark limit", valid={0,1}, default=0) == 0:
+        s["total_iters"] = prompt_int("Maximum steps per model", default=500, minimum=1)
+        s["max_seconds"] = None
+    else:
+        s["total_iters"] = 0
+        s["max_seconds"] = prompt_float("Maximum seconds per model", default=60.0)
+        while s["max_seconds"] <= 0:
+            print(f"  {_c(_RD, '✗')} Maximum seconds must be greater than zero.")
+            s["max_seconds"] = prompt_float("Maximum seconds per model", default=60.0)
+    print(f"  │")
+    print(f"  │  {_c(_DIM, 'Set 0 to benchmark every model regardless of training speed.')}")
+    s["min_iters_per_sec"] = prompt_float("Skip models below it/s  (0 = off)", default=0.0)
+    while s["min_iters_per_sec"] < 0:
+        print(f"  {_c(_RD, '✗')} The it/s threshold cannot be negative.")
+        s["min_iters_per_sec"] = prompt_float("Skip models below it/s  (0 = off)", default=0.0)
+    print(f"  │")
+    print(f"  │  {_c(_DIM, 'Run these steps before measuring it/s, so CUDA/JIT/compile startup is ignored.')}")
+    s["speed_warmup_steps"] = prompt_int("Throughput warm-up steps", default=5, minimum=0)
+    cli_section_end(64)
+
+    # ── Truncated BPTT ─────────────────────────────────────────────────────────
+    s["line"] = {"sample_lines": 1}
+    s["tbptt"] = {"enabled": False, "window": 0, "total_len": 0}
+    line = s["dataset_type"] == 1
+    cli_section("Line Mode & TBPTT" if line else "Truncated BPTT", 64)
+    if line:
+        print(f"  │  {_c(_DIM, 'Each example is one line with BOS/EOS; the window is the longest line.')}")
+        print(f"  │  {_c(_DIM, 'TBPTT streams lines through recurrent and scan models in fixed windows,')}")
+        print(f"  │  {_c(_DIM, 'carrying state and resetting it at each new line, as training does.')}")
+    else:
+        print(f"  │  {_c(_DIM, 'TBPTT streams the corpus through recurrent and scan models in fixed')}")
+        print(f"  │  {_c(_DIM, 'windows, carrying state between steps, as training does.')}")
+    print(f"  │  {_c(_DIM, 'Other models keep their normal batches.')}")
+    print(f"  │")
+    s["tbptt"]["enabled"] = prompt_str("Enable TBPTT  (y/n)", default="n").lower() in ("y", "yes", "1")
+    if s["tbptt"]["enabled"]:
+        s["tbptt"]["window"] = prompt_int(
+            "BPTT window  (tokens per step" + (", ≤ max line length)" if line else ")"), default=64, minimum=1)
+        if not line:
+            print(f"  │  {_c(_DIM, 'Total TBPTT length — tokens streamed before every state is reset.')}")
+            s["tbptt"]["total_len"] = prompt_int("Total TBPTT length  (0 = until end of data)", default=0, minimum=0)
+    cli_section_end(64)
+
+    # ── Performance ────────────────────────────────────────────────────────────
+    perf = {"use_amp": False, "amp_dtype": "fp16", "use_compile": False}
+    if DEVICE == "cuda":
+        cli_section("Performance", 64)
+        print(f"  │  {_c(_DIM, 'Applied to every model in the run.')}")
+        print(f"  │")
+        perf["use_amp"] = prompt_int("Mixed precision / AMP  (0=off 1=on)", valid={0, 1}, default=0) == 1
+        if perf["use_amp"]:
+            perf["amp_dtype"] = prompt_amp_dtype()
+        print(f"  │")
+        print(f"  │  {_c(_DIM, 'torch.compile — first steps of each model include compilation;')}")
+        print(f"  │  {_c(_DIM, 'raise the warm-up steps so it/s is measured after it.')}")
+        perf["use_compile"] = prompt_int("Enable torch.compile  (0=off 1=on)", valid={0, 1}, default=0) == 1
+        if perf["use_compile"]:
+            cli_opt(0, "aot_eager", "Portable default; traces graphs, no codegen")
+            cli_opt(1, "inductor",  "Triton codegen; fastest when the GPU/CUDA stack supports it")
+            print(f"  │")
+            perf["compile_backend"] = ["aot_eager", "inductor"][
+                prompt_int("Compile backend", valid={0, 1}, default=0)
+            ]
+        cli_section_end(64)
+    s["perf"] = perf
+
+    # ── Optimisation ───────────────────────────────────────────────────────────
+    # The normal optimizer picker keeps every architecture on the same optimizer
+    # and hyperparameters; its learning rate is the base for the options below.
+    s["optim"] = prompt_optimizer_config()
+    cli_section("Learning Rate & Clipping", 64)
+    cli_opt(0, "Constant",        "The optimizer's learning rate throughout")
+    cli_opt(1, "Cosine + warmup", "Linear ramp for N steps, then cosine decay to 0")
+    cli_opt(2, "Cosine",          "Cosine decay from the start")
+    cli_opt(3, "One-cycle",       "Ramp up over 30% of the run, then cosine down")
+    print(f"  │  {_c(_DIM, 'With a time limit, progress is measured in elapsed time.')}")
+    print(f"  │")
+    s["lr_schedule"] = ["none", "cosine_warmup", "cosine", "one_cycle"][
+        prompt_int("LR schedule", valid={0, 1, 2, 3}, default=0)]
+    s["warmup_steps"] = (prompt_int("Warmup steps", default=100, minimum=0)
+                         if s["lr_schedule"] == "cosine_warmup" else 0)
+    s["grad_clip"] = prompt_float("Gradient clip norm  (0 = off)", default=1.0)
+    print(f"  │")
+    s["lr_multipliers"], s["lr_search"] = [1.0], None
+    if "lr" not in s["optim"]["optim_params"]:
+        pinfo(f"{s['optim']['optimizer']} has no learning rate; LR sweep unavailable")
+        lr_mode = 0
+    else:
+        cli_opt(0, "Base LR",        "Every model uses the optimizer's learning rate")
+        cli_opt(1, "Multipliers",    "Try listed multiples of the base LR, keep each model's best")
+        cli_opt(2, "Search a range", "Golden-section search for each model's best LR in [min, max]")
+        print(f"  │")
+        lr_mode = prompt_int("Learning rate per model", valid={0, 1, 2}, default=0)
+    if lr_mode == 2:
+        print(f"  │  {_c(_DIM, 'Loss vs LR is U-shaped, so each step compares two LRs and drops the')}")
+        print(f"  │  {_c(_DIM, 'worse side of the range (log scale): 38% narrower per extra run.')}")
+        base = float(s["optim"]["optim_params"]["lr"])
+        while True:
+            lo = prompt_float("Minimum LR", default=base / 10)
+            hi = prompt_float("Maximum LR", default=base * 10)
+            if 0 < lo < hi:
+                break
+            print(f"  {_c(_RD, '✗')} Need 0 < minimum < maximum.")
+        halvings = prompt_int("Range halvings  (precision; each halves the log range)", default=4, minimum=1)
+        steps = lr_search_steps(halvings)
+        width = (hi / lo) ** (0.618034 ** steps)
+        pinfo(f"{steps + 2} runs per model; the best LR is found to within ×{width:.2f}")
+        s["lr_search"] = {"min": lo, "max": hi, "halvings": halvings, "steps": steps}
+    elif lr_mode == 1:
+        print(f"  │  {_c(_DIM, 'Each model trains once per multiplier of the base LR and keeps its')}")
+        print(f"  │  {_c(_DIM, 'best.  e.g. 0.3,1,3 triples the run time.')}")
+        while True:
+            raw = prompt_str("LR multipliers  (blank = base LR only)", default="")
+            try:
+                values = [float(x) for x in raw.split(",") if x.strip()] or [1.0]
+                if all(v > 0 for v in values):
+                    s["lr_multipliers"] = list(dict.fromkeys(values))
+                    break
+            except ValueError:
+                pass
+            print(f"  {_c(_RD, '✗')} Enter positive numbers separated by commas.")
+    cli_section_end(64)
+
+    # ── Recurrent structure ────────────────────────────────────────────────────
+    s["rnn"] = {}
+    structure_ids = ids & BENCH_RNN_STRUCTURE_IDS
+    if structure_ids:
+        rnn = s["rnn"]
+        cli_section("RNN Structure Options", 64)
+        print(f"  │  {_c(_DIM, f'Applied to the {len(structure_ids)} selected recurrent cells that support them')}")
+        print(f"  │  {_c(_DIM, '(vanilla RNN, GRU, LSTM, IndRNN, JANET, LTC, Mogrifier, UnICORNN, …).')}")
+        print(f"  │")
+        rnn["res_every"] = prompt_int("Residual every N layers  (0 = off)", default=0, minimum=0)
+        rnn["res_type"] = 0
+        if rnn["res_every"] > 0:
+            cli_opt(0, "Add"); cli_opt(1, "Concat+proj")
+            cli_opt(2, "ReZero scalar"); cli_opt(3, "ReZero vector")
+            print(f"  │")
+            rnn["res_type"] = prompt_int("Residual type", default=0, valid={0,1,2,3})
+        print(f"  │")
+        print(f"  │  {_c(_DIM, 'Norm:')}")
+        cli_opt(0,"None"); cli_opt(1,"BN"); cli_opt(2,"LN")
+        cli_opt(3,"RMS");  cli_opt(4,"TTanh"); cli_opt(5,"ETTanh"); cli_opt(6,"DyT")
+        print(f"  │")
+        rnn["use_norm"] = prompt_int("Norm type", default=2, valid={0,1,2,3,4,5,6})
+        rnn["dropout"] = prompt_float("Inter-layer dropout  (0.0 = off)", default=0.0)
+        print(f"  │")
+        cli_opt(0, "Off"); cli_opt(1, "Scalar"); cli_opt(2, "Per-dim vector")
+        rnn["use_multiplier"] = prompt_int("Output multiplier", valid={0, 1, 2}, default=0)
+        rnn["rnn_ffn"] = 0
+        if ids & BENCH_CUSTOM_RNN_IDS:
+            print(f"  │")
+            print(f"  │  {_c(_DIM, 'Post-layer feed-forward block (custom cells only; not vanilla RNN/GRU/LSTM):')}")
+            cli_opt(0, "Off"); cli_opt(1, "SwiGLU"); cli_opt(2, "ReGLU"); cli_opt(3, "SiLU")
+            rnn["rnn_ffn"] = prompt_int("Post-layer FFN", valid={0, 1, 2, 3}, default=0)
+        cli_section_end(64)
+
+    # ── Evaluation ─────────────────────────────────────────────────────────────
+    cli_section("Evaluation", 64)
+    print(f"  │")
+    s["nan_skip"] = prompt_int("Skip model on NaN / crash  (1=yes 0=no)", valid={0,1}, default=1) == 1
+    print(f"  │")
+    print(f"  │  {_c(_DIM, 'Fitness metric:')}")
+    cli_opt(0, "Sliding train loss",  "Rolling average of last 100 training steps")
+    cli_opt(1, "Final train eval",    "Evaluate 1 000 random training samples at the end")
+    cli_opt(2, "Validation loss",     "Best held-out loss tracked throughout training")
+    print(f"  │")
+    s["fitness_mode"] = prompt_int("Fitness metric", valid={0,1,2})
+    s["val"] = {"val_split": 0.0}
+    if s["fitness_mode"] == 2:
+        if s["dataset_type"] == 0:
+            vpath = prompt_str("Validation file  (blank to auto-split)", default="")
+            if vpath:
+                s["val"]["classic_val_path"] = vpath
+            else:
+                s["val"]["val_split"] = prompt_float("Validation split fraction", default=0.1)
+        else:
+            s["val"]["val_split"] = prompt_float("Validation split fraction", default=0.1)
+        s["val"]["_val_freq"] = prompt_int("Validation frequency  (steps)", default=100, minimum=1)
+        s["val"]["_val_samples"] = prompt_int("Validation samples per check", default=1000, minimum=1)
+    print(f"  │")
+    print(f"  │  {_c(_DIM, 'Seeds: each model trains this many times; the table shows mean ± spread.')}")
+    s["seeds"] = prompt_int("Seeds per model", default=1, minimum=1)
+    print(f"  │")
+    if s["dataset_type"] == 1:
+        s["sample_len"] = prompt_int("Max tokens per sampled line  (0 = no samples)", default=200, minimum=0)
+        if s["sample_len"]:
+            s["line"]["sample_lines"] = prompt_int("Lines sampled per model", default=3, minimum=1)
+    else:
+        s["sample_len"] = prompt_int("Sample tokens generated per model  (0 = off)", default=200, minimum=0)
+    s["sample_temperature"] = (prompt_float("Sample temperature", default=0.8)
+                               if s["sample_len"] else 0.8)
+    print(f"  │")
+    cli_opt(0, "Ranked",   "Best score first")
+    cli_opt(1, "Timeline", "Oldest first, with records and improvement over the best so far")
+    cli_opt(2, "Both")
+    s["table_order"] = prompt_int("Results table", valid={0, 1, 2}, default=2)
+    cli_section_end(64)
+    return s
+
+
+def _bench_legacy_id(model_id):
+    if model_id not in LEGACY_MODEL_IDS:
+        raise ValueError(f"Version-1 benchmark file names unknown model ID {model_id}")
+    return LEGACY_MODEL_IDS[model_id]
+
+
+def _bench_normalize_settings(s):
+    """Undo JSON's changes: int dict keys and tuples.  Version-1 settings
+    predate the model-ID renumbering and are translated in place."""
+    if s.get("version") == 1:
+        for task in s["tasks"]:
+            task["id"] = _bench_legacy_id(task["id"])
+        s["activations"] = {str(_bench_legacy_id(int(k))): v for k, v in s.get("activations", {}).items()}
+        s["version"] = BENCH_SETTINGS_VERSION
+    if s.get("version") != BENCH_SETTINGS_VERSION:
+        raise ValueError(f"Unsupported benchmark settings version {s.get('version')!r}")
+    line = s.setdefault("line", {})
+    line.setdefault("sample_lines", 1)
+    # Settings from before corpus TBPTT kept the line-mode switch under "line".
+    s.setdefault("tbptt", {"enabled": bool(line.get("use_tbptt")), "window": int(line.get("bptt_window", 0)),
+                           "total_len": 0})
+    s.setdefault("lr_search", None)
+    s.setdefault("seq2seq", None)
+    s["optim"]["optim_params"] = {
+        k: tuple(v) if isinstance(v, list) else v for k, v in s["optim"]["optim_params"].items()
+    }
+    unknown = sorted({t["id"] for t in s["tasks"]} - set(MODEL_IDS))
+    if unknown:
+        raise ValueError(f"Settings name unknown model IDs {unknown}")
+    return s
+
+
+def _bench_read_json(path):
+    path = pathlib.Path(path).expanduser()
+    if path.is_dir():
+        path = path / "results.json"
+    with open(path, "r", encoding="utf-8") as f:
+        return path, json.load(f)
+
+
+def _bench_task_key(task):
+    return json.dumps([task["id"], task["overrides"]], sort_keys=True)
+
+
+# ------------------------------------------------------------------ one model
+def _bench_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def _bench_task_cfg(s, task, cfg_base):
+    mid, overrides = task["id"], task["overrides"]
+    cfg = copy.deepcopy(cfg_base)
+    cfg.update({
+        "model_selection": mid,
+        "embed_dim": s["embed_dim"],
+        "layer_count": s["layer_count"],
+        "head_count": s["head_count"],
+        "batch_size": s["batch_size"],
+        "learning_rate": s["optim"]["optim_params"].get("lr", 1e-3),
+        "activation_name": s["activations"].get(str(mid), "gelu"),
+        "dropout": 0.0,
+        "tokenizer_mode": s["tokenizer_mode"],
+        "optimizer": s["optim"]["optimizer"],
+        "optim_params": dict(s["optim"]["optim_params"]),
+        "temperature": s.get("sample_temperature", 0.8),
+        "use_tbptt": s["tbptt"]["enabled"],
+        "bptt_window": s["tbptt"]["window"],
+        "tbptt_total_len": s["tbptt"]["total_len"],
+        # Stable samples make final-train and repeated validation scores
+        # directly comparable across checkpoints and models.
+        "_bench_train_eval_seed": SEED + 10_001,
+        "_bench_valid_seed": SEED + 10_002,
+        **s["perf"],
+    })
+    rnn = s["rnn"]
+    if mid in BENCH_RNN_STRUCTURE_IDS and rnn:
+        cfg.update({k: rnn[k] for k in ("use_norm", "res_every", "res_type", "dropout", "use_multiplier")})
+        if mid in BENCH_CUSTOM_RNN_IDS:
+            cfg["rnn_ffn"] = rnn["rnn_ffn"]
+    cfg["rnn_cell_options"] = dict(overrides.get("rnn_cell_options", {}))
+    cfg.update({k: v for k, v in overrides.items() if k != "rnn_cell_options"})
+
+    h = s["hierarchy"]
+    if h["model_type"] != MODEL_TYPE_NORMAL:
+        n = len(h["stage_dims"])
+        heads = [hd if megabyte_mixer_uses_heads(mid) else 1 for hd in h["stage_heads"]]
+        cfg.update({
+            "model_type": h["model_type"],
+            "megabyte_stage_mixers": [mid] * n,
+            "megabyte_stage_dims": list(h["stage_dims"]),
+            "megabyte_stage_depths": list(h["stage_depths"]),
+            "megabyte_stage_heads": heads,
+            "megabyte_stage_seq_lens": list(h["stage_seq_lens"]),
+            "megabyte_stage_child_embed_dims": list(h["stage_child_embed_dims"]),
+            "embed_dim": h["stage_dims"][0],
+            "layer_count": sum(h["stage_depths"]),
+            "head_count": heads[0],
+            "seq_len": math.prod(h["stage_seq_lens"]),
+        })
+        if resolve_megabyte_stage_mixer(mid) in {"rnn", "rnn_relu", "gru", "lstm"}:
+            cfg.update({
+                "megabyte_fused_rnn_version": 2,
+                "megabyte_fused_rnn_norm_type": rnn.get("use_norm", 0),
+                "megabyte_fused_rnn_res_every": rnn.get("res_every", 0),
+                "megabyte_fused_rnn_res_type": rnn.get("res_type", 0),
+                "megabyte_fused_rnn_dropout": rnn.get("dropout", 0.0),
+            })
+        if h["model_type"] == MODEL_TYPE_MEGABYTE_BOTTOM_UP:
+            cfg["megabyte_bottom_up_version"] = 6
+    return cfg
+
+
+def _bench_model_name(s, task, cfg):
+    mid = task["id"]
+    name = MODEL_NAMES.get(mid, f"Model {mid}") + _bench_variant_label(task)
+    if mid in NON_RNN_ACTIVATION_IDS:
+        name += f" [act={cfg['activation_name']}]"
+    if mid in BENCH_RNN_STRUCTURE_IDS and s["rnn"]:
+        norm_name = ["None","BN","LN","RMS","TT","ETT","DyT"][cfg.get("use_norm", 0)]
+        res_str = f"|Res{cfg.get('res_every', 0)}" if cfg.get("res_every", 0) > 0 else ""
+        ffn_str = f"|{['', 'SwiGLU', 'ReGLU', 'SiLU'][cfg.get('rnn_ffn', 0)]}" if cfg.get("rnn_ffn", 0) else ""
+        name += f" [{norm_name}{res_str}{ffn_str}]"
+    return name
+
+
+def _bench_param_count(cfg, vocab_size):
+    """Parameter count without allocating: build on the meta device, falling
+    back to a real build for constructors that compute with real tensors."""
+    global DEVICE
+    saved = DEVICE
+    try:
+        DEVICE = "meta"
+        with torch.device("meta"):
+            model = build_model(copy.deepcopy(cfg), vocab_size)
+        return sum(p.numel() for p in model.parameters())
+    except Exception:
+        pass
+    finally:
+        DEVICE = saved
+    model = None
+    try:
+        model = build_model(copy.deepcopy(cfg), vocab_size)
+        return sum(p.numel() for p in model.parameters())
+    except Exception:
+        return None
+    finally:
+        del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
+def fit_width_to_params(cfg, vocab_size, target, head_count):
+    """Hidden size (a multiple of lcm(8, heads)) whose parameter count is
+    closest to ``target``.  Returns (dim, params); params is None if no width
+    could be built."""
+    step = math.lcm(8, max(1, int(head_count)))
+    counts = {}
+
+    def count(k):
+        if k not in counts:
+            counts[k] = _bench_param_count(dict(cfg, embed_dim=k * step), vocab_size)
+        return counts[k]
+
+    lo, hi = 1, max(1, 8192 // step)
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        probe = mid
+        while count(probe) is None and probe < min(hi, mid + 3):
+            probe += 1
+        if count(probe) is None:
+            hi = mid - 1
+        elif count(probe) < target:
+            lo = probe + 1
+        else:
+            hi = mid - 1
+    valid = [(abs(n - target), k) for k, n in counts.items() if n is not None]
+    if not valid:
+        return cfg["embed_dim"], None
+    _, k = min(valid)
+    return k * step, counts[k]
+
+
+_GOLDEN = (math.sqrt(5.0) - 1.0) / 2.0     # 0.618…: range kept per search step
+
+
+def lr_search_steps(halvings):
+    """Golden-section steps giving at least ``halvings`` halvings of the range."""
+    return max(1, math.ceil(halvings * math.log(2.0) / -math.log(_GOLDEN)))
+
+
+def lr_golden_search(evaluate, lr_min, lr_max, steps):
+    """Golden-section search for the lowest score over log(LR) in
+    [lr_min, lr_max].  ``evaluate(lr)`` returns a dict with a ``score`` (inf
+    for a failed run, which steers the search away from it).  Assumes loss is
+    roughly U-shaped in log(LR); every LR tried is kept by the caller, so the
+    reported best is the best actually trained, not an interpolation.
+    Costs ``steps + 2`` evaluations."""
+    a, b = math.log(lr_min), math.log(lr_max)
+    c, d = b - _GOLDEN * (b - a), a + _GOLDEN * (b - a)
+    fc, fd = evaluate(math.exp(c))["score"], evaluate(math.exp(d))["score"]
+    for _ in range(steps):
+        if fc <= fd:
+            b, d, fd = d, c, fc
+            c = b - _GOLDEN * (b - a)
+            fc = evaluate(math.exp(c))["score"]
+        else:
+            a, c, fc = c, d, fd
+            d = a + _GOLDEN * (b - a)
+            fd = evaluate(math.exp(d))["score"]
+
+
+def bench_lr_factor(kind, progress, step, warmup_steps):
+    """Multiplier on the base LR; ``progress`` runs 0→1 over the run."""
+    p = min(max(progress, 0.0), 1.0)
+    if kind == "cosine_warmup":
+        if step < warmup_steps:
+            return (step + 1) / warmup_steps
+        return 0.5 * (1.0 + math.cos(math.pi * p))
+    if kind == "cosine":
+        return 0.5 * (1.0 + math.cos(math.pi * p))
+    if kind == "one_cycle":
+        if p < 0.3:
+            return 0.04 + 0.96 * p / 0.3
+        return 0.5 * (1.0 + math.cos(math.pi * (p - 0.3) / 0.7))
+    return 1.0
+
+
+def bench_train_loop(cfg, model, optimizer, train_ds, valid_ds, vocab, line_mode,
+                     total_iters, fitness_mode, nan_skip, *, max_seconds=None,
+                     min_iters_per_sec=0.0, speed_warmup_steps=5, stats=None,
+                     lr_schedule="none", warmup_steps=0, grad_clip=1.0):
     """
     Returns: (score, best_step, status_string)
-    status_string is "OK" or "NaN"
+    ``total_iters`` caps the run by steps.  Set ``max_seconds`` to cap it by
+    elapsed wall-clock time instead.  A positive ``min_iters_per_sec`` skips a
+    model after the warm-up throughput falls below that threshold.
+    ``cfg["use_amp"]`` / ``cfg["amp_dtype"]`` enable autocast as in training.
+    ``lr_schedule`` scales every param group's starting LR by bench_lr_factor;
+    ``grad_clip`` <= 0 disables clipping.
+    Pass a dict as ``stats`` to receive ``steps``, post-warm-up ``it_s``, and
+    the ``curve`` / ``val_curve`` lists of (step, loss).
     """
+    if total_iters <= 0 and (max_seconds is None or max_seconds <= 0):
+        raise ValueError("Benchmark needs a positive maximum step count or time limit.")
+    if max_seconds is not None and max_seconds <= 0:
+        raise ValueError("Benchmark time limit must be greater than zero.")
+    if min_iters_per_sec < 0:
+        raise ValueError("Minimum iterations per second cannot be negative.")
+    if speed_warmup_steps < 0:
+        raise ValueError("Speed-filter warm-up steps cannot be negative.")
+    if fitness_mode == 2 and valid_ds is None:
+        raise ValueError("Validation-loss benchmarking requires a validation dataset.")
+
     # === FIX START: Handle None pad_id explicitly ===
     pad_id = getattr(vocab, "pad_id", -100)
-    if pad_id is None: 
+    if pad_id is None:
         pad_id = -100
-    
+
     criterion = nn.CrossEntropyLoss(ignore_index=pad_id)
     # === FIX END ===
     model.train()
-    
+    use_amp, amp_dtype, scaler = amp_settings(cfg)
+    if stats is None:
+        stats = {}
+    stats.update(steps=0, it_s=0.0, curve=[], val_curve=[])
+    base_lrs = [group.get("lr") for group in optimizer.param_groups]
+    curve_every = 1 if max_seconds is not None else max(1, total_iters // 200)
+
     losses = []
     best_valid_loss = float('inf')
     best_valid_step = 0
-    
+
     # Validation settings from config
     val_freq = cfg.get("_val_freq", 100)
-    
+    if fitness_mode == 2 and val_freq <= 0:
+        raise ValueError("Validation frequency must be greater than zero.")
+
     # Simple batch fetcher
     def get_batch(ds):
         if hasattr(ds, 'get_batch'): return ds.get_batch(cfg["batch_size"])
@@ -4430,304 +7305,716 @@ def bench_train_loop(cfg, model, optimizer, train_ds, valid_ds, vocab, line_mode
     # Progress bar
     pbar_desc = f"[bench] {MODEL_NAMES.get(cfg['model_selection'], cfg['model_selection'])}"
     if "minrnn_act" in cfg: pbar_desc += f" (act={cfg['minrnn_act']})"
-    
-    with tqdm(total=total_iters, desc=pbar_desc, leave=False) as pbar:
-        for i in range(1, total_iters + 1):
-            try:
-                x, y = get_batch(train_ds)
-                
-                # Forward
-                if cfg["model_selection"] in RNN_MODEL_IDS:
-                    out = model(x, None)
-                    logits = out[0]
-                elif cfg["model_selection"] in SCAN_MODEL_IDS:
-                    out = model(x) # ScanLM handles None state internally usually
-                    logits = out[0] if isinstance(out, tuple) else out
-                else:
-                    logits = model(x)
 
-                loss = criterion(logits.reshape(-1, logits.size(-1)), y.reshape(-1))
-                
+    started_at = time.perf_counter()
+    speed_started_at = started_at
+    completed_steps = 0
+    last_validation_step = 0
+    pbar_total = None if max_seconds is not None else total_iters
+
+    # TBPTT, exactly as train_loop streams it: only recurrent and scan models
+    # carry state; every other model keeps its normal batches.
+    eager = getattr(model, "_orig_mod", model)
+    is_bottom_up = is_bottom_up_megabyte(cfg)
+    msel = cfg["model_selection"]
+    line_stream = None
+    if cfg.get("use_tbptt") and (msel in SCAN_MODEL_IDS or (msel in RNN_MODEL_IDS and not is_bottom_up)):
+        if line_mode:
+            line_stream = LineTBPTTStream(
+                dataset=train_ds, window=int(cfg["bptt_window"]), batch_size=cfg["batch_size"],
+                bos_id=vocab.bos_id, pad_id=vocab.pad_id)
+        else:
+            line_stream = TBPTTClassicStream(
+                train_ds.ids if hasattr(train_ds, "ids") else train_ds.data,
+                window=int(cfg["bptt_window"]), batch_size=cfg["batch_size"],
+                total_len=int(cfg.get("tbptt_total_len", 0)))
+    stats["tbptt"] = line_stream is not None
+    rnn_state = None
+    with tqdm(total=pbar_total, desc=pbar_desc, leave=False) as pbar:
+        while True:
+            if total_iters > 0 and completed_steps >= total_iters:
+                break
+            if max_seconds is not None and completed_steps > 0:
+                if time.perf_counter() - started_at >= max_seconds:
+                    break
+
+            i = completed_steps + 1
+            try:
+                if lr_schedule != "none":
+                    progress = (completed_steps / total_iters if max_seconds is None
+                                else (time.perf_counter() - started_at) / max_seconds)
+                    factor = bench_lr_factor(lr_schedule, progress, completed_steps, warmup_steps)
+                    for group, base in zip(optimizer.param_groups, base_lrs):
+                        if base is not None:
+                            group["lr"] = base * factor
+
+                if line_stream is not None:
+                    x, y, reset_mask = line_stream.get_next(DEVICE)
+                else:
+                    x, y = get_batch(train_ds)
+
+                # Forward
+                with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
+                    if line_stream is not None:
+                        if rnn_state is None and isinstance(eager, MegaByteLM) and eager.is_incremental:
+                            rnn_state = eager.init_incremental_cache(x)
+                        rnn_state = detach_state(rnn_state)
+                        if rnn_state is not None and reset_mask is not None:
+                            rnn_state = reset_rnn_state(rnn_state, reset_mask, eager, msel)
+                        logits, rnn_state = model(x, rnn_state)
+                    elif cfg["model_selection"] in RNN_MODEL_IDS and not is_bottom_up_megabyte(cfg):
+                        out = model(x, None)
+                        logits = out[0]
+                    elif cfg["model_selection"] in SCAN_MODEL_IDS:
+                        out = model(x) # ScanLM handles None state internally usually
+                        logits = out[0] if isinstance(out, tuple) else out
+                    else:
+                        out = model(x)
+                        logits = out[0] if isinstance(out, tuple) else out
+
+                    loss = criterion(logits.reshape(-1, logits.size(-1)), y.reshape(-1))
+                    aux_loss = getattr(model, "aux_loss", None)
+                    if aux_loss is not None:
+                        loss = loss + float(cfg.get("moe_aux_loss_weight", 0.01)) * aux_loss
+
+                # A seq2seq TBPTT window wholly inside masked sources has no
+                # targets (mean loss NaN); its forward already advanced the
+                # carried state, so fetch the next window without a step.
+                if not bool((y != pad_id).any()):
+                    continue
+
                 # NaN Check
                 if torch.isnan(loss) or torch.isinf(loss):
                     if nan_skip:
                         return float('inf'), i, "NaN"
                     else:
-                        # If not skipping, we must zero grad and maybe try to recover, 
+                        # If not skipping, we must zero grad and maybe try to recover,
                         # but usually optimization is broken. We'll just log high loss.
                         loss = torch.tensor(100.0, device=DEVICE, requires_grad=True)
 
                 optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
+                if scaler is not None:
+                    scaler.scale(loss).backward()
+                    # Clip true gradient magnitudes, not GradScaler-scaled ones.
+                    scaler.unscale_(optimizer)
+                    if grad_clip > 0:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    if grad_clip > 0:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                    optimizer.step()
 
                 # Record
                 l_val = loss.item()
                 losses.append(l_val)
                 if len(losses) > 100: losses.pop(0)
-                
+
                 # Update pbar
                 avg_train = sum(losses)/len(losses)
-                pbar.set_postfix(loss=f"{l_val:.4f}", avg=f"{avg_train:.4f}")
+                completed_steps = i
+                if completed_steps % curve_every == 0:
+                    stats["curve"].append((completed_steps, round(avg_train, 5)))
+                    if len(stats["curve"]) > 400:
+                        # Keep a time-limited run's curve bounded.
+                        stats["curve"] = stats["curve"][1::2]
+                        curve_every *= 2
+                if completed_steps == speed_warmup_steps:
+                    speed_started_at = time.perf_counter()
+                measured_steps = completed_steps - speed_warmup_steps
+                measured_elapsed = max(time.perf_counter() - speed_started_at, 1e-9)
+                measured_iters_per_sec = measured_steps / measured_elapsed
+                rate_label = "warming" if measured_steps <= 0 else f"{measured_iters_per_sec:.2f}"
+                stats["steps"] = completed_steps
+                if measured_steps > 0:
+                    stats["it_s"] = measured_iters_per_sec
+                pbar.set_postfix(loss=f"{l_val:.4f}", avg=f"{avg_train:.4f}",
+                                 it_s=rate_label)
                 pbar.update(1)
+
+                if (min_iters_per_sec > 0 and measured_steps > 0
+                        and measured_iters_per_sec < min_iters_per_sec):
+                    return float("inf"), completed_steps, f"SLOW ({measured_iters_per_sec:.2f} it/s)"
 
                 # Validation Logic (Fitness Mode 2)
                 if fitness_mode == 2 and valid_ds is not None:
-                    if i % val_freq == 0 or i == total_iters:
-                        vloss = eval_valid_loss(model, cfg, valid_ds, vocab, line_mode, max_samples=cfg.get("_val_samples", 1000))
+                    if i % val_freq == 0:
+                        with schedule_free_eval(optimizer):
+                            vloss = eval_valid_loss(
+                                model, cfg, valid_ds, vocab, line_mode,
+                                max_samples=cfg.get("_val_samples", 1000),
+                                seed=cfg.get("_bench_valid_seed"),
+                            )
                         if vloss is not None:
+                            last_validation_step = i
+                            stats["val_curve"].append((i, round(vloss, 5)))
                             if vloss < best_valid_loss:
                                 best_valid_loss = vloss
                                 best_valid_step = i
-                            # pbar.write(f"   Step {i}: Valid Loss {vloss:.4f} (Best: {best_valid_loss:.4f} @ {best_valid_step})")
 
             except RuntimeError as e:
                 if "out of memory" in str(e):
                     return float('inf'), i, "OOM"
                 if nan_skip:
-                    return float('inf'), i, "Crash"
+                    return float('inf'), i, f"CRASH: {e}"
                 raise e
+
+    if losses and (not stats["curve"] or stats["curve"][-1][0] != completed_steps):
+        stats["curve"].append((completed_steps, round(sum(losses) / len(losses), 5)))
 
     # === Final Scoring ===
     score = float('inf')
-    
+
     if fitness_mode == 0: # Sliding Avg
         score = sum(losses) / max(1, len(losses))
-        
+
     elif fitness_mode == 1: # Final Train Eval
-        # Eval on 10 batches
-        model.eval()
-        with torch.no_grad():
-            tmp_loss = 0
-            count = 0
-            for _ in range(10):
-                x, y = get_batch(train_ds)
-                out = model(x, None) if cfg["model_selection"] in RNN_MODEL_IDS else model(x)
-                logits = out[0] if isinstance(out, tuple) else out
-                l = criterion(logits.reshape(-1, logits.size(-1)), y.reshape(-1))
-                tmp_loss += l.item()
-                count += 1
-        score = tmp_loss / count
-        
+        # Reuse the token-weighted evaluator.  In particular, line-mode batches
+        # have different amounts of padding, so averaging ten batch means would
+        # over-weight short examples.  It also preserves ScanLM's parallel path.
+        with schedule_free_eval(optimizer):
+            score = eval_valid_loss(
+                model, cfg, train_ds, vocab, line_mode,
+                max_samples=cfg.get("_final_eval_samples", 1000),
+                seed=cfg.get("_bench_train_eval_seed"),
+            )
+        if score is None:
+            return float("inf"), 0, "NO EVAL TOKENS"
+
     elif fitness_mode == 2: # Best Valid Loss
-        # Perform one last check if not just done
-        if total_iters % val_freq != 0:
-            vloss = eval_valid_loss(model, cfg, valid_ds, vocab, line_mode, max_samples=cfg.get("_val_samples", 1000))
+        # Perform one last check if the final completed step was not validated.
+        if last_validation_step != completed_steps:
+            with schedule_free_eval(optimizer):
+                vloss = eval_valid_loss(
+                    model, cfg, valid_ds, vocab, line_mode,
+                    max_samples=cfg.get("_val_samples", 1000),
+                    seed=cfg.get("_bench_valid_seed"),
+                )
+            if vloss is not None:
+                stats["val_curve"].append((completed_steps, round(vloss, 5)))
             if vloss is not None and vloss < best_valid_loss:
                 best_valid_loss = vloss
-                best_valid_step = total_iters
-        
+                best_valid_step = completed_steps
+
         score = best_valid_loss
-        if score == float('inf'): score = 1000.0 # Fallback if validation failed entirely
+        if score == float('inf'):
+            return float("inf"), best_valid_step, "NO VALID TOKENS"
 
     return score, best_valid_step, "OK"
 
-def run_benchmark():
-    cli_banner("Benchmark", "Compare architectures on the same dataset", width=64)
 
-    # ── Dataset & tokenizer ────────────────────────────────────────────────────
-    cli_section("Dataset", 64)
-    print(f"  │")
-    dataset_path = prompt_str("Dataset file path")
-    print(f"  │")
-    print(f"  │  {_c(_DIM, 'Dataset type:')}")
-    cli_opt(0, "Standard (corpus)", "Sliding-window over a continuous text stream")
-    cli_opt(1, "Line mode",         "One example per line with BOS/EOS padding")
-    print(f"  │")
-    dataset_type = prompt_int("Dataset type", valid={0,1})
-    print(f"  │")
-    print(f"  │  {_c(_DIM, 'Tokenizer:')}")
-    cli_opt(-1, "Binary"); cli_opt(0, "Byte"); cli_opt(1, "Char")
-    cli_opt( 2, "Word");   cli_opt(3, "Tiktoken"); cli_opt(4, "BPE")
-    print(f"  │")
-    tokenizer_mode = prompt_int("Tokenizer", valid={-1,0,1,2,3,4})
-    cli_section_end(64)
+def _bench_sample(model, optimizer, cfg, vocab, prompt_ids, length, line_mode, lines=1):
+    """Decoded continuation of the shared prompt (``lines`` generated lines in
+    line mode), or a note if sampling fails."""
+    _bench_seed(SEED)
+    try:
+        with torch.no_grad(), schedule_free_eval(optimizer):
+            if line_mode and prompt_ids:
+                # Seq2seq: the outputs generated for the shared held-out input.
+                return "\n".join(
+                    seq2seq_visible(vocab.decode(
+                        generate_line_mode(model, cfg, vocab, list(prompt_ids), length)[len(prompt_ids):]))
+                    for _ in range(max(1, lines))
+                )
+            if line_mode:
+                return "\n".join(
+                    vocab.decode(generate_line_mode(model, cfg, vocab, [vocab.bos_id], length))
+                    for _ in range(max(1, lines))
+                )
+            ids = generate_classic(model, cfg, vocab, list(prompt_ids), length, stream=False)
+            return vocab.decode(ids[len(prompt_ids):])
+    except Exception as exc:
+        return f"<sampling failed: {exc}>"
+    finally:
+        model.train()
 
-    # Load vocab
-    cfg_dummy = {"dataset_type": dataset_type, "tokenizer_mode": tokenizer_mode, "custom_bpe_size": 4096}
-    if tokenizer_mode == 3: cfg_dummy["tiktoken_encoding"] = "cl100k_base"
-    if tokenizer_mode in [-1, 0, 3]: texts = []
-    else: texts = read_dataset(dataset_path, dataset_type)
-    vocab = load_or_make_vocab(cfg_dummy, dataset_path)
 
-    # ── Model group ────────────────────────────────────────────────────────────
-    tasks    = get_bench_model_list()
-    has_rnns = any(t[0] in RNN_MODEL_IDS for t in tasks)
-    has_attn = any(t[0] in ATTN_MODEL_IDS for t in tasks)
+def _bench_single_run(s, cfg, env, lr, seed):
+    cfg = copy.deepcopy(cfg)
+    if lr is not None:
+        cfg["optim_params"]["lr"] = lr
+        cfg["learning_rate"] = lr
+    _bench_seed(seed)
+    run = {"seed": seed, "lr": lr, "score": float("inf"), "best_step": -1, "status": "CRASH",
+           "params": 0, "it_s": 0.0, "curve": [], "val_curve": [], "sample": ""}
+    model = optimizer = None
+    try:
+        model = build_model(cfg, env["vocab"].size)
+        model.to(DEVICE)
+        run["params"] = sum(p.numel() for p in model.parameters())
+        # Build the optimizer on the eager module; the compiled wrapper
+        # shares its parameters.
+        optimizer = build_optimizer(model, cfg)
+        stats = {}
+        score, best_step, status = bench_train_loop(
+            cfg, wrap_model_with_compile(model, cfg), optimizer, env["train_ds"], env["valid_ds"],
+            env["vocab"], env["line_mode"], s["total_iters"], s["fitness_mode"], s["nan_skip"],
+            max_seconds=s["max_seconds"], min_iters_per_sec=s["min_iters_per_sec"],
+            speed_warmup_steps=s["speed_warmup_steps"], stats=stats,
+            lr_schedule=s["lr_schedule"], warmup_steps=s["warmup_steps"], grad_clip=s["grad_clip"],
+        )
+        run["tbptt"] = stats.get("tbptt", False)
+        run.update(score=score, best_step=best_step, status=status, it_s=stats.get("it_s", 0.0),
+                   curve=stats.get("curve", []), val_curve=stats.get("val_curve", []))
+        if status == "OK" and s["sample_len"] > 0:
+            run["sample"] = _bench_sample(model, optimizer, cfg, env["vocab"], env["prompt_ids"],
+                                          s["sample_len"], env["line_mode"], s["line"]["sample_lines"])
+    except Exception as e:
+        run["status"] = f"CRASH: {e}"
+    finally:
+        del model, optimizer
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    return run
 
-    # ── Architecture defaults ──────────────────────────────────────────────────
-    cli_section("Architecture Defaults", 64)
-    print(f"  │  {_c(_DIM, 'Applied to every model in the run.')}")
-    print(f"  │")
-    embed_dim   = prompt_int("Embedding / hidden dim", default=256)
-    layer_count = prompt_int("Layer count", default=4)
-    head_count  = 4
-    if has_attn:
-        head_count = prompt_int("Attention / xLSTM head count", default=4)
-    if dataset_type == 0:
-        seq_len = prompt_int("Sequence length", default=128)
+
+def _bench_run_task(s, task, env):
+    """Train one row over every LR multiplier and seed; keep the best LR."""
+    cfg = _bench_task_cfg(s, task, env["cfg_base"])
+    record = {
+        "key": _bench_task_key(task), "id": task["id"], "overrides": task["overrides"],
+        "year": MODEL_ORIGINS[task["id"]][0], "month": MODEL_ORIGINS[task["id"]][1],
+        "name": _bench_model_name(s, task, cfg), "embed_dim": cfg["embed_dim"], "matched_params": None,
+    }
+    if s["size_mode"] == "params":
+        record["embed_dim"], record["matched_params"] = fit_width_to_params(
+            cfg, env["vocab"].size, s["target_params"], cfg["head_count"])
+        cfg["embed_dim"] = record["embed_dim"]
+    base_lr = cfg["optim_params"].get("lr")
+    candidates = []
+
+    def evaluate(lr, mult):
+        runs = []
+        for k in range(s["seeds"]):
+            run = _bench_single_run(s, cfg, env, lr, SEED + k)
+            runs.append(run)
+            if run["status"] != "OK":
+                break
+        ok = all(r["status"] == "OK" for r in runs)
+        scores = [r["score"] for r in runs] if ok else []
+        candidates.append({
+            "lr_mult": mult, "lr": lr, "runs": runs, "ok": ok,
+            "score": float(np.mean(scores)) if ok else float("inf"),
+            "score_std": float(np.std(scores)) if ok and len(scores) > 1 else 0.0,
+        })
+        return candidates[-1]
+
+    if s.get("lr_search") and base_lr is not None:
+        search = s["lr_search"]
+        lr_golden_search(lambda lr: evaluate(lr, lr / base_lr), search["min"], search["max"], search["steps"])
     else:
-        seq_len = 0
-    batch_size  = prompt_int("Batch size", default=32)
-    lr          = prompt_float("Learning rate", default=1e-3)
-    total_iters = prompt_int("Iterations per model", default=500)
-    cli_section_end(64)
+        for mult in (s["lr_multipliers"] if base_lr is not None else [1.0]):
+            first = evaluate(None if base_lr is None else base_lr * mult, mult)
+            if first["runs"][0]["status"].startswith("SLOW"):
+                break  # a different LR does not change the speed
+    best = min(candidates, key=lambda c: (not c["ok"], c["score"]))
+    runs = best["runs"]
+    failed = next((r for r in runs if r["status"] != "OK"), None)
+    lead = min(runs, key=lambda r: r["score"])
+    record.update({
+        "score": best["score"], "score_std": best["score_std"],
+        "scores": [r["score"] for r in runs], "status": failed["status"] if failed else "OK",
+        "best_step": lead["best_step"], "lr": best["lr"], "lr_mult": best["lr_mult"],
+        "params": runs[0]["params"], "it_s": float(np.mean([r["it_s"] for r in runs])),
+        "curve": lead["curve"], "val_curve": lead["val_curve"], "sample": lead["sample"],
+        "tbptt": lead.get("tbptt", False),
+        "lr_candidates": [{"lr": c["lr"], "lr_mult": c["lr_mult"], "score": c["score"], "ok": c["ok"],
+                           "status": next((r["status"] for r in c["runs"] if r["status"] != "OK"), "OK")}
+                          for c in candidates],
+    })
+    return record
 
-    # ── RNN-specific ───────────────────────────────────────────────────────────
-    rnn_cfg = {}
-    if has_rnns:
-        cli_section("RNN Structure Options", 64)
-        print(f"  │  {_c(_DIM, 'Applied only to classic RNN models in the run.')}")
-        print(f"  │")
-        rnn_cfg["res_every"] = prompt_int("Residual every N layers  (0 = off)", default=0)
-        if rnn_cfg["res_every"] > 0:
-            print(f"  │")
-            cli_opt(0, "Add"); cli_opt(1, "Concat+proj")
-            cli_opt(2, "ReZero scalar"); cli_opt(3, "ReZero vector")
-            print(f"  │")
-            rnn_cfg["res_type"] = prompt_int("Residual type", default=0, valid={0,1,2,3})
-        else:
-            rnn_cfg["res_type"] = 0
-        print(f"  │")
-        print(f"  │  {_c(_DIM, 'Norm:')}")
-        cli_opt(0,"None"); cli_opt(1,"BN"); cli_opt(2,"LN")
-        cli_opt(3,"RMS");  cli_opt(4,"TTanh"); cli_opt(5,"ETTanh"); cli_opt(6,"DyT")
-        print(f"  │")
-        rnn_cfg["use_norm"] = prompt_int("Norm type", default=2, valid={0,1,2,3,4,5,6})
-        rnn_cfg["dropout"]  = prompt_float("Inter-layer dropout  (0.0 = off)", default=0.0)
-        print(f"  │")
-        if prompt_int("Configure advanced RNN init?  (1=yes 0=no)", default=0) == 1:
-            rnn_cfg["tanh_spectral_radius"] = prompt_float("Tanh spectral radius", default=0.99)
-            rnn_cfg["relu_identity_scale"]  = prompt_float("ReLU identity scale", default=1.0)
-        else:
-            rnn_cfg["tanh_spectral_radius"] = 0.99
-            rnn_cfg["relu_identity_scale"]  = 1.0
-        cli_section_end(64)
 
-    # ── Evaluation ─────────────────────────────────────────────────────────────
-    cli_section("Evaluation", 64)
-    print(f"  │")
-    nan_skip = (prompt_int("Skip model on NaN / crash  (1=yes 0=no)", valid={0,1}) == 1)
-    print(f"  │")
-    print(f"  │  {_c(_DIM, 'Fitness metric:')}")
-    cli_opt(0, "Sliding train loss",  "Rolling average of last 100 training steps")
-    cli_opt(1, "Final train eval",    "Evaluate 1 000 random training samples at the end")
-    cli_opt(2, "Validation loss",     "Best held-out loss tracked throughout training")
-    print(f"  │")
-    fitness_mode = prompt_int("Fitness metric", valid={0,1,2})
-    cli_section_end(64)
+# ------------------------------------------------------------------ outputs
+def _bench_json_safe(value):
+    """JSON has no infinity; failed scores are stored as null."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, dict):
+        return {k: _bench_json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_bench_json_safe(v) for v in value]
+    return value
 
-    valid_ds = None
-    train_ds = None
 
+def _bench_json_restore(record):
+    for key in ("score", "score_std"):
+        if record.get(key) is None:
+            record[key] = float("inf") if key == "score" else 0.0
+    record["scores"] = [float("inf") if v is None else v for v in record.get("scores", [])]
+    return record
+
+
+def _bench_fmt_score(r):
+    if r["score"] == float("inf"):
+        return "∞"
+    if len(r.get("scores", [])) > 1:
+        return f"{r['score']:.4f}±{r['score_std']:.3f}"
+    return f"{r['score']:.5f}"
+
+
+def _bench_save(run_dir, s, records, prompt_text=""):
+    run_dir.mkdir(parents=True, exist_ok=True)
+    tmp = run_dir / "results.json.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(_bench_json_safe({"settings": s, "records": records}), f, indent=1)
+    os.replace(tmp, run_dir / "results.json")
+    with open(run_dir / "results.csv", "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["year", "model_id", "name", "score", "score_std", "seeds", "status", "best_step",
+                    "params", "embed_dim", "lr", "lr_mult", "it_s"])
+        for r in sorted(records, key=lambda r: (MODEL_ORIGINS[r["id"]], r["id"])):
+            w.writerow([r["year"], r["id"], r["name"],
+                        "" if r["score"] == float("inf") else f"{r['score']:.6f}",
+                        f"{r['score_std']:.6f}", len(r["scores"]), r["status"], r["best_step"],
+                        r["params"], r["embed_dim"], "" if r["lr"] is None else f"{r['lr']:.6g}",
+                        r["lr_mult"], f"{r['it_s']:.3f}"])
+    if s["sample_len"]:
+        with open(run_dir / "samples.txt", "w", encoding="utf-8") as f:
+            f.write(f"Prompt (shared by every model):\n{prompt_text}\n\n")
+            for r in sorted(records, key=lambda r: (MODEL_ORIGINS[r["id"]], r["id"])):
+                if r.get("sample"):
+                    f.write(f"=== {r['year']}  {r['name']}  ({_bench_fmt_score(r)})\n{r['sample']}\n\n")
+    try:
+        _bench_plot(run_dir, s, records)
+    except Exception as exc:  # plotting is a convenience; never lose the results for it
+        pwarn(f"Plots not written: {exc}")
+
+
+# Chart palette: a one-hue blue ramp for year (light = older, dark = newer)
+# on a light chart surface with recessive grid and axis ink.
+_BENCH_YEAR_RAMP = ["#86b6ef", "#5598e7", "#2a78d6", "#1c5cab", "#104281", "#0d366b"]
+_BENCH_SURFACE, _BENCH_GRID = "#fcfcfb", "#e1e0d9"
+_BENCH_INK, _BENCH_INK2, _BENCH_MUTED = "#0b0b0b", "#52514e", "#898781"
+
+
+def _bench_plot(run_dir, s, records):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import LinearSegmentedColormap, Normalize
+
+    ok = [r for r in records if r["status"] == "OK"]
+    if not ok:
+        return
+    cmap = LinearSegmentedColormap.from_list("bench_years", _BENCH_YEAR_RAMP)
+    years = [r["year"] for r in ok]
+    norm = Normalize(min(years), max(max(years), min(years) + 1))
+    metric = ["Sliding train loss", "Final train eval", "Validation loss"][s["fitness_mode"]]
+
+    def style(ax, title, xlabel, ylabel):
+        ax.set_facecolor(_BENCH_SURFACE)
+        ax.grid(True, color=_BENCH_GRID, linewidth=0.8)
+        ax.set_axisbelow(True)
+        for side in ("top", "right"):
+            ax.spines[side].set_visible(False)
+        for side in ("left", "bottom"):
+            ax.spines[side].set_color(_BENCH_MUTED)
+        ax.tick_params(colors=_BENCH_INK2, labelsize=9)
+        ax.set_title(title, color=_BENCH_INK, fontsize=12, loc="left")
+        ax.set_xlabel(xlabel, color=_BENCH_INK2)
+        ax.set_ylabel(ylabel, color=_BENCH_INK2)
+
+    curve_sets = [("curves.png", "curve", "Training loss (100-step average)")]
+    if any(r.get("val_curve") for r in ok):
+        curve_sets.append(("val_curves.png", "val_curve", "Validation loss"))
+    for filename, key, ylabel in curve_sets:
+        fig, ax = plt.subplots(figsize=(10, 6), facecolor=_BENCH_SURFACE)
+        for r in sorted(ok, key=lambda r: r["year"]):
+            pts = r.get(key) or []
+            if pts:
+                ax.plot([p[0] for p in pts], [p[1] for p in pts], color=cmap(norm(r["year"])),
+                        linewidth=1.4, alpha=0.9)
+        style(ax, f"{ylabel} per model, colored by year", "Step", ylabel)
+        bar = fig.colorbar(plt.cm.ScalarMappable(norm=norm, cmap=cmap), ax=ax, pad=0.02)
+        bar.set_label("Year first published", color=_BENCH_INK2)
+        bar.ax.tick_params(colors=_BENCH_INK2, labelsize=9)
+        bar.outline.set_visible(False)
+        fig.tight_layout()
+        fig.savefig(run_dir / filename, dpi=130, facecolor=_BENCH_SURFACE)
+        plt.close(fig)
+
+    # Timeline: every model's score by publication date, and the best so far.
+    order = sorted(ok, key=lambda r: (MODEL_ORIGINS[r["id"]], r["id"]))
+    xs = [r["year"] + (r["month"] - 1) / 12 for r in order]
+    ys = [r["score"] for r in order]
+    fig, ax = plt.subplots(figsize=(11, 6), facecolor=_BENCH_SURFACE)
+    errs = [r["score_std"] for r in order]
+    if any(errs):
+        ax.errorbar(xs, ys, yerr=errs, fmt="none", ecolor=_BENCH_MUTED, elinewidth=1, capsize=0, zorder=1)
+    ax.scatter(xs, ys, s=36, facecolors=_BENCH_SURFACE, edgecolors=_BENCH_MUTED, linewidths=1.2, zorder=2,
+               label="Model")
+    best, fx, fy, records_idx = float("inf"), [], [], []
+    for i, (x, y) in enumerate(zip(xs, ys)):
+        if y < best:
+            best = y
+            records_idx.append(i)
+        fx.append(x); fy.append(best)
+    ax.step(fx, fy, where="post", color="#184f95", linewidth=2, zorder=3, label="Best so far")
+    ax.scatter([xs[i] for i in records_idx], [ys[i] for i in records_idx], s=56, color="#2a78d6",
+               edgecolors=_BENCH_SURFACE, linewidths=2, zorder=4, label="New record")
+    for i in records_idx:
+        label = _bench_short_name(order[i], 34)
+        ax.annotate(label, (xs[i], ys[i]), xytext=(6, 6), textcoords="offset points",
+                    fontsize=8, color=_BENCH_INK2)
+    style(ax, f"{metric} by year of publication (lower is better)", "Year first published", metric)
+    legend = ax.legend(frameon=False, fontsize=9, loc="upper right")
+    for text in legend.get_texts():
+        text.set_color(_BENCH_INK2)
+    fig.tight_layout()
+    fig.savefig(run_dir / "timeline.png", dpi=130, facecolor=_BENCH_SURFACE)
+    plt.close(fig)
+
+
+def _bench_print_tables(s, records, perf_label):
+    metric_lbl = ["Sliding Loss","Final Train Eval","Best Valid Loss"][s["fitness_mode"]]
+    show_dim = s["size_mode"] == "params"
+    show_lr = len(s["lr_multipliers"]) > 1 or bool(s.get("lr_search"))
+    name_w = 52
+
+    def cols(r):
+        name = r["name"] if len(r["name"]) <= name_w else _bench_short_name(r, name_w)
+        extra = ""
+        if show_dim:
+            extra += f"   {r['embed_dim']:>5}"
+        if show_lr:
+            extra += f"   {'-' if r['lr'] is None else format(r['lr'], '.2g'):>7}"
+        par = f"{r['params'] / 1e6:>7.2f}M" if r["params"] else f"{'-':>8}"
+        its = f"{r['it_s']:>8.2f}" if r["it_s"] else f"{'-':>8}"
+        return name, extra, par, its
+
+    extra_hdr = (f"   {'Dim':>5}" if show_dim else "") + (f"   {'LR':>7}" if show_lr else "")
+    W = 120 + len(extra_hdr)
+
+    if s["table_order"] in (0, 2):
+        ranked = sorted(records, key=lambda x: (x["score"], 0 if x["status"] == "OK" else 1))
+        print(f"\n")
+        cli_banner(f"Benchmark Results  ·  {metric_lbl}  ·  {perf_label}", width=W)
+        hdr = f"  {'Rank':<4}   {'Year':<4}   {'Model':<{name_w}}   {'Score':<15}{extra_hdr}   {'Params':>8}   {'it/s':>8}   Status"
+        print(f"  {_c(_DIM, hdr)}")
+        cli_rule(W - 4)
+        for i, r in enumerate(ranked):
+            name, extra, par, its = cols(r)
+            score = _bench_fmt_score(r)
+            rank_col = _c(_YL, _B, f"  {i+1:<4}") if i == 0 else f"  {i+1:<4}"
+            name_col = _c(_WH, f"{name:<{name_w}}") if i == 0 else f"{name:<{name_w}}"
+            scr_col = (_c(_GR, _B, f"{score:<15}") if i == 0 else
+                       _c(_RD, f"{score:<15}") if r["status"] != "OK" else f"{score:<15}")
+            stat_col = _c(_GR, r["status"]) if r["status"] == "OK" else _c(_RD, r["status"])
+            print(f"  {rank_col}   {r['year']:<4}   {name_col}   {scr_col}{extra}   {par}   {its}   {stat_col}")
+        cli_rule(W - 4)
+        if ranked and ranked[0]["score"] != float('inf'):
+            best = ranked[0]
+            print(f"\n  {_c(_GR, '★')} Winner: {_c(_WH, _B, best['name'])}  ·  score {_c(_GR, _B, _bench_fmt_score(best))}\n")
+
+    if s["table_order"] in (1, 2):
+        timeline = sorted(records, key=lambda r: (MODEL_ORIGINS[r["id"]], r["id"]))
+        print(f"\n")
+        cli_banner(f"Timeline  ·  {metric_lbl}  ·  ★ = new best so far", width=W)
+        hdr = f"  {'Year':<4}   {'Model':<{name_w}}   {'Score':<15}   {'vs best':>8}{extra_hdr}   {'Params':>8}   {'it/s':>8}   Status"
+        print(f"  {_c(_DIM, hdr)}")
+        cli_rule(W - 4)
+        best = float("inf")
+        for r in timeline:
+            name, extra, par, its = cols(r)
+            score = _bench_fmt_score(r)
+            if r["status"] == "OK" and r["score"] < best:
+                delta = "" if best == float("inf") else f"{r['score'] - best:+.4f}"
+                best = r["score"]
+                mark, score_col = _c(_YL, _B, "★"), _c(_GR, _B, f"{score:<15}")
+            else:
+                delta = "" if r["status"] != "OK" or best == float("inf") else f"{r['score'] - best:+.4f}"
+                mark, score_col = " ", (_c(_RD, f"{score:<15}") if r["status"] != "OK" else f"{score:<15}")
+            stat_col = _c(_GR, r["status"]) if r["status"] == "OK" else _c(_RD, r["status"])
+            print(f"  {r['year']:<4} {mark} {name:<{name_w}}   {score_col}   {delta:>8}{extra}   {par}   {its}   {stat_col}")
+        cli_rule(W - 4)
+
+
+# ------------------------------------------------------------------ run
+def _bench_prepare(s):
+    """Vocabulary, datasets and the shared sampling prompt for a settings dict."""
+    cfg_dummy = {"dataset_type": s["dataset_type"], "tokenizer_mode": s["tokenizer_mode"],
+                 "custom_bpe_size": 4096}
+    if s["tokenizer_mode"] == 3:
+        cfg_dummy["tiktoken_encoding"] = "cl100k_base"
+    seq2seq = s.get("seq2seq")
+    data_path = prepare_seq2seq_dataset(seq2seq) if seq2seq else s["dataset_path"]
+    vocab = load_or_make_vocab(cfg_dummy, data_path, save_config=False)
+
+    seq_len = s["seq_len"]
+    if s["hierarchy"]["model_type"] != MODEL_TYPE_NORMAL:
+        seq_len = math.prod(s["hierarchy"]["stage_seq_lens"])
     cfg_base = {
-        "dataset_path": dataset_path,
-        "dataset_type": dataset_type,
+        "dataset_path": data_path,
+        "dataset_type": s["dataset_type"],
         "seq_len": seq_len,
         "vocab_tokens": getattr(vocab, "tokens", None),
         "val_split": 0.0,
-        "valid_examples": 0
+        "valid_examples": 0,
+        "line_seq_len_cap": None,
     }
-
-    if fitness_mode == 2:
-        if dataset_type == 0:
-            vpath = prompt_str("Validation file  (blank to auto-split)", default="")
-            if vpath:
-                cfg_base["classic_val_path"] = vpath
-            else:
-                cfg_base["val_split"] = prompt_float("Validation split fraction", default=0.1)
-        else:
-            cfg_base["val_split"] = prompt_float("Validation split fraction", default=0.1)
-        cfg_base["_val_freq"]    = prompt_int("Validation frequency  (steps)", default=100)
-        cfg_base["_val_samples"] = prompt_int("Validation samples per check", default=1000)
-
+    if seq2seq:
+        cfg_base["seq2seq"] = seq2seq
+    cfg_base.update(s["val"])
     train_ds, valid_ds = build_datasets(cfg_base, vocab)
 
-    if dataset_type == 1:
-        cfg_base["seq_len"] = min(train_ds.max_len, 2048)
-        pinfo(f"Auto-set seq_len → {cfg_base['seq_len']}")
-
-    # ── Run ────────────────────────────────────────────────────────────────────
-    results = []
-    metric_name = ["Sliding Loss","Final Train Eval","Best Valid Loss"][fitness_mode]
-    print(f"\n  {_c(_GR, _B, '▸')} Starting benchmark — {_c(_WH, len(tasks))} models · metric: {_c(_YL, metric_name)}\n")
-    
-    for msel, overrides in tasks:
-        cfg = cfg_base.copy()
-        # Apply Base settings
-        cfg.update({
-            "model_selection": msel,
-            "embed_dim": embed_dim,
-            "layer_count": layer_count,
-            "head_count": head_count,
-            "batch_size": batch_size,
-            "learning_rate": lr,
-            "activation_name": "gelu",
-            "dropout": 0.0,
-            "tokenizer_mode": tokenizer_mode
-        })
-        # Apply RNN settings (if any)
-        if has_rnns and msel in RNN_MODEL_IDS:
-            cfg.update(rnn_cfg)
-            
-        # Apply Task specific overrides (e.g. minRNN activation)
-        cfg.update(overrides)
-        
-        # Construct Name
-        model_name = MODEL_NAMES.get(msel, f"Model {msel}")
-        if "minrnn_act" in overrides:
-            model_name += f" (act={overrides['minrnn_act']})"
-        if msel in RNN_MODEL_IDS and has_rnns:
-            norm_name = ["None","BN","LN","RMS","TT","ETT","DyT"][cfg.get("use_norm",0)]
-            res_str = f"|Res{cfg.get('res_every',0)}" if cfg.get("res_every",0)>0 else ""
-            model_name += f" [{norm_name}{res_str}]"
-
-        try:
-            model = build_model(cfg, vocab.size)
-            model.to(DEVICE)
-            optimizer = build_optimizer(model, cfg)
-
-            score, best_step, status = bench_train_loop(
-                cfg, model, optimizer, train_ds, valid_ds, vocab,
-                (dataset_type==1), total_iters, fitness_mode, nan_skip
+    if s["fitness_mode"] == 2:
+        if valid_ds is None:
+            raise ValueError(
+                "Validation-loss benchmarking requires a non-empty validation file or split."
+            )
+        if s["dataset_type"] == 1 and len(train_ds.offsets) == 0:
+            raise ValueError("Validation split leaves no line examples for training.")
+        # MemmapClassicDataset intentionally falls back to the full corpus when
+        # a split cannot form one sequence.  That fallback is fine for ordinary
+        # training, but it would make a benchmark validate on its training data.
+        if (
+            s["dataset_type"] == 0
+            and cfg_base.get("val_split", 0.0) > 0.0
+            and getattr(train_ds, "bin_path", None) == getattr(valid_ds, "bin_path", None)
+            and train_ds.end_idx > valid_ds.start_idx
+        ):
+            raise ValueError(
+                "Validation split is too small for the selected sequence length; "
+                "choose a larger split, shorter sequence length, or a separate validation file."
             )
 
-            results.append({"name": model_name, "score": score, "best_step": best_step, "status": status})
+    line_mode = s["dataset_type"] == 1
+    if line_mode:
+        cfg_base["seq_len"] = train_ds.max_len
+        pinfo(f"Auto-set seq_len → {cfg_base['seq_len']}")
 
-            del model, optimizer
-            torch.cuda.empty_cache()
+    # One fixed prompt, from held-out text when there is any, for every sample.
+    prompt_ids = []
+    prompt_text = "<start of line>" if line_mode else ""
+    if s["sample_len"] and seq2seq:
+        # Every model gets the same held-out input; samples are its outputs.
+        _bench_seed(SEED)
+        ds = valid_ds or train_ds
+        ids, source_len = ds.get_encoded_example(random.randrange(len(ds.offsets)))
+        prompt_ids = ids[:1 + source_len]
+        prompt_text = (f"input: {seq2seq_visible(vocab.decode(prompt_ids[1:]))}  "
+                       f"expected: {seq2seq_visible(vocab.decode(ids[1 + source_len:-1]))}")
+    elif s["sample_len"] and not line_mode:
+        _bench_seed(SEED)
+        x, _ = (valid_ds or train_ds).get_batch(1)
+        prompt_ids = x[0, :max(1, min(64, cfg_base["seq_len"] // 2))].tolist()
+        prompt_text = vocab.decode(prompt_ids)
+    return {"vocab": vocab, "train_ds": train_ds, "valid_ds": valid_ds, "cfg_base": cfg_base,
+            "line_mode": line_mode, "prompt_ids": prompt_ids, "prompt_text": prompt_text}
 
-            score_fmt = f"{score:.5f}" if score != float('inf') else "∞"
-            best_str  = f"  {_c(_DIM, f'best @ step {best_step}')}" if fitness_mode==2 else ""
-            pok(f"{_c(_WH, model_name)}  →  {_c(_GR, _B, score_fmt)}{best_str}")
 
-        except Exception as e:
-            pwarn(f"{_c(_WH, model_name)}  →  {_c(_RD, 'CRASH:')} {e}")
-            results.append({"name": model_name, "score": float('inf'), "best_step": -1, "status": "CRASH"})
+def run_benchmark():
+    cli_banner("Benchmark", "Compare architectures on the same dataset", width=64)
+    cli_section("Start", 64)
+    cli_opt(0, "New benchmark", "Answer the setup questions")
+    cli_opt(1, "Load preset",   "Replay settings saved from an earlier setup or run")
+    cli_opt(2, "Resume run",    "Continue an interrupted run in its results folder")
+    print(f"  │")
+    start = prompt_int("Start", valid={0, 1, 2}, default=0)
+    cli_section_end(64)
 
-    # ── Results table ──────────────────────────────────────────────────────────
-    results.sort(key=lambda x: (x["score"], 0 if x["status"]=="OK" else 1))
+    records = []
+    if start == 2:
+        path, data = _bench_read_json(prompt_str("Results folder or results.json"))
+        legacy_ids = data["settings"].get("version") == 1
+        s = _bench_normalize_settings(data["settings"])
+        records = [_bench_json_restore(r) for r in data.get("records", [])]
+        if legacy_ids:
+            for r in records:
+                r["id"] = _bench_legacy_id(r["id"])
+                r["key"] = _bench_task_key(r)
+        run_dir = path.parent
+        pinfo(f"Resuming {run_dir}: {len(records)} of {len(s['tasks'])} rows already done")
+    else:
+        if start == 1:
+            _, data = _bench_read_json(prompt_str("Preset file (or a results folder)"))
+            s = _bench_normalize_settings(data.get("settings", data))
+        else:
+            s = collect_bench_settings()
+            preset = prompt_str("Save these settings as a preset  (file path, blank = skip)", default="")
+            if preset:
+                with open(pathlib.Path(preset).expanduser(), "w", encoding="utf-8") as f:
+                    json.dump(s, f, indent=1)
+                pok(f"Preset saved to {preset}")
+        run_dir = pathlib.Path(BENCH_RESULTS_ROOT) / time.strftime("bench_%Y%m%d_%H%M%S")
 
-    W = 82
-    metric_lbl = ["Sliding Loss","Final Train Eval","Best Valid Loss"][fitness_mode]
-    print(f"\n")
-    cli_banner(f"Benchmark Results  ·  {metric_lbl}", width=W)
-    hdr = f"  {'Rank':<4}   {'Model':<52}   {'Score':<10}   Status"
-    print(f"  {_c(_DIM, hdr)}")
-    cli_rule(W - 4)
-    for i, r in enumerate(results):
-        score_str = f"{r['score']:.5f}" if r['score'] != float('inf') else "∞"
-        rank_col  = _c(_YL, _B, f"  {i+1:<4}") if i == 0 else f"  {i+1:<4}"
-        name_col  = _c(_WH, f"{r['name']:<52}") if i == 0 else f"{r['name']:<52}"
-        scr_col   = _c(_GR, _B, f"{score_str:<10}") if i == 0 else (_c(_RD, f"{score_str:<10}") if r["status"] != "OK" else f"{score_str:<10}")
-        stat_col  = _c(_GR, r["status"]) if r["status"] == "OK" else _c(_RD, r["status"])
-        print(f"  {rank_col}   {name_col}   {scr_col}   {stat_col}")
-    cli_rule(W - 4)
-    if results and results[0]["score"] != float('inf'):
-        best = results[0]
-        winner_score = f"{best['score']:.5f}"
-        print(f"\n  {_c(_GR, '★')} Winner: {_c(_WH, _B, best['name'])}  ·  score {_c(_GR, _B, winner_score)}\n")
+    env = _bench_prepare(s)
+    done = {r["key"] for r in records}
+    tasks = s["tasks"]
+    lr_tries = s["lr_search"]["steps"] + 2 if s.get("lr_search") else len(s["lr_multipliers"])
+    runs_per_row = s["seeds"] * lr_tries
+    metric_name = ["Sliding Loss","Final Train Eval","Best Valid Loss"][s["fitness_mode"]]
+    limit_label = (
+        f"{s['total_iters']} steps/model" if s["max_seconds"] is None
+        else f"{s['max_seconds']:g} seconds/model"
+    )
+    threshold_label = (
+        "no speed filter" if s["min_iters_per_sec"] == 0
+        else f"skip below {s['min_iters_per_sec']:g} it/s after {s['speed_warmup_steps']} warm-up steps"
+    )
+    perf = s["perf"]
+    perf_label = (
+        (f"AMP {perf['amp_dtype']}" if perf["use_amp"] else "fp32")
+        + (f" · compile ({perf['compile_backend']})" if perf["use_compile"] else "")
+    )
+    extras = []
+    if s["hierarchy"]["model_type"] != MODEL_TYPE_NORMAL:
+        extras.append("MEGABYTE" if s["hierarchy"]["model_type"] == MODEL_TYPE_MEGABYTE else "MEGABYTE bottom-up")
+    if s["size_mode"] == "params":
+        extras.append(f"~{s['target_params'] / 1e6:g}M params each")
+    if runs_per_row > 1:
+        extras.append(f"up to {runs_per_row} runs per row ({s['seeds']} seeds × {lr_tries} LRs)")
+    if s.get("lr_search"):
+        extras.append(f"LR search {s['lr_search']['min']:.2g}–{s['lr_search']['max']:.2g}")
+    if s["lr_schedule"] != "none":
+        extras.append(f"LR {s['lr_schedule']}")
+    if s["tbptt"]["enabled"]:
+        extras.append(f"TBPTT window {s['tbptt']['window']} (recurrent/scan models)")
+    print(
+        f"\n  {_c(_GR, _B, '▸')} Starting benchmark — {_c(_WH, len(tasks))} rows, oldest first"
+        f" · metric: {_c(_YL, metric_name)} · {limit_label} · {threshold_label} · {perf_label}"
+        + "".join(f" · {e}" for e in extras)
+    )
+    print(f"  {_c(_DIM, f'Results: {run_dir}')}\n")
+    _bench_save(run_dir, s, records, env["prompt_text"])
+
+    for n, task in enumerate(tasks, 1):
+        key = _bench_task_key(task)
+        if key in done:
+            continue
+        record = _bench_run_task(s, task, env)
+        records.append(record)
+        done.add(key)
+        _bench_save(run_dir, s, records, env["prompt_text"])
+
+        prefix = f"{_c(_DIM, f'[{n}/{len(tasks)}]')} {_c(_DIM, record['year'])}"
+        detail = []
+        if record["status"] == "OK" and s["fitness_mode"] == 2:
+            detail.append(f"best @ step {record['best_step']}")
+        if s["size_mode"] == "params":
+            detail.append(f"dim {record['embed_dim']} · {record['params'] / 1e6:.2f}M params")
+        if (len(s["lr_multipliers"]) > 1 or s.get("lr_search")) and record["lr"] is not None:
+            detail.append(f"lr {record['lr']:.2g}")
+        if record.get("tbptt"):
+            detail.append("TBPTT")
+        detail_str = f"  {_c(_DIM, ' · '.join(detail))}" if detail else ""
+        if record["status"] == "OK":
+            pok(f"{prefix}  {_c(_WH, record['name'])}  →  {_c(_GR, _B, _bench_fmt_score(record))}"
+                f"{detail_str}  {_c(_DIM, 'OK')}")
+            if record.get("sample"):
+                preview = record["sample"].replace("\n", "⏎")[:110]
+                print(f"      {_c(_DIM, '“' + preview + '”')}")
+        else:
+            pwarn(f"{prefix}  {_c(_WH, record['name'])}  →  {_c(_RD, _B, record['status'])}")
+
+    _bench_print_tables(s, records, perf_label)
+    written = ["results.json", "results.csv"] + (["samples.txt"] if s["sample_len"] else [])
+    written += [p.name for p in sorted(run_dir.glob("*.png"))]
+    pok(f"Saved to {run_dir}: {', '.join(written)}")
+
 
 # Replace the old `run_benchmark` call in __main__ with this one.
 
