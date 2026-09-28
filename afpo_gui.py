@@ -36,6 +36,9 @@ SNAPSHOT_INTERVAL = 1.0      # seconds between live frontier snapshots
 MAX_POPULATION_POINTS = 800
 MAX_ARCHIVE_POINTS = 400
 MAX_FIT_POINTS = 2500
+MAX_GRID_POINTS = 150        # per axis of a 2D/3D grid
+MAX_GENERATE_ROWS = 5_000_000
+GENERATE_CHUNK = 50_000
 # Options with their own place in the form (or not meaningful from the GUI).
 FORM_HANDLED = {"resume", "migrate_checkpoint", "allow_unsafe_pickle", "gui", "port", "test_csv",
                 "constraint_metadata", "sequence_group", "max_generations", "population", "seed", "workers", "adf_mode", "help"}
@@ -625,6 +628,7 @@ class ModelExplorer:
         self.models = []
         self.path = None
         self.files = {}
+        self.job = None
 
     def _require(self):
         if self.state is None:
@@ -679,12 +683,16 @@ class ModelExplorer:
                         "train_loss": item["train"]["loss"], "nodes": int(sum(afpo.node_size(t) for t in model.trees)),
                         "age": int(model.age), "origin": model.origin})
         inputs = []
+        typical = self._typical_row()
         for column, kind in zip(state["source_columns"], state["types"]):
             if kind == 1:
+                values = state["Xt"][:, state["names"].index(column)] if column in state["names"] else np.empty(0)
                 inputs.append({"name": column, "kind": "numeric", "range": (state.get("input_ranges") or {}).get(column),
-                               "typical": state["maps"].get("__afpo_numeric_fills__", {}).get(column)})
+                               "typical": state["maps"].get("__afpo_numeric_fills__", {}).get(column),
+                               "integer": bool(len(values) and np.all(np.isclose(values, np.round(values))))})
             elif kind == 2:
-                inputs.append({"name": column, "kind": "categorical", "classes": state["maps"].get(column, [])})
+                inputs.append({"name": column, "kind": "categorical", "classes": state["maps"].get(column, []),
+                               "typical": typical.get(column)})
         return {"path": str(self.path), "generation": self.generation, "source": "validation" if state.get("Xv") is not None else "training",
                 "outputs": state["out_names"], "cats": state["cats"], "inputs": inputs, "models": out,
                 "dataset": state.get("dataset_path"), "seed": state.get("run_seed"),
@@ -714,7 +722,15 @@ class ModelExplorer:
                     "scales": [list(scale) for scale in model.scales], "metrics": item["metrics"], "train": item["train"],
                     "per_output": per_output, "svg": afpo.tree_map_svg(model, names, out_names, cats),
                     "nodes": int(sum(afpo.node_size(t) for t in model.trees)), "age": int(model.age), "origin": model.origin,
-                    "features_used": [names[i] for i in afpo.used_feature_indices(model) if i < len(names)]}
+                    "features_used": [names[i] for i in afpo.used_feature_indices(model) if i < len(names)],
+                    "inputs_used": self._inputs_used(model)}
+
+    def _inputs_used(self, model):
+        """Source input columns the model reads (a text column counts if any of its categories is used)."""
+        state = self.state
+        used = [state["names"][i] for i in afpo.used_feature_indices(model) if i < len(state["names"])]
+        return [column for column, kind in zip(state["source_columns"], state["types"]) if kind in (1, 2) and
+                any(name == column or name.startswith(column + "=") or name.startswith(column + "[") for name in used)]
 
     def fit(self, index, split="train"):
         """Predicted vs. actual (regression) or a confusion matrix (classification)."""
@@ -790,32 +806,98 @@ class ModelExplorer:
             full = {**self._typical_row(), **{k: v for k, v in (row or {}).items() if v not in (None, "")}}
             return {"inputs": full, "outputs": self._decode(model, self._encode([full]))[0]}
 
-    def sweep(self, index, column, points=120):
-        """One input varied over its training range, the others held at typical values."""
-        with self.lock:
-            model, state = self._model(index), self.state
-            if column not in state["source_columns"]:
-                raise ValueError(f"Unknown input column {column!r}")
+    def _axis(self, column, lo=None, hi=None, points=120):
+        """Values one explored input takes: an even numeric range, or every category."""
+        state = self.state
+        if column not in state["source_columns"]:
+            raise ValueError(f"Unknown input column {column!r}")
+        kind = state["types"][state["source_columns"].index(column)]
+        if kind == 1:
+            low, high = (state.get("input_ranges") or {}).get(column, [0., 1.])
+            pad = .05 * (high - low) if high > low else .5
+            lo = low - pad if lo in (None, "") else float(lo)
+            hi = high + pad if hi in (None, "") else float(hi)
+            if not (math.isfinite(lo) and math.isfinite(hi)) or hi <= lo:
+                raise ValueError(f"The range for {column!r} needs a finite upper end above its lower end")
+            return "numeric", np.linspace(lo, hi, max(2, int(points))).tolist()
+        if kind == 2:
+            return "categorical", list(state["maps"].get(column, []))
+        raise ValueError(f"{column!r} is not a model input")
+
+    def _base(self, base):
+        """Typical training values, overridden by whatever the user froze the inputs at."""
+        row = self._typical_row()
+        for key, value in (base or {}).items():
+            if key in row and value not in (None, ""):
+                row[key] = value
+        return row
+
+    def _surface(self, model, rows):
+        """Numeric outputs as values; class outputs as each class's probability."""
+        state = self.state
+        values, distributions = afpo.predict_targets(model, self._encode(rows), state["cats"], probabilities=True)
+        outputs = {}
+        for j, (name, labels) in enumerate(zip(state["out_names"], state["cats"])):
+            if labels is None:
+                outputs[name] = {"kind": "value", "values": values[:, j]}
+                continue
+            dist = distributions[j]
+            outputs[name] = {"kind": "class", "labels": [str(label) for label in labels], "predicted": values[:, j].astype(int),
+                             "prob": ({str(labels[c]): dist[:, c] for c in range(len(labels))}
+                                      if dist is not None and dist.shape[1] == len(labels) else {})}
+        return outputs
+
+    def _training_points(self, columns):
+        """A sample of training rows: the explored inputs (category index for text inputs) and the targets."""
+        state = self.state
+        rows = np.arange(len(state["Xt"]))
+        if len(rows) > MAX_FIT_POINTS:
+            rows = np.random.default_rng(1).choice(rows, MAX_FIT_POINTS, replace=False)
+        coords = {}
+        for column in columns:
             kind = state["types"][state["source_columns"].index(column)]
-            base = self._typical_row()
-            if kind == 1:
-                lo, hi = (state.get("input_ranges") or {}).get(column, [0., 1.])
-                pad = .05 * (hi - lo) if hi > lo else .5
-                xs = np.linspace(lo - pad, hi + pad, int(points)).tolist()
-            elif kind == 2:
-                xs = list(state["maps"].get(column, []))
-            else:
-                raise ValueError(f"{column!r} is not a model input")
-            decoded = self._decode(model, self._encode([{**base, column: x} for x in xs]))
-            data = []
             if kind == 1 and column in state["names"]:
-                feature = state["names"].index(column)
-                rows = np.arange(len(state["Xt"]))
-                if len(rows) > MAX_FIT_POINTS:
-                    rows = np.random.default_rng(1).choice(rows, MAX_FIT_POINTS, replace=False)
-                data = {"x": state["Xt"][rows, feature], "y": {name: state["Yt"][rows, j] for j, (name, labels) in enumerate(zip(state["out_names"], state["cats"])) if labels is None}}
-            return {"column": column, "kind": "numeric" if kind == 1 else "categorical", "x": xs, "base": base,
-                    "outputs": {name: [row.get(name) for row in decoded] for name in state["out_names"]}, "data": data}
+                coords[column] = state["Xt"][rows, state["names"].index(column)]
+            elif kind == 2:
+                classes = state["maps"].get(column, [])
+                onehot = [state["names"].index(f"{column}={cl}") for cl in classes if f"{column}={cl}" in state["names"]]
+                if len(onehot) != len(classes):
+                    return None
+                coords[column] = np.argmax(state["Xt"][np.ix_(rows, onehot)], axis=1)
+            else:
+                return None        # sequence-derived inputs have no single raw column
+        return {"coords": coords, "targets": {name: state["Yt"][rows, j] for j, name in enumerate(state["out_names"])}}
+
+    def sweep(self, index, column, base=None, lo=None, hi=None, points=160):
+        """1D: one input varied, every other input frozen (typical values unless overridden)."""
+        with self.lock:
+            model = self._model(index)
+            kind, xs = self._axis(column, lo, hi, min(int(points), 1000))
+            base = self._base(base)
+            return {"column": column, "kind": kind, "x": xs, "base": base,
+                    "outputs": self._surface(model, [{**base, column: x} for x in xs]),
+                    "data": self._training_points([column])}
+
+    def grid(self, index, x, y, base=None, x_lo=None, x_hi=None, y_lo=None, y_hi=None, points=60):
+        """2D/3D: two inputs over a grid, the rest frozen.  Values are row-major: z[yi][xi]."""
+        with self.lock:
+            if x == y:
+                raise ValueError("Choose two different inputs for the axes")
+            model = self._model(index)
+            n = max(5, min(int(points), MAX_GRID_POINTS))
+            x_kind, xs = self._axis(x, x_lo, x_hi, n)
+            y_kind, ys = self._axis(y, y_lo, y_hi, n)
+            base = self._base(base)
+            outputs = self._surface(model, [{**base, x: xv, y: yv} for yv in ys for xv in xs])
+            shape = (len(ys), len(xs))
+            for item in outputs.values():
+                if item["kind"] == "value":
+                    item["values"] = np.asarray(item["values"], float).reshape(shape)
+                else:
+                    item["predicted"] = np.asarray(item["predicted"]).reshape(shape)
+                    item["prob"] = {label: np.asarray(v, float).reshape(shape) for label, v in item["prob"].items()}
+            return {"x": {"column": x, "kind": x_kind, "values": xs}, "y": {"column": y, "kind": y_kind, "values": ys},
+                    "base": base, "outputs": outputs, "data": self._training_points([x, y])}
 
     def predict_csv(self, index, path, delimiter=","):
         with self.lock:
@@ -842,6 +924,48 @@ class ModelExplorer:
             return {"path": str(destination.resolve()), "rows": int(len(result)), "columns": [str(c) for c in result.columns],
                     "preview": [[None if v is None else str(v) for v in row] for row in preview.values.tolist()], "metrics": metrics}
 
+    def generate_defaults(self, index):
+        """Per-output error of the selected model on its training rows (a guide for added noise)."""
+        with self.lock:
+            model, state = self._model(index), self.state
+            prediction = afpo.predict_targets(model, state["Xt"], state["cats"])
+            outputs = []
+            for j, (name, labels) in enumerate(zip(state["out_names"], state["cats"])):
+                if labels is None:
+                    residual = prediction[:, j] - state["Yt"][:, j]
+                    outputs.append({"name": name, "kind": "numeric", "rmse": float(np.sqrt(np.mean(residual ** 2))),
+                                    "std": float(np.std(state["Yt"][:, j]))})
+                else:
+                    outputs.append({"name": name, "kind": "class", "labels": [str(label) for label in labels],
+                                    "accuracy": float(np.mean(prediction[:, j].astype(int) == state["Yt"][:, j].astype(int)))})
+            stem = Path(str(state.get("dataset_path") or "model")).stem
+            return {"outputs": outputs, "default_name": f"{stem}_synthetic.csv"}
+
+    def generate(self, index, spec):
+        """Start writing a synthetic dataset from the selected model in the background."""
+        with self.lock:
+            if self.job is not None and self.job.running():
+                raise RuntimeError("A dataset is already being generated")
+            model, state = self._model(index), self.state
+            name = str(spec.get("path") or "").strip() or "synthetic.csv"
+            destination = Path(name).expanduser()
+            if not destination.is_absolute():
+                destination = Path(os.getcwd()) / destination
+            if destination.suffix.lower() != ".csv":
+                destination = destination.with_name(destination.name + ".csv")
+            if not destination.parent.is_dir():
+                raise FileNotFoundError(f"No such folder: {destination.parent}")
+            if destination.exists() and not spec.get("overwrite"):
+                return {"exists": True, "path": str(destination.resolve())}
+            plan = generation_plan(state, spec)
+            self.job = GenerateJob(state, model, plan, destination.resolve(), self.files)
+            self.job.start()
+            return {"started": True, "path": str(destination.resolve()), "rows": plan["rows"]}
+
+    def generate_status(self):
+        job = self.job
+        return {"state": "idle"} if job is None else job.status()
+
     def export(self, index):
         with self.lock:
             model, state = self._model(index), self.state
@@ -850,6 +974,213 @@ class ModelExplorer:
             written = [p for p in ("best_model.py", "model_tree.svg", "best_model_fixture.csv", "best_model_fixture_predictions.csv") if Path(p).exists()]
             return {"written": [str(Path(p).resolve()) for p in written],
                     "equation": afpo.equations(model, state["names"], state["out_names"], state["cats"])}
+
+
+def _encode_frame(state, frame):
+    """Encode raw input columns exactly as training did (outputs and ignored columns left empty)."""
+    frame = frame.reindex(columns=state["source_columns"])
+    for column, kind in zip(state["source_columns"], state["types"]):
+        if kind == 1:
+            frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    return afpo.encode(frame, state["types"], state["maps"])[0]
+
+
+def generation_plan(state, spec):
+    """Validate a generation request into a concrete per-input plan."""
+    sampling = spec.get("sampling") or "uniform"
+    if sampling not in ("uniform", "lhs", "grid", "training"):
+        raise ValueError(f"Unknown sampling method {sampling!r}")
+    rows = int(spec.get("rows") or 0)
+    if not 1 <= rows <= MAX_GENERATE_ROWS:
+        raise ValueError(f"Rows must be between 1 and {MAX_GENERATE_ROWS:,}")
+    ranges = state.get("input_ranges") or {}
+    requested = spec.get("inputs") or {}
+    inputs = []
+    for column, kind in zip(state["source_columns"], state["types"]):
+        if kind not in (1, 2):
+            continue
+        item = requested.get(column) or {}
+        vary = bool(item.get("vary", True))
+        if kind == 1:
+            low, high = ranges.get(column, [0., 1.])
+            lo = low if item.get("lo") in (None, "") else float(item["lo"])
+            hi = high if item.get("hi") in (None, "") else float(item["hi"])
+            if vary and (not (math.isfinite(lo) and math.isfinite(hi)) or hi < lo):
+                raise ValueError(f"{column}: the range needs a finite upper end at or above its lower end")
+            value = item.get("value")
+            if not vary:
+                if value in (None, ""):
+                    value = state["maps"].get("__afpo_numeric_fills__", {}).get(column, 0.)
+                value = float(value)
+                if not math.isfinite(value):
+                    raise ValueError(f"{column}: the fixed value must be a finite number")
+            inputs.append({"name": column, "kind": "numeric", "vary": vary, "lo": lo, "hi": hi,
+                           "integer": bool(item.get("integer", False)), "value": value})
+        else:
+            classes = list(state["maps"].get(column, []))
+            value = item.get("value")
+            if not vary and value not in classes:
+                raise ValueError(f"{column}: choose one of its categories as the fixed value")
+            inputs.append({"name": column, "kind": "categorical", "vary": vary, "classes": classes, "value": value})
+    outputs = []
+    requested_outputs = spec.get("outputs") or {}
+    for name, labels in zip(state["out_names"], state["cats"]):
+        item = requested_outputs.get(name) or {}
+        if labels is None:
+            noise = float(item.get("noise") or 0.)
+            if not math.isfinite(noise) or noise < 0:
+                raise ValueError(f"{name}: noise must be a non-negative number")
+            outputs.append({"name": name, "kind": "numeric", "noise": noise})
+        else:
+            outputs.append({"name": name, "kind": "class", "labels": list(labels), "sample": item.get("mode") == "sample",
+                            "probabilities": bool(item.get("probabilities", False))})
+    jitter = float(spec.get("jitter") or 0.) / 100.
+    seed = spec.get("seed")
+    seed = None if seed in (None, "") else int(seed)
+    plan = {"sampling": sampling, "rows": rows, "inputs": inputs, "outputs": outputs, "jitter": jitter, "seed": seed}
+    if sampling == "grid":
+        varied_numeric = [i for i in inputs if i["vary"] and i["kind"] == "numeric"]
+        categories = int(np.prod([len(i["classes"]) for i in inputs if i["vary"] and i["kind"] == "categorical"] or [1]))
+        per_axis = max(2, int(math.floor((rows / categories) ** (1 / len(varied_numeric)) + 1e-9))) if varied_numeric else 1
+        for item in varied_numeric:
+            item["axis"] = np.linspace(item["lo"], item["hi"], per_axis)
+            if item["integer"]:
+                item["axis"] = np.unique(np.rint(item["axis"]))
+        for item in inputs:
+            if item["vary"] and item["kind"] == "categorical":
+                item["axis"] = np.arange(len(item["classes"]))
+        plan["axes"] = [i for i in inputs if "axis" in i]
+        plan["rows"] = int(np.prod([len(i["axis"]) for i in plan["axes"]] or [1]))
+        if plan["rows"] > MAX_GENERATE_ROWS:
+            raise ValueError(f"That grid would have {plan['rows']:,} rows; reduce rows or vary fewer inputs")
+    return plan
+
+
+class GenerateJob:
+    """Writes model predictions for sampled inputs to CSV in chunks, in a background thread."""
+
+    def __init__(self, state, model, plan, destination, registry):
+        self.state, self.model, self.plan, self.destination, self.registry = state, model, plan, destination, registry
+        self.written = 0
+        self.error = None
+        self.done = False
+        self.preview = None
+        self.started = time.time()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self):
+        self.thread.start()
+
+    def running(self):
+        return self.thread.is_alive()
+
+    def status(self):
+        return {"state": "failed" if self.error else "finished" if self.done else "running", "written": self.written,
+                "rows": self.plan["rows"], "path": str(self.destination), "error": self.error, "preview": self.preview,
+                "elapsed": time.time() - self.started}
+
+    def _inputs(self, rng, start, stop, lhs):
+        """Raw input columns for rows [start, stop)."""
+        plan, state, count = self.plan, self.state, stop - start
+        columns = {}
+        if plan["sampling"] == "training":
+            picks = rng.integers(0, len(state["Xt"]), count)
+        if plan["sampling"] == "grid":
+            shape = [len(item["axis"]) for item in plan["axes"]]
+            coords = np.unravel_index(np.arange(start, stop), shape) if shape else []
+            by_name = {item["name"]: coord for item, coord in zip(plan["axes"], coords)}
+        for item in plan["inputs"]:
+            name = item["name"]
+            if not item["vary"]:
+                if item["kind"] == "numeric" and item["integer"] and float(item["value"]).is_integer():
+                    columns[name] = np.full(count, int(item["value"]), dtype=np.int64)
+                else:
+                    columns[name] = np.full(count, item["value"], dtype=object if item["kind"] == "categorical" else float)
+                continue
+            if item["kind"] == "categorical":
+                if plan["sampling"] == "grid":
+                    index = by_name[name]
+                elif plan["sampling"] == "training":
+                    onehot = [state["names"].index(f"{name}={cl}") for cl in item["classes"]]
+                    index = np.argmax(state["Xt"][np.ix_(picks, onehot)], axis=1)
+                else:
+                    index = rng.integers(0, len(item["classes"]), count)
+                columns[name] = np.asarray(item["classes"], dtype=object)[index]
+                continue
+            lo, hi = item["lo"], item["hi"]
+            if plan["sampling"] == "grid":
+                values = item["axis"][by_name[name]]
+            elif plan["sampling"] == "lhs":
+                values = lo + lhs[name][start:stop] * (hi - lo)
+            elif plan["sampling"] == "training":
+                values = state["Xt"][picks, state["names"].index(name)].astype(float)
+                if plan["jitter"]:
+                    values = values + rng.normal(0, plan["jitter"] * (hi - lo), count)
+            else:
+                values = lo + rng.random(count) * (hi - lo)
+            if item["integer"]:
+                values = np.rint(values).astype(np.int64)      # written as 8, not 8.0
+            columns[name] = values
+        return columns
+
+    def _outputs(self, rng, columns, count):
+        state = self.state
+        X = _encode_frame(state, pd.DataFrame(columns))
+        values, distributions = afpo.predict_targets(self.model, X, state["cats"], probabilities=True)
+        result = {}
+        for j, item in enumerate(self.plan["outputs"]):
+            if item["kind"] == "numeric":
+                column = values[:, j].astype(float)
+                if item["noise"]:
+                    column = column + rng.normal(0, item["noise"], count)
+                result[item["name"]] = column
+                continue
+            labels = np.asarray(item["labels"], dtype=object)
+            dist = distributions[j]
+            if item["sample"] and dist is not None and dist.shape[1] == len(labels):
+                cumulative = np.cumsum(dist, axis=1)
+                index = np.minimum((cumulative < rng.random(count)[:, None] * cumulative[:, -1:]).sum(axis=1), len(labels) - 1)
+            else:
+                index = np.clip(values[:, j].astype(int), 0, len(labels) - 1)
+            result[item["name"]] = labels[index]
+            if item["probabilities"] and dist is not None and dist.shape[1] == len(labels):
+                for c, label in enumerate(labels):
+                    result[f"P({item['name']}={label})"] = dist[:, c]
+        return result
+
+    def _run(self):
+        temporary = self.destination.with_name(self.destination.name + ".part")
+        try:
+            plan, state = self.plan, self.state
+            rng = np.random.default_rng(plan["seed"])
+            lhs = {}
+            if plan["sampling"] == "lhs":
+                # One stratum per row on every numeric axis, strata shuffled independently.
+                for item in plan["inputs"]:
+                    if item["vary"] and item["kind"] == "numeric":
+                        lhs[item["name"]] = (rng.permutation(plan["rows"]) + rng.random(plan["rows"])) / plan["rows"]
+            order = [c for c, k in zip(state["source_columns"], state["types"]) if k in (1, 2, 5, 6)]
+            with temporary.open("w", newline="") as handle:
+                for start in range(0, plan["rows"], GENERATE_CHUNK):
+                    stop = min(plan["rows"], start + GENERATE_CHUNK)
+                    columns = self._inputs(rng, start, stop, lhs)
+                    outputs = self._outputs(rng, columns, stop - start)
+                    frame = pd.DataFrame({**columns, **outputs})
+                    extra = [c for c in frame.columns if c not in order]
+                    frame = frame[[c for c in order if c in frame.columns] + extra]
+                    frame.to_csv(handle, index=False, header=start == 0)
+                    if start == 0:
+                        head = frame.head(20).astype(object).where(frame.head(20).notna(), None)
+                        self.preview = {"columns": [str(c) for c in frame.columns],
+                                        "rows": [[None if v is None else str(v) for v in row] for row in head.values.tolist()]}
+                    self.written = stop
+            temporary.replace(self.destination)
+            self.registry[str(self.destination)] = True
+            self.done = True
+        except Exception as exc:
+            traceback.print_exc()
+            temporary.unlink(missing_ok=True)
+            self.error = f"{type(exc).__name__}: {exc}"
 
 
 def recent_runs(limit=30):
@@ -893,9 +1224,14 @@ def run_gui(host="127.0.0.1", port=DEFAULT_PORT, open_browser=True):
         "/api/models/detail": lambda b: explorer.detail(b["index"]),
         "/api/models/fit": lambda b: explorer.fit(b["index"], b.get("split", "train")),
         "/api/models/predict": lambda b: explorer.predict(b["index"], b.get("row") or {}),
-        "/api/models/sweep": lambda b: explorer.sweep(b["index"], b["column"]),
+        "/api/models/sweep": lambda b: explorer.sweep(b["index"], b["column"], b.get("base"), b.get("lo"), b.get("hi"), b.get("points", 160)),
+        "/api/models/grid": lambda b: explorer.grid(b["index"], b["x"], b["y"], b.get("base"), b.get("x_lo"), b.get("x_hi"),
+                                                    b.get("y_lo"), b.get("y_hi"), b.get("points", 60)),
         "/api/models/predict_csv": lambda b: explorer.predict_csv(b["index"], b["path"], b.get("delimiter") or ","),
         "/api/models/export": lambda b: explorer.export(b["index"]),
+        "/api/models/generate/defaults": lambda b: explorer.generate_defaults(b["index"]),
+        "/api/models/generate": lambda b: explorer.generate(b["index"], b.get("spec") or {}),
+        "/api/models/generate/status": lambda b: explorer.generate_status(),
     }
 
     class Handler(BaseHTTPRequestHandler):

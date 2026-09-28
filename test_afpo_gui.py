@@ -97,7 +97,22 @@ class GuiTests(unittest.TestCase):
         self.assertEqual(fit["split"], "validation")
         self.assertEqual(fit["outputs"][0]["kind"], "regression")
         sweep = explorer.sweep(index, "a")
-        self.assertEqual(len(sweep["x"]), len(sweep["outputs"]["y"]))
+        self.assertEqual(len(sweep["x"]), len(sweep["outputs"]["y"]["values"]))
+        # Frozen inputs are honoured: every point equals a single-row prediction at those values.
+        frozen = explorer.sweep(index, "a", base={"b": 1.5, "c": -.5}, lo=-1, hi=1, points=5)
+        self.assertEqual(frozen["x"], [-1., -.5, 0., .5, 1.])
+        for x, value in zip(frozen["x"], frozen["outputs"]["y"]["values"]):
+            self.assertAlmostEqual(value, explorer.predict(index, {"a": x, "b": 1.5, "c": -.5})["outputs"]["y"], places=9)
+        grid = explorer.grid(index, "a", "b", base={"c": .3}, x_lo=-1, x_hi=1, y_lo=0, y_hi=2, points=7)
+        values = np.asarray(grid["outputs"]["y"]["values"])
+        self.assertEqual(values.shape, (7, 7))
+        self.assertAlmostEqual(values[6, 0], explorer.predict(index, {"a": -1, "b": 2, "c": .3})["outputs"]["y"], places=9)
+        self.assertEqual(set(grid["data"]["coords"]), {"a", "b"})
+        with self.assertRaises(ValueError):
+            explorer.grid(index, "a", "a")
+        with self.assertRaises(ValueError):
+            explorer.sweep(index, "a", lo=2, hi=1)
+        self.assertEqual(detail_inputs := explorer.detail(index)["inputs_used"], [c for c in ("a", "b", "c") if c in detail_inputs])
         single = explorer.predict(index, {"a": 1, "b": 2, "c": 0})
         batch = explorer.predict_csv(index, self.csv)
         self.assertEqual(batch["rows"], 120)
@@ -106,8 +121,72 @@ class GuiTests(unittest.TestCase):
         self.assertAlmostEqual(row, float(pd.read_csv(batch["path"])["predicted_y"].iloc[0]), places=9)
         self.assertIsInstance(single["outputs"]["y"], float)
         self.assertIsNotNone(batch["metrics"])
+        self.check_generation(explorer, index)
         exported = explorer.export(index)
         self.assertTrue(any(p.endswith("best_model.py") for p in exported["written"]))
+
+    def generate(self, explorer, index, spec):
+        started = explorer.generate(index, spec)
+        self.assertTrue(started.get("started"), started)
+        deadline = time.time() + 120
+        while explorer.generate_status()["state"] == "running" and time.time() < deadline:
+            time.sleep(.05)
+        status = explorer.generate_status()
+        self.assertEqual(status["state"], "finished", status["error"])
+        return pd.read_csv(status["path"])
+
+    def check_generation(self, explorer, index):
+        self.assertGreater(explorer.generate_defaults(index)["outputs"][0]["rmse"], -1)
+        frame = self.generate(explorer, index, {"path": "gen_uniform.csv", "rows": 1000, "seed": 1, "sampling": "uniform",
+                                                "inputs": {"a": {"lo": -1, "hi": 1}, "c": {"vary": False, "value": .5}}})
+        self.assertEqual(list(frame.columns), ["a", "b", "c", "y"])
+        self.assertEqual(len(frame), 1000)
+        self.assertTrue((frame.c == .5).all() and frame.a.between(-1, 1).all())
+        row = frame.iloc[0]
+        self.assertAlmostEqual(row.y, explorer.predict(index, {"a": row.a, "b": row.b, "c": row.c})["outputs"]["y"], places=6)
+        # Latin hypercube: exactly one row in each of the n equal strata of every varied input.
+        frame = self.generate(explorer, index, {"path": "gen_lhs.csv", "rows": 100, "seed": 2, "sampling": "lhs",
+                                                "inputs": {"a": {"lo": 0, "hi": 1}}})
+        self.assertEqual(sorted(np.floor(frame.a * 100).astype(int)), list(range(100)))
+        frame = self.generate(explorer, index, {"path": "gen_grid.csv", "rows": 100, "sampling": "grid",
+                                                "inputs": {"c": {"vary": False, "value": 0}}})
+        self.assertEqual(len(frame), 100)
+        self.assertEqual(len(frame[["a", "b"]].drop_duplicates()), 100)
+        frame = self.generate(explorer, index, {"path": "gen_train.csv", "rows": 300, "seed": 3, "sampling": "training"})
+        self.assertTrue(frame.a.isin(pd.read_csv(self.csv).a).all())
+        frame = self.generate(explorer, index, {"path": "gen_int.csv", "rows": 50, "seed": 6, "inputs": {"b": {"integer": True, "lo": 0, "hi": 5}}})
+        self.assertTrue(pd.api.types.is_integer_dtype(frame.b) and frame.b.between(0, 5).all())
+        noisy = self.generate(explorer, index, {"path": "gen_noise.csv", "rows": 20000, "seed": 4, "outputs": {"y": {"noise": .5}}})
+        clean = explorer.predict_csv(index, "gen_noise.csv")
+        residual = pd.read_csv(clean["path"]).eval("y - predicted_y")
+        self.assertAlmostEqual(residual.std(), .5, delta=.02)
+        self.assertTrue(explorer.generate(index, {"path": "gen_noise.csv", "rows": 5})["exists"])
+        with self.assertRaises(ValueError):
+            explorer.generate(index, {"path": "bad.csv", "rows": 0})
+        self.assertFalse(Path("bad.csv").exists() or Path("gen_uniform.csv.part").exists())
+
+    def test_generate_classification_samples_valid_labels(self):
+        r = np.random.default_rng(4)
+        X = r.uniform(-2, 2, (150, 2))
+        labels = np.where(X[:, 0] ** 2 + X[:, 1] ** 2 < 1.5, "inside", np.where(X[:, 0] > 0, "right", "left"))
+        path = Path(self.tmp.name) / "cls.csv"
+        pd.DataFrame({"a": X[:, 0], "g": np.where(X[:, 1] > 0, "up", "down"), "label": labels}).to_csv(path, index=False)
+        request = form(path)
+        request["data"]["types"] = [1, 2, 6]
+        session = gui.TrainingSession()
+        session.start(request)
+        wait_for(session, {"choosing", "failed"})
+        session.pick(0)
+        explorer = gui.ModelExplorer()
+        explorer.load(wait_for(session, {"finished", "failed"})["done"]["checkpoint"])
+        frame = self.generate(explorer, 0, {"path": "gen_cls.csv", "rows": 2000, "seed": 5,
+                                            "inputs": {"g": {"vary": False, "value": "up"}},
+                                            "outputs": {"label": {"mode": "sample", "probabilities": True}}})
+        self.assertEqual(list(frame.columns[:3]), ["a", "g", "label"])
+        self.assertTrue((frame.g == "up").all() and frame.label.isin(["inside", "left", "right"]).all())
+        probabilities = frame[[c for c in frame.columns if c.startswith("P(label=")]]
+        self.assertEqual(probabilities.shape[1], 3)
+        self.assertTrue(np.allclose(probabilities.sum(axis=1), 1))
 
     def test_stop_saves_checkpoint_and_offers_choice(self):
         session = gui.TrainingSession()

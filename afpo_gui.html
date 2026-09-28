@@ -11,7 +11,7 @@
   --text: #0b0b0b; --text-2: #52514e; --muted: #8a8983; --grid: #e7e6e2;
   --accent: #2a78d6; --accent-ink: #ffffff; --danger: #c93c3b; --good: #008300; --warn: #b87a00;
   --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a;
-  --seq0: #cde2fb; --seq6: #0d366b;
+  --seq: #cde2fb,#9ec5f4,#6da7ec,#3987e5,#256abf,#184f95,#0d366b;
   --other: #b9b8b2;
 }
 @media (prefers-color-scheme: dark) {
@@ -21,7 +21,7 @@
     --text: #ffffff; --text-2: #c3c2b7; --muted: #8f8e86; --grid: #2c2c29;
     --accent: #3987e5; --accent-ink: #ffffff; --danger: #e66767; --good: #3fae3f; --warn: #d9a13a;
     --s1: #3987e5; --s2: #d95926; --s3: #199e70;
-    --seq0: #0d366b; --seq6: #cde2fb;
+    --seq: #0d366b,#104281,#1c5cab,#2a78d6,#5598e7,#86b6ef,#cde2fb;
     --other: #5c5b56;
   }
 }
@@ -31,7 +31,7 @@
   --text: #ffffff; --text-2: #c3c2b7; --muted: #8f8e86; --grid: #2c2c29;
   --accent: #3987e5; --accent-ink: #ffffff; --danger: #e66767; --good: #3fae3f; --warn: #d9a13a;
   --s1: #3987e5; --s2: #d95926; --s3: #199e70;
-  --seq0: #0d366b; --seq6: #cde2fb;
+  --seq: #0d366b,#104281,#1c5cab,#2a78d6,#5598e7,#86b6ef,#cde2fb;
   --other: #5c5b56;
 }
 * { box-sizing: border-box; }
@@ -87,7 +87,7 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-sp
 tr.clickable { cursor: pointer; }
 tr.clickable:hover td { background: var(--surface-2); }
 tr.selected td { background: color-mix(in srgb, var(--accent) 14%, transparent); }
-.badge { display: inline-block; font-size: 11px; padding: 1px 7px; border-radius: 10px; background: var(--surface-2); border: 1px solid var(--border); color: var(--text-2); white-space: nowrap; }
+.badge { display: inline-block; font-size: 11px; padding: 1px 7px; border-radius: 10px; background: var(--surface-2); border: 1px solid var(--border); color: var(--text-2); white-space: nowrap;  max-width: 100%; overflow: hidden; text-overflow: ellipsis; vertical-align: middle; }
 .badge.accent { border-color: var(--accent); color: var(--accent); }
 .eq { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; word-break: break-word; }
 .eq-big { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 14px; word-break: break-word; background: var(--surface-2); border-radius: 8px; padding: 10px 12px; }
@@ -141,6 +141,27 @@ tr.selected td { background: color-mix(in srgb, var(--accent) 14%, transparent);
 @media (max-width: 760px) { #cwd { display: none; } }
 .kv { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 3px 12px; font-size: 12px; }
 .kv .k { color: var(--text-2); }
+#genInputs input[type=number], #genInputs select { min-width: 84px; }
+#genInputs td { vertical-align: middle; }
+#genOutputs input[type=number] { max-width: 130px; }
+.progress { height: 10px; background: var(--surface-2); border-radius: 4px; overflow: hidden; }
+.progress div { height: 100%; background: var(--s1); border-radius: 0 4px 4px 0; transition: width .25s; }
+.seg { display: inline-flex; gap: 2px; background: var(--surface-2); border-radius: 8px; padding: 3px; text-transform: none; letter-spacing: 0; }
+.seg button { border: 0; background: transparent; color: var(--text-2); padding: 4px 12px; border-radius: 6px; font: inherit; font-size: 12px; font-weight: 550; cursor: pointer; }
+.seg button.active { background: var(--surface); color: var(--text); box-shadow: 0 1px 2px rgba(0,0,0,.08); }
+.explore { display: grid; grid-template-columns: 300px minmax(0, 1fr); gap: 18px; align-items: start; }
+@media (max-width: 900px) { .explore { grid-template-columns: minmax(0, 1fr); } }
+.explore .range { margin-top: 4px; flex-wrap: nowrap; }
+.explore .range input { flex: 1; width: auto; }
+.frozen { border-top: 1px solid var(--border); margin-top: 8px; padding-top: 8px; }
+.frozen .field { margin-bottom: 6px; }
+.frozen .field > label { display: flex; justify-content: space-between; gap: 6px; font-weight: 500; }
+.frozen .unused { color: var(--muted); font-weight: 400; font-size: 11px; }
+.chart.h480 { height: 480px; }
+.chart canvas.grab { cursor: grab; } .chart canvas.grab:active { cursor: grabbing; }
+.colorbar { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 8px; align-items: center; font-size: 12px; color: var(--text-2); margin-top: 8px; font-variant-numeric: tabular-nums; }
+.colorbar .ramp { height: 10px; border-radius: 3px; }
+.colorbar .title { grid-column: 1 / -1; color: var(--text-2); font-size: 12px; }
 </style>
 </head>
 <body>
@@ -385,6 +406,35 @@ tr.selected td { background: color-mix(in srgb, var(--accent) 14%, transparent);
         <details style="margin-top:8px"><summary>Expression tree</summary><div class="svgbox" id="treeBox"></div></details>
       </div>
 
+      <div class="card" id="exploreCard">
+        <h2>Explore the model <span class="grow"></span>
+          <span class="seg" id="exMode"><button data-mode="1d" class="active">1D curve</button><button data-mode="2d">2D map</button><button data-mode="3d">3D surface</button></span>
+        </h2>
+        <div class="explore">
+          <div>
+            <div class="field"><label>Output</label><select id="exOutput"></select></div>
+            <div class="field"><label id="exXLabel">Input on the x axis</label><select id="exX"></select>
+              <div class="row range" id="exXRange"><input type="number" step="any" id="exXlo" placeholder="from"><input type="number" step="any" id="exXhi" placeholder="to"></div></div>
+            <div class="field exY"><label>Input on the y axis</label><select id="exY"></select>
+              <div class="row range" id="exYRange"><input type="number" step="any" id="exYlo" placeholder="from"><input type="number" step="any" id="exYhi" placeholder="to"></div></div>
+            <div class="field"><label>Resolution</label><select id="exRes"><option value="0">Coarse</option><option value="1" selected>Medium</option><option value="2">Fine</option></select></div>
+            <label class="check"><input type="checkbox" id="exData" checked> Show training rows</label>
+            <div class="frozen">
+              <div class="row" style="justify-content:space-between;margin-bottom:6px"><strong>Other inputs held at</strong><button class="link" id="exReset">reset to typical</button></div>
+              <div id="exFrozen"></div>
+              <div class="hint">Blank ranges use the training range plus 5%. Typical = training median, or the most common category.</div>
+            </div>
+          </div>
+          <div>
+            <div class="legend" id="exLegend"></div>
+            <div class="chart h480" id="exWrap2d"><canvas id="exChart"></canvas></div>
+            <div class="chart h480 hidden" id="exWrap3d"><canvas id="ex3d" class="grab"></canvas></div>
+            <div id="exColorbar" class="colorbar hidden"></div>
+            <div class="hint" id="exHint" style="margin-top:6px"></div>
+          </div>
+        </div>
+      </div>
+
       <div class="grid2">
         <div class="card">
           <h2>Fit <span class="grow"></span>
@@ -394,22 +444,12 @@ tr.selected td { background: color-mix(in srgb, var(--accent) 14%, transparent);
           <div id="fitBody"></div>
         </div>
         <div class="card">
-          <h2>Response curve <span class="grow"></span>
-            <select id="sweepInput" style="width:auto"></select>
-            <select id="sweepOutput" style="width:auto"></select>
-          </h2>
-          <div class="legend"><span><i class="sw line" style="background:var(--s1)"></i>Model (other inputs at typical values)</span><span id="sweepDataLegend"><i class="sw" style="background:var(--other)"></i>Training rows</span></div>
-          <div class="chart h320"><canvas id="sweepChart"></canvas></div>
-        </div>
-      </div>
-
-      <div class="grid2">
-        <div class="card">
           <h2>Predict one row</h2>
           <div class="fields" id="predictFields"></div>
           <div class="row"><button class="btn primary" id="predictBtn">Predict</button><button class="btn" id="typicalBtn">Typical values</button><button class="btn" id="randomBtn">Random within training range</button></div>
           <div id="predictOut" style="margin-top:10px"></div>
         </div>
+      </div>
         <div class="card">
           <h2>Predict a CSV</h2>
           <div data-path="batch" data-kind="csv"></div>
@@ -419,7 +459,32 @@ tr.selected td { background: color-mix(in srgb, var(--accent) 14%, transparent);
           </div>
           <div id="batchOut" style="margin-top:10px"></div>
         </div>
-      </div>
+
+        <div class="card" id="genCard">
+          <h2>Generate synthetic data <span class="grow"></span><span class="hint" id="genModelHint" style="text-transform:none;letter-spacing:0"></span></h2>
+          <div class="hint" style="margin-bottom:10px">Writes a CSV of the selected model's predictions at sampled inputs, using the original column names, ready for training another model such as a neural network. These are the model's answers, not measurements: its errors, and anything it does outside the training range, are copied into the data.</div>
+          <div class="grid2">
+            <div>
+              <div class="fields">
+                <div class="field"><label>Rows</label><input type="number" id="genRows" value="10000" min="1" max="5000000"></div>
+                <div class="field"><label>Sampling</label><select id="genSampling">
+                  <option value="uniform">Uniform random</option><option value="lhs">Latin hypercube (evenly spread)</option>
+                  <option value="grid">Grid (every combination)</option><option value="training">Resample training inputs</option></select></div>
+                <div class="field" id="genJitterField"><label>Jitter <span class="hint">% of each range</span></label><input type="number" id="genJitter" value="0" min="0" step="any"></div>
+                <div class="field"><label>Seed <span class="hint">blank = random</span></label><input type="number" id="genSeed"></div>
+              </div>
+              <div class="hint" id="genSamplingHint" style="margin-bottom:8px"></div>
+              <div class="scroll-x"><table id="genInputs"><thead><tr><th>Input</th><th>Vary</th><th>From</th><th>To</th><th title="Round to whole numbers">Whole</th><th>Fixed at</th></tr></thead><tbody></tbody></table></div>
+            </div>
+            <div>
+              <div class="scroll-x"><table id="genOutputs"><thead><tr><th>Output</th><th>What to write</th></tr></thead><tbody></tbody></table></div>
+              <div class="field" style="margin-top:10px"><label>Save as <span class="hint">a bare name goes to the working directory</span></label><input type="text" id="genPath" class="mono" spellcheck="false"></div>
+              <div class="row"><button class="btn primary" id="genBtn">Generate CSV</button><span class="hint" id="genEstimate"></span></div>
+              <div id="genProgress" style="margin-top:10px"></div>
+              <div id="genOut"></div>
+            </div>
+          </div>
+        </div>
     </div>
   </div>
 </section>
@@ -601,6 +666,17 @@ class Chart {
           if (L.hover) this.hits.push({x, y, d, layer: L});
         }
         ctx.stroke(); ctx.setLineDash([]);
+      } else if (L.type === 'heat') {
+        const g = L.grid, ex = cellEdges(g.xs), ey = cellEdges(g.ys), span = (g.hi - g.lo) || 1;
+        for (let yi = 0; yi < g.ys.length; yi++) for (let xi = 0; xi < g.xs.length; xi++) {
+          const v = g.z[yi][xi];
+          if (v === null || v === undefined || !isFinite(v)) continue;
+          const x0 = sx(ex[xi]), x1 = sx(ex[xi + 1]), y0 = sy(ey[yi]), y1 = sy(ey[yi + 1]);
+          const r = [Math.min(x0, x1), Math.min(y0, y1), Math.max(x0, x1), Math.max(y0, y1)];
+          ctx.fillStyle = rampCss((v - g.lo) / span);
+          ctx.fillRect(r[0], r[1], r[2] - r[0] + .6, r[3] - r[1] + .6);
+          this.hits.push({x: (r[0] + r[2]) / 2, y: (r[1] + r[3]) / 2, rect: r, d: {x: g.xs[xi], y: g.ys[yi], z: v}, layer: L});
+        }
       } else if (L.type === 'bars') {
         ctx.fillStyle = color;
         for (const d of pts) {
@@ -621,19 +697,20 @@ class Chart {
   }
   nearest(e) {
     const rect = this.c.getBoundingClientRect(), mx = e.clientX - rect.left, my = e.clientY - rect.top;
-    let best = null, bd = Infinity;
+    let best = null, bd = Infinity, cell = null;
     for (const h of this.hits) {
+      if (h.rect) { if (mx >= h.rect[0] && mx <= h.rect[2] && my >= h.rect[1] && my <= h.rect[3]) cell = h; continue; }
       if (h.band) { if (mx >= h.band[0] && mx <= h.band[1]) return h; continue; }
       const d = this.spec && this.spec.crosshair ? Math.abs(h.x - mx) : Math.hypot(h.x - mx, h.y - my);
       if (d < bd) { bd = d; best = h; }
     }
-    const limit = this.spec && this.spec.crosshair ? 40 : 12;
-    return bd <= limit ? best : null;
+    const limit = this.spec && this.spec.crosshair ? 40 : cell ? 6 : 12;
+    return bd <= limit ? best : cell;
   }
   move(e) {
     const h = this.nearest(e);
     if (!h || !this.spec.tooltip) { this.tip.style.display = 'none'; if (this.hover) { this.hover = null; this.draw(); } return; }
-    const hovered = h.band ? null : h;
+    const hovered = (h.band || h.rect) ? null : h;
     if (this.hover !== hovered) { this.hover = hovered; this.draw(); }
     this.tip.innerHTML = this.spec.tooltip(h.d, h.layer);
     this.tip.style.display = 'block';
@@ -650,6 +727,148 @@ function sparkHist(canvas, hist) {
   ctx.fillStyle = css('--s1');
   hist.counts.forEach((c, i) => { const bh = Math.max(c ? 1 : 0, c / max * (h - 2)); ctx.fillRect(i * bw, h - bh, Math.max(1, bw - 1), bh); });
 }
+// Sequential ramp (one hue, light to dark; the dark theme has its own steps).
+let RAMP = null, RAMP_KEY = '';
+function rampStops() {
+  const key = css('--seq');
+  if (key !== RAMP_KEY) {
+    RAMP_KEY = key;
+    RAMP = key.split(',').map(h => h.trim()).filter(Boolean).map(h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16)));
+  }
+  return RAMP;
+}
+function rampRgb(t) {
+  const stops = rampStops(), x = Math.min(1, Math.max(0, isFinite(t) ? t : 0)) * (stops.length - 1), i = Math.min(stops.length - 2, Math.floor(x)), f = x - i;
+  return stops[i].map((c, k) => c + (stops[i + 1][k] - c) * f);
+}
+const rampCss = t => { const [r, g, b] = rampRgb(t); return `rgb(${r | 0},${g | 0},${b | 0})`; };
+function cellEdges(values) {
+  if (values.length === 1) return [values[0] - .5, values[0] + .5];
+  const e = [values[0] - (values[1] - values[0]) / 2];
+  for (let i = 0; i < values.length - 1; i++) e.push((values[i] + values[i + 1]) / 2);
+  e.push(values[values.length - 1] + (values[values.length - 1] - values[values.length - 2]) / 2);
+  return e;
+}
+
+// A rotatable, lit surface z(x, y) drawn with the painter's algorithm.
+class Surface3D {
+  constructor(canvas) {
+    this.c = canvas; this.ctx = canvas.getContext('2d'); this.spec = null; this.verts = [];
+    this.reset();
+    this.tip = document.createElement('div'); this.tip.className = 'tip'; canvas.parentElement.appendChild(this.tip);
+    canvas.addEventListener('pointerdown', e => { this.drag = {x: e.clientX, y: e.clientY, yaw: this.yaw, elev: this.elev}; canvas.setPointerCapture(e.pointerId); this.tip.style.display = 'none'; });
+    canvas.addEventListener('pointerup', e => { this.drag = null; canvas.releasePointerCapture(e.pointerId); });
+    canvas.addEventListener('pointermove', e => {
+      if (this.drag) {
+        this.yaw = this.drag.yaw - (e.clientX - this.drag.x) * .01;
+        this.elev = Math.min(1.53, Math.max(.02, this.drag.elev + (e.clientY - this.drag.y) * .01));
+        this.draw(); return;
+      }
+      this.hover(e);
+    });
+    canvas.addEventListener('pointerleave', () => { this.tip.style.display = 'none'; });
+    canvas.addEventListener('wheel', e => { e.preventDefault(); this.zoom = Math.min(3, Math.max(.5, this.zoom * Math.exp(-e.deltaY * .0012))); this.draw(); }, {passive: false});
+    canvas.addEventListener('dblclick', () => { this.reset(); this.draw(); });
+    new ResizeObserver(() => this.draw()).observe(canvas.parentElement);
+    charts.push(this);
+  }
+  reset() { this.yaw = -.75; this.elev = .6; this.zoom = 1; }
+  set(spec) { this.spec = spec; this.draw(); }
+  project(x, y, z) {
+    const cy = Math.cos(this.yaw), sy = Math.sin(this.yaw), ce = Math.cos(this.elev), se = Math.sin(this.elev);
+    const x1 = x * cy - y * sy, y1 = x * sy + y * cy;
+    const up = z * ce + y1 * se, depth = y1 * ce - z * se, f = 4 / (4 + depth);
+    return [this.cx + x1 * f * this.scale, this.cy - up * f * this.scale, depth];
+  }
+  draw() {
+    const c = this.c, ctx = this.ctx, spec = this.spec;
+    const w = c.parentElement.clientWidth, h = c.parentElement.clientHeight;
+    if (!w || !h) return;
+    const dpr = window.devicePixelRatio || 1;
+    c.width = Math.round(w * dpr); c.height = Math.round(h * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.clearRect(0, 0, w, h);
+    this.verts = [];
+    const muted = css('--muted'), grid = css('--grid'), text2 = css('--text-2'), surface = css('--surface');
+    ctx.font = '11px system-ui, sans-serif';
+    if (!spec) { ctx.fillStyle = muted; ctx.textAlign = 'center'; ctx.fillText('No data yet', w / 2, h / 2); return; }
+    const {xs, ys, z, lo, hi} = spec, nx = xs.length, ny = ys.length, Z = .65;
+    const X = i => nx > 1 ? i / (nx - 1) * 2 - 1 : 0, Y = i => ny > 1 ? i / (ny - 1) * 2 - 1 : 0;
+    const zn = v => hi > lo ? (v - lo) / (hi - lo) * 2 * Z - Z : 0;
+    // Fit the whole box (with room for tick labels) to the canvas at the current angle.
+    this.cx = 0; this.cy = 0; this.scale = 1;
+    let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
+    for (const a of [-1.3, 1.3]) for (const b of [-1.3, 1.3]) for (const c of [-Z, Z * 1.3]) {
+      const q = this.project(a, b, c); x0 = Math.min(x0, q[0]); x1 = Math.max(x1, q[0]); y0 = Math.min(y0, q[1]); y1 = Math.max(y1, q[1]);
+    }
+    this.scale = Math.min((w - 40) / (x1 - x0), (h - 30) / (y1 - y0)) * this.zoom;
+    this.cx = w / 2 - this.scale * (x0 + x1) / 2; this.cy = h / 2 - this.scale * (y0 + y1) / 2;
+    const line = (a, b, color, width = 1) => { const p = this.project(...a), q = this.project(...b); ctx.strokeStyle = color; ctx.lineWidth = width; ctx.beginPath(); ctx.moveTo(p[0], p[1]); ctx.lineTo(q[0], q[1]); ctx.stroke(); };
+    const label = (pt, text, align = 'center', color = muted) => { const p = this.project(...pt); ctx.fillStyle = color; ctx.textAlign = align; ctx.textBaseline = 'middle'; ctx.fillText(text, p[0], p[1]); };
+    // Floor grid, then the vertical axis at the back corner.
+    for (let t = 0; t <= 4; t++) { const v = -1 + t / 2; line([v, -1, -Z], [v, 1, -Z], grid); line([-1, v, -Z], [1, v, -Z], grid); }
+    const corners = [[-1, -1], [1, -1], [1, 1], [-1, 1]].map(([a, b]) => ({a, b, d: this.project(a, b, -Z)[2]}));
+    const back = corners.reduce((m, k) => k.d > m.d ? k : m), front = corners.reduce((m, k) => k.d < m.d ? k : m);
+    line([back.a, back.b, -Z], [back.a, back.b, Z], grid, 1.5);
+    // Surface quads and training points, far to near.
+    const V = []; for (let yi = 0; yi < ny; yi++) { V.push([]); for (let xi = 0; xi < nx; xi++) { const v = z[yi][xi]; V[yi].push(v === null || !isFinite(v) ? null : [X(xi), Y(yi), zn(v), v]); } }
+    const light = [-.35, -.45, .82], ln = Math.hypot(...light);
+    const items = [];
+    for (let yi = 0; yi < ny - 1; yi++) for (let xi = 0; xi < nx - 1; xi++) {
+      const q = [V[yi][xi], V[yi][xi + 1], V[yi + 1][xi + 1], V[yi + 1][xi]];
+      if (q.some(v => !v)) continue;
+      const P = q.map(v => this.project(v[0], v[1], v[2]));
+      const u = [q[2][0] - q[0][0], q[2][1] - q[0][1], q[2][2] - q[0][2]], s2 = [q[3][0] - q[1][0], q[3][1] - q[1][1], q[3][2] - q[1][2]];
+      const n = [u[1] * s2[2] - u[2] * s2[1], u[2] * s2[0] - u[0] * s2[2], u[0] * s2[1] - u[1] * s2[0]], nn = Math.hypot(...n) || 1;
+      const shade = .7 + .3 * Math.abs((n[0] * light[0] + n[1] * light[1] + n[2] * light[2]) / nn / ln);
+      const mean = (q[0][3] + q[1][3] + q[2][3] + q[3][3]) / 4;
+      items.push({d: (P[0][2] + P[1][2] + P[2][2] + P[3][2]) / 4, P, rgb: rampRgb(hi > lo ? (mean - lo) / (hi - lo) : .5).map(c => c * shade)});
+    }
+    for (const pt of spec.points || []) {
+      const px = spec.xspan[1] > spec.xspan[0] ? (pt.x - spec.xspan[0]) / (spec.xspan[1] - spec.xspan[0]) * 2 - 1 : 0;
+      const py = spec.yspan[1] > spec.yspan[0] ? (pt.y - spec.yspan[0]) / (spec.yspan[1] - spec.yspan[0]) * 2 - 1 : 0;
+      const pz = zn(pt.z);
+      if (Math.abs(px) > 1.001 || Math.abs(py) > 1.001 || Math.abs(pz) > 1.6 || !isFinite(pz)) continue;
+      const P = this.project(px, py, pz); items.push({d: P[2], point: P});
+    }
+    items.sort((a, b) => b.d - a.d);
+    const s2c = css('--s2');
+    for (const it of items) {
+      if (it.point) { ctx.beginPath(); ctx.arc(it.point[0], it.point[1], 2.6, 0, Math.PI * 2); ctx.fillStyle = s2c; ctx.fill(); ctx.lineWidth = 1.2; ctx.strokeStyle = surface; ctx.stroke(); continue; }
+      const col = `rgb(${it.rgb[0] | 0},${it.rgb[1] | 0},${it.rgb[2] | 0})`;
+      ctx.beginPath(); ctx.moveTo(it.P[0][0], it.P[0][1]); for (let k = 1; k < 4; k++) ctx.lineTo(it.P[k][0], it.P[k][1]); ctx.closePath();
+      ctx.fillStyle = col; ctx.fill(); ctx.strokeStyle = col; ctx.lineWidth = .7; ctx.stroke();
+    }
+    for (let yi = 0; yi < ny; yi++) for (let xi = 0; xi < nx; xi++) { const v = V[yi][xi]; if (v) { const P = this.project(v[0], v[1], v[2]); this.verts.push({sx: P[0], sy: P[1], d: P[2], x: xs[xi], y: ys[yi], z: v[3]}); } }
+    // Axis ticks along the two front floor edges.
+    const tickText = (values, labels, t) => labels ? labels[Math.round(t * (labels.length - 1))] : fmt(values[0] + (values[values.length - 1] - values[0]) * t, 3);
+    const yEdge = front.b, xEdge = front.a, off = 1.18;
+    for (const t of labelsAt(spec.xlabels)) label([-1 + 2 * t, yEdge * off, -Z], tickText(xs, spec.xlabels, t));
+    for (const t of labelsAt(spec.ylabels)) label([xEdge * off, -1 + 2 * t, -Z], tickText(ys, spec.ylabels, t));
+    label([0, yEdge * 1.42, -Z], spec.xlabel, 'center', text2);
+    label([xEdge * 1.42, 0, -Z], spec.ylabel, 'center', text2);
+    // Text goes on top so the surface never hides it; a halo keeps it legible over colour.
+    ctx.save(); ctx.lineWidth = 3; ctx.strokeStyle = surface; ctx.lineJoin = 'round';
+    const halo = (pt, text, align, color) => { const q = this.project(...pt); ctx.textAlign = align; ctx.textBaseline = 'middle'; ctx.strokeText(text, q[0], q[1]); ctx.fillStyle = color; ctx.fillText(text, q[0], q[1]); };
+    for (const t of [0, .5, 1]) halo([back.a, back.b, -Z + 2 * Z * t], fmt(lo + (hi - lo) * t, 3) + ' ', 'right', muted);
+    halo([back.a, back.b, Z * 1.3], spec.zlabel, 'center', text2);
+    ctx.restore();
+  }
+  hover(e) {
+    const rect = this.c.getBoundingClientRect(), mx = e.clientX - rect.left, my = e.clientY - rect.top;
+    let best = null;
+    for (const v of this.verts) if (Math.hypot(v.sx - mx, v.sy - my) <= 9 && (!best || v.d < best.d)) best = v;
+    if (!best || !this.spec) { this.tip.style.display = 'none'; return; }
+    this.tip.innerHTML = this.spec.tooltip(best); this.tip.style.display = 'block';
+    const pw = this.c.parentElement.clientWidth, tw = this.tip.offsetWidth;
+    let left = mx + 14; if (left + tw > pw) left = Math.max(0, mx - tw - 14);
+    this.tip.style.left = left + 'px'; this.tip.style.top = Math.max(0, my - 10) + 'px';
+  }
+}
+function labelsAt(labels) {
+  if (labels && labels.length <= 6) return labels.map((_, i) => labels.length > 1 ? i / (labels.length - 1) : 0);
+  return [0, .5, 1];
+}
+
 // Losses of exactly zero cannot sit on a log axis; plot them at this floor.
 const LOG_FLOOR = 1e-16;
 const logSafe = v => (v === null || v === undefined) ? NaN : Math.max(v, LOG_FLOOR);
@@ -1055,7 +1274,7 @@ $('#paretoLog').onchange = drawPareto; $('#paretoPop').onchange = drawPareto; $(
 
 // ───────────── models ─────────────
 const M = {summary: null, index: null, detail: null};
-const candChart = new Chart($('#candChart')), sweepChart = new Chart($('#sweepChart'));
+const candChart = new Chart($('#candChart'));
 let fitCharts = [];
 async function refreshRuns() {
   try {
@@ -1081,7 +1300,7 @@ async function loadModels() {
     $('#candLossHead').textContent = s.source === 'validation' ? 'Validation' : 'Loss';
     $('#candHint').textContent = `Loss on ${s.source} data against model size. Click a point or a row to inspect that model.`;
     $('#modelsView').classList.remove('hidden'); $('#detailView').classList.add('hidden');
-    renderCandidates(); renderPredictFields();
+    renderCandidates(); renderPredictFields(); setupExplore(); GEN.inputs = {}; GEN.outputs = {}; renderGenInputs();
     const first = s.models.findIndex(m => m.label && m.label.startsWith('Best Score'));
     selectModel(first >= 0 ? first : 0);
   } catch (e) { $('#modelsInfo').textContent = ''; toast(e.message, true); }
@@ -1125,7 +1344,8 @@ async function selectModel(index) {
     $('#detailOutputs').innerHTML = `<thead><tr><th>Output</th><th class="num">Training loss</th><th class="num">Validation loss</th></tr></thead><tbody>${d.per_output.map(o => `<tr><td>${esc(o.name)}</td><td class="num">${fmt(o.train_loss)}</td><td class="num">${fmt(o.validation_loss)}</td></tr>`).join('')}</tbody>`;
     const url = URL.createObjectURL(new Blob([d.svg], {type: 'image/svg+xml'}));
     $('#treeBox').innerHTML = `<img alt="Expression tree" src="${url}">`;
-    await Promise.all([loadFit(), loadSweep()]);
+    defaultAxes(); syncAxisControls();
+    await Promise.all([loadFit(), loadExplore(), loadGenDefaults()]);
   } catch (e) { toast(e.message, true); }
 }
 function fillOutputSelect(sel, names, keep) {
@@ -1169,36 +1389,165 @@ async function loadFit() {
 }
 $('#fitSplit').onchange = () => loadFit().catch(e => toast(e.message, true));
 $('#fitOutput').onchange = () => loadFit().catch(e => toast(e.message, true));
-async function loadSweep() {
-  if (M.index == null) return;
+// ───────────── explore: 1D curve, 2D map, 3D surface ─────────────
+const EX = {mode: '1d', frozen: {}, seq: 0, timer: null, userAxes: false};
+const exChart = new Chart($('#exChart')), ex3d = new Surface3D($('#ex3d'));
+const EX_RES = {'1d': [80, 200, 500], '2d': [30, 70, 120], '3d': [18, 34, 54]};
+const SEP = '\u0001';
+const inputInfo = name => M.summary.inputs.find(i => i.name === name);
+function setupExplore() {
   const s = M.summary;
-  const sel = $('#sweepInput');
-  if (!sel.options.length || sel.dataset.path !== s.path) {
-    sel.innerHTML = s.inputs.map(i => `<option>${esc(i.name)}</option>`).join(''); sel.dataset.path = s.path;
-    const used = M.detail.features_used.find(f => s.inputs.some(i => i.name === f));
-    if (used) sel.value = used;
-  }
-  fillOutputSelect($('#sweepOutput'), s.outputs, true);
-  if (!s.inputs.length) return sweepChart.set({layers: [], empty: 'No inputs'});
-  const r = await api('/api/models/sweep', {index: M.index, column: sel.value});
-  const out = $('#sweepOutput').value || s.outputs[0], ys = r.outputs[out], cats = s.cats[s.outputs.indexOf(out)];
-  const categoricalX = r.kind === 'categorical';
-  const yv = v => cats ? cats.indexOf(v) : v;
-  const line = r.x.map((x, i) => ({x: categoricalX ? i : x, y: yv(ys[i]), label: x, value: ys[i]}));
-  const layers = [];
-  const hasData = r.data && r.data.x && r.data.y && r.data.y[out];
-  $('#sweepDataLegend').classList.toggle('hidden', !hasData);
-  if (hasData) layers.push({type: 'points', data: r.data.x.map((x, i) => ({x, y: r.data.y[out][i], data: true})), color: '--other', alpha: .6, r: 2.5});
-  layers.push(categoricalX ? {type: 'points', data: line, color: '--s1', r: 6, ring: true} : {type: 'line', data: line, color: '--s1', hover: true});
-  sweepChart.set({
-    x: {title: sel.value, labels: categoricalX ? r.x.map(String) : null, domain: categoricalX ? [-.5, r.x.length - .5] : null},
-    y: {title: out + (cats ? ' (predicted class)' : ''), labels: cats || null, domain: cats ? [-.5, cats.length - .5] : null},
-    layers, crosshair: !categoricalX,
-    tooltip: d => d.data ? `training row<br>${esc(sel.value)} = ${fmt(d.x, 6)}<br>${esc(out)} = ${fmt(d.y, 6)}` : `${esc(sel.value)} = ${esc(categoricalX ? d.label : fmt(d.label, 6))}<br>${esc(out)} = <strong>${esc(cats ? d.value : fmt(d.value, 6))}</strong>`,
+  EX.userAxes = false;
+  EX.frozen = typicalFrozen();
+  const outs = [];
+  s.outputs.forEach((name, j) => {
+    const labels = s.cats[j];
+    if (!labels) outs.push([name, name]);
+    else labels.forEach(l => outs.push([name + SEP + l, `P(${name} = ${l})`]));
   });
+  const prev = $('#exOutput').value;
+  $('#exOutput').innerHTML = outs.map(([v, l]) => `<option value="${esc(v)}">${esc(l)}</option>`).join('');
+  if (outs.some(o => o[0] === prev)) $('#exOutput').value = prev;
+  const opts = s.inputs.map(i => `<option>${esc(i.name)}</option>`).join('');
+  $('#exX').innerHTML = opts; $('#exY').innerHTML = opts;
+  if (s.inputs.length > 1) $('#exY').value = s.inputs[1].name;
+  ['#exXlo', '#exXhi', '#exYlo', '#exYhi'].forEach(id => $(id).value = '');
 }
-$('#sweepInput').onchange = () => loadSweep().catch(e => toast(e.message, true));
-$('#sweepOutput').onchange = () => loadSweep().catch(e => toast(e.message, true));
+function defaultAxes() {
+  // Until the user picks axes, follow the inputs the selected model actually reads.
+  if (EX.userAxes || !M.detail) return;
+  const names = M.summary.inputs.map(i => i.name), used = (M.detail.inputs_used || []).filter(n => names.includes(n));
+  const order = [...used, ...names.filter(n => !used.includes(n))];
+  if (order[0]) $('#exX').value = order[0];
+  if (order[1]) $('#exY').value = order[1];
+}
+function syncAxisControls() {
+  const three = EX.mode !== '1d';
+  $$('.exY').forEach(e => e.classList.toggle('hidden', !three));
+  $('#exXLabel').textContent = three ? 'Input on the x axis' : 'Input to vary';
+  for (const [sel, row, lo, hi] of [['#exX', '#exXRange', '#exXlo', '#exXhi'], ['#exY', '#exYRange', '#exYlo', '#exYhi']]) {
+    const info = inputInfo($(sel).value);
+    const numeric = info && info.kind === 'numeric';
+    $(row).classList.toggle('hidden', !numeric);
+    if (numeric && info.range) { $(lo).placeholder = 'from ' + fmt(info.range[0]); $(hi).placeholder = 'to ' + fmt(info.range[1]); }
+  }
+  renderFrozen();
+}
+function renderFrozen() {
+  const axes = new Set([$('#exX').value, ...(EX.mode !== '1d' ? [$('#exY').value] : [])]);
+  const used = new Set(M.detail ? M.detail.inputs_used || [] : []);
+  const rest = M.summary.inputs.filter(i => !axes.has(i.name));
+  const box = $('#exFrozen');
+  if (!rest.length) { box.innerHTML = '<div class="hint">Every input is on an axis.</div>'; return; }
+  box.innerHTML = rest.map(i => {
+    const tag = M.detail && !used.has(i.name) ? '<span class="unused">not used by this model</span>' : (i.kind === 'numeric' && i.range ? `<span class="unused">${fmt(i.range[0])} … ${fmt(i.range[1])}</span>` : '');
+    const v = EX.frozen[i.name] ?? '';
+    const control = i.kind === 'numeric'
+      ? `<input type="number" step="any" data-frozen="${esc(i.name)}" value="${esc(v)}" placeholder="${esc(fmt(i.typical, 6))}">`
+      : `<select data-frozen="${esc(i.name)}">${i.classes.map(c => `<option ${String(c) === String(v) ? 'selected' : ''}>${esc(c)}</option>`).join('')}</select>`;
+    return `<div class="field"><label>${esc(i.name)} ${tag}</label>${control}</div>`;
+  }).join('');
+  $$('[data-frozen]', box).forEach(el => el.addEventListener('input', () => { EX.frozen[el.dataset.frozen] = el.value; scheduleExplore(); }));
+}
+function scheduleExplore() { clearTimeout(EX.timer); EX.timer = setTimeout(() => loadExplore().catch(e => toast(e.message, true)), 220); }
+function exPick(item, key) {
+  // A numeric output's values, or one class's probability.
+  if (item.kind === 'value') return item.values;
+  const cls = key.split(SEP)[1];
+  return item.prob[cls];
+}
+function exTargets(data, key) {
+  if (!data) return null;
+  const [name, cls] = key.split(SEP), t = data.targets[name];
+  if (cls === undefined) return t;
+  const labels = M.summary.cats[M.summary.outputs.indexOf(name)];
+  return t.map(v => v === labels.indexOf(cls) ? 1 : 0);
+}
+function exBase() {
+  const base = {};
+  for (const [k, v] of Object.entries(EX.frozen)) if (v !== '' && v !== null && v !== undefined) base[k] = inputInfo(k) && inputInfo(k).kind === 'numeric' ? +v : v;
+  return base;
+}
+async function loadExplore() {
+  if (M.index == null || !M.summary) return;
+  const s = M.summary;
+  if (!s.inputs.length) { exChart.set({layers: [], empty: 'This model has no inputs to vary'}); return; }
+  const seq = ++EX.seq, mode = EX.mode, key = $('#exOutput').value, outName = key.split(SEP)[0], isProb = key.includes(SEP);
+  const outLabel = $('#exOutput').selectedOptions[0] ? $('#exOutput').selectedOptions[0].textContent : outName;
+  const points = EX_RES[mode][+$('#exRes').value], xName = $('#exX').value, showData = $('#exData').checked;
+  $('#exWrap2d').classList.toggle('hidden', mode === '3d'); $('#exWrap3d').classList.toggle('hidden', mode !== '3d');
+  if (mode === '1d') {
+    const r = await api('/api/models/sweep', {index: M.index, column: xName, base: exBase(), lo: $('#exXlo').value, hi: $('#exXhi').value, points});
+    if (seq !== EX.seq) return;
+    const ys = exPick(r.outputs[outName], key), cat = r.kind === 'categorical';
+    const line = r.x.map((x, i) => ({x: cat ? i : x, y: ys[i], label: x}));
+    const layers = [];
+    const targets = exTargets(r.data, key);
+    const dataOk = showData && r.data && targets;
+    if (dataOk) layers.push({type: 'points', data: r.data.coords[xName].map((x, i) => ({x: cat ? x + (Math.random() - .5) * .3 : x, y: targets[i], data: true, raw: x})), color: '--other', alpha: .6, r: 2.5});
+    layers.push(cat ? {type: 'points', data: line, color: '--s1', r: 6, ring: true} : {type: 'line', data: line, color: '--s1', hover: true});
+    $('#exLegend').innerHTML = `<span><i class="sw ${cat ? '' : 'line'}" style="background:var(--s1)"></i>Model</span>` + (dataOk ? `<span><i class="sw" style="background:var(--other)"></i>Training rows (their other inputs vary)</span>` : '');
+    $('#exColorbar').classList.add('hidden');
+    exChart.set({
+      x: {title: xName, labels: cat ? r.x.map(String) : null, domain: cat ? [-.5, r.x.length - .5] : null},
+      y: {title: outLabel, domain: isProb ? [-.02, 1.02] : null}, layers, crosshair: !cat,
+      tooltip: d => d.data ? `training row<br>${esc(xName)} = ${esc(cat ? r.x[d.raw] : fmt(d.x, 6))}<br>${esc(outLabel)} = ${fmt(d.y, 6)}` : `${esc(xName)} = ${esc(cat ? d.label : fmt(d.label, 6))}<br>${esc(outLabel)} = <strong>${fmt(d.y, 6)}</strong>`,
+    });
+    $('#exHint').textContent = 'The curve varies one input; every other input stays at the values on the left.';
+    return;
+  }
+  const yName = $('#exY').value;
+  if (s.inputs.length < 2) { exChart.set({layers: [], empty: 'A 2D or 3D view needs a model with at least two inputs'}); $('#exColorbar').classList.add('hidden'); return; }
+  if (yName === xName) { exChart.set({layers: [], empty: 'Choose two different inputs'}); ex3d.set(null); $('#exColorbar').classList.add('hidden'); return; }
+  const r = await api('/api/models/grid', {index: M.index, x: xName, y: yName, base: exBase(), x_lo: $('#exXlo').value, x_hi: $('#exXhi').value, y_lo: $('#exYlo').value, y_hi: $('#exYhi').value, points});
+  if (seq !== EX.seq) return;
+  const z = exPick(r.outputs[outName], key);
+  const flat = z.flat().filter(v => v !== null && isFinite(v));
+  let lo = isProb ? 0 : Math.min(...flat), hi = isProb ? 1 : Math.max(...flat);
+  if (!flat.length) { lo = 0; hi = 1; }
+  const xc = r.x.kind === 'categorical', yc = r.y.kind === 'categorical';
+  const xs = xc ? r.x.values.map((_, i) => i) : r.x.values, ys = yc ? r.y.values.map((_, i) => i) : r.y.values;
+  const targets = exTargets(r.data, key);
+  const pts = showData && r.data && targets ? r.data.coords[xName].map((x, i) => ({x, y: r.data.coords[yName][i], z: targets[i]})) : [];
+  const ramp = rampStops().map((c, i, a) => `rgb(${c.join(',')}) ${Math.round(100 * i / (a.length - 1))}%`).join(', ');
+  $('#exColorbar').classList.remove('hidden');
+  $('#exColorbar').innerHTML = `<span class="title">${esc(outLabel)}${isProb ? '' : ' (colour scale spans this view)'}</span><span>${fmt(lo)}</span><div class="ramp" style="background:linear-gradient(90deg, ${ramp})"></div><span>${fmt(hi)}</span>`;
+  const valueTip = d => `${esc(xName)} = ${esc(xc ? r.x.values[d.x] : fmt(d.x, 6))}<br>${esc(yName)} = ${esc(yc ? r.y.values[d.y] : fmt(d.y, 6))}<br>${esc(outLabel)} = <strong>${fmt(d.z, 6)}</strong>`;
+  if (mode === '2d') {
+    const ex = cellEdges(xs), ey = cellEdges(ys);
+    const layers = [{type: 'heat', data: [], grid: {xs, ys, z, lo, hi}}];
+    if (pts.length) layers.push({type: 'points', data: pts.map(p => ({...p, x: xc ? p.x + (Math.random() - .5) * .3 : p.x, y: yc ? p.y + (Math.random() - .5) * .3 : p.y, data: true, rx: p.x, ry: p.y})), color: '--s2', r: 2.6, ring: true});
+    $('#exLegend').innerHTML = pts.length ? `<span><i class="sw" style="background:var(--s2)"></i>Training rows (where the data is)</span>` : '';
+    exChart.set({
+      x: {title: xName, labels: xc ? r.x.values.map(String) : null, domain: [ex[0], ex[ex.length - 1]]},
+      y: {title: yName, labels: yc ? r.y.values.map(String) : null, domain: [ey[0], ey[ey.length - 1]]}, layers,
+      tooltip: d => d.data ? `training row<br>${esc(xName)} = ${esc(xc ? r.x.values[d.rx] : fmt(d.rx, 6))}<br>${esc(yName)} = ${esc(yc ? r.y.values[d.ry] : fmt(d.ry, 6))}<br>actual ${esc(outLabel)} = ${fmt(d.z, 6)}` : valueTip(d),
+    });
+    $('#exHint').textContent = 'Colour is the model output over two inputs; the rest stay at the values on the left. Areas far from the training rows are extrapolation.';
+    return;
+  }
+  $('#exLegend').innerHTML = pts.length ? `<span><i class="sw" style="background:var(--s2)"></i>Training rows at their actual value</span>` : '';
+  ex3d.set({xs, ys, z, lo, hi, xlabel: xName, ylabel: yName, zlabel: outLabel, xlabels: xc ? r.x.values.map(String) : null, ylabels: yc ? r.y.values.map(String) : null,
+    xspan: [xs[0], xs[xs.length - 1]], yspan: [ys[0], ys[ys.length - 1]], points: pts, tooltip: valueTip});
+  $('#exHint').textContent = 'Drag to rotate · scroll to zoom · double-click to reset the view. Training rows outside the plotted ranges are hidden.';
+}
+$$('#exMode button').forEach(b => b.onclick = () => {
+  EX.mode = b.dataset.mode;
+  $$('#exMode button').forEach(x => x.classList.toggle('active', x === b));
+  if (EX.mode !== '1d' && $('#exY').value === $('#exX').value) {
+    const other = M.summary && M.summary.inputs.find(i => i.name !== $('#exX').value);
+    if (other) $('#exY').value = other.name;
+  }
+  syncAxisControls(); scheduleExplore();
+});
+$('#exX').onchange = () => { EX.userAxes = true; ['#exXlo', '#exXhi'].forEach(id => $(id).value = ''); syncAxisControls(); scheduleExplore(); };
+$('#exY').onchange = () => { EX.userAxes = true; ['#exYlo', '#exYhi'].forEach(id => $(id).value = ''); syncAxisControls(); scheduleExplore(); };
+['#exXlo', '#exXhi', '#exYlo', '#exYhi'].forEach(id => $(id).addEventListener('input', scheduleExplore));
+['#exOutput', '#exRes', '#exData'].forEach(id => $(id).onchange = scheduleExplore);
+$('#exReset').onclick = () => { EX.frozen = typicalFrozen(); renderFrozen(); scheduleExplore(); };
+function typicalFrozen() {
+  return Object.fromEntries(M.summary.inputs.map(i => [i.name, typeof i.typical === 'number' ? +i.typical.toPrecision(6) : (i.typical ?? '')]));
+}
 function renderPredictFields() {
   const box = $('#predictFields');
   box.innerHTML = M.summary.inputs.map(i => i.kind === 'numeric'
@@ -1245,6 +1594,114 @@ $('#exportBtn').onclick = async () => {
   try { const r = await api('/api/models/export', {index: M.index}); toast('Exported: ' + r.written.map(p => p.split('/').pop()).join(', ')); }
   catch (e) { toast(e.message, true); }
 };
+
+// ───────────── synthetic data ─────────────
+const GEN = {inputs: {}, outputs: {}, defaults: null, autoPath: '', timer: null};
+const GEN_HINTS = {
+  uniform: 'Each input is drawn independently and uniformly between From and To.',
+  lhs: 'Like uniform, but every input’s range is split into one slice per row and each slice is used exactly once, so the points cover the space more evenly.',
+  grid: 'Every combination of evenly spaced values (and every category). The row count is rounded down to a whole grid.',
+  training: 'Picks real training rows, so inputs keep their natural combinations; optional jitter adds noise scaled to each From–To range. Fixed inputs still override.',
+};
+function genInputState(i) {
+  if (!GEN.inputs[i.name]) GEN.inputs[i.name] = {vary: true, lo: '', hi: '', integer: !!i.integer, value: i.kind === 'categorical' ? (i.typical ?? i.classes[0]) : ''};
+  return GEN.inputs[i.name];
+}
+function renderGenInputs() {
+  const tb = $('#genInputs tbody');
+  tb.innerHTML = M.summary.inputs.map(i => {
+    const g = genInputState(i), n = esc(i.name);
+    if (i.kind === 'categorical') return `<tr><td><strong>${n}</strong><div class="hint">${i.classes.length} categories</div></td>
+      <td><input type="checkbox" data-gen="${n}" data-k="vary" ${g.vary ? 'checked' : ''}></td><td colspan="3" class="hint">${g.vary ? 'all categories' : '—'}</td>
+      <td><select data-gen="${n}" data-k="value" ${g.vary ? 'disabled' : ''}>${i.classes.map(c => `<option ${String(c) === String(g.value) ? 'selected' : ''}>${esc(c)}</option>`).join('')}</select></td></tr>`;
+    const r = i.range || [0, 1];
+    return `<tr><td><strong>${n}</strong></td><td><input type="checkbox" data-gen="${n}" data-k="vary" ${g.vary ? 'checked' : ''}></td>
+      <td><input type="number" step="any" data-gen="${n}" data-k="lo" value="${esc(g.lo)}" placeholder="${esc(fmt(r[0]))}" ${g.vary ? '' : 'disabled'}></td>
+      <td><input type="number" step="any" data-gen="${n}" data-k="hi" value="${esc(g.hi)}" placeholder="${esc(fmt(r[1]))}" ${g.vary ? '' : 'disabled'}></td>
+      <td><input type="checkbox" data-gen="${n}" data-k="integer" ${g.integer ? 'checked' : ''}></td>
+      <td><input type="number" step="any" data-gen="${n}" data-k="value" value="${esc(g.value)}" placeholder="${esc(fmt(i.typical, 6))}" ${g.vary ? 'disabled' : ''}></td></tr>`;
+  }).join('');
+  $$('[data-gen]', tb).forEach(el => el.addEventListener(el.type === 'checkbox' || el.tagName === 'SELECT' ? 'change' : 'input', () => {
+    const g = GEN.inputs[el.dataset.gen];
+    g[el.dataset.k] = el.type === 'checkbox' ? el.checked : el.value;
+    if (el.dataset.k === 'vary') renderGenInputs();
+    genEstimate();
+  }));
+  genEstimate();
+}
+function renderGenOutputs() {
+  const d = GEN.defaults; if (!d) return;
+  $('#genOutputs tbody').innerHTML = d.outputs.map(o => {
+    const g = GEN.outputs[o.name] || (GEN.outputs[o.name] = o.kind === 'numeric' ? {noise: 0} : {mode: 'argmax', probabilities: false});
+    const n = esc(o.name);
+    if (o.kind === 'numeric') return `<tr><td><strong>${n}</strong></td><td><div class="row"><span>prediction +</span><input type="number" step="any" min="0" data-gout="${n}" data-k="noise" value="${esc(g.noise)}"><span class="hint">noise σ</span>
+      <button class="link" data-rmse="${n}" data-v="${o.rmse}">use model error (${fmt(o.rmse)})</button></div>
+      <div class="hint">Model RMSE on training rows ${fmt(o.rmse)}; spread of ${n} itself ${fmt(o.std)}. 0 = exact model values.</div></td></tr>`;
+    return `<tr><td><strong>${n}</strong><div class="hint">${o.labels.length} classes</div></td><td>
+      <select data-gout="${n}" data-k="mode" style="width:auto"><option value="argmax" ${g.mode !== 'sample' ? 'selected' : ''}>Most likely class</option><option value="sample" ${g.mode === 'sample' ? 'selected' : ''}>Sample from probabilities</option></select>
+      <label class="check" style="margin-top:4px"><input type="checkbox" data-gout="${n}" data-k="probabilities" ${g.probabilities ? 'checked' : ''}> add a probability column per class</label>
+      <div class="hint">Model accuracy on training rows ${(100 * o.accuracy).toFixed(1)}%.</div></td></tr>`;
+  }).join('');
+  $$('[data-gout]').forEach(el => el.addEventListener(el.type === 'checkbox' || el.tagName === 'SELECT' ? 'change' : 'input', () => {
+    GEN.outputs[el.dataset.gout][el.dataset.k] = el.type === 'checkbox' ? el.checked : el.value;
+  }));
+  $$('[data-rmse]').forEach(b => b.onclick = () => { GEN.outputs[b.dataset.rmse].noise = +(+b.dataset.v).toPrecision(4); renderGenOutputs(); });
+}
+async function loadGenDefaults() {
+  if (M.index == null) return;
+  try {
+    GEN.defaults = await api('/api/models/generate/defaults', {index: M.index});
+    renderGenOutputs();
+    if (!$('#genPath').value || $('#genPath').value === GEN.autoPath) { GEN.autoPath = GEN.defaults.default_name; $('#genPath').value = GEN.autoPath; }
+    $('#genModelHint').textContent = M.detail && M.detail.label ? 'using: ' + M.detail.label.split(' (')[0] : `using candidate #${M.index + 1}`;
+  } catch (e) { toast(e.message, true); }
+}
+function genEstimate() {
+  const sampling = $('#genSampling').value, rows = Math.max(0, Math.floor(+$('#genRows').value || 0));
+  $('#genSamplingHint').textContent = GEN_HINTS[sampling];
+  $('#genJitterField').classList.toggle('hidden', sampling !== 'training');
+  if (sampling !== 'grid') { $('#genEstimate').textContent = `${rows.toLocaleString()} rows`; return; }
+  const varied = M.summary.inputs.filter(i => genInputState(i).vary);
+  const numeric = varied.filter(i => i.kind === 'numeric').length;
+  const cats = varied.filter(i => i.kind === 'categorical').reduce((a, i) => a * i.classes.length, 1);
+  const per = numeric ? Math.max(2, Math.floor(Math.pow(rows / cats, 1 / numeric) + 1e-9)) : 1;
+  $('#genEstimate').textContent = `≈ ${(Math.pow(per, numeric) * cats).toLocaleString()} rows (${per} values per numeric input${cats > 1 ? `, × ${cats} category combinations` : ''}; whole-number inputs may have fewer)`;
+}
+['#genRows', '#genSampling'].forEach(id => $(id).addEventListener('input', genEstimate));
+async function startGenerate(overwrite = false) {
+  if (M.index == null) return;
+  const inputs = {}, outputs = {};
+  for (const [k, g] of Object.entries(GEN.inputs)) inputs[k] = {...g};
+  for (const [k, g] of Object.entries(GEN.outputs)) outputs[k] = {...g, noise: g.noise === '' ? 0 : +g.noise};
+  const spec = {rows: +$('#genRows').value, sampling: $('#genSampling').value, jitter: +$('#genJitter').value || 0, seed: $('#genSeed').value,
+    inputs, outputs, path: $('#genPath').value.trim(), overwrite};
+  try {
+    const r = await api('/api/models/generate', {index: M.index, spec});
+    if (r.exists) {
+      if (confirm(`${r.path} already exists. Replace it?`)) return startGenerate(true);
+      return;
+    }
+    $('#genBtn').disabled = true; $('#genOut').innerHTML = '';
+    pollGenerate();
+  } catch (e) { toast(e.message, true); }
+}
+async function pollGenerate() {
+  clearTimeout(GEN.timer);
+  try {
+    const s = await api('/api/models/generate/status');
+    const pct = s.rows ? 100 * s.written / s.rows : 0;
+    $('#genProgress').innerHTML = s.state === 'idle' ? '' : `<div class="progress"><div style="width:${pct.toFixed(1)}%"></div></div><div class="hint" style="margin-top:4px">${s.written.toLocaleString()} of ${s.rows.toLocaleString()} rows · ${fmtTime(s.elapsed)}</div>`;
+    if (s.state === 'running') { GEN.timer = setTimeout(pollGenerate, 300); return; }
+    $('#genBtn').disabled = false;
+    if (s.state === 'failed') { $('#genOut').innerHTML = `<div class="notice err">${esc(s.error)}</div>`; return; }
+    if (s.state === 'finished') {
+      const p = s.preview;
+      $('#genOut').innerHTML = `<div class="notice" style="margin-top:8px"><strong>${s.rows.toLocaleString()} rows written</strong> to <span class="mono">${esc(s.path)}</span> · <a href="/download?path=${encodeURIComponent(s.path)}">download</a></div>` +
+        (p ? `<div class="scroll-x"><table><thead><tr>${p.columns.map(c => `<th>${esc(c)}</th>`).join('')}</tr></thead><tbody>${p.rows.slice(0, 10).map(r => `<tr>${r.map(v => `<td>${v === null ? '' : esc(v)}</td>`).join('')}</tr>`).join('')}</tbody></table></div>` : '');
+    }
+  } catch (e) { $('#genBtn').disabled = false; toast(e.message, true); }
+}
+$('#genBtn').onclick = () => startGenerate(false);
 
 // ───────────── boot ─────────────
 (async function boot() {
