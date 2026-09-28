@@ -1,0 +1,1265 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AFPO Studio</title>
+<style>
+:root {
+  color-scheme: light;
+  --bg: #f4f3f0; --surface: #fcfcfb; --surface-2: #f0efec; --border: #dddcd7;
+  --text: #0b0b0b; --text-2: #52514e; --muted: #8a8983; --grid: #e7e6e2;
+  --accent: #2a78d6; --accent-ink: #ffffff; --danger: #c93c3b; --good: #008300; --warn: #b87a00;
+  --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a;
+  --seq0: #cde2fb; --seq6: #0d366b;
+  --other: #b9b8b2;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg: #121211; --surface: #1a1a19; --surface-2: #242422; --border: #34342f;
+    --text: #ffffff; --text-2: #c3c2b7; --muted: #8f8e86; --grid: #2c2c29;
+    --accent: #3987e5; --accent-ink: #ffffff; --danger: #e66767; --good: #3fae3f; --warn: #d9a13a;
+    --s1: #3987e5; --s2: #d95926; --s3: #199e70;
+    --seq0: #0d366b; --seq6: #cde2fb;
+    --other: #5c5b56;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #121211; --surface: #1a1a19; --surface-2: #242422; --border: #34342f;
+  --text: #ffffff; --text-2: #c3c2b7; --muted: #8f8e86; --grid: #2c2c29;
+  --accent: #3987e5; --accent-ink: #ffffff; --danger: #e66767; --good: #3fae3f; --warn: #d9a13a;
+  --s1: #3987e5; --s2: #d95926; --s3: #199e70;
+  --seq0: #0d366b; --seq6: #cde2fb;
+  --other: #5c5b56;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+body { background: var(--bg); color: var(--text); font: 13px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+code, .mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12px; }
+header { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; padding: 10px 16px; background: var(--surface); border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 20; }
+header h1 { font-size: 15px; margin: 0; font-weight: 650; }
+nav { display: flex; gap: 2px; background: var(--surface-2); border-radius: 8px; padding: 3px; }
+nav button { border: 0; background: transparent; color: var(--text-2); padding: 5px 14px; border-radius: 6px; font: inherit; font-weight: 550; cursor: pointer; }
+nav button.active { background: var(--surface); color: var(--text); box-shadow: 0 1px 2px rgba(0,0,0,.08); }
+header .spacer { flex: 1; }
+.pill { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-2); }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--other); display: inline-block; }
+.dot.running { background: var(--good); animation: pulse 1.4s infinite; }
+.dot.stopping, .dot.choosing, .dot.saving { background: var(--warn); }
+.dot.failed { background: var(--danger); }
+.dot.finished { background: var(--accent); }
+@keyframes pulse { 50% { opacity: .35; } }
+main { padding: 14px 16px 40px; max-width: 1500px; margin: 0 auto; }
+.tab { display: none; }
+.tab.active { display: block; }
+.grid2 { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 14px; align-items: start; }
+.grid-side { display: grid; grid-template-columns: minmax(0, 1fr) 380px; gap: 14px; align-items: start; }
+@media (max-width: 980px) { .grid2, .grid-side { grid-template-columns: minmax(0, 1fr); } }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; margin-bottom: 14px; min-width: 0; }
+.card h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--text-2); margin: 0 0 10px; font-weight: 600; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.card h2 .grow { flex: 1; }
+.hint { color: var(--muted); font-size: 12px; }
+.field { margin-bottom: 10px; }
+.field > label { display: block; font-weight: 550; margin-bottom: 3px; }
+.field > label .hint { font-weight: 400; margin-left: 6px; }
+.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.row > .grow { flex: 1; min-width: 160px; }
+.fields { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 4px 12px; }
+input[type=text], input[type=number], select, textarea { width: 100%; background: var(--surface); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 5px 8px; font: inherit; min-width: 0; }
+input:focus, select:focus, textarea:focus { outline: 2px solid color-mix(in srgb, var(--accent) 45%, transparent); outline-offset: 0; border-color: var(--accent); }
+textarea { resize: vertical; min-height: 60px; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; }
+button.btn { border: 1px solid var(--border); background: var(--surface-2); color: var(--text); border-radius: 6px; padding: 5px 12px; font: inherit; font-weight: 550; cursor: pointer; white-space: nowrap; }
+button.btn:hover { border-color: var(--muted); }
+button.btn.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+button.btn.danger { background: var(--danger); color: #fff; border-color: var(--danger); }
+button.btn:disabled { opacity: .5; cursor: default; }
+button.link { border: 0; background: none; color: var(--accent); cursor: pointer; padding: 0; font: inherit; }
+label.check { display: inline-flex; align-items: center; gap: 6px; font-weight: 450; cursor: pointer; margin-right: 12px; }
+details > summary { cursor: pointer; font-weight: 600; color: var(--text-2); margin: 4px 0 8px; }
+table { border-collapse: collapse; width: 100%; }
+th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+th { font-weight: 600; color: var(--text-2); font-size: 12px; position: sticky; top: 0; background: var(--surface); }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.scroll { overflow: auto; max-height: 420px; }
+.scroll-x { overflow-x: auto; }
+tr.clickable { cursor: pointer; }
+tr.clickable:hover td { background: var(--surface-2); }
+tr.selected td { background: color-mix(in srgb, var(--accent) 14%, transparent); }
+.badge { display: inline-block; font-size: 11px; padding: 1px 7px; border-radius: 10px; background: var(--surface-2); border: 1px solid var(--border); color: var(--text-2); white-space: nowrap; }
+.badge.accent { border-color: var(--accent); color: var(--accent); }
+.eq { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; word-break: break-word; }
+.eq-big { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 14px; word-break: break-word; background: var(--surface-2); border-radius: 8px; padding: 10px 12px; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 10px; margin-bottom: 14px; }
+.tile { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; }
+.tile .k { color: var(--text-2); font-size: 11px; text-transform: uppercase; letter-spacing: .05em; }
+.tile .v { font-size: 20px; font-weight: 650; font-variant-numeric: tabular-nums; margin-top: 2px; }
+.tile .s { color: var(--muted); font-size: 11px; }
+.chart { position: relative; width: 100%; }
+.chart canvas { display: block; width: 100%; height: 100%; }
+.chart.h320 { height: 320px; } .chart.h420 { height: 420px; } .chart.h240 { height: 240px; } .chart.h200 { height: 200px; }
+.tip { position: absolute; pointer-events: none; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 7px 9px; font-size: 12px; box-shadow: 0 4px 16px rgba(0,0,0,.14); max-width: 420px; z-index: 5; display: none; }
+.tip .t { font-weight: 600; margin-bottom: 2px; }
+.legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--text-2); margin: 2px 0 6px; }
+.legend span { display: inline-flex; align-items: center; gap: 5px; }
+.sw { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+.sw.line { width: 16px; height: 2px; border-radius: 1px; }
+.chips { display: flex; flex-wrap: wrap; gap: 4px; margin: 4px 0 2px 22px; }
+.chip { font-size: 11px; padding: 1px 7px; border-radius: 10px; border: 1px solid var(--border); background: var(--surface-2); cursor: pointer; user-select: none; font-family: ui-monospace, Menlo, Consolas, monospace; }
+.chip.off { opacity: .4; text-decoration: line-through; }
+.group { margin-bottom: 8px; }
+.console { background: var(--surface-2); border-radius: 8px; padding: 8px 10px; height: 260px; overflow: auto; white-space: pre-wrap; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 11.5px; color: var(--text-2); }
+.bars .bar { display: grid; grid-template-columns: 130px minmax(0, 1fr) 52px; gap: 8px; align-items: center; margin: 3px 0; font-size: 12px; }
+.bars .track { height: 12px; background: var(--surface-2); border-radius: 4px; overflow: hidden; }
+.bars .fill { height: 100%; background: var(--s1); border-radius: 0 4px 4px 0; }
+.stats { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 11.5px; color: var(--text-2); white-space: pre-wrap; }
+.notice { border-left: 3px solid var(--accent); background: var(--surface-2); padding: 8px 10px; border-radius: 0 8px 8px 0; margin-bottom: 10px; }
+.notice.err { border-color: var(--danger); }
+.notice.warn { border-color: var(--warn); }
+.option { border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; margin-bottom: 6px; cursor: pointer; display: grid; grid-template-columns: 20px minmax(0, 1fr); gap: 8px; }
+.option:hover { border-color: var(--muted); }
+.option.sel { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+.hist canvas { width: 96px; height: 22px; display: block; }
+.modal-bg { position: fixed; inset: 0; background: rgba(0,0,0,.35); display: none; align-items: center; justify-content: center; z-index: 50; padding: 16px; }
+.modal-bg.open { display: flex; }
+.modal { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; width: min(720px, 100%); max-height: 86vh; display: flex; flex-direction: column; }
+.modal header { position: static; border-radius: 12px 12px 0 0; }
+.modal .list { overflow: auto; padding: 6px 10px; flex: 1; }
+.modal .item { display: flex; justify-content: space-between; gap: 10px; padding: 5px 8px; border-radius: 6px; cursor: pointer; }
+.modal .item:hover { background: var(--surface-2); }
+.modal .item.dim { color: var(--muted); }
+.modal footer { padding: 10px 14px; border-top: 1px solid var(--border); display: flex; gap: 8px; justify-content: flex-end; }
+.svgbox { background: #fff; border-radius: 8px; overflow: auto; max-height: 460px; border: 1px solid var(--border); }
+.svgbox img { display: block; }
+#toast { position: fixed; bottom: 16px; right: 16px; display: flex; flex-direction: column; gap: 6px; z-index: 60; }
+#toast div { background: var(--surface); border: 1px solid var(--border); border-left: 3px solid var(--accent); border-radius: 8px; padding: 8px 12px; box-shadow: 0 4px 16px rgba(0,0,0,.14); max-width: 420px; }
+#toast div.err { border-left-color: var(--danger); }
+.cm td { text-align: center; min-width: 44px; font-variant-numeric: tabular-nums; }
+.muted { color: var(--muted); }
+.hidden { display: none !important; }
+@media (max-width: 760px) { #cwd { display: none; } }
+.kv { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 3px 12px; font-size: 12px; }
+.kv .k { color: var(--text-2); }
+</style>
+</head>
+<body>
+<header>
+  <h1>AFPO Studio</h1>
+  <nav id="tabs">
+    <button data-tab="setup" class="active">Setup</button>
+    <button data-tab="train">Train</button>
+    <button data-tab="models">Models</button>
+  </nav>
+  <span class="pill"><span class="dot" id="runDot"></span><span id="runState">idle</span></span>
+  <span class="spacer"></span>
+  <span class="hint mono" id="cwd"></span>
+  <button class="btn" id="themeBtn" title="Switch light/dark">Theme</button>
+</header>
+
+<main>
+<!-- ───────────── SETUP ───────────── -->
+<section class="tab active" id="tab-setup">
+  <div class="grid2">
+    <div>
+      <div class="card">
+        <h2>Dataset</h2>
+        <div class="field">
+          <label>CSV file <span class="hint">paste a full path, browse this machine, or upload through your browser</span></label>
+          <div data-path="dataset" data-kind="csv"></div>
+        </div>
+        <div class="row">
+          <div class="field grow">
+            <label>Delimiter</label>
+            <div class="row">
+              <select id="delimiter" style="max-width:160px">
+                <option value=",">comma ,</option><option value=";">semicolon ;</option>
+                <option value=" ">space</option><option value="\t">tab</option><option value="custom">custom…</option>
+              </select>
+              <input type="text" id="delimiterCustom" class="hidden" placeholder="e.g. |" style="max-width:90px">
+            </div>
+          </div>
+          <button class="btn primary" id="inspectBtn">Inspect columns</button>
+        </div>
+        <div id="datasetInfo" class="hint"></div>
+      </div>
+
+      <div class="card" id="columnsCard">
+        <h2>Columns <span class="grow"></span><span class="hint" id="columnsSummary"></span></h2>
+        <div id="columnsEmpty" class="hint">Inspect a dataset to choose inputs and outputs. Defaults follow the terminal version: the last usable column is the output, constant columns are ignored.</div>
+        <div class="scroll hidden" id="columnsWrap">
+          <table id="columnsTable"><thead><tr><th>#</th><th>Column</th><th>Values</th><th>Distribution</th><th>Use as</th></tr></thead><tbody></tbody></table>
+        </div>
+        <details class="hidden" id="previewWrap"><summary>Preview first rows</summary><div class="scroll-x"><table id="previewTable"></table></div></details>
+      </div>
+
+      <div class="card">
+        <h2>Validation and test data</h2>
+        <div class="field">
+          <label class="check"><input type="radio" name="valmode" value="percent" checked> Random hold-out</label>
+          <label class="check"><input type="radio" name="valmode" value="file"> Separate validation CSV</label>
+          <label class="check"><input type="radio" name="valmode" value="none"> No validation</label>
+        </div>
+        <div class="field" id="valPercentField"><label>Hold-out percentage <span class="hint">minimum 5 rows when possible</span></label><input type="number" id="valPercent" value="20" min="0" max="90" step="1" style="max-width:120px"></div>
+        <div class="field hidden" id="valFileField"><label>Validation CSV <span class="hint">same columns and delimiter</span></label><div data-path="validation" data-kind="csv"></div></div>
+        <div class="field"><label>Test CSV <span class="hint">optional; reported at the end, never used for selection</span></label><div data-path="test" data-kind="csv"></div></div>
+      </div>
+    </div>
+
+    <div>
+      <div class="card">
+        <h2>Operators <span class="grow"></span><span class="hint" id="opCount"></span></h2>
+        <div class="hint" style="margin-bottom:8px">Tick groups, then click an operator to switch it off. Smaller grammars usually find exact formulas faster.</div>
+        <div id="opGroups"></div>
+      </div>
+
+      <div class="card">
+        <h2>Search</h2>
+        <div class="fields">
+          <div class="field"><label>Population</label><input type="number" id="population" value="160" min="8"></div>
+          <div class="field"><label>Max generations <span class="hint">0 = until Stop</span></label><input type="number" id="maxGenerations" value="0" min="0"></div>
+          <div class="field"><label>Seed <span class="hint">blank = random</span></label><input type="number" id="seed" placeholder="random"></div>
+          <div class="field"><label>Worker processes <span class="hint">0 = auto</span></label><input type="number" id="workers" value="0" min="0"></div>
+          <div class="field"><label>Max nodes per output</label><input type="number" id="nodes" value="31" min="3"></div>
+          <div class="field"><label>Max depth</label><input type="number" id="depth" value="6" min="1"></div>
+          <div class="field"><label>Islands <span class="hint">1 = single population</span></label><input type="number" id="islands" value="1" min="1"></div>
+          <div class="field islandOnly"><label>Migration interval</label><input type="number" id="migrationInterval" value="25" min="1"></div>
+          <div class="field islandOnly"><label>Migrants per island</label><input type="number" id="migrants" value="2" min="1"></div>
+        </div>
+        <div class="field">
+          <label class="check"><input type="checkbox" id="affine" checked> Affine output scaling</label>
+          <label class="check"><input type="checkbox" id="coev"> Co-evolved minibatches <span class="hint">(only above 512 rows)</span></label>
+          <label class="check"><input type="checkbox" id="pressure" checked> Dynamic evolution pressure</label>
+          <label class="check"><input type="checkbox" id="adf"> ADF mining</label>
+          <select id="adfMode" style="width:auto"><option value="nested">nested (v2)</option><option value="flat">flat (v1)</option></select>
+        </div>
+        <details>
+          <summary>Advanced options</summary>
+          <div class="fields" id="advancedFields"></div>
+          <div class="field"><label>Constraint metadata JSON file <span class="hint">optional</span></label><div data-path="metadata" data-kind="json"></div></div>
+          <div class="field"><label>…or inline constraint metadata JSON</label><textarea id="metadataText" placeholder="{}"></textarea></div>
+          <div class="field"><label>Sequence groups <span class="hint">one per line: NAME=COL1,COL2,…</span></label><textarea id="sequenceGroups"></textarea></div>
+        </details>
+      </div>
+
+      <div class="card">
+        <h2>Start</h2>
+        <div id="checkMsg"></div>
+        <div class="row">
+          <button class="btn" id="checkBtn">Check setup</button>
+          <button class="btn primary" id="startBtn">Start training</button>
+          <span class="hint">Outputs go to <span class="mono">afpo_runs/</span> and <span class="mono">best_model.py</span> in the working directory, like the terminal version.</span>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Resume a checkpoint</h2>
+        <div class="field"><label>Checkpoint <span class="hint">checkpoint_latest.json from a run folder</span></label><div data-path="resume" data-kind="json"></div></div>
+        <div class="row">
+          <div class="field"><label>Stop at generation <span class="hint">0 = until Stop</span></label><input type="number" id="resumeMax" value="0" min="0" style="max-width:140px"></div>
+          <div class="field"><label>Workers <span class="hint">0 = as saved</span></label><input type="number" id="resumeWorkers" value="0" min="0" style="max-width:120px"></div>
+          <button class="btn" id="resumeBtn">Resume</button>
+        </div>
+        <div class="hint">A resumed run saves back into the same checkpoint and exports the Best Score model automatically, as in the terminal.</div>
+        <div id="resumeRuns" style="margin-top:8px"></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ───────────── TRAIN ───────────── -->
+<section class="tab" id="tab-train">
+  <div class="card" id="trainIdle">
+    <h2>No run yet</h2>
+    <div class="hint">Configure a dataset in Setup and press Start training, or resume a checkpoint.</div>
+  </div>
+  <div id="trainView" class="hidden">
+    <div class="card">
+      <div class="row">
+        <div class="grow"><strong id="trainTitle">Training</strong> <span class="hint mono" id="trainDir"></span></div>
+        <button class="btn" id="stopBtn">Stop after this generation</button>
+      </div>
+      <div id="trainNotice" style="margin-top:8px"></div>
+    </div>
+
+    <div class="card hidden" id="chooseCard">
+      <h2>Choose the model to save</h2>
+      <div class="hint" style="margin-bottom:8px" id="chooseHint"></div>
+      <div id="chooseList"></div>
+      <div class="row"><button class="btn primary" id="chooseBtn">Save selected model</button><span class="hint">Writes best_model.py, the model card and the final checkpoint.</span></div>
+    </div>
+
+    <div class="tiles" id="tiles"></div>
+
+    <div class="grid-side">
+      <div>
+        <div class="card">
+          <h2>Pareto frontier (live) <span class="grow"></span>
+            <label class="check"><input type="checkbox" id="paretoLog" checked> log loss</label>
+            <label class="check"><input type="checkbox" id="paretoPop" checked> population</label>
+          </h2>
+          <div class="legend">
+            <span><i class="sw" style="background:var(--other)"></i>Population</span>
+            <span><i class="sw" style="background:var(--s1)"></i>Archive</span>
+            <span><i class="sw line" style="background:var(--s1)"></i>Loss/size frontier</span>
+            <span><i class="sw" style="background:var(--s2)"></i>Best so far</span>
+          </div>
+          <div class="chart h420"><canvas id="paretoChart"></canvas></div>
+          <div class="hint">Training loss against model size in MDL bits (lower-left is better). Hover for equations; click an archive point to pin it. On the log scale, losses below 1e-16 (including exact fits) are drawn at 1e-16.</div>
+          <div id="pinned" class="eq-big hidden" style="margin-top:8px"></div>
+        </div>
+        <div class="card">
+          <h2>Best loss over generations <span class="grow"></span><label class="check"><input type="checkbox" id="historyLog" checked> log</label></h2>
+          <div class="legend" id="historyLegend"></div>
+          <div class="chart h240"><canvas id="historyChart"></canvas></div>
+        </div>
+        <div class="card">
+          <h2>Frontier models <span class="grow"></span><span class="hint">nondominated in loss and size</span></h2>
+          <div class="scroll"><table id="frontierTable"><thead><tr><th class="num">Bits</th><th class="num">Nodes</th><th class="num">Train loss</th><th>Equation</th></tr></thead><tbody></tbody></table></div>
+        </div>
+      </div>
+      <div>
+        <div class="card">
+          <h2>Best so far</h2>
+          <div id="bestEq" class="eq-big">—</div>
+          <div class="kv" style="margin-top:8px" id="bestKv"></div>
+        </div>
+        <div class="card">
+          <h2>Where survivors came from</h2>
+          <div class="bars" id="originBars"></div>
+          <div class="hint">How each current population member was made.</div>
+        </div>
+        <div class="card">
+          <h2>Search state</h2>
+          <div class="stats" id="statsBox">—</div>
+        </div>
+        <div class="card">
+          <h2>Console <span class="grow"></span><label class="check"><input type="checkbox" id="consoleFollow" checked> follow</label></h2>
+          <div class="console" id="console"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ───────────── MODELS ───────────── -->
+<section class="tab" id="tab-models">
+  <div class="grid2">
+    <div class="card">
+      <h2>Load a checkpoint</h2>
+      <div data-path="model" data-kind="json"></div>
+      <div class="row" style="margin-top:8px"><button class="btn primary" id="loadModelsBtn">Load models</button><span class="hint" id="modelsInfo"></span></div>
+    </div>
+    <div class="card">
+      <h2>Recent runs <span class="grow"></span><button class="link" id="refreshRuns">refresh</button></h2>
+      <div class="scroll" style="max-height:170px" id="recentRuns"><span class="hint">Loading…</span></div>
+    </div>
+  </div>
+
+  <div id="modelsView" class="hidden">
+    <div class="grid2">
+      <div class="card">
+        <h2>Candidates <span class="grow"></span><label class="check"><input type="checkbox" id="candLog" checked> log loss</label></h2>
+        <div class="legend">
+          <span><i class="sw" style="background:var(--other)"></i>Archive model</span>
+          <span><i class="sw line" style="background:var(--s1)"></i>Loss/size frontier</span>
+          <span><i class="sw" style="background:var(--s2)"></i>Recommended</span>
+        </div>
+        <div class="chart h320"><canvas id="candChart"></canvas></div>
+        <div class="hint" id="candHint"></div>
+      </div>
+      <div class="card">
+        <h2>Candidate list</h2>
+        <div class="scroll" style="max-height:380px"><table id="candTable"><thead><tr><th></th><th class="num">Bits</th><th class="num">Nodes</th><th class="num" id="candLossHead">Loss</th><th class="num">Train</th><th>Equation</th></tr></thead><tbody></tbody></table></div>
+      </div>
+    </div>
+
+    <div id="detailView" class="hidden">
+      <div class="card">
+        <h2>Selected model <span class="grow"></span><button class="btn" id="exportBtn">Export as best_model.py</button></h2>
+        <div id="detailEq"></div>
+        <div class="grid2" style="margin-top:10px">
+          <div><div class="kv" id="detailKv"></div></div>
+          <div><table id="detailOutputs"></table></div>
+        </div>
+        <details style="margin-top:8px"><summary>Expression tree</summary><div class="svgbox" id="treeBox"></div></details>
+      </div>
+
+      <div class="grid2">
+        <div class="card">
+          <h2>Fit <span class="grow"></span>
+            <select id="fitSplit" style="width:auto"><option value="validation">Validation</option><option value="train">Training</option></select>
+            <select id="fitOutput" style="width:auto"></select>
+          </h2>
+          <div id="fitBody"></div>
+        </div>
+        <div class="card">
+          <h2>Response curve <span class="grow"></span>
+            <select id="sweepInput" style="width:auto"></select>
+            <select id="sweepOutput" style="width:auto"></select>
+          </h2>
+          <div class="legend"><span><i class="sw line" style="background:var(--s1)"></i>Model (other inputs at typical values)</span><span id="sweepDataLegend"><i class="sw" style="background:var(--other)"></i>Training rows</span></div>
+          <div class="chart h320"><canvas id="sweepChart"></canvas></div>
+        </div>
+      </div>
+
+      <div class="grid2">
+        <div class="card">
+          <h2>Predict one row</h2>
+          <div class="fields" id="predictFields"></div>
+          <div class="row"><button class="btn primary" id="predictBtn">Predict</button><button class="btn" id="typicalBtn">Typical values</button><button class="btn" id="randomBtn">Random within training range</button></div>
+          <div id="predictOut" style="margin-top:10px"></div>
+        </div>
+        <div class="card">
+          <h2>Predict a CSV</h2>
+          <div data-path="batch" data-kind="csv"></div>
+          <div class="row" style="margin-top:8px">
+            <select id="batchDelimiter" style="width:auto"><option value=",">comma ,</option><option value=";">semicolon ;</option><option value=" ">space</option><option value="\t">tab</option></select>
+            <button class="btn primary" id="batchBtn">Predict file</button>
+          </div>
+          <div id="batchOut" style="margin-top:10px"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+</main>
+
+<div class="modal-bg" id="browser">
+  <div class="modal">
+    <header><strong>Browse this machine</strong><span class="spacer"></span><button class="btn" id="browserClose">Close</button></header>
+    <div style="padding:10px 14px" class="row"><button class="btn" id="browserUp">Up</button><input type="text" id="browserPath" class="grow"><button class="btn" id="browserGo">Go</button></div>
+    <div class="list" id="browserList"></div>
+    <footer><span class="hint" id="browserHint"></span></footer>
+  </div>
+</div>
+<div id="toast"></div>
+
+<script>
+'use strict';
+// ───────────── utilities ─────────────
+const $ = (s, r = document) => r.querySelector(s);
+const $$ = (s, r = document) => [...r.querySelectorAll(s)];
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+function fmt(v, digits = 4) {
+  if (v === null || v === undefined || (typeof v === 'number' && !isFinite(v))) return '—';
+  if (typeof v !== 'number') return String(v);
+  if (v === 0) return '0';
+  const a = Math.abs(v);
+  if (a >= 1e5 || a < 1e-3) return v.toExponential(Math.max(1, digits - 2));
+  return String(+v.toPrecision(digits));
+}
+function fmtTime(s) {
+  if (s == null) return '—';
+  s = Math.round(s);
+  const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), x = s % 60;
+  return h ? `${h}h ${m}m` : m ? `${m}m ${x}s` : `${x}s`;
+}
+async function api(path, body = {}) {
+  const r = await fetch(path, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+  let j;
+  try { j = await r.json(); } catch (e) { throw new Error(`${r.status} ${r.statusText}`); }
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  return j;
+}
+function toast(msg, err = false) {
+  const d = document.createElement('div');
+  d.textContent = msg; if (err) d.className = 'err';
+  $('#toast').appendChild(d);
+  setTimeout(() => d.remove(), err ? 9000 : 4500);
+}
+const store = {
+  get(k, d) { try { const v = localStorage.getItem('afpo.' + k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
+  set(k, v) { try { localStorage.setItem('afpo.' + k, JSON.stringify(v)); } catch (e) { /* private mode */ } },
+};
+
+// ───────────── theme & tabs ─────────────
+(function () {
+  const saved = store.get('theme', null);
+  if (saved) document.documentElement.dataset.theme = saved;
+  $('#themeBtn').onclick = () => {
+    const dark = document.documentElement.dataset.theme ? document.documentElement.dataset.theme === 'dark' : matchMedia('(prefers-color-scheme: dark)').matches;
+    document.documentElement.dataset.theme = dark ? 'light' : 'dark';
+    store.set('theme', document.documentElement.dataset.theme);
+    redrawAll();
+  };
+})();
+function showTab(name) {
+  $$('#tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === name));
+  $$('.tab').forEach(t => t.classList.toggle('active', t.id === 'tab-' + name));
+  store.set('tab', name);
+  requestAnimationFrame(redrawAll);
+}
+$$('#tabs button').forEach(b => b.onclick = () => showTab(b.dataset.tab));
+
+// ───────────── charts ─────────────
+const charts = [];
+function redrawAll() { charts.forEach(c => c.draw()); }
+function niceStep(span, count) {
+  const raw = span / Math.max(1, count), p = Math.pow(10, Math.floor(Math.log10(raw))), f = raw / p;
+  return (f < 1.5 ? 1 : f < 3 ? 2 : f < 7 ? 5 : 10) * p;
+}
+class Chart {
+  constructor(canvas) {
+    this.c = canvas; this.ctx = canvas.getContext('2d'); this.spec = null; this.hits = [];
+    this.tip = document.createElement('div'); this.tip.className = 'tip'; canvas.parentElement.appendChild(this.tip);
+    canvas.addEventListener('mousemove', e => this.move(e));
+    canvas.addEventListener('mouseleave', () => { this.tip.style.display = 'none'; this.hover = null; this.draw(); });
+    canvas.addEventListener('click', e => { const h = this.nearest(e); if (h && this.spec && this.spec.onClick) this.spec.onClick(h.d, h.layer); });
+    new ResizeObserver(() => this.draw()).observe(canvas.parentElement);
+    charts.push(this);
+  }
+  set(spec) { this.spec = spec; this.draw(); }
+  domain(values, log) {
+    let v = values.filter(x => isFinite(x) && (!log || x > 0));
+    if (!v.length) return null;
+    let lo = Math.min(...v), hi = Math.max(...v);
+    if (log) { lo = Math.log10(lo); hi = Math.log10(hi); }
+    if (hi - lo < 1e-12) { const d = log ? .5 : (Math.abs(lo) || 1) * .1; lo -= d; hi += d; }
+    const pad = (hi - lo) * .05; return [lo - pad, hi + pad];
+  }
+  ticks(dom, log, px) {
+    const [lo, hi] = dom, out = [];
+    if (log) {
+      const step = Math.max(1, Math.ceil((hi - lo) / Math.max(2, px / 45)));
+      for (let e = Math.ceil(lo); e <= hi; e += step) out.push({v: e, label: e === 0 ? '1' : '1e' + e});
+      if (out.length < 2) for (const m of [2, 5]) for (let e = Math.floor(lo); e <= hi; e++) { const v = Math.log10(m) + e; if (v >= lo && v <= hi) out.push({v, label: fmt(Math.pow(10, v), 2)}); }
+      return out;
+    }
+    const step = niceStep(hi - lo, Math.max(2, px / 70));
+    for (let v = Math.ceil(lo / step) * step; v <= hi + 1e-9 * step; v += step) out.push({v, label: fmt(Math.abs(v) < step * 1e-9 ? 0 : v, 3)});
+    return out;
+  }
+  draw() {
+    const c = this.c, ctx = this.ctx, spec = this.spec;
+    const w = c.parentElement.clientWidth, h = c.parentElement.clientHeight;
+    if (!w || !h) return;
+    const dpr = window.devicePixelRatio || 1;
+    c.width = Math.round(w * dpr); c.height = Math.round(h * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.clearRect(0, 0, w, h);
+    this.hits = [];
+    const muted = css('--muted'), grid = css('--grid'), text2 = css('--text-2'), surface = css('--surface');
+    ctx.font = '11px system-ui, sans-serif';
+    if (!spec || !spec.layers) return;
+    const X = spec.x || {}, Y = spec.y || {};
+    const xs = [], ys = [];
+    for (const L of spec.layers) for (const d of L.data || []) {
+      if (L.type === 'bars') { xs.push(d.x0, d.x1); ys.push(d.y, 0); }
+      else { xs.push(d.x); ys.push(d.y); }
+    }
+    const xd = X.domain ? X.domain.map(v => X.log ? Math.log10(v) : v) : this.domain(xs, X.log);
+    const yd = Y.domain ? Y.domain.map(v => Y.log ? Math.log10(v) : v) : this.domain(ys, Y.log);
+    if (!xd || !yd) {
+      ctx.fillStyle = muted; ctx.textAlign = 'center'; ctx.fillText(spec.empty || 'No data yet', w / 2, h / 2); return;
+    }
+    const m = {l: 58, r: 14, t: 10, b: 38};
+    const pw = w - m.l - m.r, ph = h - m.t - m.b;
+    const sx = v => m.l + ((X.log ? Math.log10(v) : v) - xd[0]) / (xd[1] - xd[0]) * pw;
+    const sy = v => m.t + ph - ((Y.log ? Math.log10(v) : v) - yd[0]) / (yd[1] - yd[0]) * ph;
+    this.sx = sx; this.sy = sy; this.m = m; this.pw = pw; this.ph = ph;
+    ctx.strokeStyle = grid; ctx.lineWidth = 1; ctx.fillStyle = muted;
+    ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+    const yt = Y.labels ? Y.labels.map((label, i) => ({v: i, label})) : this.ticks(yd, Y.log, ph);
+    for (const t of yt) {
+      const y = m.t + ph - (t.v - yd[0]) / (yd[1] - yd[0]) * ph; if (y < m.t - 1 || y > m.t + ph + 1) continue;
+      ctx.beginPath(); ctx.moveTo(m.l, Math.round(y) + .5); ctx.lineTo(m.l + pw, Math.round(y) + .5); ctx.stroke();
+      ctx.fillText(String(t.label).slice(0, 9), m.l - 6, y);
+    }
+    ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+    const xt = X.labels ? X.labels.map((label, i) => ({v: i, label})) : this.ticks(xd, X.log, pw);
+    for (const t of xt) {
+      const x = m.l + (t.v - xd[0]) / (xd[1] - xd[0]) * pw; if (x < m.l - 1 || x > m.l + pw + 1) continue;
+      ctx.beginPath(); ctx.moveTo(Math.round(x) + .5, m.t); ctx.lineTo(Math.round(x) + .5, m.t + ph); ctx.stroke();
+      ctx.fillText(String(t.label).slice(0, 14), x, m.t + ph + 5);
+    }
+    ctx.fillStyle = text2;
+    if (X.title) { ctx.textAlign = 'center'; ctx.fillText(X.title, m.l + pw / 2, h - 14); }
+    if (Y.title) { ctx.save(); ctx.translate(12, m.t + ph / 2); ctx.rotate(-Math.PI / 2); ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText(Y.title, 0, 0); ctx.restore(); }
+    ctx.save(); ctx.beginPath(); ctx.rect(m.l, m.t, pw, ph); ctx.clip();
+    for (const L of spec.layers) {
+      const color = L.color ? css(L.color) || L.color : css('--s1');
+      const pts = (L.data || []).filter(d => L.type === 'bars' || (isFinite(d.x) && isFinite(d.y) && (!X.log || d.x > 0) && (!Y.log || d.y > 0)));
+      ctx.globalAlpha = L.alpha ?? 1;
+      if (L.type === 'points') {
+        const r = L.r || 3;
+        for (const d of pts) {
+          const x = sx(d.x), y = sy(d.y);
+          ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fillStyle = color; ctx.fill();
+          if (L.ring) { ctx.lineWidth = 1.5; ctx.strokeStyle = surface; ctx.stroke(); }
+          if (L.hover !== false) this.hits.push({x, y, d, layer: L});
+        }
+      } else if (L.type === 'line' || L.type === 'step') {
+        ctx.strokeStyle = color; ctx.lineWidth = L.width || 2; ctx.setLineDash(L.dash || []);
+        ctx.beginPath(); let started = false, prev = null;
+        for (const d of pts) {
+          const x = sx(d.x), y = sy(d.y);
+          if (!started) { ctx.moveTo(x, y); started = true; }
+          else if (L.type === 'step') { ctx.lineTo(x, prev.y); ctx.lineTo(x, y); }
+          else ctx.lineTo(x, y);
+          prev = {x, y};
+          if (L.hover) this.hits.push({x, y, d, layer: L});
+        }
+        ctx.stroke(); ctx.setLineDash([]);
+      } else if (L.type === 'bars') {
+        ctx.fillStyle = color;
+        for (const d of pts) {
+          const x0 = sx(d.x0), x1 = sx(d.x1), y0 = sy(Y.log ? Math.max(d.y, 1e-300) : d.y), yb = sy(Y.log ? Math.pow(10, yd[0]) : Math.max(0, yd[0]));
+          const bw = Math.max(1, x1 - x0 - 2);
+          ctx.beginPath(); ctx.roundRect ? ctx.roundRect(x0 + 1, Math.min(y0, yb), bw, Math.abs(yb - y0), [4, 4, 0, 0]) : ctx.rect(x0 + 1, Math.min(y0, yb), bw, Math.abs(yb - y0));
+          ctx.fill();
+          this.hits.push({x: (x0 + x1) / 2, y: y0, d, layer: L, band: [x0, x1]});
+        }
+      }
+      ctx.globalAlpha = 1;
+    }
+    if (this.hover) {
+      const hh = this.hover; ctx.beginPath(); ctx.arc(hh.x, hh.y, (hh.layer.r || 3) + 3, 0, Math.PI * 2);
+      ctx.strokeStyle = css('--text'); ctx.lineWidth = 1.5; ctx.stroke();
+    }
+    ctx.restore();
+  }
+  nearest(e) {
+    const rect = this.c.getBoundingClientRect(), mx = e.clientX - rect.left, my = e.clientY - rect.top;
+    let best = null, bd = Infinity;
+    for (const h of this.hits) {
+      if (h.band) { if (mx >= h.band[0] && mx <= h.band[1]) return h; continue; }
+      const d = this.spec && this.spec.crosshair ? Math.abs(h.x - mx) : Math.hypot(h.x - mx, h.y - my);
+      if (d < bd) { bd = d; best = h; }
+    }
+    const limit = this.spec && this.spec.crosshair ? 40 : 12;
+    return bd <= limit ? best : null;
+  }
+  move(e) {
+    const h = this.nearest(e);
+    if (!h || !this.spec.tooltip) { this.tip.style.display = 'none'; if (this.hover) { this.hover = null; this.draw(); } return; }
+    const hovered = h.band ? null : h;
+    if (this.hover !== hovered) { this.hover = hovered; this.draw(); }
+    this.tip.innerHTML = this.spec.tooltip(h.d, h.layer);
+    this.tip.style.display = 'block';
+    const pw = this.c.parentElement.clientWidth, tw = this.tip.offsetWidth;
+    let left = h.x + 14; if (left + tw > pw) left = Math.max(0, h.x - tw - 14);
+    this.tip.style.left = left + 'px'; this.tip.style.top = Math.max(0, h.y - 10) + 'px';
+  }
+}
+function sparkHist(canvas, hist) {
+  const ctx = canvas.getContext('2d'), dpr = window.devicePixelRatio || 1, w = 96, h = 22;
+  canvas.width = w * dpr; canvas.height = h * dpr; ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  if (!hist) return;
+  const max = Math.max(...hist.counts, 1), bw = w / hist.counts.length;
+  ctx.fillStyle = css('--s1');
+  hist.counts.forEach((c, i) => { const bh = Math.max(c ? 1 : 0, c / max * (h - 2)); ctx.fillRect(i * bw, h - bh, Math.max(1, bw - 1), bh); });
+}
+// Losses of exactly zero cannot sit on a log axis; plot them at this floor.
+const LOG_FLOOR = 1e-16;
+const logSafe = v => (v === null || v === undefined) ? NaN : Math.max(v, LOG_FLOOR);
+function frontier2d(points) {
+  const sorted = [...points].sort((a, b) => a.bits - b.bits || a.loss - b.loss), out = [];
+  let best = Infinity;
+  for (const p of sorted) if (p.loss < best) { out.push(p); best = p.loss; }
+  return out;
+}
+
+// ───────────── path fields & file browser ─────────────
+const pathInputs = {};
+function mountPathField(host) {
+  const key = host.dataset.path, kind = host.dataset.kind;
+  host.classList.add('row');
+  host.innerHTML = `<input type="text" class="grow mono" placeholder="/full/path/to/file" spellcheck="false">
+    <button class="btn" type="button">Browse…</button><button class="btn" type="button">Upload…</button>
+    <input type="file" class="hidden" accept="${kind === 'json' ? '.json,application/json' : '.csv,.tsv,.txt,.dat,text/csv'}">`;
+  const [input, browse, upload, file] = [host.querySelector('input[type=text]'), ...host.querySelectorAll('button'), host.querySelector('input[type=file]')];
+  input.value = store.get('path.' + key, '');
+  input.addEventListener('change', () => { store.set('path.' + key, input.value.trim()); host.dispatchEvent(new Event('pathchange')); });
+  browse.onclick = () => openBrowser(input.value || store.get('lastDir', ''), kind, p => { input.value = p; input.dispatchEvent(new Event('change')); });
+  upload.onclick = () => file.click();
+  file.onchange = () => {
+    const f = file.files[0]; if (!f) return;
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', '/api/upload?name=' + encodeURIComponent(f.name));
+    upload.disabled = true;
+    xhr.upload.onprogress = e => { if (e.lengthComputable) upload.textContent = Math.round(100 * e.loaded / e.total) + '%'; };
+    xhr.onload = () => {
+      upload.disabled = false; upload.textContent = 'Upload…'; file.value = '';
+      try {
+        const j = JSON.parse(xhr.responseText);
+        if (xhr.status !== 200) throw new Error(j.error);
+        input.value = j.path; input.dispatchEvent(new Event('change'));
+        toast(`${j.reused ? 'Reused' : 'Uploaded'} ${f.name} → ${j.path}`);
+      } catch (e) { toast('Upload failed: ' + e.message, true); }
+    };
+    xhr.onerror = () => { upload.disabled = false; upload.textContent = 'Upload…'; toast('Upload failed', true); };
+    xhr.send(f);
+  };
+  pathInputs[key] = input;
+  return input;
+}
+let browserPick = null, browserKind = null;
+async function openBrowser(start, kind, onPick) {
+  browserPick = onPick; browserKind = kind;
+  $('#browser').classList.add('open');
+  await browseTo(start);
+}
+async function browseTo(path) {
+  try {
+    const j = await api('/api/fs', {path});
+    $('#browserPath').value = j.path; $('#browserUp').dataset.path = j.parent;
+    store.set('lastDir', j.path);
+    const list = $('#browserList'); list.innerHTML = '';
+    for (const d of j.dirs) {
+      const it = document.createElement('div'); it.className = 'item';
+      it.innerHTML = `<span>📁 ${esc(d)}</span><span class="hint">folder</span>`;
+      it.onclick = () => browseTo(j.path.replace(/\/$/, '') + '/' + d); list.appendChild(it);
+    }
+    for (const f of j.files) {
+      const match = f.kind === browserKind;
+      const it = document.createElement('div'); it.className = 'item' + (match ? '' : ' dim');
+      it.innerHTML = `<span>${esc(f.name)}</span><span class="hint">${(f.size / 1024).toFixed(f.size < 10240 ? 1 : 0)} KB · ${new Date(f.mtime * 1000).toLocaleString()}</span>`;
+      it.onclick = () => { $('#browser').classList.remove('open'); browserPick && browserPick(j.path.replace(/\/$/, '') + '/' + f.name); };
+      list.appendChild(it);
+    }
+    if (!j.dirs.length && !j.files.length) list.innerHTML = '<div class="hint" style="padding:8px">Empty folder</div>';
+    $('#browserHint').textContent = `Click a file to use it. ${browserKind === 'json' ? 'JSON' : 'CSV-like'} files are highlighted.`;
+  } catch (e) { toast(e.message, true); }
+}
+$('#browserClose').onclick = () => $('#browser').classList.remove('open');
+$('#browserUp').onclick = () => browseTo($('#browserUp').dataset.path);
+$('#browserGo').onclick = () => browseTo($('#browserPath').value);
+$('#browserPath').addEventListener('keydown', e => { if (e.key === 'Enter') browseTo($('#browserPath').value); });
+$('#browser').addEventListener('click', e => { if (e.target.id === 'browser') $('#browser').classList.remove('open'); });
+document.addEventListener('keydown', e => { if (e.key === 'Escape') $('#browser').classList.remove('open'); });
+
+// ───────────── setup form ─────────────
+let OPTIONS = null, INSPECT = null;
+const TYPE_LABELS = [[0, 'Ignore'], [1, 'Numeric input'], [2, 'Categorical input'], [5, 'Numeric output'], [6, 'Categorical output']];
+function delimiterValue() {
+  const v = $('#delimiter').value;
+  return v === 'custom' ? $('#delimiterCustom').value : v === '\\t' ? '\t' : v;
+}
+$('#delimiter').onchange = () => { $('#delimiterCustom').classList.toggle('hidden', $('#delimiter').value !== 'custom'); saveForm(); };
+function renderOperators() {
+  const saved = store.get('ops', null);
+  const box = $('#opGroups'); box.innerHTML = '';
+  for (const g of OPTIONS.groups) {
+    const on = saved ? saved.groups.includes(g.id) : g.default;
+    const div = document.createElement('div'); div.className = 'group';
+    div.innerHTML = `<label class="check"><input type="checkbox" data-group="${g.id}" ${on ? 'checked' : ''}> <strong>${g.id}. ${esc(g.name)}</strong> <span class="hint">${g.ops.length}</span></label><div class="chips"></div>`;
+    const chips = div.querySelector('.chips');
+    for (const op of g.ops) {
+      const ch = document.createElement('span'); ch.className = 'chip'; ch.textContent = op; ch.dataset.op = op;
+      ch.title = `complexity cost +${OPTIONS.op_cost[op]}`;
+      if (saved && saved.excluded.includes(op)) ch.classList.add('off');
+      ch.onclick = () => { ch.classList.toggle('off'); updateOpCount(); saveForm(); };
+      chips.appendChild(ch);
+    }
+    div.querySelector('input').onchange = () => { updateOpCount(); saveForm(); };
+    box.appendChild(div);
+  }
+  updateOpCount();
+}
+function operatorForm() {
+  const groups = $$('#opGroups input[data-group]').filter(i => i.checked).map(i => i.dataset.group);
+  const excluded = $$('#opGroups .chip.off').map(c => c.dataset.op);
+  return {groups, excluded};
+}
+function updateOpCount() {
+  const {groups, excluded} = operatorForm(), set = new Set();
+  for (const g of OPTIONS.groups) if (groups.includes(g.id)) g.ops.forEach(o => { if (!excluded.includes(o)) set.add(o); });
+  $$('#opGroups .group').forEach(div => div.querySelector('.chips').style.opacity = div.querySelector('input').checked ? 1 : .45);
+  $('#opCount').textContent = `${set.size} operators enabled`;
+}
+function renderAdvanced() {
+  const saved = store.get('advanced', {});
+  const box = $('#advancedFields'); box.innerHTML = '';
+  for (const a of OPTIONS.advanced) {
+    const f = document.createElement('div'); f.className = 'field';
+    const value = saved[a.dest] ?? a.default;
+    let control;
+    if (a.kind === 'choice') control = `<select data-adv="${a.dest}">${a.choices.map(c => `<option ${String(c) === String(value) ? 'selected' : ''}>${esc(c)}</option>`).join('')}</select>`;
+    else if (a.kind === 'bool') control = `<label class="check"><input type="checkbox" data-adv="${a.dest}" ${value ? 'checked' : ''}> on</label>`;
+    else control = `<input type="${a.kind === 'text' ? 'text' : 'number'}" step="any" data-adv="${a.dest}" value="${esc(value ?? '')}">`;
+    f.innerHTML = `<label title="${esc(a.help)}">${esc(a.flag.replace(/^--/, '').replace(/-/g, ' '))}</label>${control}<div class="hint">${esc(a.help)}</div>`;
+    box.appendChild(f);
+  }
+  box.addEventListener('change', saveForm);
+}
+const FORM_IDS = ['population', 'maxGenerations', 'seed', 'workers', 'nodes', 'depth', 'islands', 'migrationInterval', 'migrants', 'valPercent', 'metadataText', 'sequenceGroups', 'adfMode', 'delimiterCustom', 'resumeMax', 'resumeWorkers'];
+const CHECK_IDS = ['affine', 'coev', 'pressure', 'adf'];
+function saveForm() {
+  const v = {};
+  FORM_IDS.forEach(id => v[id] = $('#' + id).value);
+  CHECK_IDS.forEach(id => v[id] = $('#' + id).checked);
+  v.delimiter = $('#delimiter').value;
+  v.valmode = $('input[name=valmode]:checked').value;
+  store.set('form', v);
+  if (OPTIONS) { store.set('ops', operatorForm()); store.set('advanced', advancedValues()); }
+  $$('.islandOnly').forEach(e => e.classList.toggle('hidden', +$('#islands').value <= 1));
+  $('#valPercentField').classList.toggle('hidden', v.valmode !== 'percent');
+  $('#valFileField').classList.toggle('hidden', v.valmode !== 'file');
+}
+function restoreForm() {
+  const v = store.get('form', null);
+  if (v) {
+    FORM_IDS.forEach(id => { if (v[id] !== undefined) $('#' + id).value = v[id]; });
+    CHECK_IDS.forEach(id => { if (v[id] !== undefined) $('#' + id).checked = v[id]; });
+    if (v.delimiter) $('#delimiter').value = v.delimiter;
+    $('#delimiterCustom').classList.toggle('hidden', $('#delimiter').value !== 'custom');
+    const r = $(`input[name=valmode][value="${v.valmode}"]`); if (r) r.checked = true;
+  }
+  saveForm();
+}
+document.addEventListener('change', e => { if (e.target.closest('#tab-setup') && (e.target.id && (FORM_IDS.includes(e.target.id) || CHECK_IDS.includes(e.target.id)) || e.target.name === 'valmode')) saveForm(); });
+function advancedValues() {
+  const out = {};
+  $$('[data-adv]').forEach(el => out[el.dataset.adv] = el.type === 'checkbox' ? el.checked : el.value);
+  return out;
+}
+async function inspect() {
+  const path = pathInputs.dataset.value.trim();
+  if (!path) return toast('Choose a dataset first', true);
+  $('#inspectBtn').disabled = true; $('#datasetInfo').textContent = 'Reading…';
+  try {
+    INSPECT = await api('/api/dataset/inspect', {path, delimiter: delimiterValue()});
+    const savedTypes = store.get('types', null);
+    const key = INSPECT.path + '|' + delimiterValue();
+    INSPECT.columns.forEach(c => c.type = c.suggested);
+    if (savedTypes && savedTypes.key === key && savedTypes.types.length === INSPECT.columns.length) INSPECT.columns.forEach((c, i) => { if (!c.constant) c.type = savedTypes.types[i]; });
+    renderColumns();
+    $('#datasetInfo').textContent = `${INSPECT.rows.toLocaleString()} rows · ${INSPECT.columns.length} columns · ${INSPECT.path}`;
+  } catch (e) { $('#datasetInfo').textContent = ''; toast(e.message, true); }
+  finally { $('#inspectBtn').disabled = false; }
+}
+function renderColumns() {
+  const tb = $('#columnsTable tbody'); tb.innerHTML = '';
+  for (const c of INSPECT.columns) {
+    const tr = document.createElement('tr');
+    const values = c.numeric ? `${fmt(c.min)} … ${fmt(c.max)}<div class="hint">${c.unique} unique${c.missing ? ` · ${c.missing} missing` : ''}</div>`
+      : `${esc((c.top || []).slice(0, 3).map(t => t[0]).join(', '))}<div class="hint">${c.unique} categories${c.missing ? ` · ${c.missing} missing` : ''}</div>`;
+    const select = c.constant ? '<span class="hint">ignored (constant)</span>'
+      : `<select data-col="${c.index}">${TYPE_LABELS.map(([v, l]) => `<option value="${v}" ${v === c.type ? 'selected' : ''}>${l}</option>`).join('')}</select>` +
+        (c.class_like && c.type === 5 ? '<div class="hint">few integer codes: pick Categorical output if these are classes</div>' : '');
+    tr.innerHTML = `<td class="num">${c.index}</td><td><strong>${esc(c.name)}</strong><div class="hint">${c.numeric ? 'numeric' : 'text'}</div></td><td>${values}</td><td class="hist">${c.hist ? '<canvas></canvas>' : ''}</td><td>${select}</td>`;
+    tb.appendChild(tr);
+    if (c.hist) sparkHist(tr.querySelector('canvas'), c.hist);
+    const sel = tr.querySelector('select');
+    if (sel) sel.onchange = () => { c.type = +sel.value; storeTypes(); summarizeColumns(); renderColumns(); };
+  }
+  $('#columnsEmpty').classList.add('hidden'); $('#columnsWrap').classList.remove('hidden');
+  const pt = $('#previewTable');
+  pt.innerHTML = `<thead><tr>${INSPECT.columns.map(c => `<th>${esc(c.name)}</th>`).join('')}</tr></thead><tbody>${INSPECT.preview.map(r => `<tr>${r.map(v => `<td>${v === null ? '<span class="muted">∅</span>' : esc(v)}</td>`).join('')}</tr>`).join('')}</tbody>`;
+  $('#previewWrap').classList.remove('hidden');
+  storeTypes(); summarizeColumns();
+}
+function storeTypes() { store.set('types', {key: INSPECT.path + '|' + delimiterValue(), types: INSPECT.columns.map(c => c.type)}); }
+function summarizeColumns() {
+  const t = INSPECT.columns.map(c => c.type);
+  const n = k => t.filter(x => k.includes(x)).length;
+  $('#columnsSummary').textContent = `${n([1, 2])} inputs · ${n([5, 6])} outputs · ${n([0])} ignored`;
+}
+$('#inspectBtn').onclick = inspect;
+
+function collectForm() {
+  if (!INSPECT) throw new Error('Inspect the dataset first so its columns can be assigned');
+  if (INSPECT.path !== pathInputs.dataset.value.trim() && pathInputs.dataset.value.trim()) {
+    // Typed a new path after inspecting: the column list no longer applies.
+    throw new Error('The dataset path changed since it was inspected; press Inspect columns again');
+  }
+  const valmode = $('input[name=valmode]:checked').value;
+  return {
+    mode: 'train',
+    data: {path: INSPECT.path, delimiter: delimiterValue(), types: INSPECT.columns.map(c => c.type), validation_mode: valmode,
+      validation_percent: +$('#valPercent').value, validation_path: pathInputs.validation.value.trim(), test_path: pathInputs.test.value.trim(),
+      metadata_path: pathInputs.metadata.value.trim(), metadata_text: $('#metadataText').value.trim(), sequence_groups: $('#sequenceGroups').value},
+    operators: operatorForm(),
+    search: {nodes: +$('#nodes').value, depth: +$('#depth').value, affine: $('#affine').checked, coev: $('#coev').checked,
+      dynamic_pressure: $('#pressure').checked, adf: $('#adf').checked, islands: +$('#islands').value,
+      migration_interval: +$('#migrationInterval').value, migrants: +$('#migrants').value},
+    run: {max_generations: $('#maxGenerations').value, population: $('#population').value, seed: $('#seed').value, workers: $('#workers').value,
+      adf_mode: $('#adf').checked ? $('#adfMode').value : 'off'},
+    advanced: advancedValues(),
+  };
+}
+function showCheck(msg, err) { $('#checkMsg').innerHTML = msg ? `<div class="notice ${err ? 'err' : ''}">${esc(msg)}</div>` : ''; }
+$('#checkBtn').onclick = async () => {
+  try { const j = await api('/api/train/check', collectForm()); showCheck(`Looks good: ${j.rows.toLocaleString()} rows, ${j.operators} operators. Command-line equivalent options: ${j.argv.join(' ')}`); }
+  catch (e) { showCheck(e.message, true); }
+};
+$('#startBtn').onclick = async () => {
+  try {
+    const form = collectForm();
+    $('#startBtn').disabled = true;
+    await api('/api/train/start', form);
+    showCheck('');
+    resetTrainView(); showTab('train'); poll(true);
+  } catch (e) { showCheck(e.message, true); }
+  finally { $('#startBtn').disabled = false; }
+};
+$('#resumeBtn').onclick = async () => {
+  try {
+    const checkpoint = pathInputs.resume.value.trim();
+    if (!checkpoint) throw new Error('Choose a checkpoint to resume');
+    await api('/api/train/start', {mode: 'resume', checkpoint, run: {max_generations: $('#resumeMax').value, workers: $('#resumeWorkers').value}, advanced: {}});
+    resetTrainView(); showTab('train'); poll(true);
+  } catch (e) { toast(e.message, true); }
+};
+
+// ───────────── training monitor ─────────────
+const T = {history: [], console: 0, snapshotSeq: 0, snapshot: null, timer: null, state: 'idle', choice: 0, pinned: null, lastDone: null};
+const paretoChart = new Chart($('#paretoChart')), historyChart = new Chart($('#historyChart'));
+function resetTrainView() {
+  T.history = []; T.console = 0; T.snapshotSeq = 0; T.snapshot = null; T.pinned = null; T.choice = 0;
+  $('#console').textContent = ''; $('#pinned').classList.add('hidden'); $('#chooseCard').classList.add('hidden');
+  $('#trainNotice').innerHTML = ''; drawPareto(); drawHistory(); renderTiles(null);
+}
+async function poll(force) {
+  clearTimeout(T.timer);
+  try {
+    const s = await api('/api/train/status', {since: T.history.length, console_since: T.console, snapshot_seq: T.snapshotSeq});
+    applyStatus(s);
+    if (['running', 'stopping', 'choosing', 'saving'].includes(s.state)) T.timer = setTimeout(poll, 1000);
+  } catch (e) { $('#runState').textContent = 'server unreachable'; $('#runDot').className = 'dot failed'; T.timer = setTimeout(poll, 3000); }
+}
+function applyStatus(s) {
+  T.state = s.state;
+  $('#runDot').className = 'dot ' + s.state;
+  $('#runState').textContent = s.state === 'idle' ? 'idle' : `${s.mode === 'resume' ? 'resume' : 'training'}: ${s.state}`;
+  if (s.state === 'idle') { $('#trainIdle').classList.remove('hidden'); $('#trainView').classList.add('hidden'); return; }
+  $('#trainIdle').classList.add('hidden'); $('#trainView').classList.remove('hidden');
+  $('#trainTitle').textContent = s.mode === 'resume' ? 'Resumed run' : 'Training run';
+  $('#trainDir').textContent = s.run_dir || '';
+  if (s.history.length) T.history.push(...s.history);
+  if (s.snapshot) { T.snapshot = s.snapshot; T.snapshotSeq = s.snapshot_seq; }
+  if (s.console.length) {
+    const box = $('#console');
+    box.textContent += s.console.join('\n') + '\n';
+    if (box.textContent.length > 400000) box.textContent = box.textContent.slice(-300000);
+    if ($('#consoleFollow').checked) box.scrollTop = box.scrollHeight;
+  }
+  T.console = s.console_total;
+  const stop = $('#stopBtn');
+  stop.classList.toggle('hidden', !['running', 'stopping'].includes(s.state));
+  stop.textContent = s.stop_requests ? 'Interrupt now' : 'Stop after this generation';
+  stop.classList.toggle('danger', !!s.stop_requests);
+  let notice = '';
+  if (s.state === 'stopping') notice = '<div class="notice warn">Stopping after the current generation, then saving the checkpoint. “Interrupt now” stops mid-generation (that generation will not replay exactly on resume).</div>';
+  if (s.state === 'saving') notice = '<div class="notice">Saving the chosen model, model card and checkpoint…</div>';
+  if (s.state === 'failed') notice = `<div class="notice err"><strong>The run failed.</strong> ${esc(s.error || 'exit code ' + s.returncode)} — see the console below.</div>`;
+  if (s.state === 'finished' && s.done) {
+    const d = s.done;
+    notice = `<div class="notice"><strong>Finished${d.generation != null ? ' at generation ' + d.generation : ''}.</strong> ${d.selected ? 'Saved: ' + esc(d.selected) + '. ' : ''}
+      <div class="kv" style="margin-top:6px">${d.checkpoint ? `<span class="k">Checkpoint</span><span class="mono">${esc(d.checkpoint)}</span>` : ''}
+      ${d.model_card ? `<span class="k">Model card</span><span class="mono">${esc(d.model_card)}</span>` : ''}
+      ${d.best_model ? `<span class="k">Exported</span><span class="mono">${esc(d.best_model)}</span>` : ''}</div>
+      <div class="row" style="margin-top:8px"><button class="btn primary" id="exploreBtn">Explore these models</button></div></div>`;
+  }
+  $('#trainNotice').innerHTML = notice;
+  const explore = $('#exploreBtn');
+  if (explore) explore.onclick = () => { pathInputs.model.value = s.done.checkpoint; store.set('path.model', s.done.checkpoint); showTab('models'); loadModels(); };
+  if (s.state === 'finished' && s.done && T.lastDone !== s.done.time) { T.lastDone = s.done.time; refreshRuns(); }
+  renderChoose(s.choose);
+  drawPareto(); drawHistory(); renderTiles(s); renderSnapshotPanels();
+}
+function perGeneration() {
+  // Collapse island rows: the best island per generation.
+  const byGen = new Map();
+  for (const r of T.history) {
+    const cur = byGen.get(r.generation);
+    if (!cur || (r.best_loss ?? Infinity) < (cur.best_loss ?? Infinity)) byGen.set(r.generation, {...r, archive: (cur ? cur.archive : 0) + (r.archive || 0)});
+    else cur.archive += r.archive || 0;
+  }
+  return [...byGen.values()].sort((a, b) => a.generation - b.generation);
+}
+function renderTiles(s) {
+  const rows = perGeneration(), last = rows[rows.length - 1], best = T.snapshot && T.snapshot.best;
+  const rate = rows.length > 1 && last.elapsed > 0 ? (rows.length - 1) / (last.elapsed - rows[0].elapsed || 1) * 60 : null;
+  const tiles = [
+    ['Generation', last ? last.generation : '—', rate ? `${fmt(rate, 3)} per minute` : ''],
+    ['Elapsed', last ? fmtTime(last.elapsed) : '—', ''],
+    ['Best training loss', fmt(last && last.best_loss), best ? `${fmt(best.bits, 4)} MDL bits` : ''],
+    ['Best validation loss', fmt(last && last.best_validation), last && last.best_validation == null ? 'no validation split' : 'same model'],
+    ['Archive', last ? last.archive : '—', 'nondominated models kept'],
+    ['Feasible', last ? Math.round(100 * last.feasible) + '%' : '—', 'of the population'],
+  ];
+  $('#tiles').innerHTML = tiles.map(([k, v, sub]) => `<div class="tile"><div class="k">${k}</div><div class="v">${esc(v)}</div><div class="s">${esc(sub)}</div></div>`).join('');
+}
+function drawPareto() {
+  const snap = T.snapshot, log = $('#paretoLog').checked, pop = $('#paretoPop').checked;
+  if (!snap) return paretoChart.set({layers: [], empty: 'Waiting for the first generation…'});
+  const conv = p => ({...p, x: p.bits, y: log ? logSafe(p.loss) : p.loss});
+  const archive = snap.archive.map(conv), front = frontier2d(snap.archive).map(conv);
+  const layers = [];
+  if (pop) layers.push({type: 'points', data: snap.population.map(conv), color: '--other', alpha: .55, r: 2.5, kind: 'population'});
+  layers.push({type: 'step', data: front, color: '--s1', width: 2});
+  layers.push({type: 'points', data: archive, color: '--s1', r: 3.5, ring: true, kind: 'archive'});
+  if (snap.best) layers.push({type: 'points', data: [conv(snap.best)], color: '--s2', r: 6, ring: true, kind: 'best'});
+  paretoChart.set({
+    x: {title: 'Model size (MDL bits)'}, y: {title: log ? 'Training loss (log)' : 'Training loss', log}, layers,
+    tooltip: (d, L) => `<div class="t">${L.kind === 'best' ? 'Best so far' : L.kind === 'archive' ? 'Archive model' : 'Population member'}</div>
+      loss ${fmt(d.loss)} · ${fmt(d.bits, 4)} bits · ${d.nodes} nodes · age ${d.age}<div class="hint">${esc(d.origin)}${d.island != null && snap.archive.some(a => a.island > 0) ? ' · island ' + (d.island + 1) : ''}</div>
+      ${d.equation ? `<div class="eq" style="margin-top:4px">${esc(d.equation)}</div>` : ''}`,
+    onClick: (d) => { if (d.equation) { T.pinned = d; const p = $('#pinned'); p.classList.remove('hidden'); p.innerHTML = `${esc(d.equation)}<div class="hint" style="margin-top:4px">loss ${fmt(d.loss)} · ${fmt(d.bits, 4)} bits · ${d.nodes} nodes</div>`; } },
+  });
+}
+function drawHistory() {
+  const rows = perGeneration(), log = $('#historyLog').checked;
+  const hasVal = rows.some(r => r.best_validation != null);
+  $('#historyLegend').innerHTML = `<span><i class="sw line" style="background:var(--s1)"></i>Best training loss</span>` + (hasVal ? `<span><i class="sw line" style="background:var(--s2)"></i>Its validation loss</span>` : '');
+  const y = v => log ? logSafe(v) : (v ?? NaN);
+  const train = rows.map(r => ({x: r.generation, y: y(r.best_loss), r}));
+  const val = rows.map(r => ({x: r.generation, y: y(r.best_validation), r}));
+  const layers = [{type: 'line', data: train, color: '--s1', hover: true}];
+  if (hasVal) layers.push({type: 'line', data: val, color: '--s2', hover: false});
+  historyChart.set({
+    x: {title: 'Generation'}, y: {title: log ? 'Loss (log)' : 'Loss', log}, layers, crosshair: true, empty: 'Waiting for the first generation…',
+    tooltip: d => `<div class="t">Generation ${d.r.generation}</div>training ${fmt(d.r.best_loss)}${hasVal ? `<br>validation ${fmt(d.r.best_validation)}` : ''}<br><span class="hint">${fmt(d.r.best_bits, 4)} bits · ${fmtTime(d.r.elapsed)}</span>`,
+  });
+}
+function renderSnapshotPanels() {
+  const snap = T.snapshot;
+  if (!snap) return;
+  const b = snap.best;
+  $('#bestEq').textContent = b ? b.equation : '—';
+  $('#bestKv').innerHTML = b ? `<span class="k">Training loss</span><span>${fmt(b.loss)}</span><span class="k">Validation loss</span><span>${fmt(b.validation)}</span>
+    <span class="k">Size</span><span>${fmt(b.bits, 4)} bits · ${b.nodes} nodes</span><span class="k">Age</span><span>${b.age} generations</span><span class="k">Made by</span><span>${esc(b.origin)}</span>` : '';
+  const origins = Object.entries(snap.origins || {}), total = origins.reduce((a, [, n]) => a + n, 0) || 1;
+  $('#originBars').innerHTML = origins.map(([k, n]) => `<div class="bar"><span>${esc(k.replace(/_/g, ' '))}</span><div class="track"><div class="fill" style="width:${100 * n / total}%"></div></div><span class="num hint">${Math.round(100 * n / total)}%</span></div>`).join('');
+  $('#statsBox').textContent = (snap.stats || []).join('\n');
+  const front = frontier2d(snap.archive);
+  $('#frontierTable tbody').innerHTML = front.map(p => `<tr><td class="num">${fmt(p.bits, 4)}</td><td class="num">${p.nodes}</td><td class="num">${fmt(p.loss)}</td><td class="eq">${esc(p.equation)}</td></tr>`).join('');
+}
+function renderChoose(choose) {
+  const card = $('#chooseCard');
+  if (!choose) { card.classList.add('hidden'); return; }
+  if (!card.classList.contains('hidden') && card.dataset.time === String(choose.time)) return;
+  card.dataset.time = choose.time; card.classList.remove('hidden');
+  $('#chooseHint').textContent = `The search has ended. Scores below are on ${choose.source} data; option 1 is what the terminal saves by default.`;
+  const list = $('#chooseList'); list.innerHTML = '';
+  choose.options.forEach((o, i) => {
+    const div = document.createElement('div'); div.className = 'option' + (i === T.choice ? ' sel' : '');
+    div.innerHTML = `<input type="radio" name="choice" ${i === T.choice ? 'checked' : ''}><div><strong>${i + 1}. ${esc(o.label)}</strong>
+      <div class="hint">${choose.source} loss ${fmt(o.metrics.loss)} · shape ${fmt(o.metrics.shape)} · ${fmt(o.metrics.mdl_bits, 4)} bits · training loss ${fmt(o.train_loss)}</div>
+      <div class="eq" style="margin-top:3px">${esc(o.equation)}</div></div>`;
+    div.onclick = () => { T.choice = i; $$('.option', list).forEach((e, j) => { e.classList.toggle('sel', j === i); e.querySelector('input').checked = j === i; }); };
+    list.appendChild(div);
+  });
+  showTab('train');
+}
+$('#chooseBtn').onclick = async () => {
+  try { await api('/api/train/choose', {index: T.choice}); $('#chooseCard').classList.add('hidden'); poll(); }
+  catch (e) { toast(e.message, true); }
+};
+$('#stopBtn').onclick = async () => {
+  try { await api('/api/train/stop'); poll(); } catch (e) { toast(e.message, true); }
+};
+$('#paretoLog').onchange = drawPareto; $('#paretoPop').onchange = drawPareto; $('#historyLog').onchange = drawHistory;
+
+// ───────────── models ─────────────
+const M = {summary: null, index: null, detail: null};
+const candChart = new Chart($('#candChart')), sweepChart = new Chart($('#sweepChart'));
+let fitCharts = [];
+async function refreshRuns() {
+  try {
+    const j = await api('/api/runs');
+    const withCk = j.runs.filter(r => r.checkpoint);
+    const html = withCk.length ? `<table><tbody>${withCk.map(r => `<tr class="clickable" data-ck="${esc(r.checkpoint)}"><td>${esc(r.name)}<div class="hint">${esc(r.dataset || '')}</div></td><td class="hint">${new Date(r.modified * 1000).toLocaleString()}</td></tr>`).join('')}</tbody></table>`
+      : '<span class="hint">No runs with checkpoints in afpo_runs/ yet.</span>';
+    $('#recentRuns').innerHTML = html;
+    $('#resumeRuns').innerHTML = withCk.length ? `<div class="hint" style="margin-bottom:4px">Recent checkpoints:</div>` + withCk.slice(0, 5).map(r => `<div><button class="link" data-ck="${esc(r.checkpoint)}">${esc(r.name)}</button> <span class="hint">${esc(r.dataset ? r.dataset.split('/').pop() : '')}</span></div>`).join('') : '';
+    $$('#recentRuns tr[data-ck]').forEach(tr => tr.onclick = () => { pathInputs.model.value = tr.dataset.ck; store.set('path.model', tr.dataset.ck); loadModels(); });
+    $$('#resumeRuns [data-ck]').forEach(b => b.onclick = () => { pathInputs.resume.value = b.dataset.ck; store.set('path.resume', b.dataset.ck); });
+  } catch (e) { $('#recentRuns').innerHTML = `<span class="hint">${esc(e.message)}</span>`; }
+}
+$('#refreshRuns').onclick = refreshRuns;
+async function loadModels() {
+  const path = pathInputs.model.value.trim();
+  if (!path) return toast('Choose a checkpoint first', true);
+  $('#loadModelsBtn').disabled = true; $('#modelsInfo').textContent = 'Loading and scoring…';
+  try {
+    M.summary = await api('/api/models/load', {path}); M.index = null;
+    const s = M.summary;
+    $('#modelsInfo').textContent = `${s.models.length} candidates · generation ${s.generation} · ${s.train_rows} training / ${s.validation_rows} validation rows`;
+    $('#candLossHead').textContent = s.source === 'validation' ? 'Validation' : 'Loss';
+    $('#candHint').textContent = `Loss on ${s.source} data against model size. Click a point or a row to inspect that model.`;
+    $('#modelsView').classList.remove('hidden'); $('#detailView').classList.add('hidden');
+    renderCandidates(); renderPredictFields();
+    const first = s.models.findIndex(m => m.label && m.label.startsWith('Best Score'));
+    selectModel(first >= 0 ? first : 0);
+  } catch (e) { $('#modelsInfo').textContent = ''; toast(e.message, true); }
+  finally { $('#loadModelsBtn').disabled = false; }
+}
+$('#loadModelsBtn').onclick = loadModels;
+function renderCandidates() {
+  const s = M.summary, log = $('#candLog').checked;
+  const conv = m => ({...m, x: m.bits, y: log ? logSafe(m.loss) : m.loss});
+  candChart.set({
+    x: {title: 'Model size (MDL bits)'}, y: {title: `${s.source === 'validation' ? 'Validation' : 'Training'} loss${log ? ' (log)' : ''}`, log},
+    layers: [
+      {type: 'points', data: s.models.filter(m => !m.label).map(conv), color: '--other', r: 3.5, ring: true},
+      {type: 'step', data: frontier2d(s.models).map(conv), color: '--s1', width: 2},
+      {type: 'points', data: s.models.filter(m => m.label).map(conv), color: '--s2', r: 5, ring: true},
+      ...(M.index != null ? [{type: 'points', data: [conv(s.models[M.index])], color: '--s1', r: 7, ring: true}] : []),
+    ],
+    tooltip: d => `<div class="t">${d.label ? esc(d.label) : 'Candidate #' + (d.index + 1)}</div>${s.source} loss ${fmt(d.loss)} · training ${fmt(d.train_loss)}<br>${fmt(d.bits, 4)} bits · ${d.nodes} nodes<div class="eq" style="margin-top:4px">${esc(d.equation)}</div>`,
+    onClick: d => selectModel(d.index),
+  });
+  $('#candTable tbody').innerHTML = s.models.map(m => `<tr class="clickable ${m.index === M.index ? 'selected' : ''}" data-i="${m.index}">
+    <td>${m.label ? `<span class="badge accent" title="${esc(m.label)}">${esc(m.label.split(' (')[0])}</span>` : m.frontier ? '<span class="badge">frontier</span>' : ''}</td>
+    <td class="num">${fmt(m.bits, 4)}</td><td class="num">${m.nodes}</td><td class="num">${fmt(m.loss)}</td><td class="num">${fmt(m.train_loss)}</td><td class="eq">${esc(m.equation)}</td></tr>`).join('');
+  $$('#candTable tr[data-i]').forEach(tr => tr.onclick = () => selectModel(+tr.dataset.i));
+}
+$('#candLog').onchange = renderCandidates;
+async function selectModel(index) {
+  M.index = index; renderCandidates();
+  try {
+    const d = M.detail = await api('/api/models/detail', {index});
+    $('#detailView').classList.remove('hidden');
+    $('#detailEq').innerHTML = (d.label ? `<div style="margin-bottom:6px"><span class="badge accent">${esc(d.label)}</span></div>` : '') +
+      d.equations.map(e => `<div class="eq-big" style="margin-bottom:6px">${esc(e)}</div>`).join('') +
+      d.adfs.map(a => `<div class="eq">${esc(a.name)}(${a.arguments.join(', ')}) = ${esc(a.expression)}</div>`).join('');
+    const s = M.summary;
+    $('#detailKv').innerHTML = `<span class="k">${s.source === 'validation' ? 'Validation' : 'Training'} loss</span><span>${fmt(d.metrics.loss)}</span>
+      <span class="k">Training loss</span><span>${fmt(d.train.loss)}</span><span class="k">Shape error</span><span>${fmt(d.metrics.shape)}</span>
+      <span class="k">Size</span><span>${fmt(d.metrics.mdl_bits, 4)} MDL bits · ${d.nodes} nodes</span><span class="k">Age · origin</span><span>${d.age} · ${esc(d.origin || 'seed')}</span>
+      <span class="k">Inputs used</span><span>${esc(d.features_used.join(', ') || 'none (constant)')}</span>
+      <span class="k">Constants</span><span class="mono">${esc(d.constants.map(c => '[' + c.map(v => fmt(v, 6)).join(', ') + ']').join(' '))}</span>`;
+    $('#detailOutputs').innerHTML = `<thead><tr><th>Output</th><th class="num">Training loss</th><th class="num">Validation loss</th></tr></thead><tbody>${d.per_output.map(o => `<tr><td>${esc(o.name)}</td><td class="num">${fmt(o.train_loss)}</td><td class="num">${fmt(o.validation_loss)}</td></tr>`).join('')}</tbody>`;
+    const url = URL.createObjectURL(new Blob([d.svg], {type: 'image/svg+xml'}));
+    $('#treeBox').innerHTML = `<img alt="Expression tree" src="${url}">`;
+    await Promise.all([loadFit(), loadSweep()]);
+  } catch (e) { toast(e.message, true); }
+}
+function fillOutputSelect(sel, names, keep) {
+  const prev = sel.value;
+  sel.innerHTML = names.map(n => `<option>${esc(n)}</option>`).join('');
+  if (keep && names.includes(prev)) sel.value = prev;
+  sel.classList.toggle('hidden', names.length < 2);
+}
+async function loadFit() {
+  if (M.index == null) return;
+  const s = M.summary;
+  if (s.validation_rows === 0) { $('#fitSplit').value = 'train'; $('#fitSplit').disabled = true; } else $('#fitSplit').disabled = false;
+  const f = await api('/api/models/fit', {index: M.index, split: $('#fitSplit').value});
+  fillOutputSelect($('#fitOutput'), f.outputs.map(o => o.name), true);
+  const o = f.outputs.find(x => x.name === $('#fitOutput').value) || f.outputs[0];
+  const body = $('#fitBody');
+  fitCharts.forEach(c => charts.splice(charts.indexOf(c), 1)); fitCharts = [];
+  if (o.kind === 'classification') {
+    const max = Math.max(1, ...o.matrix.flat());
+    body.innerHTML = `<div class="hint" style="margin-bottom:6px">${f.split} rows: ${f.rows} · accuracy ${(100 * o.accuracy).toFixed(1)}%. Rows are true classes, columns predicted.</div>
+      <div class="scroll-x"><table class="cm"><thead><tr><th></th>${o.labels.map(l => `<th>${esc(l)}</th>`).join('')}</tr></thead><tbody>${o.matrix.map((row, i) => `<tr><th>${esc(o.labels[i])}</th>${row.map(v => {
+        const t = v / max; return `<td style="background:color-mix(in srgb, var(--s1) ${Math.round(8 + 72 * t)}%, var(--surface));color:${t > .55 ? '#fff' : 'var(--text)'}">${v}</td>`; }).join('')}</tr>`).join('')}</tbody></table></div>`;
+    return;
+  }
+  body.innerHTML = `<div class="hint" style="margin-bottom:4px">${f.split} rows: ${f.rows} · R² ${fmt(o.r2, 5)} · RMSE ${fmt(o.rmse)} · MAE ${fmt(o.mae)}</div>
+    <div class="legend"><span><i class="sw" style="background:var(--s1)"></i>Rows</span><span><i class="sw line" style="background:var(--muted)"></i>Perfect prediction</span></div>
+    <div class="chart h320"><canvas></canvas></div><div class="hint" style="margin:8px 0 2px">Residuals (predicted − actual)</div><div class="chart h200"><canvas></canvas></div>`;
+  const [c1, c2] = $$('canvas', body).map(c => new Chart(c)); fitCharts = [c1, c2];
+  const pts = o.actual.map((a, i) => ({x: a, y: o.predicted[i]}));
+  const finite = pts.filter(p => isFinite(p.x) && isFinite(p.y)), lo = Math.min(...finite.map(p => Math.min(p.x, p.y))), hi = Math.max(...finite.map(p => Math.max(p.x, p.y)));
+  c1.set({x: {title: 'Actual ' + o.name}, y: {title: 'Predicted'}, layers: [
+    {type: 'line', data: [{x: lo, y: lo}, {x: hi, y: hi}], color: '--muted', width: 1.5, dash: [5, 4]},
+    {type: 'points', data: pts, color: '--s1', alpha: .7, r: 2.5}],
+    tooltip: d => `actual ${fmt(d.x, 6)}<br>predicted ${fmt(d.y, 6)}<br><span class="hint">error ${fmt(d.y - d.x)}</span>`});
+  const h = o.residual_hist;
+  if (h) {
+    const bw = (h.hi - h.lo) / h.counts.length || 1;
+    c2.set({x: {title: 'Residual'}, y: {title: 'Rows'}, layers: [{type: 'bars', data: h.counts.map((c, i) => ({x0: h.lo + i * bw, x1: h.lo + (i + 1) * bw, y: c})), color: '--s1'}],
+      tooltip: d => `${fmt(d.x0)} … ${fmt(d.x1)}<br>${d.y} rows`});
+  }
+}
+$('#fitSplit').onchange = () => loadFit().catch(e => toast(e.message, true));
+$('#fitOutput').onchange = () => loadFit().catch(e => toast(e.message, true));
+async function loadSweep() {
+  if (M.index == null) return;
+  const s = M.summary;
+  const sel = $('#sweepInput');
+  if (!sel.options.length || sel.dataset.path !== s.path) {
+    sel.innerHTML = s.inputs.map(i => `<option>${esc(i.name)}</option>`).join(''); sel.dataset.path = s.path;
+    const used = M.detail.features_used.find(f => s.inputs.some(i => i.name === f));
+    if (used) sel.value = used;
+  }
+  fillOutputSelect($('#sweepOutput'), s.outputs, true);
+  if (!s.inputs.length) return sweepChart.set({layers: [], empty: 'No inputs'});
+  const r = await api('/api/models/sweep', {index: M.index, column: sel.value});
+  const out = $('#sweepOutput').value || s.outputs[0], ys = r.outputs[out], cats = s.cats[s.outputs.indexOf(out)];
+  const categoricalX = r.kind === 'categorical';
+  const yv = v => cats ? cats.indexOf(v) : v;
+  const line = r.x.map((x, i) => ({x: categoricalX ? i : x, y: yv(ys[i]), label: x, value: ys[i]}));
+  const layers = [];
+  const hasData = r.data && r.data.x && r.data.y && r.data.y[out];
+  $('#sweepDataLegend').classList.toggle('hidden', !hasData);
+  if (hasData) layers.push({type: 'points', data: r.data.x.map((x, i) => ({x, y: r.data.y[out][i], data: true})), color: '--other', alpha: .6, r: 2.5});
+  layers.push(categoricalX ? {type: 'points', data: line, color: '--s1', r: 6, ring: true} : {type: 'line', data: line, color: '--s1', hover: true});
+  sweepChart.set({
+    x: {title: sel.value, labels: categoricalX ? r.x.map(String) : null, domain: categoricalX ? [-.5, r.x.length - .5] : null},
+    y: {title: out + (cats ? ' (predicted class)' : ''), labels: cats || null, domain: cats ? [-.5, cats.length - .5] : null},
+    layers, crosshair: !categoricalX,
+    tooltip: d => d.data ? `training row<br>${esc(sel.value)} = ${fmt(d.x, 6)}<br>${esc(out)} = ${fmt(d.y, 6)}` : `${esc(sel.value)} = ${esc(categoricalX ? d.label : fmt(d.label, 6))}<br>${esc(out)} = <strong>${esc(cats ? d.value : fmt(d.value, 6))}</strong>`,
+  });
+}
+$('#sweepInput').onchange = () => loadSweep().catch(e => toast(e.message, true));
+$('#sweepOutput').onchange = () => loadSweep().catch(e => toast(e.message, true));
+function renderPredictFields() {
+  const box = $('#predictFields');
+  box.innerHTML = M.summary.inputs.map(i => i.kind === 'numeric'
+    ? `<div class="field"><label>${esc(i.name)} ${i.range ? `<span class="hint">${fmt(i.range[0])} … ${fmt(i.range[1])}</span>` : ''}</label><input type="number" step="any" data-in="${esc(i.name)}" placeholder="${esc(fmt(i.typical, 6))}"></div>`
+    : `<div class="field"><label>${esc(i.name)}</label><select data-in="${esc(i.name)}"><option value="">(most common)</option>${i.classes.map(c => `<option>${esc(c)}</option>`).join('')}</select></div>`).join('');
+  $('#predictOut').innerHTML = '';
+}
+$('#typicalBtn').onclick = () => { $$('#predictFields [data-in]').forEach(e => e.value = ''); $('#predictBtn').click(); };
+$('#randomBtn').onclick = () => {
+  for (const i of M.summary.inputs) {
+    const e = $(`#predictFields [data-in="${CSS.escape(i.name)}"]`);
+    if (i.kind === 'numeric' && i.range) e.value = +(i.range[0] + Math.random() * (i.range[1] - i.range[0])).toPrecision(5);
+    else if (i.kind === 'categorical' && i.classes.length) e.value = i.classes[Math.floor(Math.random() * i.classes.length)];
+  }
+  $('#predictBtn').click();
+};
+$('#predictBtn').onclick = async () => {
+  if (M.index == null) return;
+  const row = {};
+  $$('#predictFields [data-in]').forEach(e => { if (e.value !== '') row[e.dataset.in] = e.type === 'number' ? +e.value : e.value; });
+  try {
+    const r = await api('/api/models/predict', {index: M.index, row});
+    const outs = Object.entries(r.outputs);
+    $('#predictOut').innerHTML = `<table><tbody>${outs.map(([k, v]) => `<tr><td>${esc(k)}</td><td class="${typeof v === 'number' ? 'num' : ''}"><strong>${typeof v === 'object' && v !== null ? esc(Object.entries(v).map(([c, p]) => `${c}: ${(100 * p).toFixed(1)}%`).join(' · ')) : esc(typeof v === 'number' ? fmt(v, 8) : v)}</strong></td></tr>`).join('')}</tbody></table>
+      <div class="hint" style="margin-top:4px">Blank inputs used their typical training value: ${esc(Object.entries(r.inputs).filter(([k]) => !(k in row)).map(([k, v]) => `${k}=${typeof v === 'number' ? fmt(v, 5) : v}`).join(', ') || 'none')}</div>`;
+  } catch (e) { toast(e.message, true); }
+};
+$('#batchBtn').onclick = async () => {
+  if (M.index == null) return;
+  const path = pathInputs.batch.value.trim();
+  if (!path) return toast('Choose a CSV to predict', true);
+  $('#batchBtn').disabled = true;
+  try {
+    const r = await api('/api/models/predict_csv', {index: M.index, path, delimiter: $('#batchDelimiter').value === '\\t' ? '\t' : $('#batchDelimiter').value});
+    $('#batchOut').innerHTML = `<div class="notice">${r.rows.toLocaleString()} rows written to <span class="mono">${esc(r.path)}</span> · <a href="/download?path=${encodeURIComponent(r.path)}">download</a>
+      ${r.metrics ? `<div class="hint">The file has the output column${M.summary.outputs.length > 1 ? 's' : ''}, so it was scored: loss ${fmt(r.metrics.loss)} · shape ${fmt(r.metrics.shape)}</div>` : ''}</div>
+      <div class="scroll-x"><table><thead><tr>${r.columns.map(c => `<th>${esc(c)}</th>`).join('')}</tr></thead><tbody>${r.preview.map(row => `<tr>${row.map(v => `<td>${v === null ? '' : esc(v)}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`;
+  } catch (e) { toast(e.message, true); }
+  finally { $('#batchBtn').disabled = false; }
+};
+$('#exportBtn').onclick = async () => {
+  if (M.index == null) return;
+  if (!confirm('Export this model? This overwrites best_model.py, model_tree.svg and the fixture CSVs in the working directory.')) return;
+  try { const r = await api('/api/models/export', {index: M.index}); toast('Exported: ' + r.written.map(p => p.split('/').pop()).join(', ')); }
+  catch (e) { toast(e.message, true); }
+};
+
+// ───────────── boot ─────────────
+(async function boot() {
+  $$('[data-path]').forEach(mountPathField);
+  restoreForm();
+  try {
+    OPTIONS = await api('/api/options');
+    $('#cwd').textContent = OPTIONS.cwd;
+    renderOperators(); renderAdvanced();
+  } catch (e) { toast('Could not load options: ' + e.message, true); }
+  showTab(store.get('tab', 'setup'));
+  refreshRuns();
+  if (pathInputs.dataset.value) inspect();
+  poll();
+})();
+</script>
+</body>
+</html>

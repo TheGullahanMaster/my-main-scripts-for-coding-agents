@@ -1,0 +1,988 @@
+"""Browser GUI for afpo.py: dataset setup, live training monitor, and model explorer.
+
+Start with `python afpo.py --gui` (or choose mode 3), or run `python afpo_gui.py`.
+The server listens on 127.0.0.1:8778 only.  Each training run is a child process
+(`afpo_gui.py --run SPEC`) so the page stays responsive, model scoring can still
+fork its worker pool safely, and Stop behaves exactly like the terminal's first
+Ctrl-C (finish the generation, write the checkpoint).  Outputs land where the
+CLI puts them: afpo_runs/<run>/ and best_model.py in the working directory.
+"""
+from __future__ import annotations
+
+import argparse
+import collections
+import contextlib
+import io
+import json
+import math
+import os
+import signal
+import subprocess
+import sys
+import threading
+import time
+import traceback
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+import afpo
+
+HTML = Path(__file__).with_name("afpo_gui.html")
+GUI_RUNS = Path("afpo_gui_runs")
+DEFAULT_PORT = 8778
+SNAPSHOT_INTERVAL = 1.0      # seconds between live frontier snapshots
+MAX_POPULATION_POINTS = 800
+MAX_ARCHIVE_POINTS = 400
+MAX_FIT_POINTS = 2500
+# Options with their own place in the form (or not meaningful from the GUI).
+FORM_HANDLED = {"resume", "migrate_checkpoint", "allow_unsafe_pickle", "gui", "port", "test_csv",
+                "constraint_metadata", "sequence_group", "max_generations", "population", "seed", "workers", "adf_mode", "help"}
+
+
+# ───────────────────────── helpers ─────────────────────────
+def clean(obj):
+    """NaN/inf -> None, numpy -> Python, tuples -> lists, recursively (strict JSON)."""
+    if isinstance(obj, (float, np.floating)):
+        value = float(obj)
+        return value if math.isfinite(value) else None
+    if isinstance(obj, (bool, np.bool_)):
+        return bool(obj)
+    if isinstance(obj, (int, np.integer)):
+        return int(obj)
+    if isinstance(obj, np.ndarray):
+        return clean(obj.tolist())
+    if isinstance(obj, dict):
+        return {str(k): clean(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set, frozenset)):
+        return [clean(v) for v in obj]
+    if isinstance(obj, Path):
+        return str(obj)
+    return obj
+
+
+def list_dir(path=None):
+    path = Path(path or os.getcwd()).expanduser().resolve()
+    if path.is_file():
+        path = path.parent
+    if not path.is_dir():
+        raise FileNotFoundError(path)
+    dirs, files = [], []
+    for entry in sorted(path.iterdir(), key=lambda p: p.name.lower()):
+        if entry.name.startswith("."):
+            continue
+        try:
+            if entry.is_dir():
+                dirs.append(entry.name)
+                continue
+            suffix = entry.suffix.lower()
+            kind = "csv" if suffix in (".csv", ".tsv", ".txt", ".dat") else "json" if suffix == ".json" else "file"
+            files.append({"name": entry.name, "kind": kind, "size": entry.stat().st_size, "mtime": entry.stat().st_mtime})
+        except OSError:
+            continue
+    return {"path": str(path), "parent": str(path.parent), "dirs": dirs, "files": files}
+
+
+def save_upload(name, stream, length, folder="uploads", chunk=1 << 20):
+    """Stream a browser-picked file into <cwd>/uploads without holding it in memory."""
+    name = os.path.basename(str(name or "upload.csv")).strip() or "upload.csv"
+    dest_dir = Path(os.getcwd()) / folder
+    dest_dir.mkdir(exist_ok=True)
+    dest = dest_dir / name
+    stem, suffix, n = dest.stem, dest.suffix, 1
+    while dest.exists():
+        if dest.stat().st_size == length:      # the same upload again: reuse it
+            stream.read(length)
+            return {"path": str(dest), "size": length, "reused": True}
+        dest = dest_dir / f"{stem}-{n}{suffix}"
+        n += 1
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    left = length
+    with tmp.open("wb") as f:
+        while left > 0:
+            data = stream.read(min(chunk, left))
+            if not data:
+                break
+            f.write(data)
+            left -= len(data)
+    if left:
+        tmp.unlink(missing_ok=True)
+        raise RuntimeError("Upload interrupted")
+    tmp.replace(dest)
+    return {"path": str(dest), "size": length, "reused": False}
+
+
+def resolve_path(path, must_exist=True):
+    if not path or not str(path).strip():
+        raise ValueError("A path is required")
+    resolved = Path(str(path).strip().strip('"').strip("'")).expanduser()
+    if must_exist and not resolved.is_file():
+        raise FileNotFoundError(f"No such file: {resolved}")
+    return resolved.resolve()
+
+
+def read_frame(path, delimiter):
+    return pd.read_csv(resolve_path(path), sep=delimiter or ",", engine="python")
+
+
+def _histogram(values, bins=24):
+    values = values[np.isfinite(values)]
+    if not len(values):
+        return None
+    lo, hi = float(values.min()), float(values.max())
+    if hi <= lo:
+        return {"lo": lo, "hi": hi, "counts": [int(len(values))]}
+    counts, _ = np.histogram(values, bins=bins, range=(lo, hi))
+    return {"lo": lo, "hi": hi, "counts": counts.tolist()}
+
+
+def inspect_dataset(path, delimiter=","):
+    """Columns with the CLI's default type suggestions, a histogram each, and a preview."""
+    df = read_frame(path, delimiter)
+    if not len(df.columns):
+        raise ValueError("The file has no columns")
+    usable = [i for i, c in enumerate(df.columns) if df[c].dropna().nunique() > 1]
+    suggested_output = usable[-1] if usable else -1
+    columns = []
+    for i, col in enumerate(df.columns):
+        values = df[col].dropna()
+        unique = int(values.nunique())
+        numeric = bool(pd.api.types.is_numeric_dtype(df[col]))
+        class_like = bool(numeric and unique <= 10 and len(values) and
+                          np.all(np.isclose(values.to_numpy(float), np.round(values.to_numpy(float)))))
+        if unique <= 1:
+            suggested = 0
+        elif i == suggested_output:
+            suggested = 5 if numeric else 6
+        else:
+            suggested = 1 if numeric else 2
+        info = {"index": i, "name": str(col), "numeric": numeric, "unique": unique, "missing": int(df[col].isna().sum()),
+                "constant": unique <= 1, "class_like": class_like, "suggested": suggested,
+                "examples": [str(v) for v in values.iloc[:3].tolist()]}
+        if numeric:
+            z = pd.to_numeric(df[col], errors="coerce").to_numpy(float)
+            info["hist"] = _histogram(z)
+            finite = z[np.isfinite(z)]
+            if len(finite):
+                info["min"], info["max"], info["mean"] = float(finite.min()), float(finite.max()), float(finite.mean())
+        else:
+            top = values.astype(str).value_counts().head(8)
+            info["top"] = [[str(k), int(v)] for k, v in top.items()]
+        columns.append(info)
+    preview = df.head(12).astype(object).where(df.head(12).notna(), None).values.tolist()
+    return {"path": str(resolve_path(path)), "rows": int(len(df)), "columns": columns,
+            "preview": [[None if v is None else str(v) for v in row] for row in preview]}
+
+
+def options():
+    """Everything the setup form needs, taken from afpo itself so the two cannot drift."""
+    parser = afpo.build_arg_parser()
+    advanced = []
+    for action in parser._actions:
+        if action.dest in FORM_HANDLED or not action.option_strings:
+            continue
+        kind = ("bool" if isinstance(action, argparse._StoreTrueAction) else
+                "choice" if action.choices else
+                "int" if action.type is int else "float" if action.type is float else "text")
+        advanced.append({"dest": action.dest, "flag": action.option_strings[0], "kind": kind, "default": action.default,
+                         "choices": list(action.choices) if action.choices else None,
+                         "help": (action.help or "").replace("%%", "%")})
+    defaults = {a.dest: a.default for a in parser._actions if a.option_strings}
+    groups = [{"id": gid, "name": name, "ops": list(ops), "default": gid in afpo.DEFAULT_GROUP_IDS}
+              for gid, (name, ops) in afpo.OPERATOR_GROUPS.items()]
+    return {"groups": groups, "advanced": advanced, "defaults": defaults, "profiles": list(afpo.PROFILES),
+            "adf_modes": ["off", "flat", "nested"], "cwd": os.getcwd(),
+            "op_cost": {op: afpo.OP_COMPLEXITY_BONUS.get(op, 2) for op in afpo.OPS}}
+
+
+# ───────────────────────── run specification ─────────────────────────
+def _flag(value):
+    return value is not None and str(value).strip() != ""
+
+
+def build_argv(form):
+    """Translate the form's run options into afpo command-line arguments."""
+    run = form.get("run") or {}
+    argv = []
+    for dest, flag in (("max_generations", "--max-generations"), ("population", "--population"),
+                       ("seed", "--seed"), ("workers", "--workers")):
+        if _flag(run.get(dest)):
+            argv += [flag, str(run[dest]).strip()]
+    argv += ["--adf-mode", str(run.get("adf_mode") or "nested")]
+    parser = afpo.build_arg_parser()
+    by_dest = {a.dest: a for a in parser._actions if a.option_strings}
+    for dest, value in (form.get("advanced") or {}).items():
+        action = by_dest.get(dest)
+        if action is None or dest in FORM_HANDLED:
+            continue
+        if isinstance(action, argparse._StoreTrueAction):
+            if value in (True, "true", "1", 1):
+                argv.append(action.option_strings[0])
+        elif _flag(value) and str(value) != str(action.default):
+            argv += [action.option_strings[0], str(value)]
+    data = form.get("data") or {}
+    if _flag(data.get("test_path")):
+        argv += ["--test-csv", str(resolve_path(data["test_path"]))]
+    if _flag(data.get("metadata_path")):
+        argv += ["--constraint-metadata", str(resolve_path(data["metadata_path"]))]
+    for line in str(data.get("sequence_groups") or "").splitlines():
+        if line.strip():
+            argv += ["--sequence-group", line.strip()]
+    return argv
+
+
+def parse_argv(argv):
+    """afpo.parse_cli, turning argparse's exit-on-error into a readable ValueError."""
+    captured = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(captured):
+            return afpo.parse_cli(argv)[1]
+    except SystemExit:
+        message = captured.getvalue().strip().splitlines()
+        raise ValueError(message[-1].split("error:", 1)[-1].strip() if message else "invalid options")
+
+
+def selected_operators(form):
+    ops = form.get("operators") or {}
+    groups = [str(g) for g in ops.get("groups") or []]
+    if not groups:
+        raise ValueError("Select at least one operator group")
+    excluded = set(ops.get("excluded") or [])
+    chosen = [op for op in afpo.resolve_operator_groups(groups) if op not in excluded]
+    if not chosen:
+        raise ValueError("Every operator in the selected groups is switched off")
+    return chosen
+
+
+def setup_answers(form):
+    """The JSON-safe answers to the CLI's setup prompts (the runner re-reads the CSV)."""
+    data, search = form.get("data") or {}, form.get("search") or {}
+    path = resolve_path(data.get("path"))
+    types = [int(t) for t in data.get("types") or []]
+    if not any(t in (5, 6) for t in types) or not any(t in (1, 2) for t in types):
+        raise ValueError("Select at least one input and one output column")
+    mode = data.get("validation_mode") or "percent"
+    val_path = "0" if mode == "none" else str(resolve_path(data.get("validation_path"))) if mode == "file" else ""
+    metadata = None
+    if _flag(data.get("metadata_text")) and not _flag(data.get("metadata_path")):
+        try:
+            metadata = json.loads(data["metadata_text"])
+        except ValueError as exc:
+            raise ValueError(f"Constraint metadata is not valid JSON: {exc}")
+    islands = max(1, int(search.get("islands") or 1))
+    return {"path": str(path), "delimiter": data.get("delimiter") or ",", "types": types, "ops": selected_operators(form),
+            "affine_on": bool(search.get("affine", True)), "coev": bool(search.get("coev", False)),
+            "dynamic_pressure_on": bool(search.get("dynamic_pressure", True)), "adf_enabled": bool(search.get("adf", False)),
+            "nodes": max(3, int(search.get("nodes") or 31)), "depth": max(1, int(search.get("depth") or 6)),
+            "island_count": islands,
+            "migration_interval": max(1, int(search.get("migration_interval") or 25)) if islands > 1 else 0,
+            "migrants_per_island": max(1, int(search.get("migrants") or 2)) if islands > 1 else 0,
+            "val_path": val_path, "validation_percent": float(data.get("validation_percent") or 0) if mode == "percent" else None,
+            "metadata": metadata}
+
+
+def check_form(form):
+    """Validate a start request without launching anything."""
+    mode = form.get("mode") or "train"
+    argv = build_argv(form)
+    if mode == "resume":
+        argv += ["--resume", str(resolve_path(form.get("checkpoint")))]
+        parse_argv(argv)
+        return {"ok": True, "argv": argv}
+    args = parse_argv(argv)
+    setup = setup_answers(form)
+    if setup["island_count"] > args.population // 8:
+        raise ValueError("Island count needs at least eight models per island; raise the population or choose fewer islands")
+    df = read_frame(setup["path"], setup["delimiter"])
+    if len(setup["types"]) != len(df.columns):
+        raise ValueError(f"The column types list has {len(setup['types'])} entries but the file has {len(df.columns)} columns; inspect the dataset again")
+    return {"ok": True, "argv": argv, "operators": len(setup["ops"]), "rows": int(len(df))}
+
+
+# ───────────────────────── training child process ─────────────────────────
+class Telemetry:
+    """Turns afpo.PROGRESS_HOOK calls into JSON lines the GUI server tails."""
+
+    def __init__(self, stream, island_count):
+        self.stream, self.island_count = stream, max(1, int(island_count))
+        self.islands = {}          # id(archive) -> index
+        self.latest = {}           # index -> latest hook kwargs
+        self.last_snapshot = 0.
+        self.validation_cache = {}
+        self.announced = False
+
+    def emit(self, kind, **data):
+        self.stream.write(json.dumps(clean({"kind": kind, "time": time.time(), **data}), allow_nan=False) + "\n")
+        self.stream.flush()
+
+    def _validation(self, model, Xv, Yv, cats, constraints, out_names):
+        if model is None or Xv is None:
+            return None
+        key = (repr(model.trees), repr(model.scales))
+        if key not in self.validation_cache:
+            if len(self.validation_cache) > 2000:
+                self.validation_cache.clear()
+            try:
+                self.validation_cache[key] = afpo.frozen_metrics(model, Xv, Yv, cats, constraints, out_names)["loss"]
+            except (ArithmeticError, IndexError, RecursionError, ValueError):
+                self.validation_cache[key] = None
+        return self.validation_cache[key]
+
+    def hook(self, **kw):
+        island = self.islands.setdefault(id(kw["archive"]), len(self.islands))
+        self.latest[island] = kw
+        names, out_names, cats = kw["names"], kw["out_names"], kw["cats"]
+        if not self.announced:
+            self.announced = True
+            self.emit("config", names=names, outputs=out_names, cats=cats, islands=self.island_count,
+                      train_rows=len(kw["Xt"]), validation_rows=0 if kw["Xv"] is None else len(kw["Xv"]))
+        best = kw["best_so_far"]
+        population = [m for m in kw["population"] if m.feasible]
+        losses = [afpo.aggregate_loss(m) for m in population]
+        finite = [v for v in losses if math.isfinite(v)]
+        self.emit("gen", generation=kw["generation"], island=island, elapsed=time.time() - kw["started"],
+                  best_loss=None if best is None else afpo.aggregate_loss(best),
+                  best_bits=None if best is None else afpo.model_complexity(best),
+                  best_validation=self._validation(best, kw["Xv"], kw["Yv"], cats, kw["constraints"], out_names),
+                  population_median=float(np.median(finite)) if finite else None,
+                  feasible=len(population) / max(1, len(kw["population"])), archive=len(kw["archive"].items))
+        now = time.time()
+        if kw["generation"] == 0 or now - self.last_snapshot >= SNAPSHOT_INTERVAL:
+            self.last_snapshot = now
+            self.snapshot(kw["generation"])
+
+    def _point(self, model, names, out_names, cats, equation=False):
+        loss, bits = afpo.aggregate_loss(model), afpo.model_complexity(model)
+        if not (model.feasible and math.isfinite(loss) and math.isfinite(bits)):
+            return None
+        point = {"loss": loss, "bits": bits, "age": int(model.age), "origin": model.origin or "seed",
+                 "nodes": int(sum(afpo.node_size(t) for t in model.trees))}
+        if equation:
+            point["equation"] = afpo.equations(model, names, out_names, cats)
+        return point
+
+    def snapshot(self, generation):
+        any_kw = next(iter(self.latest.values()))
+        names, out_names, cats = any_kw["names"], any_kw["out_names"], any_kw["cats"]
+        archive, population, origins, stats = [], [], collections.Counter(), []
+        best = None
+        for index in sorted(self.latest):
+            kw = self.latest[index]
+            for model in kw["archive"].items[:MAX_ARCHIVE_POINTS]:
+                point = self._point(model, names, out_names, cats, equation=True)
+                if point:
+                    point["island"] = index
+                    archive.append(point)
+            for model in kw["population"]:
+                origins[model.origin or "seed"] += 1
+                point = self._point(model, names, out_names, cats)
+                if point and len(population) < MAX_POPULATION_POINTS:
+                    point["island"] = index
+                    population.append(point)
+            candidate = kw["best_so_far"]
+            if candidate is not None and (best is None or afpo.secondary_key(candidate) < afpo.secondary_key(best[0])):
+                best = (candidate, kw)
+            prefix = f"island {index + 1}: " if len(self.latest) > 1 else ""
+            for item in (kw["archive"].stats(), kw["pressure"].stats(), kw["semantic_qd"].stats(), kw["structural_qd"].stats(),
+                         kw["qd_controller"].stats(), kw["library"].stats() if kw["library"] is not None else None):
+                if item:
+                    stats.append(prefix + item)
+            if kw["evaluator"] is not None:
+                stats.append(prefix + "evaluator: " + ", ".join(f"{k}={v}" for k, v in kw["evaluator"].diagnostics().items()))
+        best_info = None
+        if best is not None:
+            model, kw = best
+            best_info = self._point(model, names, out_names, cats, equation=True)
+            if best_info:
+                best_info["validation"] = self._validation(model, kw["Xv"], kw["Yv"], cats, kw["constraints"], out_names)
+                best_info["losses"] = list(afpo.model_losses(model))
+        self.emit("snapshot", generation=generation, archive=archive, population=population,
+                  origins=dict(origins.most_common()), best=best_info, stats=stats)
+
+    def choose(self, labels, choices, evaluation):
+        """Offer the CLI's save choices to the browser and wait for its pick on stdin."""
+        source, entries = evaluation
+        any_kw = next(iter(self.latest.values()), None)
+        names = any_kw["names"] if any_kw else None
+        out_names = any_kw["out_names"] if any_kw else None
+        cats = any_kw["cats"] if any_kw else None
+        items = []
+        for label, model in zip(labels, choices):
+            metrics = next((e[2] for e in entries if e[0] is model), {})
+            items.append({"label": label, "metrics": metrics, "train_loss": afpo.aggregate_loss(model),
+                          "equation": afpo.equations(model, names, out_names, cats) if names else repr(model.trees)})
+        self.emit("choose", source=source, options=items)
+        line = sys.stdin.readline()
+        try:
+            index = int(line.strip() or 0)
+        except ValueError:
+            index = 0
+        index = max(0, min(len(choices) - 1, index))
+        self.emit("chosen", index=index, label=labels[index])
+        return index
+
+
+def run_spec(spec_path):
+    """Entry point of the training child process."""
+    spec = json.loads(Path(spec_path).read_text())
+    with open(spec["events"], "a", encoding="utf-8") as stream:
+        telemetry = Telemetry(stream, (spec.get("setup") or {}).get("island_count", 1))
+        telemetry.emit("started", pid=os.getpid(), mode=spec["mode"], argv=spec["argv"])
+        try:
+            args = afpo.parse_cli(spec["argv"])[1]
+            afpo.PROGRESS_HOOK = telemetry.hook
+            if spec["mode"] == "resume":
+                afpo.resume_main(args)
+                telemetry.emit("done", checkpoint=str(Path(args.resume).resolve()), best_model=str(Path("best_model.py").resolve()))
+                return 0
+            answers = spec["setup"]
+            df = pd.read_csv(answers["path"], sep=answers["delimiter"], engine="python")
+            print(f"Loaded {len(df):,} rows and {len(df.columns)} columns: {list(df.columns)}")
+            if len(answers["types"]) != len(df.columns):
+                raise ValueError("Column types do not match the dataset's columns")
+            setup = {**answers, "path": Path(answers["path"]), "df": df}
+            print(f"Operators ({len(setup['ops'])}): {', '.join(setup['ops'])}")
+            print("Structural objective = MDL model-description bits (uniform enabled grammar; exact constants and affine coefficients included).")
+            result = afpo.train_from_setup(args, setup, choose_model=telemetry.choose)
+            telemetry.emit("done", **result, best_model=str(Path("best_model.py").resolve()))
+            return 0
+        except KeyboardInterrupt:
+            telemetry.emit("error", message="Interrupted before the run could finish")
+            return 130
+        except BaseException as exc:          # the GUI must learn about every failure
+            traceback.print_exc()
+            telemetry.emit("error", message=f"{type(exc).__name__}: {exc}")
+            return 1
+
+
+class TrainingSession:
+    """One training child process at a time, plus the tail of its console and events."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.proc = None
+        self.run_dir = None
+        self.reset()
+
+    def reset(self):
+        self.events_offset = self.console_offset = 0
+        self.history = []
+        self.snapshot = None
+        self.snapshot_seq = 0
+        self.config = None
+        self.choose = None
+        self.done = None
+        self.error = None
+        self.console = collections.deque(maxlen=4000)
+        self.console_count = 0
+        self.stop_requests = 0
+        self.started_at = None
+        self.mode = None
+        self.chosen = None
+
+    def running(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def start(self, form):
+        with self.lock:
+            if self.running():
+                raise RuntimeError("A run is already in progress; stop it first")
+            info = check_form(form)
+            if self.proc is not None and self.proc.stdin and not self.proc.stdin.closed:
+                self.proc.stdin.close()
+            mode = form.get("mode") or "train"
+            argv = info["argv"]
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            run_dir = GUI_RUNS / stamp
+            suffix = 1
+            while run_dir.exists():
+                suffix += 1
+                run_dir = GUI_RUNS / f"{stamp}-{suffix}"
+            run_dir.mkdir(parents=True)
+            spec = {"mode": mode, "argv": argv, "events": str((run_dir / "events.jsonl").resolve()),
+                    "setup": setup_answers(form) if mode == "train" else None, "form": form}
+            (run_dir / "spec.json").write_text(json.dumps(clean(spec), indent=2))
+            (run_dir / "events.jsonl").touch()
+            self.reset()
+            self.run_dir, self.mode, self.started_at = run_dir, mode, time.time()
+            log = open(run_dir / "console.log", "wb")
+            env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+            # A new session keeps a Ctrl-C in the GUI's terminal from also hitting
+            # the run; Stop sends the run its own SIGINT instead.
+            self.proc = subprocess.Popen([sys.executable, "-u", str(Path(__file__).resolve()), "--run", str(run_dir / "spec.json")],
+                                         stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT, cwd=os.getcwd(),
+                                         env=env, start_new_session=True)
+            log.close()
+            return {"started": True, "run_dir": str(run_dir.resolve()), "argv": argv}
+
+    def stop(self):
+        with self.lock:
+            if not self.running():
+                return {"stopping": False}
+            if self.choose is not None and self.chosen is None:
+                raise RuntimeError("The search has finished; pick a model to save instead")
+            self.stop_requests += 1
+            os.kill(self.proc.pid, signal.SIGINT)
+            return {"stopping": True, "requests": self.stop_requests}
+
+    def pick(self, index):
+        with self.lock:
+            if not self.running() or self.choose is None:
+                raise RuntimeError("No run is waiting for a model choice")
+            if self.chosen is not None:
+                raise RuntimeError("A model was already chosen")
+            self.chosen = int(index)
+            self.proc.stdin.write(f"{int(index)}\n".encode())
+            self.proc.stdin.flush()
+            return {"chosen": int(index)}
+
+    def _read_new(self):
+        if self.run_dir is None:
+            return
+        events = self.run_dir / "events.jsonl"
+        with events.open("rb") as handle:
+            handle.seek(self.events_offset)
+            data = handle.read()
+        complete = data[:data.rfind(b"\n") + 1]
+        self.events_offset += len(complete)
+        for line in complete.decode("utf-8", "replace").splitlines():
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            kind = event.get("kind")
+            if kind == "gen":
+                self.history.append({k: event.get(k) for k in ("generation", "island", "elapsed", "best_loss", "best_bits",
+                                                              "best_validation", "population_median", "feasible", "archive")})
+            elif kind == "snapshot":
+                self.snapshot = event
+                self.snapshot_seq += 1
+            elif kind == "config":
+                self.config = event
+            elif kind == "choose":
+                self.choose = event
+            elif kind == "done":
+                self.done = event
+            elif kind == "error":
+                self.error = event.get("message")
+        log = self.run_dir / "console.log"
+        if log.exists():
+            with log.open("rb") as handle:
+                handle.seek(self.console_offset)
+                data = handle.read()
+            complete = data[:data.rfind(b"\n") + 1]
+            self.console_offset += len(complete)
+            for line in complete.decode("utf-8", "replace").splitlines():
+                if line.strip():
+                    self.console.append(line)
+                    self.console_count += 1
+
+    def status(self, since=0, console_since=0, snapshot_seq=0):
+        with self.lock:
+            self._read_new()
+            code = None if self.proc is None else self.proc.poll()
+            if code is not None and self.proc.stdin and not self.proc.stdin.closed:
+                self.proc.stdin.close()
+            if self.proc is None:
+                state = "idle"
+            elif code is None:
+                state = ("choosing" if self.choose is not None and self.chosen is None else
+                         "saving" if self.chosen is not None else
+                         "stopping" if self.stop_requests else "running")
+            else:
+                state = "finished" if code == 0 and self.done is not None else "failed"
+            since = max(0, int(since or 0))
+            console_since = max(0, int(console_since or 0))
+            first = self.console_count - len(self.console)
+            return {"state": state, "returncode": code, "mode": self.mode,
+                    "run_dir": None if self.run_dir is None else str(self.run_dir.resolve()),
+                    "started_at": self.started_at, "history_total": len(self.history), "history": self.history[since:],
+                    "snapshot_seq": self.snapshot_seq,
+                    "snapshot": self.snapshot if int(snapshot_seq or 0) != self.snapshot_seq else None,
+                    "config": self.config, "choose": self.choose if self.chosen is None else None, "chosen": self.chosen,
+                    "done": self.done, "error": self.error, "stop_requests": self.stop_requests,
+                    "console_total": self.console_count, "console": list(self.console)[max(0, console_since - first):]}
+
+    def shutdown(self):
+        if self.running():
+            print("A training run is still active: asking it to stop after this generation and save its checkpoint.", flush=True)
+            try:
+                if self.choose is None:
+                    os.kill(self.proc.pid, signal.SIGINT)
+                self.proc.stdin.close()     # an unanswered model choice falls back to Best Score
+            except OSError:
+                pass
+
+
+# ───────────────────────── model explorer ─────────────────────────
+class ModelExplorer:
+    """Loads a checkpoint in the GUI process to browse, plot, predict with and export its models."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.state = None
+        self.models = []
+        self.path = None
+        self.files = {}
+
+    def _require(self):
+        if self.state is None:
+            raise RuntimeError("Load a checkpoint first")
+
+    def load(self, path):
+        path = resolve_path(path)
+        with self.lock:
+            generation, pop, bayes, archive, state = afpo.load_checkpoint(path, allow_unsafe_pickle=False)
+            maps = state["maps"]
+            afpo.SEQUENCE_LAYOUT = maps.get(afpo.SEQUENCE_LAYOUT_KEY)
+            tolerance = state.get("parsimony_quality_tolerance", 0.)
+            if state.get("island_states"):
+                islands = [afpo.island_from_snapshot(item, len(state["Xt"]), tolerance) for item in state["island_states"]]
+                pool = [m for island in islands for m in [*island.archive.items, island.best_models.model] if m is not None]
+                populations = [m for island in islands for m in island.population]
+            else:
+                pool, populations = list(archive.items), list(pop)
+                best = state.get("best_model", {}).get("model")
+                if best:
+                    pool.append(afpo.Model(**best))
+            constraints = afpo.compile_constraints(state.get("profile", "general"), state.get("constraint_metadata", {}))
+            cats, names, out_names = state["cats"], state["names"], state["out_names"]
+            Xt, Yt, Xv, Yv = state["Xt"], state["Yt"], state.get("Xv"), state.get("Yv")
+            loss_tolerance = state.get("selection_loss_tolerance", .01)
+            candidates = afpo.unique_models([*pool, *populations])
+            evaluation = afpo.selection_evaluation(candidates, Xv, Yv, cats, constraints, out_names)
+            labels, choices, selection = afpo.model_options([e[0] for e in evaluation[1]], cats=cats, loss_tolerance=loss_tolerance, evaluation=evaluation)
+            recommended = {id(model): label for label, model in zip(labels, choices)}
+            pool_ids = {afpo.selection_identity(m) for m in pool}
+            frontier_ids = {id(e[0]) for e in afpo.selection_frontier(evaluation[1])}
+            entries = [e for e in evaluation[1] if afpo.selection_identity(e[0]) in pool_ids or id(e[0]) in recommended or id(e[0]) in frontier_ids]
+            entries.sort(key=lambda e: (e[2]["mdl_bits"], e[2]["loss"]))
+            self.models = []
+            for model, scored, metrics in entries:
+                train = afpo.frozen_metrics(model, Xt, Yt, cats, constraints, out_names)
+                self.models.append({"model": model, "metrics": metrics, "train": train,
+                                    "label": recommended.get(id(model)), "frontier": id(model) in frontier_ids})
+            self.state, self.path, self.constraints = state, path, constraints
+            self.generation = generation
+            saved = state.get("selection") or {}
+            return self.summary(saved)
+
+    def summary(self, saved=None):
+        state = self.state
+        out = []
+        for index, item in enumerate(self.models):
+            model = item["model"]
+            out.append({"index": index, "label": item["label"], "frontier": item["frontier"],
+                        "equation": afpo.equations(model, state["names"], state["out_names"], state["cats"]),
+                        "bits": item["metrics"]["mdl_bits"], "loss": item["metrics"]["loss"], "shape": item["metrics"]["shape"],
+                        "train_loss": item["train"]["loss"], "nodes": int(sum(afpo.node_size(t) for t in model.trees)),
+                        "age": int(model.age), "origin": model.origin})
+        inputs = []
+        for column, kind in zip(state["source_columns"], state["types"]):
+            if kind == 1:
+                inputs.append({"name": column, "kind": "numeric", "range": (state.get("input_ranges") or {}).get(column),
+                               "typical": state["maps"].get("__afpo_numeric_fills__", {}).get(column)})
+            elif kind == 2:
+                inputs.append({"name": column, "kind": "categorical", "classes": state["maps"].get(column, [])})
+        return {"path": str(self.path), "generation": self.generation, "source": "validation" if state.get("Xv") is not None else "training",
+                "outputs": state["out_names"], "cats": state["cats"], "inputs": inputs, "models": out,
+                "dataset": state.get("dataset_path"), "seed": state.get("run_seed"),
+                "train_rows": len(state["Xt"]), "validation_rows": 0 if state.get("Xv") is None else len(state["Xv"]),
+                "saved_selection": (saved or {}).get("selected_choice"), "manifest": state.get("manifest")}
+
+    def _model(self, index):
+        self._require()
+        index = int(index)
+        if not 0 <= index < len(self.models):
+            raise ValueError("Unknown model index")
+        return self.models[index]["model"]
+
+    def detail(self, index):
+        with self.lock:
+            model, state = self._model(index), self.state
+            names, out_names, cats = state["names"], state["out_names"], state["cats"]
+            item = self.models[int(index)]
+            validation = (afpo.frozen_metrics(model, state["Xv"], state["Yv"], cats, self.constraints, out_names)
+                          if state.get("Xv") is not None else None)
+            per_output = [{"name": name, "train_loss": item["train"]["losses"][j],
+                           "validation_loss": None if validation is None else validation["losses"][j]}
+                          for j, name in enumerate(out_names)]
+            return {"index": int(index), "label": item["label"], "equations": afpo.equations(model, names, out_names, cats).split("; "),
+                    "adfs": afpo.adf_display_definitions(model, names),
+                    "constants": [list(afpo.constant_vector(tree)) for tree in model.trees],
+                    "scales": [list(scale) for scale in model.scales], "metrics": item["metrics"], "train": item["train"],
+                    "per_output": per_output, "svg": afpo.tree_map_svg(model, names, out_names, cats),
+                    "nodes": int(sum(afpo.node_size(t) for t in model.trees)), "age": int(model.age), "origin": model.origin,
+                    "features_used": [names[i] for i in afpo.used_feature_indices(model) if i < len(names)]}
+
+    def fit(self, index, split="train"):
+        """Predicted vs. actual (regression) or a confusion matrix (classification)."""
+        with self.lock:
+            model, state = self._model(index), self.state
+            X, Y = (state["Xv"], state["Yv"]) if split == "validation" and state.get("Xv") is not None else (state["Xt"], state["Yt"])
+            prediction = afpo.predict_targets(model, X, state["cats"])
+            rows = np.arange(len(X))
+            if len(rows) > MAX_FIT_POINTS:
+                rows = np.random.default_rng(0).choice(rows, MAX_FIT_POINTS, replace=False)
+            outputs = []
+            for j, (name, labels) in enumerate(zip(state["out_names"], state["cats"])):
+                if labels is None:
+                    residual = prediction[:, j] - Y[:, j]
+                    outputs.append({"name": name, "kind": "regression", "actual": Y[rows, j], "predicted": prediction[rows, j],
+                                    "residual_hist": _histogram(residual, 30),
+                                    "rmse": float(np.sqrt(np.mean(residual ** 2))), "mae": float(np.mean(np.abs(residual))),
+                                    "r2": float(1 - np.sum(residual ** 2) / max(np.sum((Y[:, j] - Y[:, j].mean()) ** 2), afpo.EPS))})
+                else:
+                    k = len(labels)
+                    matrix = np.zeros((k, k), dtype=int)
+                    truth, guess = Y[:, j].astype(int), prediction[:, j].astype(int)
+                    for t, g in zip(truth, guess):
+                        if 0 <= t < k and 0 <= g < k:
+                            matrix[t, g] += 1
+                    outputs.append({"name": name, "kind": "classification", "labels": labels, "matrix": matrix,
+                                    "accuracy": float(np.mean(truth == guess))})
+            return {"split": "validation" if X is state.get("Xv") else "train", "rows": len(X), "outputs": outputs}
+
+    def _encode(self, rows):
+        state = self.state
+        frame = pd.DataFrame([{column: row.get(column) for column in state["source_columns"]} for row in rows],
+                             columns=state["source_columns"])
+        for column, kind in zip(state["source_columns"], state["types"]):
+            if kind == 1:
+                frame[column] = pd.to_numeric(frame[column], errors="coerce")
+        return afpo.encode(frame, state["types"], state["maps"])[0]
+
+    def _typical_row(self):
+        state = self.state
+        row = {}
+        fills = state["maps"].get("__afpo_numeric_fills__", {})
+        for column, kind in zip(state["source_columns"], state["types"]):
+            if kind == 1:
+                row[column] = fills.get(column, 0.)
+            elif kind == 2:
+                classes = state["maps"].get(column, [])
+                columns = [state["names"].index(f"{column}={cl}") for cl in classes if f"{column}={cl}" in state["names"]]
+                counts = state["Xt"][:, columns].sum(axis=0) if columns else []
+                row[column] = classes[int(np.argmax(counts))] if len(counts) else (classes[0] if classes else None)
+        return row
+
+    def _decode(self, model, X):
+        state = self.state
+        values, distributions = afpo.predict_targets(model, X, state["cats"], probabilities=True)
+        results = []
+        for r in range(len(X)):
+            row = {}
+            for j, (name, labels) in enumerate(zip(state["out_names"], state["cats"])):
+                if labels is None:
+                    row[name] = float(values[r, j])
+                else:
+                    label_index = int(values[r, j])
+                    row[name] = labels[label_index] if 0 <= label_index < len(labels) else None
+                    if distributions[j] is not None and distributions[j].shape[1] == len(labels):
+                        row[name + " probabilities"] = {str(labels[c]): float(distributions[j][r, c]) for c in range(len(labels))}
+            results.append(row)
+        return results
+
+    def predict(self, index, row):
+        with self.lock:
+            model = self._model(index)
+            full = {**self._typical_row(), **{k: v for k, v in (row or {}).items() if v not in (None, "")}}
+            return {"inputs": full, "outputs": self._decode(model, self._encode([full]))[0]}
+
+    def sweep(self, index, column, points=120):
+        """One input varied over its training range, the others held at typical values."""
+        with self.lock:
+            model, state = self._model(index), self.state
+            if column not in state["source_columns"]:
+                raise ValueError(f"Unknown input column {column!r}")
+            kind = state["types"][state["source_columns"].index(column)]
+            base = self._typical_row()
+            if kind == 1:
+                lo, hi = (state.get("input_ranges") or {}).get(column, [0., 1.])
+                pad = .05 * (hi - lo) if hi > lo else .5
+                xs = np.linspace(lo - pad, hi + pad, int(points)).tolist()
+            elif kind == 2:
+                xs = list(state["maps"].get(column, []))
+            else:
+                raise ValueError(f"{column!r} is not a model input")
+            decoded = self._decode(model, self._encode([{**base, column: x} for x in xs]))
+            data = []
+            if kind == 1 and column in state["names"]:
+                feature = state["names"].index(column)
+                rows = np.arange(len(state["Xt"]))
+                if len(rows) > MAX_FIT_POINTS:
+                    rows = np.random.default_rng(1).choice(rows, MAX_FIT_POINTS, replace=False)
+                data = {"x": state["Xt"][rows, feature], "y": {name: state["Yt"][rows, j] for j, (name, labels) in enumerate(zip(state["out_names"], state["cats"])) if labels is None}}
+            return {"column": column, "kind": "numeric" if kind == 1 else "categorical", "x": xs, "base": base,
+                    "outputs": {name: [row.get(name) for row in decoded] for name in state["out_names"]}, "data": data}
+
+    def predict_csv(self, index, path, delimiter=","):
+        with self.lock:
+            model, state = self._model(index), self.state
+            frame = read_frame(path, delimiter)
+            missing = [c for c, k in zip(state["source_columns"], state["types"]) if k in (1, 2) and c not in frame.columns]
+            if missing:
+                raise ValueError(f"The CSV lacks input column(s): {', '.join(missing)}")
+            rows = frame.to_dict("records")
+            X = self._encode(rows)
+            decoded = self._decode(model, X)
+            result = frame.copy()
+            for name in state["out_names"]:
+                result[f"predicted_{name}"] = [row.get(name) for row in decoded]
+            destination = Path(os.getcwd()) / f"afpo_predictions_{Path(path).stem}.csv"
+            result.to_csv(destination, index=False)
+            self.files[str(destination.resolve())] = True
+            metrics = None
+            if all(name in frame.columns for name in state["out_names"]):
+                Xe, Ye, *_ = afpo.encode(frame[state["source_columns"]] if all(c in frame.columns for c in state["source_columns"]) else
+                                         frame.reindex(columns=state["source_columns"]), state["types"], state["maps"])
+                metrics = afpo.frozen_metrics(model, Xe, Ye, state["cats"], self.constraints, state["out_names"])
+            preview = result.head(25).astype(object).where(result.head(25).notna(), None)
+            return {"path": str(destination.resolve()), "rows": int(len(result)), "columns": [str(c) for c in result.columns],
+                    "preview": [[None if v is None else str(v) for v in row] for row in preview.values.tolist()], "metrics": metrics}
+
+    def export(self, index):
+        with self.lock:
+            model, state = self._model(index), self.state
+            afpo.export_model(model, state["names"], state["out_names"], state["cats"], state["maps"], state["source_columns"],
+                              state["types"], state.get("export_fixture"), state.get("input_ranges"))
+            written = [p for p in ("best_model.py", "model_tree.svg", "best_model_fixture.csv", "best_model_fixture_predictions.csv") if Path(p).exists()]
+            return {"written": [str(Path(p).resolve()) for p in written],
+                    "equation": afpo.equations(model, state["names"], state["out_names"], state["cats"])}
+
+
+def recent_runs(limit=30):
+    """afpo_runs/* newest first, with enough detail to pick one."""
+    root = Path("afpo_runs")
+    runs = []
+    if root.is_dir():
+        for run in sorted((p for p in root.iterdir() if p.is_dir()), key=lambda p: p.stat().st_mtime, reverse=True)[:limit]:
+            checkpoint = run / "checkpoint_latest.json"
+            info = {"name": run.name, "path": str(run.resolve()), "checkpoint": str(checkpoint.resolve()) if checkpoint.exists() else None,
+                    "modified": (checkpoint if checkpoint.exists() else run).stat().st_mtime, "model_card": (run / "model_card.json").exists()}
+            try:
+                manifest = json.loads((run / "manifest.json").read_text())
+                info["dataset"] = manifest.get("dataset", {}).get("path")
+                info["rows"] = manifest.get("dataset", {}).get("rows")
+                info["seed"] = manifest.get("seed")
+            except (OSError, ValueError):
+                pass
+            runs.append(info)
+    return {"runs": runs}
+
+
+# ───────────────────────── HTTP server ─────────────────────────
+def run_gui(host="127.0.0.1", port=DEFAULT_PORT, open_browser=True):
+    import webbrowser
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import parse_qs, urlparse
+
+    session, explorer = TrainingSession(), ModelExplorer()
+    routes = {
+        "/api/options": lambda b: options(),
+        "/api/fs": lambda b: list_dir(b.get("path")),
+        "/api/dataset/inspect": lambda b: inspect_dataset(b["path"], b.get("delimiter") or ","),
+        "/api/train/check": lambda b: check_form(b),
+        "/api/train/start": lambda b: session.start(b),
+        "/api/train/stop": lambda b: session.stop(),
+        "/api/train/choose": lambda b: session.pick(b["index"]),
+        "/api/train/status": lambda b: session.status(b.get("since", 0), b.get("console_since", 0), b.get("snapshot_seq", 0)),
+        "/api/runs": lambda b: recent_runs(),
+        "/api/models/load": lambda b: explorer.load(b["path"]),
+        "/api/models/detail": lambda b: explorer.detail(b["index"]),
+        "/api/models/fit": lambda b: explorer.fit(b["index"], b.get("split", "train")),
+        "/api/models/predict": lambda b: explorer.predict(b["index"], b.get("row") or {}),
+        "/api/models/sweep": lambda b: explorer.sweep(b["index"], b["column"]),
+        "/api/models/predict_csv": lambda b: explorer.predict_csv(b["index"], b["path"], b.get("delimiter") or ","),
+        "/api/models/export": lambda b: explorer.export(b["index"]),
+    }
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def _send(self, code, body, ctype="application/json", extra=None):
+            data = body if isinstance(body, bytes) else json.dumps(clean(body), allow_nan=False, default=str).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            for key, value in (extra or {}).items():
+                self.send_header(key, value)
+            self.end_headers()
+            self.wfile.write(data)
+
+        def _handle(self, body):
+            path = urlparse(self.path).path
+            if path in ("/", "/index.html"):
+                return self._send(200, HTML.read_bytes(), "text/html; charset=utf-8")
+            if path == "/favicon.ico":
+                return self._send(204, b"", "image/x-icon")
+            if path == "/download":
+                # Only files this GUI wrote (prediction CSVs) can be downloaded.
+                target = str(Path(body.get("path", "")).resolve())
+                if target not in explorer.files or not Path(target).is_file():
+                    return self._send(404, {"error": "unknown file"})
+                return self._send(200, Path(target).read_bytes(), "text/csv",
+                                  {"Content-Disposition": f'attachment; filename="{Path(target).name}"'})
+            try:
+                if path not in routes:
+                    return self._send(404, {"error": f"unknown route {path}"})
+                self._send(200, routes[path](body))
+            except Exception as exc:
+                if not isinstance(exc, (ValueError, KeyError, FileNotFoundError, RuntimeError)):
+                    traceback.print_exc()
+                self._send(400, {"error": f"{type(exc).__name__}: {exc}"})
+
+        def do_GET(self):
+            self._handle({k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()})
+
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length") or 0)
+            url = urlparse(self.path)
+            if url.path == "/api/upload":
+                try:
+                    name = parse_qs(url.query).get("name", ["upload.csv"])[0]
+                    return self._send(200, save_upload(name, self.rfile, n))
+                except Exception as exc:
+                    return self._send(400, {"error": f"{type(exc).__name__}: {exc}"})
+            try:
+                body = json.loads(self.rfile.read(n) or b"{}")
+            except ValueError:
+                return self._send(400, {"error": "invalid JSON body"})
+            self._handle(body)
+
+    server = None
+    for p in range(int(port), int(port) + 20):
+        try:
+            server = ThreadingHTTPServer((host, p), Handler)
+            break
+        except OSError:
+            continue
+    if server is None:
+        raise OSError(f"No free port in {port}-{int(port) + 19}")
+    url = f"http://{host}:{server.server_address[1]}/"
+    if server.server_address[1] != int(port):
+        print(f"Port {port} is busy; using {server.server_address[1]} instead.", flush=True)
+    print(f"AFPO GUI running at {url}  (Ctrl+C to stop; working directory {os.getcwd()})", flush=True)
+    if open_browser:
+        threading.Timer(0.5, lambda: webbrowser.open(url)).start()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopping GUI.")
+    finally:
+        session.shutdown()
+        server.server_close()
+
+
+if __name__ == "__main__":
+    cli = argparse.ArgumentParser(description="Browser GUI for afpo.py")
+    cli.add_argument("--port", type=int, default=DEFAULT_PORT)
+    cli.add_argument("--no-browser", action="store_true", help="Do not open a browser tab")
+    cli.add_argument("--run", metavar="SPEC", help=argparse.SUPPRESS)
+    options_ = cli.parse_args()
+    if options_.run:
+        sys.exit(run_spec(options_.run))
+    run_gui(port=options_.port, open_browser=not options_.no_browser)
