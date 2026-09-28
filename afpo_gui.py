@@ -24,10 +24,13 @@ import time
 import traceback
 from pathlib import Path
 
+# afpo must load before numpy: it pins the BLAS pool to one thread, which
+# only works before numpy starts.  Imported the other way round, every training
+# run and its workers got a 16-thread pool and ran ~40x slower.
+import afpo
+
 import numpy as np
 import pandas as pd
-
-import afpo
 
 HTML = Path(__file__).with_name("afpo_gui.html")
 GUI_RUNS = Path("afpo_gui_runs")

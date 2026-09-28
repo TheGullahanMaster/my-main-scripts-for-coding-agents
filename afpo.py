@@ -2365,9 +2365,29 @@ def objective_labels(output_names, include_violations=False):
     if include_violations: labels+=tuple(f"{name}:constraint_violation" for name in output_names)
     return labels+("mdl_bits","age")
 
+# Behavioural heuristics -- duplicate detection, fragment mining, the Bayesian
+# proposal model and the mutation step-size guard -- only need to tell models
+# apart, not to score them.  They ran on every training row in the parent
+# process, which no worker can share: ~60% of a generation at 100k rows, so 15
+# workers ran no faster than one.  Above this many rows they use one fixed
+# random subset; survival and selection scores still use every row.
+BEHAVIOUR_PROBE_ROWS = 1024
+_BEHAVIOUR_INDICES={}
+def behaviour_rows(X, Y=None):
+    """X (and Y) themselves up to BEHAVIOUR_PROBE_ROWS rows, else the same fixed random rows of both."""
+    if not isinstance(X,np.ndarray) or X.ndim!=2 or len(X)<=BEHAVIOUR_PROBE_ROWS:
+        return X if Y is None else (X,Y)
+    rows=_BEHAVIOUR_INDICES.get(len(X))
+    if rows is None:
+        # Seeded by the row count alone: deterministic, and the run's own RNG
+        # streams are untouched, so seeded runs stay reproducible.
+        rows=np.sort(np.random.default_rng(len(X)).choice(len(X),BEHAVIOUR_PROBE_ROWS,replace=False))
+        _BEHAVIOUR_INDICES[len(X)]=rows
+    return row_subset(X,rows) if Y is None else (row_subset(X,rows),row_subset(Y,rows))
+
 def semantic_key(model, X, decimals=8):
-    """Stable behavioral identity on the active evaluation sample."""
-    return np.round(predict_model(model,X),decimals).tobytes()
+    """Stable behavioral identity on the active evaluation sample (a fixed subset of it on large data)."""
+    return np.round(predict_model(model,behaviour_rows(X)),decimals).tobytes()
 def novelty_pool(models, X):
     """One best representative per structural and behavioral identity."""
     structural={}
@@ -4193,16 +4213,18 @@ def evolve_generation(pop, generation, *, X, Xt, Yt, Xv, Yv, cats, constraints, 
     else: active_ops=list(ops)
     pressure.observe(generation,quality_improved,(semantic_qd,structural_qd)); pressure.apply(bayes,qd_controller)
     diverse=[*semantic_qd.cells.values(),*structural_qd.cells.values()]
-    if isinstance(bayes,PerOutputBayesianBanks): bayes.update(stable_elite,cats,Xt,Yt,diverse,affine_on=affine_on)
-    else: bayes.update(stable_elite,Xt,Yt,cats,diverse)
-    if generation%5==0: bayes.rejuvenate_particles(Xt,Yt,affine_on,cats,nodes,depth)
+    Xb,Yb=behaviour_rows(Xt,Yt)
+    if isinstance(bayes,PerOutputBayesianBanks): bayes.update(stable_elite,cats,Xb,Yb,diverse,affine_on=affine_on)
+    else: bayes.update(stable_elite,Xb,Yb,cats,diverse)
+    if generation%5==0: bayes.rejuvenate_particles(Xb,Yb,affine_on,cats,nodes,depth)
     if generation%10==0 and Xv is not None:
         bayes.record_predictive_check(Xv,Yv,cats,"validation")
         if adf_registry is not None and adf_registry.enabled and elite:
             diagnostic=min(elite,key=secondary_key)
             adf_registry.record_validation(diagnostic,frozen_metrics(diagnostic,Xv,Yv,cats,constraints,out_names)["loss"],generation)
     if progress is not None: progress(generation,elite,sample)
-    library.observe(unique_models([*stable_elite,*archive.items,*diverse]),Xt,Yt,cats)
+    library.observe(unique_models([*stable_elite,*archive.items,*diverse]),Xb,Yb,cats)
+    Xsb=behaviour_rows(Xs)
     parent_pool=novelty_pool(pop,Xs)
     parent_count=max(1,population_size//2); qd_count=dual_qd_parent_count(parent_count,qd_controller,semantic_qd,structural_qd)
     ordinary=lexicase_parents(parent_pool,parent_count-qd_count,Xs,Ys,cats,lexicase_cases)
@@ -4229,7 +4251,7 @@ def evolve_generation(pop, generation, *, X, Xt, Yt, Xv, Yv, cats, constraints, 
             scales=list(p.model.scales); child_age=p.model.age+1; child_origin="fragment"
             sources=[p.model]
         elif rng.random() < crossover_rate and len(parents)>=2:
-            p,q=rng.sample(parents,2); trees=[semantic_crossover(a,b,Xs,nodes,depth,adf_registry.definitions if adf_registry else None) for a,b in zip(p.model.trees,q.model.trees)]; scales=list(p.model.scales); child_age=max(p.model.age,q.model.age)+1
+            p,q=rng.sample(parents,2); trees=[semantic_crossover(a,b,Xsb,nodes,depth,adf_registry.definitions if adf_registry else None) for a,b in zip(p.model.trees,q.model.trees)]; scales=list(p.model.scales); child_age=max(p.model.age,q.model.age)+1
             if trees==list(p.model.trees) and unchanged<unchanged_limit: unchanged+=1; continue
             child=Model(trees,scales,child_age,origin="crossover",parent_ids=(p.model.lineage_id,q.model.lineage_id),mdl_operators=grammar_for_trees(active_ops,trees,adf_registry.definitions if adf_registry else None),mdl_feature_count=X.shape[1],adfs={} if adf_registry is None else dict(adf_registry.definitions),founder_ids=tuple(sorted(set(p.model.founder_ids).union(q.model.founder_ids))),birth_generation=generation+1-child_age)
             children.append(child); credits.append((child,(p,q))); continue
@@ -4239,7 +4261,7 @@ def evolve_generation(pop, generation, *, X, Xt, Yt, Xv, Yv, cats, constraints, 
             trees=[]; kinds=[]; macro_used=False
             for index,tree in enumerate(p.model.trees):
                 proposal=None if bayesian_mode=="off" else (bayes[index] if isinstance(bayes,PerOutputBayesianBanks) else bayes)
-                child_tree,kind,macro=semantic_mutate(tree,Xs,portfolio,X.shape[1],active_ops,nodes,depth,proposal,adf_registry.definitions if adf_registry else None,library)
+                child_tree,kind,macro=semantic_mutate(tree,Xsb,portfolio,X.shape[1],active_ops,nodes,depth,proposal,adf_registry.definitions if adf_registry else None,library)
                 trees.append(child_tree); kinds.append(kind); macro_used|=macro
             if trees==list(p.model.trees) and unchanged<unchanged_limit: unchanged+=1; continue
             scales=list(p.model.scales); child_age=p.model.age+1; child_origin="macro_mutation" if macro_used else "mutation"
