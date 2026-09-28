@@ -5059,7 +5059,7 @@ MEGABYTE_MODEL_ID_MIXERS = {
     801: "xlstm_m", 802: "xlstm", 900: "mingru", 901: "minlstm", 903: "minindrnn", 905:
     "minindygru", 906: "minindylstm", 1000: "s4", 1001: "dss", 1002: "s4d", 1003: "s5", 1005:
     "lru_ssm", 1006: "mamba", 1007: "mamba_ssm", 1008: "mamba2", 1009: "mamba3", 1101: "deltanet",
-    1102: "rwkv", 1103: "retnet", 1106: "hgrn2", 1107: "gated_deltanet", 1108: "rwkv7"
+    1102: "rwkv", 1103: "retnet", 1106: "hgrn2", 1107: "gated_deltanet", 1108: "rwkv7", 520: "m2rnn"
 }
 # Custom recurrent cells run through the same CustomRNNWrapper stacks as
 # normal mode (MEGABYTE mixer name -> CustomRNNWrapper cell name).
@@ -5074,7 +5074,7 @@ MEGABYTE_CELL_MIXERS = {
 MEGABYTE_HIDDEN_LM_MIXERS = frozenset({
     "mogrifier", "nru", "lmu", "cfc", "qrnn", "sru",
     "srupp", "mamba3", "xlstm", "xlstm_m", "xlstm_s",
-    "s4", "s4d", "s5", "dss", "lru_ssm",
+    "s4", "s4d", "s5", "dss", "lru_ssm", "m2rnn",
 })
 MEGABYTE_LINEAR_STACK_MIXERS = frozenset({"deltanet", "gated_deltanet", "mamba2", "hgrn2", "retnet"})
 INCREMENTAL_MEGABYTE_MIXERS = frozenset({
@@ -5148,6 +5148,8 @@ def _megabyte_hidden_lm(kind, dim, depth, heads, seq_len, lmu_theta=None):
         lm = SRUppLM(1, dim, depth, max_cache=seq_len)
     elif kind == "mamba3":
         lm = Mamba3LM(1, dim, depth)
+    elif kind == "m2rnn":
+        lm = M2RNNLM(1, dim, depth)
     elif kind in {"xlstm", "xlstm_m", "xlstm_s"}:
         lm = XLSTMFullLM(1, dim, depth, num_heads=heads,
                          kind={"xlstm": "mix", "xlstm_m": "m", "xlstm_s": "s"}[kind])

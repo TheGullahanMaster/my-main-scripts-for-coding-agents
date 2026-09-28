@@ -2789,129 +2789,192 @@ import torch
 from torch.optim.optimizer import Optimizer, required
 
 class AdamHD(Optimizer):
-    r"""Implements Adam with Hypergradient Descent (Adam-HD).
+    r"""Adam with a stabilised hypergradient-descent learning rate.
 
-    It has been proposed in
-    "ONLINE LEARNING RATE ADAPTATION WITH HYPERGRADIENT DESCENT"
-    (ICLR 2018, Baydin et al.)
-    
+    Builds on "Online Learning Rate Adaptation with Hypergradient Descent"
+    (Baydin et al., ICLR 2018), whose additive rule
+    ``lr -= hyper_lr * <g_t, u_{t-1}>`` tends either to collapse the learning
+    rate onto its floor (the one-step hypergradient is short-horizon biased
+    towards small steps) or to explode it (the raw dot product scales with the
+    model size and gradient magnitude, so no single ``hyper_lr`` fits).  This
+    version changes the rule in five ways:
+
+    * Scale-free signal: the hypergradient is the cosine between the current
+      gradient and ``d theta / d lr``, so it lies in [-1, 1] for any model.
+    * Longer horizon: ``d theta / d lr`` is an EMA (``horizon``) of recent
+      update directions rather than only the last one, which averages out
+      step-to-step oscillation and reduces the greedy bias towards decay.
+    * Multiplicative, bounded update in log space, smoothed by an EMA
+      (``hyper_beta``) and limited to ``exp(+-hyper_lr)`` per step.
+    * A weak log-space pull (``anchor``) towards the highest learning rate
+      reached so far, so the small positive bias the hypergradient shows at
+      the noise floor anneals the LR instead of walking it onto a bound, plus
+      hard bounds: the adapted multiplier stays within [1/100, 100] and the
+      LR within ``min_lr`` / ``max_lr`` when given.
+    * Spike guard: non-finite gradients skip the step, and a gradient norm
+      above ``spike_factor`` times its running average is clipped; both cut
+      the learning rate by ``backoff``.
+
+    The adaptation is kept as a multiplier on the group's base LR.  When
+    something else writes ``group['lr']`` (an LR schedule or warmup), that
+    value becomes the new base and the multiplier carries over, so AdamHD
+    composes with schedules instead of being overwritten by them.
+
+    Weight decay is decoupled (AdamW style).  ``group['last_hypergrad']``
+    holds the latest cosine for logging.
+
     Arguments:
-        params (iterable): iterable of parameters to optimize or dicts defining
-            parameter groups
-        lr (float, optional): initial learning rate (default: 1e-3)
-        hyper_lr (float, optional): learning rate for the hypergradient update (β in the paper).
-            (default: 1e-7)
-        betas (Tuple[float, float], optional): coefficients used for computing running averages
-            of gradient and its square (default: (0.9, 0.999))
-        eps (float, optional): term added to the denominator to improve numerical stability
-            (default: 1e-8)
-        weight_decay (float, optional): weight decay (L2 penalty) (default: 0)
+        params (iterable): parameters or parameter-group dicts.
+        lr (float): initial learning rate (default: 1e-3).
+        hyper_lr (float): log-LR step size; the largest change per step is a
+            factor ``exp(hyper_lr)`` (default: 0.05).
+        betas (Tuple[float, float]): Adam moment coefficients (default: (0.9, 0.999)).
+        eps (float): Adam denominator term (default: 1e-8).
+        weight_decay (float): decoupled weight decay (default: 0).
+        hyper_beta (float): EMA coefficient of the hypergradient (default: 0.9).
+        horizon (float): EMA coefficient of ``d theta / d lr``; 0 is the
+            paper's one-step rule (default: 0.9).
+        anchor (float): strength of the pull towards the peak LR; the LR
+            settles where ``mean cosine = -anchor * log(lr / peak_lr)``.
+            Higher keeps the LR closer to its peak (default: 0.02).
+        min_lr, max_lr (float, optional): absolute LR bounds, on top of the
+            [1/100, 100] bound on the adapted multiplier.
+        warmup (int): steps before the LR starts adapting (default: 20).
+        spike_factor (float): gradient-norm spike threshold relative to its
+            running average; 0 disables the guard (default: 8).
+        backoff (float): LR factor applied on a spike or non-finite gradient
+            (default: 0.5).
     """
 
-    def __init__(self, params, lr=1e-3, hyper_lr=5e-8, betas=(0.9, 0.999),
-                 eps=1e-8, weight_decay=0.01):
-        #if lr < 0.0:
-        #    raise ValueError("Invalid initial learning rate: {}".format(lr))
+    def __init__(self, params, lr=1e-3, hyper_lr=0.05, betas=(0.9, 0.999), eps=1e-8,
+                 weight_decay=0.0, hyper_beta=0.9, horizon=0.9, anchor=0.02,
+                 min_lr=None, max_lr=None, warmup=20, spike_factor=8.0, backoff=0.5):
+        if not lr > 0.0:
+            raise ValueError("Invalid initial learning rate: {}".format(lr))
         if hyper_lr < 0.0:
             raise ValueError("Invalid hypergradient learning rate: {}".format(hyper_lr))
         if eps <= 0.0:
             raise ValueError("Invalid epsilon value: {}".format(eps))
+        if not all(0.0 <= b < 1.0 for b in (*betas, hyper_beta, horizon)):
+            raise ValueError("betas, hyper_beta and horizon must lie in [0, 1)")
+        if min_lr is not None and max_lr is not None and min_lr > max_lr:
+            raise ValueError("min_lr {} is greater than max_lr {}".format(min_lr, max_lr))
+        if not 0.0 < backoff <= 1.0:
+            raise ValueError("Invalid backoff: {}".format(backoff))
         defaults = dict(lr=lr, hyper_lr=hyper_lr, betas=betas, eps=eps,
-                        weight_decay=weight_decay)
+                        weight_decay=weight_decay, hyper_beta=hyper_beta, horizon=horizon,
+                        anchor=anchor, min_lr=min_lr, max_lr=max_lr, warmup=warmup,
+                        spike_factor=spike_factor, backoff=backoff, last_hypergrad=0.0)
         super(AdamHD, self).__init__(params, defaults)
 
-    def step(self, closure=None):
-        """Performs a single optimization step.
+    @staticmethod
+    def _sync_base(group):
+        """Adopt an LR written from outside (a scheduler) as the new base."""
+        if group.get('hd_written') != group['lr']:
+            group['hd_base'] = group['lr']
+        group.setdefault('hd_scale', 1.0)
 
-        Arguments:
-            closure (callable, optional): A closure that reevaluates the model and returns the loss.
-            It is assumed that gradients have been computed (e.g. via loss.backward()) before calling
-            this method.
-        """
+    @staticmethod
+    def _set_scale(group, scale):
+        """Store the adapted multiplier, bounded, and write the effective LR."""
+        base = group['hd_base']
+        scale = min(max(scale, 1e-2), 1e2)
+        lr = base * scale
+        if group['min_lr'] is not None:
+            lr = max(lr, group['min_lr'])
+        if group['max_lr'] is not None:
+            lr = min(lr, group['max_lr'])
+        if base > 0.0:
+            group['hd_scale'] = lr / base
+        group['lr'] = group['hd_written'] = lr
+
+    def _backoff(self, factor):
+        for group in self.param_groups:
+            self._sync_base(group)
+            self._set_scale(group, group['hd_scale'] * factor)
+            group['hd_m'] = 0.0
+
+    @torch.no_grad()
+    def step(self, closure=None):
         loss = None
         if closure is not None:
-            loss = closure()
+            with torch.enable_grad():
+                loss = closure()
 
-        # We will accumulate a global hypergradient term h_t across all parameters.
-        global_hypergrad = 0.0
+        active = [(group, p) for group in self.param_groups for p in group['params']
+                  if p.grad is not None]
+        if not active:
+            return loss
+        device = active[0][1].device
+        dot = torch.zeros((), device=device, dtype=torch.float32)
+        g_sq, d_sq = dot.clone(), dot.clone()
+        for group, p in active:
+            if p.grad.is_sparse:
+                raise RuntimeError('AdamHD does not support sparse gradients')
+            g = p.grad.float()
+            g_sq += g.pow(2).sum().to(device)
+            direction = self.state[p].get('hd_dir')
+            if direction is not None:
+                dot += (g * direction).sum().to(device)
+                d_sq += direction.pow(2).sum().to(device)
+        dot, g_sq, d_sq = torch.stack((dot, g_sq, d_sq)).tolist()
 
-        # First, loop over all parameter groups and parameters to accumulate hypergradient dot product.
+        lead = self.param_groups[0]
+        if not all(math.isfinite(v) for v in (dot, g_sq, d_sq)):
+            # A NaN/Inf gradient would poison the moments: skip and back off.
+            self._backoff(lead['backoff'])
+            return loss
+
+        t = lead['hd_step'] = lead.get('hd_step', 0) + 1
+        g_norm = math.sqrt(g_sq)
+        g_ema = lead.get('hd_gnorm_ema', 0.0)
+        clip = 1.0
+        spike = (lead['spike_factor'] > 0 and t > lead['warmup'] and g_ema > 0.0
+                 and g_norm > lead['spike_factor'] * g_ema)
+        if spike:
+            clip = lead['spike_factor'] * g_ema / g_norm
+            self._backoff(lead['backoff'])
+        lead['hd_gnorm_ema'] = g_norm if g_ema == 0.0 else 0.98 * g_ema + 0.02 * g_norm * clip
+
+        # Cosine between the gradient and d(theta)/d(lr); positive means a
+        # larger learning rate would have increased the loss.
+        cosine = dot / math.sqrt(g_sq * d_sq) if g_sq > 0.0 and d_sq > 0.0 else 0.0
         for group in self.param_groups:
-            hyper_lr = group['hyper_lr']
-            for p in group['params']:
-                if p.grad is None:
-                    continue
-                grad = p.grad.data
-                state = self.state[p]
-                # On the very first step, there is no previous hypergradient so we treat it as zero.
-                if 'hyper_grad' in state:
-                    # Accumulate dot product (sum of elementwise products)
-                    global_hypergrad += torch.sum(grad * state['hyper_grad']).item()
-                # Else: if not present, treat as zero contribution
+            self._sync_base(group)
+            group['last_hypergrad'] = cosine
+            hd_m = group['hd_m'] = (group['hyper_beta'] * group.get('hd_m', 0.0)
+                                    + (1.0 - group['hyper_beta']) * cosine)
+            if t > group['warmup'] and not spike:
+                beta, scale = group['hyper_lr'], group['hd_scale']
+                ref = group.get('hd_ref', 1.0)
+                delta = -beta * (hd_m + group['anchor'] * math.log(scale / ref))
+                self._set_scale(group, scale * math.exp(min(max(delta, -beta), beta)))
+                group['hd_ref'] = max(ref, group['hd_scale'])
+            else:
+                self._set_scale(group, group['hd_scale'])
 
-        # Now, update the learning rate (for each parameter group)
-        for group in self.param_groups:
-            # Update the global learning rate: note that in multi-group usage you might want to do this per group.
-            group['lr'] = group['lr'] - group['hyper_lr'] * global_hypergrad
-            if group['lr'] < 0.0:
-                group['lr'] = group['lr'] * -1
-
-        # Now, perform the Adam update for each parameter.
-        for group in self.param_groups:
-            for p in group['params']:
-                if p.grad is None:
-                    continue
-                grad = p.grad.data
-                if grad.is_sparse:
-                    raise RuntimeError('Adam-HD does not support sparse gradients')
-
-                state = self.state[p]
-
-                # State initialization
-                if len(state) == 0:
-                    state['step'] = 0
-                    # Exponential moving average of gradient values
-                    state['exp_avg'] = torch.zeros_like(p.data)
-                    # Exponential moving average of squared gradient values
-                    state['exp_avg_sq'] = torch.zeros_like(p.data)
-                    # Initialize previous hypergradient to zeros.
-                    state['hyper_grad'] = torch.zeros_like(p.data)
-
-                exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
-                beta1, beta2 = group['betas']
-
-                state['step'] += 1
-                t = state['step']
-
-                if group['weight_decay'] != 0:
-                    grad = grad.add(group['weight_decay'], p.data)
-
-                # Update biased first moment estimate.
-                exp_avg.mul_(beta1).add_(1 - beta1, grad)
-                # Update biased second raw moment estimate.
-                exp_avg_sq.mul_(beta2).addcmul_(1 - beta2, grad, grad)
-                # Compute bias-corrected first moment estimate.
-                bias_correction1 = 1 - beta1 ** t
-                # Compute bias-corrected second moment estimate.
-                bias_correction2 = 1 - beta2 ** t
-
-                denom = (exp_avg_sq.sqrt() / math.sqrt(bias_correction2)).add_(group['eps'])
-                # The bias-corrected first moment.
-                avg = exp_avg / bias_correction1
-
-                # Compute the update direction u_t according to Adam-HD:
-                # u_t = - (lr * avg) / (sqrt(v̂_t) + eps)
-                update = - group['lr'] * avg / denom
-
-                # Also compute the hypergradient for this parameter:
-                # ∇_α u_t = - avg / (sqrt(v̂_t) + eps)
-                hyper_grad_new = - avg / denom
-
-                # Update parameter.
-                p.data.add_(update)
-
-                # Save the hypergradient for use in the next iteration.
-                state['hyper_grad'] = hyper_grad_new.clone()
+        for group, p in active:
+            state = self.state[p]
+            if 'step' not in state:
+                state['step'] = 0
+                state['exp_avg'] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                state['exp_avg_sq'] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                state['hd_dir'] = torch.zeros_like(p, dtype=torch.float32)
+            state['step'] += 1
+            beta1, beta2 = group['betas']
+            grad = p.grad if clip == 1.0 else p.grad * clip
+            exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
+            exp_avg.lerp_(grad, 1.0 - beta1)
+            exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
+            bias_correction1 = 1.0 - beta1 ** state['step']
+            bias_correction2 = 1.0 - beta2 ** state['step']
+            denom = (exp_avg_sq.sqrt() / math.sqrt(bias_correction2)).add_(group['eps'])
+            # u = d(theta)/d(lr) for this step: the Adam direction plus decoupled decay.
+            update = exp_avg.div(denom).mul_(-1.0 / bias_correction1)
+            if group['weight_decay'] != 0:
+                update.add_(p, alpha=-group['weight_decay'])
+            p.add_(update, alpha=group['lr'])
+            state['hd_dir'].mul_(group['horizon']).add_(update.float())
 
         return loss
 

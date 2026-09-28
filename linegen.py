@@ -4488,6 +4488,20 @@ OPTIMIZER_REGISTRY = [
             {"key": "weight_decay", "prompt": "Weight decay", "type": "float", "default": 0.0},
         ],
     },
+    {
+        "name": "AdamHD",
+        "class": "adamhd",
+        "defaults": {"lr": 1e-3},
+        "params": [
+            {"key": "lr", "prompt": "Initial learning rate  (adapted online by hypergradient descent)", "type": "float", "default": 1e-3},
+            {"key": "hyper_lr", "prompt": "Hypergradient step  (max log-LR change per step)", "type": "float", "default": 0.05},
+            {"key": "anchor", "prompt": "Anchor  (pull towards the peak LR; higher decays less)", "type": "float", "default": 0.02},
+            {"key": "horizon", "prompt": "Horizon  (EMA of past updates in the hypergradient; 0 = paper's one step)", "type": "float", "default": 0.9},
+            {"key": "betas", "prompt": "Betas  (comma-separated, e.g. 0.9,0.999)", "type": "betas", "default": (0.9, 0.999)},
+            {"key": "eps", "prompt": "Epsilon", "type": "float", "default": 1e-8},
+            {"key": "weight_decay", "prompt": "Weight decay  (decoupled)", "type": "float", "default": 0.0},
+        ],
+    },
 ]
 
 
@@ -4673,6 +4687,12 @@ def build_optimizer(model, cfg):
         if isinstance(betas, list): betas = tuple(betas)
         return torch.optim.Adam(optim_groups, lr=op.get("lr", 3e-4),
                                 betas=betas, eps=op.get("eps", 1e-8))
+    elif optimizer_key == "adamhd":
+        betas = op.get("betas", (0.9, 0.999))
+        if isinstance(betas, list): betas = tuple(betas)
+        return AdamHD(optim_groups, lr=op.get("lr", 1e-3), hyper_lr=op.get("hyper_lr", 0.05),
+                      anchor=op.get("anchor", 0.02), horizon=op.get("horizon", 0.9),
+                      betas=betas, eps=op.get("eps", 1e-8))
     elif optimizer_key == "equalized_adamw":
         betas = op.get("betas", (0.9, 0.999))
         if isinstance(betas, list): betas = tuple(betas)
@@ -6088,7 +6108,7 @@ HIERARCHICAL_MODEL_MIXERS = {
     801: "xlstm_m", 802: "xlstm", 900: "mingru", 901: "minlstm", 903: "minindrnn", 905:
     "minindygru", 906: "minindylstm", 1000: "s4", 1001: "dss", 1002: "s4d", 1003: "s5", 1005:
     "lru_ssm", 1006: "mamba", 1007: "mamba_ssm", 1008: "mamba2", 1009: "mamba3", 1101: "deltanet",
-    1102: "rwkv", 1103: "retnet", 1106: "hgrn2", 1107: "gated_deltanet", 1108: "rwkv7"
+    1102: "rwkv", 1103: "retnet", 1106: "hgrn2", 1107: "gated_deltanet", 1108: "rwkv7", 520: "m2rnn"
 }
 
 
@@ -6108,7 +6128,7 @@ _INCREMENTAL_HIERARCHY_MIXERS = frozenset({
     "qrnn", "sru", "mamba_ssm", "deltanet", "gated_deltanet", "rwkv7",
     "modern", "transformer",
     "mogrifier_lstm", "mogrifier_gru", "irnn", "unicornn", "indylstm", "light_ru",
-    "rru", "exprnn", "srupp", "mamba3", "xlstm", "xlstm_m", "xlstm_s",
+    "rru", "exprnn", "srupp", "mamba3", "m2rnn", "xlstm", "xlstm_m", "xlstm_s",
     "retnet", "mamba2", "hgrn2", "s4", "s4d", "s5", "dss", "lru_ssm",
 })
 _HEAD_HIERARCHY_MIXERS = frozenset({"transformer", "gpt2", "modern", "hypermixer", "xlstm", "xlstm_m", "xlstm_s"})
