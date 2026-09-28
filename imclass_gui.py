@@ -322,6 +322,9 @@ class TrainingSession:
             raise ValueError('Unknown optimizer.')
         lr = spec.get('lr')
         lr = float(lr) if lr not in (None, '') else ic.OPTIMIZER_LRS[optimizer_id]
+        hd = ic.hd_options(spec.get('hd')) if optimizer_id in ic.HD_OPTIMIZERS else None
+        if not math.isfinite(lr) or lr < 0 or (lr == 0 and not (hd and hd['max_lr'])):
+            raise ValueError('The learning rate must be positive (0 only for the HD optimizers with a max LR).')
         augments = sorted({int(a) for a in spec.get('augments', [])})
         if any(a not in ic.AUGMENTS for a in augments):
             raise ValueError('Unknown augmentation id.')
@@ -333,7 +336,8 @@ class TrainingSession:
         fraction = float(spec.get('val_fraction', 0.1) or 0)
         if not 0 <= fraction < 1:
             raise ValueError('Validation fraction must be in [0, 1).')
-        return dict(mode=mode, cfg=cfg, optimizer_id=optimizer_id, lr=lr, augments=augments, fraction=fraction,
+        return dict(mode=mode, cfg=cfg, optimizer_id=optimizer_id, lr=lr, hd=spec.get('hd') if hd else None,
+                    augments=augments, fraction=fraction,
                     batch_size=int(spec.get('batch_size', 64)), epochs=int(spec.get('epochs', 10)),
                     seed=int(spec.get('seed', 0) or 0), save_dir=spec.get('save_dir') or DEFAULT_SAVE_DIR,
                     dedupe=bool(spec.get('dedupe', True)))
@@ -438,7 +442,7 @@ class TrainingSession:
             run = ic.train_model(model, classes, records, val, batch_size=o['batch_size'], epochs=o['epochs'],
                                  optimizer_id=o['optimizer_id'], seed=seed, augments=o['augments'],
                                  save_dir=o['save_dir'], device=device, lr=o['lr'],
-                                 progress_callback=callback, optimizer_state=optimizer_state)
+                                 progress_callback=callback, optimizer_state=optimizer_state, hd=o['hd'])
             self._set(state='done', run_dir=str(run))
         except KeyboardInterrupt:
             self._set(state='stopped', detail='stopped; interrupt.pt saved in the run folder')
@@ -766,7 +770,8 @@ def augment_preview(spec, count=8):
 
 def options():
     return {'models': ic.MODEL_NAMES, 'isotropic': sorted(ic.ISOTROPIC), 'augments': ic.AUGMENTS,
-            'optimizers': ['SGD + momentum', 'Adam', 'Muon', 'CLion', 'RAdamScheduleFree'],
+            'optimizers': ['SGD + momentum', 'Adam', 'Muon', 'CLion', 'RAdamScheduleFree', 'AdamHD', 'MuonHD', 'NorMuonHD'],
+            'hd_optimizers': list(ic.HD_OPTIMIZERS), 'hd_defaults': dict(ic.HD_DEFAULTS),
             'optimizer_lrs': list(ic.OPTIMIZER_LRS), 'defaults': ic.asdict(ic.Config()),
             'activations': ['none', 'Sigmoid', 'Tanh', 'ReLU', 'LeakyReLU', 'PReLU', 'GELU', 'SiLU', 'Mish', 'SwiGLU'],
             'dream_setups': list(ic.DREAM_SETUPS), 'dream_optimizers': list(ic.DREAM_OPTIMIZERS),

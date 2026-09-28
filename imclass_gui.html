@@ -815,7 +815,7 @@ addEventListener("beforeunload", e => { if (D.dirty) { e.preventDefault(); e.ret
 
 // ───────────────────────── Train page ─────────────────────────
 const DEFAULT_FORM = { source: "", val_mode: "fraction", val_fraction: 0.1, val_source: "", dedupe: true, mode: "new", checkpoint: "", freeze: true,
-  config: null, head_layers: 1, head_dims: "128", activation: 7, slope: 0.01, augments: [], batch_size: 64, epochs: 10, optimizer_id: 1, lr: "", seed: 0, save_dir: "ImClass" };
+  config: null, head_layers: 1, head_dims: "128", activation: 7, slope: 0.01, augments: [], batch_size: 64, epochs: 10, optimizer_id: 1, lr: "", hd: {}, seed: 0, save_dir: "ImClass" };
 const T = { F: Object.assign(structuredClone(DEFAULT_FORM), store.get("trainForm", {})), inspect: null, browse: null, st: null, since: 0, steps: [], losses: [], timer: null, runs: null, preview: null };
 const F = () => T.F, saveForm = () => store.set("trainForm", T.F);
 function fld(label, input) { if (!input.dataset.fkey) input.dataset.fkey = "tr:" + label; return el("label", { class: "ctl" }, label, input); }
@@ -913,7 +913,8 @@ function trainOptionsCard() {
       catch (e) { toast(e.message); } } }, "Preview augmentations"), el("span", { class: "muted" }, "one training image, eight random augmented versions")), prev));
   card.append(el("div", { class: "form-grid", style: "margin-top:8px" },
     fld("Optimizer", sel(f, "optimizer_id", G.opts.optimizers.map((n, i) => [i, n]))),
-    fld("Learning rate", el("input", { type: "number", step: 0.0001, min: 0, value: f.lr, placeholder: String(G.opts.optimizer_lrs[f.optimizer_id]), onchange: e => { f.lr = e.target.value; saveForm(); } })),
+    fld(G.opts.hd_optimizers.includes(+f.optimizer_id) ? "Initial learning rate (0 = start at zero)" : "Learning rate", el("input", { type: "number", step: 0.0001, min: 0, value: f.lr, placeholder: String(G.opts.optimizer_lrs[f.optimizer_id]), onchange: e => { f.lr = e.target.value; saveForm(); } })),
+    ...hdFields(f),
     fld("Batch size", num(f, "batch_size", { min: 1 })), fld("Epochs", num(f, "epochs", { min: 1 })),
     fld("Seed (0 = random)", num(f, "seed", { min: 0 })), fld("Save folder", el("input", { type: "text", value: f.save_dir, onchange: e => { f.save_dir = e.target.value.trim() || "ImClass"; saveForm(); T.runs = null; } }))));
   const busy = ["preparing", "training", "stopping"].includes(T.st?.state);
@@ -923,13 +924,24 @@ function trainOptionsCard() {
     el("span", { class: "note", style: "margin:0" }, `Runs are saved in ${f.save_dir}/run_… with best.pt, last.pt, history.csv and split.csv.`)));
   return card;
 }
+// AdamHD / MuonHD / NorMuonHD: the learning rate adapts online (hypergradient); these tune how
+function hdFields(f) {
+  if (!G.opts.hd_optimizers.includes(+f.optimizer_id)) return [];
+  f.hd = f.hd || {};
+  const d = G.opts.hd_defaults, h = f.hd, val = k => h[k] ?? d[k];
+  const numHd = (k, attrs) => el("input", Object.assign({ type: "number", value: val(k), "data-fkey": "tr:hd:" + k, onchange: e => { h[k] = e.target.value === "" ? d[k] : +e.target.value; saveForm(); } }, attrs));
+  return [fld("Hypergradient step", numHd("hyper_lr", { step: 0.01, min: 0, title: "largest log-LR change per step" })),
+    fld("Anchor (pull to peak LR)", numHd("anchor", { step: 0.1, min: 0 })),
+    fld("Max LR (0 = 100× initial)", numHd("max_lr", { step: 0.001, min: 0, title: "needed when the initial LR is 0" })),
+    el("label", { class: "ctl check" }, el("input", { type: "checkbox", "data-fkey": "tr:hd:normalize", checked: !!val("normalize"), onchange: e => { h.normalize = e.target.checked; saveForm(); } }), "Normalized hypergradient (off = original rule)")];
+}
 async function startTraining() {
   const f = F();
   const spec = { mode: f.mode, source: f.source, checkpoint: f.checkpoint, freeze: f.freeze, dedupe: f.dedupe,
     val_fraction: f.val_mode === "fraction" ? f.val_fraction : 0, val_source: f.val_mode === "source" ? f.val_source : "",
     config: Object.assign({}, f.config, { head_dims: headDims(), activation: f.activation, slope: f.slope }),
     head: { dims: headDims(), activation: f.activation, slope: f.slope },
-    augments: f.augments, batch_size: f.batch_size, epochs: f.epochs, optimizer_id: f.optimizer_id, lr: f.lr, seed: f.seed, save_dir: f.save_dir };
+    augments: f.augments, batch_size: f.batch_size, epochs: f.epochs, optimizer_id: f.optimizer_id, lr: f.lr, hd: f.hd, seed: f.seed, save_dir: f.save_dir };
   try { T.st = await api("/api/train/start", spec); T.since = 0; T.steps = []; T.losses = []; T.runs = null; renderTrain(); pollTrain(); }
   catch (e) { toast("Cannot start: " + e.message); }
 }

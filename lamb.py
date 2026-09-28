@@ -2788,97 +2788,87 @@ import math
 import torch
 from torch.optim.optimizer import Optimizer, required
 
-class AdamHD(Optimizer):
-    r"""Adam with a stabilised hypergradient-descent learning rate.
+class _HypergradientLR:
+    """Learning-rate controller shared by AdamHD, MuonHD and NorMuonHD.
 
-    Builds on "Online Learning Rate Adaptation with Hypergradient Descent"
-    (Baydin et al., ICLR 2018), whose additive rule
-    ``lr -= hyper_lr * <g_t, u_{t-1}>`` tends either to collapse the learning
-    rate onto its floor (the one-step hypergradient is short-horizon biased
-    towards small steps) or to explode it (the raw dot product scales with the
-    model size and gradient magnitude, so no single ``hyper_lr`` fits).  This
-    version changes the rule in five ways:
+    Holds the adapted LR as a multiplier (``hd_scale``) on each group's base
+    LR, updated from the cosine between the gradient and ``d theta / d lr``
+    (see AdamHD for the rule, bounds, zero start and spike guard).  Subclasses
+    measure ``dot = <g, d>``, ``|g|^2`` and ``|d|^2`` and call ``_hd_adapt``.
 
-    * Scale-free signal: the hypergradient is the cosine between the current
-      gradient and ``d theta / d lr``, so it lies in [-1, 1] for any model.
-    * Longer horizon: ``d theta / d lr`` is an EMA (``horizon``) of recent
-      update directions rather than only the last one, which averages out
-      step-to-step oscillation and reduces the greedy bias towards decay.
-    * Multiplicative, bounded update in log space, smoothed by an EMA
-      (``hyper_beta``) and limited to ``exp(+-hyper_lr)`` per step.
-    * A weak log-space pull (``anchor``) towards the highest learning rate
-      reached so far, so the small positive bias the hypergradient shows at
-      the noise floor anneals the LR instead of walking it onto a bound, plus
-      hard bounds: the adapted multiplier stays within [1/100, 100] and the
-      LR within ``min_lr`` / ``max_lr`` when given.
-    * Spike guard: non-finite gradients skip the step, and a gradient norm
-      above ``spike_factor`` times its running average is clipped; both cut
-      the learning rate by ``backoff``.
-
-    The adaptation is kept as a multiplier on the group's base LR.  When
-    something else writes ``group['lr']`` (an LR schedule or warmup), that
-    value becomes the new base and the multiplier carries over, so AdamHD
-    composes with schedules instead of being overwritten by them.
-
-    Weight decay is decoupled (AdamW style).  ``group['last_hypergrad']``
-    holds the latest cosine for logging.
-
-    Arguments:
-        params (iterable): parameters or parameter-group dicts.
-        lr (float): initial learning rate (default: 1e-3).
-        hyper_lr (float): log-LR step size; the largest change per step is a
-            factor ``exp(hyper_lr)`` (default: 0.05).
-        betas (Tuple[float, float]): Adam moment coefficients (default: (0.9, 0.999)).
-        eps (float): Adam denominator term (default: 1e-8).
-        weight_decay (float): decoupled weight decay (default: 0).
-        hyper_beta (float): EMA coefficient of the hypergradient (default: 0.9).
-        horizon (float): EMA coefficient of ``d theta / d lr``; 0 is the
-            paper's one-step rule (default: 0.9).
-        anchor (float): strength of the pull towards the peak LR; the LR
-            settles where ``mean cosine = -anchor * log(lr / peak_lr)``.
-            Higher keeps the LR closer to its peak (default: 0.02).
-        min_lr, max_lr (float, optional): absolute LR bounds, on top of the
-            [1/100, 100] bound on the adapted multiplier.
-        warmup (int): steps before the LR starts adapting (default: 20).
-        spike_factor (float): gradient-norm spike threshold relative to its
-            running average; 0 disables the guard (default: 8).
-        backoff (float): LR factor applied on a spike or non-finite gradient
-            (default: 0.5).
+    Divergence guard (``guard``, default on): the hypergradient cannot see an LR
+    that is too high for the model when the gradient/update cosine stays near
+    zero, and one oversized step can leave a model whose gradients are NaN on
+    every batch (every step is then skipped, so it never recovers).  Every
+    ``guard_every`` healthy steps the weights and LR are snapshotted.  When the
+    smoothed training loss (fed through ``observe_loss`` or a ``step`` closure)
+    stays more than ``guard_tolerance`` above its best for ``guard_patience``
+    steps, or the gradients are non-finite for ``guard_patience`` steps in a row,
+    the weights roll back to the snapshot, the optimizer state is cleared, the LR
+    returns to the snapshot's, and a ceiling of ``guard_ceiling`` × the LR that
+    failed stops it from climbing back into the same trouble.
     """
 
-    def __init__(self, params, lr=1e-3, hyper_lr=0.05, betas=(0.9, 0.999), eps=1e-8,
-                 weight_decay=0.0, hyper_beta=0.9, horizon=0.9, anchor=0.02,
-                 min_lr=None, max_lr=None, warmup=20, spike_factor=8.0, backoff=0.5):
-        if not lr > 0.0:
+    def observe_loss(self, loss):
+        """Report the training loss of the batch about to be stepped; enables the
+        guard's loss-based rollback.  Anything float() cannot convert is ignored."""
+        try:
+            self._hd_loss = float(loss)
+        except (TypeError, ValueError):
+            pass
+
+    @staticmethod
+    def _hd_options(lr, hyper_lr, hyper_beta, horizon, anchor, min_lr, max_lr, warmup,
+                    spike_factor, backoff, normalize, guard=True, guard_every=50, guard_tolerance=0.2,
+                    guard_patience=10, guard_ceiling=0.7):
+        if anchor is None:
+            anchor = 1.0 if normalize else 0.02
+        if not lr >= 0.0:
             raise ValueError("Invalid initial learning rate: {}".format(lr))
+        if lr == 0.0 and not (max_lr is not None and max_lr > 0.0):
+            raise ValueError("A zero initial learning rate needs max_lr > 0 to set the LR scale")
         if hyper_lr < 0.0:
             raise ValueError("Invalid hypergradient learning rate: {}".format(hyper_lr))
-        if eps <= 0.0:
-            raise ValueError("Invalid epsilon value: {}".format(eps))
-        if not all(0.0 <= b < 1.0 for b in (*betas, hyper_beta, horizon)):
-            raise ValueError("betas, hyper_beta and horizon must lie in [0, 1)")
+        if not all(0.0 <= b < 1.0 for b in (hyper_beta, horizon)):
+            raise ValueError("hyper_beta and horizon must lie in [0, 1)")
         if min_lr is not None and max_lr is not None and min_lr > max_lr:
             raise ValueError("min_lr {} is greater than max_lr {}".format(min_lr, max_lr))
         if not 0.0 < backoff <= 1.0:
             raise ValueError("Invalid backoff: {}".format(backoff))
-        defaults = dict(lr=lr, hyper_lr=hyper_lr, betas=betas, eps=eps,
-                        weight_decay=weight_decay, hyper_beta=hyper_beta, horizon=horizon,
-                        anchor=anchor, min_lr=min_lr, max_lr=max_lr, warmup=warmup,
-                        spike_factor=spike_factor, backoff=backoff, last_hypergrad=0.0)
-        super(AdamHD, self).__init__(params, defaults)
+        if guard and not (guard_every >= 1 and guard_tolerance > 0.0 and guard_patience >= 1
+                          and 0.0 < guard_ceiling <= 1.0):
+            raise ValueError("Invalid guard settings")
+        return dict(hyper_lr=hyper_lr, hyper_beta=hyper_beta, horizon=horizon, anchor=anchor,
+                    min_lr=min_lr, max_lr=max_lr, warmup=warmup, spike_factor=spike_factor,
+                    backoff=backoff, last_hypergrad=0.0, normalize=normalize, guard=bool(guard),
+                    guard_every=int(guard_every), guard_tolerance=float(guard_tolerance),
+                    guard_patience=int(guard_patience), guard_ceiling=float(guard_ceiling))
+
+    ZERO_SEED = 1e-2    # zero start: first nonzero LR, as a fraction of max_lr
+    ZERO_FLOOR = 1e-4   # zero start: lowest LR afterwards, as a fraction of max_lr
 
     @staticmethod
     def _sync_base(group):
         """Adopt an LR written from outside (a scheduler) as the new base."""
-        if group.get('hd_written') != group['lr']:
+        if 'hd_base' not in group and group['lr'] == 0.0:
+            # Zero start: the multiplier is relative to max_lr and begins at 0.
+            group['hd_zero'], group['hd_base'], group['hd_scale'] = True, group['max_lr'], 0.0
+            group['hd_written'] = 0.0
+        elif group.get('hd_written') != group['lr'] and not (group.get('hd_zero') and group['lr'] == 0.0):
             group['hd_base'] = group['lr']
         group.setdefault('hd_scale', 1.0)
 
-    @staticmethod
-    def _set_scale(group, scale):
+    @classmethod
+    def _set_scale(cls, group, scale):
         """Store the adapted multiplier, bounded, and write the effective LR."""
         base = group['hd_base']
-        scale = min(max(scale, 1e-2), 1e2)
+        if group.get('hd_zero'):
+            lo = 0.0 if scale == 0.0 or group['min_lr'] is not None else cls.ZERO_FLOOR
+        else:
+            lo = 0.0 if group['min_lr'] is not None else 1e-2
+        hi = math.inf if group['max_lr'] is not None else 1e2
+        hi = min(hi, group.get('hd_ceiling', math.inf))   # set by the guard after a rollback
+        scale = min(max(scale, lo), hi)
         lr = base * scale
         if group['min_lr'] is not None:
             lr = max(lr, group['min_lr'])
@@ -2892,7 +2882,248 @@ class AdamHD(Optimizer):
         for group in self.param_groups:
             self._sync_base(group)
             self._set_scale(group, group['hd_scale'] * factor)
-            group['hd_m'] = 0.0
+            group['hd_m'] = group['hd_v'] = 0.0
+            group['hd_n'] = 0
+
+    def _hd_snapshot(self, t):
+        snap = getattr(self, '_hd_snap', None)
+        with torch.no_grad():
+            if snap is None:
+                snap = self._hd_snap = {p: p.detach().clone() for g in self.param_groups for p in g['params']}
+            else:
+                for p, copy in snap.items():
+                    copy.copy_(p.detach())
+        self._hd_snap_info = {'step': t, 'scales': [g['hd_scale'] for g in self.param_groups],
+                              'loss': self.param_groups[0].get('hd_loss_ema'), 'used': 0}
+        for g in self.param_groups:
+            g['hd_peak'] = g['hd_scale']
+
+    def _hd_rollback(self, reason):
+        """Restore the last snapshot: weights, a fresh optimizer state, a capped LR."""
+        info, lead = self._hd_snap_info, self.param_groups[0]
+        with torch.no_grad():
+            for p, copy in self._hd_snap.items():
+                p.copy_(copy)
+        for i, group in enumerate(self.param_groups):
+            for p in group['params']:
+                self.state[p].clear()          # moments and hd_dir are polluted by the bad steps
+            self._sync_base(group)
+            failed = max(group.get('hd_peak', group['hd_scale']), group['hd_scale'])
+            if failed > 0.0:
+                group['hd_ceiling'] = min(group.get('hd_ceiling', math.inf), group['guard_ceiling'] * failed)
+            scale = min(info['scales'][i], group.get('hd_ceiling', math.inf))
+            if info['used']:                   # the same snapshot failed again: go lower
+                scale *= group['backoff'] ** info['used']
+            self._set_scale(group, scale)
+            group['hd_ref'] = group['hd_peak'] = group['hd_scale']
+            group['hd_m'] = group['hd_v'] = 0.0
+            group['hd_n'] = 0
+        info['used'] += 1
+        lead['hd_rollbacks'] = lead.get('hd_rollbacks', 0) + 1
+        lead['hd_loss_bad'] = lead['hd_nf_run'] = 0
+        if info['loss'] is not None:
+            lead['hd_loss_ema'] = info['loss']
+        print(f"[{type(self).__name__}] {reason}: rolled back to step {info['step']}, "
+              f"lr {lead['lr']:.3g} (ceiling {lead['hd_base'] * lead.get('hd_ceiling', math.inf):.3g})", flush=True)
+
+    def _hd_guard(self, finite):
+        """Divergence guard; True when this step must be skipped."""
+        lead = self.param_groups[0]
+        if not finite:
+            run = lead['hd_nf_run'] = lead.get('hd_nf_run', 0) + 1
+            if run >= lead['guard_patience'] and getattr(self, '_hd_snap', None) is not None:
+                self._hd_rollback(f"non-finite gradients for {run} steps")
+            elif run == 1:                     # halve once per streak, not on every skipped step
+                self._backoff(lead['backoff'])
+            return True
+        lead['hd_nf_run'] = 0
+        loss, self._hd_loss = getattr(self, '_hd_loss', None), None
+        if loss is not None:
+            if not math.isfinite(loss):
+                lead['hd_loss_bad'] = lead.get('hd_loss_bad', 0) + 1
+            else:
+                ema = lead.get('hd_loss_ema')
+                ema = lead['hd_loss_ema'] = loss if ema is None else 0.9 * ema + 0.1 * loss
+                best = lead['hd_loss_best'] = min(lead.get('hd_loss_best', ema), ema)
+                limit = best + lead['guard_tolerance'] * max(abs(best), 1e-8)
+                lead['hd_loss_bad'] = lead.get('hd_loss_bad', 0) + 1 if ema > limit else 0
+            if (lead['hd_loss_bad'] >= lead['guard_patience'] and getattr(self, '_hd_snap', None) is not None):
+                self._hd_rollback(f"loss {lead.get('hd_loss_ema', float('nan')):.4g} stayed above "
+                                  f"{1 + lead['guard_tolerance']:.2g}x its best {lead.get('hd_loss_best', float('nan')):.4g}")
+                return True
+        return False
+
+    def _hd_guard_after(self, t):
+        """Track the LR peak and take a snapshot every guard_every healthy steps."""
+        lead = self.param_groups[0]
+        for g in self.param_groups:
+            g['hd_peak'] = max(g.get('hd_peak', g['hd_scale']), g['hd_scale'])
+        if t % lead['guard_every'] == 0 and lead.get('hd_loss_bad', 0) == 0:
+            self._hd_snapshot(t)
+
+    def _hd_adapt(self, dot, g_sq, d_sq):
+        """Adapt every group's LR from this step's hypergradient statistics.
+
+        Returns the factor to scale the gradients by (1.0 unless a spike was
+        clipped), or None when the step must be skipped (non-finite gradient,
+        or a guard rollback).
+        """
+        lead = self.param_groups[0]
+        if lead.get('guard'):
+            if self._hd_guard(all(math.isfinite(v) for v in (dot, g_sq, d_sq))):
+                return None
+        elif not all(math.isfinite(v) for v in (dot, g_sq, d_sq)):
+            # A NaN/Inf gradient would poison the moments: skip and back off.
+            self._backoff(lead['backoff'])
+            return None
+
+        t = lead['hd_step'] = lead.get('hd_step', 0) + 1
+        g_norm = math.sqrt(g_sq)
+        g_ema = lead.get('hd_gnorm_ema', 0.0)
+        clip = 1.0
+        spike = (lead['spike_factor'] > 0 and t > lead['warmup'] and g_ema > 0.0
+                 and g_norm > lead['spike_factor'] * g_ema)
+        if spike:
+            clip = lead['spike_factor'] * g_ema / g_norm
+            self._backoff(lead['backoff'])
+        lead['hd_gnorm_ema'] = g_norm if g_ema == 0.0 else 0.98 * g_ema + 0.02 * g_norm * clip
+
+        # Cosine between the gradient and d(theta)/d(lr); positive means a
+        # larger learning rate would have increased the loss.
+        cosine = dot / math.sqrt(g_sq * d_sq) if g_sq > 0.0 and d_sq > 0.0 else 0.0
+        for group in self.param_groups:
+            self._sync_base(group)
+            group['last_hypergrad'] = cosine
+            hb = group['hyper_beta']
+            hd_m = group['hd_m'] = hb * group.get('hd_m', 0.0) + (1.0 - hb) * cosine
+            if group.get('normalize'):
+                # Signal-to-noise form: the bias-corrected mean cosine over its RMS,
+                # in [-1, 1]; consistent evidence moves the LR at the full rate.
+                hd_v = group['hd_v'] = hb * group.get('hd_v', 0.0) + (1.0 - hb) * cosine * cosine
+                n = group['hd_n'] = group.get('hd_n', 0) + 1
+                corr = 1.0 - hb ** n
+                hd_m = (hd_m / corr) / (math.sqrt(hd_v / corr) + 1e-12) if hd_v > 0.0 else 0.0
+            if t > group['warmup'] and not spike and group['hd_scale'] == 0.0:
+                # Zero start: seed the LR once the hypergradient asks for a larger one.
+                if hd_m < 0.0:
+                    self._set_scale(group, self.ZERO_SEED)
+                    group['hd_ref'] = group['hd_scale']
+                else:
+                    self._set_scale(group, 0.0)
+            elif t > group['warmup'] and not spike:
+                beta, scale = group['hyper_lr'], group['hd_scale']
+                ref = group.get('hd_ref', 1.0)
+                delta = -beta * (hd_m + group['anchor'] * math.log(scale / ref))
+                self._set_scale(group, scale * math.exp(min(max(delta, -beta), beta)))
+                group['hd_ref'] = max(ref, group['hd_scale'])
+            else:
+                self._set_scale(group, group['hd_scale'])
+        if lead.get('guard'):
+            self._hd_guard_after(t)
+        return clip
+
+
+class AdamHD(_HypergradientLR, Optimizer):
+    r"""Adam with a stabilised hypergradient-descent learning rate.
+
+    Builds on "Online Learning Rate Adaptation with Hypergradient Descent"
+    (Baydin et al., ICLR 2018), whose additive rule
+    ``lr -= hyper_lr * <g_t, u_{t-1}>`` tends either to collapse the learning
+    rate onto its floor (the one-step hypergradient is short-horizon biased
+    towards small steps) or to explode it (the raw dot product scales with the
+    model size and gradient magnitude, so no single ``hyper_lr`` fits).  This
+    version changes the rule in five ways:
+
+    * Scale-free signal: the hypergradient is the cosine between the current
+      gradient and ``d theta / d lr``, so it lies in [-1, 1] for any model.
+      With ``normalize`` (default) its running mean is divided by its running
+      RMS, a signal-to-noise ratio also in [-1, 1]: on minibatch noise the raw
+      cosine stays near +-0.1-0.3 even when its sign is consistent, which held
+      the LR to ~1%/step; the normalized signal moves it at up to the full
+      ``hyper_lr`` rate when the evidence agrees, and slowly when it does not.
+    * Longer horizon: ``d theta / d lr`` is an EMA (``horizon``) of recent
+      update directions rather than only the last one, which averages out
+      step-to-step oscillation and reduces the greedy bias towards decay.
+    * Multiplicative, bounded update in log space, smoothed by an EMA
+      (``hyper_beta``) and limited to ``exp(+-hyper_lr)`` per step.
+    * A weak log-space pull (``anchor``) towards the highest learning rate
+      reached so far, so the small positive bias the hypergradient shows at
+      the noise floor anneals the LR instead of walking it onto a bound, plus
+      hard bounds: the adapted multiplier stays within [1/100, 100] of the
+      base LR.  ``max_lr`` (``min_lr``) replaces the upper (lower) multiplier
+      bound with an absolute LR bound.
+    * Spike guard: non-finite gradients skip the step, and a gradient norm
+      above ``spike_factor`` times its running average is clipped; both cut
+      the learning rate by ``backoff``.
+
+    The adaptation is kept as a multiplier on the group's base LR.  When
+    something else writes ``group['lr']`` (an LR schedule or warmup), that
+    value becomes the new base and the multiplier carries over, so AdamHD
+    composes with schedules instead of being overwritten by them.
+
+    Zero start (``lr=0``, as in the paper's experiments): needs ``max_lr``,
+    which sets the scale.  The parameters stay put while the moments and
+    ``d theta / d lr`` accumulate; after ``warmup`` steps, as soon as the
+    smoothed hypergradient asks for a larger LR, it is seeded at
+    ``max_lr / 100`` and then adapts multiplicatively within
+    [``max_lr * 1e-4`` (or ``min_lr``), ``max_lr``]; ``hyper_lr`` sets how
+    fast it climbs.  Outside writes of 0 (a
+    schedule scaling a zero base) are ignored.
+
+    Weight decay is decoupled (AdamW style).  ``group['last_hypergrad']``
+    holds the latest cosine for logging.
+
+    Arguments:
+        params (iterable): parameters or parameter-group dicts.
+        lr (float): initial learning rate; 0 starts from zero and needs
+            ``max_lr`` (default: 1e-3).
+        hyper_lr (float): log-LR step size; the largest change per step is a
+            factor ``exp(hyper_lr)`` (default: 0.05).
+        betas (Tuple[float, float]): Adam moment coefficients (default: (0.9, 0.999)).
+        eps (float): Adam denominator term (default: 1e-8).
+        weight_decay (float): decoupled weight decay (default: 0).
+        hyper_beta (float): EMA coefficient of the hypergradient (default: 0.9).
+        horizon (float): EMA coefficient of ``d theta / d lr``; 0 is the
+            paper's one-step rule (default: 0.9).
+        anchor (float, optional): strength of the pull towards the peak LR; the
+            LR settles where ``signal = -anchor * log(lr / peak_lr)``.  Higher
+            keeps the LR closer to its peak (default: 1.0 normalized, 0.02 raw;
+            the normalized signal needs the stronger pull, else its consistent
+            short-horizon bias towards small steps walks the LR down).
+        min_lr, max_lr (float, optional): absolute LR bounds; each replaces
+            the matching [1/100, 100] multiplier bound.
+        warmup (int): steps before the LR starts adapting (default: 20).
+        spike_factor (float): gradient-norm spike threshold relative to its
+            running average; 0 disables the guard (default: 8).
+        backoff (float): LR factor applied on a spike or non-finite gradient
+            (default: 0.5).
+        normalize (bool): signal-to-noise hypergradient (default: True);
+            False is the original raw-cosine rule.
+        guard (bool): divergence guard with snapshots and rollback (default:
+            True; see _HypergradientLR).  Feed the training loss with
+            ``observe_loss(loss)`` before ``step()`` (or pass a closure) for the
+            loss-based trigger; non-finite gradients trigger it regardless.
+        guard_every (int): steps between snapshots of healthy weights (default: 50).
+        guard_tolerance (float): relative rise of the smoothed loss over its
+            best that counts as diverging (default: 0.2).
+        guard_patience (int): consecutive diverging or non-finite steps before
+            rolling back (default: 10).
+        guard_ceiling (float): after a rollback the LR stays below this
+            fraction of the LR that failed (default: 0.7).
+    """
+
+    def __init__(self, params, lr=1e-3, hyper_lr=0.05, betas=(0.9, 0.999), eps=1e-8,
+                 weight_decay=0.0, hyper_beta=0.9, horizon=0.9, anchor=None,
+                 min_lr=None, max_lr=None, warmup=20, spike_factor=8.0, backoff=0.5,
+                 normalize=True, guard=True, guard_every=50, guard_tolerance=0.2, guard_patience=10, guard_ceiling=0.7):
+        if eps <= 0.0:
+            raise ValueError("Invalid epsilon value: {}".format(eps))
+        if not all(0.0 <= b < 1.0 for b in betas):
+            raise ValueError("betas must lie in [0, 1)")
+        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay,
+                        **self._hd_options(lr, hyper_lr, hyper_beta, horizon, anchor, min_lr, max_lr,
+                                           warmup, spike_factor, backoff, normalize, guard, guard_every, guard_tolerance, guard_patience, guard_ceiling))
+        super(AdamHD, self).__init__(params, defaults)
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -2900,6 +3131,7 @@ class AdamHD(Optimizer):
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
+            self.observe_loss(loss)
 
         active = [(group, p) for group in self.param_groups for p in group['params']
                   if p.grad is not None]
@@ -2919,39 +3151,9 @@ class AdamHD(Optimizer):
                 d_sq += direction.pow(2).sum().to(device)
         dot, g_sq, d_sq = torch.stack((dot, g_sq, d_sq)).tolist()
 
-        lead = self.param_groups[0]
-        if not all(math.isfinite(v) for v in (dot, g_sq, d_sq)):
-            # A NaN/Inf gradient would poison the moments: skip and back off.
-            self._backoff(lead['backoff'])
+        clip = self._hd_adapt(dot, g_sq, d_sq)
+        if clip is None:
             return loss
-
-        t = lead['hd_step'] = lead.get('hd_step', 0) + 1
-        g_norm = math.sqrt(g_sq)
-        g_ema = lead.get('hd_gnorm_ema', 0.0)
-        clip = 1.0
-        spike = (lead['spike_factor'] > 0 and t > lead['warmup'] and g_ema > 0.0
-                 and g_norm > lead['spike_factor'] * g_ema)
-        if spike:
-            clip = lead['spike_factor'] * g_ema / g_norm
-            self._backoff(lead['backoff'])
-        lead['hd_gnorm_ema'] = g_norm if g_ema == 0.0 else 0.98 * g_ema + 0.02 * g_norm * clip
-
-        # Cosine between the gradient and d(theta)/d(lr); positive means a
-        # larger learning rate would have increased the loss.
-        cosine = dot / math.sqrt(g_sq * d_sq) if g_sq > 0.0 and d_sq > 0.0 else 0.0
-        for group in self.param_groups:
-            self._sync_base(group)
-            group['last_hypergrad'] = cosine
-            hd_m = group['hd_m'] = (group['hyper_beta'] * group.get('hd_m', 0.0)
-                                    + (1.0 - group['hyper_beta']) * cosine)
-            if t > group['warmup'] and not spike:
-                beta, scale = group['hyper_lr'], group['hd_scale']
-                ref = group.get('hd_ref', 1.0)
-                delta = -beta * (hd_m + group['anchor'] * math.log(scale / ref))
-                self._set_scale(group, scale * math.exp(min(max(delta, -beta), beta)))
-                group['hd_ref'] = max(ref, group['hd_scale'])
-            else:
-                self._set_scale(group, group['hd_scale'])
 
         for group, p in active:
             state = self.state[p]
@@ -11579,6 +11781,104 @@ class NorMuon(AdaMuon):
         if group['weight_decay']:
             torch._foreach_mul_(params, 1 - group['lr'] * group['weight_decay'])
         torch._foreach_add_(params, [u.reshape_as(p) for u, p in zip(updates, params)])
+
+
+class _HDWrapped(_HypergradientLR):
+    """Hypergradient LR for an optimizer whose update is linear in ``lr``
+    (theta <- theta * (1 - lr * wd) - lr * u, as in the Muon family).
+
+    Each step runs the wrapped update once at lr = 1 to read the update
+    direction ``d = d theta / d lr`` directly (so it is also defined while the
+    adapted LR is still 0), then places the parameters at ``theta + lr * d``.
+    This costs one temporary FP32 copy of the stepped parameters.  A clipped
+    gradient spike rescales ``p.grad`` in place.
+    """
+
+    def _hd_init(self, hd):
+        self.defaults.update(hd)
+        for group in self.param_groups:
+            for key, value in hd.items():
+                group.setdefault(key, value)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+            self.observe_loss(loss)
+        active = [(group, p) for group in self.param_groups for p in group['params'] if p.grad is not None]
+        if not active:
+            return loss
+        device = active[0][1].device
+        dot = torch.zeros((), device=device, dtype=torch.float32)
+        g_sq, d_sq = dot.clone(), dot.clone()
+        for group, p in active:
+            g = p.grad.float()
+            g_sq += g.pow(2).sum().to(device)
+            direction = self.state[p].get('hd_dir')
+            if direction is not None:
+                dot += (g * direction).sum().to(device)
+                d_sq += direction.pow(2).sum().to(device)
+        dot, g_sq, d_sq = torch.stack((dot, g_sq, d_sq)).tolist()
+
+        clip = self._hd_adapt(dot, g_sq, d_sq)
+        if clip is None:
+            return loss
+        if clip != 1.0:
+            for _, p in active:
+                p.grad.mul_(clip)
+
+        lrs = [group['lr'] for group in self.param_groups]
+        before = [p.detach().float().clone() for _, p in active]
+        for group in self.param_groups:
+            group['lr'] = 1.0
+        try:
+            super().step()
+        finally:
+            for group, lr in zip(self.param_groups, lrs):
+                group['lr'] = lr
+        for (group, p), start in zip(active, before):
+            direction = p.detach().float() - start
+            state = self.state[p]
+            if 'hd_dir' in state:
+                state['hd_dir'].mul_(group['horizon']).add_(direction)
+            else:
+                state['hd_dir'] = direction.clone()
+            p.copy_(start.add_(direction, alpha=group['lr']))
+        return loss
+
+
+class MuonHD(_HDWrapped, Muon):
+    """Muon with AdamHD's hypergradient learning rate.
+
+    The learning rate adapts online from the cosine between each gradient and
+    the recent Muon update directions (signal-to-noise normalized by default,
+    anchored to the peak LR, bounded, spike-guarded; ``lr=0`` starts from zero
+    and needs ``max_lr``).  See AdamHD for the rule and its options.  All
+    other arguments are Muon's; groups keep their own base LRs (for example
+    the AdamW fallback) and share one adapted multiplier.
+    """
+
+    def __init__(self, params, lr=4.2e-4, *, hyper_lr=0.05, hyper_beta=0.9, horizon=0.9,
+                 anchor=None, min_lr=None, max_lr=None, warmup=20, spike_factor=8.0,
+                 backoff=0.5, normalize=True, guard=True, guard_every=50, guard_tolerance=0.2, guard_patience=10, guard_ceiling=0.7, **muon_kwargs):
+        hd = self._hd_options(lr, hyper_lr, hyper_beta, horizon, anchor, min_lr, max_lr,
+                              warmup, spike_factor, backoff, normalize, guard, guard_every, guard_tolerance, guard_patience, guard_ceiling)
+        super().__init__(params, lr=lr, **muon_kwargs)
+        self._hd_init(hd)
+
+
+class NorMuonHD(_HDWrapped, NorMuon):
+    """NorMuon with AdamHD's hypergradient learning rate (see MuonHD)."""
+
+    def __init__(self, params, lr=4.2e-4, *, hyper_lr=0.05, hyper_beta=0.9, horizon=0.9,
+                 anchor=None, min_lr=None, max_lr=None, warmup=20, spike_factor=8.0,
+                 backoff=0.5, normalize=True, guard=True, guard_every=50, guard_tolerance=0.2, guard_patience=10, guard_ceiling=0.7, **normuon_kwargs):
+        hd = self._hd_options(lr, hyper_lr, hyper_beta, horizon, anchor, min_lr, max_lr,
+                              warmup, spike_factor, backoff, normalize, guard, guard_every, guard_tolerance, guard_patience, guard_ceiling)
+        super().__init__(params, lr=lr, **normuon_kwargs)
+        self._hd_init(hd)
 
 
 class AdaGO(Muon):

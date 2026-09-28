@@ -15,6 +15,8 @@ from torch.utils.data import DataLoader, Dataset
 from collections import deque
 from tqdm import tqdm
 import traceback
+import threading
+import time
 import textwrap
 import copy
 import importlib
@@ -2240,7 +2242,7 @@ def save_checkpoint(model, optimizer, optimizer_choice, path="model.pt"):
     """model.pt as before, plus the optimizer state so training can be resumed seamlessly."""
     torch.save(model.state_dict(), path)
     if hasattr(optimizer, "state_dict"):
-        try: torch.save({"optimizer": optimizer_choice, "state": optimizer.state_dict()}, OPTIMIZER_STATE_FILE)
+        try: torch.save({"optimizer": optimizer_choice, "class": type(optimizer).__name__, "state": optimizer.state_dict()}, OPTIMIZER_STATE_FILE)
         except Exception as e: print(f"  (optimizer state not saved: {e})")
 
 
@@ -2251,6 +2253,10 @@ def restore_optimizer(optimizer, optimizer_choice, custom_lr=None):
     saved = torch.load(OPTIMIZER_STATE_FILE, map_location="cpu")
     if saved.get("optimizer") != optimizer_choice:
         print(f"Resume: saved optimizer state is for {saved.get('optimizer')}, not {optimizer_choice}; starting it fresh."); return False
+    # Files saved before the class was recorded: "AdamHD" was then lamb.AdamAdaHD.
+    saved_cls = saved.get("class") or ("AdamAdaHD" if optimizer_choice == "AdamHD" else type(optimizer).__name__)
+    if saved_cls != type(optimizer).__name__:
+        print(f"Resume: saved optimizer state is for {saved_cls}, not {type(optimizer).__name__}; starting it fresh."); return False
     fresh_lrs = [g.get("lr") for g in optimizer.param_groups]
     try: optimizer.load_state_dict(saved["state"])
     except Exception as e:
@@ -3507,6 +3513,53 @@ class EvolutionaryOptimizer:
     def eval(self): pass
 
 
+MUON_CHOICES = ("Muon", "AdaMuon", "NorMuon", "AdaGO", "AdamGO", "RMSGO", "AdaDeltaGO", "MuonHD", "NorMuonHD")
+HD_CHOICES = ("AdamHD", "MuonHD", "NorMuonHD")   # hypergradient LR (lamb.AdamHD rule)
+_HD_ANSWERS = {}
+
+
+def prompt_hd_options(optimizer_choice, use_defaults=False):
+    """Hypergradient-LR options of AdamHD / MuonHD / NorMuonHD (see lamb.AdamHD).
+    use_defaults=True returns the defaults without reading stdin (GUI). The CLI asks
+    once per run and reuses the answers when the optimizer is rebuilt (growth, evolution)."""
+    if not use_defaults and optimizer_choice in _HD_ANSWERS:
+        return dict(_HD_ANSWERS[optimizer_choice])
+    def ask(label, default, convert=float):
+        while not use_defaults:
+            raw = input(f"{label} [{default}]: ").strip()
+            if not raw:
+                return default
+            try:
+                if convert is bool:
+                    if raw.lower() not in ('1', '0', 'true', 'false', 'yes', 'no', 'y', 'n'):
+                        raise ValueError
+                    return raw.lower() in ('1', 'true', 'yes', 'y')
+                return convert(raw)
+            except ValueError:
+                print("Invalid value; please try again.")
+        return default
+
+    options = dict(hyper_lr=ask("Hypergradient step (max log-LR change per step)", .05),
+                   normalize=ask("Normalized hypergradient (off = original raw-cosine rule)?", True, bool))
+    options['anchor'] = ask("Anchor (pull towards the peak LR; higher decays less)", 1. if options['normalize'] else .02)
+    options['max_lr'] = ask("Maximum LR (0 = 100x the initial LR; needed for a zero initial LR)", 0.)
+    if optimizer_choice == "AdamHD":
+        options['weight_decay'] = ask("Weight decay (decoupled)", 0.)
+    if not use_defaults:
+        _HD_ANSWERS[optimizer_choice] = dict(options)
+    return options
+
+
+def optimizer_options(optimizer_choice, use_defaults=False):
+    """Every constructor option the CLI asks for: Muon family and/or hypergradient LR."""
+    options = {}
+    if optimizer_choice in MUON_CHOICES:
+        options.update(prompt_muon_options(optimizer_choice, use_defaults))
+    if optimizer_choice in HD_CHOICES:
+        options.update(prompt_hd_options(optimizer_choice, use_defaults))
+    return options
+
+
 def prompt_muon_options(optimizer_choice, use_defaults=False):
     """Configure the shared Muon family using its current constructor options.
     use_defaults=True returns the prompt defaults without reading stdin (GUI)."""
@@ -3546,7 +3599,7 @@ def prompt_muon_options(optimizer_choice, use_defaults=False):
     if optimizer_choice == "AdaMuon":
         options['eps'] = ask("AdaMuon epsilon", 1e-8)
         options['nesterov'] = ask("AdaMuon Nesterov (off=paper Algorithm 1)?", False, bool)
-    elif optimizer_choice == "NorMuon":
+    elif optimizer_choice in ("NorMuon", "NorMuonHD"):
         options['eps'] = ask("NorMuon epsilon", 1e-8)
         options['beta2'] = ask("Row variance decay (beta2)", .95)
     elif optimizer_choice in ("AdaGO", "RMSGO"):
@@ -3584,11 +3637,19 @@ def select_optimizer(optimizer_choice, model, custom_lr=None, optim_params=None)
     """
     _lr = custom_lr  # None means use default
     if optimizer_choice == "Adam": optimizer = optim.Adam(model.parameters(), lr=_lr if _lr is not None else 0.0004)
-    elif optimizer_choice in ("Muon", "AdaMuon", "NorMuon", "AdaGO", "AdamGO", "RMSGO", "AdaDeltaGO"):
-        options = dict(prompt_muon_options(optimizer_choice) if optim_params is None else optim_params)
+    elif optimizer_choice in ("Muon", "AdaMuon", "NorMuon", "AdaGO", "AdamGO", "RMSGO", "AdaDeltaGO", "MuonHD", "NorMuonHD"):
+        if optim_params is None:
+            options = dict(prompt_muon_options(optimizer_choice))
+            if optimizer_choice in ("MuonHD", "NorMuonHD"):
+                options.update(prompt_hd_options(optimizer_choice))
+        else:
+            options = dict(optim_params)
+        if 'max_lr' in options:   # HD: 0 means no absolute cap (lamb uses None)
+            options['max_lr'] = float(options['max_lr']) or None
         if _lr is not None:
             options['lr'] = _lr
         optimizer_cls = (AdaDeltaGO if optimizer_choice == "AdaDeltaGO" else RMSGO if optimizer_choice == "RMSGO" else AdamGO if optimizer_choice == "AdamGO" else AdaGO if optimizer_choice == "AdaGO" else
+                         MuonHD if optimizer_choice == "MuonHD" else NorMuonHD if optimizer_choice == "NorMuonHD" else
                          {"Muon": Muon, "AdaMuon": AdaMuon, "NorMuon": NorMuon}[optimizer_choice])
         # AdamW-fallback LR = main LR * adam_lr_ratio (absent = legacy shared LR);
         # a ratio keeps custom and LR-finder rates proportional.
@@ -3600,10 +3661,16 @@ def select_optimizer(optimizer_choice, model, custom_lr=None, optim_params=None)
             for group in optimizer.param_groups:
                 if not group['use_muon']:
                     group['lr'] *= ratio
+                    if group.get('max_lr'):   # HD: keep the fallback's cap in proportion too
+                        group['max_lr'] *= ratio
     elif optimizer_choice == "Adam3":
         order = max(int(optim_params.get("order", 3) if optim_params is not None else input("Enter amount of orders (3 is minimum): ")), 3)
         optimizer = ThreeAdam(model.parameters(), lr=0.004, order=order)
-    elif optimizer_choice == "AdamHD": optimizer = AdamAdaHD(model.parameters(), lr=0.000)
+    elif optimizer_choice == "AdamHD":
+        options = dict(prompt_hd_options(optimizer_choice) if optim_params is None else optim_params)
+        if 'max_lr' in options:
+            options['max_lr'] = float(options['max_lr']) or None
+        optimizer = AdamHD(model.parameters(), lr=_lr if _lr is not None else 1e-3, **options)
     elif optimizer_choice == "SGD": optimizer = CSGD(model.parameters(), momentum=0.9, lr=0.01)
     elif optimizer_choice == "SGDHD": optimizer = SGDHD(model.parameters(), momentum=0.9, lr=0.0, nesterov=True)
     elif optimizer_choice == "Lamb": optimizer = CLamb(model.parameters(), lr=0.01)
@@ -4594,7 +4661,8 @@ def ask_optimizer():
                "13":"NAdam","14":"SparseAdam","15":"RAdamScheduleFree","16":"AdEMAMix",
                "17":"Adam3","18":"AdamDelta","19":"AutoAdam","20":"NormAdam","21":"SWATS",
                "22":"AdaBoundW","23":"CLion","24":"Signum","25":"SRprop","26":"IRprop", "27": "Adan", "28": "Prodigy",
-               "29": "Evolution", "30": "Muon", "31": "AdaMuon", "32": "NorMuon", "33": "AdaGO", "34": "AdamGO", "35": "RMSGO", "36": "AdaDeltaGO"}
+               "29": "Evolution", "30": "Muon", "31": "AdaMuon", "32": "NorMuon", "33": "AdaGO", "34": "AdamGO", "35": "RMSGO", "36": "AdaDeltaGO",
+               "37": "MuonHD", "38": "NorMuonHD"}
     print("Choose optimizer:")
     for key, name in options.items(): print(f"{key}: {name}")
     choice = input("Enter the number or name: ").strip()
@@ -5921,8 +5989,18 @@ def run_benchmark(csv_file, delimiter, input_cols, output_cols, col_types, vocab
                   num_heads=1, input_attention_type="none", moe_mode=1, num_steps=1000,
                   loss_calc_mode=0, train_eval_amount=None, valid_eval_percentage=None,
                   use_lsuv=False, lsuv_max_iter=10, lsuv_normalize_mean=True,
-                  val_file_path=None, val_delimiter=None, sweep_config=None, custom_lr=None):
-    """Benchmark with optional external validation file support."""
+                  val_file_path=None, val_delimiter=None, sweep_config=None, custom_lr=None,
+                  activations=None, activation_type=None, optim_params_for=None, progress_callback=None,
+                  eval_interval=500, final_eval=False):
+    """Benchmark with optional external validation file support.
+
+    Non-interactive use (GUI): ``activations`` (names) and ``activation_type`` replace
+    the activation prompts, ``optim_params_for(optimizer) -> dict`` replaces the
+    optimizer prompts.  ``progress_callback(event)`` receives start / combo / step /
+    result events; returning True stops the benchmark.  ``final_eval`` adds a
+    validation check after the last step (loss_calc_mode 2).  Returns the result
+    rows (name, metric and per-combination statistics)."""
+    import time
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -5955,7 +6033,15 @@ def run_benchmark(csv_file, delimiter, input_cols, output_cols, col_types, vocab
     output_dims = output_pred_dim
 
     # Build sweep combinations
-    if sweep_config and sweep_config.get('activations'):
+    if activations is not None:
+        amap = _build_activation_map()
+        unknown = [n for n in activations if n not in amap]
+        if unknown or not activations:
+            raise ValueError(f"Unknown activations: {unknown}" if unknown else "Choose at least one activation.")
+        if activation_type is None:
+            activation_type = ask_activation_type()
+        act_dict = {name: wrap_activation(amap[name], activation_type) for name in activations}
+    elif sweep_config and sweep_config.get('activations'):
         act_dict = sweep_config['activations']
         activation_type = ask_activation_type()
         wrapped_act_dict = {name: wrap_activation(factory, activation_type) for name, factory in act_dict.items()}
@@ -5991,8 +6077,13 @@ def run_benchmark(csv_file, delimiter, input_cols, output_cols, col_types, vocab
     if total_combos > len(act_dict):
         print(f"\n=== Full Hyperparameter Sweep: {total_combos} combinations ===")
     
+    notify = progress_callback or (lambda event: False)
+    stop = bool(notify({"event": "start", "total": total_combos, "names": [c['act_name'] for c in sweep_combos]}))
+    details = []
     results = []
     for combo_idx, combo in enumerate(sweep_combos):
+        if stop:
+            break
         act_name = combo['act_name']
         act_factory = combo['act_factory']
         cur_optimizer = combo['optimizer']
@@ -6013,7 +6104,13 @@ def run_benchmark(csv_file, delimiter, input_cols, output_cols, col_types, vocab
             if len(res_list) > 1: extras.append(f"res={cur_res}")
             if extras: combo_name = f"{act_name} [{', '.join(extras)}]"
         print(f"\n=== [{combo_idx+1}/{total_combos}] Benchmarking {combo_name} ===")
+        stop = bool(notify({"event": "combo", "index": combo_idx, "name": combo_name, "optimizer": cur_optimizer,
+                            "lr": cur_lr, "arch": cur_arch, "norm": cur_norm, "res": cur_res, "activation": act_name}))
         best_metric = float("nan"); recent = deque(maxlen=100)
+        detail = {"name": combo_name, "activation": act_name, "optimizer": cur_optimizer, "lr": cur_lr, "arch": list(cur_arch),
+                  "norm": cur_norm, "res": cur_res, "params": 0, "seconds": 0.0, "steps": 0, "curve": [], "val_curve": [],
+                  "error": None}
+        started = time.time(); curve_every = max(1, num_steps // 200); window = deque(maxlen=max(10, curve_every))
         try:
             model = MLPO(input_dims, hidden_dims, output_dims, act_factory, cur_res,
                 norm_type=cur_norm, groups=groups, attention_type=attention_type, num_heads=num_heads,
@@ -6025,12 +6122,22 @@ def run_benchmark(csv_file, delimiter, input_cols, output_cols, col_types, vocab
             if use_lsuv:
                 lsuv_init(model, train_loader, device, max_iter=lsuv_max_iter,
                          normalize_mean=lsuv_normalize_mean, verbose=False)
-            optimizer = select_optimizer(cur_optimizer, model, custom_lr=cur_lr)
-            if optimizer_choice == "RAdamScheduleFree": optimizer.train()
+            detail["params"] = sum(p.numel() for p in model.parameters())
+            optimizer = select_optimizer(cur_optimizer, model, custom_lr=cur_lr,
+                                         optim_params=optim_params_for(cur_optimizer) if optim_params_for else None)
+            if cur_optimizer == "RAdamScheduleFree": optimizer.train()
             
             criterion = CombinedLoss(output_layout) if has_categorical else nn.HuberLoss()
             if has_categorical: criterion.calibrate(dataset)
-            step = 0; EVAL_INTERVAL = 500
+            step = 0; EVAL_INTERVAL = max(1, int(eval_interval))
+            def validate():
+                model.eval(); val_losses = []
+                with torch.no_grad():
+                    for vi, vt in val_loader:
+                        vi, vt = vi.to(device), vt.to(device)
+                        val_losses.append(criterion(model(vi), vt).item())
+                model.train()
+                return sum(val_losses) / len(val_losses) if val_losses else None
             pbar = tqdm(total=num_steps, desc=f"{combo_name[:30]:<30}", leave=True)
             
             while step < num_steps:
@@ -6042,7 +6149,9 @@ def run_benchmark(csv_file, delimiter, input_cols, output_cols, col_types, vocab
                     if noise_mode == "output noise":
                         outputs = outputs + torch.randn_like(outputs) * noise_params.get("std", 0.1)
                     loss = criterion(outputs, targets)
-                    optimizer.zero_grad(); loss.backward(); optimizer.step()
+                    optimizer.zero_grad(); loss.backward()
+                    if hasattr(optimizer, "observe_loss"): optimizer.observe_loss(loss.item())   # HD divergence guard
+                    optimizer.step()
                     if noise_mode == "weight noise":
                         with torch.no_grad():
                             for p in model.parameters(): p.add_(torch.randn_like(p) * noise_params.get("std", 0.1))
@@ -6053,19 +6162,27 @@ def run_benchmark(csv_file, delimiter, input_cols, output_cols, col_types, vocab
                             avg = sum(recent) / len(recent)
                             if math.isnan(best_metric) or avg < best_metric: best_metric = avg
                     elif loss_calc_mode == 2 and (step % EVAL_INTERVAL == 0) and val_loader:
-                        model.eval(); val_losses = []
-                        with torch.no_grad():
-                            for vi, vt in val_loader:
-                                vi, vt = vi.to(device), vt.to(device)
-                                val_losses.append(criterion(model(vi), vt).item())
-                        model.train()
-                        if val_losses:
-                            va = sum(val_losses) / len(val_losses)
+                        va = validate()
+                        if va is not None:
+                            detail["val_curve"].append((step, va))
                             if math.isnan(best_metric) or va < best_metric: best_metric = va
                     
+                    window.append(loss.item())
                     step += 1; pbar.update(1)
-                    if step >= num_steps: break
+                    if step % curve_every == 0 or step >= num_steps:
+                        detail["curve"].append((step, sum(window) / len(window)))
+                        if notify({"event": "step", "index": combo_idx, "step": step, "total_steps": num_steps,
+                                   "loss": detail["curve"][-1][1], "val": detail["val_curve"][-1][1] if detail["val_curve"] else None,
+                                   "curve": detail["curve"], "val_curve": detail["val_curve"]}):
+                            stop = True
+                    if step >= num_steps or stop: break
+                if stop: break
             pbar.close()
+            if final_eval and loss_calc_mode == 2 and val_loader and not stop:
+                va = validate()
+                if va is not None:
+                    detail["val_curve"].append((step, va))
+                    if math.isnan(best_metric) or va < best_metric: best_metric = va
 
             if loss_calc_mode == 1:
                 if train_eval_amount is None: raise ValueError("train_eval_amount required")
@@ -6081,15 +6198,22 @@ def run_benchmark(csv_file, delimiter, input_cols, output_cols, col_types, vocab
                 best_metric = sum(eval_losses) / len(eval_losses) if eval_losses else float("nan")
 
         except RuntimeError as e:
-            print(f"RuntimeError during {act_name}: {e}"); best_metric = float("nan")
+            print(f"RuntimeError during {act_name}: {e}"); best_metric = float("nan"); detail["error"] = str(e).split("\n")[0][:300]
         except Exception as e:
-            print(f"Error during {act_name}: {e}"); best_metric = float("nan")
+            print(f"Error during {act_name}: {e}"); best_metric = float("nan"); detail["error"] = str(e).split("\n")[0][:300]
         finally:
             try: del model; del optimizer
             except: pass
             if torch.cuda.is_available(): torch.cuda.empty_cache()
 
+        if stop:
+            break   # an interrupted combination is not a result
+        detail.update(metric=best_metric, seconds=time.time() - started, steps=detail["curve"][-1][0] if detail["curve"] else 0,
+                      final_loss=detail["curve"][-1][1] if detail["curve"] else None)
+        detail["steps_per_s"] = detail["steps"] / detail["seconds"] if detail["seconds"] > 0 else 0.0
+        details.append(detail)
         print(best_metric); results.append((combo_name, best_metric))
+        stop = bool(notify({"event": "result", "index": combo_idx, "result": detail}))
 
     results.sort(key=lambda x: float("inf") if math.isnan(x[1]) else x[1])
     print("\n===== Benchmark Results =====")
@@ -6101,6 +6225,7 @@ def run_benchmark(csv_file, delimiter, input_cols, output_cols, col_types, vocab
             for rank, (name, score) in enumerate(results, 1): writer.writerow([rank, name, score])
         print("\nResults saved to benchmark_results.csv")
     except Exception as e: print("CSV save failed:", e)
+    return details
 
 
 ##############################################
@@ -8037,13 +8162,14 @@ _GUI_COL_TYPES = ["i", "in", "inlab", "intex", "inim", "inlabcat", "intexcat", "
 _GUI_OPTIMIZERS = ["Adam", "AdamHD", "SGD", "SGDHD", "Lamb", "Adagrad", "Adadelta", "AdamW", "RMSprop", "Rprop", "ASGD",
                    "Adamax", "NAdam", "SparseAdam", "RAdamScheduleFree", "AdEMAMix", "Adam3", "AdamDelta", "AutoAdam",
                    "NormAdam", "SWATS", "AdaBoundW", "CLion", "Signum", "SRprop", "IRprop", "Adan", "Prodigy",
-                   "Evolution", "Muon", "AdaMuon", "NorMuon", "AdaGO", "AdamGO", "RMSGO", "AdaDeltaGO"]
-_GUI_MUON_FAMILY = ("Muon", "AdaMuon", "NorMuon", "AdaGO", "AdamGO", "RMSGO", "AdaDeltaGO")
+                   "Evolution", "Muon", "AdaMuon", "NorMuon", "AdaGO", "AdamGO", "RMSGO", "AdaDeltaGO", "MuonHD", "NorMuonHD"]
+# optimizers with an options panel in the GUI (every option the CLI asks for)
+_GUI_MUON_FAMILY = MUON_CHOICES + ("AdamHD",)
 
 
 def _gui_muon_params(opt, overrides):
     """CLI defaults for a Muon-family optimizer with the GUI's overrides applied (same types as the CLI)."""
-    params = prompt_muon_options(opt, use_defaults=True)
+    params = optimizer_options(opt, use_defaults=True)
     for k, v in (overrides or {}).items():
         if k not in params or v is None or v == "": continue
         d = params[k]
@@ -8293,11 +8419,142 @@ class TrainingSession:
             with self.lock: self.finished = time.time()
 
 
+_GUI_ACT_SUBSETS = {"All": "ACTIVATION_MAP", "Basics": "BASICS_MAP", "ReLUs": "RELUS_MAP", "Periodics": "PERIODICS_MAP",
+                    "Self-gated": "SELF_GATED_MAP", "Trainables": "TRAINABLE_MAP", "IDK": "IDK_MAP"}
+_GUI_NORMS = ["none", "batch", "instance", "layer", "group", "rmsnorm"]
+_GUI_RESIDUALS = ["none", "highway", "residual", "rezero", "elementwise_rezero", "concat", "densenet"]
+
+
+class BenchSession:
+    """The CLI benchmark (run_benchmark) driven from the GUI: the dataset, columns and
+    base network come from the Train page's form; the sweep axes from the Benchmark page."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.state, self.error, self.results, self.current, self.total, self.names = "idle", None, [], None, 0, []
+        self.started = self.finished = None
+        self.stop_requested, self.settings = False, None
+
+    def start(self, spec):
+        with self.lock:
+            if self.state in ("preparing", "running", "stopping"):
+                raise RuntimeError("A benchmark is already running.")
+        form, b = spec.get("train") or {}, spec.get("bench") or {}
+        a = TrainingSession._build_args(None, form)
+        amap = _build_activation_map()
+        acts = [n for n in (b.get("activations") or []) if n in amap and n != "Custom"]
+        if not acts:
+            raise ValueError("Choose at least one activation to benchmark.")
+        opts = [o for o in (b.get("optimizers") or [a["kwargs"]["optimizer_choice"]]) if o in _GUI_OPTIMIZERS]
+        def floats(raw):
+            try: return [float(x) for x in str(raw or "").replace(";", ",").split(",") if x.strip()]
+            except ValueError: raise ValueError("Learning rates must be numbers separated by commas.")
+        lrs = floats(b.get("learning_rates"))
+        archs = []
+        for part in str(b.get("architectures") or "").split("|"):
+            try: dims = [int(x) for x in part.replace(" ", "").split(",") if x]
+            except ValueError: raise ValueError("Architectures look like 128,64 | 256,128,64")
+            if dims:
+                if min(dims) < 1: raise ValueError("Layer widths must be at least 1.")
+                archs.append(dims)
+        norms = [n for n in (b.get("norms") or []) if n in _GUI_NORMS]
+        res = [r for r in (b.get("residuals") or []) if r in _GUI_RESIDUALS]
+        sweep = {k: v for k, v in (("optimizers", opts if len(opts) > 1 or opts != [a["kwargs"]["optimizer_choice"]] else None),
+                                   ("learning_rates", lrs or None), ("architectures", archs or None),
+                                   ("norm_types", norms or None), ("residual_types", res or None)) if v}
+        metric = int(b.get("metric", 2 if form.get("val_mode", "split") != "none" else 0))
+        if metric not in (0, 1, 2): raise ValueError("Unknown benchmark metric")
+        v = a["val"]
+        if metric == 2 and v["mode"] == "none":
+            raise ValueError("Validation-loss scoring needs validation (set it on the Train page).")
+        steps = int(b.get("steps", 1000))
+        if steps < 1: raise ValueError("Steps must be at least 1.")
+        n = len(acts) * max(1, len(opts)) * max(1, len(lrs)) * max(1, len(archs)) * max(1, len(norms)) * max(1, len(res))
+        base_optimizer, base_params = a["kwargs"]["optimizer_choice"], a["kwargs"]["optim_params"] or {}
+        def optim_params_for(opt):
+            overrides = base_params if opt == base_optimizer else {}
+            return _gui_muon_params(opt, overrides) if opt in _GUI_MUON_FAMILY else dict(overrides)
+        with self.lock:
+            self.state, self.error, self.results, self.current, self.total, self.names = "preparing", None, [], None, n, []
+            self.started, self.finished, self.stop_requested = time.time(), None, False
+            self.settings = {"steps": steps, "metric": ["Best sliding train loss", "Final train eval", "Best validation loss"][metric],
+                             "base": {"hidden_dims": a["kwargs"]["hidden_dims"], "optimizer": base_optimizer,
+                                      "norm": a["kwargs"]["norm_type"], "residual": a["kwargs"]["residual_type"],
+                                      "lr": a["kwargs"]["custom_lr"], "batch_size": a["kwargs"]["batch_size"]},
+                             "axes": {"activations": acts, **{k: v for k, v in sweep.items()}}, "dataset": a["path"]}
+        threading.Thread(target=self._run, args=(a, acts, int(b.get("activation_type", a["kwargs"]["activation_type"])), sweep,
+                                                 metric, steps, b, optim_params_for), daemon=True, name="mlp-benchmark").start()
+        return self.status()
+
+    def _callback(self, e):
+        with self.lock:
+            kind = e.get("event")
+            if kind == "start":
+                self.state, self.names, self.total = "running" if not self.stop_requested else "stopping", e["names"], e["total"]
+            elif kind == "combo":
+                self.current = {k: e[k] for k in ("index", "name", "optimizer", "lr", "arch", "norm", "res", "activation")}
+                self.current.update(step=0, curve=[], val_curve=[], started=time.time())
+            elif kind == "step" and self.current:
+                self.current.update(step=e["step"], total_steps=e["total_steps"], curve=list(e["curve"]), val_curve=list(e["val_curve"]))
+            elif kind == "result":
+                self.results.append(e["result"]); self.current = None
+            return self.stop_requested
+
+    def _run(self, a, acts, act_type, sweep, metric, steps, b, optim_params_for):
+        try:
+            col_types = a["col_types"]; vocabularies = {}; image_params = dict(a["image_params"])
+            for c, t in col_types.items():
+                if t in ("i", "inim"): continue
+                _setup_vocab_for_col(c, t, a["path"], a["delim"], vocabularies, image_params)
+            kw, v = a["kwargs"], a["val"]
+            vfile = None
+            if metric == 2 and v["mode"] == "file":
+                vfile = os.path.abspath(os.path.expanduser(v["file"] or ""))
+                if not os.path.isfile(vfile): raise FileNotFoundError(f"Validation file not found: {vfile}")
+            run_benchmark(a["path"], a["delim"], a["input_cols"], a["output_cols"], col_types, vocabularies, image_params,
+                          kw["hidden_dims"], kw["batch_size"], kw["optimizer_choice"], kw["residual_type"], kw["noise_mode"],
+                          kw["noise_params"], norm_type=kw["norm_type"], groups=kw["groups"] or 1, attention_type=kw["attention_type"],
+                          num_heads=kw["num_heads"] or 1, input_attention_type=kw["input_attention_type"], moe_mode=kw["moe_mode"],
+                          num_steps=steps, loss_calc_mode=metric, train_eval_amount=int(b.get("eval_amount", 1000)) if metric == 1 else None,
+                          valid_eval_percentage=v["pct"] if metric == 2 and v["mode"] == "split" else None,
+                          use_lsuv=kw["use_lsuv"], lsuv_max_iter=kw["lsuv_max_iter"], lsuv_normalize_mean=kw["lsuv_normalize_mean"],
+                          val_file_path=vfile, val_delimiter=a["delim"], sweep_config=sweep or None, custom_lr=kw["custom_lr"],
+                          activations=acts, activation_type=act_type, optim_params_for=optim_params_for,
+                          progress_callback=self._callback, eval_interval=int(b.get("eval_interval", 100)), final_eval=True)
+            with self.lock:
+                self.state, self.current = ("stopped" if self.stop_requested else "done"), None
+        except Exception as e:
+            traceback.print_exc()
+            with self.lock:
+                self.state, self.error, self.current = "error", f"{type(e).__name__}: {e}", None
+        finally:
+            with self.lock: self.finished = time.time()
+
+    def stop(self):
+        with self.lock:
+            if self.state in ("preparing", "running"):
+                self.stop_requested, self.state = True, "stopping"
+        return self.status()
+
+    def status(self, known=0):
+        with self.lock:
+            known = max(0, min(int(known or 0), len(self.results)))
+            done = len(self.results)
+            elapsed = (self.finished or time.time()) - self.started if self.started else 0
+            cur = dict(self.current) if self.current else None
+            if cur: cur["elapsed"] = time.time() - cur.pop("started")
+            return {"state": self.state, "error": self.error, "total": self.total, "done": done, "names": list(self.names),
+                    "results_from": known, "results": self.results[known:], "current": cur, "settings": self.settings,
+                    "elapsed": elapsed, "eta": elapsed / done * (self.total - done) if done and self.state == "running" else None}
+
+
 def gui_train_options():
     amap = _build_activation_map()
     return {"col_types": _GUI_COL_TYPES, "optimizers": _GUI_OPTIMIZERS, "muon_family": list(_GUI_MUON_FAMILY),
-            "muon_defaults": {o: prompt_muon_options(o, use_defaults=True) for o in _GUI_MUON_FAMILY},
+            "muon_defaults": {o: optimizer_options(o, use_defaults=True) for o in _GUI_MUON_FAMILY},
             "activations": [n for n in amap if n != "Custom"], "activation_params": _GUI_ACT_PARAMS,
+            "act_subsets": {k: [n for n in globals()[v] if n in amap and n != "Custom"] for k, v in _GUI_ACT_SUBSETS.items()},
+            "norms": _GUI_NORMS, "residuals": _GUI_RESIDUALS,
             "cwd": os.getcwd()}
 
 
@@ -8308,6 +8565,7 @@ def run_gui(host="127.0.0.1", port=8765, open_browser=True, model_path="model.pt
     from urllib.parse import urlparse, parse_qs
 
     session = TrainingSession()
+    bench = BenchSession()
     holder = {"sampler": None, "error": None}
     holder_lock = threading.Lock()
 
@@ -8354,6 +8612,9 @@ def run_gui(host="127.0.0.1", port=8765, open_browser=True, model_path="model.pt
         "/api/train/start": lambda b: session.start(b),
         "/api/train/stop": lambda b: session.stop(),
         "/api/train/status": lambda b: session.status(b.get("since", 0)),
+        "/api/bench/start": lambda b: bench.start(b),
+        "/api/bench/stop": lambda b: bench.stop(),
+        "/api/bench/status": lambda b: bench.status(b.get("known", 0)),
     }
 
     class Handler(BaseHTTPRequestHandler):
@@ -9159,8 +9420,8 @@ if __name__ == "__main__":
               f"on {kwargs['csv_file']} (last optimizer: {kwargs['optimizer_choice']}).")
         if input("Keep the same optimizer? (Y/n): ").strip().lower() == "n":
             kwargs["optimizer_choice"] = ask_optimizer()
-        if kwargs["optimizer_choice"] in ("Muon", "AdaMuon", "NorMuon", "AdaGO", "AdamGO", "RMSGO", "AdaDeltaGO"):
-            kwargs["optim_params"] = prompt_muon_options(kwargs["optimizer_choice"], use_defaults=True)
+        if kwargs["optimizer_choice"] in _GUI_MUON_FAMILY:
+            kwargs["optim_params"] = optimizer_options(kwargs["optimizer_choice"], use_defaults=True)
         kwargs["custom_lr"] = ask_learning_rate()
         bs = input(f"Batch size (Enter = {kwargs['batch_size']}): ").strip()
         if bs: kwargs["batch_size"] = int(bs)

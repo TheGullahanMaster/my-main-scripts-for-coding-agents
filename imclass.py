@@ -40,7 +40,10 @@ MODEL_NAMES = ['Basic ConvNet', 'ResNet', 'EfficientNet family', 'Basic ViT',
                'DeiT III style ViT', 'MLP-Mixer', 'gMLP', 'aMLP',
                'Hierarchical ConvNeXt', 'Isotropic ConvNeXt', 'PatchRNN', 'ViP (Vision Permutator)']
 ISOTROPIC = {3, 4, 5, 6, 7, 9, 10, 11}
-OPTIMIZER_LRS = (0.01, 0.001, 0.00042, 0.0001, 0.0025)
+OPTIMIZER_LRS = (0.01, 0.001, 0.00042, 0.0001, 0.0025, 0.001, 0.00042, 0.00042)
+OPTIMIZER_NAMES = ('SGD+momentum', 'Adam', 'Muon', 'CLion', 'RAdamScheduleFree', 'AdamHD', 'MuonHD', 'NorMuonHD')
+HD_OPTIMIZERS = (5, 6, 7)   # hypergradient LR (lamb.AdamHD rule); options in `hd`
+HD_DEFAULTS = dict(hyper_lr=0.05, normalize=True, anchor=1.0, max_lr=0.0)
 DREAM_SETUPS = ('direct pixels', 'FFT')
 DREAM_OPTIMIZERS = ('Adam', 'L-BFGS', 'normalized gradient ascent')
 AUGMENTS = {
@@ -689,12 +692,37 @@ class Classifier(nn.Module):
         self.train(self.training)
 
 
-def make_optimizer(model, choice, lr=None):
+def hd_options(hd=None):
+    """Hypergradient-LR options (AdamHD / MuonHD / NorMuonHD) with defaults; max_lr 0 = no cap."""
+    options = dict(HD_DEFAULTS, **{k: v for k, v in (hd or {}).items() if k in HD_DEFAULTS and v not in (None, '')})
+    options['normalize'] = bool(options['normalize'])
+    options['hyper_lr'], options['anchor'] = float(options['hyper_lr']), float(options['anchor'])
+    options['max_lr'] = float(options['max_lr']) or None
+    return options
+
+
+def _muon_groups(model):
+    matrix, fallback = [], []
+    for name, p in model.named_parameters():
+        if p.requires_grad:
+            target = fallback if p.ndim < 2 or name.startswith('head.') or name.endswith('position') else matrix
+            target.append(p)
+    groups = []
+    if matrix:
+        groups.append({'params': matrix, 'use_muon': True})
+    if fallback:
+        groups.append({'params': fallback, 'use_muon': False})
+    return groups
+
+
+def make_optimizer(model, choice, lr=None, hd=None):
+    """hd: hypergradient options for IDs 5-7 (see hd_options); a zero lr needs hd['max_lr']."""
     if choice not in range(len(OPTIMIZER_LRS)):
-        raise ValueError('Optimizer ID must be 0–4.')
+        raise ValueError(f'Optimizer ID must be 0–{len(OPTIMIZER_LRS) - 1}.')
     lr = OPTIMIZER_LRS[choice] if lr is None else lr
-    if not math.isfinite(lr) or lr <= 0:
-        raise ValueError('Optimizer learning rate must be finite and positive.')
+    if not math.isfinite(lr) or lr < 0 or (lr == 0 and choice not in HD_OPTIMIZERS):
+        raise ValueError('Optimizer learning rate must be finite and positive'
+                         + (' (0 only for AdamHD / MuonHD / NorMuonHD with a max LR).' if choice not in HD_OPTIMIZERS else '.'))
     params = [p for p in model.parameters() if p.requires_grad]
     if choice == 0:
         return torch.optim.SGD(params, lr=lr, momentum=0.9)
@@ -702,17 +730,7 @@ def make_optimizer(model, choice, lr=None):
         return torch.optim.Adam(params, lr=lr)
     if choice == 2:
         from lamb import Muon
-        matrix, fallback = [], []
-        for name, p in model.named_parameters():
-            if p.requires_grad:
-                target = fallback if p.ndim < 2 or name.startswith('head.') or name.endswith('position') else matrix
-                target.append(p)
-        groups = []
-        if matrix:
-            groups.append({'params': matrix, 'use_muon': True})
-        if fallback:
-            groups.append({'params': fallback, 'use_muon': False})
-        return Muon(groups, lr=lr)
+        return Muon(_muon_groups(model), lr=lr)
     if choice == 3:
         from lamb import CLion
         return CLion(params, lr=lr)
@@ -721,7 +739,13 @@ def make_optimizer(model, choice, lr=None):
         optimizer = RAdamScheduleFree(params, lr=lr)
         optimizer.train()  # step() requires train mode; evaluation and saving swap to x
         return optimizer
-    raise ValueError('Optimizer ID must be 0–4.')
+    if choice == 5:
+        from lamb import AdamHD
+        return AdamHD(params, lr=lr, **hd_options(hd))
+    if choice in (6, 7):
+        from lamb import MuonHD, NorMuonHD
+        return (MuonHD if choice == 6 else NorMuonHD)(_muon_groups(model), lr=lr, **hd_options(hd))
+    raise ValueError(f'Optimizer ID must be 0–{len(OPTIMIZER_LRS) - 1}.')
 
 
 def mix_batch(x, y, classes, augments):
@@ -861,10 +885,11 @@ def save_on_interrupt(run, model, classes, optimizer, options, progress):
 
 def train_model(model, classes, train_records, val_records, *, batch_size=64,
                 epochs=10, optimizer_id=1, seed=1, augments=(), save_dir='ImClass', device='cpu', lr=None,
-                progress_callback=None, optimizer_state=None):
+                progress_callback=None, optimizer_state=None, hd=None):
     """progress_callback(dict) is called at start, after every batch and after every epoch (GUI);
     returning True stops like Ctrl+C: interrupt.pt is saved at the same safe boundary.
-    optimizer_state: continue from a saved optimizer state (lr, if given, overrides its rate)."""
+    optimizer_state: continue from a saved optimizer state (lr, if given, overrides its rate).
+    hd: hypergradient-LR options for optimizer IDs 5-7 (AdamHD / MuonHD / NorMuonHD)."""
     if batch_size < 1 or epochs < 1:
         raise ValueError('Batch size and epoch count must be positive.')
     if {p.resolve() for p, _ in train_records} & {p.resolve() for p, _ in val_records}:
@@ -876,7 +901,7 @@ def train_model(model, classes, train_records, val_records, *, batch_size=64,
                         pin_memory=torch.device(device).type == 'cuda')
     val_loader = (DataLoader(ImageDataset(val_records, Preprocess(model.cfg)), batch_size=batch_size)
                   if val_records else None)
-    optimizer = make_optimizer(model, optimizer_id, lr)
+    optimizer = make_optimizer(model, optimizer_id, lr, hd)
     if optimizer_state is not None:
         optimizer.load_state_dict(optimizer_state)
         if lr is not None:
@@ -886,6 +911,8 @@ def train_model(model, classes, train_records, val_records, *, batch_size=64,
     options = dict(seed=seed, augments=list(augments), batch_size=batch_size, epochs=epochs,
                    optimizer_id=optimizer_id, lr=optimizer.param_groups[0]['lr'],
                    class_counts=counts, class_weights=weights)
+    if optimizer_id in HD_OPTIMIZERS:
+        options['hd'] = {k: (v if v is not None else 0.0) for k, v in hd_options(hd).items()}
     (run / 'config.json').write_text(json.dumps({'config': asdict(model.cfg), 'classes': classes,
                                                **options}, indent=2))
     with (run / 'split.csv').open('w', newline='') as stream:
@@ -919,6 +946,8 @@ def train_model(model, classes, train_records, val_records, *, batch_size=64,
                 loss.backward()
                 nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 5.0,
                                          error_if_nonfinite=True)
+                if hasattr(optimizer, 'observe_loss'):   # HD optimizers' divergence guard
+                    optimizer.observe_loss(loss.item())
                 optimizer.step()
                 loss_sum += loss.item() * len(y)
                 credit += targets.gather(1, logits.argmax(1, keepdim=True)).sum().item()
@@ -1557,10 +1586,21 @@ def prompt_training(model, classes, records, device):
         fraction = ask('Validation fraction [0,1), 0 disables', 0.1, check_fraction)
     batch_size = ask('Batch size', 64, int, lambda x: x > 0)
     epochs = ask('Epoch count', 10, int, lambda x: x > 0)
-    optimizer_id = ask('Optimizer: 0=SGD+momentum 1=Adam 2=Muon 3=CLion 4=RAdamScheduleFree', 1, int,
+    optimizer_id = ask('Optimizer: ' + ' '.join(f'{i}={n}' for i, n in enumerate(OPTIMIZER_NAMES)), 1, int,
                        lambda x: x in range(len(OPTIMIZER_LRS)))
-    lr = ask('Optimizer learning rate', OPTIMIZER_LRS[optimizer_id], float,
-             lambda x: math.isfinite(x) and x > 0)
+    hd = None
+    if optimizer_id in HD_OPTIMIZERS:
+        lr = ask('Initial learning rate (0 = start at zero; needs a max LR)', OPTIMIZER_LRS[optimizer_id], float,
+                 lambda x: math.isfinite(x) and x >= 0)
+        hd = dict(hyper_lr=ask('Hypergradient step (max log-LR change per step)', 0.05, float, lambda x: x >= 0),
+                  normalize=ask('Normalized hypergradient (n = original raw-cosine rule)', 'y', yes_no))
+        hd['anchor'] = ask('Anchor (pull towards the peak LR; higher decays less)', 1.0 if hd['normalize'] else 0.02,
+                           float, lambda x: x >= 0)
+        hd['max_lr'] = ask('Maximum LR (0 = 100x the initial LR)', 0.0, float,
+                           lambda x: math.isfinite(x) and x >= 0 and (lr > 0 or x > 0))
+    else:
+        lr = ask('Optimizer learning rate', OPTIMIZER_LRS[optimizer_id], float,
+                 lambda x: math.isfinite(x) and x > 0)
     seed = seed_everything(ask('Seed (0 = random)', 0, int, lambda x: 0 <= x < 2**63))
     save_dir = ask('Save directory', 'ImClass')
     print(f'Seed: {seed}', flush=True)
@@ -1575,7 +1615,7 @@ def prompt_training(model, classes, records, device):
                            model.cfg.slope, model.frozen)
     return train_model(model, classes, records, validation, batch_size=batch_size, epochs=epochs,
                        optimizer_id=optimizer_id, lr=lr, seed=seed, augments=augments,
-                       save_dir=save_dir, device=device)
+                       save_dir=save_dir, device=device, hd=hd)
 
 
 def main():

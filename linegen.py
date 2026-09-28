@@ -2601,6 +2601,8 @@ def train_loop(cfg, model, optimizer, dataset, valid_ds, vocab, line_mode, progr
         total_updates = max(1, math.ceil(batches / grad_accum_steps) * int(cfg["epoch_count"]))
         print(f"LR schedule: {lr_schedule}" + (f", {warmup_steps} warmup steps" if lr_schedule == "cosine_warmup" else "")
               + f", over {total_updates:,} updates")
+        if all(base == 0.0 for base in base_lrs):
+            pwarn("The initial learning rate is 0, so the schedule has nothing to scale and is ignored.")
         if total_updates > 10**9:
             pwarn("The epoch count is effectively unlimited, so the decay is spread over "
                   f"{total_updates:,} updates and the LR stays near its base value.")
@@ -2711,6 +2713,8 @@ def train_loop(cfg, model, optimizer, dataset, valid_ds, vocab, line_mode, progr
                     or batch_index + 1 == remaining_steps
                 )
                 if is_update:
+                    if hasattr(optimizer, "observe_loss"):   # HD optimizers' divergence guard
+                        optimizer.observe_loss(loss.item())
                     if scaler is not None:
                         # Clipping must see true gradient magnitudes, not the
                         # values multiplied by GradScaler's dynamic scale.
@@ -4493,13 +4497,61 @@ OPTIMIZER_REGISTRY = [
         "class": "adamhd",
         "defaults": {"lr": 1e-3},
         "params": [
-            {"key": "lr", "prompt": "Initial learning rate  (adapted online by hypergradient descent)", "type": "float", "default": 1e-3},
+            {"key": "lr", "prompt": "Initial learning rate  (adapted online by hypergradient descent; 0 = start at zero, needs a max LR)", "type": "float", "default": 1e-3},
+            {"key": "max_lr", "prompt": "Max learning rate  (0 = 100x the initial LR)", "type": "float", "default": 0.0},
             {"key": "hyper_lr", "prompt": "Hypergradient step  (max log-LR change per step)", "type": "float", "default": 0.05},
-            {"key": "anchor", "prompt": "Anchor  (pull towards the peak LR; higher decays less)", "type": "float", "default": 0.02},
+            {"key": "normalize", "prompt": "Normalized hypergradient  (0 = original raw-cosine rule)", "type": "bool", "default": True},
+            {"key": "anchor", "prompt": "Anchor  (pull towards the peak LR; higher decays less; 1.0 normalized, 0.02 raw)", "type": "float", "default": 1.0},
             {"key": "horizon", "prompt": "Horizon  (EMA of past updates in the hypergradient; 0 = paper's one step)", "type": "float", "default": 0.9},
             {"key": "betas", "prompt": "Betas  (comma-separated, e.g. 0.9,0.999)", "type": "betas", "default": (0.9, 0.999)},
             {"key": "eps", "prompt": "Epsilon", "type": "float", "default": 1e-8},
             {"key": "weight_decay", "prompt": "Weight decay  (decoupled)", "type": "float", "default": 0.0},
+        ],
+    },
+    {
+        "name": "MuonHD", "class": "muonhd", "defaults": {"lr": 4.2e-4},
+        "params": [
+            {"key": "lr", "prompt": "Initial learning rate  (adapted online by hypergradient descent; 0 = start at zero, needs a max LR)", "type": "float", "default": 4.2e-4},
+            {"key": "hyper_lr", "prompt": "Hypergradient step  (max log-LR change per step)", "type": "float", "default": 0.05},
+            {"key": "normalize", "prompt": "Normalized hypergradient  (0 = original raw-cosine rule)", "type": "bool", "default": True},
+            {"key": "anchor", "prompt": "Anchor  (pull towards the peak LR; higher decays less; 1.0 normalized, 0.02 raw)", "type": "float", "default": 1.0},
+            {"key": "max_lr", "prompt": "Max learning rate  (0 = 100x the initial LR)", "type": "float", "default": 0.0},
+            {"key": "momentum", "prompt": "Momentum", "type": "float", "default": .95},
+            {"key": "rank", "prompt": "Rank (0=full, >0=approximate)", "type": "int", "default": 0},
+            {"key": "muon_all", "prompt": "MuonAll (all parameters)", "type": "bool", "default": False},
+            {"key": "muon_all_reshape", "prompt": "MuonAll: use near-square vector reshape?", "type": "bool", "default": False},
+            {"key": "cautious", "prompt": "Cautious updates (0=off 1=on)", "type": "bool", "default": False},
+            {"key": "orthogonalization_backend", "prompt": "Backend (newton_schulz / polar_express)", "type": "backend", "default": "polar_express"},
+            {"key": "weight_decay", "prompt": "Weight decay", "type": "float", "default": .1},
+            {"key": "newton_schulz_iter", "prompt": "Orthogonalization iterations", "type": "int", "default": 5},
+            {"key": "adam_betas", "prompt": "AdamW fallback betas", "type": "betas", "default": (.9, .999)},
+            {"key": "adam_eps", "prompt": "AdamW fallback epsilon", "type": "float", "default": 1e-8},
+            {"key": "foreach", "prompt": "Batch optimizer updates (0=off 1=on)", "type": "bool", "default": True},
+            {"key": "ns_bfloat16", "prompt": "BF16 matrix iterations (0=off 1=on)", "type": "bool", "default": False},
+        ],
+    },
+    {
+        "name": "NorMuonHD", "class": "normuonhd", "defaults": {"lr": 4.2e-4},
+        "params": [
+            {"key": "lr", "prompt": "Initial learning rate  (adapted online by hypergradient descent; 0 = start at zero, needs a max LR)", "type": "float", "default": 4.2e-4},
+            {"key": "hyper_lr", "prompt": "Hypergradient step  (max log-LR change per step)", "type": "float", "default": 0.05},
+            {"key": "normalize", "prompt": "Normalized hypergradient  (0 = original raw-cosine rule)", "type": "bool", "default": True},
+            {"key": "anchor", "prompt": "Anchor  (pull towards the peak LR; higher decays less; 1.0 normalized, 0.02 raw)", "type": "float", "default": 1.0},
+            {"key": "max_lr", "prompt": "Max learning rate  (0 = 100x the initial LR)", "type": "float", "default": 0.0},
+            {"key": "momentum", "prompt": "Momentum (beta1)", "type": "float", "default": .95},
+            {"key": "beta2", "prompt": "Row variance decay (beta2)", "type": "float", "default": .95},
+            {"key": "eps", "prompt": "NorMuon epsilon", "type": "float", "default": 1e-8},
+            {"key": "rank", "prompt": "Rank (0=full, >0=approximate)", "type": "int", "default": 0},
+            {"key": "muon_all", "prompt": "MuonAll (all parameters)", "type": "bool", "default": False},
+            {"key": "muon_all_reshape", "prompt": "MuonAll: use near-square vector reshape?", "type": "bool", "default": False},
+            {"key": "cautious", "prompt": "Cautious updates (0=off 1=on)", "type": "bool", "default": False},
+            {"key": "orthogonalization_backend", "prompt": "Backend (newton_schulz / polar_express)", "type": "backend", "default": "polar_express"},
+            {"key": "weight_decay", "prompt": "Weight decay", "type": "float", "default": .1},
+            {"key": "newton_schulz_iter", "prompt": "Orthogonalization iterations", "type": "int", "default": 5},
+            {"key": "adam_betas", "prompt": "AdamW fallback betas", "type": "betas", "default": (.9, .999)},
+            {"key": "adam_eps", "prompt": "AdamW fallback epsilon", "type": "float", "default": 1e-8},
+            {"key": "foreach", "prompt": "Batch optimizer updates (0=off 1=on)", "type": "bool", "default": True},
+            {"key": "ns_bfloat16", "prompt": "BF16 matrix iterations (0=off 1=on)", "type": "bool", "default": False},
         ],
     },
 ]
@@ -4606,7 +4658,7 @@ def linegen_muon_param_groups(model, optim_groups):
 
 def build_optimizer(model, cfg):
     wd = cfg.get("optim_params", {}).get(
-        "weight_decay", 0.1 if cfg.get("optimizer") in {"muon", "adamuon", "normuon"} else 0.0)
+        "weight_decay", 0.1 if cfg.get("optimizer") in {"muon", "adamuon", "normuon", "muonhd", "normuonhd"} else 0.0)
     decay_params = []
     no_decay_params = []
 
@@ -4639,13 +4691,20 @@ def build_optimizer(model, cfg):
     optimizer_key = cfg.get("optimizer", "prodigy")
     op = cfg.get("optim_params", {})
 
-    if optimizer_key in {"muon", "adamuon", "normuon", "adago", "adamgo", "rmsgo", "adadeltago"}:
+    if optimizer_key in {"muon", "adamuon", "normuon", "adago", "adamgo", "rmsgo", "adadeltago", "muonhd", "normuonhd"}:
         optimizer_cls = (AdaDeltaGO if optimizer_key == 'adadeltago' else RMSGO if optimizer_key == 'rmsgo' else AdamGO if optimizer_key == 'adamgo' else AdaGO if optimizer_key == 'adago' else NorMuon if optimizer_key == 'normuon'
-                         else AdaMuon if optimizer_key == 'adamuon' else Muon)
+                         else AdaMuon if optimizer_key == 'adamuon' else MuonHD if optimizer_key == 'muonhd'
+                         else NorMuonHD if optimizer_key == 'normuonhd' else Muon)
         adaptive = ({'eps': op.get('eps', 1e-8), 'nesterov': op.get('nesterov', False)}
                     if optimizer_key == 'adamuon' else {})
-        if optimizer_key == 'normuon':
+        if optimizer_key in ('normuon', 'normuonhd'):
             adaptive = {'eps': op.get('eps', 1e-8), 'beta2': op.get('beta2', .95)}
+        if optimizer_key in ('muonhd', 'normuonhd'):
+            # Hypergradient LR (AdamHD rule); max_lr 0 = no absolute cap.
+            normalize = bool(op.get('normalize', True))
+            adaptive.update(hyper_lr=op.get('hyper_lr', 0.05), normalize=normalize,
+                            anchor=op.get('anchor', 1.0 if normalize else 0.02),
+                            max_lr=float(op.get('max_lr', 0.0) or 0.0) or None)
         if optimizer_key == 'adago':
             adaptive = {'eps': op.get('eps', 5e-4), 'gamma': op.get('gamma', 1.), 'v0': op.get('v0', 1.)}
         if optimizer_key == 'rmsgo':
@@ -4690,9 +4749,15 @@ def build_optimizer(model, cfg):
     elif optimizer_key == "adamhd":
         betas = op.get("betas", (0.9, 0.999))
         if isinstance(betas, list): betas = tuple(betas)
+        max_lr = float(op.get("max_lr", 0.0) or 0.0)
+        if float(op.get("lr", 1e-3)) == 0.0 and max_lr <= 0.0:
+            raise ValueError("AdamHD: a zero initial learning rate needs a max learning rate > 0")
+        # Runs saved before the option existed keep the original raw rule.
+        normalize = bool(op.get("normalize", False))
         return AdamHD(optim_groups, lr=op.get("lr", 1e-3), hyper_lr=op.get("hyper_lr", 0.05),
-                      anchor=op.get("anchor", 0.02), horizon=op.get("horizon", 0.9),
-                      betas=betas, eps=op.get("eps", 1e-8))
+                      anchor=op.get("anchor", 1.0 if normalize else 0.02), horizon=op.get("horizon", 0.9),
+                      normalize=normalize,
+                      betas=betas, eps=op.get("eps", 1e-8), max_lr=max_lr if max_lr > 0.0 else None)
     elif optimizer_key == "equalized_adamw":
         betas = op.get("betas", (0.9, 0.999))
         if isinstance(betas, list): betas = tuple(betas)
@@ -5360,6 +5425,48 @@ def run_hyperparam_sweep():
         print(f"\n  {_c(_GR, '★')} Best config: embed={_c(_WH,b['embed_dim'])} layers={_c(_WH,b['layer_count'])} lr={_c(_WH,blr)} batch={_c(_WH,b['batch_size'])}\n")
 
 
+def speed_test_model(cfg_t, vocab, warmup, measure):
+    """Time forward + backward + optimizer steps on random tokens for one model.
+
+    ``cfg_t`` carries model_selection, seq_len and batch_size.  Returns tok_s,
+    params, ms_per_step and (on CUDA) peak_mem in bytes; raises on failure.
+    """
+    msel, seq_len, batch_size = cfg_t["model_selection"], cfg_t["seq_len"], cfg_t["batch_size"]
+    model = opt = None
+    try:
+        if DEVICE == "cuda":
+            torch.cuda.reset_peak_memory_stats()
+        model = build_model(cfg_t, vocab.size); model.to(DEVICE); model.train()
+        total_p = sum(p.numel() for p in model.parameters())
+        opt = build_optimizer(model, cfg_t)
+        dx = torch.randint(0, vocab.size, (batch_size, seq_len), device=DEVICE)
+        dy = torch.randint(0, vocab.size, (batch_size, seq_len), device=DEVICE)
+        crit = nn.CrossEntropyLoss()
+
+        def step():
+            if msel in RNN_MODEL_IDS and not is_bottom_up_megabyte(cfg_t): lg = model(dx, None)[0]
+            elif msel in SCAN_MODEL_IDS: out = model(dx); lg = out[0] if isinstance(out, tuple) else out
+            else:
+                out = model(dx)
+                lg = out[0] if isinstance(out, tuple) else out
+            crit(lg.reshape(-1, lg.size(-1)), dy.reshape(-1)).backward(); opt.step(); opt.zero_grad(set_to_none=True)
+        for _ in range(warmup):
+            step()
+        if DEVICE == "cuda": torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        for _ in range(measure):
+            step()
+        if DEVICE == "cuda": torch.cuda.synchronize()
+        elapsed = time.perf_counter() - t0
+        return {"tok_s": measure * batch_size * seq_len / elapsed, "params": total_p,
+                "ms_per_step": 1000 * elapsed / max(1, measure),
+                "peak_mem": torch.cuda.max_memory_allocated() if DEVICE == "cuda" else None}
+    finally:
+        del model, opt
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
 def run_speed_benchmark():
     """Measure throughput (tokens/second) for models."""
     cli_banner("Speed Benchmark", "Forward + backward pass throughput in tokens / second", width=64)
@@ -5401,34 +5508,10 @@ def run_speed_benchmark():
         cfg_t["batch_size"]      = batch_size
         name = MODEL_NAMES.get(msel, f"Model {msel}")
         try:
-            model   = build_model(cfg_t, vocab.size); model.to(DEVICE); model.train()
-            total_p = sum(p.numel() for p in model.parameters())
-            opt     = build_optimizer(model, cfg_t)
-            dx = torch.randint(0, vocab.size, (batch_size, seq_len), device=DEVICE)
-            dy = torch.randint(0, vocab.size, (batch_size, seq_len), device=DEVICE)
-            crit = nn.CrossEntropyLoss()
-            for _ in range(warmup):
-                if msel in RNN_MODEL_IDS and not is_bottom_up_megabyte(cfg_t): lg = model(dx, None)[0]
-                elif msel in SCAN_MODEL_IDS: out = model(dx); lg = out[0] if isinstance(out, tuple) else out
-                else:
-                    out = model(dx)
-                    lg = out[0] if isinstance(out, tuple) else out
-                crit(lg.reshape(-1, lg.size(-1)), dy.reshape(-1)).backward(); opt.step(); opt.zero_grad(set_to_none=True)
-            if DEVICE == "cuda": torch.cuda.synchronize()
-            t0 = time.perf_counter()
-            for _ in range(measure):
-                if msel in RNN_MODEL_IDS and not is_bottom_up_megabyte(cfg_t): lg = model(dx, None)[0]
-                elif msel in SCAN_MODEL_IDS: out = model(dx); lg = out[0] if isinstance(out, tuple) else out
-                else:
-                    out = model(dx)
-                    lg = out[0] if isinstance(out, tuple) else out
-                crit(lg.reshape(-1, lg.size(-1)), dy.reshape(-1)).backward(); opt.step(); opt.zero_grad(set_to_none=True)
-            if DEVICE == "cuda": torch.cuda.synchronize()
-            elapsed = time.perf_counter() - t0
-            tps = measure * batch_size * seq_len / elapsed
+            r = speed_test_model(cfg_t, vocab, warmup, measure)
+            tps, total_p = r["tok_s"], r["params"]
             results.append({"name": name, "tok_s": tps, "params": total_p})
             pok(f"{_c(_WH, f'{name:<42}')} {_c(_GR, _B, f'{tps:>10,.0f}')} tok/s  {_c(_DIM, readable_num(total_p) + ' params')}")
-            del model, opt; torch.cuda.empty_cache()
         except Exception as e:
             pwarn(f"{_c(_WH, f'{name:<42}')} {_c(_RD, 'FAILED:')} {e}")
             results.append({"name": name, "tok_s": 0, "params": 0})
@@ -5856,6 +5939,8 @@ def train_for_iterations(cfg, model, optimizer, dataset, valid_ds, vocab, line_m
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            if hasattr(optimizer, "observe_loss"):   # HD optimizers' divergence guard
+                optimizer.observe_loss(loss.item())
             optimizer.step()
 
             # track losses
@@ -7413,6 +7498,8 @@ def bench_train_loop(cfg, model, optimizer, train_ds, valid_ds, vocab, line_mode
                         loss = torch.tensor(100.0, device=DEVICE, requires_grad=True)
 
                 optimizer.zero_grad(set_to_none=True)
+                if hasattr(optimizer, "observe_loss"):   # HD optimizers' divergence guard
+                    optimizer.observe_loss(loss.item())
                 if scaler is not None:
                     scaler.scale(loss).backward()
                     # Clip true gradient magnitudes, not GradScaler-scaled ones.
@@ -7457,6 +7544,8 @@ def bench_train_loop(cfg, model, optimizer, train_ds, valid_ds, vocab, line_mode
                 if (min_iters_per_sec > 0 and measured_steps > 0
                         and measured_iters_per_sec < min_iters_per_sec):
                     return float("inf"), completed_steps, f"SLOW ({measured_iters_per_sec:.2f} it/s)"
+                if stats.get("stop"):   # set by a GUI through BENCH_RUN_HOOK
+                    return float("inf"), completed_steps, "STOPPED"
 
                 # Validation Logic (Fitness Mode 2)
                 if fitness_mode == 2 and valid_ds is not None:
@@ -7551,6 +7640,13 @@ def _bench_sample(model, optimizer, cfg, vocab, prompt_ids, length, line_mode, l
         model.train()
 
 
+# Optional observer for GUIs: BENCH_RUN_HOOK(run, stats) is called as each
+# training run starts.  ``stats`` is the live dict bench_train_loop fills in
+# (steps, it_s, curve, val_curve); setting stats["stop"] = True ends the run
+# with status "STOPPED" at the next step.
+BENCH_RUN_HOOK = None
+
+
 def _bench_single_run(s, cfg, env, lr, seed):
     cfg = copy.deepcopy(cfg)
     if lr is not None:
@@ -7568,6 +7664,8 @@ def _bench_single_run(s, cfg, env, lr, seed):
         # shares its parameters.
         optimizer = build_optimizer(model, cfg)
         stats = {}
+        if BENCH_RUN_HOOK is not None:
+            BENCH_RUN_HOOK(run, stats)
         score, best_step, status = bench_train_loop(
             cfg, wrap_model_with_compile(model, cfg), optimizer, env["train_ds"], env["valid_ds"],
             env["vocab"], env["line_mode"], s["total_iters"], s["fitness_mode"], s["nan_skip"],

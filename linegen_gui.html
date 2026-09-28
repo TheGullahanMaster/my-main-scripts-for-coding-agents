@@ -245,13 +245,14 @@ table.stages select { max-width: 170px; }
 <body>
 <header>
   <h1>LineGen Studio</h1>
-  <nav class="modes" id="modes"><button data-page="train">Train</button><button data-page="sample">Sample &amp; inspect</button></nav>
+  <nav class="modes" id="modes"><button data-page="train">Train</button><button data-page="sample">Sample &amp; inspect</button><button data-page="bench">Benchmark</button></nav>
   <span class="meta" id="deviceInfo"></span>
   <span class="spacer"></span>
   <button id="themeBtn" title="Toggle light / dark">Theme</button>
 </header>
 <div id="trainPage" class="page" hidden></div>
 <div id="samplePage" class="page" hidden></div>
+<div id="benchPage" class="page" hidden></div>
 <div class="tooltip" id="tooltip"></div>
 <div class="toast" id="toast"></div>
 <script>
@@ -990,22 +991,22 @@ function trainingCard() {
   card.append(el("p", { class: "note", style: "margin:8px 0 0" }, "The loss chart gets a point every optimizer step; the other intervals control validation, text previews and checkpoints."));
   return card;
 }
-function optimizerCard(obj, key, pkey, title = "Optimizer") {
+function optimizerCard(obj, key, pkey, title = "Optimizer", save = saveForms, rerender = renderTrain) {
   const card = el("div", { class: "card" }, el("h2", {}, title));
   const idx = +obj[key], entry = G.opts.optimizers[idx];
   obj[pkey] = obj[pkey] || {};
   const P = obj[pkey];
   card.append(el("div", { class: "form-grid" }, el("label", { class: "ctl", style: "grid-column:1/-1" }, "Optimizer",
-    el("select", { "data-fkey": "opt:" + key, onchange: e => { obj[key] = +e.target.value; obj[pkey] = {}; saveForms(); renderTrain(); } }, G.opts.optimizers.map((o, i) => el("option", { value: i, selected: i === idx }, `${i} · ${o.name}`))))));
+    el("select", { "data-fkey": "opt:" + key, onchange: e => { obj[key] = +e.target.value; obj[pkey] = {}; save(); rerender(); } }, G.opts.optimizers.map((o, i) => el("option", { value: i, selected: i === idx }, `${i} · ${o.name}`))))));
   const g = el("div", { class: "form-grid", style: "margin-top:8px" });
   for (const p of entry.params) {
     const k = p.key, dflt = p.default, label = p.prompt.replace(/\s*\(.*$/, "") || k, hint = p.prompt;
     let input;
-    if (p.type === "bool") { input = el("input", { type: "checkbox", checked: P[k] ?? dflt, onchange: e => { P[k] = e.target.checked; saveForms(); } }); g.append(el("label", { class: "ctl check", title: hint }, input, label)); continue; }
-    if (p.type === "betas") input = el("input", { type: "text", value: P[k] ?? "", placeholder: String(dflt), onchange: e => { P[k] = e.target.value.trim(); saveForms(); } });
-    else if (p.type === "backend") input = el("select", { onchange: e => { P[k] = e.target.value; saveForms(); } }, ["newton_schulz", "polar_express"].map(b => el("option", { value: b, selected: (P[k] ?? dflt) === b }, b)));
-    else if (p.type === "int" || p.type === "float") input = el("input", { type: "number", value: P[k] ?? "", placeholder: String(dflt), step: p.type === "int" ? 1 : niceStep(Math.abs(+dflt) / 10 || 0.001), onchange: e => { P[k] = e.target.value === "" ? "" : +e.target.value; saveForms(); } });
-    else input = el("input", { type: "text", value: P[k] ?? "", placeholder: String(dflt), onchange: e => { P[k] = e.target.value; saveForms(); } });
+    if (p.type === "bool") { input = el("input", { type: "checkbox", checked: P[k] ?? dflt, onchange: e => { P[k] = e.target.checked; save(); } }); g.append(el("label", { class: "ctl check", title: hint }, input, label)); continue; }
+    if (p.type === "betas") input = el("input", { type: "text", value: P[k] ?? "", placeholder: String(dflt), onchange: e => { P[k] = e.target.value.trim(); save(); } });
+    else if (p.type === "backend") input = el("select", { onchange: e => { P[k] = e.target.value; save(); } }, ["newton_schulz", "polar_express"].map(b => el("option", { value: b, selected: (P[k] ?? dflt) === b }, b)));
+    else if (p.type === "int" || p.type === "float") input = el("input", { type: "number", value: P[k] ?? "", placeholder: String(dflt), step: p.type === "int" ? 1 : niceStep(Math.abs(+dflt) / 10 || 0.001), onchange: e => { P[k] = e.target.value === "" ? "" : +e.target.value; save(); } });
+    else input = el("input", { type: "text", value: P[k] ?? "", placeholder: String(dflt), onchange: e => { P[k] = e.target.value; save(); } });
     input.dataset.fkey = "op:" + key + ":" + k;
     g.append(fld(label, input, hint));
   }
@@ -1559,13 +1560,455 @@ function tabInfl(root) {
     valueLabel: S.inflMethod === "gradient" ? "gradient × input" : "drop in log p when blanked (nats)", colorPos: css("--div-pos"), colorNeg: css("--div-neg"), onClick: k => { S.sel = order[k][1]; runInfluence(); } }));
 }
 
+// ───────────────────────── Benchmark page ─────────────────────────
+const BF_DEFAULT = {
+  dataset_path: "", dataset_type: 0, tokenizer_mode: 1, models: [], variants: {}, activations: {}, ultra: false,
+  year_from: "", year_to: "", q: "", model_type: 0,
+  stages: [{ seq_len: 64, dim: 128, child_dim: 64, depth: 2, heads: 4 }, { seq_len: 4, dim: 64, child_dim: 32, depth: 2, heads: 4 }],
+  size_mode: "fixed", embed_dim: 128, target_millions: 1, layer_count: 2, head_count: 4, seq_len: 128, batch_size: 32,
+  limit_mode: "steps", total_iters: 500, max_seconds: 60, min_iters_per_sec: 0, speed_warmup_steps: 5,
+  use_tbptt: false, bptt_window: 64, tbptt_total_len: 0, use_amp: false, amp_dtype: "fp16", use_compile: false,
+  optimizer: null, optim_params: {}, lr_scheduler: "none", warmup_steps: 100, grad_clip: 1,
+  lr_mode: "single", lr_multipliers: "0.5,1,2", lr_min: "", lr_max: "", lr_halvings: 4,
+  res_every: 0, res_type: 0, use_norm: 2, dropout: 0, use_multiplier: 0, rnn_ffn: 0,
+  nan_skip: true, fitness_mode: 2, val_mode: "split", val_split: 0.1, val_path: "", val_freq: 100, val_samples: 1000,
+  seeds: 1, sample_len: 200, sample_lines: 3, sample_temperature: 0.8, table_order: 2,
+};
+const B = {
+  F: Object.assign(structuredClone(BF_DEFAULT), store.get("benchForm", {})), mode: store.get("benchMode", "new"), path: store.get("benchPath", ""),
+  kind: store.get("benchKind", "arch"), speed: null, speedTimer: null, SP: Object.assign({ seq_len: "", batch_size: "", warmup: 10, measure: 50 }, store.get("speedForm", {})),
+  opts: null, st: null, records: [], known: 0, csince: 0, console: [], timer: null, check: null, list: null, view: null,
+  rtab: store.get("benchTab", "table"), sort: store.get("benchSort", "score"), sortDir: 1, sel: null, curveKind: "train", browse: null,
+};
+const saveB = () => { store.set("benchForm", B.F); store.set("benchMode", B.mode); store.set("benchPath", B.path); };
+const benchBusy = () => ["preparing", "running", "stopping"].includes(B.st?.state);
+const bNum = (k, attrs = {}) => numIn(B.F, k, attrs, null, saveB);
+const bSel = (k, options, after = null) => selIn(B.F, k, options, () => { saveB(); (after || renderBench)(); });
+const bChk = (k, label) => chk(B.F, k, label, () => { saveB(); renderBench(); });
+const famColor = fam => series()[Math.max(0, G.opts.groups.indexOf(fam)) % 8];
+const modelYear = id => (B.opts.origins[id] || [0])[0];
+
+async function renderBench() {
+  if (!B.opts) { try { B.opts = await api("/api/bench/options"); } catch (e) { toast(e.message); return; } }
+  if (!B.list) { try { B.list = await api("/api/bench/list"); } catch { B.list = { runs: [] }; } }
+  const f = B.F;
+  if (f.optimizer == null) f.optimizer = G.opts.default_optimizer;
+  const left = el("div"), right = el("div");
+  const kinds = el("div", { class: "card" }, el("div", { class: "modes", style: "display:inline-flex" }, [["arch", "Architecture benchmark"], ["speed", "Speed test"]].map(([k, n]) =>
+    el("button", { class: B.kind === k ? "active" : "", onclick: () => { B.kind = k; store.set("benchKind", k); renderBench(); } }, n))));
+  if (B.kind === "speed") {
+    left.append(kinds, speedCard(), benchModelsCard());
+    right.append(speedResultsCard());
+    mount($("#benchPage"), el("div", { class: "train-grid" }, left, right));
+    drawSpeed();
+    return;
+  }
+  left.append(kinds, benchRunCard());
+  if (B.mode === "new") left.append(benchDataCard(), benchModelsCard(), benchSizeCard(),
+    optimizerCard(f, "optimizer", "optim_params", "Optimizer (shared by every model)", saveB, renderBench), benchLrCard(), benchRnnCard(), benchScoreCard());
+  left.append(benchActionsCard());
+  right.append(benchMonitorCard());
+  mount($("#benchPage"), el("div", { class: "train-grid" }, left, right));
+  drawBenchMonitor(true);
+}
+
+function benchRunCard() {
+  const card = el("div", { class: "card" }, el("h2", {}, "Benchmark"));
+  card.append(el("p", { class: "note" }, "Trains every selected architecture on the same data with the same budget and ranks them — the CLI's benchmark mode (results, CSV, plots and samples go to benchmark_results/, and runs can be resumed from the CLI too)."));
+  card.append(el("div", { class: "modes", style: "display:inline-flex" }, [["new", "New benchmark"], ["preset", "Load preset"], ["resume", "Resume a run"]].map(([k, n]) =>
+    el("button", { class: B.mode === k ? "active" : "", onclick: () => { B.mode = k; saveB(); renderBench(); } }, n))));
+  if (B.mode === "preset") card.append(el("div", { class: "row-flex", style: "margin-top:8px" },
+    el("input", { type: "text", value: B.path, placeholder: "preset .json (or a results folder)", style: "flex:1", onchange: e => { B.path = e.target.value.trim(); saveB(); } }),
+    chooseButton("Choose file…", { kind: "json", start: () => dirOf(B.path), title: "Choose a benchmark preset", onPick: p => { B.path = p; saveB(); renderBench(); } })));
+  const runs = B.list?.runs || [];
+  if (B.mode === "resume" && runs.length && !runs.some(r => r.path === B.path)) { B.path = runs.find(r => !r.error)?.path || ""; saveB(); }
+  if (B.mode === "resume") card.append(el("div", { class: "form-grid", style: "margin-top:8px" }, fld("Results folder", el("select", { onchange: e => { B.path = e.target.value; saveB(); } },
+    runs.filter(r => !r.error).map(r => el("option", { value: r.path, selected: r.path === B.path }, `${r.name} · ${r.done}/${r.rows} rows · ${baseName(r.dataset || "")}`))))));
+  if (runs.length) card.append(el("details", { style: "margin-top:8px" }, el("summary", {}, `Past results (${runs.length}) — click one to view it`),
+    el("div", { class: "browser" }, runs.map(r => el("div", { class: "item", onclick: () => viewBench(r.path) }, `${r.name}`,
+      el("span", { class: "muted" }, r.error ? "unreadable" : `${r.done}/${r.rows} rows · ${baseName(r.dataset || "")}`))))));
+  return card;
+}
+async function viewBench(path) {
+  try { B.view = await api("/api/bench/load", { path }); B.sel = null; renderBench(); toast(`Showing ${baseName(path)}`, true); }
+  catch (e) { toast(e.message); }
+}
+
+function benchDataCard() {
+  const f = B.F, card = el("div", { class: "card" }, el("h2", {}, "Dataset"));
+  const setDs = p => { f.dataset_path = p; saveB(); renderBench(); };
+  card.append(el("div", { class: "row-flex" },
+    el("input", { type: "text", value: f.dataset_path, placeholder: "text / binary file", style: "flex:1;min-width:200px", "data-fkey": "b:ds", onchange: e => setDs(e.target.value.trim()) }),
+    chooseButton("Choose file…", { start: () => dirOf(f.dataset_path), title: "Choose a dataset", onPick: setDs }),
+    uploadButton("Upload…", { onDone: setDs }),
+    el("button", { onclick: () => { B.browse = B.browse ? null : "ds"; renderBench(); } }, B.browse ? "Close" : "Browse…")));
+  if (B.browse) card.append(fileBrowser({ accept: ["file", "json"], key: "fbbench", onPick: p => { B.browse = null; setDs(p); } }));
+  card.append(el("div", { class: "form-grid", style: "margin-top:10px" },
+    fld("Dataset type", bSel("dataset_type", [[0, "Corpus (sliding windows)"], [1, "Line mode"]])),
+    fld("Tokenizer", bSel("tokenizer_mode", TOKENIZERS))));
+  if (f.dataset_type === 1) card.append(el("p", { class: "note", style: "margin:8px 0 0" }, "Seq2seq benchmarks: set them up once in the CLI and load the saved preset here."));
+  return card;
+}
+
+function benchModelsCard() {
+  const f = B.F, O = B.opts, card = el("div", { class: "card" }, el("h2", {}, el("span", { class: "grow" }, "Models"), el("span", { class: "pill" }, `${f.models.length} selected`)));
+  const lo = +f.year_from || 0, hi = +f.year_to || 9999;
+  const inYears = id => { const y = modelYear(id); return y >= lo && y <= hi; };
+  card.append(el("div", { class: "btns" }, O.groups.map(g => el("button", { title: `${g.ids.length} models`, onclick: () => { f.models = g.ids.filter(inYears); f.ultra = g.ultra; saveB(); renderBench(); } }, g.name)),
+    el("button", { onclick: () => { f.models = []; f.ultra = false; saveB(); renderBench(); } }, "None")));
+  card.append(el("div", { class: "form-grid", style: "margin-top:8px" },
+    fld("First published from", bNum("year_from", { min: 1900, max: 2100, placeholder: "any" })), fld("to", bNum("year_to", { min: 1900, max: 2100, placeholder: "any" })),
+    fld("Topology", bSel("model_type", [[0, "Flat"], [1, "MEGABYTE (compatible models)"], [2, "MEGABYTE bottom-up"]])),
+    el("label", { class: "ctl check", title: "every activation / on-off option becomes its own row" }, el("input", { type: "checkbox", checked: f.ultra, onchange: e => { f.ultra = e.target.checked; saveB(); renderBench(); } }), "Ultra: all variants")));
+  const q = el("input", { type: "search", placeholder: "filter by name or ID…", value: f.q, "data-fkey": "b:q", style: "width:100%;margin-top:8px",
+    oninput: e => { f.q = e.target.value; saveB(); drawList(); } });
+  const list = el("div", { class: "browser", style: "max-height:320px;margin-top:6px" });
+  const drawList = () => {
+    const qq = f.q.trim().toLowerCase(), sel = new Set(f.models);
+    const shown = G.opts.models.filter(m => inYears(m.id) && (!qq || m.name.toLowerCase().includes(qq) || m.label.toLowerCase().includes(qq) || String(m.id) === qq)
+      && (!+f.model_type || O.hierarchical_ids.includes(m.id)));
+    list.replaceChildren(...G.opts.groups.flatMap(g => {
+      const ms = shown.filter(m => m.group === g); if (!ms.length) return [];
+      const all = ms.every(m => sel.has(m.id));
+      return [el("div", { class: "path", style: "display:flex;gap:8px;align-items:center" }, el("input", { type: "checkbox", checked: all, onchange: e => { const ids = new Set(f.models); ms.forEach(m => e.target.checked ? ids.add(m.id) : ids.delete(m.id)); f.models = [...ids]; saveB(); renderBench(); } }), el("b", {}, g), el("span", { class: "muted" }, `${ms.filter(m => sel.has(m.id)).length}/${ms.length}`)),
+        ...ms.map(m => el("label", { class: "item", style: "justify-content:flex-start;gap:8px" }, el("input", { type: "checkbox", checked: sel.has(m.id), onchange: e => { const ids = new Set(f.models); e.target.checked ? ids.add(m.id) : ids.delete(m.id); f.models = [...ids]; saveB(); renderBench(); } }),
+          el("span", {}, `${m.id} · ${m.label}`), el("span", { class: "muted", style: "margin-left:auto" }, String(modelYear(m.id)))))];
+    }));
+  };
+  drawList();
+  card.append(q, list);
+  if (+f.model_type) card.append(benchStages());
+  // per-model activations and variants
+  const chosen = f.models.map(modelById).filter(Boolean);
+  const actModels = chosen.filter(m => m.activation), varModels = chosen.filter(m => O.variants[m.id]);
+  if (actModels.length) card.append(el("details", {}, el("summary", {}, `Feed-forward activations (${actModels.length} models)`), el("div", { class: "form-grid" },
+    actModels.map(m => fld(`${m.id} · ${m.label}`, el("select", { onchange: e => { f.activations[m.id] = e.target.value; saveB(); } },
+      G.opts.activations.map(a => el("option", { value: a.name, selected: a.name === (f.activations[m.id] || m.activation) }, a.name + (a.name === m.activation ? " (default)" : "")))))))));
+  if (varModels.length && !f.ultra) card.append(el("details", {}, el("summary", {}, `Per-model options (${varModels.length} models) — one value, a comma list (each its own row) or “all”`),
+    el("div", { class: "form-grid" }, varModels.flatMap(m => O.variants[m.id].map(opt => fld(`${m.id} · ${opt.label}`,
+      el("input", { type: "text", value: (f.variants[m.id] || {})[opt.key] ?? "", "data-fkey": `b:v:${m.id}:${opt.key}`,
+        placeholder: opt.names ? `${opt.default ?? "auto"} (${opt.names.map((n, i) => `${i}=${n}`).join(", ")})` : opt.choices ? `${opt.default} (${opt.choices.join(", ")})` : String(opt.default ?? "auto"),
+        onchange: e => { (f.variants[m.id] ||= {})[opt.key] = e.target.value; saveB(); B.check = null; } })))))));
+  return card;
+}
+function benchStages() {
+  const f = B.F, box = el("div", { style: "margin-top:8px" });
+  box.append(el("div", { class: "scroll" }, el("table", { class: "data stages" }, el("tr", {}, ["stage", "length", "width", "child embed", "layers", "heads", ""].map(h => el("th", {}, h))),
+    f.stages.map((s, i) => el("tr", {}, el("td", {}, String(i + 1)), ...["seq_len", "dim", "child_dim", "depth", "heads"].map(k => el("td", {}, numIn(s, k, { min: 1, "data-fkey": `b:st${i}${k}` }, null, saveB))),
+      el("td", {}, el("button", { disabled: f.stages.length <= 2, onclick: () => { f.stages.splice(i, 1); saveB(); renderBench(); } }, "✕")))))),
+    el("button", { style: "margin-top:6px", onclick: () => { f.stages.push(structuredClone(f.stages.at(-1))); saveB(); renderBench(); } }, "+ stage"));
+  return box;
+}
+function benchSizeCard() {
+  const f = B.F, mega = +f.model_type > 0, card = el("div", { class: "card" }, el("h2", {}, "Size & budget"));
+  card.append(el("div", { class: "form-grid" },
+    !mega ? fld("Size", bSel("size_mode", [["fixed", "Same width for all"], ["params", "Same parameter count"]])) : null,
+    !mega ? (f.size_mode === "params" ? fld("Target parameters (millions)", bNum("target_millions", { min: 0.001, step: 0.5 })) : fld("Width", bNum("embed_dim", { min: 1, step: 8 }))) : null,
+    !mega ? fld("Layers", bNum("layer_count", { min: 1 })) : null, !mega ? fld("Heads (attention / xLSTM)", bNum("head_count", { min: 1 })) : null,
+    !mega && f.dataset_type === 0 ? fld("Window (tokens)", bNum("seq_len", { min: 1, step: 32 })) : null,
+    fld("Batch size", bNum("batch_size", { min: 1 })),
+    fld("Budget", bSel("limit_mode", [["steps", "Steps per model"], ["seconds", "Seconds per model"]])),
+    f.limit_mode === "seconds" ? fld("Seconds per model", bNum("max_seconds", { min: 1, step: 10 })) : fld("Steps per model", bNum("total_iters", { min: 1, step: 100 })),
+    fld("Skip below it/s (0 = off)", bNum("min_iters_per_sec", { min: 0, step: 1 })), fld("Speed warm-up steps", bNum("speed_warmup_steps", { min: 0 })),
+    bChk("use_tbptt", "TBPTT for recurrent / scan models"),
+    f.use_tbptt ? fld("BPTT window", bNum("bptt_window", { min: 1 })) : null,
+    G.opts.cuda ? bChk("use_amp", "Mixed precision (AMP)") : null,
+    G.opts.cuda && f.use_amp ? fld("AMP precision", bSel("amp_dtype", [["fp16", "fp16"], ...(G.opts.bf16 ? [["bf16", "bf16"]] : [])])) : null,
+    G.opts.cuda ? bChk("use_compile", "torch.compile") : null));
+  return card;
+}
+function benchLrCard() {
+  const f = B.F, card = el("div", { class: "card" }, el("h2", {}, "Learning rate"));
+  card.append(el("div", { class: "form-grid" },
+    fld("Per model", bSel("lr_mode", [["single", "The optimizer's LR"], ["multipliers", "Try several multipliers, keep the best"], ["search", "Golden-section search, keep the best"]])),
+    f.lr_mode === "multipliers" ? fld("Multipliers (comma list)", txtIn(f, "lr_multipliers", {}, () => { saveB(); })) : null,
+    f.lr_mode === "search" ? fld("Minimum LR", bNum("lr_min", { min: 0, placeholder: "LR ÷ 10" })) : null,
+    f.lr_mode === "search" ? fld("Maximum LR", bNum("lr_max", { min: 0, placeholder: "LR × 10" })) : null,
+    f.lr_mode === "search" ? fld("Range halvings (precision)", bNum("lr_halvings", { min: 1 })) : null,
+    fld("Schedule", bSel("lr_scheduler", [["none", "Constant"], ["cosine_warmup", "Warmup + cosine"], ["cosine", "Cosine"], ["one_cycle", "One-cycle"]])),
+    f.lr_scheduler === "cosine_warmup" ? fld("Warmup steps", bNum("warmup_steps", { min: 0 })) : null,
+    fld("Gradient clip (0 = off)", bNum("grad_clip", { min: 0, step: 0.1 }))));
+  return card;
+}
+function benchRnnCard() {
+  const f = B.F;
+  if (!f.models.some(id => B.opts.structure_ids.includes(id))) return el("span");
+  return el("div", { class: "card" }, el("h2", {}, "Recurrent structure (classic RNN rows)"), el("div", { class: "form-grid" },
+    fld("Normalisation", bSel("use_norm", NORMS)), fld("Residual every N layers", bNum("res_every", { min: 0 })),
+    +f.res_every > 0 ? fld("Residual type", bSel("res_type", RES_TYPES)) : null, fld("Dropout", bNum("dropout", { min: 0, step: 0.05 })),
+    fld("Output multiplier", bSel("use_multiplier", [[0, "Off"], [1, "Scalar"], [2, "Per-dimension"]])),
+    f.models.some(id => B.opts.custom_rnn_ids.includes(id)) ? fld("Post-layer FFN", bSel("rnn_ffn", FFNS)) : null));
+}
+function benchScoreCard() {
+  const f = B.F, card = el("div", { class: "card" }, el("h2", {}, "Scoring & samples"));
+  card.append(el("div", { class: "form-grid" },
+    fld("Score", bSel("fitness_mode", B.opts.fitness.map((n, i) => [i, n]))),
+    +f.fitness_mode === 2 && f.dataset_type === 0 ? fld("Validation", bSel("val_mode", [["split", "Hold out the end of the file"], ["file", "Separate file"]])) : null,
+    +f.fitness_mode === 2 && !(f.dataset_type === 0 && f.val_mode === "file") ? fld("Held-out fraction", bNum("val_split", { min: 0.01, max: 0.9, step: 0.05 })) : null,
+    +f.fitness_mode === 2 && f.dataset_type === 0 && f.val_mode === "file" ? fld("Validation file", txtIn(f, "val_path", {}, saveB)) : null,
+    +f.fitness_mode === 2 ? fld("Validate every N steps", bNum("val_freq", { min: 1 })) : null,
+    +f.fitness_mode === 2 ? fld("Validation samples", bNum("val_samples", { min: 1, step: 100 })) : null,
+    fld("Seeds per model", bNum("seeds", { min: 1 })), bChk("nan_skip", "Skip a model on NaN / crash"),
+    fld(f.dataset_type === 1 ? "Max tokens per sampled line (0 = none)" : "Sample tokens per model (0 = none)", bNum("sample_len", { min: 0, step: 50 })),
+    f.dataset_type === 1 && +f.sample_len ? fld("Lines per model", bNum("sample_lines", { min: 1 })) : null,
+    +f.sample_len ? fld("Sample temperature", bNum("sample_temperature", { min: 0, step: 0.1 })) : null));
+  return card;
+}
+function benchActionsCard() {
+  const card = el("div", { class: "card" }), busy = benchBusy();
+  const C = B.check;
+  card.append(el("div", { class: "row-flex" },
+    el("button", { class: "primary", disabled: busy, onclick: startBench }, busy ? "Running…" : { new: "Start benchmark", preset: "Run preset", resume: "Resume" }[B.mode]),
+    el("button", { disabled: !busy || B.st?.state === "stopping", onclick: async () => { B.st = await api("/api/bench/stop"); drawBenchMonitor(); } }, B.st?.state === "stopping" ? "Stopping…" : "Stop (resumable)"),
+    B.mode === "new" ? el("button", { onclick: async () => { try { B.check = await api("/api/bench/check", { config: B.F }); } catch (e) { B.check = { error: e.message }; } renderBench(); } }, "Check rows") : null,
+    B.mode === "new" ? el("button", { onclick: async () => { const p = prompt("Save preset to (file path or folder):", dirOf(B.F.dataset_path) || G.opts.cwd); if (!p) return; try { const r = await api("/api/bench/preset", { config: B.F, path: p }); toast("Preset saved: " + r.path, true); } catch (e) { toast(e.message); } } }, "Save preset…") : null));
+  if (C) card.append(C.error ? el("p", { class: "warn" }, C.error) : el("div", { style: "margin-top:8px" },
+    el("p", { class: "note", style: "margin:0 0 4px" }, `${C.summary.rows} rows × up to ${C.summary.runs_per_row} runs each · ${C.summary.limit} · score: ${C.summary.metric}`),
+    el("details", {}, el("summary", {}, "Rows, oldest idea first"), el("div", { class: "browser" }, C.tasks.map(t => el("div", { class: "item" }, t.name, el("span", { class: "muted" }, String(t.year))))))));
+  return card;
+}
+async function startBench() {
+  const body = B.mode === "new" ? { mode: "new", config: B.F } : { mode: B.mode, path: B.path };
+  try { B.st = await api("/api/bench/start", body); B.records = []; B.known = 0; B.view = null; B.sel = null; B.console = []; B.csince = B.st.console_total || 0; renderBench(); }
+  catch (e) { toast("Cannot start: " + e.message); }
+}
+
+// ───── monitor / results ─────
+function benchMonitorCard() {
+  const st = B.st || { state: "idle" };
+  const card = el("div", { class: "card" }, el("h2", {}, el("span", { class: "grow" }, B.view ? `Results · ${baseName(B.view.path)}` : "Benchmark monitor"),
+    B.view ? el("button", { onclick: () => { B.view = null; B.sel = null; renderBench(); } }, "Back to live") : el("span", { class: "state " + st.state, id: "bState" }, st.state)));
+  card.append(el("div", { id: "bStats" }), el("div", { class: "progress" }, el("div", { id: "bProgress" })), el("div", { id: "bCurrent" }));
+  const res = el("div", { class: "card" }, el("div", { id: "bTabs" }), el("div", { id: "bResults" }));
+  const cons = el("div", { class: "card" }, el("details", {}, el("summary", {}, "Console (linegen output)"), el("pre", { id: "bConsole", class: "console" })));
+  return el("div", {}, card, res, cons);
+}
+function benchRows() { return B.view ? B.view.records : B.records; }
+function benchSummary() { return B.view ? B.view.summary : B.st?.summary; }
+function drawBenchMonitor(full = false) {
+  const st = B.st || { state: "idle" }, S0 = benchSummary(), rows = benchRows();
+  const se = $("#bState"); if (se) { se.className = "state " + st.state; se.textContent = st.state; }
+  const box = $("#bStats");
+  if (box) {
+    box.replaceChildren(S0 ? kv("rows", B.view ? `${rows.length} of ${S0.rows}` : `${st.done_rows} of ${st.total_rows} done`, "score", S0.metric + " (lower is better)",
+      "budget", `${S0.limit} · batch ${S0.batch_size}` + (S0.seq_len ? ` · window ${S0.seq_len}` : "") + (S0.size_mode === "params" ? ` · ~${human(S0.target_params)} params each` : ` · width ${S0.embed_dim} × ${S0.layer_count} layers`),
+      "optimizer", `${S0.optimizer} · LR ${S0.lr_mode}` + (S0.seeds > 1 ? ` · ${S0.seeds} seeds` : ""),
+      ...(B.view ? ["folder", B.view.path] : ["elapsed", dur(st.elapsed) + (st.eta != null && benchBusy() ? ` · about ${dur(st.eta)} left` : ""), ...(st.run_dir ? ["folder", st.run_dir] : [])]))
+      : el("p", { class: "note" }, "Set up a benchmark on the left, or open past results."));
+    if (st.error && !B.view) box.append(el("p", { class: "warn" }, st.error));
+    if (st.detail && st.state === "preparing") box.append(el("p", { class: "note" }, st.detail));
+  }
+  const bar = $("#bProgress"); if (bar) bar.style.width = S0 && !B.view && st.total_rows ? `${100 * st.done_rows / st.total_rows}%` : B.view ? "100%" : "0";
+  const cur = $("#bCurrent");
+  if (cur) {
+    const c = !B.view && st.current;
+    if (!c) cur.replaceChildren();
+    else {
+      cur.replaceChildren(el("div", { class: "row-flex", style: "margin:4px 0" }, el("b", {}, `Now: ${c.name}`), el("span", { class: "muted" }, `${c.year} · row ${c.index + 1} · run ${c.runs_started || 0} of ${S0?.runs_per_row || 1}` +
+        (c.lr != null ? ` · lr ${fmt(c.lr, 3)}` : "") + (c.params ? ` · ${human(c.params)} params` : "") + ` · step ${fmtInt(c.steps || 0)}` + (c.it_s ? ` · ${c.it_s.toFixed(1)} it/s` : ""))));
+      if (c.curve?.length > 1) {
+        const ch = new Chart(cur, { height: 150 });
+        const ser = [{ name: "train loss", x: c.curve.map(p => p[0]), y: c.curve.map(p => p[1]), color: series()[0] }];
+        if (c.val_curve?.length) ser.push({ name: "validation", x: c.val_curve.map(p => p[0]), y: c.val_curve.map(p => p[1]), color: series()[1], dots: true });
+        requestAnimationFrame(() => drawXY(ch, { series: ser, xLabel: "step", yLabel: "loss" }));
+      }
+    }
+  }
+  const tabs = $("#bTabs");
+  if (tabs && (full || tabs.dataset.n !== String(rows.length))) {
+    tabs.dataset.n = String(rows.length);
+    tabs.replaceChildren(pageTabs("btab", [["table", `Leaderboard (${rows.length})`], ["charts", "Charts"], ["curves", "Loss curves"], ["detail", "Row detail"]], B.rtab, k => { B.rtab = k; store.set("benchTab", k); drawBenchMonitor(true); }));
+    drawBenchResults();
+  }
+  const cb = $("#bConsole");
+  if (cb && cb.dataset.n !== String(B.console.length)) { const end = cb.scrollTop + cb.clientHeight >= cb.scrollHeight - 8; cb.dataset.n = String(B.console.length); cb.textContent = B.console.join("\n"); if (end) cb.scrollTop = cb.scrollHeight; }
+}
+function rankedRows() {
+  const rows = benchRows().map(r => Object.assign({}, r, { ok: r.status === "OK" && r.score != null }));
+  const okScores = rows.filter(r => r.ok).map(r => r.score), best = okScores.length ? Math.min(...okScores) : null;
+  const S0 = benchSummary(), tokPerStep = (S0?.batch_size || 1) * (S0?.seq_len || 0);
+  const byScore = rows.filter(r => r.ok).sort((a, b) => a.score - b.score);
+  byScore.forEach((r, i) => r.rank = i + 1);
+  rows.forEach(r => { r.delta = r.ok && best ? 100 * (r.score - best) / best : null; r.tok_s = tokPerStep ? r.it_s * tokPerStep : null; });
+  // Pareto: no other row is both faster and better
+  rows.forEach(r => { r.pareto = r.ok && !rows.some(o => o !== r && o.ok && o.score <= r.score && o.it_s >= r.it_s && (o.score < r.score || o.it_s > r.it_s)); });
+  return rows;
+}
+function drawBenchResults() {
+  const root = $("#bResults"); if (!root) return;
+  const rows = rankedRows();
+  if (!rows.length) { root.replaceChildren(el("div", { class: "muted" }, "Results appear here row by row.")); return; }
+  const content = el("div");
+  root.replaceChildren(content);
+  ({ table: benchTable, charts: benchCharts, curves: benchCurves, detail: benchDetail })[B.rtab](content, rows);
+}
+function benchTable(root, rows) {
+  const cols = [["rank", "#"], ["short", "model"], ["year", "year"], ["score", "score"], ["delta", "vs best"], ["params", "params"], ["it_s", "it/s"], ["tok_s", "tokens/s"], ["lr", "best LR"], ["best_step", "best step"], ["status", "status"]];
+  const key = B.sort, dir = B.sortDir;
+  const val = (r, k) => k === "rank" ? (r.rank ?? 1e9) : k === "score" || k === "delta" ? (r.ok ? r[k] : 1e99) : r[k] ?? -1;
+  rows.sort((a, b) => { const x = val(a, key), y = val(b, key); return (typeof x === "string" ? x.localeCompare(y) : x - y) * dir; });
+  root.append(el("p", { class: "note" }, "Click a column to sort, a row for its details. ★ = on the speed/quality frontier (nothing else is both faster and better)."),
+    el("div", { class: "scroll", style: "max-height:560px;overflow-y:auto" }, el("table", { class: "data" },
+      el("tr", {}, cols.map(([k, n]) => el("th", { style: "cursor:pointer", onclick: () => { B.sortDir = B.sort === k ? -B.sortDir : 1; B.sort = k; store.set("benchSort", k); drawBenchResults(); } }, n + (key === k ? (dir > 0 ? " ▲" : " ▼") : "")))),
+      rows.map(r => el("tr", { style: "cursor:pointer" + (B.sel === r.key ? ";background:var(--surface-2)" : ""), onclick: () => { B.sel = r.key; B.rtab = "detail"; drawBenchMonitor(true); } },
+        el("td", {}, r.rank ? String(r.rank) : "–"), el("td", { title: r.name }, el("span", { class: "sw", style: `display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:6px;background:${famColor(r.family)}` }), (r.pareto ? "★ " : "") + (r.short || r.name)),
+        el("td", {}, String(r.year)), el("td", {}, r.ok ? fmt(r.score) + (r.score_std ? ` ±${fmt(r.score_std, 2)}` : "") : "–"),
+        el("td", {}, r.delta != null ? (r.delta < 0.05 ? "best" : `+${r.delta.toFixed(1)}%`) : "–"), el("td", {}, human(r.params)), el("td", {}, r.it_s ? r.it_s.toFixed(1) : "–"),
+        el("td", {}, r.tok_s ? human(r.tok_s) : "–"), el("td", {}, r.lr != null ? fmt(r.lr, 3) : "–"), el("td", {}, r.best_step >= 0 ? String(r.best_step) : "–"),
+        el("td", { class: r.status === "OK" ? "" : "warn" }, r.status))))));
+}
+function drawScatter(chart, { pts, xLabel, yLabel, logX = false, frontier = null, onPick = null }) {
+  const ctx = chart.setup();
+  const tx = v => logX ? Math.log10(Math.max(v, 1e-12)) : v;
+  const xs = pts.map(p => tx(p.x)), ys = pts.map(p => p.y);
+  const [xlo, xhi] = extent([xs], 0.06), [ylo, yhi] = extent([ys], 0.08);
+  const f = chart.frame({ xlo, xhi, ylo, yhi, xLabel: logX ? xLabel + " (log₁₀)" : xLabel, yLabel });
+  const draw = hover => {
+    ctx.clearRect(0, 0, chart.w, chart.height); chart.frame({ xlo, xhi, ylo, yhi, xLabel: logX ? xLabel + " (log₁₀)" : xLabel, yLabel });
+    if (frontier && frontier.length > 1) { ctx.strokeStyle = css("--muted"); ctx.setLineDash([4, 3]); ctx.lineWidth = 1.2; ctx.beginPath(); frontier.forEach((p, i) => { const X = f.sx(tx(p.x)), Y = f.sy(p.y); i ? ctx.lineTo(X, Y) : ctx.moveTo(X, Y); }); ctx.stroke(); ctx.setLineDash([]); }
+    pts.forEach((p, i) => { ctx.fillStyle = p.color; ctx.globalAlpha = hover == null || hover === i ? 0.9 : 0.35; ctx.beginPath(); ctx.arc(f.sx(xs[i]), f.sy(ys[i]), hover === i ? 6 : 4.5, 0, 7); ctx.fill(); });
+    ctx.globalAlpha = 1;
+    if (hover != null) { ctx.strokeStyle = css("--text"); ctx.lineWidth = 1.5; ctx.beginPath(); ctx.arc(f.sx(xs[hover]), f.sy(ys[hover]), 7.5, 0, 7); ctx.stroke(); }
+  };
+  const nearest = (mx, my) => { let bi = null, bd = 18 * 18; pts.forEach((p, i) => { const d = (f.sx(xs[i]) - mx) ** 2 + (f.sy(ys[i]) - my) ** 2; if (d < bd) { bd = d; bi = i; } }); return bi; };
+  draw(null);
+  chart.redrawOverlay = p => draw(p ? nearest(p.x, p.y) : null);
+  chart.hover = (mx, my) => { const i = nearest(mx, my); if (i == null) return null; const p = pts[i]; return `<b>${esc(p.label)}</b><div>${esc(xLabel)}: ${fmt(p.x)}</div><div>${esc(yLabel)}: ${fmt(p.y)}</div>${onPick ? '<div class="muted">click for details</div>' : ""}`; };
+  chart.click = onPick ? ((mx, my) => { const i = nearest(mx, my); if (i != null) onPick(pts[i]); }) : null;
+}
+function benchCharts(root, rows) {
+  const ok = rows.filter(r => r.ok), pick = p => { B.sel = p.key; B.rtab = "detail"; drawBenchMonitor(true); };
+  if (!ok.length) { root.append(el("p", { class: "muted" }, "No successful rows yet.")); return; }
+  const pt = (r, x) => ({ x, y: r.score, label: `${r.short || r.name} (${r.year})`, color: famColor(r.family), key: r.key });
+  const fams = [...new Set(ok.map(r => r.family))];
+  root.append(el("div", { class: "legend" }, fams.map(fm => el("span", {}, el("span", { class: "sw", style: `background:${famColor(fm)}` }), fm))));
+  const grid = el("div", { class: "grid" }); root.append(grid);
+  const c1 = new Chart(grid, { height: 260, title: "Score by year of the idea", sub: "does newer mean better on your data?" });
+  const c2 = new Chart(grid, { height: 260, title: "Score vs parameters" });
+  const c3 = new Chart(grid, { height: 260, title: "Score vs speed", sub: "dashed = frontier (best score at each speed)" });
+  const c4 = new Chart(grid, { title: "Leaderboard", sub: "top 15" });
+  const front = ok.filter(r => r.pareto).sort((a, b) => a.it_s - b.it_s).map(r => ({ x: r.it_s, y: r.score }));
+  const top = ok.slice().sort((a, b) => a.score - b.score).slice(0, 15);
+  requestAnimationFrame(() => {
+    drawScatter(c1, { pts: ok.map(r => pt(r, r.year + (r.month || 6) / 12)), xLabel: "year", yLabel: "score", onPick: pick });
+    drawScatter(c2, { pts: ok.map(r => pt(r, r.params)), xLabel: "parameters", yLabel: "score", logX: true, onPick: pick });
+    drawScatter(c3, { pts: ok.filter(r => r.it_s > 0).map(r => pt(r, r.it_s)), xLabel: "optimizer steps / s", yLabel: "score", logX: true, frontier: front, onPick: pick });
+    drawHBars(c4, { labels: top.map(r => r.short || r.name), values: top.map(r => r.score), valueLabel: benchSummary()?.metric || "score", colorPos: css("--s1"), colorNeg: css("--s1"), onClick: i => pick({ key: top[i].key }) });
+  });
+  const byFam = fams.map(fm => { const rs = ok.filter(r => r.family === fm); const b = rs.reduce((a, r) => r.score < a.score ? r : a); return { fm, n: rs.length, best: b, mean: rs.reduce((a, r) => a + r.score, 0) / rs.length }; }).sort((a, b) => a.best.score - b.best.score);
+  root.append(el("h3", {}, "By family"), el("div", { class: "scroll" }, el("table", { class: "data" }, el("tr", {}, ["family", "rows", "best", "best model", "mean"].map(h => el("th", {}, h))),
+    byFam.map(x => el("tr", {}, el("td", {}, x.fm), el("td", {}, String(x.n)), el("td", {}, fmt(x.best.score)), el("td", {}, x.best.short || x.best.name), el("td", {}, fmt(x.mean)))))));
+  const failed = rows.filter(r => !r.ok);
+  if (failed.length) root.append(el("h3", {}, `Did not finish (${failed.length})`), el("div", { class: "chips" }, failed.map(r => el("span", { class: "pill warnpill", title: r.status }, `${r.short || r.name}: ${r.status.slice(0, 40)}`))));
+}
+function benchCurves(root, rows) {
+  const kind = B.curveKind, ok = rows.filter(r => (kind === "val" ? r.val_curve : r.curve)?.length > 1);
+  root.append(el("div", { class: "controls" }, fld("Curves", el("select", { onchange: e => { B.curveKind = e.target.value; drawBenchResults(); } },
+    [["train", "training loss (smoothed)"], ["val", "validation loss"]].map(([v, t]) => el("option", { value: v, selected: v === kind }, t))))));
+  if (!ok.length) { root.append(el("p", { class: "muted" }, "No curves of this kind.")); return; }
+  const sorted = ok.slice().sort((a, b) => (a.ok ? a.score : 1e99) - (b.ok ? b.score : 1e99)), top = new Set(sorted.slice(0, 6).map(r => r.key));
+  const ch = new Chart(root, { height: 320, title: kind === "val" ? "Validation loss" : "Training loss", sub: "the six best rows are bold" });
+  const ser = sorted.map(r => { const c = kind === "val" ? r.val_curve : r.curve; return { name: r.short || r.name, x: c.map(p => p[0]), y: c.map(p => p[1]), color: famColor(r.family), width: top.has(r.key) ? 2.2 : 1, alpha: top.has(r.key) ? 1 : 0.35, noLegend: !top.has(r.key), noHover: !top.has(r.key) && sorted.length > 12, dots: kind === "val" && top.has(r.key) }; });
+  requestAnimationFrame(() => drawXY(ch, { series: ser, xLabel: "step", yLabel: "loss", logY: false }));
+}
+function benchDetail(root, rows) {
+  const r = rows.find(x => x.key === B.sel) || rows.slice().sort((a, b) => (a.ok ? a.score : 1e99) - (b.ok ? b.score : 1e99))[0];
+  if (!r) return;
+  B.sel = r.key;
+  root.append(el("div", { class: "controls" }, fld("Row", el("select", { onchange: e => { B.sel = e.target.value; drawBenchResults(); } },
+    rows.map(x => el("option", { value: x.key, selected: x.key === r.key }, `${x.rank ? "#" + x.rank + " " : ""}${x.short || x.name}`))))));
+  root.append(kv("model", r.name, "family", `${r.family} · first published ${r.year}`, "score", r.ok ? `${fmt(r.score)}${r.score_std ? ` ± ${fmt(r.score_std)} over ${r.scores.length} seeds` : ""}${r.rank ? ` · rank ${r.rank}` : ""}${r.delta != null && r.delta >= 0.05 ? ` · ${r.delta.toFixed(1)}% behind the best` : ""}` : r.status,
+    "size", `${human(r.params)} parameters · width ${r.embed_dim}`, "speed", r.it_s ? `${r.it_s.toFixed(1)} steps/s` + (r.tok_s ? ` · ${human(r.tok_s)} tokens/s` : "") : "–",
+    "learning rate", r.lr != null ? `${fmt(r.lr, 3)} (×${fmt(r.lr_mult, 3)} of the base)` : "–", ...(r.best_step >= 0 ? ["best step", String(r.best_step)] : []),
+    ...(Object.keys(r.overrides || {}).length ? ["options", JSON.stringify(r.overrides)] : [])));
+  const grid = el("div", { class: "grid", style: "margin-top:10px" }); root.append(grid);
+  if (r.curve?.length > 1) {
+    const ch = new Chart(grid, { height: 220, title: "Loss" });
+    const ser = [{ name: "train (smoothed)", x: r.curve.map(p => p[0]), y: r.curve.map(p => p[1]), color: series()[0] }];
+    if (r.val_curve?.length) ser.push({ name: "validation", x: r.val_curve.map(p => p[0]), y: r.val_curve.map(p => p[1]), color: series()[1], dots: true });
+    requestAnimationFrame(() => drawXY(ch, { series: ser, xLabel: "step", yLabel: "loss" }));
+  }
+  const cands = (r.lr_candidates || []).filter(c => c.lr != null);
+  if (cands.length > 1) {
+    const ch = new Chart(grid, { height: 220, title: "Learning rates tried", sub: "score per candidate LR" });
+    const okc = cands.filter(c => c.ok && c.score != null).sort((a, b) => a.lr - b.lr);
+    requestAnimationFrame(() => drawScatter(ch, { pts: okc.map(c => ({ x: c.lr, y: c.score, label: `lr ${fmt(c.lr, 3)}`, color: series()[2] })), xLabel: "learning rate", yLabel: "score", logX: true, frontier: okc.map(c => ({ x: c.lr, y: c.score })) }));
+  }
+  if (r.sample) root.append(el("h3", {}, "Sample"), el("pre", { class: "sampletext" }, r.sample));
+}
+// ───── speed test ─────
+function speedCard() {
+  const P = B.SP, run = G.opts.run, busy = B.speed?.state === "running";
+  const sv = () => store.set("speedForm", B.SP);
+  const card = el("div", { class: "card" }, el("h2", {}, "Speed test"));
+  card.append(el("p", { class: "note" }, run ? `Times training steps (forward, backward, optimizer) on random tokens for each selected model, using the saved run's settings (${run.model_name}, vocab from ${baseName(run.dataset_path || "")}) — linegen's Speed mode.` : "Needs a saved run (textgen.json) in the working folder: its tokenizer, optimizer and size are the template."));
+  card.append(el("div", { class: "form-grid" },
+    fld("Window (tokens)", numIn(P, "seq_len", { min: 1, placeholder: run ? String(run.seq_len) : "" }, null, sv)),
+    fld("Batch size", numIn(P, "batch_size", { min: 1, placeholder: run ? String(run.batch_size) : "" }, null, sv)),
+    fld("Warm-up steps (not timed)", numIn(P, "warmup", { min: 0 }, null, sv)), fld("Timed steps", numIn(P, "measure", { min: 1 }, null, sv))));
+  card.append(el("div", { class: "row-flex", style: "margin-top:10px" },
+    el("button", { class: "primary", disabled: busy || !run, onclick: async () => { try { B.speed = await api("/api/speed/start", Object.assign({ models: B.F.models }, P)); renderBench(); pollSpeed(); } catch (e) { toast(e.message); } } }, busy ? "Measuring…" : `Measure ${B.F.models.length} models`),
+    el("button", { disabled: !busy, onclick: async () => { B.speed = await api("/api/speed/stop"); } }, "Stop after this model")));
+  return card;
+}
+function speedResultsCard() {
+  return el("div", { class: "card" }, el("h2", {}, el("span", { class: "grow" }, "Throughput"), el("span", { class: "state " + (B.speed?.state || "idle"), id: "spState" }, B.speed?.state || "idle")), el("div", { id: "spBody" }));
+}
+function drawSpeed() {
+  const body = $("#spBody"), st = B.speed; if (!body) return;
+  const se = $("#spState"); if (se && st) { se.className = "state " + st.state; se.textContent = st.state; }
+  if (!st || (!st.results.length && !st.current)) { body.replaceChildren(el("p", { class: "muted" }, "Pick models on the left and press Measure.")); return; }
+  const rows = st.results.map(r => Object.assign({}, r, { ok: r.status === "OK" })), ok = rows.filter(r => r.ok).sort((a, b) => b.tok_s - a.tok_s);
+  const fastest = ok[0]?.tok_s || 1;
+  body.replaceChildren(el("p", { class: "note" }, `${st.results.length} of ${st.total} measured` + (st.current ? ` · now ${st.current}` : "") + (st.settings ? ` · window ${st.settings.seq_len} × batch ${st.settings.batch_size}, ${st.settings.measure} timed steps` : "")),
+    el("div", { class: "progress" }, el("div", { style: `width:${100 * st.results.length / Math.max(1, st.total)}%` })));
+  if (st.error) body.append(el("p", { class: "warn" }, st.error));
+  body.append(el("div", { class: "scroll", style: "max-height:420px;overflow-y:auto" }, el("table", { class: "data" },
+    el("tr", {}, ["#", "model", "tokens/s", "vs fastest", "ms/step", "params", "tokens/s per M params", "peak GPU memory"].map(h => el("th", {}, h))),
+    ok.map((r, i) => el("tr", {}, el("td", {}, String(i + 1)), el("td", {}, el("span", { class: "sw", style: `display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:6px;background:${famColor(r.family)}` }), r.name),
+      el("td", {}, human(r.tok_s)), el("td", {}, i ? `${(100 * r.tok_s / fastest).toFixed(0)}%` : "fastest"), el("td", {}, fmt(r.ms_per_step, 3)), el("td", {}, human(r.params)),
+      el("td", {}, r.params ? human(r.tok_s / (r.params / 1e6)) : "–"), el("td", {}, r.peak_mem != null ? bytesH(r.peak_mem) : "–"))),
+    rows.filter(r => !r.ok).map(r => el("tr", {}, el("td", {}, "–"), el("td", {}, r.name), el("td", { class: "warn", colspan: 6 }, r.status))))));
+  if (ok.length > 1) {
+    const grid = el("div", { class: "grid", style: "margin-top:10px" }); body.append(grid);
+    const c1 = new Chart(grid, { title: "Tokens per second", sub: "fastest first" }), c2 = new Chart(grid, { height: 240, title: "Speed vs size" });
+    const c3 = ok.some(r => r.peak_mem) ? new Chart(grid, { height: 240, title: "Peak GPU memory vs size" }) : null;
+    const pt = (r, y) => ({ x: r.params, y, label: r.name, color: famColor(r.family) });
+    requestAnimationFrame(() => {
+      const top = ok.slice(0, 20);
+      drawHBars(c1, { labels: top.map(r => r.name.split(" (")[0].slice(0, 28)), values: top.map(r => r.tok_s), valueLabel: "tokens / s", colorPos: css("--s3"), colorNeg: css("--s3") });
+      drawScatter(c2, { pts: ok.filter(r => r.params).map(r => pt(r, r.tok_s / 1e3)), xLabel: "parameters", yLabel: "k tokens / s", logX: true });
+      if (c3) drawScatter(c3, { pts: ok.filter(r => r.params && r.peak_mem).map(r => pt(r, r.peak_mem / 2 ** 20)), xLabel: "parameters", yLabel: "peak MB", logX: true });
+    });
+  }
+}
+async function pollSpeed() {
+  clearTimeout(B.speedTimer);
+  try { const prev = B.speed?.state; B.speed = await api("/api/speed/status"); if (G.page === "bench" && B.kind === "speed") { if (prev !== B.speed.state) whenNotTyping(renderBench); else drawSpeed(); } } catch { /* ignore */ }
+  if (B.speed?.state === "running") B.speedTimer = setTimeout(pollSpeed, 1000);
+}
+async function pollBench() {
+  clearTimeout(B.timer);
+  try {
+    const st = await api("/api/bench/status", { known: B.known, console_since: B.csince }), prev = B.st?.state;
+    if (st.records_from === B.known) { B.records.push(...st.records); B.known += st.records.length; }
+    else if (st.records_from < B.known) { B.records = st.records; B.known = st.records.length; }
+    B.st = st;
+    if (st.console?.length) { B.console.push(...st.console); B.console.splice(0, Math.max(0, B.console.length - 1500)); }
+    if (st.console_total != null) B.csince = st.console_total;
+    if (G.page === "bench") { if (prev && prev !== st.state) { B.list = null; whenNotTyping(renderBench); } else drawBenchMonitor(); }
+    if (prev && prev !== st.state && ["done", "error", "stopped"].includes(st.state)) toast(st.state === "error" ? "Benchmark failed: " + st.error : `Benchmark ${st.state}: ${st.done_rows} of ${st.total_rows} rows`, st.state !== "error");
+  } catch { /* server restarting */ }
+  B.timer = setTimeout(pollBench, benchBusy() ? 1500 : 5000);
+}
+
 // ───────────────────────── shell ─────────────────────────
 function showPage(page) {
   G.page = page; store.set("page", page);
   for (const b of $("#modes").children) b.classList.toggle("active", b.dataset.page === page);
-  for (const p of ["train", "sample"]) $("#" + p + "Page").hidden = p !== page;
+  for (const p of ["train", "sample", "bench"]) $("#" + p + "Page").hidden = p !== page;
   history.replaceState(null, "", "#" + page);
-  if (page === "train") renderTrain(); else renderSample();
+  if (page === "train") renderTrain(); else if (page === "bench") renderBench(); else renderSample();
 }
 async function boot() {
   const theme = store.get("theme", null); if (theme) document.documentElement.dataset.theme = theme;
@@ -1577,8 +2020,9 @@ async function boot() {
   try { G.opts = await api("/api/options"); } catch (e) { toast("Server unreachable: " + e.message); return; }
   $("#deviceInfo").textContent = `${G.opts.gpu || G.opts.device} · ${G.opts.cwd}`;
   const want = location.hash.slice(1);
-  showPage(["train", "sample"].includes(want) ? want : store.get("page", "train"));
+  showPage(["train", "sample", "bench"].includes(want) ? want : store.get("page", "train"));
   pollTrain();
+  pollBench();
   let rw, lastW = innerWidth;
   addEventListener("resize", () => { clearTimeout(rw); rw = setTimeout(() => { if (innerWidth !== lastW) whenNotTyping(() => { lastW = innerWidth; showPage(G.page); }); }, 150); });
 }

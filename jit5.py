@@ -5907,7 +5907,7 @@ def prompt_resume_settings(cfg, optimizer, completed_steps):
         # parameter grouping, optimizer type and tensor state stay compatible.
         bounds = {'weight_decay': (0, None), 'momentum': (0, .999999),
                   'eps': (1e-16, None), 'alpha': (0, .999999),
-                  'hyper_lr': (0, None), 'nu': (0, None), 'beta2': (0, .999999)}
+                  'hyper_lr': (0, None), 'nu': (0, None), 'beta2': (0, .999999), 'anchor': (0, None)}
         if cfg['optimizer_type'] == 'adadeltago':
             bounds.update(gamma=(1e-16, None), rho=(0, .999999))
         if cfg['optimizer_type'] == 'rmsgo':
@@ -5926,7 +5926,7 @@ def prompt_resume_settings(cfg, optimizer, completed_steps):
                           for i, value in enumerate(groups[0]['betas']))
             for group in groups:
                 group['betas'] = betas
-        if cfg['optimizer_type'] in {'muon', 'adamuon', 'normuon', 'adago', 'adamgo', 'rmsgo', 'adadeltago'}:
+        if cfg['optimizer_type'] in {'muon', 'adamuon', 'normuon', 'adago', 'adamgo', 'rmsgo', 'adadeltago', 'muonhd', 'normuonhd'}:
             backend = optimizer.param_groups[0].get('orthogonalization_backend', 'polar_express')
             cfg['muon_backend'] = ('polar_express' if get_input('Use Polar Express backend?',
                                    backend == 'polar_express', bool) else 'newton_schulz')
@@ -6199,6 +6199,9 @@ OPTIMIZER_TYPES = {
     '21': ('rmsgo', 'RMSGO', .05),
     '22': ('adadeltago', 'AdaDeltaGO', .05),
     '23': ('radam_schedulefree', 'RAdamScheduleFree', 2.5e-3),
+    '24': ('adamhd', 'AdamHD', 1e-3),
+    '25': ('muonhd', 'MuonHD', 4.2e-4),
+    '26': ('normuonhd', 'NorMuonHD', 4.2e-4),
 }
 
 
@@ -6327,10 +6330,20 @@ def jit_muon_param_groups(model):
                              param_groups=[{'params': [p for p in model.parameters() if p.requires_grad]}])
 
 
-MUON_FAMILY = {'muon', 'adamuon', 'normuon', 'adago', 'adamgo', 'rmsgo', 'adadeltago'}
+MUON_FAMILY = {'muon', 'adamuon', 'normuon', 'adago', 'adamgo', 'rmsgo', 'adadeltago', 'muonhd', 'normuonhd'}
+# Hypergradient-LR optimizers from lamb (AdamHD rule; settings use the hg_ prefix).
+HD_TYPES = {'adamhd', 'muonhd', 'normuonhd'}
 GO_FAMILY = {'adago', 'adamgo', 'rmsgo', 'adadeltago'}
 # Suggested AdamW-fallback LR; GO matrix LRs (0.05) are far too large for Adam.
 MUON_FALLBACK_LR = 4.2e-4
+
+
+def hd_kwargs(cfg):
+    """Hypergradient-LR options of AdamHD / MuonHD / NorMuonHD from the config."""
+    max_lr = cfg.get('hg_max_lr', 0.) or None
+    normalize = cfg.get('hg_normalize', True)
+    return dict(hyper_lr=cfg.get('hg_hyper_lr', .05), normalize=normalize,
+                anchor=cfg.get('hg_anchor', 1. if normalize else .02), max_lr=max_lr)
 
 
 def muon_group_lr_scale(group, cfg):
@@ -6353,13 +6366,16 @@ def build_optimizer(model: nn.Module, cfg: dict):
     opt_type = cfg.get('optimizer_type', 'adan')
     lr = cfg['lr']
     trainable = [p for p in model.parameters() if p.requires_grad]
-    if opt_type in {'muon', 'adamuon', 'normuon', 'adago', 'adamgo', 'rmsgo', 'adadeltago'}:
+    if opt_type in {'muon', 'adamuon', 'normuon', 'adago', 'adamgo', 'rmsgo', 'adadeltago', 'muonhd', 'normuonhd'}:
         optimizer_cls = (AdaDeltaGO if opt_type == 'adadeltago' else RMSGO if opt_type == 'rmsgo' else AdamGO if opt_type == 'adamgo' else AdaGO if opt_type == 'adago' else NorMuon if opt_type == 'normuon'
-                         else AdaMuon if opt_type == 'adamuon' else Muon)
+                         else AdaMuon if opt_type == 'adamuon' else MuonHD if opt_type == 'muonhd'
+                         else NorMuonHD if opt_type == 'normuonhd' else Muon)
         adaptive = ({'eps': cfg.get('adamuon_eps', 1e-8),
                      'nesterov': cfg.get('adamuon_nesterov', False)} if opt_type == 'adamuon' else {})
-        if opt_type == 'normuon':
+        if opt_type in ('normuon', 'normuonhd'):
             adaptive = {'eps': cfg.get('normuon_eps', 1e-8), 'beta2': cfg.get('normuon_beta2', .95)}
+        if opt_type in ('muonhd', 'normuonhd'):
+            adaptive.update(hd_kwargs(cfg))
         if opt_type == 'adago':
             adaptive = {'eps': cfg.get('adago_eps', 5e-4), 'gamma': cfg.get('adago_gamma', 1.),
                         'v0': cfg.get('adago_v0', 1.)}
@@ -6417,6 +6433,8 @@ def build_optimizer(model: nn.Module, cfg: dict):
             max_dlr=1e-2,
             update_clip_norm=1.0,
         )
+    if opt_type == 'adamhd':
+        return AdamHD(trainable, lr=lr, weight_decay=cfg.get('hg_weight_decay', 0.), **hd_kwargs(cfg))
     if opt_type == 'paper_adamhd':
         return PaperAdamHD(
             trainable, lr=lr,
@@ -6622,7 +6640,7 @@ def validate_config(cfg):
             raise ConfigError(f'{key} must be one of {values}')
     if cfg['full_bf16'] and cfg['use_amp']:
         raise ConfigError('Full BF16 and AMP cannot both be enabled')
-    if cfg['optimizer_type'] in {'muon', 'adamuon', 'normuon', 'adago', 'adamgo', 'rmsgo', 'adadeltago'}:
+    if cfg['optimizer_type'] in {'muon', 'adamuon', 'normuon', 'adago', 'adamgo', 'rmsgo', 'adadeltago', 'muonhd', 'normuonhd'}:
         if not isinstance(cfg.get('muon_all', False), bool):
             raise ConfigError('muon_all must be boolean')
         if not isinstance(cfg.get('muon_all_reshape', False), bool):
@@ -7188,7 +7206,7 @@ def main():
             opt_type, opt_desc, default_lr = get_optimizer_choice(opt_in)
             cfg['optimizer_type'] = opt_type
             cfg['lr'] = get_input(f"Learning rate for {opt_desc}", default_lr, float)
-            if opt_type in {'muon', 'adamuon', 'normuon', 'adago', 'adamgo', 'rmsgo', 'adadeltago'}:
+            if opt_type in {'muon', 'adamuon', 'normuon', 'adago', 'adamgo', 'rmsgo', 'adadeltago', 'muonhd', 'normuonhd'}:
                 cfg['cautious'] = get_input("Cautious updates?", False, bool)
                 cfg['muon_all'] = get_input("MuonAll (all parameters)?", False, bool)
                 cfg['muon_all_reshape'] = get_input("MuonAll: use near-square vector reshape?", False, bool)
@@ -7209,7 +7227,7 @@ def main():
                 if opt_type == 'adamuon':
                     cfg['adamuon_eps'] = get_number("AdaMuon epsilon", 1e-8, float, 1e-16)
                     cfg['adamuon_nesterov'] = get_input("AdaMuon Nesterov (off=paper Algorithm 1)?", False, bool)
-                if opt_type == 'normuon':
+                if opt_type in ('normuon', 'normuonhd'):
                     cfg['normuon_beta2'] = get_number("NorMuon variance decay (beta2)", .95, float, 0, .999999)
                     cfg['normuon_eps'] = get_number("NorMuon epsilon", 1e-8, float, 1e-16)
                 if opt_type == 'adago':
@@ -7230,6 +7248,18 @@ def main():
                     cfg['adamgo_gamma'] = get_number("AdamGO gradient norm cap (gamma)", 1., float, 1e-16)
                     cfg['adamgo_delta'] = get_number("AdamGO denominator stabilizer (delta)", 1e-8, float, 1e-16)
                     cfg['adamgo_min_step'] = get_number("AdamGO minimum step (0=disabled)", 0., float, 0)
+            if opt_type in ('adamhd', 'muonhd', 'normuonhd'):
+                cfg['hg_hyper_lr'] = get_number("Hypergradient step (max log-LR change per step)", .05, float, 0)
+                cfg['hg_normalize'] = get_input("Normalized hypergradient (off = original raw-cosine rule)?", True, bool)
+                cfg['hg_anchor'] = get_number("Anchor (pull towards the peak LR; higher decays less)",
+                                              1. if cfg['hg_normalize'] else .02, float, 0)
+                while True:
+                    cfg['hg_max_lr'] = get_number("Maximum LR (0 = 100x the initial LR)", 0., float, 0)
+                    if cfg['lr'] > 0 or cfg['hg_max_lr'] > 0:
+                        break
+                    print("│  A zero initial learning rate needs a maximum LR to set the scale.")
+                if opt_type == 'adamhd':
+                    cfg['hg_weight_decay'] = get_number("AdamHD weight decay (decoupled)", 0., float, 0)
             if opt_type == 'paper_adamhd':
                 cfg['hyper_lr'] = get_input("Hypergradient learning rate beta", 1e-10, float)
                 cfg['hd_min_lr'] = get_input("PaperAdamHD minimum LR", 1e-5, float)
@@ -7557,6 +7587,8 @@ def main():
                     continue
 
                 align_grad_strides(parameter_list)
+                if hasattr(optimizer, 'observe_loss'):   # HD optimizers' divergence guard
+                    optimizer.observe_loss(loss_val)
                 scaler.step(optimizer)
                 scaler.update()
                 consecutive_skips = 0
@@ -7574,7 +7606,7 @@ def main():
                 spike_guard_safe_steps += 1
                 current_lr = optimizer.param_groups[0].get('last_dlr', optimizer.param_groups[0]['lr'])
                 desc = f"loss {loss_val:.4f} · avg {loss_ema:.4f} · lr {current_lr:.2e}"
-                if cfg['optimizer_type'] == 'paper_adamhd':
+                if cfg['optimizer_type'] in ('adamhd', 'muonhd', 'normuonhd', 'paper_adamhd'):
                     last_hypergrad = optimizer.param_groups[0].get('last_hypergrad', 0.0)
                     desc += f" | HD: {last_hypergrad:.2e}"
                 elif cfg['optimizer_type'] == 'prodigy':

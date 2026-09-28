@@ -1484,6 +1484,453 @@ class Sampler:
                       'grad_degenerate': degenerate})
 
 
+
+# ───────────────────────── benchmark ─────────────────────────
+BENCH_GROUP_NAMES = {0: 'All models', 1: 'Ultra (all × options)', 2: 'Fixed-context', 3: 'Classic RNNs',
+                     4: 'Modern recurrent', 5: 'Core comparison'}
+FITNESS_NAMES = ['Sliding train loss', 'Final train eval', 'Best validation loss']
+
+
+def bench_options():
+    groups = []
+    for gid, name in BENCH_GROUP_NAMES.items():
+        ids = sorted(lg.MODEL_NAMES) if gid in (0, 1) else list(lg.BENCH_GROUPS[gid])
+        groups.append({'id': gid, 'name': name, 'ids': ids, 'ultra': gid == 1})
+    origins = {mid: list(lg.MODEL_ORIGINS[mid]) for mid in lg.MODEL_IDS}
+    variants = {str(mid): [{k: v for k, v in opt.items()} for opt in opts] for mid, opts in lg.BENCH_VARIANTS.items()}
+    return clean({
+        'groups': groups, 'origins': origins, 'variants': variants, 'fitness': FITNESS_NAMES,
+        'structure_ids': sorted(lg.BENCH_RNN_STRUCTURE_IDS), 'custom_rnn_ids': sorted(lg.BENCH_CUSTOM_RNN_IDS),
+        'hierarchical_ids': sorted(set(lg.HIERARCHICAL_MODEL_MIXERS) - {lg.MLP_MODEL_ID}),
+        'results_root': os.path.abspath(lg.BENCH_RESULTS_ROOT),
+    })
+
+
+def bench_tasks(ids, variant_text=None, ultra=False, hierarchical=False):
+    """The CLI's row list: one row per model and per combination of its variant values
+    (variant_text[mid][key] uses the CLI syntax: one value, a comma list or 'all')."""
+    import itertools
+    variant_text = variant_text or {}
+    ids = [int(i) for i in dict.fromkeys(ids)]
+    unknown = sorted(set(ids) - set(lg.MODEL_IDS))
+    if unknown:
+        raise ValueError(f'Unknown model IDs: {unknown}')
+    if hierarchical:
+        ids = [i for i in ids if i in lg.HIERARCHICAL_MODEL_MIXERS and i != lg.MLP_MODEL_ID]
+    if not ids:
+        raise ValueError('Choose at least one model' + (' with a MEGABYTE stage adapter.' if hierarchical else '.'))
+    tasks = []
+    for mid in ids:
+        opts = lg.BENCH_VARIANTS.get(mid)
+        if not opts:
+            tasks.append({'id': mid, 'overrides': {}})
+            continue
+        choices = []
+        for opt in opts:
+            if ultra:
+                values = list(opt['choices']) if opt['kind'] in {'choice', 'bool'} else [opt['default']]
+            else:
+                raw = str((variant_text.get(str(mid)) or {}).get(opt['key'], '') or '').strip()
+                try:
+                    values = lg._bench_parse_values(opt, raw)
+                except ValueError as exc:
+                    raise ValueError(f"{lg.MODEL_NAMES[mid]} · {opt['label']}: {exc}")
+            choices.append(values)
+        for combo in itertools.product(*choices):
+            overrides, cell = {}, {}
+            for opt, value in zip(opts, combo):
+                if value is None:
+                    continue
+                (cell if opt['cell'] else overrides)[opt['key']] = value
+            if cell:
+                overrides['rnn_cell_options'] = cell
+            tasks.append({'id': mid, 'overrides': overrides})
+    tasks.sort(key=lambda t: (lg.MODEL_ORIGINS[t['id']], t['id']))
+    return tasks
+
+
+def bench_settings_from_form(f):
+    """The settings dict collect_bench_settings() builds from the CLI answers."""
+    import json as _json
+    s = {'version': lg.BENCH_SETTINGS_VERSION}
+    path = str(Path(str(f.get('dataset_path') or '')).expanduser())
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f'Dataset file not found: {path or "(empty)"}')
+    s['dataset_path'] = path
+    s['dataset_type'] = _int(f, 'dataset_type', 0, 0, 1)
+    s['tokenizer_mode'] = _int(f, 'tokenizer_mode', 1, -1, 4)
+    s['seq2seq'] = seq2seq_from_form(path, f.get('seq2seq') or {}) if s['dataset_type'] == 1 and f.get('seq2seq_on') else None
+    model_type = _int(f, 'model_type', 0, 0, 2)
+    if model_type:
+        stages = f.get('stages') or []
+        if len(stages) < 2:
+            raise ValueError('MEGABYTE needs at least two stages')
+        h = {'model_type': model_type, 'stage_seq_lens': [], 'stage_dims': [], 'stage_child_embed_dims': [],
+             'stage_depths': [], 'stage_heads': []}
+        for st in stages:
+            d = _int(st, 'dim', 128, 1)
+            h['stage_seq_lens'].append(_int(st, 'seq_len', 4, 1)); h['stage_dims'].append(d)
+            h['stage_child_embed_dims'].append(_int(st, 'child_dim', min(64, d), 1, d))
+            h['stage_depths'].append(_int(st, 'depth', 2, 1)); h['stage_heads'].append(_int(st, 'heads', 8, 1))
+        s['hierarchy'] = h
+    else:
+        s['hierarchy'] = {'model_type': 0}
+    s['tasks'] = bench_tasks(f.get('models') or [], f.get('variants'), bool(f.get('ultra')), bool(model_type))
+    ids = {t['id'] for t in s['tasks']}
+    acts = f.get('activations') or {}
+    s['activations'] = {}
+    for mid in sorted(ids & lg.NON_RNN_ACTIVATION_IDS):
+        a = acts.get(str(mid)) or lg.MODEL_DEFAULT_ACTIVATIONS[mid]
+        if a not in lg.ACT_NAMES:
+            raise ValueError(f'Unknown activation {a}')
+        s['activations'][str(mid)] = a
+    s['size_mode'], s['target_params'] = 'fixed', 0
+    s['embed_dim'], s['layer_count'], s['head_count'], s['seq_len'] = 256, 4, 4, 0
+    if not model_type:
+        if f.get('size_mode') == 'params':
+            s['size_mode'] = 'params'
+            s['target_params'] = int(_float(f, 'target_millions', 2.0, 0.0001) * 1e6)
+        else:
+            s['embed_dim'] = _int(f, 'embed_dim', 256, 1)
+        s['layer_count'] = _int(f, 'layer_count', 4, 1)
+        s['head_count'] = _int(f, 'head_count', 4, 1)
+        if s['dataset_type'] == 0:
+            s['seq_len'] = _int(f, 'seq_len', 128, 1)
+    s['batch_size'] = _int(f, 'batch_size', 32, 1)
+    if f.get('limit_mode') == 'seconds':
+        s['total_iters'], s['max_seconds'] = 0, _float(f, 'max_seconds', 60.0, 1e-6)
+    else:
+        s['total_iters'], s['max_seconds'] = _int(f, 'total_iters', 500, 1), None
+    s['min_iters_per_sec'] = _float(f, 'min_iters_per_sec', 0.0, 0.0)
+    s['speed_warmup_steps'] = _int(f, 'speed_warmup_steps', 5, 0)
+    s['line'] = {'sample_lines': _int(f, 'sample_lines', 3, 1) if s['dataset_type'] == 1 else 1}
+    tb = bool(f.get('use_tbptt'))
+    s['tbptt'] = {'enabled': tb, 'window': _int(f, 'bptt_window', 64, 1) if tb else 0,
+                  'total_len': _int(f, 'tbptt_total_len', 0, 0) if tb and s['dataset_type'] == 0 else 0}
+    cuda = lg.DEVICE == 'cuda'
+    perf = {'use_amp': bool(f.get('use_amp')) and cuda, 'amp_dtype': 'bf16' if f.get('amp_dtype') == 'bf16' else 'fp16',
+            'use_compile': bool(f.get('use_compile')) and cuda}
+    if perf['use_compile']:
+        perf['compile_backend'] = 'inductor' if f.get('compile_backend') == 'inductor' else 'aot_eager'
+    s['perf'] = perf
+    s['optim'] = optimizer_from_form(f.get('optimizer', 24), f.get('optim_params'))
+    s['lr_schedule'] = _scheduler(f.get('lr_scheduler'))
+    s['warmup_steps'] = _int(f, 'warmup_steps', 100, 0) if s['lr_schedule'] == 'cosine_warmup' else 0
+    s['grad_clip'] = _float(f, 'grad_clip', 1.0, 0.0)
+    s['lr_multipliers'], s['lr_search'] = [1.0], None
+    lr_mode = f.get('lr_mode', 'single') if 'lr' in s['optim']['optim_params'] else 'single'
+    if lr_mode == 'search':
+        base = float(s['optim']['optim_params']['lr'] or 1e-3)
+        lo, hi = _float(f, 'lr_min', base / 10, 1e-12), _float(f, 'lr_max', base * 10, 1e-12)
+        if not lo < hi:
+            raise ValueError('LR search needs minimum < maximum')
+        halvings = _int(f, 'lr_halvings', 4, 1)
+        s['lr_search'] = {'min': lo, 'max': hi, 'halvings': halvings, 'steps': lg.lr_search_steps(halvings)}
+    elif lr_mode == 'multipliers':
+        try:
+            values = [float(x) for x in str(f.get('lr_multipliers') or '').split(',') if x.strip()] or [1.0]
+        except ValueError:
+            raise ValueError('LR multipliers must be numbers separated by commas')
+        if not all(v > 0 for v in values):
+            raise ValueError('LR multipliers must be positive')
+        s['lr_multipliers'] = list(dict.fromkeys(values))
+    s['rnn'] = {}
+    if ids & lg.BENCH_RNN_STRUCTURE_IDS:
+        res_every = _int(f, 'res_every', 0, 0)
+        s['rnn'] = {'res_every': res_every, 'res_type': _int(f, 'res_type', 0, 0, 3) if res_every else 0,
+                    'use_norm': _int(f, 'use_norm', 2, 0, 6), 'dropout': _float(f, 'dropout', 0.0, 0.0),
+                    'use_multiplier': _int(f, 'use_multiplier', 0, 0, 2),
+                    'rnn_ffn': _int(f, 'rnn_ffn', 0, 0, 3) if ids & lg.BENCH_CUSTOM_RNN_IDS else 0}
+    s['nan_skip'] = bool(f.get('nan_skip', True))
+    s['fitness_mode'] = _int(f, 'fitness_mode', 2, 0, 2)
+    s['val'] = {'val_split': 0.0}
+    if s['fitness_mode'] == 2:
+        if s['dataset_type'] == 0 and f.get('val_mode') == 'file':
+            vp = str(Path(str(f.get('val_path') or '')).expanduser())
+            if not os.path.isfile(vp):
+                raise FileNotFoundError(f'Validation file not found: {vp}')
+            s['val']['classic_val_path'] = vp
+        else:
+            s['val']['val_split'] = _float(f, 'val_split', 0.1, 0.0)
+            if not 0 < s['val']['val_split'] < 1:
+                raise ValueError('The validation split must be in (0, 1) for validation-loss scoring')
+        s['val']['_val_freq'] = _int(f, 'val_freq', 100, 1)
+        s['val']['_val_samples'] = _int(f, 'val_samples', 1000, 1)
+    s['seeds'] = _int(f, 'seeds', 1, 1)
+    s['sample_len'] = _int(f, 'sample_len', 200, 0)
+    s['sample_temperature'] = _float(f, 'sample_temperature', 0.8, 0.0) if s['sample_len'] else 0.8
+    s['table_order'] = _int(f, 'table_order', 2, 0, 2)
+    # a JSON round trip gives exactly what a preset file or results.json would load as
+    return lg._bench_normalize_settings(_json.loads(_json.dumps(lg._bench_json_safe(s))))
+
+
+def bench_record_view(r):
+    keep = ('key', 'id', 'name', 'year', 'month', 'score', 'score_std', 'scores', 'status', 'best_step', 'lr', 'lr_mult',
+            'params', 'embed_dim', 'matched_params', 'it_s', 'curve', 'val_curve', 'sample', 'tbptt', 'lr_candidates', 'overrides')
+    out = {k: r.get(k) for k in keep}
+    spec = lg.MODEL_SPECS.get(r['id'])
+    if spec is not None:
+        out.update(family=spec.menu_group, short=lg._bench_short_name(r), stateful=spec.stateful, attention=spec.attention)
+    return out
+
+
+def bench_summary(s):
+    lr_tries = s['lr_search']['steps'] + 2 if s.get('lr_search') else len(s['lr_multipliers'])
+    return {'rows': len(s['tasks']), 'runs_per_row': s['seeds'] * lr_tries, 'metric': FITNESS_NAMES[s['fitness_mode']],
+            'fitness_mode': s['fitness_mode'], 'limit': (f"{s['total_iters']} steps/model" if s['max_seconds'] is None
+                                                          else f"{s['max_seconds']:g} s/model"),
+            'dataset': s['dataset_path'], 'optimizer': s['optim']['optimizer'], 'batch_size': s['batch_size'],
+            'seq_len': s['seq_len'], 'size_mode': s['size_mode'], 'target_params': s['target_params'],
+            'embed_dim': s['embed_dim'], 'layer_count': s['layer_count'], 'seeds': s['seeds'],
+            'lr_mode': 'search' if s.get('lr_search') else 'multipliers' if len(s['lr_multipliers']) > 1 else 'single',
+            'model_type': s['hierarchy']['model_type'], 'sample_len': s['sample_len']}
+
+
+def bench_list(root=None):
+    root = Path(root or lg.BENCH_RESULTS_ROOT)
+    out = []
+    if root.is_dir():
+        for d in sorted(root.iterdir(), reverse=True):
+            f = d / 'results.json'
+            if f.is_file():
+                try:
+                    import json as _json
+                    data = _json.loads(f.read_text(encoding='utf-8'))
+                    n = len(data.get('settings', {}).get('tasks', []))
+                    out.append({'path': str(d.resolve()), 'name': d.name, 'rows': n, 'done': len(data.get('records', [])),
+                                'dataset': data.get('settings', {}).get('dataset_path'), 'modified': f.stat().st_mtime})
+                except Exception as exc:
+                    out.append({'path': str(d.resolve()), 'name': d.name, 'error': str(exc)})
+    return {'root': str(root.resolve()), 'runs': out[:200]}
+
+
+def bench_load(path):
+    """A finished (or interrupted) benchmark folder, for viewing."""
+    p, data = lg._bench_read_json(path)
+    s = lg._bench_normalize_settings(data['settings'])
+    records = [lg._bench_json_restore(r) for r in data.get('records', [])]
+    return clean({'path': str(p.parent), 'settings': s, 'summary': bench_summary(s),
+                  'records': [bench_record_view(r) for r in records],
+                  'prompt': (p.parent / 'samples.txt').read_text(encoding='utf-8').split('\n\n')[0] if (p.parent / 'samples.txt').exists() else ''})
+
+
+class BenchmarkSession:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.thread = None
+        self.reset()
+
+    def reset(self):
+        self.state, self.error, self.detail = 'idle', None, ''
+        self.s, self.records, self.run_dir, self.prompt = None, [], None, ''
+        self.current, self.live, self.row_times = None, None, []
+        self.started = self.finished = None
+        self.stop_requested, self.console_start = False, 0
+
+    def start(self, spec):
+        with self.lock:
+            if self.state in ('preparing', 'running', 'stopping'):
+                raise RuntimeError('A benchmark is already running.')
+        mode = spec.get('mode', 'new')
+        records = []
+        if mode == 'resume':
+            path, data = lg._bench_read_json(spec['path'])
+            legacy = data['settings'].get('version') == 1
+            s = lg._bench_normalize_settings(data['settings'])
+            records = [lg._bench_json_restore(r) for r in data.get('records', [])]
+            if legacy:
+                for r in records:
+                    r['id'] = lg._bench_legacy_id(r['id'])
+                    r['key'] = lg._bench_task_key(r)
+            run_dir = path.parent
+        else:
+            if mode == 'preset':
+                _, data = lg._bench_read_json(spec['path'])
+                s = lg._bench_normalize_settings(data.get('settings', data))
+            else:
+                s = bench_settings_from_form(spec.get('config') or {})
+            run_dir = Path(lg.BENCH_RESULTS_ROOT) / time.strftime('bench_%Y%m%d_%H%M%S')
+        with self.lock:
+            self.reset()
+            self.s, self.records, self.run_dir = s, records, run_dir
+            self.state, self.started = 'preparing', time.time()
+            self.console_start = console().count
+        self.thread = threading.Thread(target=self._run, daemon=True, name='linegen-benchmark')
+        self.thread.start()
+        return self.status()
+
+    def stop(self):
+        with self.lock:
+            if self.state in ('preparing', 'running'):
+                self.stop_requested, self.state = True, 'stopping'
+                if self.live:
+                    self.live['stats']['stop'] = True
+        return self.status()
+
+    def _hook(self, run, stats):
+        with self.lock:
+            if self.stop_requested:
+                stats['stop'] = True
+            if self.current is not None:
+                self.current['runs_started'] += 1
+            self.live = {'run': run, 'stats': stats, 'started': time.time()}
+
+    def _run(self):
+        tee = console()
+        tee.threads.add(threading.get_ident())
+        lg.BENCH_RUN_HOOK = self._hook
+        try:
+            s = self.s
+            self._set(detail='preparing the vocabulary and datasets')
+            env = lg._bench_prepare(s)
+            self._set(prompt=env['prompt_text'], state='running' if not self.stop_requested else 'stopping', detail='')
+            lg._bench_save(self.run_dir, s, self.records, env['prompt_text'])
+            done = {r['key'] for r in self.records}
+            for n, task in enumerate(s['tasks']):
+                if self.stop_requested:
+                    break
+                key = lg._bench_task_key(task)
+                if key in done:
+                    continue
+                cfg = lg._bench_task_cfg(s, task, env['cfg_base'])
+                with self.lock:
+                    self.current = {'index': n, 'id': task['id'], 'name': lg._bench_model_name(s, task, cfg),
+                                    'year': lg.MODEL_ORIGINS[task['id']][0], 'started': time.time(), 'runs_started': 0}
+                    self.live = None
+                t0 = time.time()
+                record = lg._bench_run_task(s, task, env)
+                stopped = any(c['status'] == 'STOPPED' for c in record.get('lr_candidates', [])) or record['status'] == 'STOPPED'
+                if stopped and self.stop_requested:
+                    break   # an interrupted row is not a result; resuming reruns it
+                with self.lock:
+                    self.records.append(record)
+                    self.row_times.append(time.time() - t0)
+                done.add(key)
+                lg._bench_save(self.run_dir, s, self.records, env['prompt_text'])
+            self._set(state='stopped' if self.stop_requested else 'done', finished=time.time(), current=None, live=None,
+                      detail=f'saved {self.run_dir}')
+        except BaseException as exc:
+            traceback.print_exc()
+            self._set(state='error', error=f'{type(exc).__name__}: {exc}', finished=time.time(), current=None, live=None)
+        finally:
+            lg.BENCH_RUN_HOOK = None
+            tee.threads.discard(threading.get_ident())
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    def _set(self, **kw):
+        with self.lock:
+            for k, v in kw.items():
+                setattr(self, k, v)
+
+    def status(self, known=0, console_since=None):
+        with self.lock:
+            s = self.s
+            out = {'state': self.state, 'error': self.error, 'detail': self.detail,
+                   'run_dir': str(self.run_dir.resolve()) if self.run_dir else None, 'prompt': self.prompt,
+                   'summary': bench_summary(s) if s else None, 'total_rows': len(s['tasks']) if s else 0,
+                   'done_rows': len(self.records), 'elapsed': (self.finished or time.time()) - self.started if self.started else 0}
+            known = max(0, int(known or 0))
+            out['records_from'] = min(known, len(self.records))
+            out['records'] = [bench_record_view(r) for r in self.records[known:]]
+            if self.row_times and s:
+                remaining = len(s['tasks']) - len(self.records)
+                out['eta'] = remaining * (sum(self.row_times) / len(self.row_times))
+            cur = dict(self.current) if self.current else None
+            if cur and self.live:
+                st = self.live['stats']
+                cur.update(seed=self.live['run'].get('seed'), lr=self.live['run'].get('lr'),
+                           params=self.live['run'].get('params'), steps=st.get('steps', 0), it_s=st.get('it_s', 0.0),
+                           curve=list(st.get('curve', [])), val_curve=list(st.get('val_curve', [])),
+                           run_elapsed=time.time() - self.live['started'])
+            if cur:
+                cur['elapsed'] = time.time() - cur['started']
+            out['current'] = cur
+        if console_since is not None:
+            count, lines = console().tail(max(int(console_since), self.console_start))
+            out['console'], out['console_total'] = lines[-300:], count
+        return clean(out)
+
+
+class SpeedSession:
+    """linegen's Speed mode: training-step throughput per model on random tokens,
+    with the saved run's config (textgen.json) as the template, as in the CLI."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.state, self.error, self.results, self.current, self.total = 'idle', None, [], None, 0
+        self.stop_requested, self.settings = False, None
+
+    def start(self, spec):
+        with self.lock:
+            if self.state == 'running':
+                raise RuntimeError('A speed test is already running.')
+        if not os.path.exists(lg.CONFIG_PATH):
+            raise FileNotFoundError(f'The speed test uses the saved run config ({lg.CONFIG_PATH}); train a model first.')
+        cfg = lg.load_run_config()
+        ids = [int(i) for i in spec.get('models') or []]
+        unknown = sorted(set(ids) - set(lg.MODEL_IDS))
+        if unknown or not ids:
+            raise ValueError(f'Unknown model IDs: {unknown}' if unknown else 'Choose at least one model.')
+        settings = {'seq_len': _int(spec, 'seq_len', cfg['seq_len'], 1), 'batch_size': _int(spec, 'batch_size', cfg['batch_size'], 1),
+                    'warmup': _int(spec, 'warmup', 10, 0), 'measure': _int(spec, 'measure', 50, 1)}
+        with self.lock:
+            self.state, self.error, self.results, self.current = 'running', None, [], None
+            self.total, self.stop_requested, self.settings = len(ids), False, dict(settings, config=cfg.get('dataset_path'))
+        threading.Thread(target=self._run, args=(cfg, ids, settings), daemon=True, name='linegen-speed').start()
+        return self.status()
+
+    def _run(self, cfg, ids, st):
+        try:
+            vocab = lg.load_or_make_vocab(cfg, cfg['dataset_path'], save_config=False)
+            for msel in ids:
+                if self.stop_requested:
+                    break
+                name = lg.MODEL_NAMES.get(msel, f'Model {msel}')
+                with self.lock:
+                    self.current = name
+                cfg_t = dict(cfg, model_selection=msel, seq_len=st['seq_len'], batch_size=st['batch_size'])
+                row = {'id': msel, 'name': name, 'family': lg.MODEL_SPECS[msel].menu_group, 'year': lg.MODEL_ORIGINS[msel][0]}
+                try:
+                    row.update(lg.speed_test_model(cfg_t, vocab, st['warmup'], st['measure']), status='OK')
+                except Exception as exc:
+                    row.update(status=f'FAILED: {exc}'.split('\n')[0][:200], tok_s=0, params=0)
+                with self.lock:
+                    self.results.append(row)
+            with self.lock:
+                self.state, self.current = ('stopped' if self.stop_requested else 'done'), None
+        except Exception as exc:
+            traceback.print_exc()
+            with self.lock:
+                self.state, self.error, self.current = 'error', f'{type(exc).__name__}: {exc}', None
+
+    def stop(self):
+        self.stop_requested = True
+        return self.status()
+
+    def status(self):
+        with self.lock:
+            return clean({'state': self.state, 'error': self.error, 'results': list(self.results), 'current': self.current,
+                          'total': self.total, 'settings': self.settings})
+
+
+def bench_check(form):
+    """Rows and run count for a form, without starting anything."""
+    s = bench_settings_from_form(form)
+    return clean({'summary': bench_summary(s), 'tasks': [{'id': t['id'], 'name': lg.MODEL_NAMES[t['id']] + lg._bench_variant_label(t),
+                                                          'year': lg.MODEL_ORIGINS[t['id']][0]} for t in s['tasks']]})
+
+
+def bench_save_preset(form, path):
+    s = bench_settings_from_form(form)
+    import json as _json
+    p = Path(str(path)).expanduser()
+    if p.is_dir():
+        p = p / 'benchmark_preset.json'
+    p.write_text(_json.dumps(lg._bench_json_safe(s), indent=1), encoding='utf-8')
+    return {'path': str(p.resolve())}
+
+
 # ───────────────────────── server ─────────────────────────
 def run_gui(host='127.0.0.1', port=8767, open_browser=True):
     import json
@@ -1492,7 +1939,7 @@ def run_gui(host='127.0.0.1', port=8767, open_browser=True):
     from urllib.parse import parse_qs, urlparse
 
     console()
-    session, sampler = TrainingSession(), Sampler()
+    session, sampler, bench, speed = TrainingSession(), Sampler(), BenchmarkSession(), SpeedSession()
     routes = {
         '/api/options': lambda b: options(),
         '/api/fs': lambda b: list_dir(b.get('path')),
@@ -1515,6 +1962,17 @@ def run_gui(host='127.0.0.1', port=8767, open_browser=True):
         '/api/analyze/unit': lambda b: sampler.unit_values(b),
         '/api/analyze/state': lambda b: sampler.state_detail(b),
         '/api/influence': lambda b: sampler.influence(b),
+        '/api/bench/options': lambda b: bench_options(),
+        '/api/bench/check': lambda b: bench_check(b.get('config') or {}),
+        '/api/bench/preset': lambda b: bench_save_preset(b.get('config') or {}, b['path']),
+        '/api/bench/start': lambda b: bench.start(b),
+        '/api/bench/stop': lambda b: bench.stop(),
+        '/api/bench/status': lambda b: bench.status(b.get('known', 0), b.get('console_since')),
+        '/api/bench/list': lambda b: bench_list(b.get('root')),
+        '/api/speed/start': lambda b: speed.start(b),
+        '/api/speed/stop': lambda b: speed.stop(),
+        '/api/speed/status': lambda b: speed.status(),
+        '/api/bench/load': lambda b: bench_load(b['path']),
     }
 
     class Handler(BaseHTTPRequestHandler):
