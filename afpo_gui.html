@@ -268,6 +268,14 @@ input, select, textarea { max-width: 100%; }
           <div class="field"><label>Islands <span class="hint">1 = single population</span></label><input type="number" id="islands" value="1" min="1"></div>
           <div class="field islandOnly"><label>Migration interval</label><input type="number" id="migrationInterval" value="25" min="1"></div>
           <div class="field islandOnly"><label>Migrants per island</label><input type="number" id="migrants" value="2" min="1"></div>
+          <div class="field islandOnly"><label class="check"><input type="checkbox" id="roles"> Self-organising roles <span class="hint">island 1 generalist, others specialise</span></label></div>
+          <div class="field islandOnly"><label>Role update interval</label><input type="number" id="roleInterval" value="10" min="1"></div>
+          <div class="field"><label>AFPO stages <span class="hint">newcomers climb a ladder</span></label><select id="stageMode"><option value="off">Off</option><option value="fitness">Fitness (HFC)</option><option value="age">Age (ALPS)</option><option value="both">Fitness + age</option></select></div>
+          <div class="field stageOnly"><label>Stages per island</label><input type="number" id="stages" value="3" min="2"></div>
+          <div class="field stageOnly"><label>Promotion interval</label><input type="number" id="stageInterval" value="5" min="1"></div>
+          <div class="field stageFitness"><label>Admission bar <span class="hint">loss quantile of stage above</span></label><input type="number" id="stageQuantile" value="0.5" min="0.05" max="1" step="0.05"></div>
+          <div class="field stageAge"><label>Age gap</label><input type="number" id="stageAgeGap" value="10" min="1"></div>
+          <div class="field stageAge"><label>Age limits</label><select id="stageSchedule"><option value="linear">Linear</option><option value="polynomial" selected>Polynomial</option><option value="exponential">Exponential</option></select></div>
         </div>
         <div class="field">
           <label class="check"><input type="checkbox" id="affine" checked> Affine output scaling</label>
@@ -1031,8 +1039,8 @@ function renderAdvanced() {
   }
   box.addEventListener('change', saveForm);
 }
-const FORM_IDS = ['population', 'maxGenerations', 'seed', 'workers', 'nodes', 'depth', 'islands', 'migrationInterval', 'migrants', 'valPercent', 'metadataText', 'sequenceGroups', 'adfMode', 'delimiterCustom', 'resumeMax', 'resumeWorkers'];
-const CHECK_IDS = ['affine', 'coev', 'pressure', 'adf'];
+const FORM_IDS = ['population', 'maxGenerations', 'seed', 'workers', 'nodes', 'depth', 'islands', 'migrationInterval', 'migrants', 'stageMode', 'stages', 'stageInterval', 'stageQuantile', 'stageAgeGap', 'stageSchedule', 'roleInterval', 'valPercent', 'metadataText', 'sequenceGroups', 'adfMode', 'delimiterCustom', 'resumeMax', 'resumeWorkers'];
+const CHECK_IDS = ['affine', 'coev', 'pressure', 'adf', 'roles'];
 function saveForm() {
   const v = {};
   FORM_IDS.forEach(id => v[id] = $('#' + id).value);
@@ -1042,6 +1050,10 @@ function saveForm() {
   store.set('form', v);
   if (OPTIONS) { store.set('ops', operatorForm()); store.set('advanced', advancedValues()); }
   $$('.islandOnly').forEach(e => e.classList.toggle('hidden', +$('#islands').value <= 1));
+  const stageMode = $('#stageMode').value;
+  $$('.stageOnly').forEach(e => e.classList.toggle('hidden', stageMode === 'off'));
+  $$('.stageFitness').forEach(e => e.classList.toggle('hidden', stageMode !== 'fitness' && stageMode !== 'both'));
+  $$('.stageAge').forEach(e => e.classList.toggle('hidden', stageMode !== 'age' && stageMode !== 'both'));
   $('#valPercentField').classList.toggle('hidden', v.valmode !== 'percent');
   $('#valFileField').classList.toggle('hidden', v.valmode !== 'file');
 }
@@ -1121,7 +1133,10 @@ function collectForm() {
     operators: operatorForm(),
     search: {nodes: +$('#nodes').value, depth: +$('#depth').value, affine: $('#affine').checked, coev: $('#coev').checked,
       dynamic_pressure: $('#pressure').checked, adf: $('#adf').checked, islands: +$('#islands').value,
-      migration_interval: +$('#migrationInterval').value, migrants: +$('#migrants').value},
+      migration_interval: +$('#migrationInterval').value, migrants: +$('#migrants').value,
+      stage_mode: $('#stageMode').value, stages: +$('#stages').value, stage_interval: +$('#stageInterval').value,
+      stage_quantile: +$('#stageQuantile').value, stage_age_gap: +$('#stageAgeGap').value, stage_schedule: $('#stageSchedule').value,
+      roles: $('#roles').checked, role_interval: +$('#roleInterval').value},
     run: {max_generations: $('#maxGenerations').value, population: $('#population').value, seed: $('#seed').value, workers: $('#workers').value,
       adf_mode: $('#adf').checked ? $('#adfMode').value : 'off'},
     advanced: advancedValues(),
@@ -1243,7 +1258,7 @@ function drawPareto() {
   paretoChart.set({
     x: {title: 'Model size (MDL bits)'}, y: {title: log ? 'Training loss (log)' : 'Training loss', log}, layers,
     tooltip: (d, L) => `<div class="t">${L.kind === 'best' ? 'Best so far' : L.kind === 'archive' ? 'Archive model' : 'Population member'}</div>
-      loss ${fmt(d.loss)} · ${fmt(d.bits, 4)} bits · ${d.nodes} nodes · age ${d.age}<div class="hint">${esc(d.origin)}${d.island != null && snap.archive.some(a => a.island > 0) ? ' · island ' + (d.island + 1) : ''}</div>
+      loss ${fmt(d.loss)} · ${fmt(d.bits, 4)} bits · ${d.nodes} nodes · age ${d.age}<div class="hint">${esc(d.origin)}${d.cell ? ' · ' + esc(d.cell) : d.island != null && snap.archive.some(a => a.island > 0) ? ' · island ' + (d.island + 1) : ''}</div>
       ${d.equation ? `<div class="eq" style="margin-top:4px">${esc(d.equation)}</div>` : ''}`,
     onClick: (d) => { if (d.equation) { T.pinned = d; const p = $('#pinned'); p.classList.remove('hidden'); p.innerHTML = `${esc(d.equation)}<div class="hint" style="margin-top:4px">loss ${fmt(d.loss)} · ${fmt(d.bits, 4)} bits · ${d.nodes} nodes</div>`; } },
   });

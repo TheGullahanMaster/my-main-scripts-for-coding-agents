@@ -4290,12 +4290,13 @@ class FlowMatchingWrapper(nn.Module):
 
     @torch.no_grad()
     def sample(self, shape, steps=50, solver="heun", condition=None, class_labels=None,
-               guidance_scale=1.0, initial_noise=None):
+               guidance_scale=1.0, initial_noise=None, step_callback=None):
         """Sample with optional CFG: unconditional + scale * (conditional - unconditional).
 
         Scale 1 preserves ordinary conditional sampling and its single forward
         pass. Guidance requires training with a null class (class dropout).
         Conditional/unconditional self-conditioning histories stay separate.
+        step_callback(done, steps, z, x_pred) runs after every solver step (GUI).
         """
         if not math.isfinite(guidance_scale) or guidance_scale < 0:
             raise ValueError("guidance_scale must be finite and nonnegative")
@@ -4388,6 +4389,8 @@ class FlowMatchingWrapper(nn.Module):
                     z + dt * d0, t1, next_cond, next_uncond)
                 z = z + dt * 0.5 * (d0 + d1)
             cond_state, uncond_state = next_cond, next_uncond
+            if step_callback is not None:
+                step_callback(i + 1, steps, z, next_cond[1])
 
         return z
 
@@ -5887,6 +5890,17 @@ def prompt_stem_extras(cfg):
             break
 
 
+def prompt_trainable_modules(model):
+    print('\n'.join(name for name, module in model.named_modules() if name and list(module.parameters())))
+    return [p.strip() for p in get_input(
+        'Trainable module names/patterns (comma separated)', '').split(',') if p.strip()]
+
+
+def prompt_resume_edits(cfg, optimizer, completed_steps):
+    prompt_resume_settings(cfg, optimizer, completed_steps)
+    prompt_training_features(cfg)
+
+
 def prompt_resume_settings(cfg, optimizer, completed_steps):
     """Keep architecture and optimizer type; edit compatible runtime settings."""
     ui_section('Resume settings')
@@ -6828,6 +6842,388 @@ def build_model(cfg, device):
     return model
 
 
+def run_training(cfg, device, *, checkpoint_dir, output_dir, loaded=False, ckpt=None, fine_checkpoint=None,
+                 choose_modules=None, edit_resume=None, progress=None):
+    """Build, resume and train a configured run; shared by the CLI and the browser GUI.
+
+    choose_modules(model) returns trainable module patterns for finetune_policy='modules';
+    edit_resume(cfg, optimizer, completed_steps) edits resume settings in place;
+    progress(event_dict) receives start/step/validation/preview/checkpoint/log events and
+    stops training (with the usual final save) by returning True.  Returns completed updates.
+    """
+    model_path = os.path.join(checkpoint_dir, "model.pt")
+    config_path = os.path.join(checkpoint_dir, "config.json")
+    ckpt = ckpt or {}
+    notify = progress or (lambda event: False)
+    # --- Apply defaults for legacy configs ---
+    # NOTE: architecture-changing additions (qk_norm, final adaLN, time
+    # scaling) default to their LEGACY (off / 1.0) values here so that
+    # resuming an old checkpoint rebuilds the exact original architecture.
+    # New configs created above already carry the paper-faithful values.
+    apply_config_defaults(cfg)
+    if not loaded and fine_checkpoint is None:
+        cfg['finetune_policy'] = 'all'
+    if cfg['conditioning_mode'] == 'class':
+        names = discover_class_names(cfg['dataset_path'])
+        if loaded or fine_checkpoint is not None:
+            unknown = set(names) - set(cfg['class_names'])
+            if unknown:
+                raise ConfigError(f'New class labels require explicit transfer mapping: {sorted(unknown)}')
+        else:
+            cfg['class_names'] = names
+            if not names:
+                raise ConfigError('No class folders found')
+    if not loaded and fine_checkpoint is None:
+        validate_fresh_run(cfg)
+    validate_config(cfg)
+
+    bf16_supported = (device.type == 'cuda'
+                      and getattr(torch.cuda, 'is_bf16_supported', lambda: False)())
+    if cfg['full_bf16'] and not bf16_supported:
+        raise RuntimeError("Full BF16 requires a CUDA device with native BF16 support")
+    if cfg['use_amp'] and cfg['amp_dtype'] == 'bf16' and not bf16_supported:
+        print("│  ⚠ BF16 AMP is unavailable; falling back to FP16 AMP")
+        cfg['amp_dtype'] = 'fp16'
+
+    # Seed
+    if cfg['seed'] > 0:
+        set_seed(cfg['seed'])
+
+    # --- Build Model ---
+    model = build_model(cfg, device)
+    if fine_checkpoint is not None:
+        model.load_state_dict(fine_checkpoint[cfg['finetune_weights']], strict=True)
+        if cfg['finetune_policy'] == 'modules' and choose_modules is not None:
+            cfg['trainable_modules'] = choose_modules(model)
+    configure_trainable(model, cfg)
+
+    ui_config_summary(cfg, parameter_count=count_parameters(model))
+    ui_section("Diffusion")
+    ui_key_value("Time sampling", f"logit-normal μ={cfg['t_mu']} σ={cfg['t_sigma']}")
+    ui_key_value("Schedule / x clipping", f"{cfg['noise_schedule']} / {cfg['x_clip']}")
+    ui_rule()
+
+    ema = (EMA(model, warmup_steps=cfg['ema_warmup_steps'], warmup=cfg['ema_warmup'])
+           if cfg['use_ema'] else None)
+    maybe_compile(model, cfg, device)  # after EMA: the shadow copy stays eager
+    flow_model = FlowMatchingWrapper(
+        model, pred_mode=cfg['pred_mode'], loss_mode=cfg['loss_mode'],
+        t_loc=cfg['t_mu'], t_scale=cfg['t_sigma'], x_clip=cfg['x_clip'], noise_schedule=cfg['noise_schedule'],
+        self_cond_prob=cfg['self_cond_prob'],
+        class_dropout_prob=cfg['class_dropout_prob'],
+    ).to(device)
+    optimizer = build_optimizer(model, cfg)
+
+    scheduler = CosineWarmupScheduler(
+        optimizer, warmup_steps=cfg['warmup_steps'],
+        total_steps=cfg['steps'], min_lr_ratio=0.1, mode=cfg['lr_schedule'],
+    )
+
+    start_step = 0
+    if loaded and os.path.exists(model_path):
+        model.load_state_dict(ckpt['model'])
+        optimizer.load_state_dict(ckpt['optimizer'])
+        if 'completed_steps' not in ckpt and cfg['optimizer_type'] == 'clion':
+            for group in optimizer.param_groups:
+                group['betas'] = (0.95, 0.98)
+                group['weight_decay'] = 0.0
+                group['rescale_mask'] = cfg.get('clion_rescale_mask', False)
+                group['foreach'] = True
+        if 'completed_steps' not in ckpt and cfg['optimizer_type'] == 'modern_clion':
+            for group in optimizer.param_groups:
+                group['nu'] = cfg.get('modern_clion_nu', MODERN_CLION_DEFAULT_NU)
+                group['weight_decay'] = cfg.get('modern_clion_weight_decay', group.get('weight_decay', 0.0))
+        if 'completed_steps' not in ckpt and cfg['optimizer_type'] == 'layerwise_nsgda':
+            for group in optimizer.param_groups:
+                group['momentum'] = cfg.get('layerwise_nsgda_momentum', 0.9)
+                group['cautious'] = cfg.get('layerwise_nsgda_cautious', True)
+        if ema and 'ema' in ckpt:
+            ema.shadow.load_state_dict(ckpt['ema'])
+        start_step = ckpt.get('completed_steps', ckpt.get('step', -1) + 1)
+        if ema:
+            ema.step_count = ckpt.get('ema_step_count', start_step)
+        old_schedule = (cfg['steps'], cfg['lr'], cfg['warmup_steps'], cfg['lr_schedule'],
+                        cfg.get('muon_adam_lr_ratio', 1.0))
+        old_current_lr = optimizer.param_groups[0]['lr']
+        if edit_resume is not None:
+            edit_resume(cfg, optimizer, start_step)
+        if (ckpt.get('scheduler') and cfg['steps'] == old_schedule[0]
+                and cfg['lr'] == old_current_lr and cfg['lr_schedule'] == 'cosine'):
+            cfg['lr'] = old_schedule[1]
+        validate_config(cfg)
+        scheduler = CosineWarmupScheduler(optimizer, cfg['warmup_steps'], cfg['steps'],
+                                          min_lr_ratio=0.1, mode=cfg['lr_schedule'],
+                                          resume_step=(start_step if cfg['lr_schedule'] == 'cosine'
+                                                       and start_step >= cfg['warmup_steps'] else None),
+                                          min_lrs=[min(cfg['cosine_min_lr'] * muon_group_lr_scale(group, cfg),
+                                                       group['lr'])
+                                                   for group in optimizer.param_groups])
+        if (ckpt.get('scheduler') and old_schedule ==
+                (cfg['steps'], cfg['lr'], cfg['warmup_steps'], cfg['lr_schedule'],
+                 cfg.get('muon_adam_lr_ratio', 1.0))):
+            for key, value in ckpt['scheduler'].items():
+                setattr(scheduler, key, value)
+        restore_rng_state(ckpt.get('rng'))
+        print(f"│  Resuming checkpoint at step {start_step:,}")
+
+    ds, validation_ds = build_training_datasets(cfg)
+    reset_stream = cfg['reset_data_stream']
+    stream_state = ckpt.get('data_stream') if loaded and not reset_stream else None
+    if loaded and not stream_state:
+        print('│  Starting a new data stream (reset requested or legacy checkpoint).')
+    dl_iter = TrainingStream(ds, cfg, stream_state)
+    if cfg['conditioning_mode'] == 'class':
+        print(f"│  Class sampling: {cfg['class_sampling']} · {dl_iter.epoch_size:,} examples per epoch")
+    cfg['reset_data_stream'] = False
+    best = ckpt.get('best', {}) if loaded and not reset_stream else {}
+    evaluation_keys = ('pred_mode', 'loss_mode', 'noise_schedule', 't_mu', 't_sigma', 'self_cond_prob',
+                       'use_ema', 'validation_seed', 'validation_batch_size', 'validation_max_batches',
+                       'best_training_loss', 'grad_accum_steps', 'batch_size')
+    evaluation_files = ([(p, os.stat(p).st_size, os.stat(p).st_mtime_ns)
+                         for p in dataset_files(validation_ds)] if validation_ds is not None else [])
+    best_context = stable_digest([dl_iter.fingerprint, evaluation_files,
+                                  {k: cfg[k] for k in evaluation_keys}])
+    if best.get('context') != best_context:
+        best = {'context': best_context}
+    best_path = os.path.join(checkpoint_dir, 'best.pt')
+    save_config(cfg, config_path)
+
+    amp_enabled = cfg['use_amp'] and device.type == 'cuda'
+    amp_dtype = torch.bfloat16 if cfg['amp_dtype'] == 'bf16' else torch.float16
+    # Gradient scaling prevents FP16 underflow; BF16 has FP32-like range.
+    scaler = GradScaler(enabled=amp_enabled and cfg['amp_dtype'] == 'fp16')
+
+    if loaded and ckpt.get('scaler'):
+        scaler.load_state_dict(ckpt['scaler'])
+    if is_schedule_free(optimizer):
+        optimizer.train()  # checkpoints hold x; training steps run at y
+    if cfg['compile_mode'] != 'off':
+        verify_compiled_gradients(model, flow_model, cfg, device, amp_enabled, amp_dtype)
+    parameter_list = [p for p in model.parameters() if p.requires_grad]  # built once, walked every step
+
+    with training_session(dl_iter):
+        # Loss tracking
+        loss_ema = 0.0
+        loss_ema_decay = 0.99
+        grad_norm_ema = 0.0
+        spike_guard_safe_steps = 0
+        spike_guard_skips = 0
+
+        ui_header("Training", "Press Ctrl+C to finish the current step, save, and exit")
+        completed_steps = start_step
+        consecutive_skips = 0
+        if loaded and not reset_stream and ckpt.get('guard'):
+            state = ckpt['guard']
+            loss_ema = state['loss_ema']
+            grad_norm_ema = state['grad_norm_ema']
+            spike_guard_safe_steps = state['safe_steps']
+        pbar = tqdm(initial=start_step, total=cfg['steps'],
+                    desc="Training", unit="step", dynamic_ncols=True)
+
+        def report(message, kind='log'):
+            pbar.write(message)
+            notify({'event': kind, 'message': message, 'step': completed_steps})
+
+        report(f"Spike diagnostics: {os.path.join(output_dir, 'spike_events.log')}")
+        notify({'event': 'start', 'start_step': start_step, 'total': cfg['steps'], 'output_dir': output_dir,
+                'checkpoint_dir': checkpoint_dir, 'params': count_parameters(model), 'config': cfg})
+        stop = False
+        while completed_steps < cfg['steps']:
+            step = completed_steps
+            if interrupted or stop:
+                break
+
+            batches = [next(dl_iter) for _ in range(cfg['grad_accum_steps'])]
+
+            # LR schedule (linear warmup, then constant per the paper unless
+            # cfg['lr_schedule'] == 'cosine'). PaperAdamHD and Prodigy adapt
+            # their step sizes internally, so do not overwrite them.
+            if cfg['optimizer_type'] not in {'paper_adamhd', 'prodigy', 'radam_schedulefree'}:
+                scheduler.step(step)
+
+            optimizer.zero_grad(set_to_none=True)
+            loss_tensor = accumulated_backward(flow_model, batches, cfg, scaler, amp_enabled, amp_dtype)
+            del batches
+
+            # Unscale before measuring the real global norm. clip_grad_norm_
+            # returns the norm before clipping, so it can detect finite but
+            # destructive jumps even when ordinary clipping is enabled.
+            # Loss and norm then reach the host in ONE sync per update.
+            scaler.unscale_(optimizer)
+            max_norm = cfg['grad_clip'] if cfg['grad_clip'] > 0 else float('inf')
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+            loss_val, grad_norm_val = torch.stack(
+                (loss_tensor, grad_norm.detach().float().to(loss_tensor.device))).tolist()
+
+            # A finite loss can still be catastrophically larger than the
+            # recent flow-matching distribution. Skip it before it reaches
+            # the optimizer or momentum buffers.
+            loss_limit = max(loss_ema * cfg['spike_loss_factor'], 1e-6)
+            if (not math.isfinite(loss_val) or (cfg['use_spike_guard']
+                    and spike_guard_safe_steps >= cfg['spike_guard_warmup']
+                    and loss_val > loss_limit)):
+                optimizer.zero_grad(set_to_none=True)
+                # unscale_ already ran; update() resets it (and backs off
+                # the fp16 scale when the gradients overflowed).
+                scaler.update()
+                spike_guard_skips += 1
+                consecutive_skips += 1
+                report_training_spike(
+                    output_dir, lambda m: report(m, 'spike'), kind='loss', value=loss_val, limit=loss_limit,
+                    loss=loss_val, completed_steps=completed_steps, optimizer=optimizer,
+                    total_skips=spike_guard_skips, consecutive_skips=consecutive_skips)
+                if consecutive_skips >= 100:
+                    report("Stopping after 100 consecutive rejected batches; saving progress.")
+                    break
+                continue
+
+            grad_limit = max(grad_norm_ema * cfg['spike_grad_factor'], 1e-6)
+            if (not math.isfinite(grad_norm_val) or (cfg['use_spike_guard']
+                    and spike_guard_safe_steps >= cfg['spike_guard_warmup']
+                    and grad_norm_val > grad_limit)):
+                optimizer.zero_grad(set_to_none=True)
+                scaler.update()
+                spike_guard_skips += 1
+                consecutive_skips += 1
+                report_training_spike(
+                    output_dir, lambda m: report(m, 'spike'), kind='grad', value=grad_norm_val, limit=grad_limit,
+                    loss=loss_val, completed_steps=completed_steps, optimizer=optimizer,
+                    total_skips=spike_guard_skips, consecutive_skips=consecutive_skips)
+                if consecutive_skips >= 100:
+                    report("Stopping after 100 consecutive rejected batches; saving progress.")
+                    break
+                continue
+
+            align_grad_strides(parameter_list)
+            if hasattr(optimizer, 'observe_loss'):   # HD optimizers' divergence guard
+                optimizer.observe_loss(loss_val)
+            scaler.step(optimizer)
+            scaler.update()
+            consecutive_skips = 0
+            completed_steps += 1
+            pbar.update(1)
+
+            if ema:
+                ema.update(model)
+
+            # Track accepted updates only; rejected spikes cannot inflate the
+            # guard's own baseline and make it permissive.
+            loss_ema = loss_ema * loss_ema_decay + loss_val * (1 - loss_ema_decay) if spike_guard_safe_steps else loss_val
+            grad_norm_ema = (grad_norm_ema * cfg['spike_ema_decay'] + grad_norm_val * (1 - cfg['spike_ema_decay'])
+                             if spike_guard_safe_steps else grad_norm_val)
+            spike_guard_safe_steps += 1
+            current_lr = optimizer.param_groups[0].get('last_dlr', optimizer.param_groups[0]['lr'])
+            desc = f"loss {loss_val:.4f} · avg {loss_ema:.4f} · lr {current_lr:.2e}"
+            if cfg['optimizer_type'] in ('adamhd', 'muonhd', 'normuonhd', 'paper_adamhd'):
+                last_hypergrad = optimizer.param_groups[0].get('last_hypergrad', 0.0)
+                desc += f" | HD: {last_hypergrad:.2e}"
+            elif cfg['optimizer_type'] == 'prodigy':
+                d = optimizer.param_groups[0].get('d', 0.0)
+                desc += f" | D: {d:.2e}"
+            elif cfg['optimizer_type'] == 'modern_clion':
+                sign_fraction = optimizer.param_groups[0].get('last_sign_fraction', None)
+                min_c = optimizer.param_groups[0].get('last_min_nonzero_abs', None)
+                if sign_fraction is None:
+                    used_sign = optimizer.param_groups[0].get('last_used_sign', None)
+                    mode = "sign" if used_sign else "raw"
+                elif sign_fraction >= 0.999999:
+                    mode = "sign"
+                elif sign_fraction <= 1e-12:
+                    mode = "raw"
+                else:
+                    mode = f"mixed {sign_fraction:.1%} sign"
+                if min_c is not None:
+                    desc += f" | MCLion: {mode} min|c|={min_c:.1e}"
+            pbar.set_postfix_str(desc, refresh=False)
+
+            step = completed_steps
+            val_score = None
+            if validation_ds is not None and (step % cfg['validation_every'] == 0 or step == cfg['steps']):
+                evaluation_model = ema.shadow if ema else model
+                with schedule_free_eval(optimizer):
+                    val_score = validation_loss(evaluation_model, validation_ds, cfg, amp_enabled, amp_dtype)
+                report(f'Validation loss at {step}: {val_score:.6g}')
+                best = update_best(evaluation_model, cfg, val_score, step, best, best_path, 'validation_loss',
+                                   optimizer=optimizer)
+            elif validation_ds is None and cfg['best_training_loss']:
+                # This metric came from the training model, not its EMA shadow.
+                best = update_best(model, cfg, loss_ema, step, best, best_path, 'training_loss_ema',
+                                   optimizer=optimizer)
+            metrics_path = os.path.join(output_dir, 'metrics.csv')
+            new_metrics = not os.path.exists(metrics_path)
+            with open(metrics_path, 'a', newline='', encoding='utf-8') as handle:
+                writer = csv.writer(handle)
+                if new_metrics:
+                    writer.writerow(['step', 'train_loss', 'train_loss_ema', 'validation_loss', 'lr', 'grad_norm'])
+                writer.writerow([step, loss_val, loss_ema, val_score, current_lr, grad_norm_val])
+            # Optional previews use fixed examples and never interrupt checkpointing.
+            if step > 0 and step % cfg['sample_every'] == 0:
+                with schedule_free_eval(optimizer):
+                    previewed = safe_training_preview(
+                        ema.shadow if ema else model, validation_ds if validation_ds is not None else ds, cfg,
+                        f"{output_dir}/sample_{step}.png", report, amp_enabled=amp_enabled, amp_dtype=amp_dtype)
+                if previewed:
+                    notify({'event': 'preview', 'step': step, 'path': f"{output_dir}/sample_{step}.png"})
+
+            # --- Checkpointing ---
+            if step > 0 and step % cfg['save_every'] == 0:
+                save_checkpoint(model, optimizer, ema, completed_steps, model_path, max_keep=1,
+                            scaler=scaler, cfg=cfg, stream=dl_iter, best=best, scheduler=scheduler, guard={'loss_ema': loss_ema,
+                            'grad_norm_ema': grad_norm_ema, 'safe_steps': spike_guard_safe_steps})
+                report(f"  ✓ Checkpoint saved at step {step:,}", 'checkpoint')
+            stop = bool(notify({'event': 'step', 'step': step, 'loss': loss_val, 'loss_ema': loss_ema,
+                                'validation_loss': val_score, 'lr': current_lr, 'grad_norm': grad_norm_val,
+                                'skips': spike_guard_skips, 'desc': desc, 'best': best.get('score')}))
+
+        # Final save
+        save_checkpoint(model, optimizer, ema, completed_steps, model_path, max_keep=1,
+                            scaler=scaler, cfg=cfg, stream=dl_iter, best=best, scheduler=scheduler, guard={'loss_ema': loss_ema,
+                            'grad_norm_ema': grad_norm_ema, 'safe_steps': spike_guard_safe_steps})
+        pbar.close()
+        notify({'event': 'saved', 'step': completed_steps, 'path': model_path})
+    return completed_steps
+
+
+def resize_and_cache_dataset(cfg):
+    """Pre-resize the dataset into <dataset>/resized and train from there (CLI and GUI)."""
+    if cfg['resize_width'] == -1 or cfg['resize_height'] == -1:
+        print("│  ⚠ Native-size loading cannot be pre-resized into a cache; continuing without cache.")
+    else:
+        original_path = cfg['dataset_path']
+        resized_path = os.path.join(original_path, "resized")
+        files = [
+            path for path in find_image_paths(original_path)
+            if os.path.relpath(path, original_path).split(os.sep)[0] != 'resized'
+        ]
+        if files:
+            if os.path.exists(resized_path):
+                shutil.rmtree(resized_path)
+            os.makedirs(resized_path)
+            resample = getattr(Image.Resampling, 'LANCZOS', Image.LANCZOS)
+            mode = {3: 'RGB', 1: 'L', 4: 'RGBA'}.get(cfg['channels'], 'RGB')
+            for fpath in tqdm(files, desc="Resizing"):
+                try:
+                    with Image.open(fpath) as img:
+                        if cfg['conditioning_mode'] == 'pix2pix' and cfg.get('pix2pix_source_mode') == 'combined':
+                            resize_size = (2 * cfg['resize_width'], cfg['resize_height'])
+                        else:
+                            resize_size = (cfg['resize_width'], cfg['resize_height'])
+                        img = img.convert(mode).resize(resize_size, resample)
+                        relative = os.path.relpath(fpath, original_path)
+                        base_dest = os.path.join(resized_path, os.path.splitext(relative)[0] + ".png")
+                        dest = base_dest
+                        os.makedirs(os.path.dirname(dest), exist_ok=True)
+                        counter = 1
+                        while os.path.exists(dest):
+                            stem, extension = os.path.splitext(base_dest)
+                            dest = f"{stem}_{counter}{extension}"
+                            counter += 1
+                        img.save(dest)
+                except Exception:
+                    pass
+            cfg['dataset_path'] = resized_path
+
+
 def main():
     global interrupted
     interrupted = False
@@ -6842,8 +7238,12 @@ def main():
     ui_key_value("TF32", torch.backends.cuda.matmul.allow_tf32)
     ui_key_value("Output", SAVE_DIR)
     ui_rule()
-    mode_in = input("│  Mode [0/train, 1/sample, 2/retry, 3/continue, 4/finetune]: ").lower().strip()
+    mode_in = input("│  Mode [0/train, 1/sample, 2/retry, 3/continue, 4/finetune, 5/gui]: ").lower().strip()
 
+    if mode_in in ['5', 'g', 'gui']:
+        from jit5_gui import run_gui
+        run_gui(port=get_number('Port', 8768, int, 1, 65535))
+        return
     if mode_in not in ['t', '0', 'train', 's', '1', 'sample', '2', 'retry',
                        '3', 'continue', '4', 'finetune']:
         return
@@ -7311,362 +7711,15 @@ def main():
 
             # Optional dataset resize & cache
             if get_input("Resize and cache dataset?", "0", bool):
-                if cfg['resize_width'] == -1 or cfg['resize_height'] == -1:
-                    print("│  ⚠ Native-size loading cannot be pre-resized into a cache; continuing without cache.")
-                    cfg['dataset_path'] = cfg['dataset_path']
-                else:
-                    original_path = cfg['dataset_path']
-                    resized_path = os.path.join(original_path, "resized")
-                    files = [
-                        path for path in find_image_paths(original_path)
-                        if os.path.relpath(path, original_path).split(os.sep)[0] != 'resized'
-                    ]
-                    if files:
-                        if os.path.exists(resized_path):
-                            shutil.rmtree(resized_path)
-                        os.makedirs(resized_path)
-                        resample = getattr(Image.Resampling, 'LANCZOS', Image.LANCZOS)
-                        mode = {3: 'RGB', 1: 'L', 4: 'RGBA'}.get(cfg['channels'], 'RGB')
-                        for fpath in tqdm(files, desc="Resizing"):
-                            try:
-                                with Image.open(fpath) as img:
-                                    if cfg['conditioning_mode'] == 'pix2pix' and cfg.get('pix2pix_source_mode') == 'combined':
-                                        resize_size = (2 * cfg['resize_width'], cfg['resize_height'])
-                                    else:
-                                        resize_size = (cfg['resize_width'], cfg['resize_height'])
-                                    img = img.convert(mode).resize(resize_size, resample)
-                                    relative = os.path.relpath(fpath, original_path)
-                                    base_dest = os.path.join(resized_path, os.path.splitext(relative)[0] + ".png")
-                                    dest = base_dest
-                                    os.makedirs(os.path.dirname(dest), exist_ok=True)
-                                    counter = 1
-                                    while os.path.exists(dest):
-                                        stem, extension = os.path.splitext(base_dest)
-                                        dest = f"{stem}_{counter}{extension}"
-                                        counter += 1
-                                    img.save(dest)
-                            except Exception:
-                                pass
-                        cfg['dataset_path'] = resized_path
+                resize_and_cache_dataset(cfg)
 
             # Clean old samples
             #for f in glob.glob(os.path.join(output_dir, "sample_*.png")):
             #    os.remove(f)
 
-        # --- Apply defaults for legacy configs ---
-        # NOTE: architecture-changing additions (qk_norm, final adaLN, time
-        # scaling) default to their LEGACY (off / 1.0) values here so that
-        # resuming an old checkpoint rebuilds the exact original architecture.
-        # New configs created above already carry the paper-faithful values.
-        apply_config_defaults(cfg)
-        if not loaded and fine_checkpoint is None:
-            cfg['finetune_policy'] = 'all'
-        if cfg['conditioning_mode'] == 'class':
-            names = discover_class_names(cfg['dataset_path'])
-            if loaded or fine_checkpoint is not None:
-                unknown = set(names) - set(cfg['class_names'])
-                if unknown:
-                    raise ConfigError(f'New class labels require explicit transfer mapping: {sorted(unknown)}')
-            else:
-                cfg['class_names'] = names
-                if not names:
-                    raise ConfigError('No class folders found')
-        if not loaded and fine_checkpoint is None:
-            validate_fresh_run(cfg)
-        validate_config(cfg)
-
-        bf16_supported = (device.type == 'cuda'
-                          and getattr(torch.cuda, 'is_bf16_supported', lambda: False)())
-        if cfg['full_bf16'] and not bf16_supported:
-            raise RuntimeError("Full BF16 requires a CUDA device with native BF16 support")
-        if cfg['use_amp'] and cfg['amp_dtype'] == 'bf16' and not bf16_supported:
-            print("│  ⚠ BF16 AMP is unavailable; falling back to FP16 AMP")
-            cfg['amp_dtype'] = 'fp16'
-
-        # Seed
-        if cfg['seed'] > 0:
-            set_seed(cfg['seed'])
-
-        # --- Build Model ---
-        model = build_model(cfg, device)
-        if fine_checkpoint is not None:
-            model.load_state_dict(fine_checkpoint[cfg['finetune_weights']], strict=True)
-            if cfg['finetune_policy'] == 'modules':
-                print('\n'.join(name for name, module in model.named_modules() if name and list(module.parameters())))
-                cfg['trainable_modules'] = [p.strip() for p in get_input(
-                    'Trainable module names/patterns (comma separated)', '').split(',') if p.strip()]
-        configure_trainable(model, cfg)
-
-        ui_config_summary(cfg, parameter_count=count_parameters(model))
-        ui_section("Diffusion")
-        ui_key_value("Time sampling", f"logit-normal μ={cfg['t_mu']} σ={cfg['t_sigma']}")
-        ui_key_value("Schedule / x clipping", f"{cfg['noise_schedule']} / {cfg['x_clip']}")
-        ui_rule()
-
-        ema = (EMA(model, warmup_steps=cfg['ema_warmup_steps'], warmup=cfg['ema_warmup'])
-               if cfg['use_ema'] else None)
-        maybe_compile(model, cfg, device)  # after EMA: the shadow copy stays eager
-        flow_model = FlowMatchingWrapper(
-            model, pred_mode=cfg['pred_mode'], loss_mode=cfg['loss_mode'],
-            t_loc=cfg['t_mu'], t_scale=cfg['t_sigma'], x_clip=cfg['x_clip'], noise_schedule=cfg['noise_schedule'],
-            self_cond_prob=cfg['self_cond_prob'],
-            class_dropout_prob=cfg['class_dropout_prob'],
-        ).to(device)
-        optimizer = build_optimizer(model, cfg)
-
-        scheduler = CosineWarmupScheduler(
-            optimizer, warmup_steps=cfg['warmup_steps'],
-            total_steps=cfg['steps'], min_lr_ratio=0.1, mode=cfg['lr_schedule'],
-        )
-
-        start_step = 0
-        if loaded and os.path.exists(model_path):
-            model.load_state_dict(ckpt['model'])
-            optimizer.load_state_dict(ckpt['optimizer'])
-            if 'completed_steps' not in ckpt and cfg['optimizer_type'] == 'clion':
-                for group in optimizer.param_groups:
-                    group['betas'] = (0.95, 0.98)
-                    group['weight_decay'] = 0.0
-                    group['rescale_mask'] = cfg.get('clion_rescale_mask', False)
-                    group['foreach'] = True
-            if 'completed_steps' not in ckpt and cfg['optimizer_type'] == 'modern_clion':
-                for group in optimizer.param_groups:
-                    group['nu'] = cfg.get('modern_clion_nu', MODERN_CLION_DEFAULT_NU)
-                    group['weight_decay'] = cfg.get('modern_clion_weight_decay', group.get('weight_decay', 0.0))
-            if 'completed_steps' not in ckpt and cfg['optimizer_type'] == 'layerwise_nsgda':
-                for group in optimizer.param_groups:
-                    group['momentum'] = cfg.get('layerwise_nsgda_momentum', 0.9)
-                    group['cautious'] = cfg.get('layerwise_nsgda_cautious', True)
-            if ema and 'ema' in ckpt:
-                ema.shadow.load_state_dict(ckpt['ema'])
-            start_step = ckpt.get('completed_steps', ckpt.get('step', -1) + 1)
-            if ema:
-                ema.step_count = ckpt.get('ema_step_count', start_step)
-            old_schedule = (cfg['steps'], cfg['lr'], cfg['warmup_steps'], cfg['lr_schedule'],
-                            cfg.get('muon_adam_lr_ratio', 1.0))
-            old_current_lr = optimizer.param_groups[0]['lr']
-            prompt_resume_settings(cfg, optimizer, start_step)
-            prompt_training_features(cfg)
-            if (ckpt.get('scheduler') and cfg['steps'] == old_schedule[0]
-                    and cfg['lr'] == old_current_lr and cfg['lr_schedule'] == 'cosine'):
-                cfg['lr'] = old_schedule[1]
-            validate_config(cfg)
-            scheduler = CosineWarmupScheduler(optimizer, cfg['warmup_steps'], cfg['steps'],
-                                              min_lr_ratio=0.1, mode=cfg['lr_schedule'],
-                                              resume_step=(start_step if cfg['lr_schedule'] == 'cosine'
-                                                           and start_step >= cfg['warmup_steps'] else None),
-                                              min_lrs=[min(cfg['cosine_min_lr'] * muon_group_lr_scale(group, cfg),
-                                                           group['lr'])
-                                                       for group in optimizer.param_groups])
-            if (ckpt.get('scheduler') and old_schedule ==
-                    (cfg['steps'], cfg['lr'], cfg['warmup_steps'], cfg['lr_schedule'],
-                     cfg.get('muon_adam_lr_ratio', 1.0))):
-                for key, value in ckpt['scheduler'].items():
-                    setattr(scheduler, key, value)
-            restore_rng_state(ckpt.get('rng'))
-            print(f"│  Resuming checkpoint at step {start_step:,}")
-
-        ds, validation_ds = build_training_datasets(cfg)
-        reset_stream = cfg['reset_data_stream']
-        stream_state = ckpt.get('data_stream') if loaded and not reset_stream else None
-        if loaded and not stream_state:
-            print('│  Starting a new data stream (reset requested or legacy checkpoint).')
-        dl_iter = TrainingStream(ds, cfg, stream_state)
-        if cfg['conditioning_mode'] == 'class':
-            print(f"│  Class sampling: {cfg['class_sampling']} · {dl_iter.epoch_size:,} examples per epoch")
-        cfg['reset_data_stream'] = False
-        best = ckpt.get('best', {}) if loaded and not reset_stream else {}
-        evaluation_keys = ('pred_mode', 'loss_mode', 'noise_schedule', 't_mu', 't_sigma', 'self_cond_prob',
-                           'use_ema', 'validation_seed', 'validation_batch_size', 'validation_max_batches',
-                           'best_training_loss', 'grad_accum_steps', 'batch_size')
-        evaluation_files = ([(p, os.stat(p).st_size, os.stat(p).st_mtime_ns)
-                             for p in dataset_files(validation_ds)] if validation_ds is not None else [])
-        best_context = stable_digest([dl_iter.fingerprint, evaluation_files,
-                                      {k: cfg[k] for k in evaluation_keys}])
-        if best.get('context') != best_context:
-            best = {'context': best_context}
-        best_path = os.path.join(checkpoint_dir, 'best.pt')
-        save_config(cfg, config_path)
-
-        amp_enabled = cfg['use_amp'] and device.type == 'cuda'
-        amp_dtype = torch.bfloat16 if cfg['amp_dtype'] == 'bf16' else torch.float16
-        # Gradient scaling prevents FP16 underflow; BF16 has FP32-like range.
-        scaler = GradScaler(enabled=amp_enabled and cfg['amp_dtype'] == 'fp16')
-
-        if loaded and ckpt.get('scaler'):
-            scaler.load_state_dict(ckpt['scaler'])
-        if is_schedule_free(optimizer):
-            optimizer.train()  # checkpoints hold x; training steps run at y
-        if cfg['compile_mode'] != 'off':
-            verify_compiled_gradients(model, flow_model, cfg, device, amp_enabled, amp_dtype)
-        parameter_list = [p for p in model.parameters() if p.requires_grad]  # built once, walked every step
-
-        with training_session(dl_iter):
-            # Loss tracking
-            loss_ema = 0.0
-            loss_ema_decay = 0.99
-            grad_norm_ema = 0.0
-            spike_guard_safe_steps = 0
-            spike_guard_skips = 0
-
-            ui_header("Training", "Press Ctrl+C to finish the current step, save, and exit")
-            completed_steps = start_step
-            consecutive_skips = 0
-            if loaded and not reset_stream and ckpt.get('guard'):
-                state = ckpt['guard']
-                loss_ema = state['loss_ema']
-                grad_norm_ema = state['grad_norm_ema']
-                spike_guard_safe_steps = state['safe_steps']
-            pbar = tqdm(initial=start_step, total=cfg['steps'],
-                        desc="Training", unit="step", dynamic_ncols=True)
-            pbar.write(f"Spike diagnostics: {os.path.join(output_dir, 'spike_events.log')}")
-            while completed_steps < cfg['steps']:
-                step = completed_steps
-                if interrupted:
-                    break
-
-                batches = [next(dl_iter) for _ in range(cfg['grad_accum_steps'])]
-
-                # LR schedule (linear warmup, then constant per the paper unless
-                # cfg['lr_schedule'] == 'cosine'). PaperAdamHD and Prodigy adapt
-                # their step sizes internally, so do not overwrite them.
-                if cfg['optimizer_type'] not in {'paper_adamhd', 'prodigy', 'radam_schedulefree'}:
-                    scheduler.step(step)
-
-                optimizer.zero_grad(set_to_none=True)
-                loss_tensor = accumulated_backward(flow_model, batches, cfg, scaler, amp_enabled, amp_dtype)
-                del batches
-
-                # Unscale before measuring the real global norm. clip_grad_norm_
-                # returns the norm before clipping, so it can detect finite but
-                # destructive jumps even when ordinary clipping is enabled.
-                # Loss and norm then reach the host in ONE sync per update.
-                scaler.unscale_(optimizer)
-                max_norm = cfg['grad_clip'] if cfg['grad_clip'] > 0 else float('inf')
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
-                loss_val, grad_norm_val = torch.stack(
-                    (loss_tensor, grad_norm.detach().float().to(loss_tensor.device))).tolist()
-
-                # A finite loss can still be catastrophically larger than the
-                # recent flow-matching distribution. Skip it before it reaches
-                # the optimizer or momentum buffers.
-                loss_limit = max(loss_ema * cfg['spike_loss_factor'], 1e-6)
-                if (not math.isfinite(loss_val) or (cfg['use_spike_guard']
-                        and spike_guard_safe_steps >= cfg['spike_guard_warmup']
-                        and loss_val > loss_limit)):
-                    optimizer.zero_grad(set_to_none=True)
-                    # unscale_ already ran; update() resets it (and backs off
-                    # the fp16 scale when the gradients overflowed).
-                    scaler.update()
-                    spike_guard_skips += 1
-                    consecutive_skips += 1
-                    report_training_spike(
-                        output_dir, pbar.write, kind='loss', value=loss_val, limit=loss_limit,
-                        loss=loss_val, completed_steps=completed_steps, optimizer=optimizer,
-                        total_skips=spike_guard_skips, consecutive_skips=consecutive_skips)
-                    if consecutive_skips >= 100:
-                        pbar.write("Stopping after 100 consecutive rejected batches; saving progress.")
-                        break
-                    continue
-
-                grad_limit = max(grad_norm_ema * cfg['spike_grad_factor'], 1e-6)
-                if (not math.isfinite(grad_norm_val) or (cfg['use_spike_guard']
-                        and spike_guard_safe_steps >= cfg['spike_guard_warmup']
-                        and grad_norm_val > grad_limit)):
-                    optimizer.zero_grad(set_to_none=True)
-                    scaler.update()
-                    spike_guard_skips += 1
-                    consecutive_skips += 1
-                    report_training_spike(
-                        output_dir, pbar.write, kind='grad', value=grad_norm_val, limit=grad_limit,
-                        loss=loss_val, completed_steps=completed_steps, optimizer=optimizer,
-                        total_skips=spike_guard_skips, consecutive_skips=consecutive_skips)
-                    if consecutive_skips >= 100:
-                        pbar.write("Stopping after 100 consecutive rejected batches; saving progress.")
-                        break
-                    continue
-
-                align_grad_strides(parameter_list)
-                if hasattr(optimizer, 'observe_loss'):   # HD optimizers' divergence guard
-                    optimizer.observe_loss(loss_val)
-                scaler.step(optimizer)
-                scaler.update()
-                consecutive_skips = 0
-                completed_steps += 1
-                pbar.update(1)
-
-                if ema:
-                    ema.update(model)
-
-                # Track accepted updates only; rejected spikes cannot inflate the
-                # guard's own baseline and make it permissive.
-                loss_ema = loss_ema * loss_ema_decay + loss_val * (1 - loss_ema_decay) if spike_guard_safe_steps else loss_val
-                grad_norm_ema = (grad_norm_ema * cfg['spike_ema_decay'] + grad_norm_val * (1 - cfg['spike_ema_decay'])
-                                 if spike_guard_safe_steps else grad_norm_val)
-                spike_guard_safe_steps += 1
-                current_lr = optimizer.param_groups[0].get('last_dlr', optimizer.param_groups[0]['lr'])
-                desc = f"loss {loss_val:.4f} · avg {loss_ema:.4f} · lr {current_lr:.2e}"
-                if cfg['optimizer_type'] in ('adamhd', 'muonhd', 'normuonhd', 'paper_adamhd'):
-                    last_hypergrad = optimizer.param_groups[0].get('last_hypergrad', 0.0)
-                    desc += f" | HD: {last_hypergrad:.2e}"
-                elif cfg['optimizer_type'] == 'prodigy':
-                    d = optimizer.param_groups[0].get('d', 0.0)
-                    desc += f" | D: {d:.2e}"
-                elif cfg['optimizer_type'] == 'modern_clion':
-                    sign_fraction = optimizer.param_groups[0].get('last_sign_fraction', None)
-                    min_c = optimizer.param_groups[0].get('last_min_nonzero_abs', None)
-                    if sign_fraction is None:
-                        used_sign = optimizer.param_groups[0].get('last_used_sign', None)
-                        mode = "sign" if used_sign else "raw"
-                    elif sign_fraction >= 0.999999:
-                        mode = "sign"
-                    elif sign_fraction <= 1e-12:
-                        mode = "raw"
-                    else:
-                        mode = f"mixed {sign_fraction:.1%} sign"
-                    if min_c is not None:
-                        desc += f" | MCLion: {mode} min|c|={min_c:.1e}"
-                pbar.set_postfix_str(desc, refresh=False)
-
-                step = completed_steps
-                val_score = None
-                if validation_ds is not None and (step % cfg['validation_every'] == 0 or step == cfg['steps']):
-                    evaluation_model = ema.shadow if ema else model
-                    with schedule_free_eval(optimizer):
-                        val_score = validation_loss(evaluation_model, validation_ds, cfg, amp_enabled, amp_dtype)
-                    pbar.write(f'Validation loss at {step}: {val_score:.6g}')
-                    best = update_best(evaluation_model, cfg, val_score, step, best, best_path, 'validation_loss',
-                                       optimizer=optimizer)
-                elif validation_ds is None and cfg['best_training_loss']:
-                    # This metric came from the training model, not its EMA shadow.
-                    best = update_best(model, cfg, loss_ema, step, best, best_path, 'training_loss_ema',
-                                       optimizer=optimizer)
-                metrics_path = os.path.join(output_dir, 'metrics.csv')
-                new_metrics = not os.path.exists(metrics_path)
-                with open(metrics_path, 'a', newline='', encoding='utf-8') as handle:
-                    writer = csv.writer(handle)
-                    if new_metrics:
-                        writer.writerow(['step', 'train_loss', 'train_loss_ema', 'validation_loss', 'lr', 'grad_norm'])
-                    writer.writerow([step, loss_val, loss_ema, val_score, current_lr, grad_norm_val])
-                # Optional previews use fixed examples and never interrupt checkpointing.
-                if step > 0 and step % cfg['sample_every'] == 0:
-                    with schedule_free_eval(optimizer):
-                        safe_training_preview(ema.shadow if ema else model, validation_ds if validation_ds is not None else ds, cfg,
-                                              f"{output_dir}/sample_{step}.png", pbar.write,
-                                              amp_enabled=amp_enabled, amp_dtype=amp_dtype)
-
-                # --- Checkpointing ---
-                if step > 0 and step % cfg['save_every'] == 0:
-                    save_checkpoint(model, optimizer, ema, completed_steps, model_path, max_keep=1,
-                                scaler=scaler, cfg=cfg, stream=dl_iter, best=best, scheduler=scheduler, guard={'loss_ema': loss_ema,
-                                'grad_norm_ema': grad_norm_ema, 'safe_steps': spike_guard_safe_steps})
-                    pbar.write(f"  ✓ Checkpoint saved at step {step:,}")
-
-            # Final save
-            save_checkpoint(model, optimizer, ema, completed_steps, model_path, max_keep=1,
-                                scaler=scaler, cfg=cfg, stream=dl_iter, best=best, scheduler=scheduler, guard={'loss_ema': loss_ema,
-                                'grad_norm_ema': grad_norm_ema, 'safe_steps': spike_guard_safe_steps})
-            pbar.close()
+        completed_steps = run_training(cfg, device, checkpoint_dir=checkpoint_dir, output_dir=output_dir,
+                                       loaded=loaded, ckpt=ckpt, fine_checkpoint=fine_checkpoint,
+                                       choose_modules=prompt_trainable_modules, edit_resume=prompt_resume_edits)
         ui_header("Training complete" if completed_steps >= cfg['steps'] else "Training stopped",
                   f"Completed {completed_steps:,} updates · Final checkpoint: {model_path}")
 

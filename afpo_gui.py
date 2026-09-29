@@ -277,6 +277,10 @@ def setup_answers(form):
         except ValueError as exc:
             raise ValueError(f"Constraint metadata is not valid JSON: {exc}")
     islands = max(1, int(search.get("islands") or 1))
+    stage_mode = search.get("stage_mode") or "off"
+    stages = afpo.stage_config(stage_mode, count=int(search.get("stages") or 3), interval=int(search.get("stage_interval") or 5),
+                               age_gap=int(search.get("stage_age_gap") or 10), schedule=search.get("stage_schedule") or "polynomial",
+                               threshold_quantile=float(search.get("stage_quantile") or .5))
     return {"path": str(path), "delimiter": data.get("delimiter") or ",", "types": types, "ops": selected_operators(form),
             "affine_on": bool(search.get("affine", True)), "coev": bool(search.get("coev", False)),
             "dynamic_pressure_on": bool(search.get("dynamic_pressure", True)), "adf_enabled": bool(search.get("adf", False)),
@@ -284,6 +288,8 @@ def setup_answers(form):
             "island_count": islands,
             "migration_interval": max(1, int(search.get("migration_interval") or 25)) if islands > 1 else 0,
             "migrants_per_island": max(1, int(search.get("migrants") or 2)) if islands > 1 else 0,
+            "stages": stages,
+            "roles": afpo.role_config(bool(search.get("roles")) and islands > 1, interval=int(search.get("role_interval") or 10)),
             "val_path": val_path, "validation_percent": float(data.get("validation_percent") or 0) if mode == "percent" else None,
             "metadata": metadata}
 
@@ -298,8 +304,8 @@ def check_form(form):
         return {"ok": True, "argv": argv}
     args = parse_argv(argv)
     setup = setup_answers(form)
-    if setup["island_count"] > args.population // 8:
-        raise ValueError("Island count needs at least eight models per island; raise the population or choose fewer islands")
+    if setup["island_count"] * setup["stages"]["count"] > args.population // 8:
+        raise ValueError("Islands x stages need at least eight models each; raise the population or choose fewer islands/stages")
     df = read_frame(setup["path"], setup["delimiter"])
     if len(setup["types"]) != len(df.columns):
         raise ValueError(f"The column types list has {len(setup['types'])} entries but the file has {len(df.columns)} columns; inspect the dataset again")
@@ -310,8 +316,9 @@ def check_form(form):
 class Telemetry:
     """Turns afpo.PROGRESS_HOOK calls into JSON lines the GUI server tails."""
 
-    def __init__(self, stream, island_count):
+    def __init__(self, stream, island_count, stage_count=1):
         self.stream, self.island_count = stream, max(1, int(island_count))
+        self.stage_count = max(1, int(stage_count))
         self.islands = {}          # id(archive) -> index
         self.latest = {}           # index -> latest hook kwargs
         self.last_snapshot = 0.
@@ -335,13 +342,21 @@ class Telemetry:
                 self.validation_cache[key] = None
         return self.validation_cache[key]
 
+    def cell_name(self, index):
+        """Cells arrive island-major (island * stages + stage), as afpo loops over them."""
+        island, stage = divmod(index, self.stage_count)
+        parts = [f"island {island + 1}"] if self.island_count > 1 else []
+        if self.stage_count > 1:
+            parts.append(f"stage {stage + 1}")
+        return " ".join(parts) or f"island {index + 1}"
+
     def hook(self, **kw):
         island = self.islands.setdefault(id(kw["archive"]), len(self.islands))
         self.latest[island] = kw
         names, out_names, cats = kw["names"], kw["out_names"], kw["cats"]
         if not self.announced:
             self.announced = True
-            self.emit("config", names=names, outputs=out_names, cats=cats, islands=self.island_count,
+            self.emit("config", names=names, outputs=out_names, cats=cats, islands=self.island_count, stages=self.stage_count,
                       train_rows=len(kw["Xt"]), validation_rows=0 if kw["Xv"] is None else len(kw["Xv"]))
         best = kw["best_so_far"]
         population = [m for m in kw["population"] if m.feasible]
@@ -379,17 +394,21 @@ class Telemetry:
                 point = self._point(model, names, out_names, cats, equation=True)
                 if point:
                     point["island"] = index
+                    if self.stage_count > 1:
+                        point["cell"] = self.cell_name(index)
                     archive.append(point)
             for model in kw["population"]:
                 origins[model.origin or "seed"] += 1
                 point = self._point(model, names, out_names, cats)
                 if point and len(population) < MAX_POPULATION_POINTS:
                     point["island"] = index
+                    if self.stage_count > 1:
+                        point["cell"] = self.cell_name(index)
                     population.append(point)
             candidate = kw["best_so_far"]
             if candidate is not None and (best is None or afpo.secondary_key(candidate) < afpo.secondary_key(best[0])):
                 best = (candidate, kw)
-            prefix = f"island {index + 1}: " if len(self.latest) > 1 else ""
+            prefix = f"{self.cell_name(index)}: " if len(self.latest) > 1 else ""
             for item in (kw["archive"].stats(), kw["pressure"].stats(), kw["semantic_qd"].stats(), kw["structural_qd"].stats(),
                          kw["qd_controller"].stats(), kw["library"].stats() if kw["library"] is not None else None):
                 if item:
@@ -433,7 +452,8 @@ def run_spec(spec_path):
     """Entry point of the training child process."""
     spec = json.loads(Path(spec_path).read_text())
     with open(spec["events"], "a", encoding="utf-8") as stream:
-        telemetry = Telemetry(stream, (spec.get("setup") or {}).get("island_count", 1))
+        setup_spec = spec.get("setup") or {}
+        telemetry = Telemetry(stream, setup_spec.get("island_count", 1), (setup_spec.get("stages") or {}).get("count", 1))
         telemetry.emit("started", pid=os.getpid(), mode=spec["mode"], argv=spec["argv"])
         try:
             args = afpo.parse_cli(spec["argv"])[1]

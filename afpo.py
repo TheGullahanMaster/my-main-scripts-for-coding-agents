@@ -641,6 +641,77 @@ def _fold_constant_offsets(op, children):
     if right[0]=="c" and split(left):
         c1,rest,_,rest_sign=split(left); return build(c1+sign*right[1],rest,rest_sign)
     return None
+# Equivalence keys: one identity for algebraically equal equations, so x+y and
+# y+x, (a+b)+c and a+(b+c), x+x and 2*x, x*x and square(x), or x-x and 0 are
+# treated as one candidate.  Sums and products are flattened into sorted
+# coefficient/term and factor multisets (associative-commutative normal form);
+# other commutative operators sort their operands.  The key is an identity,
+# never a rewrite: trees keep evolving in their own syntax and scoring stays
+# exact.  Coefficients are rounded to 12 significant digits so reassociated
+# float sums of the same constants still match.
+EQUIVALENCE_COLLAPSE = True
+_EQUIVALENCE_CACHE = {}
+EQUIVALENCE_STATS = {"children_redrawn":0}
+_POWER_FACTORS = {"square":2,"cube":3}
+def _key_number(value):
+    value=float(value)
+    return 0. if value==0 else float(f"{value:.12g}")
+def _sum_parts(t, sign, parts):
+    """Accumulate sign*t into parts = [constant, {term: coefficient}]."""
+    op=t[0]
+    if op=="c": parts[0]+=sign*float(t[1]); return
+    if op=="+" and len(t)==3: _sum_parts(t[1],sign,parts); _sum_parts(t[2],sign,parts); return
+    if op=="-" and len(t)==3: _sum_parts(t[1],sign,parts); _sum_parts(t[2],-sign,parts); return
+    if op=="neg" and len(t)==2: _sum_parts(t[1],-sign,parts); return
+    coefficient,term=_product_key(t)
+    if term is None: parts[0]+=sign*coefficient; return
+    parts[1][term]=parts[1].get(term,0.)+sign*coefficient
+def _product_parts(t, parts):
+    """Accumulate t into parts = [coefficient, [factor keys]]."""
+    op=t[0]
+    if op=="c": parts[0]*=float(t[1]); return
+    if op=="*" and len(t)==3: _product_parts(t[1],parts); _product_parts(t[2],parts); return
+    if op=="neg" and len(t)==2: parts[0]=-parts[0]; _product_parts(t[1],parts); return
+    if op in _POWER_FACTORS and len(t)==2:
+        for _ in range(_POWER_FACTORS[op]): _product_parts(t[1],parts)
+        return
+    key=_equivalence_key(t)
+    if key[0]=="sum" and not key[1] and len(key[2])==1:
+        # A single scaled term, e.g. neg(x) or 2*x reached through a sum.
+        coefficient,term=key[2][0]; parts[0]*=coefficient; parts[1].append(term); return
+    if key[0]=="const": parts[0]*=key[1]; return
+    parts[1].append(key)
+def _product_key(t):
+    """(coefficient, factor-multiset key or None for a pure constant)."""
+    parts=[1.,[]]; _product_parts(t,parts)
+    if parts[0]==0 or not parts[1]: return parts[0],None
+    factors=tuple(sorted(parts[1],key=repr))
+    return parts[0],(factors[0] if len(factors)==1 else ("prod",factors))
+def _equivalence_key(t):
+    op=t[0]
+    if op=="c": return ("const",_key_number(t[1]))
+    if op in ("x","arg"): return (op,t[1])
+    if op in ("+","-","neg","*") or op in _POWER_FACTORS:
+        parts=[0.,{}]; _sum_parts(t,1.,parts)
+        terms=tuple(sorted(((_key_number(coefficient),term) for term,coefficient in parts[1].items() if _key_number(coefficient)!=0),key=repr))
+        constant=_key_number(parts[0])
+        if not terms: return ("const",constant)
+        if constant==0 and len(terms)==1 and terms[0][0]==1.: return terms[0][1]
+        return ("sum",constant,terms)
+    children=[_equivalence_key(child) for child in t[1:]]
+    if op in COMMUTATIVE_OPS: children.sort(key=repr)
+    return (op,*children)
+def equivalence_key(tree):
+    """Hashable identity shared by algebraically equal trees (see above)."""
+    if not EQUIVALENCE_COLLAPSE: return repr(tree)
+    raw=repr(tree); hit=_EQUIVALENCE_CACHE.get(raw)
+    if hit is None:
+        if len(_EQUIVALENCE_CACHE)>=16384: _EQUIVALENCE_CACHE.clear()
+        hit=_EQUIVALENCE_CACHE[raw]=repr(_equivalence_key(tree))
+    return hit
+def model_equivalence_key(model_or_trees):
+    trees=model_or_trees.trees if hasattr(model_or_trees,"trees") else model_or_trees
+    return tuple(equivalence_key(tree) for tree in trees)
 def weighted_complexity(t):
     """Node count plus the selected operator's anti-overfitting cost bonus."""
     if t[0] in ("x","c","arg"): return 1
@@ -2120,10 +2191,10 @@ def equations(m, feature_names, output_names, cats=None):
     return "; ".join(rendered)
 
 def unique_models(models):
-    """Collapse duplicate tree structures for concise reporting/choices."""
+    """Collapse equivalent equations (equivalence_key) for concise reporting/choices."""
     kept = {}
     for m in models:
-        key = repr(m.trees)
+        key = model_equivalence_key(m)
         if key not in kept or secondary_key(m) < secondary_key(kept[key]):
             kept[key] = m
     return list(kept.values())
@@ -2389,10 +2460,10 @@ def semantic_key(model, X, decimals=8):
     """Stable behavioral identity on the active evaluation sample (a fixed subset of it on large data)."""
     return np.round(predict_model(model,behaviour_rows(X)),decimals).tobytes()
 def novelty_pool(models, X):
-    """One best representative per structural and behavioral identity."""
+    """One best representative per equivalence (algebraic) and behavioral identity."""
     structural={}
     for model in models:
-        key=repr(model.trees)
+        key=model_equivalence_key(model)
         if key not in structural or secondary_key(model)<secondary_key(structural[key]): structural[key]=model
     semantic={}
     for model in structural.values():
@@ -2672,7 +2743,7 @@ class ParetoArchive:
         self.generation+=1; before={repr(m.trees) for m in self.items}
         by_tree={}
         for model in [*self.items,*candidates]:
-            key=repr(model.trees)
+            key=model_equivalence_key(model)
             if key not in by_tree or secondary_key(model) < secondary_key(by_tree[key]):
                 by_tree[key]=model.clone()
                 # Genotypic age belongs to live AFPO survival, not a permanent
@@ -3012,7 +3083,10 @@ def _lazy_shuffle(items):
         j=rng.randrange(n-i); value=pool[j]; pool[j]=pool[n-i-1]
         yield value
 
-def lexicase_parents(pop, count, X, Y, cats, max_cases=0):
+def lexicase_parents(pop, count, X, Y, cats, max_cases=0, case_weights=None):
+    """Epsilon-lexicase parents.  case_weights (one per row of X, selection
+    only) make heavily weighted rows tend to be examined first, which is how a
+    self-organised island role steers its parents; None keeps uniform order."""
     predictions=[predict_targets(m,X,cats) for m in pop]; errors=np.empty((len(pop),len(X)*Y.shape[1]))
     for i,pred in enumerate(predictions):
         parts=[np.abs(pred[:,j]-Y[:,j]) if cats[j] is None else (np.rint(pred[:,j])!=Y[:,j]) for j in range(Y.shape[1])]
@@ -3022,10 +3096,15 @@ def lexicase_parents(pop, count, X, Y, cats, max_cases=0):
         # Informed down-sampling prioritizes cases where the population still
         # disagrees most, preserving selection pressure under large datasets.
         cases=np.argsort(np.median(errors,axis=0))[-max_cases:].tolist()
+    weights=None
+    if case_weights is not None:
+        weights=np.maximum(np.tile(np.asarray(case_weights,float),Y.shape[1])[cases],EPS)
     selected=[]
     for _ in range(count):
         pool=np.arange(len(pop))
-        for case in _lazy_shuffle(cases):
+        # Exponential race: sorting E/w gives a weight-proportional random order.
+        order=_lazy_shuffle(cases) if weights is None else (cases[k] for k in np.argsort(np.random.exponential(size=len(cases))/weights))
+        for case in order:
             values=errors[pool,case]; epsilon=np.median(np.abs(values-np.median(values)))
             pool=pool[values<=values.min()+epsilon+EPS]
             if len(pool)<=1: break
@@ -3979,6 +4058,9 @@ class IslandRuntime:
     adf_registry:ADFRegistry
     budget:EvaluationBudget
     population_size:int=0
+    island_index:int=0
+    stage:int=0
+    role:dict=field(default_factory=dict)
     def __post_init__(self):
         if not self.population_size: self.population_size=len(self.population)
 
@@ -3986,6 +4068,7 @@ def island_snapshot(island):
     """Serialize an island without sharing mutable evolutionary state."""
     return {
         "population_size":island.population_size,
+        "island":island.island_index,"stage":island.stage,"role":dict(island.role),
         "population":[PosteriorParticlePopulation._model_data(model) for model in island.population],
         "bayesian_banks":bayesian_banks_snapshot(island.bayes),
         "archive":{"capacity":island.archive.capacity,"normalization":island.archive.normalization,"parsimony_quality_tolerance":island.archive.parsimony_quality_tolerance,"items":[PosteriorParticlePopulation._model_data(model) for model in island.archive.items]},
@@ -4021,6 +4104,7 @@ def island_from_snapshot(data, n_rows, parsimony_quality_tolerance):
         ADFRegistry.from_snapshot(runtime.get("adf_registry",{})),
         EvaluationBudget.from_snapshot(runtime.get("evaluation_budget",{})),
         data.get("population_size",len(population)),
+        int(data.get("island",0)),int(data.get("stage",0)),dict(data.get("role") or {}),
     )
 
 def snapshot_islands(state, islands, island_config):
@@ -4030,6 +4114,30 @@ def snapshot_islands(state, islands, island_config):
     state["island_states"]=snapshots
     runtime=snapshots[0]["runtime"]
     state.update(runtime)
+
+def migrate_fragments(islands, count, generation=None):
+    """Send each island's best fragments to the next island on the ring.
+
+    Migrants arrive on probation (support 1, no contribution, provenance
+    kept) and must earn their place through the receiver's own support and
+    contribution accounting; fragments calling ADFs the receiver lacks stay home."""
+    if len(islands)<2 or count<1: return 0
+    outgoing=[]
+    for island in islands:
+        ranked=sorted(island.library.items.values(),key=lambda item:(-FragmentLibrary._item_score(item),repr(item["tree"])))
+        outgoing.append([dict(item) for item in ranked[:count]])
+    moved=0
+    for index,island in enumerate(islands):
+        source=(index-1)%len(islands)
+        for item in outgoing[source]:
+            key=repr(item["tree"])
+            calls={node[0] for node in walk_tree(item["tree"]) if node[0].startswith("adf_")}
+            if key in island.library.items or not calls<=set(island.adf_registry.definitions): continue
+            island.library.items[key]={**item,"support":1,"contribution":0.,"uses":0,"rejections":0,"source":"island_migrant",
+                                       "provenance":{"island":islands[source].island_index,"stage":islands[source].stage,"generation":generation,"origin_source":item.get("source")}}
+            moved+=1
+        island.library._trim_items()
+    return moved
 
 def migrate_islands(islands, migrant_count, *, X, nsga_normalization, parsimony_quality_tolerance, evaluator=None):
     """Send local Pareto elites around a ring, keeping each island's size fixed."""
@@ -4051,6 +4159,253 @@ def migrate_islands(islands, migrant_count, *, X, nsga_normalization, parsimony_
         island.best_models.update(incoming)
     return sum(map(len,outgoing))
 
+# AFPO stages ("vertical islands").  Each island is split into a ladder of
+# stages, each a full, isolated IslandRuntime (its archives, QD cells and
+# fragment library are parent sources, so sharing them would leak top-stage
+# models back down).  Only stage 0 receives brand-new random models; upper
+# stages are fed by promotion.  Modes:
+#   fitness  HFC-style: a model moves up once its full-training loss beats the
+#            admission threshold of the stage above (a quantile of that stage's
+#            losses, never loosened).
+#   age      ALPS-style: stage k holds models up to an age limit; older ones
+#            leave and are admitted above only if they survive its NSGA
+#            selection; stage 0 is reseeded every age_gap generations.
+#   both     fitness promotion plus age eviction; an evicted model is admitted
+#            above only if it also beats the admission threshold.
+# Cells are stored island-major: cells[island*stages+stage].  With one stage
+# this is exactly the plain island model.
+STAGE_MODES=("off","fitness","age","both")
+STAGE_AGE_SCHEDULES=("linear","polynomial","exponential")
+def stage_config(mode="off", count=1, interval=5, age_gap=10, schedule="polynomial", threshold_quantile=.5, **state):
+    """Validated stage configuration plus its persistent bookkeeping."""
+    mode=str(mode)
+    if mode not in STAGE_MODES: raise ValueError(f"Unknown stage mode {mode!r}; choose one of {', '.join(STAGE_MODES)}")
+    count=1 if mode=="off" else int(count)
+    if mode!="off" and count<2: raise ValueError("Stages need at least two stages")
+    if int(interval)<1 or int(age_gap)<1: raise ValueError("Stage promotion interval and age gap must be positive")
+    if schedule not in STAGE_AGE_SCHEDULES: raise ValueError(f"Unknown age schedule {schedule!r}")
+    if not 0<float(threshold_quantile)<=1: raise ValueError("Stage threshold quantile must be in (0, 1]")
+    return {"mode":mode,"count":count,"interval":int(interval),"age_gap":int(age_gap),"schedule":schedule,
+            "threshold_quantile":float(threshold_quantile),"thresholds":dict(state.get("thresholds",{})),
+            "promotion_events":int(state.get("promotion_events",0)),"promoted":int(state.get("promoted",0)),
+            "evicted":int(state.get("evicted",0)),"reseeds":int(state.get("reseeds",0))}
+def stage_age_limit(stage, config):
+    """Oldest age stage `stage` may hold; None for the unlimited top stage."""
+    if config["mode"] not in ("age","both") or stage>=config["count"]-1: return None
+    gap=config["age_gap"]; n=stage+1
+    return gap*{"linear":n,"polynomial":n*n,"exponential":2**stage}[config["schedule"]]
+def cell_population_sizes(total, cells):
+    return [total//cells+(index<total%cells) for index in range(cells)]
+def fresh_stage_models(count, cell, generation, *, n_features, ops, nodes, depth):
+    """Brand-new random models for stage 0, in the cell's current grammar."""
+    registry=cell.adf_registry; definitions=registry.definitions
+    active_ops=registry.operators(ops) if registry.enabled else list(ops)
+    head_count=len(cell.population[0].trees) if cell.population else 1
+    models=[]
+    for _ in range(max(0,count)):
+        trees=[random_tree(n_features,active_ops,nodes,depth,adfs=definitions) for _ in range(head_count)]
+        models.append(Model(trees,[(1.,0.)]*head_count,0,origin="stage_seed",mdl_operators=grammar_for_trees(active_ops,trees,definitions),
+                            mdl_feature_count=n_features,adfs=dict(definitions),birth_generation=generation))
+    return models
+def _stage_threshold(config, island_index, stage, receiver):
+    """Admission loss for `stage` (monotone: a stage's bar is never lowered)."""
+    losses=[aggregate_loss(model) for model in receiver.population if model.feasible and np.isfinite(aggregate_loss(model))]
+    key=f"{island_index}:{stage}"; previous=config["thresholds"].get(key)
+    if not losses: return previous
+    current=float(np.quantile(losses,config["threshold_quantile"]))
+    value=current if previous is None else min(float(previous),current)
+    config["thresholds"][key]=value
+    return value
+def promote_stages(cells, island_count, config, generation, *, X, n_features, ops, nodes, depth, nsga_normalization,
+                   parsimony_quality_tolerance, evaluator=None):
+    """Move models up each island's stage ladder; returns (promoted, evicted, reseeded)."""
+    stages=config["count"]; mode=config["mode"]
+    if mode=="off" or stages<2: return 0,0,0
+    promoted=evicted=reseeded=0
+    for island_index in range(island_count):
+        ladder=cells[island_index*stages:(island_index+1)*stages]
+        if evaluator is not None:
+            for cell in ladder:
+                refresh_persistent_scores(cell.archive,cell.best_models,cell.semantic_qd,cell.structural_qd,evaluator)
+                evaluator.assess(cell.population,"train")
+        # Top-down, so one event moves a model at most one rung.
+        for stage in range(stages-2,-1,-1):
+            source,receiver=ladder[stage],ladder[stage+1]
+            threshold=_stage_threshold(config,island_index,stage+1,receiver) if mode in ("fitness","both") else None
+            limit=stage_age_limit(stage,config)
+            good=[m for m in source.population if m.feasible and threshold is not None and aggregate_loss(m)<threshold]
+            if good:
+                good=select_nsga(good,min(len(good),max(1,len(source.population)//4)),nsga_normalization,parsimony_quality_tolerance)
+            old=[m for m in source.population if limit is not None and m.age>limit]
+            leaving={id(m):m for m in [*good,*old]}
+            if not leaving: continue
+            staying=[m for m in source.population if id(m) not in leaving]
+            if len(staying)<2:
+                # Never empty a stage: keep its best leavers until offspring refill it.
+                keep=select_nsga(list(leaving.values()),min(len(leaving),2-len(staying)),nsga_normalization,parsimony_quality_tolerance)
+                for m in keep: leaving.pop(id(m))
+                staying+=keep
+            good_ids={id(m) for m in good}
+            offered=[m for m in leaving.values() if id(m) in good_ids or (mode=="age" and m.feasible)
+                     or (mode=="both" and m.feasible and threshold is not None and aggregate_loss(m)<threshold)]
+            incoming=[m.clone() for m in offered]
+            for m in incoming: m.origin="stage_promotion"
+            if incoming:
+                receiver.adf_registry.import_models(incoming)
+                incoming_ids={id(m) for m in incoming}
+                receiver.population=select_nsga([*receiver.population,*incoming],receiver.population_size,nsga_normalization,parsimony_quality_tolerance)
+                admitted=[m for m in receiver.population if id(m) in incoming_ids]
+                if admitted:
+                    receiver.archive.update(admitted,X); receiver.best_models.update(admitted)
+                promoted+=len(admitted)
+                evicted+=len(leaving)-len(admitted)
+            else: evicted+=len(leaving)
+            source.population=staying
+        bottom=ladder[0]
+        if mode in ("age","both") and generation%config["age_gap"]==0:
+            # ALPS: stage 0 restarts from scratch once its best had the chance to move up.
+            bottom.population=fresh_stage_models(bottom.population_size,bottom,generation,n_features=n_features,ops=ops,nodes=nodes,depth=depth)
+            reseeded+=1
+        elif len(bottom.population)<bottom.population_size:
+            # HFC: vacated bottom slots are the continuous supply of fresh models.
+            bottom.population+=fresh_stage_models(bottom.population_size-len(bottom.population),bottom,generation,n_features=n_features,ops=ops,nodes=nodes,depth=depth)
+    config["promotion_events"]+=1; config["promoted"]+=promoted; config["evicted"]+=evicted; config["reseeds"]+=reseeded
+    return promoted,evicted,reseeded
+def island_config_stages(island_config):
+    """Stage configuration of a (possibly pre-stage) island configuration."""
+    return stage_config(**island_config.get("stages",{}))
+def advance_topology(cells, island_config, generation, *, X, n_features, ops, nodes, depth, nsga_normalization,
+                     parsimony_quality_tolerance, evaluator=None, Y=None, cats=None, Xv=None, Yv=None,
+                     crossover_rate=.35, bayesian_proposal_rate=.25):
+    """After a generation: horizontal ring migration (per stage level),
+    vertical stage promotion, and self-organising role updates."""
+    stages=island_config["stages"]; stage_count=stages["count"]; island_count=island_config["count"]
+    roles=island_config.get("roles") or role_config()
+    if island_count>1 and island_config.get("migration_interval") and generation%island_config["migration_interval"]==0:
+        migrated=0
+        for stage in range(stage_count):
+            level=[cells[index*stage_count+stage] for index in range(island_count)]
+            migrated+=migrate_islands(level,island_config["migrants_per_island"],X=X,nsga_normalization=nsga_normalization,
+                                      parsimony_quality_tolerance=parsimony_quality_tolerance,evaluator=evaluator)
+            if roles["enabled"]:
+                roles["fragment_migrants"]+=migrate_fragments(level,ROLE_FRAGMENT_MIGRANTS,generation)
+        island_config["migration_events"]=int(island_config.get("migration_events",0))+1
+        per_level=" per stage level" if stage_count>1 else ""
+        print(f"Island migration {island_config['migration_events']}: moved {migrated} local Pareto elite(s) around the ring{per_level}.",flush=True)
+    if stage_count>1 and generation%stages["interval"]==0:
+        promoted,evicted,reseeded=promote_stages(cells,island_count,stages,generation,X=X,n_features=n_features,ops=ops,nodes=nodes,depth=depth,
+                                                 nsga_normalization=nsga_normalization,parsimony_quality_tolerance=parsimony_quality_tolerance,evaluator=evaluator)
+        note=f", stage 0 reseeded on {reseeded} island(s)" if reseeded else ""
+        print(f"Stage promotion {stages['promotion_events']} ({stages['mode']}): {promoted} model(s) climbed, {evicted} left without admission{note}.",flush=True)
+    if roles["enabled"] and island_count>1 and Y is not None and generation%roles["interval"]==0:
+        retired,collapsed=update_roles(cells,island_config,generation,X=X,Y=Y,cats=cats,Xv=Xv,Yv=Yv,crossover_rate=crossover_rate,
+                                       bayesian_proposal_rate=bayesian_proposal_rate,nodes=nodes)
+        contributions=", ".join(f"{cell_label(cell,island_count,stage_count)}={cell.role.get('contribution',0.):.3g}" for cell in cells if cell.island_index>0)
+        extra="".join([f"; retired {retired}" if retired else "",f"; split {collapsed} collapsed pair(s)" if collapsed else ""])
+        print(f"Island roles {roles['updates']}: held-out contribution {contributions}{extra}.",flush=True)
+# Self-organising island roles.  No role is named in advance: each specialist
+# island's parent selection weights the training rows it already handles
+# better than the other islands (soft responsibilities, as in a mixture of
+# experts), so the positive feedback splits the data into niches for any
+# island count.  Island 0 of each stage level stays a generalist.  Specialists
+# also get a deterministic spread of search settings (tree size, crossover,
+# Bayesian proposals), a held-out complementarity check retires specialists
+# that stop contributing, and fragment libraries migrate with the ring.  All
+# of it is selection-only: reported losses, archives, and the final pick use
+# the true unweighted objective.
+ROLE_FRAGMENT_MIGRANTS = 4
+ROLE_COLLAPSE_CORRELATION = .95
+ROLE_MIN_CONTRIBUTION = 1e-3
+def role_config(enabled=False, interval=10, mix=.5, retire_after=5, **state):
+    if int(interval)<1 or int(retire_after)<1: raise ValueError("Role interval and retirement window must be positive")
+    if not 0<=float(mix)<=.9: raise ValueError("Role mix must be in [0, 0.9] so every island still sees all rows")
+    return {"enabled":bool(enabled),"interval":int(interval),"mix":float(mix),"retire_after":int(retire_after),
+            "updates":int(state.get("updates",0)),"retirements":int(state.get("retirements",0)),
+            "collapses":int(state.get("collapses",0)),"fragment_migrants":int(state.get("fragment_migrants",0))}
+def role_parameters(t, crossover_rate, bayesian_proposal_rate, nodes):
+    """Search settings along one axis t in [0,1]: small, proposal-driven trees
+    at 0; large, crossover-driven trees at 1."""
+    t=float(np.clip(t,0.,1.))
+    return {"t":t,"crossover_rate":float(np.clip(crossover_rate*(.5+t),0.,.9)),
+            "bayesian_proposal_rate":float(np.clip(bayesian_proposal_rate*(1.5-t),0.,1.)),
+            "nodes":max(3,int(round(nodes*(.5+.5*t))))}
+def assign_role_parameters(cells, island_count, crossover_rate, bayesian_proposal_rate, nodes):
+    """Spread specialist settings evenly over [0,1] by island index; island 0 keeps the defaults."""
+    for cell in cells:
+        if cell.island_index==0: cell.role={}; continue
+        t=(cell.island_index-1)/max(1,island_count-2)
+        cell.role={"params":role_parameters(t,crossover_rate,bayesian_proposal_rate,nodes),"stale":0}
+def cell_search_settings(cell, crossover_rate, bayesian_proposal_rate, nodes):
+    """(crossover_rate, bayesian_proposal_rate, nodes, case_weights) for one cell's generation."""
+    params=cell.role.get("params") or {}
+    weights=cell.role.get("case_weights")
+    return (params.get("crossover_rate",crossover_rate),params.get("bayesian_proposal_rate",bayesian_proposal_rate),
+            params.get("nodes",nodes),None if weights is None else np.asarray(weights,float))
+def row_errors(model, X, Y, cats):
+    """Scale-free per-row error (mean over outputs) used for responsibilities."""
+    pred=predict_targets(model,X,cats); parts=[]
+    for j,labels in enumerate(cats):
+        if labels is None: parts.append(np.abs(pred[:,j]-Y[:,j])/max(target_scale(Y[:,j]),EPS))
+        else: parts.append((np.rint(pred[:,j])!=Y[:,j]).astype(float))
+    return np.nan_to_num(np.mean(parts,axis=0),nan=CLIP,posinf=CLIP)
+def _cell_representative(cell):
+    if cell.best_models.model is not None: return cell.best_models.model
+    feasible=[m for m in cell.population if m.feasible]
+    return min(feasible or cell.population,key=secondary_key)
+def _random_affinity(n):
+    return np.random.exponential(size=n)
+def _normalized(weights):
+    weights=np.maximum(np.asarray(weights,float),0.); mean=float(np.mean(weights))
+    return np.ones_like(weights) if not np.isfinite(mean) or mean<=EPS else weights/mean
+def update_roles(cells, island_config, generation, *, X, Y, cats, Xv=None, Yv=None, crossover_rate, bayesian_proposal_rate, nodes):
+    """Recompute responsibilities per stage level; returns (retired, collapsed)."""
+    roles=island_config["roles"]; island_count=island_config["count"]; stage_count=island_config["stages"]["count"]
+    if not roles["enabled"] or island_count<2: return 0,0
+    retired=collapsed=0
+    Xc,Yc=(Xv,Yv) if Xv is not None and len(Xv) else (X,Y)
+    for stage in range(stage_count):
+        level=[cells[index*stage_count+stage] for index in range(island_count)]
+        representatives=[_cell_representative(cell) for cell in level]
+        errors=np.array([row_errors(m,X,Y,cats) for m in representatives])
+        temperature=float(np.median(errors))+EPS
+        logits=-errors/temperature; logits-=logits.max(axis=0)
+        responsibility=np.exp(logits); responsibility/=responsibility.sum(axis=0)
+        # Held-out complementarity: how much worse the best-of-islands error gets without this island.
+        held=np.array([row_errors(m,Xc,Yc,cats) for m in representatives])
+        best=held.min(axis=0); scale=float(np.mean(best))+EPS
+        for index,cell in enumerate(level):
+            if index==0: cell.role.pop("case_weights",None); continue
+            target=responsibility[index]*island_count
+            previous=cell.role.get("specialization")
+            if previous is None or len(previous)!=len(target):
+                specialization=_normalized(.5*_normalized(target)+.5*_normalized(_random_affinity(len(target))))
+            else: specialization=_normalized(.5*np.asarray(previous,float)+.5*_normalized(target))
+            others=np.delete(held,index,axis=0).min(axis=0)
+            contribution=float(np.mean(others-best))/scale
+            cell.role["contribution"]=contribution
+            cell.role["stale"]=0 if contribution>ROLE_MIN_CONTRIBUTION else int(cell.role.get("stale",0))+1
+            if cell.role["stale"]>=roles["retire_after"]:
+                # A niche that no longer helps anywhere is abandoned for a fresh random one.
+                specialization=_normalized(_random_affinity(len(target)))
+                cell.role["params"]=role_parameters(rng.random(),crossover_rate,bayesian_proposal_rate,nodes)
+                cell.role["stale"]=0; retired+=1
+            cell.role["specialization"]=specialization
+        specialists=level[1:]
+        for i,left in enumerate(specialists):
+            for right in specialists[i+1:]:
+                a,b=left.role["specialization"],right.role["specialization"]
+                if np.std(a)>EPS and np.std(b)>EPS and np.corrcoef(a,b)[0,1]>ROLE_COLLAPSE_CORRELATION:
+                    right.role["specialization"]=_normalized(_random_affinity(len(b))); collapsed+=1
+        for cell in specialists:
+            cell.role["case_weights"]=_normalized(roles["mix"]*cell.role["specialization"]+(1-roles["mix"]))
+    roles["updates"]+=1; roles["retirements"]+=retired; roles["collapses"]+=collapsed
+    return retired,collapsed
+def cell_label(cell, island_count, stage_count):
+    parts=[]
+    if island_count>1: parts.append(f"Island {cell.island_index+1}/{island_count}")
+    if stage_count>1: parts.append(f"stage {cell.stage+1}/{stage_count}")
+    return " ".join(parts)
+
 def direct_feature_baselines(X, Y, cats, ops, affine_on):
     """One model per input feature whose every head reads that feature directly.
 
@@ -4067,8 +4422,11 @@ def direct_feature_baselines(X, Y, cats, ops, affine_on):
 def new_island_runtime(population_size, *, X, Xt, cats, ops, nodes, depth, head_count, bayesian_particles,
                        run_seed, island_index, qd_parent_rate, nsga_normalization, parsimony_quality_tolerance,
                        dynamic_pressure_on, stagnation_window, adf_enabled, adf_mode, evaluation_budget,
-                       evaluation_refresh, interaction_discovery):
-    """Create one isolated AFPO/Bayesian search state for an island run."""
+                       evaluation_refresh, interaction_discovery, cell=None):
+    """Create one isolated AFPO/Bayesian search state for an island run.
+
+    island_index seeds the cell's archives; cell=(island, stage) labels it
+    (defaults to (island_index, 0) for stage-free runs)."""
     adf_registry=ADFRegistry(adf_enabled,allow_nested=adf_mode=="nested")
     seeds=direct_feature_baselines(X,None,cats,ops,True)[:population_size//4]
     for seed in seeds: seed.adfs=dict(adf_registry.definitions)
@@ -4087,6 +4445,7 @@ def new_island_runtime(population_size, *, X, Xt, cats, ops, nodes, depth, head_
         BestModelArchive(parsimony_quality_tolerance),
         DynamicPressureController(dynamic_pressure_on,parsimony_quality_tolerance,qd_controller.uniform_rate,stagnation_window),
         library,adf_registry,EvaluationBudget(evaluation_budget,evaluation_refresh),
+        island_index=(island_index if cell is None else cell[0]),stage=(0 if cell is None else cell[1]),
     )
 
 # Called once per island per generation with that island's live state (the
@@ -4167,8 +4526,10 @@ def refresh_persistent_scores(archive, best_models, semantic_qd, structural_qd, 
 
 def evolve_generation(pop, generation, *, X, Xt, Yt, Xv, Yv, cats, constraints, out_names, ops, nodes, depth, affine_on, coev,
                       bayes, archive, semantic_qd, structural_qd, qd_controller, best_models, pressure, cases, portfolio, library, evaluator,
-                      bayesian_proposal_rate, crossover_rate, qd_mode, lexicase_cases, nsga_normalization, progress=None, bayesian_mode="adaptive", adf_registry=None, budget=None, population_size=None):
-    """Advance one generation; fresh and resumed runs share this exact path."""
+                      bayesian_proposal_rate, crossover_rate, qd_mode, lexicase_cases, nsga_normalization, progress=None, bayesian_mode="adaptive", adf_registry=None, budget=None, population_size=None, case_weights=None):
+    """Advance one generation; fresh and resumed runs share this exact path.
+
+    case_weights: optional selection-only per-training-row weights (island roles)."""
     population_size=len(pop) if population_size is None else population_size
     if population_size<1 or not pop: raise ValueError("Evolution requires a nonempty population")
     particle_models=[particle for bank in (bayes.banks if isinstance(bayes,PerOutputBayesianBanks) else [bayes]) for particle in [*bank.particles.catalog,*bank.particles.particles]]
@@ -4227,7 +4588,8 @@ def evolve_generation(pop, generation, *, X, Xt, Yt, Xv, Yv, cats, constraints, 
     Xsb=behaviour_rows(Xs)
     parent_pool=novelty_pool(pop,Xs)
     parent_count=max(1,population_size//2); qd_count=dual_qd_parent_count(parent_count,qd_controller,semantic_qd,structural_qd)
-    ordinary=lexicase_parents(parent_pool,parent_count-qd_count,Xs,Ys,cats,lexicase_cases)
+    row_weights=None if case_weights is None else (np.asarray(case_weights) if isinstance(sample,slice) else np.asarray(case_weights)[sample])
+    ordinary=lexicase_parents(parent_pool,parent_count-qd_count,Xs,Ys,cats,lexicase_cases,row_weights)
     parents=(blend_dual_qd_parents(ordinary,semantic_qd,structural_qd,parent_count,qd_count,qd_controller.uniform_rate)
              if qd_mode=="adaptive_dual" else blend_fixed_semantic_parents(ordinary,semantic_qd,parent_count,qd_count)); children=[]; feedback=[]; credits=[]; injections=[]; discovery_children=[]
     # Archive parents need the same screen fit as their children for feedback.
@@ -4235,6 +4597,15 @@ def evolve_generation(pop, generation, *, X, Xt, Yt, Xv, Yv, cats, constraints, 
     # A child identical to its parent is a wasted slot and a wasted tuning
     # pass; redraw it, with a bound so tiny grammars cannot loop forever.
     unchanged=0; unchanged_limit=4*population_size
+    # Equivalent offspring (y+x beside x+y) would only be deduplicated after
+    # paying for tuning and scoring; redraw them under the same bound instead.
+    seen={model_equivalence_key(model) for model in pop}
+    def duplicate(trees):
+        nonlocal unchanged
+        key=model_equivalence_key(trees)
+        if EQUIVALENCE_COLLAPSE and key in seen and unchanged<unchanged_limit:
+            unchanged+=1; EQUIVALENCE_STATS["children_redrawn"]+=1; return True
+        seen.add(key); return False
     while len(children)<population_size:
         sources=[]
         if pressure.novelty_rate() and rng.random()<pressure.novelty_rate():
@@ -4253,6 +4624,7 @@ def evolve_generation(pop, generation, *, X, Xt, Yt, Xv, Yv, cats, constraints, 
         elif rng.random() < crossover_rate and len(parents)>=2:
             p,q=rng.sample(parents,2); trees=[semantic_crossover(a,b,Xsb,nodes,depth,adf_registry.definitions if adf_registry else None) for a,b in zip(p.model.trees,q.model.trees)]; scales=list(p.model.scales); child_age=max(p.model.age,q.model.age)+1
             if trees==list(p.model.trees) and unchanged<unchanged_limit: unchanged+=1; continue
+            if duplicate(trees): continue
             child=Model(trees,scales,child_age,origin="crossover",parent_ids=(p.model.lineage_id,q.model.lineage_id),mdl_operators=grammar_for_trees(active_ops,trees,adf_registry.definitions if adf_registry else None),mdl_feature_count=X.shape[1],adfs={} if adf_registry is None else dict(adf_registry.definitions),founder_ids=tuple(sorted(set(p.model.founder_ids).union(q.model.founder_ids))),birth_generation=generation+1-child_age)
             children.append(child); credits.append((child,(p,q))); continue
         else:
@@ -4266,6 +4638,7 @@ def evolve_generation(pop, generation, *, X, Xt, Yt, Xv, Yv, cats, constraints, 
             if trees==list(p.model.trees) and unchanged<unchanged_limit: unchanged+=1; continue
             scales=list(p.model.scales); child_age=p.model.age+1; child_origin="macro_mutation" if macro_used else "mutation"
             sources=[p.model]
+        if duplicate(trees): continue
         child=Model(trees,scales,child_age,origin=child_origin,parent_ids=tuple(model.lineage_id for model in sources),mdl_operators=grammar_for_trees(active_ops,trees,adf_registry.definitions if adf_registry else None),mdl_feature_count=X.shape[1],adfs={} if adf_registry is None else dict(adf_registry.definitions),founder_ids=tuple(sorted({founder for model in sources for founder in model.founder_ids})),birth_generation=generation+1-child_age)
         children.append(child)
         if child.origin=="bayesian_injection": injections.append(child)
@@ -4330,8 +4703,10 @@ def resume_main(args):
     if not isinstance(bayes,PerOutputBayesianBanks): raise ValueError("Checkpoint predates per-output Bayesian banks and cannot resume; start a new run")
     X,Y,Xt,Yt,Xv,Yv=(state[k] for k in ("X","Y","Xt","Yt","Xv","Yv"))
     names,out_names,cats,maps=(state[k] for k in ("names","out_names","cats","maps"))
-    global SEQUENCE_LAYOUT
+    global SEQUENCE_LAYOUT,EQUIVALENCE_COLLAPSE
     SEQUENCE_LAYOUT=maps.get(SEQUENCE_LAYOUT_KEY)
+    # Checkpoints from before equivalence keys searched without them; keep that.
+    EQUIVALENCE_COLLAPSE=bool(state.get("equivalence_collapse",False)); EQUIVALENCE_STATS["children_redrawn"]=0
     ops,nodes,depth,affine_on,coev=(state[k] for k in ("operators","nodes","depth","affine_on","coev"))
     constraints=compile_constraints(state.get("profile","general"),state.get("constraint_metadata",{}))
     if getattr(bayes,"legacy_head_banks",False) and any(labels is not None and len(labels)>2 for labels in cats):
@@ -4357,29 +4732,34 @@ def resume_main(args):
         pressure=DynamicPressureController.from_snapshot(state.get("dynamic_pressure",{"enabled":state.get("dynamic_pressure_enabled",False),"base_parsimony":parsimony_quality_tolerance,"base_uniform":qd_controller.uniform_rate}))
         islands=[IslandRuntime(pop,bayes,archive,portfolio,cases,semantic_qd,structural_qd,qd_controller,best_models,pressure,library,ADFRegistry.from_snapshot(state.get("adf_registry",{})),EvaluationBudget.from_snapshot(state.get("evaluation_budget",{"mode":args.evaluation_budget,"refresh":args.evaluation_refresh})))]
         island_config={"count":1,"migration_interval":0,"migrants_per_island":0,"topology":"ring","migration_events":0}
-    if island_config.get("count")!=len(islands): raise ValueError("Checkpoint island configuration does not match its saved island states")
+    island_config["stages"]=island_config_stages(island_config); stage_count=island_config["stages"]["count"]
+    island_config["roles"]=role_config(**island_config.get("roles",{}))
+    if island_config.get("count",0)*stage_count!=len(islands): raise ValueError("Checkpoint island configuration does not match its saved island states")
+    for index,cell in enumerate(islands):
+        if "island_states" in state and not any("stage" in item for item in state["island_states"]): cell.island_index,cell.stage=divmod(index,stage_count)
     qd_mode=state.get("qd_mode","adaptive_dual")
     workers=resolve_worker_count(args.workers if args.workers else state.get("evaluation_workers",0),sum(len(island.population) for island in islands))
     evaluator=ModelEvaluator(workers,{"train":(Xt,Yt)},affine_on,cats,constraints,out_names)
-    topology="single population" if len(islands)==1 else f"{len(islands)} islands; ring migration every {island_config.get('migration_interval',0)} generations"
+    topology="single population" if island_config["count"]==1 else f"{island_config['count']} islands; ring migration every {island_config.get('migration_interval',0)} generations"
+    if stage_count>1: topology+=f"; {stage_count} {island_config['stages']['mode']} stages per island"
     print(f"Resumed generation {generation} from {checkpoint_path} (seed {state['run_seed']}); {topology}; model scoring uses {'serial evaluation' if workers==1 else f'{workers} worker processes'}.")
     started=time.time(); stop=GracefulStop().__enter__(); interrupted=False
     try:
         while (not args.max_generations or generation < args.max_generations) and not stop.requested:
             for island_index,island in enumerate(islands):
                 def progress(gen,elite,sample,island=island,island_index=island_index):
-                    if len(islands)>1 and gen%10==0: print(f"Island {island_index+1}/{len(islands)}",flush=True)
+                    if len(islands)>1 and gen%10==0: print(cell_label(island,island_config["count"],stage_count),flush=True)
                     evolution_progress(gen,elite,sample,started=started,Xt=Xt,Yt=Yt,Xv=Xv,Yv=Yv,names=names,out_names=out_names,cats=cats,constraints=constraints,coev=coev,cases=island.cases,archive=island.archive,semantic_qd=island.semantic_qd,structural_qd=island.structural_qd,qd_controller=island.qd_controller,pressure=island.pressure,bayes=island.bayes,library=island.library,budget=island.budget,evaluator=evaluator,adf_registry=island.adf_registry,population=island.population,best_so_far=island.best_models.model,loss_tolerance=loss_tolerance)
+                cell_crossover,cell_proposals,cell_nodes,cell_weights=cell_search_settings(island,crossover_rate,rate,nodes)
                 island.population=evolve_generation(island.population,generation,X=X,Xt=Xt,Yt=Yt,Xv=Xv,Yv=Yv,cats=cats,constraints=constraints,out_names=out_names,
-                                  ops=ops,nodes=nodes,depth=depth,affine_on=affine_on,coev=coev,bayes=island.bayes,archive=island.archive,
+                                  ops=ops,nodes=cell_nodes,depth=depth,case_weights=cell_weights,affine_on=affine_on,coev=coev,bayes=island.bayes,archive=island.archive,
                                   semantic_qd=island.semantic_qd,structural_qd=island.structural_qd,qd_controller=island.qd_controller,best_models=island.best_models,
-                                  pressure=island.pressure,cases=island.cases,portfolio=island.portfolio,library=island.library,evaluator=evaluator,bayesian_proposal_rate=rate,
-                                  crossover_rate=crossover_rate,qd_mode=qd_mode,lexicase_cases=state.get("lexicase_cases",args.lexicase_cases),nsga_normalization=nsga_normalization,bayesian_mode=state.get("bayesian_mode",args.bayesian_mode),adf_registry=island.adf_registry,budget=island.budget,progress=progress,population_size=island.population_size)
+                                  pressure=island.pressure,cases=island.cases,portfolio=island.portfolio,library=island.library,evaluator=evaluator,bayesian_proposal_rate=cell_proposals,
+                                  crossover_rate=cell_crossover,qd_mode=qd_mode,lexicase_cases=state.get("lexicase_cases",args.lexicase_cases),nsga_normalization=nsga_normalization,bayesian_mode=state.get("bayesian_mode",args.bayesian_mode),adf_registry=island.adf_registry,budget=island.budget,progress=progress,population_size=island.population_size)
             generation+=1
-            if len(islands)>1 and generation%island_config["migration_interval"]==0:
-                migrated=migrate_islands(islands,island_config["migrants_per_island"],X=Xt,nsga_normalization=nsga_normalization,parsimony_quality_tolerance=parsimony_quality_tolerance,evaluator=evaluator)
-                island_config["migration_events"]=int(island_config.get("migration_events",0))+1
-                print(f"Island migration {island_config['migration_events']}: moved {migrated} local Pareto elite(s) around the ring.",flush=True)
+            advance_topology(islands,island_config,generation,X=Xt,n_features=X.shape[1],ops=ops,nodes=nodes,depth=depth,
+                             nsga_normalization=nsga_normalization,parsimony_quality_tolerance=parsimony_quality_tolerance,evaluator=evaluator,
+                             Y=Yt,cats=cats,Xv=Xv,Yv=Yv,crossover_rate=crossover_rate,bayesian_proposal_rate=rate)
             if args.checkpoint_every and generation%args.checkpoint_every==0:
                 snapshot_islands(state,islands,island_config); save_checkpoint(checkpoint_path,generation,islands[0].population,islands[0].bayes,islands[0].archive,state)
     except KeyboardInterrupt: interrupted=True
@@ -4426,6 +4806,7 @@ def build_arg_parser():
     ap.add_argument("--evaluation-refresh",type=int,default=25,help="Adaptive evaluation full-refresh interval in generations")
     ap.add_argument("--sequence-group",action="append",default=[],metavar="NAME=COL1,COL2,...",help="Ordered numeric input columns forming one sequence (repeatable, equal lengths); enables seqsum/seqprod with per-position features NAME[i], prod(NAME[<i]), sum(NAME[<i]) and i")
     ap.add_argument("--stagnation-window",type=int,default=100,help="Generations without quality/QD activity before bounded pressure escalates")
+    ap.add_argument("--equivalence-collapse",choices=("on","off"),default="on",help="Treat algebraically equal equations (x+y vs y+x, x+x vs 2*x, x*x vs square(x)) as one candidate in offspring, deduplication and archives (default: on)")
     ap.add_argument("--gui",action="store_true",help="Start the browser GUI (training, live Pareto frontier, model explorer) instead of the terminal prompts")
     ap.add_argument("--port",type=int,default=8778,help="Browser GUI port (default: 8778)")
     return ap
@@ -4494,6 +4875,11 @@ def collect_training_setup(args):
     if island_count>1:
         migration_interval=max(1,int(ask("Migration interval (generations)","25")))
         migrants_per_island=max(1,int(ask("Migrants per island","2")))
+    roles=role_config()
+    if island_count>1 and yes(ask("Self-organising island roles (island 1 generalist, the rest specialise)? 1=yes, 0=no","0")):
+        roles=role_config(True,interval=int(ask("Role update interval (generations)","10")))
+    stages=ask_stage_setup()
+    if island_count*stages["count"]>args.population//8: raise ValueError("Islands x stages need at least eight models each; raise --population or choose fewer islands/stages")
     val_path=ask("Validation CSV (blank=random split; 0=disabled)","")
     if args.constraint_metadata:
         metadata=json.loads(Path(args.constraint_metadata).read_text())
@@ -4509,8 +4895,25 @@ def collect_training_setup(args):
     validation_percent=None if val_path else float(ask("Validation percentage (0 disables validation; minimum 5 rows when possible)","20"))
     return {"path":path,"df":df,"types":types,"delimiter":delimiter,"ops":ops,"affine_on":affine_on,"coev":coev,
             "dynamic_pressure_on":dynamic_pressure_on,"adf_enabled":adf_enabled,"nodes":nodes,"depth":depth,
-            "island_count":island_count,"migration_interval":migration_interval,"migrants_per_island":migrants_per_island,
+            "island_count":island_count,"migration_interval":migration_interval,"migrants_per_island":migrants_per_island,"stages":stages,"roles":roles,
             "val_path":val_path,"validation_percent":validation_percent,"metadata":metadata}
+
+def ask_stage_setup():
+    """Interactive AFPO stage questions (see promote_stages)."""
+    answer=ask("AFPO stages: 0=off, 1=fitness (HFC), 2=age (ALPS), 3=both","0")
+    modes={"0":"off","1":"fitness","2":"age","3":"both"}
+    if answer not in modes: raise ValueError("Stage mode must be 0, 1, 2, or 3")
+    mode=modes[answer]
+    if mode=="off": return stage_config()
+    options={"mode":mode,"count":int(ask("Stages per island","3")),"interval":int(ask("Promotion interval (generations)","5"))}
+    if mode in ("fitness","both"):
+        options["threshold_quantile"]=float(ask("Admission bar: loss quantile of the stage above (0-1]","0.5"))
+    if mode in ("age","both"):
+        options["age_gap"]=int(ask("Age gap (generations)","10"))
+        schedule=ask("Age limits: 0=linear, 1=polynomial, 2=exponential","1")
+        if schedule not in ("0","1","2"): raise ValueError("Age schedule must be 0, 1, or 2")
+        options["schedule"]=STAGE_AGE_SCHEDULES[int(schedule)]
+    return stage_config(**options)
 
 def choose_model_interactively(labels, choices, evaluation):
     while True:
@@ -4523,6 +4926,8 @@ def train_from_setup(args, setup, choose_model=None):
 
     ``choose_model(labels, choices, evaluation)`` returns the index of the model
     to save; the default asks at the terminal."""
+    global EQUIVALENCE_COLLAPSE
+    EQUIVALENCE_COLLAPSE=getattr(args,"equivalence_collapse","on")=="on"; EQUIVALENCE_STATS["children_redrawn"]=0
     run_seed=args.seed if args.seed is not None else random.SystemRandom().randrange(2**32)
     rng.seed(run_seed); np.random.seed(run_seed)
     print(f"Run seed: {run_seed}")
@@ -4530,7 +4935,11 @@ def train_from_setup(args, setup, choose_model=None):
     affine_on,coev,dynamic_pressure_on,adf_enabled,nodes,depth=(setup[key] for key in ("affine_on","coev","dynamic_pressure_on","adf_enabled","nodes","depth"))
     island_count,migration_interval,migrants_per_island,val_path=(setup[key] for key in ("island_count","migration_interval","migrants_per_island","val_path"))
     adf_enabled=adf_enabled and args.adf_mode!="off"
-    if island_count>args.population//8: raise ValueError("Island count needs at least eight models per island; raise --population or choose fewer islands")
+    stages=stage_config(**(setup.get("stages") or {}))
+    roles=role_config(**(setup.get("roles") or {}))
+    if roles["enabled"] and island_count<2: raise ValueError("Island roles need at least two islands (one generalist plus specialists)")
+    cell_count=island_count*stages["count"]
+    if cell_count>args.population//8: raise ValueError("Islands x stages need at least eight models each; raise --population or choose fewer islands/stages")
     perceptron_enabled=any(operator.startswith("perceptron") for operator in ops)
     metadata=setup.get("metadata")
     if metadata is None: metadata=json.loads(Path(args.constraint_metadata).read_text()) if args.constraint_metadata else {}
@@ -4596,7 +5005,10 @@ def train_from_setup(args, setup, choose_model=None):
         "preprocessing":{"schema_version":1,"fit_rows":len(Xt),"fit_scope":"training_rows_only"},
         "interaction_discovery":interaction_discovery,
         "bayesian_particles_per_output":args.bayesian_particles,
-        "islands":{"count":island_count,"population_total":args.population,"migration_interval":migration_interval,"migrants_per_island":migrants_per_island,"topology":"ring","state":"independent population, Bayesian banks, archive, QD, fragment library, pressure, ADF, and budget"},
+        "islands":{"count":island_count,"population_total":args.population,"migration_interval":migration_interval,"migrants_per_island":migrants_per_island,"topology":"ring","state":"independent population, Bayesian banks, archive, QD, fragment library, pressure, ADF, and budget",
+                   "stages":{key:stages[key] for key in ("mode","count","interval","age_gap","schedule","threshold_quantile")},
+                   "roles":{key:roles[key] for key in ("enabled","interval","mix","retire_after")}},
+        "equivalence_collapse":EQUIVALENCE_COLLAPSE,
         "mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age",
         "test_csv":str(Path(args.test_csv).resolve()) if args.test_csv else None,
     },df,train_indices,validation_indices,external_validation)
@@ -4612,41 +5024,46 @@ def train_from_setup(args, setup, choose_model=None):
         "selection_policy":"loss_tolerance_shortest_mdl","selection_loss_tolerance":args.selection_loss_tolerance,
         "nsga_normalization":args.nsga_normalization,"parsimony_quality_tolerance":args.parsimony_quality_tolerance,"dynamic_pressure_enabled":dynamic_pressure_on,"adf_registry":ADFRegistry(adf_enabled,allow_nested=args.adf_mode=="nested").snapshot(),
         "profile":args.profile,"constraint_metadata":metadata,"constraints":constraints.describe(),"bayesian_particles":args.bayesian_particles,"interaction_discovery":interaction_discovery,
-        "island_config":{"count":island_count,"migration_interval":migration_interval,"migrants_per_island":migrants_per_island,"topology":"ring","migration_events":0},
+        "island_config":{"count":island_count,"migration_interval":migration_interval,"migrants_per_island":migrants_per_island,"topology":"ring","migration_events":0,"stages":stages,"roles":roles},
+        "equivalence_collapse":EQUIVALENCE_COLLAPSE,
         "mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age"}
     head_count=sum(len(heads) for heads in classification_layout(cats)[0])
-    population_sizes=[args.population//island_count+(index<args.population%island_count) for index in range(island_count)]
+    population_sizes=cell_population_sizes(args.population,cell_count)
     islands=[new_island_runtime(size,X=X,Xt=Xt,cats=cats,ops=ops,nodes=nodes,depth=depth,head_count=head_count,
-                                bayesian_particles=args.bayesian_particles,run_seed=run_seed,island_index=index,
+                                bayesian_particles=args.bayesian_particles,run_seed=run_seed,island_index=index,cell=divmod(index,stages["count"]),
                                 qd_parent_rate=args.qd_parent_rate,nsga_normalization=args.nsga_normalization,
                                 parsimony_quality_tolerance=args.parsimony_quality_tolerance,dynamic_pressure_on=dynamic_pressure_on,
                                 stagnation_window=args.stagnation_window,adf_enabled=adf_enabled,adf_mode=args.adf_mode,
                                 evaluation_budget=args.evaluation_budget,evaluation_refresh=args.evaluation_refresh,
                                 interaction_discovery=interaction_discovery)
              for index,size in enumerate(population_sizes)]
+    if roles["enabled"]: assign_role_parameters(islands,island_count,args.crossover_rate,args.bayesian_proposal_rate,nodes)
     snapshot_islands(checkpoint_state,islands,checkpoint_state["island_config"])
     workers=checkpoint_state["evaluation_workers"]
     evaluator=ModelEvaluator(workers,{"train":(Xt,Yt)},affine_on,cats,constraints,out_names)
     gen=0; start=time.time()
-    topology=("single population" if island_count==1 else f"{island_count} islands ({', '.join(map(str,population_sizes))} models), ring migration every {migration_interval} generations")
+    topology=("single population" if island_count==1 else f"{island_count} islands, ring migration every {migration_interval} generations")
+    if stages["count"]>1: topology+=f", {stages['count']} {stages['mode']} stages per island (promotion every {stages['interval']} generations)"
+    if roles["enabled"]: topology+=f", self-organising roles (generalist + {island_count-1} specialist(s), update every {roles['interval']} generations)"
+    if cell_count>1: topology+=f" ({', '.join(map(str,population_sizes))} models per cell)"
     print(f"Searching indefinitely with {args.bayesian_proposal_rate:.0%} Bayesian proposals, {topology}, and {'serial evaluation' if workers==1 else f'{workers} worker processes'}; press Ctrl-C to choose and save a model.")
     stop=GracefulStop().__enter__(); interrupted=False
     try:
         while (not args.max_generations or gen<args.max_generations) and not stop.requested:
             for island_index,island in enumerate(islands):
                 def progress(generation,elite,sample,island=island,island_index=island_index):
-                    if island_count>1 and generation%10==0: print(f"Island {island_index+1}/{island_count}",flush=True)
+                    if cell_count>1 and generation%10==0: print(cell_label(island,island_count,stages["count"]),flush=True)
                     evolution_progress(generation,elite,sample,started=start,Xt=Xt,Yt=Yt,Xv=Xv,Yv=Yv,names=names,out_names=out_names,cats=cats,constraints=constraints,coev=coev,cases=island.cases,archive=island.archive,semantic_qd=island.semantic_qd,structural_qd=island.structural_qd,qd_controller=island.qd_controller,pressure=island.pressure,bayes=island.bayes,library=island.library,budget=island.budget,evaluator=evaluator,adf_registry=island.adf_registry,population=island.population,best_so_far=island.best_models.model,loss_tolerance=args.selection_loss_tolerance)
+                cell_crossover,cell_proposals,cell_nodes,cell_weights=cell_search_settings(island,args.crossover_rate,args.bayesian_proposal_rate,nodes)
                 island.population=evolve_generation(island.population,gen,X=X,Xt=Xt,Yt=Yt,Xv=Xv,Yv=Yv,cats=cats,constraints=constraints,out_names=out_names,
-                                  ops=ops,nodes=nodes,depth=depth,affine_on=affine_on,coev=coev,bayes=island.bayes,archive=island.archive,
+                                  ops=ops,nodes=cell_nodes,depth=depth,case_weights=cell_weights,affine_on=affine_on,coev=coev,bayes=island.bayes,archive=island.archive,
                                   semantic_qd=island.semantic_qd,structural_qd=island.structural_qd,qd_controller=island.qd_controller,best_models=island.best_models,
-                                  pressure=island.pressure,cases=island.cases,portfolio=island.portfolio,library=island.library,evaluator=evaluator,bayesian_proposal_rate=args.bayesian_proposal_rate,
-                                  crossover_rate=args.crossover_rate,qd_mode=args.qd_mode,lexicase_cases=args.lexicase_cases,nsga_normalization=args.nsga_normalization,bayesian_mode=args.bayesian_mode,adf_registry=island.adf_registry,budget=island.budget,progress=progress,population_size=island.population_size)
+                                  pressure=island.pressure,cases=island.cases,portfolio=island.portfolio,library=island.library,evaluator=evaluator,bayesian_proposal_rate=cell_proposals,
+                                  crossover_rate=cell_crossover,qd_mode=args.qd_mode,lexicase_cases=args.lexicase_cases,nsga_normalization=args.nsga_normalization,bayesian_mode=args.bayesian_mode,adf_registry=island.adf_registry,budget=island.budget,progress=progress,population_size=island.population_size)
             gen+=1
-            if island_count>1 and gen%migration_interval==0:
-                migrated=migrate_islands(islands,migrants_per_island,X=Xt,nsga_normalization=args.nsga_normalization,parsimony_quality_tolerance=args.parsimony_quality_tolerance,evaluator=evaluator)
-                checkpoint_state["island_config"]["migration_events"]+=1
-                print(f"Island migration {checkpoint_state['island_config']['migration_events']}: moved {migrated} local Pareto elite(s) around the ring.",flush=True)
+            advance_topology(islands,checkpoint_state["island_config"],gen,X=Xt,n_features=X.shape[1],ops=ops,nodes=nodes,depth=depth,
+                             nsga_normalization=args.nsga_normalization,parsimony_quality_tolerance=args.parsimony_quality_tolerance,evaluator=evaluator,
+                             Y=Yt,cats=cats,Xv=Xv,Yv=Yv,crossover_rate=args.crossover_rate,bayesian_proposal_rate=args.bayesian_proposal_rate)
             if args.checkpoint_every and gen % args.checkpoint_every == 0:
                 snapshot_islands(checkpoint_state,islands,checkpoint_state["island_config"])
                 save_checkpoint(checkpoint_path,gen,islands[0].population,islands[0].bayes,islands[0].archive,checkpoint_state)
@@ -4672,8 +5089,9 @@ def train_from_setup(args, setup, choose_model=None):
     evaluation=selection_evaluation(f,Xv,Yv,cats,constraints,out_names)
     labels,choices,selection=model_options(f,cats=cats,loss_tolerance=args.selection_loss_tolerance,evaluation=evaluation)
     print_frontier(f,names,out_names,cats,recommendations=(labels,choices),evaluation=evaluation)
-    if island_count==1: print(islands[0].archive.stats())
+    if len(islands)==1: print(islands[0].archive.stats())
     else: print(f"Island archives: {' | '.join(island.archive.stats() for island in islands)}")
+    if EQUIVALENCE_COLLAPSE: print(f"Equivalence collapse: redrew {EQUIVALENCE_STATS['children_redrawn']} offspring equivalent to an existing or sibling equation.")
     selected_index=max(0,min(len(choices)-1,int((choose_model or choose_model_interactively)(labels,choices,evaluation))))
     chosen=choices[selected_index]
     print(f"Selected model: {equations(chosen,names,out_names,cats)}")

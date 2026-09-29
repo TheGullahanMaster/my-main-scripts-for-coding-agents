@@ -69,6 +69,19 @@ class GuiTests(unittest.TestCase):
             gui.check_form(bad)
         self.assertTrue(gui.check_form(form(self.csv))["ok"])
 
+    def test_stage_and_role_fields_reach_the_setup(self):
+        staged = form(self.csv, islands=2, migration_interval=5, migrants=1, stage_mode="both", stages=2,
+                      stage_interval=4, stage_quantile=.4, stage_age_gap=6, stage_schedule="linear", roles=True, role_interval=7)
+        setup = gui.setup_answers(staged)
+        self.assertEqual({k: setup["stages"][k] for k in ("mode", "count", "interval", "threshold_quantile", "age_gap", "schedule")},
+                         {"mode": "both", "count": 2, "interval": 4, "threshold_quantile": .4, "age_gap": 6, "schedule": "linear"})
+        self.assertEqual((setup["roles"]["enabled"], setup["roles"]["interval"]), (True, 7))
+        self.assertFalse(gui.setup_answers(form(self.csv, roles=True))["roles"]["enabled"])     # one island: no roles
+        self.assertTrue(gui.check_form(staged)["ok"])
+        crowded = form(self.csv, islands=2, stage_mode="age", stages=3)                          # 40 models over 6 cells
+        with self.assertRaisesRegex(ValueError, "eight models each"):
+            gui.check_form(crowded)
+
     def test_train_choose_then_explore(self):
         session = gui.TrainingSession()
         session.start(form(self.csv))

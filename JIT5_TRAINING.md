@@ -2,8 +2,14 @@
 
 Run `conda run --no-capture-output -n pytorch2 python jit5.py`.
 
-The menu accepts `0/train`, `1/sample`, `2/retry`, `3/continue`, and
-`4/finetune`. Train retains its existing Continue question for compatibility.
+The menu accepts `0/train`, `1/sample`, `2/retry`, `3/continue`,
+`4/finetune`, and `5/gui`. Train retains its existing Continue question for compatibility.
+
+`5/gui` (or `python jit5_gui.py [port]`) opens a browser GUI on 127.0.0.1 (default
+port 8768) with the same four training workflows, a live monitor (loss, validation,
+learning rate, gradient norm, preview grids, log, stop-and-save) and sampling with a
+denoising-trajectory view. It uses the same checkpoint folder layout as the CLI, and
+Ctrl+C in the terminal still finishes the current step and saves.
 
 ## Configuration and retry
 

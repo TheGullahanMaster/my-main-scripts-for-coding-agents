@@ -1,0 +1,1329 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>JiT5 Studio</title>
+<style>
+:root {
+  color-scheme: light;
+  --bg: #f4f3f0; --surface: #fcfcfb; --surface-2: #f0efec; --border: #dddcd7;
+  --text: #0b0b0b; --text-2: #52514e; --muted: #8a8983; --grid: #e7e6e2;
+  --accent: #2a78d6; --accent-ink: #ffffff; --danger: #c93c3b; --good: #008300; --warn: #b77a00;
+  --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s4: #eda100; --s5: #e87ba4; --s6: #008300; --s7: #4a3aa7; --s8: #e34948;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg: #121211; --surface: #1a1a19; --surface-2: #242422; --border: #34342f;
+    --text: #ffffff; --text-2: #c3c2b7; --muted: #8f8e86; --grid: #2c2c29;
+    --accent: #3987e5; --accent-ink: #ffffff; --danger: #e66767; --good: #3fae3f; --warn: #d9a232;
+    --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #d55181; --s6: #008300; --s7: #9085e9; --s8: #e66767;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #121211; --surface: #1a1a19; --surface-2: #242422; --border: #34342f;
+  --text: #ffffff; --text-2: #c3c2b7; --muted: #8f8e86; --grid: #2c2c29;
+  --accent: #3987e5; --accent-ink: #ffffff; --danger: #e66767; --good: #3fae3f; --warn: #d9a232;
+  --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #d55181; --s6: #008300; --s7: #9085e9; --s8: #e66767;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+body { background: var(--bg); color: var(--text); font: 13px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+header { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 10px 16px; background: var(--surface); border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 5; }
+header h1 { font-size: 15px; margin: 0; font-weight: 650; }
+header .meta { color: var(--text-2); font-size: 12px; }
+header .spacer { flex: 1; }
+.modes { display: flex; gap: 2px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; padding: 2px; flex-wrap: wrap; }
+.modes button { border: 0; background: none; padding: 4px 14px; border-radius: 6px; color: var(--text-2); }
+.modes button.active { background: var(--surface); color: var(--text); font-weight: 600; box-shadow: 0 1px 2px rgba(0,0,0,.12); }
+.page { padding: 14px 16px; }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 12px; margin-bottom: 14px; min-width: 0; }
+.card h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--text-2); margin: 0 0 10px; font-weight: 600; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.card h2 .grow { flex: 1; }
+input[type=number], input[type=text], select, textarea { background: var(--surface-2); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 4px 6px; font: inherit; min-width: 0; }
+input:focus, select:focus, textarea:focus { outline: 2px solid color-mix(in srgb, var(--accent) 50%, transparent); outline-offset: 0; }
+input::placeholder { color: var(--muted); }
+textarea { width: 100%; font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; resize: vertical; }
+button { background: var(--surface-2); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 5px 10px; font: inherit; cursor: pointer; }
+button:hover { border-color: var(--muted); }
+button:disabled { opacity: .5; cursor: default; }
+button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+button.danger { color: var(--danger); border-color: var(--danger); }
+.btns { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+.form-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 10px 12px; }
+.ctl { display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: var(--text-2); min-width: 0; }
+.ctl > span { display: flex; justify-content: space-between; gap: 6px; }
+.ctl > span .hint { color: var(--muted); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ctl input[type=number], .ctl input[type=text], .ctl select { width: 100%; }
+.ctl.check { flex-direction: row; align-items: center; gap: 6px; color: var(--text); padding-top: 16px; }
+.ctl.check input { accent-color: var(--accent); margin: 0; }
+.ctl.wide { grid-column: 1 / -1; }
+.ctl.bad input, .ctl.bad select { border-color: var(--danger); }
+.pathrow { display: flex; gap: 6px; }
+.pathrow input { flex: 1; }
+.setup { display: grid; grid-template-columns: minmax(0, 1fr) 330px; gap: 14px; align-items: start; }
+@media (max-width: 1000px) { .setup { grid-template-columns: minmax(0, 1fr); } }
+.sticky { position: sticky; top: 64px; }
+@media (max-width: 1000px) { .sticky { position: static; } }
+.two { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 14px; }
+@media (max-width: 1100px) { .two { grid-template-columns: minmax(0, 1fr); } }
+.three { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
+@media (max-width: 1200px) { .three { grid-template-columns: minmax(0, 1fr); } }
+.kv { display: grid; grid-template-columns: auto 1fr; gap: 2px 12px; font-size: 12px; font-variant-numeric: tabular-nums; }
+.kv div:nth-child(odd) { color: var(--text-2); }
+.kv div:nth-child(even) { word-break: break-all; }
+.note { color: var(--text-2); font-size: 12px; margin: 0 0 10px; }
+.muted { color: var(--muted); }
+.warn { color: var(--danger); font-size: 12px; }
+.okmsg { color: var(--good); font-size: 12px; }
+.pill { font-size: 11px; padding: 1px 7px; border-radius: 10px; background: var(--surface-2); border: 1px solid var(--border); color: var(--text-2); white-space: nowrap; }
+.state { font-size: 11px; font-weight: 650; text-transform: uppercase; letter-spacing: .05em; padding: 2px 8px; border-radius: 10px; border: 1px solid var(--border); background: var(--surface-2); }
+.state.training, .state.preparing, .state.queued, .state.running, .state.stopping { color: var(--accent); border-color: var(--accent); }
+.state.error { color: var(--danger); border-color: var(--danger); }
+.state.done, .state.stopped { color: var(--good); border-color: var(--good); }
+.progress { height: 6px; background: var(--surface-2); border-radius: 3px; overflow: hidden; margin: 8px 0; }
+.progress > div { height: 100%; width: 0; background: var(--accent); transition: width .5s; }
+.big { font-size: 22px; font-weight: 650; font-variant-numeric: tabular-nums; }
+.stats { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 10px; }
+.stat .lab { color: var(--text-2); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+.stat .val { font-size: 18px; font-weight: 650; font-variant-numeric: tabular-nums; }
+.chart { position: relative; min-width: 0; }
+.chart canvas { display: block; width: 100%; }
+.chart .title { font-weight: 600; font-size: 12px; margin-bottom: 4px; display: flex; flex-wrap: wrap; gap: 0 8px; align-items: baseline; }
+.chart .title .sub { color: var(--muted); font-weight: 400; }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 12px; color: var(--text-2); margin: 4px 0; }
+.legend .sw { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+.tooltip { position: fixed; pointer-events: none; background: var(--surface); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; font-size: 12px; box-shadow: 0 4px 14px rgba(0,0,0,.15); z-index: 50; display: none; max-width: 320px; font-variant-numeric: tabular-nums; }
+.tooltip .sw { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+.toast { position: fixed; bottom: 16px; right: 16px; background: var(--danger); color: #fff; padding: 8px 12px; border-radius: 8px; max-width: min(560px, calc(100vw - 32px)); display: none; z-index: 60; white-space: pre-wrap; }
+.log { font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; max-height: 260px; overflow: auto; background: var(--surface-2); border-radius: 6px; padding: 6px 8px; white-space: pre-wrap; word-break: break-word; }
+.log .k-spike { color: var(--warn); }
+.log .k-error { color: var(--danger); }
+.log .k-checkpoint { color: var(--good); }
+.preview img { max-width: 100%; image-rendering: pixelated; border-radius: 6px; background: var(--surface-2); display: block; }
+.preview .bar { display: flex; gap: 8px; align-items: center; margin-bottom: 6px; flex-wrap: wrap; }
+.preview input[type=range] { flex: 1; min-width: 120px; accent-color: var(--accent); }
+.gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(var(--tile, 128px), 1fr)); gap: 8px; }
+.gallery figure { margin: 0; background: var(--surface-2); border-radius: 8px; overflow: hidden; }
+.gallery img { width: 100%; display: block; image-rendering: pixelated; aspect-ratio: auto; }
+.gallery figcaption { font-size: 11px; color: var(--text-2); padding: 3px 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.gallery .pair { display: grid; grid-template-columns: 1fr 1fr; gap: 2px; }
+.film { display: flex; gap: 6px; overflow-x: auto; padding-bottom: 4px; }
+.film figure { margin: 0; flex: 0 0 auto; text-align: center; }
+.film img { width: 96px; height: 96px; object-fit: contain; image-rendering: pixelated; background: var(--surface-2); border-radius: 6px; display: block; }
+.film figcaption { font-size: 10px; color: var(--muted); }
+.thumbs { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+.thumbs img { width: 64px; height: 64px; object-fit: cover; border-radius: 6px; background: var(--surface-2); }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip { display: inline-flex; align-items: center; gap: 5px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 14px; padding: 2px 10px; font-size: 12px; cursor: pointer; user-select: none; }
+.chip.on { background: color-mix(in srgb, var(--accent) 16%, var(--surface)); border-color: var(--accent); color: var(--text); }
+.chip input { display: none; }
+.modal { position: fixed; inset: 0; background: rgba(0,0,0,.45); display: flex; align-items: center; justify-content: center; z-index: 40; padding: 16px; }
+.modal .card { width: min(640px, 100%); max-height: calc(100vh - 32px); display: flex; flex-direction: column; margin: 0; }
+.browser { border: 1px solid var(--border); border-radius: 8px; overflow: auto; min-height: 200px; flex: 1; margin: 8px 0; }
+.browser .item { padding: 4px 10px; cursor: pointer; display: flex; justify-content: space-between; gap: 8px; }
+.browser .item:hover, .browser .item.sel { background: var(--surface-2); }
+.browser .path { padding: 6px 10px; font-size: 12px; color: var(--text-2); border-bottom: 1px solid var(--grid); position: sticky; top: 0; background: var(--surface); word-break: break-all; }
+table.data { border-collapse: collapse; width: 100%; font-size: 12px; font-variant-numeric: tabular-nums; }
+table.data th, table.data td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+table.data th { color: var(--text-2); font-weight: 600; }
+table.data tr.click { cursor: pointer; }
+table.data tr.click:hover td, table.data tr.sel td { background: var(--surface-2); }
+.scroll { overflow: auto; }
+.modlist { max-height: 300px; overflow: auto; border: 1px solid var(--border); border-radius: 8px; padding: 4px 0; }
+.modlist label { display: flex; gap: 6px; align-items: center; padding: 1px 8px; font-size: 12px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.modlist label .muted { margin-left: auto; font-family: system-ui, sans-serif; }
+details summary { cursor: pointer; color: var(--text-2); font-size: 12px; margin: 6px 0; }
+.section-sub { font-size: 11px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; margin: 12px 0 6px; grid-column: 1 / -1; }
+.empty { color: var(--muted); padding: 24px; text-align: center; }
+[hidden] { display: none !important; }
+canvas { max-width: 100%; }
+</style>
+</head>
+<body>
+<header>
+  <h1>JiT5 Studio</h1>
+  <nav class="modes" id="modes"><button data-page="setup">Setup</button><button data-page="monitor">Monitor</button><button data-page="sample">Sample</button></nav>
+  <span class="meta" id="deviceInfo"></span>
+  <span class="meta" id="runBadge"></span>
+  <span class="spacer"></span>
+  <button id="themeBtn" title="Toggle light / dark">Theme</button>
+</header>
+<div id="setupPage" class="page" hidden></div>
+<div id="monitorPage" class="page" hidden></div>
+<div id="samplePage" class="page" hidden></div>
+<div class="tooltip" id="tooltip"></div>
+<div class="toast" id="toast"></div>
+<script>
+"use strict";
+// ───────────────────────── utilities ─────────────────────────
+const $ = (sel, root = document) => root.querySelector(sel);
+const el = (tag, attrs = {}, ...kids) => {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === "class") e.className = v;
+    else if (k === "style") e.style.cssText = v;
+    else if (k.startsWith("on")) e.addEventListener(k.slice(2), v);
+    else if (k === "value") e.value = v;
+    else if (k === "checked") e.checked = !!v;
+    else if (v !== false && v != null) e.setAttribute(k, v === true ? "" : v);
+  }
+  for (const k of kids.flat()) if (k != null && k !== false) e.append(k.nodeType ? k : document.createTextNode(k));
+  return e;
+};
+const css = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+function fmt(v, digits = 4) {
+  if (v == null || Number.isNaN(v)) return "–";
+  if (typeof v !== "number") return String(v);
+  const a = Math.abs(v);
+  if (a !== 0 && (a >= 1e5 || a < 1e-3)) return v.toExponential(2);
+  return Number(v.toPrecision(digits)).toString();
+}
+const fmtInt = v => v == null ? "–" : Math.round(v).toLocaleString();
+function fmtDur(s) {
+  if (!Number.isFinite(s) || s < 0) return "–";
+  s = Math.round(s);
+  const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), ss = s % 60;
+  return h ? `${h}h ${String(m).padStart(2, "0")}m` : m ? `${m}m ${String(ss).padStart(2, "0")}s` : `${ss}s`;
+}
+const kv = (...pairs) => el("div", { class: "kv" }, pairs.flat().map(p => el("div", {}, p ?? "–")));
+function toast(msg, ok = false) { const t = $("#toast"); t.textContent = msg; t.style.background = ok ? "var(--good)" : "var(--danger)"; t.style.display = "block"; clearTimeout(toast.t); toast.t = setTimeout(() => t.style.display = "none", ok ? 4000 : 9000); }
+async function api(path, body = {}) {
+  const r = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const j = await r.json().catch(() => ({ error: `HTTP ${r.status}` }));
+  if (!r.ok || j.error) throw new Error(j.error || `HTTP ${r.status}`);
+  return j;
+}
+const imgUrl = (path, size) => `/api/image?path=${encodeURIComponent(path)}${size ? `&size=${size}` : ""}`;  // stable URL: the browser caches it
+const store = {
+  get(k, d) { try { const v = localStorage.getItem("jit5." + k); return v == null ? d : JSON.parse(v); } catch { return d; } },
+  set(k, v) { try { localStorage.setItem("jit5." + k, JSON.stringify(v)); } catch { /* storage unavailable */ } },
+};
+const debounce = (fn, ms) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; };
+// Run fn now, or after the user leaves the form field they are typing in (rebuilding would destroy it).
+function whenNotTyping(fn) {
+  const a = document.activeElement;
+  if (a && /^(INPUT|SELECT|TEXTAREA)$/.test(a.tagName) && a.isConnected && !a.closest(".modal")) a.addEventListener("blur", () => setTimeout(fn, 0), { once: true });
+  else fn();
+}
+function keepScroll(fn) {
+  const y = window.scrollY, body = document.body;
+  const act = document.activeElement, fkey = act && act.dataset ? act.dataset.fkey : null;
+  body.style.minHeight = document.documentElement.scrollHeight + "px";
+  try { return fn(); } finally {
+    if (fkey && !act.isConnected) {
+      const twin = document.querySelector(`[data-fkey="${CSS.escape(fkey)}"]`);
+      if (twin) twin.focus({ preventScroll: true });
+    }
+    if (window.scrollY !== y) window.scrollTo(0, y);
+    requestAnimationFrame(() => { body.style.minHeight = ""; });
+  }
+}
+
+// ───────────────────────── charts ─────────────────────────
+function niceTicks(lo, hi, n = 5) {
+  if (!(hi > lo)) hi = lo + 1;
+  const span = hi - lo, step0 = span / n, mag = Math.pow(10, Math.floor(Math.log10(step0)));
+  const step = [1, 2, 2.5, 5, 10].map(m => m * mag).find(s => span / s <= n) || 10 * mag;
+  const out = [];
+  for (let v = Math.ceil(lo / step) * step; v <= hi + step * 1e-9; v += step) out.push(Math.abs(v) < step * 1e-9 ? 0 : v);
+  return out;
+}
+const tip = $("#tooltip");
+function showTip(html, ev) {
+  if (!html) { tip.style.display = "none"; return; }
+  tip.innerHTML = html; tip.style.display = "block";
+  const r = tip.getBoundingClientRect();
+  let x = ev.clientX + 14, y = ev.clientY + 14;
+  if (x + r.width > innerWidth - 8) x = ev.clientX - r.width - 14;
+  if (y + r.height > innerHeight - 8) y = ev.clientY - r.height - 14;
+  tip.style.left = Math.max(4, x) + "px"; tip.style.top = Math.max(4, y) + "px";
+}
+class Chart {
+  constructor(parent, { height = 220, title = "", sub = "" } = {}) {
+    this.root = el("div", { class: "chart" });
+    this.titleEl = el("div", { class: "title" }, title, sub ? el("span", { class: "sub" }, sub) : null);
+    this.legendEl = el("div", { class: "legend" });
+    this.canvas = el("canvas", { role: "img", "aria-label": title || "chart" });
+    this.root.append(this.titleEl, this.canvas, this.legendEl);
+    parent.append(this.root);
+    this.height = height; this.canvas.style.height = height + "px";
+    this.canvas.addEventListener("mousemove", ev => { if (this.hover) { const p = this.pos(ev); showTip(this.hover(p.x, p.y), ev); this.redraw?.(p); } });
+    this.canvas.addEventListener("mouseleave", () => { showTip(null); this.redraw?.(null); });
+  }
+  pos(ev) { const r = this.canvas.getBoundingClientRect(); return { x: ev.clientX - r.left, y: ev.clientY - r.top }; }
+  setup() {
+    const dpr = window.devicePixelRatio || 1, w = Math.max(200, this.canvas.clientWidth || this.root.clientWidth || 400), h = this.height;
+    this.canvas.width = Math.round(w * dpr); this.canvas.height = Math.round(h * dpr);
+    const ctx = this.canvas.getContext("2d"); ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.clearRect(0, 0, w, h);
+    this.w = w; this.ctx = ctx;
+    return ctx;
+  }
+  legend(items) {
+    const key = items.map(i => i.join()).join("|");
+    if (key === this.legendKey) return;
+    this.legendKey = key;
+    this.legendEl.replaceChildren(...items.map(([name, color]) => el("span", {}, el("span", { class: "sw", style: `background:${color}` }), name))); }
+}
+const tickFmt = v => { const a = Math.abs(v); return a !== 0 && (a >= 1e5 || a < 1e-3) ? v.toExponential(1).replace(".0e", "e") : fmt(v, 3); };
+// Multi-series line chart; each series has its own x. logY plots log10 with decade labels.
+function drawSeries(chart, { series, xLabel = "step", yLabel = "", logY = false, empty = "no data yet" }) {
+  const ctx = chart.setup(), W = chart.w, H = chart.height;
+  const tf = v => logY ? (v > 0 ? Math.log10(v) : null) : v;
+  let xlo = Infinity, xhi = -Infinity, ylo = Infinity, yhi = -Infinity;
+  for (const s of series) for (let i = 0; i < s.x.length; i++) {
+    const y = tf(s.y[i]); if (y == null || !Number.isFinite(y)) continue;
+    xlo = Math.min(xlo, s.x[i]); xhi = Math.max(xhi, s.x[i]);
+    if (!s.noScale) { ylo = Math.min(ylo, y); yhi = Math.max(yhi, y); }
+  }
+  chart.legend(series.filter(s => !s.hideLegend).map(s => [s.name, s.color]));
+  if (!Number.isFinite(xlo) || !Number.isFinite(ylo)) {
+    ctx.fillStyle = css("--muted"); ctx.font = "12px system-ui, sans-serif"; ctx.textAlign = "center"; ctx.fillText(empty, W / 2, H / 2);
+    chart.hover = null; chart.redraw = null; return;
+  }
+  if (xhi === xlo) { xhi = xlo + 1; }
+  if (yhi === ylo) { const d = Math.abs(ylo) * .1 || 1; ylo -= d; yhi += d; }
+  const pad = (yhi - ylo) * .06; ylo -= pad; yhi += pad;
+  const box = { l: 56, r: W - 12, t: 8, b: H - 32 };
+  const sx = v => box.l + (v - xlo) / (xhi - xlo) * (box.r - box.l);
+  const sy = v => box.b - (v - ylo) / (yhi - ylo) * (box.b - box.t);
+  const frame = () => {
+    ctx.clearRect(0, 0, W, H);
+    ctx.font = "11px system-ui, sans-serif"; ctx.lineWidth = 1; ctx.strokeStyle = css("--grid"); ctx.fillStyle = css("--muted");
+    ctx.textAlign = "right"; ctx.textBaseline = "middle";
+    for (const v of niceTicks(ylo, yhi, Math.max(2, Math.floor((box.b - box.t) / 36)))) {
+      const y = sy(v); ctx.beginPath(); ctx.moveTo(box.l, y); ctx.lineTo(box.r, y); ctx.stroke();
+      ctx.fillText(tickFmt(logY ? Math.pow(10, v) : v), box.l - 6, y);
+    }
+    ctx.textAlign = "center"; ctx.textBaseline = "top";
+    for (const v of niceTicks(xlo, xhi, Math.max(2, Math.floor((box.r - box.l) / 80)))) {
+      const x = sx(v); ctx.beginPath(); ctx.moveTo(x, box.t); ctx.lineTo(x, box.b); ctx.stroke(); ctx.fillText(fmt(v, 4), x, box.b + 6);
+    }
+    ctx.fillStyle = css("--text-2"); ctx.textBaseline = "bottom"; ctx.fillText(xLabel, (box.l + box.r) / 2, H - 1);
+    if (yLabel) { ctx.save(); ctx.translate(11, (box.t + box.b) / 2); ctx.rotate(-Math.PI / 2); ctx.textBaseline = "middle"; ctx.fillText(yLabel + (logY ? " (log)" : ""), 0, 0); ctx.restore(); }
+    ctx.save(); ctx.beginPath(); ctx.rect(box.l, box.t - 2, box.r - box.l, box.b - box.t + 4); ctx.clip();
+    for (const s of series) {
+      ctx.strokeStyle = s.color; ctx.fillStyle = s.color; ctx.lineWidth = s.width || 2; ctx.globalAlpha = s.alpha ?? 1; ctx.lineJoin = "round";
+      if (s.dots) {
+        for (let i = 0; i < s.x.length; i++) { const y = tf(s.y[i]); if (y == null || !Number.isFinite(y)) continue; ctx.beginPath(); ctx.arc(sx(s.x[i]), sy(y), 3, 0, 7); ctx.fill(); }
+      }
+      if (!s.dotsOnly) {
+        ctx.beginPath(); let on = false;
+        for (let i = 0; i < s.x.length; i++) { const y = tf(s.y[i]); if (y == null || !Number.isFinite(y)) { on = false; continue; } const px = sx(s.x[i]), py = sy(y); on ? ctx.lineTo(px, py) : ctx.moveTo(px, py); on = true; }
+        ctx.stroke();
+      }
+      ctx.globalAlpha = 1;
+    }
+    ctx.restore();
+  };
+  const nearest = (s, x) => { let b = -1, bd = Infinity; for (let i = 0; i < s.x.length; i++) { const d = Math.abs(s.x[i] - x); if (d < bd) { bd = d; b = i; } } return b; };
+  frame();
+  chart.redraw = p => {
+    frame();
+    if (!p || p.x < box.l || p.x > box.r) return;
+    ctx.strokeStyle = css("--muted"); ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(p.x, box.t); ctx.lineTo(p.x, box.b); ctx.stroke();
+    const x = xlo + (p.x - box.l) / (box.r - box.l) * (xhi - xlo);
+    for (const s of series) { const i = nearest(s, x); const y = i >= 0 ? tf(s.y[i]) : null; if (y == null || !Number.isFinite(y)) continue; ctx.fillStyle = s.color; ctx.strokeStyle = css("--surface"); ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(sx(s.x[i]), sy(y), 4, 0, 7); ctx.fill(); ctx.stroke(); }
+  };
+  chart.hover = (mx) => {
+    if (mx < box.l || mx > box.r) return null;
+    const x = xlo + (mx - box.l) / (box.r - box.l) * (xhi - xlo);
+    const rows = series.map(s => { const i = nearest(s, x); return i < 0 ? "" : `<div><span class="sw" style="background:${s.color}"></span>${esc(s.name)}: <b>${fmt(s.y[i])}</b> <span class="muted">@ ${fmtInt(s.x[i])}</span></div>`; }).join("");
+    return rows;
+  };
+}
+
+// ───────────────────────── file browser ─────────────────────────
+function browse({ title = "Choose", start = "", pick = "file", kinds = ["image", "json", "checkpoint"], onPick }) {
+  let current = start, selected = null;
+  const list = el("div", { class: "browser" });
+  const pathInput = el("input", { type: "text", value: start, style: "flex:1" });
+  const chooseBtn = el("button", { class: "primary" }, pick === "folder" ? "Use this folder" : "Choose");
+  const modal = el("div", { class: "modal", onclick: ev => { if (ev.target === modal) modal.remove(); } },
+    el("div", { class: "card" }, el("h2", {}, title),
+      el("div", { class: "pathrow" }, pathInput, el("button", { onclick: () => load(pathInput.value) }, "Go")),
+      list,
+      el("div", { class: "btns" }, chooseBtn, el("button", { onclick: () => modal.remove() }, "Cancel"),
+        el("span", { class: "muted" }, pick === "folder" ? "Double-click a folder to open it." : "Double-click to choose."))));
+  chooseBtn.onclick = () => {
+    const value = pick === "folder" ? (selected || current) : selected;
+    if (!value) return toast("Select a file first.");
+    modal.remove(); onPick(value);
+  };
+  async function load(path) {
+    try {
+      const r = await api("/api/fs", { path, kinds });
+      current = r.path; selected = null; pathInput.value = r.path;
+      list.replaceChildren(el("div", { class: "path" }, r.path),
+        el("div", { class: "item", ondblclick: () => load(r.parent), onclick: () => load(r.parent) }, "⬑ ..", el("span", { class: "muted" }, "up")),
+        ...r.dirs.map(d => {
+          const full = r.path.replace(/\/$/, "") + "/" + d;
+          const item = el("div", { class: "item", ondblclick: () => load(full), onclick: () => { if (pick === "folder") { list.querySelectorAll(".sel").forEach(e => e.classList.remove("sel")); item.classList.add("sel"); selected = full; } else load(full); } }, "📁 " + d, el("span", { class: "muted" }, "folder"));
+          return item;
+        }),
+        ...(pick === "folder" ? [] : r.files.map(f => {
+          const full = r.path.replace(/\/$/, "") + "/" + f.name;
+          const item = el("div", { class: "item", ondblclick: () => { modal.remove(); onPick(full); }, onclick: () => { list.querySelectorAll(".sel").forEach(e => e.classList.remove("sel")); item.classList.add("sel"); selected = full; } },
+            f.name, el("span", { class: "muted" }, `${f.kind} · ${f.size > 1 << 20 ? (f.size / 2 ** 20).toFixed(1) + " MB" : Math.ceil(f.size / 1024) + " kB"}`));
+          return item;
+        })));
+    } catch (e) { toast(e.message); }
+  }
+  document.body.append(modal); load(start || OPT.cwd);
+}
+
+// ───────────────────────── form fields ─────────────────────────
+// A field: { key, label, type: num|int|text|bool|select|path, options, show(f), ph(f) placeholder/default, hint, pick, kinds }
+// Parts of the page rebuild themselves only when their structure changes, never on a timer:
+// liveBox(sig, build) rebuilds when sig() changes and otherwise just calls box.update().
+const live = new Set();
+function liveBox(sig, build, tag = "div", attrs = {}) {
+  const box = el(tag, attrs);
+  let last;
+  box.refresh = (force = false) => {
+    const s = sig();
+    if (force || s !== last) {
+      last = s;
+      const fill = () => box.replaceChildren(...[].concat(build()).filter(Boolean));
+      box.isConnected ? keepScroll(fill) : fill();
+    }
+    else if (box.update) box.update();
+  };
+  live.add(box);
+  box.refresh();
+  return box;
+}
+function refreshLive() {
+  for (const b of [...live]) { if (b.isConnected) b.refresh(); else if (b.dataset.built) live.delete(b); else b.dataset.built = "1"; }
+}
+const setText = (e, v) => { v = v == null ? "" : String(v); if (e.textContent !== v) e.textContent = v; };
+// A field: { key, label, type: num|int|text|bool|select|path, options, show(f), ph(f) placeholder/default, hint, pick, kinds }
+function fieldControl(field, obj, onChange, controls) {
+  const v = obj[field.key];
+  const ph = field.ph ? field.ph(obj) : null;
+  const set = val => { obj[field.key] = val; onChange(field.key); };
+  const hint = field.hint ? el("span", { class: "hint", title: field.hint }, field.hint) : null;
+  if (field.type === "bool") {
+    const input = el("input", { type: "checkbox", checked: v == null ? !!ph : !!v, "data-fkey": field.key, onchange: e => set(e.target.checked) });
+    controls.push({ field, input });
+    return el("label", { class: "ctl check", title: field.hint || "" }, input, field.label);
+  }
+  let input;
+  if (field.type === "select") {
+    const opts = typeof field.options === "function" ? field.options(obj) : field.options;
+    input = el("select", { "data-fkey": field.key, onchange: e => set(field.numeric ? Number(e.target.value) : e.target.value) },
+      opts.map(o => { const [val, lab] = Array.isArray(o) ? o : [o, o]; return el("option", { value: val, selected: String(val) === String(v ?? ph) }, lab); }));
+  } else {
+    input = el("input", {
+      type: "text", inputmode: field.type === "text" || field.type === "path" ? "text" : "decimal", "data-fkey": field.key,
+      value: v == null ? "" : String(v), placeholder: ph == null ? "" : String(ph),
+      onchange: e => {
+        const raw = e.target.value.trim();
+        if (field.type === "text" || field.type === "path") return set(raw);
+        if (raw === "") return set(null);
+        const n = Number(raw);
+        if (!Number.isFinite(n) || (field.type === "int" && !Number.isInteger(n))) { e.target.closest(".ctl").classList.add("bad"); return toast(`${field.label}: ${field.type === "int" ? "an integer" : "a number"} is required.`); }
+        e.target.closest(".ctl").classList.remove("bad"); set(n);
+      },
+    });
+  }
+  controls.push({ field, input });
+  if (field.type === "path") {
+    const row = el("div", { class: "pathrow" }, input, el("button", { title: "Browse", onclick: () => browse({ title: field.label, start: obj[field.key] || OPT.cwd, pick: field.pick || "folder", kinds: field.kinds, onPick: p => { input.value = p; set(p); } }) }, "…"));
+    return el("label", { class: "ctl wide" }, el("span", {}, field.label, hint), row);
+  }
+  return el("label", { class: "ctl" + (field.wide ? " wide" : "") }, el("span", {}, field.label, hint), input);
+}
+// Bring an existing control in line with obj (values another field reset, placeholders that depend on other fields).
+function syncControl(field, obj, input) {
+  if (document.activeElement === input) return;
+  const v = obj[field.key], ph = field.ph ? field.ph(obj) : null;
+  if (field.type === "bool") { const c = v == null ? !!ph : !!v; if (input.checked !== c) input.checked = c; return; }
+  if (field.type === "select") { const want = String(v ?? ph); if (want !== "undefined" && want !== "null" && input.value !== want) input.value = want; return; }
+  if (input.closest(".ctl.bad")) return;  // keep the user's invalid text visible until they fix it
+  const want = v == null ? "" : String(v);
+  if (input.value !== want) input.value = want;
+  const p = ph == null ? "" : String(ph);
+  if (input.placeholder !== p) input.placeholder = p;
+}
+function fieldGrid(fields, obj, onChange) {
+  let controls = [];
+  const visible = () => fields.filter(f => !f.show || f.show(obj));
+  const box = liveBox(() => visible().map(f => f.sub || f.key).join("|"), () => {
+    controls = [];
+    return visible().map(f => f.sub ? el("div", { class: "section-sub" }, f.sub) : fieldControl(f, obj, k => { onChange(k); refreshLive(); }, controls));
+  }, "div", { class: "form-grid" });
+  box.update = () => { for (const { field, input } of controls) syncControl(field, obj, input); };
+  return box;
+}
+
+// ───────────────────────── state ─────────────────────────
+let OPT = null;
+const MODEL = {};    // key -> {id, name}
+const OPTIM = {};    // key -> {id, name, lr}
+const S = {
+  page: store.get("page", "setup"),
+  setupMode: store.get("setupMode", "new"),
+  ckdir: store.get("ckdir", null),
+  form: null, jsonText: store.get("jsonText", ""), jsonPath: "", check: null, checkError: null, dataset: null, synth: null,
+  cont: store.get("cont", {}), contInfo: null, fine: store.get("fine", { policy: "all", modules: [] }), fineInfo: null, fineModules: null, modFilter: "",
+  train: { state: "idle", points: [], val: [], logs: [], previews: [], info: {} }, since: 0, logSince: 0, runKey: null,
+  view: "live", runs: null, runView: null, logY: store.get("logY", true), previewIdx: null,
+  sample: store.get("sample", { steps: null, seed: 0, count: 8, batch_size: 4, x_clip: "", framing: "tile", combined: false, trajectory: true, inputs: [], classes: {} }),
+  sinfo: null, sstatus: null, sresults: [], ssince: 0, tile: store.get("tile", 128),
+};
+const saveForm = debounce(() => store.set("form", S.form), 300);
+
+// ───────────────────────── Setup page: new-run form ─────────────────────────
+const isPatch = f => !OPT.is_conv.includes(f.model_type) && !OPT.is_hier.includes(f.model_type) && f.model_type !== "fcdm_unet";
+const isHier = f => OPT.is_hier.includes(f.model_type);
+const isConv = f => OPT.is_conv.includes(f.model_type);
+const isRin = f => f.model_type === "rin", isFcdmIso = f => f.model_type === "fcdm_isotropic";
+const plainTokens = f => isPatch(f) && !isRin(f) && !isFcdmIso(f);
+const stemOn = f => (isPatch(f) || isHier(f)) && Number(f.conv_stem) > 0;
+const muon = f => OPT.muon_family.includes(f.optimizer_type);
+const hasVal = f => !!(f.validation_path || Number(f.validation_percent) > 0);
+function syntheticActive(f) {
+  const s = (f.pix2pix_sources || []).filter(x => x !== "folders" && x !== "combined");
+  const active = new Set(s);
+  if (active.has("restoration")) OPT.effect_modes.forEach(m => active.add(m));
+  return active;
+}
+function cropRange(v) { const p = String(v ?? "").replace(/-/g, " ").replace(/,/g, " ").split(/\s+/).filter(Boolean).map(Number); return p.length === 2 && p[0] !== p[1]; }
+function patchGrid(f, axis) {
+  const size = axis === "width" ? cropMax(f.crop_w, f.resize_width) : cropMax(f.crop_h, f.resize_height);
+  const p = Number(axis === "width" ? f.p_width : f.p_height), o = Number(axis === "width" ? f.overlap_w : f.overlap_h);
+  if (Number(f.conv_stem) === 3) return Math.min(8, size);
+  return Math.max(1, Math.floor((size - p) / Math.max(1, p - o)) + 1);
+}
+function cropMax(v, resize) {
+  const p = String(v ?? "").replace(/-/g, " ").replace(/,/g, " ").split(/\s+/).filter(Boolean).map(Number);
+  if (!p.length) return Number(resize);
+  if (p.length === 2 && S.form.crop_output === "min") return Math.min(...p);
+  return Math.max(...p);
+}
+const optLr = f => (OPTIM[f.optimizer_type] || {}).lr;
+const yes = [["x", "x (clean image)"], ["eps", "eps (noise)"], ["v", "v (velocity)"]];
+function newRunSections() {
+  const F = [
+    ["Dataset", [
+      { key: "dataset_path", label: "Dataset folder", type: "path" },
+      { key: "conditioning_mode", label: "Dataset format", type: "select", options: [["unconditional", "Unconditional (any images)"], ["class", "Class folders"], ["pix2pix", "Pix2Pix (paired / synthetic)"]] },
+      { key: "class_dropout_prob", label: "Class dropout (guidance)", type: "num", show: f => f.conditioning_mode === "class", hint: "0 = off" },
+      { key: "guidance_scale", label: "Guidance strength", type: "num", show: f => f.conditioning_mode === "class" && Number(f.class_dropout_prob) > 0, hint: "1 = unguided" },
+      { key: "class_sampling", label: "Class sampling", type: "select", options: [["uniform", "uniform (balanced)"], ["natural", "natural"]], show: f => f.conditioning_mode === "class" },
+      { key: "pix2pix_direction", label: "Direction", type: "select", options: [["a_to_b", "A → B"], ["b_to_a", "B → A"]], show: f => f.conditioning_mode === "pix2pix" && (f.pix2pix_sources || []).some(s => s === "folders" || s === "combined") },
+      { key: "cond_residual", label: "Add source as output residual", type: "bool", show: f => f.conditioning_mode === "pix2pix" },
+      { key: "resize_cache", label: "Resize and cache dataset first", type: "bool", hint: "writes <dataset>/resized" },
+    ]],
+    ["Image size", [
+      { key: "channels", label: "Channels", type: "select", numeric: true, options: [[1, "1 (gray)"], [3, "3 (RGB)"], [4, "4 (RGBA)"]] },
+      { key: "resize_width", label: "Source resize width", type: "int", hint: "-1 = native" },
+      { key: "resize_height", label: "Source resize height", type: "int", hint: "-1 = native" },
+      { key: "crop_w", label: "Crop width", type: "text", ph: f => f.resize_width > 0 ? f.resize_width : "required", hint: "N or N-M" },
+      { key: "crop_h", label: "Crop height", type: "text", ph: f => f.resize_height > 0 ? f.resize_height : "required", hint: "N or N-M" },
+      { key: "crop_output", label: "Variable crop output", type: "select", options: [["max", "max size"], ["min", "min size"]], show: f => cropRange(f.crop_w) || cropRange(f.crop_h) },
+    ]],
+    ["Model", [
+      { key: "model_type", label: "Architecture", type: "select", wide: true, options: () => OPT.models.map(m => [m.key, `${m.id}. ${m.name}`]) },
+      { key: "fcdm_dim", label: "FCDM base channels", type: "int", show: f => f.model_type === "fcdm_unet", hint: "even" },
+      { key: "fcdm_depth", label: "FCDM base blocks", type: "int", show: f => f.model_type === "fcdm_unet", hint: "L,2L,4L,2L,L" },
+      { key: "fcdm_mlp_ratio", label: "FCDM expansion ratio", type: "num", show: f => f.model_type === "fcdm_unet" || isFcdmIso(f) },
+      { key: "conv_stem", label: "Conv-stem", type: "select", numeric: true, options: [[0, "off"], [1, "input only"], [2, "output only"], [3, "both"]], show: f => isPatch(f) || isHier(f) },
+      { key: "p_width", label: "Patch width", type: "int", show: f => isPatch(f) && Number(f.conv_stem) !== 3 },
+      { key: "p_height", label: "Patch height", type: "int", show: f => isPatch(f) && Number(f.conv_stem) !== 3 },
+      { key: "overlap_w", label: "Patch width overlap", type: "int", show: f => isPatch(f) && Number(f.conv_stem) !== 3, hint: "pixels" },
+      { key: "overlap_h", label: "Patch height overlap", type: "int", show: f => isPatch(f) && Number(f.conv_stem) !== 3, hint: "pixels" },
+      { key: "dim", label: "Model width (dim)", type: "int", show: isPatch, hint: "rounded to ×8" },
+      { key: "depth", label: "RIN routing blocks", type: "int", show: isRin, ph: () => 6 },
+      { key: "depth", label: "Depth", type: "int", show: f => isPatch(f) && !isRin(f), ph: () => 4 },
+      { key: "heads", label: "Attention heads", type: "int", show: f => isPatch(f) && OPT.needs_heads.includes(f.model_type) },
+      { key: "hyper_heads", label: "HyperMixer heads", type: "int", show: f => isPatch(f) && OPT.hyper_heads.includes(f.model_type) },
+      { key: "hat_group_depth", label: "HAT blocks per group", type: "int", show: f => f.model_type === "hat", hint: "paper: 6" },
+      { key: "rin_num_latents", label: "RIN slots", type: "int", show: isRin, hint: "incl. time/class" },
+      { key: "rin_latent_dim", label: "RIN latent width", type: "int", show: isRin, ph: f => 2 * (Number(f.dim) || 256) },
+      { key: "rin_layers_per_block", label: "RIN latent layers / block", type: "int", show: isRin },
+      { key: "use_bottleneck", label: "Bottleneck patch embed", type: "bool", show: f => isPatch(f) && !isRin(f) && !(Number(f.conv_stem) & 1) },
+      { key: "bottleneck_dim", label: "Bottleneck dim", type: "int", show: f => isPatch(f) && !isRin(f) && !(Number(f.conv_stem) & 1) && f.use_bottleneck },
+      { key: "dropout", label: "Dropout", type: "num", show: f => isPatch(f) && !isFcdmIso(f), hint: "0 = off" },
+      { key: "self_cond", label: "Self-conditioning", type: "bool", show: isPatch, ph: f => isRin(f) },
+      { key: "self_cond_prob", label: "Self-conditioning probability", type: "num", show: f => isPatch(f) && (f.self_cond ?? isRin(f)), ph: f => isRin(f) ? 0.9 : 0.5 },
+      { key: "use_adaln", label: "AdaLN-Zero", type: "bool", show: plainTokens },
+      { key: "use_final_adaln", label: "Final adaLN-Zero head", type: "bool", show: plainTokens },
+      { key: "use_qk_norm", label: "QK-Norm", type: "bool", show: plainTokens },
+      { key: "use_2d_pos_emb", label: "2D sin-cos position emb.", type: "bool", show: plainTokens },
+      { key: "use_conv_mlp", label: "Conv-MLP (off = SwiGLU)", type: "bool", show: plainTokens },
+      { key: "use_grn", label: "Global Response Norm", type: "bool", show: f => isPatch(f) && OPT.grn_models.includes(f.model_type) },
+      { key: "axial", label: "Axial mixing", type: "bool", show: f => isPatch(f) && OPT.axial_models.includes(f.model_type) },
+      { key: "conv_dim", label: "Initial filter count", type: "int", show: isConv, hint: "rounded to ×8" },
+      { key: "fmap_max", label: "Max filter count", type: "int", show: isConv },
+      { key: "bottleneck_res", label: "Bottleneck resolution", type: "int", show: isConv },
+      { key: "hier_dim", label: "Initial feature width", type: "int", show: isHier },
+      { key: "hier_fmap_max", label: "Max feature width", type: "int", show: isHier },
+      { key: "hier_depth", label: "MLP layers per stage", type: "int", show: isHier },
+      { key: "hier_input_grid_size", label: "Global input grid", type: "int", show: isHier, hint: "N×N" },
+      { key: "hier_output_grid_size", label: "Refinement root grid", type: "int", show: isHier, hint: "divides input grid" },
+      { key: "hier_global_mixer", label: "Global processor", type: "select", show: isHier, options: [["jit", "JiT"], ["mlpmixer", "MLP-Mixer"], ["gmlp", "gMLP"], ["convnext", "ConvNeXt"], ["vip", "ViP"]] },
+      { key: "hier_global_dim", label: "Global processor width", type: "int", show: isHier, ph: f => f.hier_dim },
+      { key: "hier_global_depth", label: "Global processor layers", type: "int", show: isHier, ph: f => f.hier_depth },
+      { key: "hier_global_heads", label: "Global JiT heads", type: "int", show: f => isHier(f) && f.hier_global_mixer === "jit" },
+      { sub: "Convolutional stem", show: stemOn },
+      { key: "stem_initial", label: "Stem initial filters", type: "int", show: stemOn },
+      { key: "stem_max", label: "Stem max features", type: "int", show: stemOn },
+      { key: "stem_activation", label: "Stem activation", type: "select", numeric: true, show: stemOn, options: () => OPT.stem_activations },
+      { key: "stem_glu_scaling", label: "Stem GLU scaling", type: "select", numeric: true, show: f => stemOn(f) && Number(f.stem_activation) >= 7, options: [[0, "default"], [1, "Transformer 2/3 widths"]] },
+      { key: "stem_skips", label: "U-Net stem skips", type: "bool", show: f => stemOn(f) && Number(f.conv_stem) === 3 },
+      { key: "stem_grn", label: "Stem GRN", type: "bool", show: stemOn },
+      { key: "stem_conditioning", label: "Stem class/time conditioning", type: "select", numeric: true, show: stemOn, options: () => OPT.stem_conditioning },
+      { key: "stem_width", label: "Stem bottleneck grid width", type: "int", show: f => stemOn(f) && isPatch(f), ph: f => patchGrid(f, "width") },
+      { key: "stem_height", label: "Stem bottleneck grid height", type: "int", show: f => stemOn(f) && isPatch(f), ph: f => patchGrid(f, "height") },
+    ]],
+    ["Diffusion objective", [
+      { key: "pred_mode", label: "Network predicts", type: "select", options: yes },
+      { key: "loss_mode", label: "Loss space", type: "select", options: yes },
+      { key: "t_mu", label: "Logit-normal time mean μ", type: "num", hint: "more negative = more noise" },
+      { key: "t_sigma", label: "Logit-normal time std σ", type: "num" },
+      { key: "noise_schedule", label: "Noise schedule", type: "select", options: ["linear", "rin_sigmoid"] },
+      { key: "x_clip", label: "Predicted-x clipping", type: "select", options: ["none", "static", "dynamic"] },
+      { key: "time_scale", label: "Time-embedding scale", type: "num" },
+      { key: "sampling_steps", label: "Heun sampling steps", type: "int" },
+    ]],
+    ["Optimizer", [
+      { key: "optimizer_type", label: "Optimizer", type: "select", options: () => OPT.optimizers.map(o => [o.key, `${o.id}. ${o.name} · lr ${o.lr}`]) },
+      { key: "lr", label: "Learning rate", type: "num", ph: optLr },
+      { key: "lr_schedule", label: "LR schedule after warmup", type: "select", options: ["constant", "cosine"] },
+      { key: "warmup_steps", label: "LR warmup steps", type: "int" },
+      { key: "cautious", label: "Cautious updates", type: "bool", show: muon },
+      { key: "muon_all", label: "MuonAll (all parameters)", type: "bool", show: muon },
+      { key: "muon_all_reshape", label: "MuonAll near-square reshape", type: "bool", show: muon },
+      { key: "muon_fallback_lr", label: "AdamW fallback LR", type: "num", show: f => muon(f) && !f.muon_all, ph: f => OPT.go_family.includes(f.optimizer_type) ? OPT.muon_fallback_lr : (f.lr ?? optLr(f)), hint: "embeddings, norms…" },
+      { key: "muon_momentum", label: "Muon momentum", type: "num", show: muon },
+      { key: "muon_rank", label: "Muon rank", type: "int", show: muon, hint: "0 = full" },
+      { key: "muon_weight_decay", label: "Muon weight decay", type: "num", show: muon, ph: f => OPT.go_family.includes(f.optimizer_type) ? 0 : 0.1 },
+      { key: "muon_backend", label: "Orthogonalization", type: "select", show: muon, options: [["polar_express", "Polar Express"], ["newton_schulz", "Newton–Schulz"]] },
+      { key: "muon_ns_steps", label: "Orthogonalization iterations", type: "int", show: muon },
+      { key: "muon_foreach", label: "Batch optimizer updates", type: "bool", show: muon },
+      { key: "muon_ns_bfloat16", label: "BF16 matrix iterations", type: "bool", show: muon },
+      { key: "adamuon_eps", label: "AdaMuon ε", type: "num", show: f => f.optimizer_type === "adamuon" },
+      { key: "adamuon_nesterov", label: "AdaMuon Nesterov", type: "bool", show: f => f.optimizer_type === "adamuon" },
+      { key: "normuon_beta2", label: "NorMuon β₂", type: "num", show: f => ["normuon", "normuonhd"].includes(f.optimizer_type) },
+      { key: "normuon_eps", label: "NorMuon ε", type: "num", show: f => ["normuon", "normuonhd"].includes(f.optimizer_type) },
+      ...[["adago", ["gamma", "v0", "eps"]], ["rmsgo", ["gamma", "v0", "eps", "beta2"]], ["adadeltago", ["gamma", "rho", "eps"]], ["adamgo", ["beta2", "gamma", "delta", "min_step"]]]
+        .flatMap(([o, keys]) => keys.map(k => ({ key: `${o}_${k}`, label: `${o} ${k}`, type: "num", show: f => f.optimizer_type === o }))),
+      { key: "hg_hyper_lr", label: "Hypergradient step", type: "num", show: f => ["adamhd", "muonhd", "normuonhd"].includes(f.optimizer_type), hint: "max log-LR change" },
+      { key: "hg_normalize", label: "Normalized hypergradient", type: "bool", show: f => ["adamhd", "muonhd", "normuonhd"].includes(f.optimizer_type) },
+      { key: "hg_anchor", label: "Anchor", type: "num", show: f => ["adamhd", "muonhd", "normuonhd"].includes(f.optimizer_type), ph: f => f.hg_normalize === false ? 0.02 : 1 },
+      { key: "hg_max_lr", label: "Maximum LR", type: "num", show: f => ["adamhd", "muonhd", "normuonhd"].includes(f.optimizer_type), hint: "0 = 100× initial" },
+      { key: "hg_weight_decay", label: "AdamHD weight decay", type: "num", show: f => f.optimizer_type === "adamhd" },
+      { key: "hyper_lr", label: "PaperAdamHD β", type: "num", show: f => f.optimizer_type === "paper_adamhd" },
+      { key: "hd_min_lr", label: "PaperAdamHD min LR", type: "num", show: f => f.optimizer_type === "paper_adamhd" },
+      { key: "hd_max_lr", label: "PaperAdamHD max LR", type: "num", show: f => f.optimizer_type === "paper_adamhd" },
+      { key: "modern_clion_nu", label: "ModernCLion ν", type: "num", show: f => f.optimizer_type === "modern_clion" },
+      { key: "modern_clion_weight_decay", label: "ModernCLion weight decay", type: "num", show: f => f.optimizer_type === "modern_clion" },
+      { key: "clion_rescale_mask", label: "CLion mask rescaling", type: "bool", show: f => f.optimizer_type === "clion" },
+      { key: "layerwise_nsgda_momentum", label: "LayerWise nSGDA momentum", type: "num", show: f => f.optimizer_type === "layerwise_nsgda" },
+      { key: "layerwise_nsgda_cautious", label: "LayerWise nSGDA cautious", type: "bool", show: f => f.optimizer_type === "layerwise_nsgda" },
+    ]],
+    ["Runtime", [
+      { key: "steps", label: "Training steps", type: "int" },
+      { key: "batch_size", label: "Batch size", type: "int" },
+      { key: "grad_accum_steps", label: "Gradient accumulation", type: "int", hint: "batches / update" },
+      { key: "use_ema", label: "EMA weights", type: "bool" },
+      { key: "ema_warmup", label: "EMA warmup", type: "select", show: f => f.use_ema, options: () => OPT.ema_warmups },
+      { key: "ema_warmup_steps", label: "EMA warmup steps", type: "int", show: f => f.use_ema && f.ema_warmup === "smooth" },
+      { key: "use_flip", label: "Random horizontal flip", type: "bool" },
+      { key: "use_vflip", label: "Random vertical flip", type: "bool" },
+      { key: "use_rot90", label: "Random 90° rotations", type: "bool", hint: "square only" },
+      { key: "use_amp", label: "Mixed precision (AMP)", type: "bool", show: f => !f.full_bf16 },
+      { key: "amp_dtype", label: "AMP dtype", type: "select", show: f => f.use_amp && !f.full_bf16, options: ["fp16", "bf16"] },
+      { key: "full_bf16", label: "Full BF16 (experimental)", type: "bool" },
+      { key: "grad_clip", label: "Gradient clip norm", type: "num", hint: "0 = off" },
+      { key: "use_spike_guard", label: "Skip loss/gradient spikes", type: "bool" },
+      { key: "use_grad_ckpt", label: "Gradient checkpointing", type: "bool" },
+      { key: "compile_mode", label: "torch.compile", type: "select", options: () => OPT.compile_modes },
+      { key: "seed", label: "Random seed", type: "int", hint: "0 = random" },
+      { key: "num_workers", label: "Data loader workers", type: "int" },
+    ]],
+    ["Previews, checkpoints & validation", [
+      { key: "sample_every", label: "Preview every N steps", type: "int" },
+      { key: "num_sample_images", label: "Images per preview", type: "int" },
+      { key: "preview_batch_size", label: "Preview batch size", type: "int", ph: f => f.batch_size },
+      { key: "preview_seed", label: "Preview seed", type: "int", ph: f => f.seed || 42 },
+      { key: "save_every", label: "Checkpoint every N steps", type: "int" },
+      { key: "save_best", label: "Save best weights (best.pt)", type: "bool" },
+      { key: "validation_path", label: "Validation folder (optional)", type: "path" },
+      { key: "validation_percent", label: "Validation % held out", type: "num", show: f => !f.validation_path, hint: "0 = off" },
+      { key: "validation_every", label: "Validate every N updates", type: "int", show: hasVal },
+      { key: "validation_batch_size", label: "Validation batch size", type: "int", show: hasVal, ph: f => f.batch_size },
+      { key: "validation_max_batches", label: "Validation batch limit", type: "int", show: hasVal, hint: "0 = all" },
+      { key: "validation_seed", label: "Validation seed", type: "int", show: hasVal },
+      { key: "best_training_loss", label: "Best by smoothed training loss", type: "bool", show: f => !hasVal(f) && f.save_best },
+    ]],
+  ];
+  return F;
+}
+const FEATURE_FIELDS = () => newRunSections()[6][1].filter(f => ["validation_path", "validation_percent", "validation_every", "validation_batch_size", "validation_max_batches", "validation_seed", "save_best", "best_training_loss"].includes(f.key))
+  .concat([{ key: "grad_accum_steps", label: "Gradient accumulation", type: "int", hint: "batches / update" }]);
+
+function onFormChange(key) {
+  const f = S.form;
+  if (key === "model_type") { f.self_cond = null; f.self_cond_prob = null; f.depth = null; }
+  if (key === "conditioning_mode" && f.conditioning_mode === "pix2pix" && !(f.pix2pix_sources || []).length) f.pix2pix_sources = ["folders"];
+  saveForm();
+  if (key === "dataset_path" || key === "conditioning_mode" || key === "pix2pix_sources") inspectDataset();
+  refreshLive();
+  autoCheck();  // the summary keeps the previous result until the new check arrives
+}
+const autoCheck = debounce(() => runCheck(true), 700);
+async function runCheck(quiet = false) {
+  try {
+    const body = S.setupMode === "json" ? { config: parseJson() } : { form: S.form };
+    S.check = await api("/api/config/check", body); S.checkError = null;
+  } catch (e) { S.check = null; S.checkError = e.message; if (!quiet) toast(e.message); }
+  renderSummary();
+}
+async function inspectDataset() {
+  const f = S.form; if (!f.dataset_path) { S.dataset = null; return; }
+  const mode = f.conditioning_mode === "pix2pix" && (f.pix2pix_sources || []).includes("folders") ? "pix2pix_folders" : f.conditioning_mode;
+  try { S.dataset = await api("/api/dataset/inspect", { path: f.dataset_path, mode }); }
+  catch (e) { S.dataset = { error: e.message }; }
+  const box = $("#dsInfo");
+  if (box) keepScroll(() => box.replaceChildren(datasetCard()));
+}
+function datasetCard() {
+  const d = S.dataset, f = S.form;
+  const card = el("div", {});
+  if (!d) return card;
+  if (d.error) return el("div", { class: "warn" }, d.error);
+  card.append(kv("Images", fmtInt(d.images), "Common sizes", d.sizes.map(([s, n]) => `${s} (${n})`).join(", ") || "–",
+    ...(d.classes.length ? ["Class folders", d.classes.map(c => `${c.name} (${c.count})`).join(", ")] : []),
+    ...(d.has_ab ? ["A / B folders", `${d.a_count} / ${d.b_count}`] : []),
+    ...(d.resized_cache ? ["Cache", "a resized/ folder already exists (it is rebuilt when caching)"] : [])));
+  for (const w of d.warnings) card.append(el("div", { class: "warn" }, w));
+  card.append(el("div", { class: "thumbs" }, d.samples.map(p => el("img", { src: imgUrl(p, 128), title: p, loading: "lazy" }))));
+  return card;
+}
+function pix2pixCard() {
+  const f = S.form;
+  const srcs = new Set(f.pix2pix_sources || []);
+  const toggle = key => {
+    if (key === "folders" || key === "combined") f.pix2pix_sources = [key];
+    else { srcs.delete("folders"); srcs.delete("combined"); srcs.has(key) ? srcs.delete(key) : srcs.add(key); f.pix2pix_sources = [...srcs].length ? [...srcs] : ["folders"]; }
+    onFormChange("pix2pix_sources");
+  };
+  const chips = el("div", { class: "chips" }, OPT.synthetic_sources.map(([key, lab]) =>
+    el("span", { class: "chip" + (srcs.has(key) ? " on" : ""), onclick: () => toggle(key), title: key === "folders" ? "dataset/A and dataset/B folders" : key === "combined" ? "each image is A|B side by side" : "synthesized from clean images" }, lab)));
+  const active = syntheticActive(f);
+  f.synthetic_params = f.synthetic_params || {};
+  const keys = [];
+  for (const [mode, names] of OPT.synthetic_params) if (active.has(mode)) for (const n of names) if (!keys.includes(n)) keys.push(n);
+  const fields = keys.map(k => ({ key: k, label: k.replace(/_/g, " "), type: Number.isInteger(OPT.synthetic_defaults[k]) ? "int" : "num", ph: () => OPT.synthetic_defaults[k] }));
+  const grid = fieldGrid(fields, f.synthetic_params, () => { saveForm(); autoCheck(); });
+  const preview = el("div", {});
+  const btn = el("button", { onclick: async () => {
+    btn.disabled = true;
+    try {
+      const r = await api("/api/dataset/synthetic_preview", { form: { ...f, preview_nonce: Math.floor(Math.random() * 1e6) } });
+      preview.replaceChildren(el("div", { class: "gallery", style: "--tile:110px" }, r.pairs.map(p => el("figure", {}, el("div", { class: "pair" }, el("img", { src: p.source }), el("img", { src: p.target })), el("figcaption", {}, "condition | target")))));
+    } catch (e) { toast(e.message); } finally { btn.disabled = false; }
+  } }, "Preview training pairs");
+  return el("div", {}, el("div", { class: "section-sub" }, "Pix2Pix sources (effects combine)"), chips,
+    keys.length ? el("div", { class: "section-sub" }, "Effect settings (blank = default)") : null, keys.length ? grid : null,
+    el("div", { class: "btns", style: "margin-top:10px" }, btn, el("span", { class: "muted" }, "Shows what the model is trained on: the condition (left) and the target (right).")), preview);
+}
+
+// ───────────────────────── Setup page: layout ─────────────────────────
+function checkpointDirRow() {
+  const input = el("input", { type: "text", value: S.ckdir, onchange: e => { S.ckdir = e.target.value.trim() || OPT.save_dir; store.set("ckdir", S.ckdir); S.contInfo = null; renderSetup(); } });
+  return el("label", { class: "ctl wide" }, el("span", {}, "Checkpoint folder", el("span", { class: "hint" }, "model.pt, best.pt, config.json and run*/ go here")),
+    el("div", { class: "pathrow" }, input, el("button", { onclick: () => browse({ title: "Checkpoint folder", start: S.ckdir, pick: "folder", onPick: p => { S.ckdir = p; store.set("ckdir", p); S.contInfo = null; renderSetup(); } }) }, "…")));
+}
+function renderSetup() {
+  const page = $("#setupPage");
+  const modeBtns = el("nav", { class: "modes", style: "display:inline-flex" }, [["new", "New run"], ["json", "From config JSON"], ["continue", "Continue"], ["finetune", "Fine-tune"]].map(([k, lab]) =>
+    el("button", { class: S.setupMode === k ? "active" : "", onclick: () => { S.setupMode = k; store.set("setupMode", k); S.check = null; S.checkError = null; renderSetup(); if (k === "new") autoCheck(); if (k === "continue") loadContinueInfo(); if (k === "finetune" && S.fine.source) loadFineInfo(); } }, lab)));
+  const left = el("div", {});
+  const right = el("div", { class: "sticky", id: "summaryBox" }, el("div", { id: "summaryCard" }), el("div", { id: "trainMini" }));
+  left.append(el("div", { class: "card" }, el("div", { class: "btns", style: "justify-content:space-between" }, modeBtns,
+    el("span", { class: "muted" }, { new: "Every prompt of jit5.py's train mode, as a form.", json: "Prepared config / retry: the JSON is used exactly as written.", continue: "Resume model.pt in the checkpoint folder.", finetune: "Start from a checkpoint's weights on (new) data." }[S.setupMode])),
+    el("div", { class: "form-grid", style: "margin-top:10px" }, checkpointDirRow())));
+  if (S.setupMode === "new") {
+    const secs = newRunSections();
+    for (const [title, fields] of secs) {
+      const card = el("div", { class: "card" }, el("h2", {}, title));
+      card.append(fieldGrid(fields, S.form, onFormChange));
+      if (title === "Dataset") {
+        card.append(liveBox(() => S.form.conditioning_mode === "pix2pix" ? "p2p|" + JSON.stringify(S.form.pix2pix_sources) : "",
+                            () => S.form.conditioning_mode === "pix2pix" ? pix2pixCard() : []));
+        card.append(el("div", { id: "dsInfo", style: "margin-top:8px" }, datasetCard()));
+      }
+      left.append(card);
+    }
+    left.append(el("div", { class: "btns" }, el("button", { onclick: () => { if (confirm("Reset every field to the jit5.py defaults?")) { S.form = structuredClone(OPT.defaults); saveForm(); renderSetup(); autoCheck(); } } }, "Reset to defaults")));
+  } else if (S.setupMode === "json") left.append(jsonCard());
+  else if (S.setupMode === "continue") left.append(...continueCards());
+  else left.append(...finetuneCards());
+  page.replaceChildren(el("div", { class: "setup" }, left, right));
+  renderSummary();
+  trainMiniUpdate();
+}
+// Rebuilt only when its content differs, so polling never replaces a button under the pointer.
+function renderSummary() {
+  const box = $("#summaryCard"); if (!box) return;
+  const card = el("div", { class: "card" }, el("h2", {}, "Summary"));
+  const running = ["queued", "preparing", "training", "stopping"].includes(S.train.state);
+  const start = el("button", { class: "primary", disabled: running, onclick: startTraining }, running ? "A run is active" : "Start training");
+  if (S.setupMode === "new" || S.setupMode === "json") {
+    if (S.checkError) card.append(el("div", { class: "warn", style: "margin-bottom:8px" }, S.checkError));
+    if (S.check) {
+      const c = S.check.config, sm = S.check.summary;
+      card.append(kv("Parameters", `${fmtInt(sm.params)} (${(sm.params / 1e6).toFixed(2)} M)`, "Architecture", (MODEL[c.model_type] || {}).name || c.model_type,
+        "Resolution", `${c.width}×${c.height}×${c.channels}`, ...(sm.tokens ? ["Tokens", sm.tokens] : []),
+        "Data", c.conditioning_mode + (c.conditioning_mode === "class" ? ` · ${c.class_names.length} classes` : c.conditioning_mode === "pix2pix" ? ` · ${c.pix2pix_source_mode}` : ""),
+        "Objective", `${c.pred_mode}-pred, ${c.loss_mode}-loss`, "Optimizer", `${(OPTIM[c.optimizer_type] || {}).name || c.optimizer_type} · lr ${fmt(c.lr)}`,
+        "Updates", `${fmtInt(c.steps)} × batch ${c.batch_size}${c.grad_accum_steps > 1 ? " × " + c.grad_accum_steps : ""}`,
+        "Validation", c.validation_path ? "folder" : c.validation_percent ? c.validation_percent + " %" : "off"));
+      for (const n of S.check.notes) card.append(el("div", { class: "muted", style: "margin-top:4px" }, n));
+      card.append(el("div", { class: "okmsg", style: "margin-top:6px" }, "✓ Configuration is valid"));
+    } else if (!S.checkError) card.append(el("div", { class: "muted" }, "Checking…"));
+    card.append(el("div", { class: "btns", style: "margin-top:12px" }, start, el("button", { onclick: () => runCheck(false) }, "Check"),
+      el("button", { disabled: !S.check, onclick: saveConfigAs }, "Save config JSON…"),
+      S.setupMode === "new" ? el("button", { disabled: !S.check, onclick: () => { S.jsonText = JSON.stringify(S.check.config, null, 2); store.set("jsonText", S.jsonText); S.setupMode = "json"; store.set("setupMode", "json"); renderSetup(); } }, "Edit as JSON") : null));
+  } else if (S.setupMode === "continue") {
+    const i = S.contInfo;
+    if (!i) card.append(el("div", { class: "muted" }, "No resumable model.pt loaded."));
+    else if (i.error) card.append(el("div", { class: "warn" }, i.error));
+    else card.append(kv("Checkpoint", i.path, "Completed", fmtInt(i.completed_steps) + " updates", "Planned", fmtInt(i.completed_steps + (S.cont.extra_steps ?? Math.max(1, i.config.steps - i.completed_steps))) + " updates",
+      "Architecture", (MODEL[i.config.model_type] || {}).name, "Optimizer", (OPTIM[i.config.optimizer_type] || {}).name, "Best", i.best && i.best.score != null ? `${fmt(i.best.score)} @ ${i.best.step} (${i.best.metric})` : "–"));
+    card.append(el("div", { class: "btns", style: "margin-top:12px" }, start));
+  } else {
+    const i = S.fineInfo;
+    if (!i) card.append(el("div", { class: "muted" }, "Choose a source checkpoint."));
+    else if (i.error) card.append(el("div", { class: "warn" }, i.error));
+    else card.append(kv("Source", i.path, "Kind", i.kind, "Architecture", (MODEL[i.config.model_type] || {}).name, "Trained on", i.config.dataset_path,
+      "Writes to", `${S.ckdir}/model.pt`));
+    card.append(el("div", { class: "warn", style: "margin-top:8px" }, `Like the CLI, this overwrites ${S.ckdir}/model.pt. Pick another checkpoint folder above to keep it.`));
+    card.append(el("div", { class: "btns", style: "margin-top:12px" }, start));
+  }
+  if (box.firstChild && box.firstChild.outerHTML === card.outerHTML) return;
+  keepScroll(() => box.replaceChildren(card));
+}
+function trainMiniUpdate() {
+  const box = $("#trainMini"); if (!box) return;
+  const t = S.train;
+  box.hidden = t.state === "idle";
+  if (box.hidden) return;
+  if (!box.firstChild) box.append(el("div", { class: "card" }, el("h2", {}, "Current run", el("span", { class: "grow" }), el("span", { class: "state", "data-r": "state" })),
+    el("div", { class: "progress" }, el("div", { "data-r": "bar" })), el("div", { class: "muted", "data-r": "text" }),
+    el("div", { class: "btns", style: "margin-top:8px" }, el("button", { onclick: () => showPage("monitor") }, "Open monitor"))));
+  const q = r => box.querySelector(`[data-r="${r}"]`);
+  q("state").className = "state " + t.state; setText(q("state"), t.state);
+  q("bar").style.width = `${t.total ? 100 * t.completed / t.total : 0}%`;
+  setText(q("text"), `${fmtInt(t.completed)} / ${fmtInt(t.total)} updates`);
+}
+function parseJson() {
+  try { return JSON.parse(S.jsonText); } catch (e) { throw new Error("Invalid JSON: " + e.message); }
+}
+function jsonCard() {
+  const ta = el("textarea", { rows: 28, spellcheck: "false", value: S.jsonText, oninput: e => { S.jsonText = e.target.value; store.set("jsonText", S.jsonText); S.check = null; autoCheck(); } });
+  return el("div", { class: "card" }, el("h2", {}, "Configuration JSON"),
+    el("p", { class: "note" }, "Load a prepared config, or the previous run's config for a retry (fresh weights, no optimizer state). Every field is editable; geometry fields must stay consistent. Booleans must be true/false."),
+    el("div", { class: "btns", style: "margin-bottom:8px" },
+      el("button", { onclick: async () => { try { const r = await api("/api/config/previous", { checkpoint_dir: S.ckdir }); S.jsonText = JSON.stringify(r.config, null, 2); S.jsonPath = r.path; store.set("jsonText", S.jsonText); renderSetup(); runCheck(); } catch (e) { toast(e.message); } } }, "Load previous config (retry)"),
+      el("button", { onclick: () => browse({ title: "Config JSON", start: OPT.cwd, pick: "file", kinds: ["json"], onPick: async p => { try { const r = await api("/api/config/load", { path: p }); S.jsonText = JSON.stringify(r.config, null, 2); S.jsonPath = r.path; store.set("jsonText", S.jsonText); renderSetup(); runCheck(); } catch (e) { toast(e.message); } } }) }, "Open JSON file…"),
+      S.jsonPath ? el("span", { class: "muted" }, S.jsonPath) : null),
+    ta);
+}
+async function saveConfigAs() {
+  const path = prompt("Save config as (.json path)", `${S.ckdir}/prepared.json`);
+  if (!path) return;
+  try { const r = await api("/api/config/save", { path, config: S.check.config }); toast("Saved " + r.path, true); } catch (e) { toast(e.message); }
+}
+
+// ───────────────────────── Setup page: continue / fine-tune ─────────────────────────
+async function loadContinueInfo() {
+  try { S.contInfo = await api("/api/checkpoint/info", { path: `${S.ckdir}/model.pt` }); if (S.contInfo.completed_steps == null) S.contInfo = { error: "model.pt holds no optimizer state; it cannot be resumed." }; }
+  catch (e) { S.contInfo = { error: e.message }; }
+  whenNotTyping(() => keepScroll(renderSetup));
+}
+function continueCards() {
+  const i = S.contInfo, c = S.cont;
+  if (!i) { loadContinueInfo(); return [el("div", { class: "card muted" }, "Loading checkpoint…")]; }
+  if (i.error) return [el("div", { class: "card" }, el("div", { class: "warn" }, i.error), el("div", { class: "btns", style: "margin-top:8px" }, el("button", { onclick: loadContinueInfo }, "Retry")))];
+  const cfg = i.config, change = () => { store.set("cont", c); renderSummary(); };
+  const rebuild = change;  // field grids refresh themselves
+  c.optimizer = c.optimizer || {}; c.settings = c.settings || {}; c.features = c.features || {};
+  const cards = [];
+  if (i.legacy_class_sampling) cards.push(el("div", { class: "card warn" }, "This class checkpoint predates uniform class sampling: the data stream restarts (weights and optimizer are kept)."));
+  cards.push(el("div", { class: "card" }, el("h2", {}, "Data"), fieldGrid([
+    { key: "dataset_path", label: "Dataset folder", type: "path", ph: () => cfg.dataset_path },
+    { key: "reset_stream", label: "Reset data stream (changed files / transforms)", type: "bool" },
+  ], c, rebuild), el("p", { class: "note", style: "margin-top:8px" }, "A different dataset folder always starts a new data stream.")));
+  cards.push(el("div", { class: "card" }, el("h2", {}, "Schedule"), fieldGrid([
+    { key: "extra_steps", label: "Additional training steps", type: "int", ph: () => Math.max(1, cfg.steps - i.completed_steps) },
+    { key: "batch_size", label: "Batch size", type: "int", ph: () => cfg.batch_size },
+    { key: "lr", label: cfg.lr_schedule === "cosine" && i.completed_steps >= cfg.warmup_steps ? "Resume LR (cosine continues)" : "Learning rate", type: "num", ph: () => i.resume_lr },
+  ], c, change)));
+  const og = i.optimizer_group, bounds = i.optimizer_bounds;
+  const optFields = Object.keys(bounds).map(k => ({ key: k, label: k.replace(/_/g, " "), type: "num", ph: () => og[k] }));
+  const optCard = el("div", { class: "card" }, el("h2", {}, "Optimizer", el("span", { class: "pill" }, (OPTIM[cfg.optimizer_type] || {}).name)),
+    el("p", { class: "note" }, "Blank keeps the saved value. Rank, grouping and optimizer type stay fixed."), fieldGrid(optFields, c.optimizer, change));
+  if (og.betas) {
+    optCard.append(el("div", { class: "form-grid", style: "margin-top:10px" }, og.betas.map((b, j) => el("label", { class: "ctl" }, el("span", {}, `β${j + 1}`),
+      el("input", { type: "text", placeholder: String(b), value: c.optimizer.betas ? String(c.optimizer.betas[j]) : "", onchange: e => { const vals = og.betas.map((d, k) => k === j ? (e.target.value.trim() === "" ? d : Number(e.target.value)) : (c.optimizer.betas ? c.optimizer.betas[k] : d)); c.optimizer.betas = vals.every((v, k) => v === og.betas[k]) ? null : vals; change(); } })))));
+  }
+  if (OPT.muon_family.includes(cfg.optimizer_type)) optCard.append(el("div", { style: "margin-top:10px" }, fieldGrid([
+    { key: "muon_backend", label: "Orthogonalization", type: "select", options: [["", "keep"], ["polar_express", "Polar Express"], ["newton_schulz", "Newton–Schulz"]] },
+    { key: "cautious", label: "Cautious updates", type: "bool", ph: () => !!cfg.cautious },
+    { key: "fallback_lr", label: "AdamW fallback LR", type: "num", show: () => !cfg.muon_all, ph: () => cfg.lr * (cfg.muon_adam_lr_ratio ?? 1) },
+  ], c.optimizer, change)));
+  cards.push(optCard);
+  const s = c.settings;
+  const settingFields = [
+    { key: "grad_clip", label: "Gradient clip norm", type: "num", ph: () => cfg.grad_clip },
+    { key: "sample_every", label: "Preview every N steps", type: "int", ph: () => cfg.sample_every },
+    { key: "save_every", label: "Checkpoint every N steps", type: "int", ph: () => cfg.save_every },
+    { key: "sampling_steps", label: "Preview solver steps", type: "int", ph: () => cfg.sampling_steps },
+    { key: "preview_batch_size", label: "Preview batch size", type: "int", ph: () => cfg.preview_batch_size },
+    { key: "preview_seed", label: "Preview seed", type: "int", ph: () => cfg.preview_seed },
+    { key: "num_sample_images", label: "Preview image count", type: "int", ph: () => cfg.num_sample_images },
+    { key: "guidance_scale", label: "Preview guidance", type: "num", show: () => cfg.conditioning_mode === "class" && cfg.class_dropout_prob > 0, ph: () => cfg.guidance_scale },
+    { key: "compile_mode", label: "torch.compile", type: "select", options: () => OPT.compile_modes.map(m => [m, m]), ph: () => cfg.compile_mode },
+    { key: "use_spike_guard", label: "Skip loss/gradient spikes", type: "bool", ph: () => cfg.use_spike_guard },
+    { key: "use_flip", label: "Random horizontal flip", type: "bool", ph: () => cfg.use_flip },
+    { key: "use_vflip", label: "Random vertical flip", type: "bool", ph: () => cfg.use_vflip },
+    { key: "use_rot90", label: "Random 90° rotations", type: "bool", ph: () => cfg.use_rot90 },
+  ];
+  cards.push(el("div", { class: "card" }, el("h2", {}, "Training & preview settings"), fieldGrid(settingFields, s, change)));
+  cards.push(featuresCard(c.features, cfg, rebuild));
+  return cards;
+}
+function featuresCard(obj, cfg, onChange) {
+  const view = new Proxy(obj, { get: (o, k) => (k in o && o[k] != null) ? o[k] : cfg[k], set: (o, k, v) => { o[k] = v; return true; }, has: (o, k) => true });
+  const fields = FEATURE_FIELDS().map(f => ({ ...f, ph: () => cfg[f.key] }));
+  return el("div", { class: "card" }, el("h2", {}, "Validation, best weights & accumulation"), fieldGrid(fields, view, onChange));
+}
+async function loadFineInfo() {
+  S.fineInfo = null; S.fineModules = null;
+  try { S.fineInfo = await api("/api/checkpoint/info", { path: S.fine.source }); } catch (e) { S.fineInfo = { error: e.message }; }
+  whenNotTyping(() => keepScroll(renderSetup));
+}
+function finetuneCards() {
+  const c = S.fine, i = S.fineInfo;
+  c.features = c.features || {};
+  const change = () => { store.set("fine", c); renderSummary(); };
+  const rebuild = change;  // field grids refresh themselves
+  const src = el("div", { class: "card" }, el("h2", {}, "Source checkpoint"), fieldGrid([
+    { key: "source", label: "Checkpoint (.pt)", type: "path", pick: "file", kinds: ["checkpoint"] },
+  ], c, () => { change(); loadFineInfo(); }));
+  if (!i || i.error) return [src];
+  const cfg = i.config;
+  const cards = [src, el("div", { class: "card" }, el("h2", {}, "Fine-tuning"), fieldGrid([
+    { key: "dataset_path", label: "Fine-tuning dataset", type: "path", ph: () => cfg.dataset_path },
+    { key: "lr", label: "Learning rate", type: "num", ph: () => cfg.lr * 0.1 },
+    { key: "steps", label: "Update count", type: "int", ph: () => cfg.steps },
+    { key: "warmup_steps", label: "Warmup updates", type: "int", ph: () => Math.min(100, c.steps ?? cfg.steps) },
+    { key: "weights", label: "Source weights", type: "select", options: () => i.weights.map(w => [w, w === "ema" ? "EMA" : "model"]) },
+    { key: "policy", label: "Trainable parameters", type: "select", options: [["all", "all"], ["last", "last blocks + output"], ["modules", "chosen modules"]] },
+    { key: "last_blocks", label: "Last blocks to train", type: "int", show: f => f.policy === "last", ph: () => 1 },
+  ], c, rebuild))];
+  cards.push(liveBox(() => c.policy === "modules" ? "modules" : "", () => c.policy === "modules" ? modulesCard() : []));
+  cards.push(featuresCard(c.features, cfg, rebuild));
+  return cards;
+}
+function modulesCard() {
+  const c = S.fine;
+  const pill = el("span", { class: "pill" }, `${c.modules.length} selected`);
+  const counted = () => { setText(pill, `${c.modules.length} selected`); renderSummary(); };
+  if (!S.fineModules && !S.fineModulesLoading) {
+    S.fineModulesLoading = true;
+    api("/api/checkpoint/modules", { path: c.source }).then(r => { S.fineModules = r.modules; refreshLive(); })
+      .catch(e => toast(e.message)).finally(() => { S.fineModulesLoading = false; });
+  }
+  const list = liveBox(() => `${!!S.fineModules}|${S.modFilter}`, () => {
+    if (!S.fineModules) return el("div", { class: "muted", style: "padding:4px 8px" }, "Listing modules…");
+    const chosen = new Set(c.modules), q = S.modFilter.toLowerCase();
+    return S.fineModules.filter(m => !q || m.name.toLowerCase().includes(q)).slice(0, 600).map(m => el("label", { style: `padding-left:${8 + m.depth * 14}px` },
+      el("input", { type: "checkbox", checked: chosen.has(m.name), onchange: e => {
+        const set = new Set(c.modules); e.target.checked ? set.add(m.name) : set.delete(m.name);
+        c.modules = [...set]; store.set("fine", c); patterns.value = c.modules.join(", "); counted();
+      } }),
+      m.name, el("span", { class: "muted" }, `${m.type} · ${fmtInt(m.params)}`)));
+  }, "div", { class: "modlist" });
+  const refilter = debounce(() => list.refresh(), 200);
+  const filter = el("input", { type: "text", placeholder: "filter, e.g. layers.3", value: S.modFilter, oninput: e => { S.modFilter = e.target.value; refilter(); } });
+  const patterns = el("input", { type: "text", placeholder: "or type patterns: a.*, b", value: c.modules.join(", "), onchange: e => {
+    c.modules = e.target.value.split(",").map(x => x.trim()).filter(Boolean); store.set("fine", c); counted(); list.refresh(true);
+  } });
+  return el("div", { class: "card" }, el("h2", {}, "Trainable modules", pill),
+    el("div", { class: "pathrow", style: "margin-bottom:6px" }, filter, patterns), list,
+    el("p", { class: "note", style: "margin-top:6px" }, "A module trains with everything inside it. Patterns use shell wildcards (fnmatch)."));
+}
+
+async function startTraining() {
+  let spec;
+  try {
+    if (S.setupMode === "new") spec = { mode: "new", form: S.form };
+    else if (S.setupMode === "json") spec = { mode: "new", config: parseJson() };
+    else if (S.setupMode === "continue") {
+      const c = S.cont, blank = o => Object.fromEntries(Object.entries(o || {}).filter(([, v]) => v !== null && v !== ""));
+      spec = { mode: "continue", dataset_path: c.dataset_path || null, reset_stream: !!c.reset_stream,
+        resume: { extra_steps: c.extra_steps, batch_size: c.batch_size, lr: c.lr, optimizer: blank(c.optimizer), settings: blank(c.settings), features: blank(c.features) } };
+    } else {
+      const c = S.fine;
+      if (c.policy === "modules" && !c.modules.length) return toast("Choose at least one trainable module.");
+      spec = { mode: "finetune", source: c.source, dataset_path: c.dataset_path || null, lr: c.lr, steps: c.steps, warmup_steps: c.warmup_steps,
+        policy: c.policy || "all", last_blocks: c.last_blocks, modules: c.modules, weights: c.weights || null, features: c.features };
+    }
+    spec.checkpoint_dir = S.ckdir;
+    await api("/api/train/start", spec);
+    S.train = { state: "queued", points: [], val: [], logs: [], previews: [], info: {} }; S.since = 0; S.logSince = 0; S.view = "live";
+    toast("Training started", true);
+    showPage("monitor");
+    pollTrain();
+  } catch (e) { toast(e.message); }
+}
+
+// ───────────────────────── Monitor page ─────────────────────────
+let pollTimer = null;
+async function pollTrain() {
+  clearTimeout(pollTimer);
+  try {
+    const r = await api("/api/train/status", { since: S.since, log_since: S.logSince });
+    const t = S.train;
+    const key = r.run_dir + "|" + (r.info && r.info.start_step);
+    if (r.total_points < S.since || (S.runKey && key !== S.runKey && r.run_dir)) { S.since = 0; S.logSince = 0; S.runKey = key; t.points = []; t.logs = []; return pollTrain(); }
+    S.runKey = key;
+    t.points.push(...r.points); S.since = r.total_points;
+    t.logs.push(...r.logs); S.logSince = r.log_total;
+    Object.assign(t, { state: r.state, error: r.error, detail: r.detail, val: r.val, previews: r.previews, info: r.info, run_dir: r.run_dir, completed: r.completed, total: r.total, skips: r.skips, best: r.best, elapsed: r.elapsed });
+    const now = performance.now(); t.rate = t.rate || []; t.rate.push([now, r.completed]); t.rate = t.rate.filter(([ts]) => now - ts < 30000);
+    $("#runBadge").textContent = ["queued", "preparing", "training", "stopping"].includes(r.state) ? `● training ${fmtInt(r.completed)}/${fmtInt(r.total)}` : "";
+    if (S.page === "monitor" && S.view === "live") updateMonitor();
+    if (S.page === "setup") { trainMiniUpdate(); renderSummary(); }
+    if (S.page === "sample") updateSample();
+  } catch (e) { /* server restarting */ }
+  const active = ["queued", "preparing", "training", "stopping"].includes(S.train.state);
+  pollTimer = setTimeout(pollTrain, active ? 1000 : 5000);
+}
+// Long runs: draw at most ~n points per series (bucket means keep the curve's shape).
+function thin(points, n = 3000) {
+  if (points.length <= n) return points;
+  const k = Math.ceil(points.length / n), out = [];
+  for (let i = 0; i < points.length; i += k) {
+    const chunk = points.slice(i, i + k), row = [chunk.at(-1)[0]];
+    for (let j = 1; j < chunk[0].length; j++) {
+      let sum = 0, cnt = 0;
+      for (const r of chunk) if (r[j] != null && Number.isFinite(r[j])) { sum += r[j]; cnt++; }
+      row.push(cnt ? sum / cnt : null);
+    }
+    out.push(row);
+  }
+  return out;
+}
+// Three charts created once; draw() repaints their canvases in place.
+function makeCharts(host, lossTitle = "Loss") {
+  const lossC = new Chart(host, { title: lossTitle, sub: "per update, EMA 0.99 and validation", height: 260 });
+  const lrHost = el("div", {}), gnHost = el("div", {});
+  host.append(el("div", { class: "two" }, lrHost, gnHost));
+  const lrC = new Chart(lrHost, { title: "Learning rate", height: 160 });
+  const gnC = new Chart(gnHost, { title: "Gradient norm", sub: "before clipping", height: 160 });
+  let last = [[], []];
+  const draw = (points = last[0], val = last[1]) => {
+    last = [points, val];
+    const p = thin(points), xs = p.map(r => r[0]);
+    drawSeries(lossC, { logY: S.logY, yLabel: "loss", series: [
+      { name: "train loss", x: xs, y: p.map(r => r[1]), color: css("--muted"), width: 1, alpha: .45 },
+      { name: "EMA", x: xs, y: p.map(r => r[2]), color: css("--s1"), width: 2 },
+      { name: "validation", x: val.map(v => v[0]), y: val.map(v => v[1]), color: css("--s2"), width: 2, dots: true },
+    ] });
+    drawSeries(lrC, { yLabel: "lr", series: [{ name: "lr", x: xs, y: p.map(r => r[3]), color: css("--s3"), width: 2 }] });
+    drawSeries(gnC, { yLabel: "norm", logY: S.logY, series: [{ name: "grad norm", x: xs, y: p.map(r => r[4]), color: css("--s7"), width: 1.5 }] });
+  };
+  return { draw };
+}
+// Preview-grid viewer; set(list) updates it in place and follows the newest grid unless the slider was moved back.
+function previewViewer() {
+  let list = [], idx = null, shown = null;
+  const img = el("img", { alt: "preview grid" });
+  const label = el("span", { class: "pill" });
+  const range = el("input", { type: "range", min: 0, max: 0, value: 0 });
+  const empty = el("div", { class: "empty" }, "No preview grids yet. One is saved every “Preview every N steps”.");
+  const wrap = el("div", {}, el("div", { class: "bar" }, label, range, el("button", { onclick: () => { idx = null; show(); } }, "Latest")), img);
+  const box = el("div", { class: "preview" }, empty, wrap);
+  function show() {
+    empty.hidden = !!list.length; wrap.hidden = !list.length;
+    if (!list.length) return;
+    const i = idx == null ? list.length - 1 : Math.min(idx, list.length - 1);
+    range.max = list.length - 1;
+    if (document.activeElement !== range) range.value = i;
+    setText(label, `step ${fmtInt(list[i].step)} · ${i + 1}/${list.length}`);
+    const path = list[i].path;
+    if (path === shown) return;
+    shown = path;
+    const next = new Image();  // swap only once loaded: the old grid keeps its space meanwhile
+    next.onload = () => { if (shown === path) img.src = next.src; };
+    next.src = imgUrl(path);
+  }
+  range.oninput = e => { const v = +e.target.value; idx = v === list.length - 1 ? null : v; show(); };
+  box.set = l => { list = l || []; show(); };
+  return box;
+}
+let M = null;  // the monitor page's live elements
+function renderMonitor() {
+  const page = $("#monitorPage");
+  const viewSel = el("select", { onchange: e => { S.view = e.target.value; if (S.view !== "live") loadRun(S.view); else renderMonitor(); } },
+    el("option", { value: "live", selected: S.view === "live" }, "Current run (live)"),
+    (S.runs ? S.runs.runs : []).filter(r => r.has_metrics || r.previews).map(r => el("option", { value: r.path, selected: S.view === r.path }, `${r.name}${r.last_step ? " · " + fmtInt(r.last_step) + " steps" : ""}${r.previews ? " · " + r.previews + " previews" : ""}`)));
+  const logToggle = el("label", { class: "ctl check", style: "padding:0" }, el("input", { type: "checkbox", checked: S.logY, onchange: e => { S.logY = e.target.checked; store.set("logY", S.logY); M && M.redraw(); } }), "log scale");
+  const stop = el("button", { class: "danger", onclick: stopTraining }, "Stop & save");
+  const head = el("div", { class: "card" }, el("div", { class: "btns", style: "justify-content:space-between" },
+    el("div", { class: "btns" }, viewSel, el("button", { onclick: refreshRuns }, "Refresh runs"), logToggle), stop));
+  if (S.view !== "live") {
+    stop.hidden = true;
+    M = { redraw: () => {} };
+    page.replaceChildren(head, runViewBody());
+    return;
+  }
+  const r = {};
+  const stat = (lab, key) => el("div", { class: "stat" }, el("div", { class: "lab" }, lab), r[key] = el("div", { class: "val" }, "–"));
+  const status = el("div", { class: "card" },
+    el("h2", {}, "Training", r.state = el("span", { class: "state" }), r.detail = el("span", { class: "muted", style: "text-transform:none;letter-spacing:0" })),
+    r.error = el("div", { class: "warn", style: "margin-bottom:8px" }),
+    el("div", { class: "progress" }, r.bar = el("div", {})),
+    el("div", { class: "stats" }, stat("Updates", "updates"), stat("Loss (EMA)", "loss"), stat("Validation", "val"), stat("Best", "best"),
+      stat("Learning rate", "lr"), stat("Speed", "speed"), stat("Elapsed", "elapsed"), stat("Remaining", "remaining"), stat("Skipped spikes", "skips")),
+    r.info = el("div", { class: "muted", style: "margin-top:8px" }));
+  const chartsCard = el("div", { class: "card" });
+  const preview = previewViewer();
+  const log = el("div", { class: "log" });
+  const body = el("div", {}, status, el("div", { class: "two" }, chartsCard,
+    el("div", {}, el("div", { class: "card" }, el("h2", {}, "Preview grids", el("span", { class: "pill" }, "fixed seed, EMA weights")), preview),
+      el("div", { class: "card" }, el("h2", {}, "Log"), log))));
+  const empty = el("div", { class: "card empty" }, "No training run in this session. Start one on the Setup page, or pick a previous run above.");
+  page.replaceChildren(head, empty, body);
+  const charts = makeCharts(chartsCard);
+  M = { r, stop, body, empty, charts, preview, log, logCount: 0, redraw: () => charts.draw() };
+  updateMonitor();
+}
+function updateMonitor() {
+  if (!M || !M.r) return;
+  const t = S.train, r = M.r, idle = t.state === "idle";
+  M.empty.hidden = !idle; M.body.hidden = idle;
+  M.stop.hidden = !["preparing", "training", "queued"].includes(t.state);
+  if (idle) return;
+  r.state.className = "state " + t.state; setText(r.state, t.state);
+  setText(r.detail, t.detail); setText(r.error, t.error); r.error.hidden = !t.error;
+  r.bar.style.width = `${t.total ? 100 * t.completed / t.total : 0}%`;
+  const rate = t.rate && t.rate.length > 1 ? (t.rate.at(-1)[1] - t.rate[0][1]) / ((t.rate.at(-1)[0] - t.rate[0][0]) / 1000) : null;
+  const last = t.points.at(-1), cfg = (t.info || {}).config || {};
+  setText(r.updates, `${fmtInt(t.completed)} / ${fmtInt(t.total)}`);
+  setText(r.loss, last ? fmt(last[2]) : "–");
+  setText(r.val, t.val.length ? fmt(t.val.at(-1)[1]) : "–");
+  setText(r.best, t.best != null ? fmt(t.best) : "–");
+  setText(r.lr, last ? fmt(last[3]) : "–");
+  setText(r.speed, rate ? `${rate.toFixed(2)} upd/s` : "–");
+  setText(r.elapsed, fmtDur(t.elapsed));
+  setText(r.remaining, rate > 0 && t.state === "training" ? fmtDur((t.total - t.completed) / rate) : "–");
+  setText(r.skips, fmtInt(t.skips || 0));
+  setText(r.info, t.info && t.info.output_dir ? `${(MODEL[cfg.model_type] || {}).name || cfg.model_type || ""} · ${fmtInt(t.info.params)} trainable parameters · output ${t.info.output_dir}` : "");
+  M.charts.draw(t.points, t.val);
+  M.preview.set(t.previews);
+  if (t.logs.length < M.logCount) { M.log.replaceChildren(); M.logCount = 0; }
+  if (t.logs.length > M.logCount) {
+    const atBottom = M.log.scrollHeight - M.log.scrollTop - M.log.clientHeight < 30;
+    M.log.append(...t.logs.slice(M.logCount).map(l => el("div", { class: "k-" + l.kind }, l.message)));
+    M.logCount = t.logs.length;
+    while (M.log.childElementCount > 600) M.log.firstChild.remove();
+    if (atBottom) M.log.scrollTop = M.log.scrollHeight;  // scrolls the log box only, never the page
+  }
+}
+async function stopTraining() {
+  if (!confirm("Stop after the current update and save the checkpoint?")) return;
+  try { await api("/api/train/stop"); toast("Stopping after the current update…", true); pollTrain(); } catch (e) { toast(e.message); }
+}
+async function refreshRuns() {
+  try { S.runs = await api("/api/runs", { checkpoint_dir: S.ckdir }); } catch (e) { toast(e.message); }
+  if (S.page === "monitor") renderMonitor();
+  if (S.page === "sample") renderSample();
+}
+async function loadRun(path) {
+  S.runView = null; renderMonitor();
+  try { S.runView = await api("/api/run", { path }); } catch (e) { S.runView = { error: e.message }; }
+  if (S.view === path) renderMonitor();
+}
+function runViewBody() {
+  const r = S.runView;
+  if (!r) return el("div", { class: "card muted" }, "Loading…");
+  if (r.error) return el("div", { class: "card warn" }, r.error);
+  const chartsCard = el("div", { class: "card" });
+  const preview = previewViewer();
+  const right = el("div", {}, el("div", { class: "card" }, el("h2", {}, "Preview grids"), preview));
+  if (r.generated && r.generated.length) right.append(el("div", { class: "card" }, el("h2", {}, "Generated images", el("span", { class: "pill" }, r.generated.length)),
+    el("div", { class: "gallery", style: "--tile:96px" }, r.generated.slice(0, 120).map(p => el("figure", {}, el("img", { src: imgUrl(p, 256), loading: "lazy" }), el("figcaption", {}, p.split("/").at(-1)))))));
+  if (r.spikes && r.spikes.length) right.append(el("div", { class: "card" }, el("h2", {}, "Spike guard events"), el("div", { class: "log" }, r.spikes.map(x => el("div", { class: "k-spike" }, x)))));
+  const node = el("div", {}, el("div", { class: "muted", style: "margin-bottom:8px" }, r.path), el("div", { class: "two" }, chartsCard, right));
+  // Charts measure their width, so draw them once the node is in the page.
+  requestAnimationFrame(() => {
+    preview.set(r.previews || []);
+    if (r.points) { const charts = makeCharts(chartsCard, `Loss · ${r.name}`); charts.draw(r.points, r.val || []); M.redraw = () => charts.draw(); }
+    else chartsCard.append(el("div", { class: "empty" }, "No metrics.csv in this folder (a sampling run)."));
+  });
+  return node;
+}
+
+// ───────────────────────── Sample page ─────────────────────────
+function renderSample() {
+  const page = $("#samplePage");
+  const s = S.sample, info = S.sinfo;
+  const ckptRows = [];
+  if (S.runs) for (const c of S.runs.checkpoints) ckptRows.push(c);
+  const pick = el("div", { class: "card" }, el("h2", {}, "Checkpoint"),
+    el("div", { class: "btns" }, ckptRows.map(c => el("button", { class: info && info.checkpoint === c.path ? "primary" : "", onclick: () => loadSampler(c.path) }, `${c.name} · ${new Date(c.mtime * 1000).toLocaleString()}`)),
+      el("button", { onclick: () => browse({ title: "Checkpoint", start: S.ckdir, pick: "file", kinds: ["checkpoint"], onPick: loadSampler }) }, "Other checkpoint…"),
+      el("button", { onclick: refreshRuns }, "Refresh")),
+    info ? el("div", { style: "margin-top:10px" }, kv("File", info.checkpoint, "Weights", info.weights, "Architecture", (MODEL[info.config.model_type] || {}).name, "Output", `${info.size[0]}×${info.size[1]}×${info.channels}`,
+      "Conditioning", info.conditioning + (info.classes.length ? ` · ${info.classes.length} classes` : ""), "Parameters", fmtInt(info.params), "Device", info.device)) : el("p", { class: "note", style: "margin-top:8px" }, "Load a checkpoint to sample from it."));
+  if (!info) { page.replaceChildren(pick); return; }
+  const change = () => store.set("sample", s);
+  const fields = [
+    { key: "steps", label: "Heun steps", type: "int", ph: () => info.config.sampling_steps },
+    { key: "seed", label: "Seed", type: "int", hint: "0 = random" },
+    { key: "count", label: "Image count", type: "int", show: () => info.conditioning === "unconditional" },
+    { key: "batch_size", label: "Batch size", type: "int" },
+    { key: "guidance_scale", label: "Guidance strength", type: "num", show: () => info.guidance_available, ph: () => info.config.guidance_scale, hint: "1 = unguided" },
+    { key: "x_clip", label: "Predicted-x clipping", type: "select", options: () => [["", `as trained (${info.config.x_clip})`], ["none", "none"], ["static", "static"], ["dynamic", "dynamic"]] },
+    { key: "framing", label: "Large inputs", type: "select", show: () => info.conditioning === "pix2pix", options: [["tile", "tile at training scale"], ["center", "one center window"]] },
+    { key: "combined", label: "Also save combined A|B pairs", type: "bool", show: () => info.conditioning === "pix2pix" },
+    { key: "trajectory", label: "Record denoising trajectory", type: "bool" },
+  ];
+  const settings = el("div", { class: "card" }, el("h2", {}, "Settings"), fieldGrid(fields, s, change));
+  if (info.conditioning === "class") {
+    const counts = s.classes[info.checkpoint] = s.classes[info.checkpoint] || {};
+    settings.append(el("div", { class: "section-sub" }, "Images per class"),
+      el("div", { class: "form-grid" }, [["-1", "random class"], ...info.classes.map((c, i) => [String(i), c])].map(([i, name]) =>
+        el("label", { class: "ctl" }, el("span", {}, name), el("input", { type: "text", inputmode: "numeric", placeholder: "0", value: counts[i] || "", onchange: e => { counts[i] = Math.max(0, parseInt(e.target.value) || 0); change(); } })))),
+      el("div", { class: "btns", style: "margin-top:8px" }, el("button", { onclick: () => { info.classes.forEach((_, i) => counts[i] = 1); change(); renderSample(); } }, "One of each"), el("button", { onclick: () => { for (const k in counts) delete counts[k]; change(); renderSample(); } }, "Clear")));
+  }
+  if (info.conditioning === "pix2pix") {
+    s.inputs = s.inputs || [];
+    settings.append(el("div", { class: "section-sub" }, "Input images or folders"),
+      el("div", { class: "chips" }, s.inputs.map((p, j) => el("span", { class: "chip on", title: p, onclick: () => { s.inputs.splice(j, 1); change(); renderSample(); } }, p.split("/").at(-1) || p, " ✕"))),
+      el("div", { class: "btns", style: "margin-top:8px" },
+        el("button", { onclick: () => browse({ title: "Input image", start: s.inputs.at(-1) || OPT.cwd, pick: "file", kinds: ["image"], onPick: p => { s.inputs.push(p); change(); renderSample(); } }) }, "Add image…"),
+        el("button", { onclick: () => browse({ title: "Input folder", start: s.inputs.at(-1) || OPT.cwd, pick: "folder", onPick: p => { s.inputs.push(p); change(); renderSample(); } }) }, "Add folder…")));
+  }
+  const R = { nRes: 0, nFilm: 0 };
+  R.gen = el("button", { class: "primary", onclick: startSampling }, "Generate");
+  R.stop = el("button", { class: "danger", onclick: () => api("/api/sample/stop").catch(e => toast(e.message)) }, "Stop");
+  R.gpu = el("span", { class: "muted" }, "A training run is using the GPU; sampling shares it.");
+  settings.append(el("div", { class: "btns", style: "margin-top:12px" }, R.gen, R.stop, R.gpu));
+  const out = el("div", { class: "card" }, el("h2", {}, "Results", R.state = el("span", { class: "state" }), R.seed = el("span", { class: "pill" }), el("span", { class: "grow" }),
+      el("label", { class: "ctl check", style: "padding:0;text-transform:none;letter-spacing:0" }, "size",
+        el("input", { type: "range", min: 64, max: 384, value: S.tile, oninput: e => { S.tile = +e.target.value; store.set("tile", S.tile); R.gal.style.setProperty("--tile", `${S.tile}px`); } }))),
+    R.err = el("div", { class: "warn" }),
+    R.prog = el("div", {}, el("div", { class: "progress" }, R.bar = el("div", {})), R.progText = el("div", { class: "muted" })),
+    R.filmWrap = el("div", {}, el("div", { class: "section-sub" }, "Denoising trajectory · predicted clean image (first sample)"), R.film = el("div", { class: "film" })),
+    R.galWrap = el("div", {}, R.galSub = el("div", { class: "section-sub" }), R.gal = el("div", { class: "gallery", style: `--tile:${S.tile}px` })),
+    R.empty = el("div", { class: "empty" }, "Generated images appear here and are saved to a new run folder next to the checkpoint."));
+  SM = R;
+  page.replaceChildren(el("div", { class: "two" }, el("div", {}, pick, settings), el("div", {}, out)));
+  updateSample();
+}
+let SM = null;  // the sample page's live elements
+function updateSample() {
+  if (!SM || !$("#samplePage").contains(SM.gal)) return;
+  const st = S.sstatus || {}, running = st.state === "running";
+  SM.gen.disabled = running; setText(SM.gen, running ? "Sampling…" : "Generate");
+  SM.stop.hidden = !running;
+  SM.gpu.hidden = !["queued", "preparing", "training", "stopping"].includes(S.train.state);
+  SM.state.hidden = !st.state; SM.state.className = "state " + (st.state || ""); setText(SM.state, st.state);
+  SM.seed.hidden = !st.seed; setText(SM.seed, st.seed ? `seed ${st.seed}` : "");
+  SM.err.hidden = !st.error; setText(SM.err, st.error);
+  SM.prog.hidden = !st.total;
+  SM.bar.style.width = `${st.total ? 100 * st.done / st.total : 0}%`;
+  setText(SM.progText, st.total ? `${st.done} / ${st.total} images · ${st.output_dir || ""}` : "");
+  const traj = st.trajectory || [];
+  if (traj.length < SM.nFilm) { SM.film.replaceChildren(); SM.nFilm = 0; }
+  SM.film.append(...traj.slice(SM.nFilm).map(f => el("figure", {}, el("img", { src: f.image }), el("figcaption", {}, `step ${f.step}/${f.steps}`))));
+  SM.nFilm = traj.length; SM.filmWrap.hidden = !traj.length;
+  if (S.sresults.length < SM.nRes) { SM.gal.replaceChildren(); SM.nRes = 0; }
+  SM.gal.append(...S.sresults.slice(SM.nRes).map(r => r.error ? el("figure", {}, el("figcaption", { class: "warn" }, `${r.label}: ${r.error}`)) :
+    el("figure", { title: r.path }, r.source ? el("div", { class: "pair" }, el("img", { src: r.source }), el("img", { src: r.image })) : el("img", { src: r.image }),
+      el("figcaption", {}, r.label + (r.windows > 1 ? ` · ${r.windows} tiles` : "")))));
+  SM.nRes = S.sresults.length;
+  SM.galWrap.hidden = !SM.nRes;
+  setText(SM.galSub, st.grid ? "Images (grid saved as generated_grid.png)" : "Images");
+  SM.empty.hidden = !!SM.nRes || running;
+}
+async function loadSampler(path) {
+  try { S.sinfo = await api("/api/sample/load", { path }); toast("Checkpoint loaded", true); } catch (e) { toast(e.message); }
+  renderSample();
+}
+// After a page reload: show the checkpoint and results the server still holds.
+async function reattachSampler() {
+  try {
+    const r = await api("/api/sample/status", { since: 0 });
+    if (!r.checkpoint || S.sinfo) return;
+    S.sinfo = await api("/api/sample/load", { path: r.checkpoint });
+    S.sresults = r.results; S.ssince = r.result_total; S.sstatus = r;
+    if (r.state === "running") pollSample();
+    if (S.page === "sample") renderSample();
+  } catch (e) { /* nothing loaded yet */ }
+}
+let samplePoll = null;
+async function startSampling() {
+  const s = S.sample, info = S.sinfo;
+  const body = { checkpoint: info.checkpoint, steps: s.steps, seed: s.seed, batch_size: s.batch_size, count: s.count, guidance_scale: s.guidance_scale,
+    x_clip: s.x_clip || null, framing: s.framing, combined: s.combined, trajectory: s.trajectory, inputs: s.inputs };
+  if (info.conditioning === "class") body.classes = Object.entries(s.classes[info.checkpoint] || {}).filter(([, n]) => n > 0).map(([i, n]) => ({ index: Number(i), count: n }));
+  try { S.sstatus = await api("/api/sample/start", body); S.sresults = []; S.ssince = 0; updateSample(); pollSample(); } catch (e) { toast(e.message); }
+}
+async function pollSample() {
+  clearTimeout(samplePoll);
+  try {
+    const r = await api("/api/sample/status", { since: S.ssince });
+    S.sresults.push(...r.results); S.ssince = r.result_total; S.sstatus = r;
+    if (S.page === "sample") updateSample();
+    if (r.state === "running") samplePoll = setTimeout(pollSample, 500);
+  } catch (e) { toast(e.message); }
+}
+
+// ───────────────────────── boot ─────────────────────────
+function showPage(p) {
+  S.page = p; store.set("page", p);
+  for (const b of document.querySelectorAll("#modes button")) b.classList.toggle("active", b.dataset.page === p);
+  for (const name of ["setup", "monitor", "sample"]) $(`#${name}Page`).hidden = name !== p;
+  if (p === "setup") renderSetup();
+  if (p === "monitor") { if (!S.runs) refreshRuns(); renderMonitor(); }
+  if (p === "sample") { if (!S.runs) refreshRuns(); if (!S.sinfo) reattachSampler(); renderSample(); }
+}
+function applyTheme(t) { if (t) document.documentElement.setAttribute("data-theme", t); else document.documentElement.removeAttribute("data-theme"); }
+async function boot() {
+  applyTheme(store.get("theme", null));
+  $("#themeBtn").onclick = () => {
+    const dark = document.documentElement.getAttribute("data-theme") === "dark" || (!document.documentElement.getAttribute("data-theme") && matchMedia("(prefers-color-scheme: dark)").matches);
+    const t = dark ? "light" : "dark"; store.set("theme", t); applyTheme(t); showPage(S.page);
+  };
+  try { OPT = await api("/api/options"); } catch (e) { document.body.append(el("div", { class: "empty" }, "Cannot reach the jit5 GUI server: " + e.message)); return; }
+  OPT.models.forEach(m => MODEL[m.key] = m); OPT.optimizers.forEach(o => OPTIM[o.key] = o);
+  S.ckdir = S.ckdir || OPT.save_dir;
+  S.form = { ...structuredClone(OPT.defaults), ...store.get("form", {}) };
+  $("#deviceInfo").textContent = `${OPT.device}${OPT.gpu ? " · " + OPT.gpu : ""} · ${OPT.cwd}`;
+  for (const b of document.querySelectorAll("#modes button")) b.onclick = () => showPage(b.dataset.page);
+  // #setup, #monitor or #sample opens that page; #setup:continue also picks the setup mode
+  const [linked, mode] = location.hash.slice(1).split(":");
+  if (["new", "json", "continue", "finetune"].includes(mode)) S.setupMode = mode;
+  showPage(["setup", "monitor", "sample"].includes(linked) ? linked : S.page);
+  if (S.setupMode === "new") autoCheck();
+  if (S.form.dataset_path) inspectDataset();
+  pollTrain();
+  window.addEventListener("resize", debounce(() => { if (S.page === "monitor" && M) M.redraw(); }, 200));
+}
+boot();
+</script>
+</body>
+</html>
