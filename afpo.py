@@ -773,6 +773,79 @@ def evaluate(t, X, adfs=None, arguments=None, position=None):
         with np.errstate(all="ignore"): return clean(np.sum(parts,axis=0) if t[0]=="seqsum" else np.prod(parts,axis=0))
     return fast_op_eval(t[0],[evaluate(q,X,adfs,arguments,position) for q in t[1:]])
 
+# Numeric guards exist to keep evaluation finite, not to model anything.  A
+# model whose output depends on one is rejected.  Every operator result is
+# clamped to +/-CLIP and several operators clip inputs (pow's exponent, exp,
+# sinh, cosh, tan, ...), and the search learns to use them as hidden min/max:
+# min(x, 17) as -1.34e-11*((x-3.59)*-7.45e10)+3.59 (the product saturates at
+# CLIP exactly when x reaches 17), or a pow of an exp_decay plateau.  Such
+# equations read as something else, break under exact re-evaluation, and
+# depend on the guard constants.  The check evaluates each tree twice in one
+# pass, guarded and with the exact unguarded mathematics, and flags the model
+# when a value reaches the clamp or the two outputs differ beyond round-off
+# relative to the output's spread.  Natural saturation (a steep sigmoid step,
+# exp of a very negative number) changes outputs by ~1e-22 and stays legal.
+# Protected-division/log EPS offsets are standard GP semantics and not checked.
+GUARD_EXPLOIT_CHECK = True
+GUARD_TOLERANCE = 1e-6
+_UNGUARDED = {
+    "pow":lambda x,a: np.sign(x)*np.abs(x)**a[1],
+    "exp":lambda x,a: np.exp(x), "expm1":lambda x,a: np.expm1(x), "10^x":lambda x,a: 10.**x,
+    "exp_decay":lambda x,a: np.exp(-x*a[1]), "gaussian":lambda x,a: np.exp(-x*x),
+    "sigmoid":lambda x,a: 1/(1+np.exp(-x)), "perceptronSigma1":lambda x,a: 1/(1+np.exp(-x)),
+    "perceptronSigma2":lambda x,a: 1/(1+np.exp(-(x+a[1]))),
+    "perceptronCustom1":lambda x,a: x/(1+np.exp(-x)), "perceptronCustom2":lambda x,a: (x+a[1])/(1+np.exp(-(x+a[1]))),
+    "sinh":lambda x,a: np.sinh(x), "cosh":lambda x,a: np.cosh(x), "tan":lambda x,a: np.tan(x),
+}
+_GUARD_CACHE = {}
+class _GuardEngaged(Exception):
+    pass
+def _guard_walk(t, X, adfs, arguments=None, position=None):
+    """(guarded value, exact unguarded value) of a node; raises _GuardEngaged at the value clamp."""
+    if t[0]=="arg":
+        if arguments is None or not isinstance(t[1],int) or not 0<=t[1]<len(arguments): raise ValueError("Invalid ADF argument")
+        return arguments[t[1]]
+    if t[0] in ("x","c"):
+        value=evaluate(t,X,adfs,None,position); return value,value
+    if t[0].startswith("adf_"):
+        item=(adfs or {}).get(t[0])
+        if item is None or len(t)-1!=int(item["arity"]): raise ValueError(f"Unknown or malformed ADF {t[0]!r}")
+        pairs=[_guard_walk(q,X,adfs,arguments,position) for q in t[1:]]
+        return _guard_walk(item["tree"],X,adfs,pairs,position)
+    with np.errstate(all="ignore"):
+        if t[0] in ("seqsum","seqprod"):
+            pairs=[_guard_walk(t[1],X,adfs,arguments,i) for i in range(SEQUENCE_LAYOUT["length"])]
+            reduce=np.sum if t[0]=="seqsum" else np.prod
+            raw=reduce([v for v,_ in pairs],axis=0); exact=reduce([r for _,r in pairs],axis=0)
+        else:
+            pairs=[_guard_walk(q,X,adfs,arguments,position) for q in t[1:]]
+            values=[v for v,_ in pairs]; references=[r for _,r in pairs]
+            raw=np.asarray(_OP_TABLE[t[0]](values[0],values),float)
+            exact=np.asarray(_UNGUARDED.get(t[0],_OP_TABLE[t[0]])(references[0],references),float)
+    value=clean(raw)
+    if np.any(np.abs(value)>=CLIP): raise _GuardEngaged("value_clamp")
+    return value,exact
+def _guard_changes_output(value, exact):
+    spread=float(np.std(value)) if np.size(value)>1 else 0.
+    tolerance=GUARD_TOLERANCE*(spread+1e-9*(1.+np.abs(value)))
+    return bool(np.any(~(np.abs(exact-value)<=tolerance)))
+def guard_engagement(trees, X, adfs=None):
+    """'' when no numeric guard shapes the trees' values on X, else the guard's name."""
+    if not GUARD_EXPLOIT_CHECK: return ""
+    X=np.asarray(X,float); interface=X.__array_interface__
+    key=(tuple(repr(t) for t in trees),adf_signature(trees,adfs),interface["data"][0],X.shape,X.strides)
+    hit=_GUARD_CACHE.get(key)
+    if hit is not None: return hit[0]
+    reason=""
+    try:
+        for tree in trees:
+            value,exact=_guard_walk(tree,X,adfs)
+            if _guard_changes_output(value,exact): reason="input_clip"; break
+    except _GuardEngaged as engaged: reason=str(engaged)
+    if len(_GUARD_CACHE)>=20000: _GUARD_CACHE.clear()
+    _GUARD_CACHE[key]=(reason,X)      # holding X keeps its buffer address from being reused
+    return reason
+
 # Deterministic top-level tree outputs, reused across the many places one
 # generation re-predicts the same trees on the same rows (mutation baselines,
 # behavioral dedup, lexicase, QD cells, serial scoring).  Entries hold the
@@ -1125,7 +1198,9 @@ def fit_tree_constants(tree, X, y, adfs=None, fit_readout=True, iterations=CONST
         if not improved or gain<=1e-10*max(cost,1e-30): break
     if cost>=initial: return tree
     tuned=with_constants(tree,current)
-    return tree if guarded_constant_divisor(tuned) else tuned
+    # A fit that only improves by driving a value into a numeric guard would be
+    # rejected at scoring; keep the untuned constants instead.
+    return tree if guarded_constant_divisor(tuned) or guard_engagement([tuned],X,adfs) else tuned
 
 def _classifier_log_loss(raw, truth, class_count):
     scales=fit_classifier_affine(raw,truth,class_count)
@@ -3213,7 +3288,7 @@ def _lazy_shuffle(items):
         j=rng.randrange(n-i); value=pool[j]; pool[j]=pool[n-i-1]
         yield value
 
-SCALE_BALANCED_SELECTION = False
+SCALE_BALANCED_SELECTION = True    # --scale-balanced-selection (default on since the 2026-09-29 3-seed benchmark)
 SCALE_BALANCE_BINS = 5
 def scale_balanced_row_weights(Y, cats, bins=SCALE_BALANCE_BINS):
     """Selection-only row weights giving every target-magnitude quantile bin
@@ -3537,6 +3612,56 @@ def interpolation_probes(X):
     _INTERPOLATION_PROBE_CACHE[key]=(probes,X)
     return probes
 
+# Memorisation check.  A model can fit the training rows and still be wrong
+# everywhere between them: a short-period mod() sawtooth whose period nearly
+# divides the row spacing looks like a smooth ramp on the training grid (and
+# even at exact midpoints) but is noise anywhere else.  Pair each sampled row
+# with its nearest neighbour (standardised inputs) and probe at a random but
+# fixed fraction of the way between them; random fractions matter, because
+# probes at a fixed fraction of the spacing are aliased along with the grid.
+# Each prediction is measured against the band spanned by the two neighbours'
+# targets (widened by half its width plus INTERPOLATION_BAND_SLACK target
+# scales), and only the *excess* over the model's own miss at those two rows
+# is charged, as a median over probes: a memoriser hits the rows and misses
+# between most of them, an honest model that is wrong somewhere is about as
+# wrong at the rows, a steep but imperfect jump disturbs only the probes that
+# straddle it, and an exactly correct model pays nothing.
+INTERPOLATION_CHECK = True
+INTERPOLATION_CHECK_WEIGHT = 1.
+INTERPOLATION_BAND_SLACK = .05
+_NEIGHBOUR_PROBE_CACHE = {}
+def neighbour_probes(X):
+    """(probe inputs, row indices, neighbour indices) for nearest-neighbour pairs, or None."""
+    if not isinstance(X,np.ndarray) or X.ndim!=2 or len(X)<4: return None
+    key=(X.__array_interface__["data"][0],X.shape,X.strides)
+    cached=_NEIGHBOUR_PROBE_CACHE.get(key)
+    if cached is not None and cached[3] is X: return cached[:3]
+    values=np.asarray(X,float); scale=values.std(axis=0)
+    standard=np.divide(values-values.mean(axis=0),scale,out=np.zeros_like(values),where=scale>EPS)
+    generator=np.random.default_rng(len(X)+7919)
+    rows=generator.choice(len(X),min(INTERPOLATION_PROBES,len(X)),replace=False)
+    distance=np.sum((standard[rows,None,:]-standard[None,:,:])**2,axis=2); distance[distance<=1e-18]=np.inf
+    partner=np.argmin(distance,axis=1); usable=np.isfinite(distance[np.arange(len(rows)),partner])
+    rows,partner=rows[usable],partner[usable]
+    if not len(rows): return None
+    fraction=generator.uniform(.15,.85,len(rows))[:,None]
+    # Few-valued columns (one-hot flags, small codes) are copied, not interpolated.
+    discrete=np.array([len(np.unique(values[:,j]))<=10 for j in range(values.shape[1])])
+    probes=np.where(discrete,values[rows],values[rows]+(values[partner]-values[rows])*fraction)
+    if len(_NEIGHBOUR_PROBE_CACHE)>32: _NEIGHBOUR_PROBE_CACHE.clear()
+    _NEIGHBOUR_PROBE_CACHE[key]=(probes,rows,partner,X)
+    return probes,rows,partner
+def interpolation_band_excess(between, at_left, at_right, left, right, y):
+    """Median excess (in target scales) of the between-neighbour miss over the at-row miss.
+
+    The median charges pervasive misbehaviour (a memoriser misses between
+    most row pairs) but not a steep, slightly misplaced jump, which only
+    disturbs the one or two probes that straddle it."""
+    low=np.minimum(left,right); high=np.maximum(left,right); scale=max(target_scale(y),EPS)
+    slack=.5*(high-low)+INTERPOLATION_BAND_SLACK*scale
+    def miss(prediction): return np.minimum(np.maximum(0.,np.maximum(low-slack-prediction,prediction-high-slack))/scale,1e6)
+    return float(np.median(np.maximum(0.,miss(between)-.5*(miss(at_left)+miss(at_right)))))
+
 def interpolation_excursion(prediction, y):
     """Mean distance (in target spans) by which in-between predictions leave the target envelope."""
     low,high=float(np.min(y)),float(np.max(y)); span=max(high-low,EPS)
@@ -3574,6 +3699,11 @@ def assess(m, X, Y, affine_on, cats, fit_affine=True, constraints=None, output_n
         m.feasible=False; m.invalid_reason=f"adf_evaluation:{error}"; INVALID_DIAGNOSTICS[m.invalid_reason]=INVALID_DIAGNOSTICS.get(m.invalid_reason,0)+1
         extra=len(cats) if constraints is not None and constraints.active else 0
         m.constraint_count=extra; m.objectives=(*(float("inf"),)*(2*len(cats)+extra),float("inf"),m.age); return
+    guard=guard_engagement(m.trees,X,m.adfs)
+    if guard:
+        m.feasible=False; m.invalid_reason=f"numeric_guard:{guard}"; INVALID_DIAGNOSTICS[m.invalid_reason]=INVALID_DIAGNOSTICS.get(m.invalid_reason,0)+1
+        extra=len(cats) if constraints is not None and constraints.active else 0
+        m.constraint_count=extra; m.objectives=(*(float("inf"),)*(2*len(cats)+extra),float("inf"),m.age); return
     targets,_=classification_layout(cats)
     if raw.shape[1] != sum(len(heads) for heads in targets):
         # Same objective layout as the other infeasible paths, or fronts()
@@ -3600,6 +3730,12 @@ def assess(m, X, Y, affine_on, cats, fit_affine=True, constraints=None, output_n
                 try: between=clean(scales[heads[0]][0]*evaluate_cached(m.trees[heads[0]],probes,m.adfs)+scales[heads[0]][1])
                 except (ArithmeticError, IndexError, RecursionError, ValueError): between=np.full(len(probes),CLIP)
                 loss+=interpolation_excursion(between,Y[:,j])
+            local=neighbour_probes(X) if INTERPOLATION_CHECK else None
+            if local is not None:
+                inputs,rows,partner=local
+                try: fitted=clean(scales[heads[0]][0]*evaluate_cached(m.trees[heads[0]],inputs,m.adfs)+scales[heads[0]][1])
+                except (ArithmeticError, IndexError, RecursionError, ValueError): fitted=np.full(len(inputs),CLIP)
+                loss+=INTERPOLATION_CHECK_WEIGHT*interpolation_band_excess(fitted,p[rows],p[partner],Y[rows,j],Y[partner,j],Y[:,j])
             losses.append(loss); shapes.append(shape_error(p,Y[:,j]))
             decoded.append(p)
         elif len(cats[j])>2:
@@ -3839,6 +3975,14 @@ def _select_best(evaluation, loss_tolerance):
         "policy":"loss_tolerance_shortest_mdl","loss_tolerance":loss_tolerance,"best_loss":best_loss,
         "allowed_loss":allowed_loss,"eligible_candidates":len(eligible)}
 
+def constant_selection_warning(model, source):
+    """Explain a recommended model that reads no input column, else None."""
+    if used_feature_indices(model): return None
+    if source=="validation":
+        return ("No candidate that uses the inputs beat a constant on the validation rows, so the recommended model is a constant: "
+                "the search did not find structure that carries over to held-out data (common with tiny validation sets or rules it never found). "
+                "The 'Lowest Training Loss' choice shows the best training fit.")
+    return "The recommended model is a constant: no candidate that uses the inputs fit the training data better."
 def model_options(models, X=None, Y=None, cats=None, loss_tolerance=.01, constraints=None, output_names=(), best_so_far=None, evaluation=None):
     """Return the deduplicated candidates shown when the user saves a model."""
     models=[*models]+([best_so_far] if best_so_far is not None else [])
@@ -3856,6 +4000,14 @@ def model_options(models, X=None, Y=None, cats=None, loss_tolerance=.01, constra
         ("Most Correct Shape",min(entries,key=lambda e:(e[2]["shape"],e[2]["loss"],e[2]["mdl_bits"]))[0]),
         ("Youngest Model",min(entries,key=lambda e:(model_age(e[0]),e[2]["loss"],e[2]["mdl_bits"]))[0]),
     ]
+    selection["warning"]=constant_selection_warning(best,selection["source"])
+    if selection["source"]=="validation":
+        # Validation can reject everything the search found; keep the best
+        # training fit visible (clearly labelled, and second when the default
+        # is a constant) instead of hiding it behind the constant.
+        fit=("Lowest Training Loss (not supported by validation)",min(entries,key=lambda e:(aggregate_loss(e[0]),e[2]["mdl_bits"]))[0])
+        if selection["warning"]: candidates.insert(1,fit)
+        else: candidates.append(fit)
     labels=[]; choices=[]; seen=set()
     for label,model in candidates:
         key=selection_identity(model)
@@ -4868,8 +5020,11 @@ def resume_main(args):
     if not isinstance(bayes,PerOutputBayesianBanks): raise ValueError("Checkpoint predates per-output Bayesian banks and cannot resume; start a new run")
     X,Y,Xt,Yt,Xv,Yv=(state[k] for k in ("X","Y","Xt","Yt","Xv","Yv"))
     names,out_names,cats,maps=(state[k] for k in ("names","out_names","cats","maps"))
-    global SEQUENCE_LAYOUT,EQUIVALENCE_COLLAPSE,RESIDUAL_ARCHIVE,QD_PARENT_CHOICE,SCALE_BALANCED_SELECTION
+    global SEQUENCE_LAYOUT,EQUIVALENCE_COLLAPSE,RESIDUAL_ARCHIVE,QD_PARENT_CHOICE,SCALE_BALANCED_SELECTION,GUARD_EXPLOIT_CHECK
     SEQUENCE_LAYOUT=maps.get(SEQUENCE_LAYOUT_KEY)
+    GUARD_EXPLOIT_CHECK=bool(state.get("numeric_guard_check",False))
+    global INTERPOLATION_CHECK
+    INTERPOLATION_CHECK=bool(state.get("interpolation_check",False))
     # Settings that postdate a checkpoint resume with the behaviour it was searched with.
     RESIDUAL_ARCHIVE=bool(state.get("residual_archive",False)); QD_PARENT_CHOICE=state.get("qd_parent_choice","legacy")
     SCALE_BALANCED_SELECTION=bool(state.get("scale_balanced_selection",False))
@@ -4948,6 +5103,8 @@ def resume_main(args):
     snapshot_islands(state,islands,island_config)
     save_checkpoint(checkpoint_path,generation,islands[0].population,islands[0].bayes,islands[0].archive,state)
     print(f"Resume complete at generation {generation}. {selection['source'].title()} loss-tolerance shortest-MDL model selected: {equations(chosen,names,out_names,cats)}")
+    warning=constant_selection_warning(chosen,selection["source"])
+    if warning: print(f"WARNING: {warning}"); state["selection"]["warning"]=warning
     print(f"{selection['source'].title()} selection scores: mean loss={selection['metrics']['loss']:.6g}, mean shape={selection['metrics']['shape']:.6g}, MDL bits={selection['metrics']['mdl_bits']:.6g}")
     export_model(chosen,names,out_names,cats,maps,state["source_columns"],state["types"],state.get("export_fixture"),state.get("input_ranges")); evaluator.close()
 
@@ -4977,7 +5134,9 @@ def build_arg_parser():
     ap.add_argument("--equivalence-collapse",choices=("on","off"),default="on",help="Treat algebraically equal equations (x+y vs y+x, x+x vs 2*x, x*x vs square(x)) as one candidate in offspring, deduplication and archives (default: on)")
     ap.add_argument("--residual-archive",choices=("on","off"),default="on",help="Keep a third QD archive keyed by where each model errs (target-size bins and input regions), so complementary partial models survive (default: on)")
     ap.add_argument("--qd-parent-choice",choices=QD_PARENT_CHOICES,default="quality_coverage",help="How QD archives pick parent cells beyond the uniform share: success x bounded quality rank x coverage bonus, or legacy success-only (default: quality_coverage)")
-    ap.add_argument("--scale-balanced-selection",choices=("on","off"),default="off",help="Selection-only: give every target-magnitude band equal weight and compare asinh-compressed errors in lexicase parent choice; reported loss is unchanged (default: off)")
+    ap.add_argument("--scale-balanced-selection",choices=("on","off"),default="on",help="Selection-only: give every target-magnitude band equal weight and compare asinh-compressed errors in lexicase parent choice; reported loss is unchanged (default: on)")
+    ap.add_argument("--numeric-guard-check",choices=("on","off"),default="on",help="Reject models whose values depend on afpo's numeric safety guards (the +/-1e12 value clamp, sinh/cosh/tan input clips) instead of letting them use a guard as a hidden min/max (default: on)")
+    ap.add_argument("--interpolation-check",choices=("on","off"),default="on",help="Add a loss term scoring predictions between nearest-neighbour rows against interpolated targets, so equations that only memorise the training rows (e.g. short-period mod sawtooths) lose (default: on)")
     ap.add_argument("--gui",action="store_true",help="Start the browser GUI (training, live Pareto frontier, model explorer) instead of the terminal prompts")
     ap.add_argument("--port",type=int,default=8778,help="Browser GUI port (default: 8778)")
     return ap
@@ -5097,10 +5256,13 @@ def train_from_setup(args, setup, choose_model=None):
 
     ``choose_model(labels, choices, evaluation)`` returns the index of the model
     to save; the default asks at the terminal."""
-    global EQUIVALENCE_COLLAPSE,RESIDUAL_ARCHIVE,QD_PARENT_CHOICE,SCALE_BALANCED_SELECTION
+    global EQUIVALENCE_COLLAPSE,RESIDUAL_ARCHIVE,QD_PARENT_CHOICE,SCALE_BALANCED_SELECTION,GUARD_EXPLOIT_CHECK
     EQUIVALENCE_COLLAPSE=getattr(args,"equivalence_collapse","on")=="on"; EQUIVALENCE_STATS["children_redrawn"]=0
+    GUARD_EXPLOIT_CHECK=getattr(args,"numeric_guard_check","on")=="on"
+    global INTERPOLATION_CHECK
+    INTERPOLATION_CHECK=getattr(args,"interpolation_check","on")=="on"
     RESIDUAL_ARCHIVE=getattr(args,"residual_archive","on")=="on"; QD_PARENT_CHOICE=getattr(args,"qd_parent_choice","quality_coverage")
-    SCALE_BALANCED_SELECTION=getattr(args,"scale_balanced_selection","off")=="on"
+    SCALE_BALANCED_SELECTION=getattr(args,"scale_balanced_selection","on")=="on"
     run_seed=args.seed if args.seed is not None else random.SystemRandom().randrange(2**32)
     rng.seed(run_seed); np.random.seed(run_seed)
     print(f"Run seed: {run_seed}")
@@ -5182,7 +5344,7 @@ def train_from_setup(args, setup, choose_model=None):
                    "stages":{key:stages[key] for key in ("mode","count","interval","age_gap","schedule","threshold_quantile")},
                    "roles":{key:roles[key] for key in ("enabled","interval","mix","retire_after")}},
         "equivalence_collapse":EQUIVALENCE_COLLAPSE,"residual_archive":RESIDUAL_ARCHIVE,"qd_parent_choice":QD_PARENT_CHOICE,"scale_balanced_selection":SCALE_BALANCED_SELECTION,
-        "mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age",
+        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age",
         "test_csv":str(Path(args.test_csv).resolve()) if args.test_csv else None,
     },df,train_indices,validation_indices,external_validation)
     print(f"Run manifest: {manifest_path}")
@@ -5199,7 +5361,7 @@ def train_from_setup(args, setup, choose_model=None):
         "profile":args.profile,"constraint_metadata":metadata,"constraints":constraints.describe(),"bayesian_particles":args.bayesian_particles,"interaction_discovery":interaction_discovery,
         "island_config":{"count":island_count,"migration_interval":migration_interval,"migrants_per_island":migrants_per_island,"topology":"ring","migration_events":0,"stages":stages,"roles":roles},
         "equivalence_collapse":EQUIVALENCE_COLLAPSE,"residual_archive":RESIDUAL_ARCHIVE,"qd_parent_choice":QD_PARENT_CHOICE,"scale_balanced_selection":SCALE_BALANCED_SELECTION,
-        "mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age"}
+        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age"}
     head_count=sum(len(heads) for heads in classification_layout(cats)[0])
     population_sizes=cell_population_sizes(args.population,cell_count)
     islands=[new_island_runtime(size,X=X,Xt=Xt,cats=cats,ops=ops,nodes=nodes,depth=depth,head_count=head_count,
@@ -5262,6 +5424,7 @@ def train_from_setup(args, setup, choose_model=None):
     evaluation=selection_evaluation(f,Xv,Yv,cats,constraints,out_names)
     labels,choices,selection=model_options(f,cats=cats,loss_tolerance=args.selection_loss_tolerance,evaluation=evaluation)
     print_frontier(f,names,out_names,cats,recommendations=(labels,choices),evaluation=evaluation)
+    if selection.get("warning"): print(f"WARNING: {selection['warning']}")
     if len(islands)==1: print(islands[0].archive.stats())
     else: print(f"Island archives: {' | '.join(island.archive.stats() for island in islands)}")
     if EQUIVALENCE_COLLAPSE: print(f"Equivalence collapse: redrew {EQUIVALENCE_STATS['children_redrawn']} offspring equivalent to an existing or sibling equation.")

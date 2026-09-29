@@ -45,10 +45,17 @@ HERE = Path(__file__).resolve().parent
 # name -> setup overrides (and CLI flags) on top of a single-population run.
 CONFIGS = {
     "baseline": {},
+    # Every search default added on 2026-09-29 switched off (the fragment-library
+    # admission fixes have no switch, so this is not the exact earlier code).
+    "pre_session_defaults": {"flags": ["--equivalence-collapse", "off", "--qd-parent-choice", "legacy",
+                                       "--residual-archive", "off", "--scale-balanced-selection", "off",
+                                       "--numeric-guard-check", "off", "--interpolation-check", "off"]},
+    "no_scale_balance": {"flags": ["--scale-balanced-selection", "off"]},
     "no_equivalence": {"flags": ["--equivalence-collapse", "off"]},
     "legacy_qd_parents": {"flags": ["--qd-parent-choice", "legacy"]},
     "no_residual_archive": {"flags": ["--residual-archive", "off"]},
-    "scale_balanced": {"flags": ["--scale-balanced-selection", "on"]},
+    "no_guard_check": {"flags": ["--numeric-guard-check", "off"]},
+    "no_interpolation_check": {"flags": ["--interpolation-check", "off"]},
     "stages_fitness": {"stages": {"mode": "fitness", "count": 3, "interval": 5}},
     "stages_age": {"stages": {"mode": "age", "count": 3, "interval": 5, "age_gap": 10}},
     "stages_both": {"stages": {"mode": "both", "count": 3, "interval": 5, "age_gap": 10}},
@@ -219,9 +226,20 @@ def summarize(runs, strong_r2):
         }
     base = table.get("baseline")
     if base:
-        for row in table.values():
+        baseline_scores = {(run["case"], run["seed"]): max(run["test_r2"], -1.) for run in runs if run["config"] == "baseline"}
+        resample = np.random.default_rng(0)
+        for config, row in table.items():
             row["delta_test_r2_vs_baseline"] = row["mean_test_r2"] - base["mean_test_r2"]
             row["evaluations_vs_baseline"] = row["mean_evaluations"] / base["mean_evaluations"] if base["mean_evaluations"] else None
+            # Paired on (case, seed): both configurations faced the same data and seed.
+            pairs = np.array([max(run["test_r2"], -1.) - baseline_scores[(run["case"], run["seed"])] for run in runs
+                              if run["config"] == config and (run["case"], run["seed"]) in baseline_scores])
+            if config == "baseline" or not len(pairs):
+                continue
+            boot = pairs[resample.integers(0, len(pairs), size=(4000, len(pairs)))].mean(axis=1)
+            row["paired"] = {"n": int(len(pairs)), "mean_difference": float(pairs.mean()),
+                             "ci95": [float(np.quantile(boot, .025)), float(np.quantile(boot, .975))],
+                             "wins": int(np.sum(pairs > 1e-4)), "losses": int(np.sum(pairs < -1e-4)), "ties": int(np.sum(np.abs(pairs) <= 1e-4))}
     per_case = {}
     for run in runs:
         per_case.setdefault(run["case"], {}).setdefault(run["config"], []).append(run["test_r2"])
@@ -238,6 +256,16 @@ def print_summary(table, per_case, strong_r2):
               f"{row['mean_mdl_bits']:>8.0f}{ratio:>9}{row['mean_seconds']:>8.1f}")
     print(f"(solved = held-out test R2 >= {strong_r2}; strong = training R2 reached it during search; "
           "1st gen = median generation it did; evals x = evaluation work relative to baseline)")
+    paired = {config: row["paired"] for config, row in table.items() if "paired" in row}
+    if paired:
+        print(f"\nPaired against baseline on the same case and seed (test R2 difference, bootstrap 95% interval):")
+        print(f"{'config':<22}{'pairs':>6}{'mean diff':>11}{'95% interval':>22}{'W/L/T':>12}  verdict")
+        for config, info in paired.items():
+            low, high = info["ci95"]
+            verdict = "better" if low > 0 else "worse" if high < 0 else "no clear difference"
+            interval = f"[{low:+.4f}, {high:+.4f}]"
+            record = f"{info['wins']}/{info['losses']}/{info['ties']}"
+            print(f"{config:<22}{info['n']:>6}{info['mean_difference']:>+11.4f}{interval:>22}{record:>12}  {verdict}")
     configs = list(table)
     print("\nMean held-out test R2 per case:")
     print(f"{'case':<16}" + "".join(f"{c[:14]:>15}" for c in configs))
@@ -251,6 +279,7 @@ def main():
     parser.add_argument("--population", type=int, default=96)
     parser.add_argument("--rows", type=int, default=64)
     parser.add_argument("--seeds", default="20260716,20260717,20260718", help="Comma-separated fixed seeds (at least three recommended)")
+    parser.add_argument("--seed-count", type=int, help="Use this many consecutive seeds starting at the first --seeds value instead")
     parser.add_argument("--cases", default="all", help="Comma-separated case names, or 'all' (includes mytempos when the CSV exists)")
     parser.add_argument("--configs", default="all", help=f"Comma-separated from: {', '.join(CONFIGS)}")
     parser.add_argument("--operator-groups", default="1,2,3,7", help="afpo operator group IDs (default: arithmetic, powers, exp/log, conditionals)")
@@ -286,6 +315,8 @@ def main():
     if args.population < 8 * cells:
         parser.error(f"--population must be at least {8 * cells} for the selected configurations (8 models per island x stage)")
     seeds = [int(s) for s in args.seeds.split(",")]
+    if args.seed_count:
+        seeds = [seeds[0] + offset for offset in range(args.seed_count)]
 
     jobs = [(case, data, config, seed) for case, data in cases.items() for config in configs for seed in seeds]
     runs, total, started = [], len(jobs), time.perf_counter()

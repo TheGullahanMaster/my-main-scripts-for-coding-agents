@@ -411,6 +411,114 @@ class ScaleBalancedSelectionTests(unittest.TestCase):
         self.assertEqual(len(plain), 400)
 
 
+class NumericGuardTests(unittest.TestCase):
+    """Models may not use afpo's numeric safety guards as hidden nonlinearities."""
+    def setUp(self):
+        r = np.random.default_rng(1); n = 80
+        clip = r.integers(0, 18, n).astype(float); reserve = r.integers(0, 40, n).astype(float)
+        self.X = np.column_stack([clip, reserve]); self.Y = np.minimum(clip + reserve, 17.)[:, None]
+
+    def scored(self, tree):
+        m = a.Model([tree], [(1., 0.)], mdl_operators=tuple(a.OPS), mdl_feature_count=2)
+        a.assess(m, self.X, self.Y, True, [None]); return m
+
+    def test_guard_exploits_are_infeasible(self):
+        exploits = {
+            # min(x, 17) through the +/-1e12 value clamp (the reported equation).
+            "value_clamp": ("*", ("+", ("+", ("x", 0), ("c", -3.58557)), ("x", 1)), ("c", -7.45466e10)),
+            # A plateau from pow's exponent clip, and one from exp_decay's input clip amplified by pow.
+            "input_clip": ("pow", ("c", 1.0000003), ("delta", ("*", ("c", -1.), ("x", 0)), ("+", ("c", -4.99999), ("x", 1)))),
+        }
+        for reason, tree in exploits.items():
+            m = self.scored(tree)
+            self.assertFalse(m.feasible)
+            self.assertEqual(m.invalid_reason, f"numeric_guard:{reason}")
+        composed = self.scored(("pow", ("exp_decay", ("+", ("x", 0), ("x", 1)), ("c", 2.94118)), ("c", -1.35472e-07)))
+        self.assertEqual(composed.invalid_reason, "numeric_guard:input_clip")
+        self.assertFalse(self.scored(("sinh", ("*", ("c", 10.), ("x", 0)))).feasible)
+
+    def test_honest_and_naturally_saturating_models_stay_valid(self):
+        for tree in (("min", ("+", ("x", 0), ("x", 1)), ("c", 17.)),
+                     ("sigmoid", ("*", ("c", 1000.), ("-", ("x", 0), ("c", 8.5)))),     # steep step
+                     ("exp", ("*", ("c", -20.), ("x", 1))),                             # decays to ~0
+                     ("pow", ("x", 0), ("c", 2.)),
+                     ("+", ("sin", ("x", 0)), ("log", ("x", 1)))):
+            m = self.scored(tree)
+            self.assertTrue(m.feasible, (tree, m.invalid_reason))
+
+    def test_constant_fitter_does_not_tune_into_a_guard(self):
+        x = self.X[:, :1] + self.X[:, 1:]
+        tree = ("*", ("+", ("x", 0), ("c", -3.)), ("c", 2.))
+        tuned = a.fit_tree_constants(tree, x, self.Y[:, 0])
+        self.assertEqual(a.guard_engagement([tuned], x), "")
+
+    def test_switch_off_restores_the_old_behaviour(self):
+        self.addCleanup(setattr, a, "GUARD_EXPLOIT_CHECK", a.GUARD_EXPLOIT_CHECK)
+        a.GUARD_EXPLOIT_CHECK = False
+        self.assertTrue(self.scored(("*", ("+", ("+", ("x", 0), ("c", -3.58557)), ("x", 1)), ("c", -7.45466e10))).feasible)
+
+
+class ConstantSelectionTests(unittest.TestCase):
+    def setUp(self):
+        self.X = np.linspace(0, 1, 20)[:, None]; self.Y = (1 + .3 * self.X[:, 0])[:, None]
+        self.linear = model(("x", 0)); self.constant = model(("c", 1.))
+        for m in (self.linear, self.constant): a.assess(m, self.X, self.Y, True, [None])
+
+    def options(self, Xv, Yv):
+        evaluation = a.selection_evaluation([self.linear, self.constant], Xv, Yv, [None])
+        return a.model_options([self.linear, self.constant], cats=[None], evaluation=evaluation)
+
+    def test_constant_win_on_validation_is_explained_and_the_training_fit_offered(self):
+        Xv = np.array([[0.], [.5], [1.]]); Yv = np.array([[1.4], [.9], [1.1]])     # the trend fails on held-out rows
+        labels, choices, selection = self.options(Xv, Yv)
+        self.assertIs(choices[0], self.constant)
+        self.assertIn("did not find structure", selection["warning"])
+        offered = dict(zip(labels, choices))["Lowest Training Loss (not supported by validation)"]
+        self.assertIs(offered, self.linear)
+
+    def test_no_warning_when_a_real_model_wins(self):
+        Xv = np.array([[0.], [.5], [1.]]); Yv = 1 + .3 * Xv
+        labels, choices, selection = self.options(Xv, Yv)
+        self.assertIs(choices[0], self.linear)
+        self.assertIsNone(selection["warning"])
+
+
+class InterpolationCheckTests(unittest.TestCase):
+    """Equations that only memorise the training grid must lose to honest ones."""
+    def setUp(self):
+        import benchmark_afpo
+        self.X, y, self.Xtest, self.ytest = benchmark_afpo.synthetic_cases(64)["ratio_wrap"]
+        self.Y = y[:, None]
+        c = lambda v: ("c", float(v))
+        ratio = ("/", ("*", c(100.), ("x", 0)), ("x", 1))
+        self.true = ("if_else", ("gt", ratio, c(1.65)), ("/", ratio, c(2.)), ("if_else", ("lt", ratio, c(.8)), ("*", ratio, c(2.)), ratio))
+        # From the 20-seed benchmark: fits the training grid (R2 0.92), test R2 0.003.
+        self.sawtooth = ("mod", ("+", c(-103.542), ("x", 1)), c(-1.08552))
+        # Partial but honest: handles the upper wrap, misses the lower one.
+        self.smooth = ("if_else", ("gt", ratio, c(1.65)), ("/", ratio, c(2.)), ratio)
+
+    def loss(self, tree, check=True):
+        self.addCleanup(setattr, a, "INTERPOLATION_CHECK", a.INTERPOLATION_CHECK)
+        a.INTERPOLATION_CHECK = check
+        m = a.Model([tree], [(1., 0.)], mdl_operators=tuple(a.OPS), mdl_feature_count=2)
+        a.assess(m, self.X, self.Y, True, [None]); return a.aggregate_loss(m)
+
+    def test_memoriser_wins_without_the_check_and_loses_with_it(self):
+        self.assertLess(self.loss(self.sawtooth, False), self.loss(self.smooth, False))
+        self.assertGreater(self.loss(self.sawtooth), self.loss(self.smooth))
+        self.assertEqual(self.loss(self.true), 0.)            # an exactly correct model pays nothing
+
+    def test_probes_sit_between_neighbours_at_irregular_fractions(self):
+        probes, rows, partner = a.neighbour_probes(self.X)
+        self.assertEqual(len(probes), a.INTERPOLATION_PROBES)
+        spacing = float(np.median(np.diff(np.sort(self.X[:, 1]))))
+        offsets = np.array([np.min(np.abs(self.X[:, 1] - p)) for p in probes[:, 1]]) / spacing
+        self.assertTrue(np.all(offsets > .1))                      # never on a training row
+        self.assertGreater(float(np.std(offsets)), .05)            # not one fixed fraction (aliasing)
+        self.assertTrue(np.all(probes[:, 0] == self.X[0, 0]))       # constant column copied, not blended
+        self.assertIs(a.neighbour_probes(self.X)[0], probes)
+
+
 class StagedRunTests(unittest.TestCase):
     def test_staged_islanded_run_checkpoints_and_resumes(self):
         rng = np.random.default_rng(0); x = rng.uniform(1, 3, (40, 2))

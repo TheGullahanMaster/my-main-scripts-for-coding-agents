@@ -31,6 +31,53 @@ GUI form test in `test_afpo_gui.py`):
 Not done: role-specific ALPS reseeding uses global tree size; residual-signature
 descriptors (Phase 3) and everything in Phases 4-5 other than the above.
 
+## Benchmark verdicts 2026-09-29 (20 seeds, piecewise / ratio_wrap / MyTempos)
+
+`benchmark_afpo_20seed.json`; paired on case+seed against the current
+defaults, bootstrap 95% intervals, per case (pooling hides MyTempos).
+
+- Keep **scale-balanced selection** on: switching it off loses 0.18 R² on
+  MyTempos [-0.31, -0.06]; no effect on the other two.
+- Keep **equivalence collapse** on (-0.17 without it on MyTempos [-0.33, -0.01])
+  and **quality/coverage QD parent choice** (-0.21 with legacy [-0.35, -0.07]).
+- **Residual archive**: no clear difference anywhere (MyTempos -0.08 without
+  it, interval spans 0). Kept on; unproven.
+- **Stages, islands, roles**: nothing beats the defaults on any case.
+  `stages_both` is worse on piecewise [-0.043, -0.002]; islands+stages+roles
+  is worse on piecewise and MyTempos. All stay off by default.
+- ratio_wrap is too noisy to rank anything (intervals ~ +/-0.3).
+- **Numeric guard check** added afterwards (`--numeric-guard-check`, default
+  on): models whose output depends on the +/-1e12 value clamp or on an
+  operator's input clip (pow exponent, exp, sinh, cosh, tan, ...) are
+  infeasible; the constant fitter never tunes into one. Found on capped data
+  (min(x, 17) learned through the clamp). On 5 seeds x 9 cases it made no
+  accuracy difference (+0.003 [-0.023, +0.041]); on a synthetic ammo cap it
+  removed the exploits (2 of 5 runs -> 0 of 5).
+- Found: catastrophic test failures (R² down to -10) from memorising
+  constructs: `mod(x + 1e5..1e6, c)` sawtooths and `pow` with huge constants
+  fit training rows but not the rows between them. Two MyTempos runs
+  selected a constant model.
+- **Constant selection** (fixed 2026-09-29): not a selection bug. MyTempos
+  keeps 5 validation rows; in both runs they were mostly "wrapped" rows the
+  search never modelled, so every input-using candidate lost to a constant on
+  validation and choosing the constant was correct on the evidence. Now the
+  run prints a warning explaining this, the selection record/model card carries
+  it, and the best training fit is offered second, labelled "Lowest Training
+  Loss (not supported by validation)".
+- **Interpolation check** (`--interpolation-check`, default on) against
+  memorisation: probes at random fixed fractions between nearest-neighbour
+  rows; charges the median excess of the between-row miss over the at-row
+  miss against the neighbours' target band. Random fractions are essential
+  (a sawtooth whose period nearly divides the spacing is aliased at exact
+  midpoints); the median keeps steep-but-imperfect jumps unpenalised (a mean
+  version made piecewise measurably worse, -0.028 [-0.074, -0.001]). 20 seeds:
+  MyTempos +0.17 [+0.08, +0.28]; ratio_wrap +0.12 [-0.10, +0.37] with runs
+  below 0 going 2 -> 1; piecewise and the six easy cases unchanged. Remaining
+  gap: a sawtooth whose period itself nearly matches the row spacing can
+  still slip through (1 of 20 ratio_wrap runs).
+- The numeric guard check does not reduce memorisation (ratio_wrap runs
+  below 0: 2 with and 2 without it, 20 seeds).
+
 ## What already exists (do not rebuild)
 
 - Islands: `IslandRuntime` (3966), one full search state per island (population,
