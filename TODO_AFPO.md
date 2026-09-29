@@ -75,6 +75,15 @@ defaults, bootstrap 95% intervals, per case (pooling hides MyTempos).
   below 0 going 2 -> 1; piecewise and the six easy cases unchanged. Remaining
   gap: a sawtooth whose period itself nearly matches the row spacing can
   still slip through (1 of 20 ratio_wrap runs).
+- **Noise-floor ties** (fixed 2026-09-29, from a user run on weight_gradient =
+  forward_input * upstream_delta): the exact 51-bit model never reached the
+  Pareto archive (only the NSGA elite was offered; the best-so-far tracker also
+  sees offspring), and "Best Score" recommended a 160-bit copy bloated with
+  log10(...) factors because its validation loss was 1.5% lower -- at 4.7e-11,
+  i.e. CSV rounding noise. Now: comparisons use max(relative tolerance,
+  LOSS_NOISE_FLOOR = 1e-9); the archive is offered the best-so-far model each
+  generation and applies the parsimony near-tie filter. Replaying that run's
+  checkpoint recommends the exact product.
 - The numeric guard check does not reduce memorisation (ratio_wrap runs
   below 0: 2 with and 2 without it, 20 seeds).
 

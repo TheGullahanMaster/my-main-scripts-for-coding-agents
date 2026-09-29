@@ -2800,14 +2800,29 @@ class _HypergradientLR:
     that is too high for the model when the gradient/update cosine stays near
     zero, and one oversized step can leave a model whose gradients are NaN on
     every batch (every step is then skipped, so it never recovers).  Every
-    ``guard_every`` healthy steps the weights and LR are snapshotted.  When the
-    smoothed training loss (fed through ``observe_loss`` or a ``step`` closure)
-    stays more than ``guard_tolerance`` above its best for ``guard_patience``
-    steps, or the gradients are non-finite for ``guard_patience`` steps in a row,
-    the weights roll back to the snapshot, the optimizer state is cleared, the LR
-    returns to the snapshot's, and a ceiling of ``guard_ceiling`` × the LR that
-    failed stops it from climbing back into the same trouble.
+    ``guard_every`` healthy steps the weights and LR are snapshotted, together
+    with a slow average of the training loss (fed through ``observe_loss`` or a
+    ``step`` closure) as the reference.  When the 10-step loss average stays above
+    that reference by more than ``guard_tolerance`` (relative) and by more than
+    ``NOISE_SIGMAS`` standard deviations of its own batch noise for
+    ``guard_patience`` steps, or the gradients are non-finite for
+    ``guard_patience`` steps in a row, the weights roll back to the snapshot, the
+    optimizer state is cleared, the LR returns to the snapshot's, and a ceiling of
+    ``guard_ceiling`` × the LR that failed stops it from climbing straight back
+    into the same trouble.
+
+    The ceiling is temporary: every later healthy snapshot raises it by
+    ``1 / sqrt(guard_ceiling)`` and it is lifted once back at the LR that failed.
+    It never pushes the LR below the multiplier floor.  When the loss keeps
+    failing from the same snapshot ``GUARD_RETRIES`` times at ever lower LRs, the
+    higher loss is not the LR's doing (a data or objective shift, or a reference
+    taken on a lucky stretch): the guard accepts it as the new reference instead
+    of backing off further.
     """
+
+    LOSS_FAST, LOSS_SLOW = 0.9, 0.98   # EMA decays: the watched loss and the reference
+    NOISE_SIGMAS = 4.0   # how far above the reference, in noise std devs, counts as diverging
+    GUARD_RETRIES = 3    # loss rollbacks to one snapshot before its loss level is accepted
 
     def observe_loss(self, loss):
         """Report the training loss of the batch about to be stepped; enables the
@@ -2859,16 +2874,20 @@ class _HypergradientLR:
         group.setdefault('hd_scale', 1.0)
 
     @classmethod
+    def _scale_floor(cls, group, scale=1.0):
+        """Lowest multiplier allowed (min_lr, when set, bounds the LR instead)."""
+        if group.get('hd_zero'):
+            return 0.0 if scale == 0.0 or group['min_lr'] is not None else cls.ZERO_FLOOR
+        return 0.0 if group['min_lr'] is not None else 1e-2
+
+    @classmethod
     def _set_scale(cls, group, scale):
         """Store the adapted multiplier, bounded, and write the effective LR."""
         base = group['hd_base']
-        if group.get('hd_zero'):
-            lo = 0.0 if scale == 0.0 or group['min_lr'] is not None else cls.ZERO_FLOOR
-        else:
-            lo = 0.0 if group['min_lr'] is not None else 1e-2
+        lo = cls._scale_floor(group, scale)
         hi = math.inf if group['max_lr'] is not None else 1e2
         hi = min(hi, group.get('hd_ceiling', math.inf))   # set by the guard after a rollback
-        scale = min(max(scale, lo), hi)
+        scale = max(min(scale, hi), lo)                   # the floor wins over the guard's ceiling
         lr = base * scale
         if group['min_lr'] is not None:
             lr = max(lr, group['min_lr'])
@@ -2893,8 +2912,9 @@ class _HypergradientLR:
             else:
                 for p, copy in snap.items():
                     copy.copy_(p.detach())
+        lead = self.param_groups[0]
         self._hd_snap_info = {'step': t, 'scales': [g['hd_scale'] for g in self.param_groups],
-                              'loss': self.param_groups[0].get('hd_loss_ema'), 'used': 0}
+                              'loss': lead.get('hd_loss_ema'), 'ref': lead.get('hd_loss_slow'), 'used': 0}
         for g in self.param_groups:
             g['hd_peak'] = g['hd_scale']
 
@@ -2910,10 +2930,12 @@ class _HypergradientLR:
             self._sync_base(group)
             failed = max(group.get('hd_peak', group['hd_scale']), group['hd_scale'])
             if failed > 0.0:
-                group['hd_ceiling'] = min(group.get('hd_ceiling', math.inf), group['guard_ceiling'] * failed)
+                ceiling = min(group.get('hd_ceiling', math.inf), group['guard_ceiling'] * failed)
+                group['hd_ceiling'] = max(ceiling, self._scale_floor(group))
+                group['hd_failed'] = failed    # the ceiling is lifted once it relaxes back to here
             scale = min(info['scales'][i], group.get('hd_ceiling', math.inf))
             if info['used']:                   # the same snapshot failed again: go lower
-                scale *= group['backoff'] ** info['used']
+                scale *= group['backoff'] ** min(info['used'], self.GUARD_RETRIES)
             self._set_scale(group, scale)
             group['hd_ref'] = group['hd_peak'] = group['hd_scale']
             group['hd_m'] = group['hd_v'] = 0.0
@@ -2921,10 +2943,45 @@ class _HypergradientLR:
         info['used'] += 1
         lead['hd_rollbacks'] = lead.get('hd_rollbacks', 0) + 1
         lead['hd_loss_bad'] = lead['hd_nf_run'] = 0
+        lead['hd_streak_sum'] = 0.0
         if info['loss'] is not None:
             lead['hd_loss_ema'] = info['loss']
+        if info['ref'] is not None:
+            lead['hd_loss_slow'] = info['ref']
+        lead.pop('hd_loss_prev', None)         # no successive-difference across the jump
         print(f"[{type(self).__name__}] {reason}: rolled back to step {info['step']}, "
               f"lr {lead['lr']:.3g} (ceiling {lead['hd_base'] * lead.get('hd_ceiling', math.inf):.3g})", flush=True)
+
+    def _hd_loss_limit(self, lead):
+        """Loss level the 10-step average must stay under, or None before a snapshot."""
+        info = getattr(self, '_hd_snap_info', None)
+        ref = info.get('ref') if info is not None else None
+        if ref is None:
+            return None
+        n = lead.get('hd_loss_n', 0)
+        var = lead.get('hd_loss_var', 0.0) / (1.0 - self.LOSS_SLOW ** n) if n else 0.0
+        # Std dev of (fast EMA - slow EMA reference) for independent batch noise of variance var.
+        f, s = self.LOSS_FAST, self.LOSS_SLOW
+        sd = math.sqrt(var * ((1.0 - f) / (1.0 + f) + (1.0 - s) / (1.0 + s)))
+        return ref + max(lead['guard_tolerance'] * max(abs(ref), 1e-8), self.NOISE_SIGMAS * sd)
+
+    def _hd_observe(self, lead, loss):
+        """Update the loss averages; True when the smoothed loss is above its limit."""
+        fast, slow = lead.get('hd_loss_ema'), lead.get('hd_loss_slow')
+        fast = loss if fast is None else self.LOSS_FAST * fast + (1.0 - self.LOSS_FAST) * loss
+        slow = fast if slow is None else self.LOSS_SLOW * slow + (1.0 - self.LOSS_SLOW) * loss
+        lead['hd_loss_ema'], lead['hd_loss_slow'] = fast, slow
+        limit = self._hd_loss_limit(lead)
+        bad = limit is not None and fast > limit
+        prev = lead.get('hd_loss_prev')
+        if prev is not None and not bad:
+            # Batch noise from successive differences, which a trend barely inflates;
+            # frozen while flagged so a divergence cannot widen its own threshold.
+            lead['hd_loss_var'] = (self.LOSS_SLOW * lead.get('hd_loss_var', 0.0)
+                                   + (1.0 - self.LOSS_SLOW) * 0.5 * (loss - prev) ** 2)
+            lead['hd_loss_n'] = lead.get('hd_loss_n', 0) + 1
+        lead['hd_loss_prev'] = loss
+        return bad
 
     def _hd_guard(self, finite):
         """Divergence guard; True when this step must be skipped."""
@@ -2939,26 +2996,42 @@ class _HypergradientLR:
         lead['hd_nf_run'] = 0
         loss, self._hd_loss = getattr(self, '_hd_loss', None), None
         if loss is not None:
-            if not math.isfinite(loss):
-                lead['hd_loss_bad'] = lead.get('hd_loss_bad', 0) + 1
-            else:
-                ema = lead.get('hd_loss_ema')
-                ema = lead['hd_loss_ema'] = loss if ema is None else 0.9 * ema + 0.1 * loss
-                best = lead['hd_loss_best'] = min(lead.get('hd_loss_best', ema), ema)
-                limit = best + lead['guard_tolerance'] * max(abs(best), 1e-8)
-                lead['hd_loss_bad'] = lead.get('hd_loss_bad', 0) + 1 if ema > limit else 0
+            bad = not math.isfinite(loss) or self._hd_observe(lead, loss)
+            lead['hd_loss_bad'] = lead.get('hd_loss_bad', 0) + 1 if bad else 0
+            # Raw losses of the current streak: the level to accept if it persists.
+            lead['hd_streak_sum'] = lead.get('hd_streak_sum', 0.0) + loss if bad else 0.0
             if (lead['hd_loss_bad'] >= lead['guard_patience'] and getattr(self, '_hd_snap', None) is not None):
+                info, limit = self._hd_snap_info, self._hd_loss_limit(lead)
+                # Both EMAs still lag a shift (a rollback reset them): the streak's mean is its level.
+                level = lead['hd_streak_sum'] / lead['hd_loss_bad']
+                if info['used'] >= self.GUARD_RETRIES and limit is not None and math.isfinite(level):
+                    lead['hd_loss_ema'] = lead['hd_loss_slow'] = level
+                    lead['hd_loss_bad'], lead['hd_streak_sum'] = 0, 0.0
+                    self._hd_snapshot(lead.get('hd_step', 0))
+                    print(f"[{type(self).__name__}] loss {lead['hd_loss_ema']:.4g} stayed above "
+                          f"{limit:.4g} after {info['used']} rollbacks at lower LRs: accepted as the new "
+                          f"reference, lr {lead['lr']:.3g}", flush=True)
+                    return False
                 self._hd_rollback(f"loss {lead.get('hd_loss_ema', float('nan')):.4g} stayed above "
-                                  f"{1 + lead['guard_tolerance']:.2g}x its best {lead.get('hd_loss_best', float('nan')):.4g}")
+                                  f"{limit if limit is not None else float('nan'):.4g} "
+                                  f"(reference {info['ref'] if info['ref'] is not None else float('nan'):.4g})")
                 return True
         return False
 
     def _hd_guard_after(self, t):
-        """Track the LR peak and take a snapshot every guard_every healthy steps."""
+        """Track the LR peak, relax the ceiling and snapshot every guard_every healthy steps."""
         lead = self.param_groups[0]
         for g in self.param_groups:
             g['hd_peak'] = max(g.get('hd_peak', g['hd_scale']), g['hd_scale'])
         if t % lead['guard_every'] == 0 and lead.get('hd_loss_bad', 0) == 0:
+            for g in self.param_groups:
+                if 'hd_ceiling' in g:
+                    ceiling = g['hd_ceiling'] / math.sqrt(g['guard_ceiling'])
+                    if ceiling >= g.get('hd_failed', 0.0):
+                        g.pop('hd_ceiling')
+                        g.pop('hd_failed', None)
+                    else:
+                        g['hd_ceiling'] = ceiling
             self._hd_snapshot(t)
 
     def _hd_adapt(self, dot, g_sq, d_sq):
@@ -3104,12 +3177,14 @@ class AdamHD(_HypergradientLR, Optimizer):
             ``observe_loss(loss)`` before ``step()`` (or pass a closure) for the
             loss-based trigger; non-finite gradients trigger it regardless.
         guard_every (int): steps between snapshots of healthy weights (default: 50).
-        guard_tolerance (float): relative rise of the smoothed loss over its
-            best that counts as diverging (default: 0.2).
+        guard_tolerance (float): relative rise of the smoothed loss over the
+            last snapshot's loss that counts as diverging, widened on noisy
+            losses to ``NOISE_SIGMAS`` standard deviations (default: 0.2).
         guard_patience (int): consecutive diverging or non-finite steps before
             rolling back (default: 10).
         guard_ceiling (float): after a rollback the LR stays below this
-            fraction of the LR that failed (default: 0.7).
+            fraction of the LR that failed; the ceiling relaxes over later
+            healthy snapshots and is then lifted (default: 0.7).
     """
 
     def __init__(self, params, lr=1e-3, hyper_lr=0.05, betas=(0.9, 0.999), eps=1e-8,

@@ -2544,6 +2544,11 @@ def secondary_key(model):
     """Deterministic non-fitness key for duplicate handling and diagnostics."""
     # Losses that differ only by round-off are ties, so the shorter model wins.
     return (_noise_rounded(aggregate_loss(model)),_noise_rounded(float(np.mean(model_shapes(model)))),model_complexity(model),repr(model.trees))
+# Loss/shape differences below this (afpo's scaled units) are rounding noise,
+# not fit: a CSV holding ~7 significant digits leaves an exact model at a loss
+# of ~1e-11, and a bigger model with spare constants can "beat" it by 1e-12.
+# Near-tie comparisons use max(relative tolerance, this floor).
+LOSS_NOISE_FLOOR = 1e-9
 def _noise_rounded(value):
     return 0. if abs(value)<1e-20 else float(f"{value:.10g}")
 def objective_labels(output_names, include_violations=False):
@@ -2721,7 +2726,7 @@ def parsimony_preferred(shorter, longer, tolerance):
     for left,right in zip(model_violations(shorter),model_violations(longer)):
         if left>right: return False
     for left,right in zip(_quality_objectives(shorter),_quality_objectives(longer)):
-        if left>right+tolerance*max(abs(right),EPS): return False
+        if left>right+max(tolerance*abs(right),LOSS_NOISE_FLOOR): return False
     return True
 
 def parsimony_candidates(candidates, tolerance):
@@ -2734,7 +2739,7 @@ def materially_better_quality(candidate, incumbent, tolerance):
     """Whether candidate improves quality without giving back another quality objective."""
     if not candidate.feasible or not incumbent.feasible: return candidate.feasible and not incumbent.feasible
     if any(left>right for left,right in zip(model_violations(candidate),model_violations(incumbent))): return False
-    comparisons=[(left,right,tolerance*max(abs(right),EPS)) for left,right in zip(_quality_objectives(candidate),_quality_objectives(incumbent))]
+    comparisons=[(left,right,max(tolerance*abs(right),LOSS_NOISE_FLOOR)) for left,right in zip(_quality_objectives(candidate),_quality_objectives(incumbent))]
     return all(left<=right+band for left,right,band in comparisons) and any(left<right-band for left,right,band in comparisons)
 
 class BestModelArchive:
@@ -2865,6 +2870,8 @@ class ParetoArchive:
                 # quality archive. Keep the actual age/birth metadata intact.
                 by_tree[key].objectives=(*model.objectives[:-1],0)
         self.items=fronts(list(by_tree.values()))[0] if by_tree else []
+        # A bigger model only noise-better than a simpler one is not a trade-off.
+        self.items=parsimony_candidates(self.items,self.parsimony_quality_tolerance)
         if X is not None:
             # Keep only the best representative of behaviorally identical
             # equations; different syntax alone should not fill the archive.
@@ -3968,7 +3975,7 @@ def _select_best(evaluation, loss_tolerance):
     source,entries=evaluation
     candidates=[e[0] for e in entries]; vectors=[tuple(e[1].objectives) for e in entries]; metrics=[e[2] for e in entries]
     best_loss=min(item["loss"] for item in metrics)
-    allowed_loss=best_loss+loss_tolerance*max(abs(best_loss),EPS)
+    allowed_loss=best_loss+max(loss_tolerance*abs(best_loss),LOSS_NOISE_FLOOR)
     eligible=[i for i,item in enumerate(metrics) if item["loss"]<=allowed_loss]
     index=min(eligible,key=lambda i:(metrics[i]["mdl_bits"],metrics[i]["shape"],metrics[i]["loss"],repr(candidates[i].trees)))
     return candidates[index],{"source":source,"objectives":vectors[index],"metrics":metrics[index],
@@ -4880,7 +4887,9 @@ def evolve_generation(pop, generation, *, X, Xt, Yt, Xv, Yv, cats, constraints, 
     stable_elite=[stable_by_id[id(model)] for model in elite]
     quality_improved=best_models.update(stable_pop)
     library.adapt_macro_rate(generation,quality_improved)
-    archive.update(stable_elite,Xt)
+    # The best-so-far tracker also sees offspring directly; offer it too, so the
+    # archive (and the plotted frontier) never lacks the best model found.
+    archive.update([*stable_elite,*([best_models.model] if best_models.model is not None else [])],Xt)
     if adf_registry is not None and adf_registry.enabled:
         particle_models=[particle for bank in (bayes.banks if isinstance(bayes,PerOutputBayesianBanks) else [bayes]) for particle in [*bank.particles.catalog,*bank.particles.particles]]
         adf_registry.mark_usage([*pop,*archive.items,*qd_cell_models(semantic_qd,structural_qd,residual_qd),*particle_models],generation,elite)

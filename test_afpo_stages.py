@@ -519,6 +519,49 @@ class InterpolationCheckTests(unittest.TestCase):
         self.assertIs(a.neighbour_probes(self.X)[0], probes)
 
 
+class NoiseFloorTests(unittest.TestCase):
+    """At loss ~ 0, rounding noise must not decide between an exact model and bloated copies."""
+    def setUp(self):
+        r = np.random.default_rng(3)
+        self.X = r.normal(size=(400, 2)) * 1e-2
+        self.Y = np.round(self.X[:, :1] * self.X[:, 1:], 9)            # a CSV-style ~7-digit product
+        self.exact = model(("*", ("x", 0), ("x", 1)), ops=tuple(a.OPS), features=2)
+        # The same product times a factor that is ~1 on the data, fitted into the noise.
+        self.bloated = model(("*", ("*", ("x", 0), ("x", 1)), ("log10", ("+", ("c", 9.99999), ("*", ("x", 0), ("c", 1e-7))))),
+                             ops=tuple(a.OPS), features=2)
+        for m in (self.exact, self.bloated): a.assess(m, self.X, self.Y, True, [None])
+
+    def scored(self, tree, loss, shape, bits):
+        m = model(tree, ops=tuple(a.OPS), features=2); m.objectives = (loss, shape, float(bits), 0); return m
+
+    def run_pair(self):
+        # The reported run: the exact product lost by 1.5% of a 5e-11 loss (rounding noise).
+        exact = self.scored(("*", ("x", 0), ("x", 1)), 4.764e-11, 2.62e-19, 51)
+        bloated = self.scored(("*", ("*", ("x", 0), ("x", 1)), ("log10", ("c", 10.))), 4.695e-11, 2.61e-19, 160)
+        return exact, bloated
+
+    def test_selection_prefers_the_shorter_model_within_the_noise_floor(self):
+        exact, bloated = self.run_pair()
+        entries = [(m, m, {"loss": m.objectives[0], "shape": m.objectives[1], "mdl_bits": m.objectives[2]}) for m in (bloated, exact)]
+        chosen, _ = a._select_best(("validation", entries), .01)
+        self.assertIs(chosen, exact)
+
+    def test_archive_drops_noise_better_bloat(self):
+        exact, bloated = self.run_pair()
+        archive = a.ParetoArchive(parsimony_quality_tolerance=.01)
+        archive.update([bloated, exact])
+        self.assertEqual([repr(m.trees) for m in archive.items], [repr(exact.trees)])
+
+    def test_best_so_far_is_offered_to_the_archive(self):
+        cats = [None]; ops = ["+", "-", "*", "square"]
+        state = island(self.X, cats, ops)
+        ev = a.ModelEvaluator(1, {"train": (self.X, self.Y)}, True, cats, a.compile_constraints(), ["y0"]); self.addCleanup(ev.close)
+        exact = model(("*", ("x", 0), ("x", 1)), ops=tuple(ops), features=2); a.assess(exact, self.X, self.Y, True, cats)
+        state.best_models.model = exact                                  # found as a child, never in the population
+        advance(state, 0, self.X, self.Y, cats, ops, ev)
+        self.assertIn(a.model_equivalence_key(exact), {a.model_equivalence_key(m) for m in state.archive.items})
+
+
 class StagedRunTests(unittest.TestCase):
     def test_staged_islanded_run_checkpoints_and_resumes(self):
         rng = np.random.default_rng(0); x = rng.uniform(1, 3, (40, 2))

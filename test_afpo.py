@@ -556,5 +556,27 @@ class IntegrationTests(unittest.TestCase):
             self.assertEqual(a._json_checkpoint_value(a.island_snapshot(restored)), expected)
 
 
+class BehaviourRowTests(unittest.TestCase):
+    def test_small_data_is_passed_through_unchanged(self):
+        X = np.random.default_rng(0).normal(size=(a.BEHAVIOUR_PROBE_ROWS, 3)); Y = X[:, :1]
+        self.assertIs(a.behaviour_rows(X), X)
+        self.assertEqual(tuple(map(id, a.behaviour_rows(X, Y))), (id(X), id(Y)))
+
+    def test_large_data_uses_one_fixed_aligned_subset_without_touching_run_rngs(self):
+        X = np.random.default_rng(1).normal(size=(5000, 3)); Y = (X[:, 0] * 2).reshape(-1, 1)
+        state, np_state = a.rng.getstate(), np.random.get_state()
+        Xb, Yb = a.behaviour_rows(X, Y)
+        self.assertEqual(Xb.shape, (a.BEHAVIOUR_PROBE_ROWS, 3))
+        self.assertTrue(np.array_equal(Yb[:, 0], Xb[:, 0] * 2))            # rows stay paired
+        self.assertIs(a.behaviour_rows(X), Xb)                             # same cached array each time
+        self.assertEqual(a.rng.getstate(), state)
+        self.assertTrue(all(np.array_equal(u, v) for u, v in zip(np.random.get_state(), np_state)))
+
+    def test_semantic_key_still_separates_models_on_large_data(self):
+        X = np.random.default_rng(2).uniform(-2, 2, size=(5000, 2))
+        keys = {a.semantic_key(model(tree, features=2), X) for tree in (("x", 0), ("x", 1), ("*", ("x", 0), ("x", 1)))}
+        self.assertEqual(len(keys), 3)
+
+
 if __name__ == "__main__":
     unittest.main()
