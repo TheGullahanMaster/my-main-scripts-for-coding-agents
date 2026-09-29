@@ -193,16 +193,32 @@ so 2 islands and 20 islands both cover the range. Existing
 afpo already has semantic + structural CVT QD archives and a fragment library,
 so these are **audit-then-extend**, not new builds.
 
-- [ ] Audit `FragmentLibrary.observe` admission against TODO item 2 criteria
-  (measurable contribution, reject constants/duplicates/affine-vanishing).
-  Record what is missing before changing anything.
-- [ ] Add a residual-signature QD descriptor (per target-magnitude bin and
-  input-region bin) as a third archive or as extra dimensions of the semantic
-  one; keep capacity bounded.
-- [ ] Scale-balanced selection-only case sampling (equal target-magnitude
-  quantiles, asinh residual comparison) as an option in `CasePopulation`.
-- [ ] Quality-and-coverage-aware archive parent choice (check what
-  `QDOutcomeController` already does first).
+- [x] Audit `FragmentLibrary.observe` admission against TODO item 2 criteria.
+  Found and fixed (2026-09-29): (1) contribution was measured against
+  predicting zero, so any fragment, even a constant one, was credited for
+  shifting the mean; (2) contribution was scored on the rows it was fitted
+  to, so an unrelated `sin(x1)` scored 36x the admission bar on chance
+  correlation; (3) support counted models, so clones of one ancestor looked
+  like independent evidence; (4) affine rescalings (`c*f`, `f+c`) were stored
+  as separate fragments; (5) contribution was a never-decaying maximum. Now:
+  cross-fitted held-out reduction beyond the best constant, constant-valued
+  fragments rejected, support counts disjoint founder lineages, fragments keyed
+  up to affine rescaling + algebraic equivalence (`fragment_key`), evolved
+  contributions decay 5% per observation, bar raised to 5e-3; migrated
+  fragments get a 10-observation probation.
+- [x] Residual-signature QD archive (`ResidualQualityDiversityArchive`, a third
+  repertoire): descriptor = share of error per target-magnitude bin (3 per
+  numeric output) and per input region (4 quartiles of the first principal
+  component); 64 cells. `--residual-archive on|off` (default on).
+- [x] Scale-balanced selection-only lexicase (`--scale-balanced-selection
+  on|off`, default off): equal total weight per target-magnitude quantile bin
+  and asinh-compressed error comparison. Implemented in lexicase (the parent
+  selector every run uses) rather than `CasePopulation`, which only acts on
+  co-evolved minibatches above 512 rows.
+- [x] Quality-and-coverage-aware archive parent choice: success rate x bounded
+  quality rank (best cell at most e^2 the worst's weight, ties share a rank) x
+  coverage bonus for rarely tried cells; the protected uniform share is kept.
+  `--qd-parent-choice legacy` restores success-only weighting.
 
 ## Phase 4 — Later (after Phases 1–3 produce telemetry)
 

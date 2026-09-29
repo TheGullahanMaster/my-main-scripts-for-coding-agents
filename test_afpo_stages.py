@@ -267,11 +267,12 @@ class RoleTests(unittest.TestCase):
                                                         "rejections": 0, "source": "observed", "family": "adf"}}
         cells[1].library.items = {}
         moved = a.migrate_fragments(cells, 4, generation=3)
-        item = cells[1].library.items.get(repr(("square", X0)))
+        item = cells[1].library.items.get(a.fragment_key(("square", X0)))
         self.assertIsNotNone(item)
         self.assertEqual((item["support"], item["contribution"], item["source"]), (1, 0., "island_migrant"))
         self.assertEqual(item["provenance"]["island"], 0)
-        self.assertNotIn(repr(("adf_1", X0)), cells[1].library.items)     # receiver lacks that ADF
+        self.assertNotIn(a.fragment_key(("adf_1", X0)), cells[1].library.items)   # receiver lacks that ADF
+        self.assertEqual(item["probation"], a.FRAGMENT_MIGRANT_PROBATION)
         self.assertEqual(moved, 1)
 
     def test_roles_require_two_islands(self):
@@ -283,6 +284,131 @@ class RoleTests(unittest.TestCase):
                  "roles": {"enabled": True}}
         with contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(ValueError, "at least two islands"):
             a.train_from_setup(args, setup)
+
+
+class FragmentAdmissionTests(unittest.TestCase):
+    def setUp(self):
+        r = np.random.default_rng(0); n = 200
+        self.X = r.normal(size=(n, 3))
+        self.noise = r.normal(scale=.3, size=n) + (r.random(n) < .1) * 3      # skewed noise: a nonzero-mean residual
+
+    def fitted(self, tree, Y, founders=None, ops=("+", "*", "sin", "gt")):
+        m = a.Model([tree], [(1., 0.)], mdl_operators=ops, mdl_feature_count=3, **({"founder_ids": founders} if founders else {}))
+        a.assess(m, self.X, Y, True, [None]); return m
+
+    def library(self, models, Y):
+        lib = a.FragmentLibrary(); lib.observe(models, self.X, Y, [None]); return lib
+
+    def test_chance_and_constant_fragments_are_rejected(self):
+        Y = (2 * self.X[:, 0] + self.noise)[:, None]
+        tree = ("+", ("*", ("x", 0), ("c", 2.)), ("+", ("*", ("sin", ("x", 1)), ("c", 1e-9)), ("gt", ("x", 1), ("c", 1e9))))
+        lib = self.library([self.fitted(tree, Y)], Y)
+        for fragment in (("sin", ("x", 1)), ("gt", ("x", 1), ("c", 1e9))):
+            self.assertNotIn(a.fragment_key(fragment), lib.items)
+
+    def test_real_residual_structure_is_admitted_once(self):
+        Y = (2 * self.X[:, 0] + np.sin(3 * self.X[:, 2]) + .1 * self.noise)[:, None]
+        tree = ("+", ("*", ("x", 0), ("c", 2.)), ("*", ("sin", ("*", ("x", 2), ("c", 3.))), ("c", 1e-9)))
+        lib = self.library([self.fitted(tree, Y, ops=("+", "*", "sin"))], Y)
+        item = lib.items.get(a.fragment_key(("sin", ("*", ("x", 2), ("c", 3.)))))
+        self.assertIsNotNone(item)
+        self.assertGreater(item["contribution"], a.FRAGMENT_MIN_CONTRIBUTION)
+        # c*sin(3*x2) and sin(3*x2) are one fragment after the affine fit.
+        self.assertEqual(a.fragment_key(("*", ("sin", ("*", ("x", 2), ("c", 3.))), ("c", 1e-9))), a.fragment_key(item["tree"]))
+
+    def test_support_counts_independent_lineages_only(self):
+        Y = (2 * self.X[:, 0] + self.noise)[:, None]
+        founder = self.fitted(("x", 0), Y)
+        siblings = [self.fitted(("+", ("*", ("x", 0), ("c", c)), ("sin", ("x", 1))), Y, founder.founder_ids) for c in (1., 2., 3.)]
+        lib = self.library(siblings, Y)
+        self.assertEqual(lib.items[a.fragment_key(("sin", ("x", 1)))]["support"], 1)   # three siblings, one lineage
+        strangers = [self.fitted(("+", ("*", ("x", 0), ("c", c)), ("sin", ("x", 1))), Y) for c in (1., 2.)]
+        self.assertEqual(self.library(strangers, Y).items[a.fragment_key(("sin", ("x", 1)))]["support"], 2)
+
+
+class ResidualArchiveTests(unittest.TestCase):
+    def setUp(self):
+        self.X = np.linspace(.1, 3, 60)[:, None]; self.Y = np.exp(self.X)      # targets span ~1 to ~20
+        self.archive = a.ResidualQualityDiversityArchive(self.X, self.Y, [None], seed=1, capacity=8)
+
+    def specialist(self, tree):
+        m = model(tree, ops=("+", "-", "*", "square", "exp")); a.assess(m, self.X, self.Y, True, [None]); return m
+
+    def test_descriptor_is_an_error_share_per_group(self):
+        d = self.archive.descriptor(self.specialist(("x", 0)))
+        self.assertEqual(len(d), a.RESIDUAL_TARGET_BINS + a.RESIDUAL_REGION_BINS)
+        self.assertAlmostEqual(float(d[:a.RESIDUAL_TARGET_BINS].sum()), 1.)
+        self.assertAlmostEqual(float(d[a.RESIDUAL_TARGET_BINS:].sum()), 1.)
+
+    def test_complementary_partial_models_occupy_different_cells(self):
+        low = self.specialist(("+", ("c", 1.), ("x", 0)))                  # right for small targets only
+        high = self.specialist(("square", ("square", ("x", 0))))           # steep: fits the top end better
+        self.archive.update([low, high])
+        self.assertNotEqual(self.archive.cell(low), self.archive.cell(high))
+        self.assertEqual(len(self.archive.cells), 2)
+        restored = a.ResidualQualityDiversityArchive.from_snapshot(self.archive.snapshot())
+        self.assertEqual(sorted(restored.cells), sorted(self.archive.cells))
+
+    def test_runtime_gets_one_only_when_targets_are_given(self):
+        cats = [None]
+        self.assertIsNone(island(self.X, cats, ["+", "*"]).residual_qd)
+        kwargs = dict(X=self.X, Xt=self.X, cats=cats, ops=["+", "*"], nodes=15, depth=4, head_count=1, bayesian_particles=12,
+                      run_seed=1, island_index=0, qd_parent_rate=.2, nsga_normalization="intercept", parsimony_quality_tolerance=.01,
+                      dynamic_pressure_on=True, stagnation_window=100, adf_enabled=False, adf_mode="nested",
+                      evaluation_budget="baseline", evaluation_refresh=2, interaction_discovery={})
+        state = a.new_island_runtime(12, Yt=self.Y, **kwargs)
+        self.assertIsNotNone(state.residual_qd)
+        ev = a.ModelEvaluator(1, {"train": (self.X, self.Y)}, True, cats, a.compile_constraints(), ["y0"]); self.addCleanup(ev.close)
+        for generation in range(3): advance(state, generation, self.X, self.Y, cats, ["+", "*"], ev, residual_qd=state.residual_qd)
+        self.assertTrue(state.residual_qd.cells)
+        restored = a.island_from_snapshot(a.island_snapshot(state), len(self.X), .01)
+        self.assertEqual(len(restored.residual_qd.cells), len(state.residual_qd.cells))
+
+
+class ParentChoiceTests(unittest.TestCase):
+    def archive(self, losses):
+        archive = a.QualityDiversityArchive(np.zeros((1, 1)), [None], seed=1)
+        for key, loss in enumerate(losses):
+            m = model(("x", 0)); m.objectives = (loss, 0., 3., 0); archive.cells[key] = m
+        return archive
+
+    def picks(self, archive, choice):
+        self.addCleanup(setattr, a, "QD_PARENT_CHOICE", a.QD_PARENT_CHOICE)
+        a.QD_PARENT_CHOICE = choice; a.rng.seed(4)
+        return [parent.cell for parent in archive.sample_tagged(4000, "semantic", uniform_rate=0.)]
+
+    def test_quality_rank_is_preferred_but_bounded(self):
+        picks = self.picks(self.archive([.1, .5, 1., 5.]), "quality_coverage")
+        counts = [picks.count(k) for k in range(4)]
+        self.assertGreater(counts[0], counts[3] * 3)          # the best cell is clearly preferred...
+        self.assertGreater(counts[3], 0)                      # ...but the worst is still drawn
+        self.assertLess(counts[0] / len(picks), .6)           # and nothing takes over
+
+    def test_coverage_bonus_favours_untried_cells(self):
+        archive = self.archive([1., 1.])
+        archive.cell_trials = {0: 50.}; archive.cell_successes = {0: 25.}
+        picks = self.picks(archive, "quality_coverage")
+        self.assertGreater(picks.count(1), picks.count(0))
+
+    def test_legacy_ignores_quality(self):
+        picks = self.picks(self.archive([.1, 5.]), "legacy")
+        self.assertAlmostEqual(picks.count(0) / len(picks), .5, delta=.05)
+
+
+class ScaleBalancedSelectionTests(unittest.TestCase):
+    def test_every_magnitude_band_gets_equal_weight(self):
+        Y = np.r_[np.full(90, .01), np.linspace(1, 1000, 10)][:, None]
+        w = a.scale_balanced_row_weights(Y, [None], bins=2)
+        self.assertAlmostEqual(float(w.mean()), 1.)
+        self.assertAlmostEqual(float(w[:90].sum()), float(w[90:].sum()), places=6)
+
+    def test_small_target_errors_count_in_balanced_mode(self):
+        X = np.array([[0.], [1.]]); Y = np.array([[.01], [1000.]])
+        small_ok = model(("c", .01)); big_ok = model(("c", 1000.))
+        plain = a.lexicase_parents([small_ok, big_ok], 400, X, Y, [None])
+        balanced = a.lexicase_parents([small_ok, big_ok], 400, X, Y, [None], scale_balanced=True)
+        self.assertGreater(sum(p is small_ok for p in balanced), 150)
+        self.assertEqual(len(plain), 400)
 
 
 class StagedRunTests(unittest.TestCase):
@@ -305,6 +431,7 @@ class StagedRunTests(unittest.TestCase):
             self.assertEqual(state["island_config"]["stages"]["mode"], "both")
             self.assertGreater(state["island_config"]["stages"]["promotion_events"], 0)
             self.assertTrue(state["equivalence_collapse"])
+            self.assertIn("residual", state["island_states"][0]["runtime"]["quality_diversity"])
             self.assertGreater(state["island_config"]["roles"]["updates"], 0)
             self.assertIn("case_weights", next(c for c in state["island_states"] if c["island"] == 1)["role"])
             resume = a.parse_cli(["--resume", result["checkpoint"], "--max-generations", "6", "--workers", "1"])[1]

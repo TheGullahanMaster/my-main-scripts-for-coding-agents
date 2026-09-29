@@ -24,10 +24,13 @@ Examples:
 """
 
 import argparse
+import concurrent.futures
 import contextlib
 import io
 import json
 import math
+import multiprocessing
+import os
 import tempfile
 import time
 from pathlib import Path
@@ -43,6 +46,9 @@ HERE = Path(__file__).resolve().parent
 CONFIGS = {
     "baseline": {},
     "no_equivalence": {"flags": ["--equivalence-collapse", "off"]},
+    "legacy_qd_parents": {"flags": ["--qd-parent-choice", "legacy"]},
+    "no_residual_archive": {"flags": ["--residual-archive", "off"]},
+    "scale_balanced": {"flags": ["--scale-balanced-selection", "on"]},
     "stages_fitness": {"stages": {"mode": "fitness", "count": 3, "interval": 5}},
     "stages_age": {"stages": {"mode": "age", "count": 3, "interval": 5, "age_gap": 10}},
     "stages_both": {"stages": {"mode": "both", "count": 3, "interval": 5, "age_gap": 10}},
@@ -250,7 +256,8 @@ def main():
     parser.add_argument("--operator-groups", default="1,2,3,7", help="afpo operator group IDs (default: arithmetic, powers, exp/log, conditionals)")
     parser.add_argument("--nodes", type=int, default=21)
     parser.add_argument("--depth", type=int, default=5)
-    parser.add_argument("--workers", type=int, default=1, help="afpo scoring processes (1 keeps runs deterministic)")
+    parser.add_argument("--workers", type=int, default=1, help="afpo scoring processes per run (1 keeps runs deterministic)")
+    parser.add_argument("--jobs", type=int, default=1, help="Runs executed in parallel processes (results are identical; wall-clock timings get noisier)")
     parser.add_argument("--strong-r2", type=float, default=.99)
     parser.add_argument("--quick", action="store_true", help="Smoke-sized matrix: 12 generations, population 48, one seed")
     parser.add_argument("--keep-logs", metavar="DIR", help="Save each run's trainer output to DIR")
@@ -280,14 +287,26 @@ def main():
         parser.error(f"--population must be at least {8 * cells} for the selected configurations (8 models per island x stage)")
     seeds = [int(s) for s in args.seeds.split(",")]
 
-    runs, total, started = [], len(cases) * len(configs) * len(seeds), time.perf_counter()
-    for case, data in cases.items():
-        for config in configs:
-            for seed in seeds:
-                run = run_one(case, data, config, seed, args)
-                runs.append(run)
-                print(f"[{len(runs)}/{total}] {case:<16} {config:<22} seed {seed}: test R2={run['test_r2']:.4f} "
-                      f"first strong gen={run['first_strong_generation']} {run['elapsed_seconds']:.1f}s  {run['equation']}", flush=True)
+    jobs = [(case, data, config, seed) for case, data in cases.items() for config in configs for seed in seeds]
+    runs, total, started = [], len(jobs), time.perf_counter()
+
+    def report(run):
+        runs.append(run)
+        print(f"[{len(runs)}/{total}] {run['case']:<16} {run['config']:<22} seed {run['seed']}: test R2={run['test_r2']:.4f} "
+              f"first strong gen={run['first_strong_generation']} {run['elapsed_seconds']:.1f}s  {run['equation']}", flush=True)
+
+    if args.jobs <= 1:
+        for job in jobs:
+            report(run_one(*job, args))
+    else:
+        # One BLAS thread per process so parallel runs do not oversubscribe the CPU.
+        for name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+            os.environ.setdefault(name, "1")
+        with concurrent.futures.ProcessPoolExecutor(args.jobs, mp_context=multiprocessing.get_context("spawn")) as pool:
+            for future in concurrent.futures.as_completed([pool.submit(run_one, *job, args) for job in jobs]):
+                report(future.result())
+    order = {(case, config, seed): index for index, (case, _, config, seed) in enumerate(jobs)}
+    runs.sort(key=lambda run: order[(run["case"], run["config"], run["seed"])])
     table, per_case = summarize(runs, args.strong_r2)
     print_summary(table, per_case, args.strong_r2)
     payload = {"settings": {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()},

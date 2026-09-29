@@ -1777,6 +1777,39 @@ class MutationPortfolio:
 # of 16 matched runs and cancelled most of the age cap's gains.
 MACRO_STAGNATION_STEP, MACRO_MAX_RATE = 0., .50
 _FRAGMENT_FIT_CACHE={}; _FRAGMENT_FIT_FAILED=object()
+FRAGMENT_MIN_CONTRIBUTION = 5e-3   # held-out share of the residual loss a fragment must remove
+FRAGMENT_CONTRIBUTION_DECAY = .95
+FRAGMENT_MIGRANT_PROBATION = 10   # observations a migrated fragment may stay unproven
+def fragment_key(tree):
+    """Identity of a fragment up to the affine fit it always receives: c*f,
+    f*c, f+c, c+f, f-c and neg(f) all key as f (then algebraic equivalence)."""
+    while True:
+        op=tree[0]
+        if op=="neg" and len(tree)==2: tree=tree[1]; continue
+        if op in ("*","+") and len(tree)==3 and (tree[1][0]=="c")!=(tree[2][0]=="c"):
+            tree=tree[2] if tree[1][0]=="c" else tree[1]; continue
+        if op=="-" and len(tree)==3 and tree[2][0]=="c" and tree[1][0]!="c": tree=tree[1]; continue
+        return equivalence_key(tree)
+def _fragment_halves(n):
+    """Deterministic interleaved row halves for cross-fitting (None when too few rows)."""
+    if n<8: return None
+    rows=np.arange(n); return rows[0::2],rows[1::2]
+def cross_fitted_reduction(values, residual, halves):
+    """Held-out residual reduction of an affinely fitted fragment beyond the best constant.
+
+    Fit on one half, score on the other, both ways, and average.  A fragment
+    that is constant on the rows earns nothing (it can only move the mean,
+    which the model's own affine readout already does)."""
+    values=np.asarray(values,float)
+    if not np.all(np.isfinite(values)) or float(np.std(values))<=1e-12*(1.+float(np.mean(np.abs(values)))): return 0.
+    if halves is None: return 0.
+    gains=[]
+    for fit,score in (halves,halves[::-1]):
+        scale,offset=affine(values[fit],residual[fit])
+        _,level=affine(np.zeros(len(fit)),residual[fit])
+        target=residual[score]
+        gains.append(robust_loss(np.full(len(score),level),target)-robust_loss(clean(scale*values[score]+offset),target))
+    return float(np.mean(gains))
 class FragmentLibrary:
     """Small, checkpointable store of partial symbolic discoveries."""
     def __init__(self, capacity=96, fragment_rate=.15, macro_rate=.10, probe_reserve=24):
@@ -1800,17 +1833,17 @@ class FragmentLibrary:
         """Reserve bounded capacity for independently validated discoveries."""
         probes=[item for item in self.items.values() if item.get("source")=="interaction_probe"]
         probes=sorted(probes,key=lambda item:(-self._item_score(item),repr(item["tree"])))[:min(self.probe_reserve,self.capacity)]
-        retained={repr(item["tree"]):item for item in probes}
-        ordinary=[item for item in self.items.values() if repr(item["tree"]) not in retained]
+        retained={fragment_key(item["tree"]):item for item in probes}
+        ordinary=[item for item in self.items.values() if fragment_key(item["tree"]) not in retained]
         ordinary.sort(key=lambda item:(-self._item_score(item),repr(item["tree"])))
-        for item in ordinary[:max(0,self.capacity-len(retained))]: retained[repr(item["tree"])]=item
+        for item in ordinary[:max(0,self.capacity-len(retained))]: retained[fragment_key(item["tree"])]=item
         self.items=retained
 
     def admit_discoveries(self, report):
         """Add evidence-backed pre-evolution fragments without creating models."""
         self.probe_candidates+=int(report.get("screened",0))
         for discovery in report.get("accepted",[]):
-            tree=simplify_tree(discovery["tree"]); key=repr(tree)
+            tree=simplify_tree(discovery["tree"]); key=fragment_key(tree)
             item=self.items.get(key)
             if item is None:
                 item={"tree":tree,"support":2,"contribution":max(0.,float(discovery.get("contribution",0.))),
@@ -1822,52 +1855,59 @@ class FragmentLibrary:
         self._trim_items()
 
     def observe(self, models, X, Y, cats):
-        """Collect supported or residual-helpful subtrees from current discoveries."""
+        """Collect independently supported or held-out-helpful subtrees.
+
+        A fragment is admitted when it recurs in models from at least two
+        independent lineages (disjoint founder sets), or when, affinely fitted
+        to a model's residual on one half of the rows, it reduces that residual
+        on the other half beyond what the best constant does (cross-fitted, so
+        chance correlations earn nothing).  Constant-valued fragments are
+        rejected, affine rescalings of one fragment (c*f, f+c) share a single
+        entry, and evolved contributions decay so stale credit fades."""
         targets,_=classification_layout(cats)
+        for item in self.items.values():
+            if item.get("source")!="interaction_probe": item["contribution"]=float(item["contribution"])*FRAGMENT_CONTRIBUTION_DECAY
+            if item.get("probation"): item["probation"]=int(item["probation"])-1
+        halves=_fragment_halves(len(X))
         for model in models[:32]:
-            # Support counts distinct models containing a fragment.  Elite and
-            # archive models recur every generation; counting each sighting made
-            # support a survival clock that swamped contribution in ranking.
-            model_key=hashlib.blake2b(repr(model.trees).encode(),digest_size=8).hexdigest()
+            founders=set(model.founder_ids)
             try: prediction=predict_targets(model,X,cats)
             except (ArithmeticError, IndexError, ValueError): continue
             for output,(labels,heads) in enumerate(zip(cats,targets)):
                 if labels is not None or not heads: continue
                 residual=np.asarray(Y[:,output]-prediction[:,output],float)
-                baseline=robust_loss(np.zeros_like(residual),residual)
                 residual_key=(hashlib.blake2b(np.ascontiguousarray(residual).view(np.uint8),digest_size=16).digest(),array_digest(X),adf_signature(model.trees,model.adfs))
                 tree=model.trees[heads[0]]
                 for path in subtree_paths(tree):
                     fragment=subtree_at(tree,path); size=node_size(fragment)
                     if not 2<=size<=12: continue
-                    key=repr(fragment); item=self.items.get(key)
+                    key=fragment_key(fragment); item=self.items.get(key)
                     if item is None:
                         item={"tree":fragment,"support":0,"contribution":0.,"uses":0,"rejections":0,"source":"evolved","family":"evolved"}
                         self.items[key]=item
-                    supporters=item.setdefault("supporters",[])
-                    if model_key not in supporters:
-                        item["support"]+=1; supporters.append(model_key); del supporters[:-64]
+                    elif size<node_size(item["tree"]): item["tree"]=fragment      # keep the simplest spelling
+                    lineage=set(item.setdefault("founders",[]))
+                    if not founders&lineage:
+                        item["support"]+=1; item["founders"]=sorted(lineage|founders)[-256:]
                     # Elite/archive/QD models recur across generations, so the
                     # same fragment is refitted to the same residual; the fit
                     # is deterministic, so reuse it (failures included).
                     fit_key=(key,residual_key); reduction=_FRAGMENT_FIT_CACHE.get(fit_key)
                     if reduction is None:
-                        try:
-                            values=evaluate_cached(fragment,X,model.adfs)
-                            scale,offset=affine(values,residual)
-                            reduction=baseline-robust_loss(clean(scale*values+offset),residual)
-                        except (ArithmeticError, IndexError, ValueError):
-                            reduction=_FRAGMENT_FIT_FAILED
+                        try: reduction=cross_fitted_reduction(evaluate_cached(fragment,X,model.adfs),residual,halves)
+                        except (ArithmeticError, IndexError, ValueError): reduction=_FRAGMENT_FIT_FAILED
                         if len(_FRAGMENT_FIT_CACHE)>=100_000: _FRAGMENT_FIT_CACHE.clear()
                         _FRAGMENT_FIT_CACHE[fit_key]=reduction
                     if reduction is _FRAGMENT_FIT_FAILED:
                         item["rejections"]+=1; self.rejections+=1; continue
                     item["contribution"]=max(float(item["contribution"]),float(reduction))
         admitted=[item for item in self.items.values()
-                  if item["support"]>=2 or item["contribution"]>1e-4]
+                  if item.get("source")=="interaction_probe" or item.get("probation",0)>0
+                  or item["support"]>=2 or item["contribution"]>FRAGMENT_MIN_CONTRIBUTION]
+        self.rejections+=len(self.items)-len(admitted)
         self.admissions=len(admitted)
         admitted.sort(key=lambda item:(-(item["support"]+item["contribution"]),repr(item["tree"])))
-        self.items={repr(item["tree"]):item for item in admitted}
+        self.items={fragment_key(item["tree"]):item for item in admitted}
         self._trim_items()
 
     def sample(self, family=None, exclude_families=()):
@@ -1917,7 +1957,7 @@ class FragmentLibrary:
         for key in ("fragment_attempts","fragment_survivors","macro_attempts","macro_survivors","admissions","rejections","probe_candidates","probe_accepted","scaffold_attempts"):
             setattr(result,key,int(data.get(key,0)))
         result.base_macro_rate=float(data.get("base_macro_rate",result.macro_rate)); result.last_improvement=int(data.get("last_improvement",0))
-        result.items={repr(item["tree"]):item for item in data.get("items",[]) if "tree" in item}; result._trim_items()
+        result.items={fragment_key(item["tree"]):item for item in data.get("items",[]) if "tree" in item}; result._trim_items()
         return result
 
     def stats(self):
@@ -2830,6 +2870,11 @@ def qd_eligible_candidates(candidates):
     threshold=float(np.median([aggregate_loss(model) for model in feasible]))
     return [model for model in feasible if aggregate_loss(model)<=threshold],threshold
 
+# How QD archives pick parent cells beyond their protected uniform share:
+# "quality_coverage" weights each cell by its success rate, a bounded quality
+# rank and a coverage bonus for rarely tried cells; "legacy" uses success only.
+QD_PARENT_CHOICES=("quality_coverage","legacy")
+QD_PARENT_CHOICE="quality_coverage"
 class QualityDiversityArchive:
     """Frozen-CVT semantic repertoire used only as a bounded parent source."""
     policy="stratified_standardized_prediction_cvt"
@@ -2897,6 +2942,15 @@ class QualityDiversityArchive:
         keys=sorted(self.cells); uniform=min(count,int(math.ceil(count*uniform_rate)))
         chosen=[rng.choice(keys) for _ in range(uniform)]
         weights=[(self.cell_successes.get(key,0.)+1.)/(self.cell_trials.get(key,0.)+2.) for key in keys]
+        if QD_PARENT_CHOICE=="quality_coverage" and len(keys)>1:
+            # Quality: a bounded rank weight (best cell at most e^2 ~ 7.4x the
+            # worst), so a strong cell is preferred but can never take over.
+            # Coverage: an optimism bonus for cells rarely tried as parents.
+            losses={key:aggregate_loss(self.cells[key]) for key in keys}
+            rank={key:sum(other<losses[key] for other in losses.values()) for key in keys}    # ties share a rank
+            total=sum(self.cell_trials.get(key,0.) for key in keys)
+            weights=[weight*math.exp(-2.*rank[key]/(len(keys)-1))*(1.+math.sqrt(math.log(total+2.)/(self.cell_trials.get(key,0.)+1.)))
+                     for weight,key in zip(weights,keys)]
         chosen+=rng.choices(keys,weights=weights,k=count-uniform)
         return [ParentChoice(self.cells[key].clone(),source,key) for key in chosen]
 
@@ -2982,6 +3036,71 @@ class StructuralQualityDiversityArchive(QualityDiversityArchive):
         result.cell_successes={int(key):float(value) for key,value in data.get("cell_successes",{}).items()}
         return result
 
+RESIDUAL_ARCHIVE = True       # --residual-archive
+RESIDUAL_TARGET_BINS = 3      # low / middle / high target values, per numeric output
+RESIDUAL_REGION_BINS = 4      # quartiles of the probe inputs' first principal component
+def residual_regions(probe_X, probe_Y, cats):
+    """Fixed row groups for residual signatures: target-magnitude bins per
+    numeric output and input-region bins, each a list of row-index arrays."""
+    X=np.asarray(probe_X,float); groups=[]
+    for j,labels in enumerate(cats):
+        if labels is not None: continue
+        y=np.asarray(probe_Y[:,j],float)
+        edges=np.quantile(y,np.linspace(0,1,RESIDUAL_TARGET_BINS+1)[1:-1]) if len(y) else []
+        bins=np.searchsorted(edges,y,side="left")
+        groups.append([np.flatnonzero(bins==b) for b in range(RESIDUAL_TARGET_BINS)])
+    if len(X)>=RESIDUAL_REGION_BINS and X.shape[1]:
+        centred=X-X.mean(axis=0); scale=X.std(axis=0); centred=np.divide(centred,scale,out=np.zeros_like(centred),where=scale>EPS)
+        try: component=np.linalg.svd(centred,full_matrices=False)[2][0]
+        except np.linalg.LinAlgError: component=np.ones(X.shape[1])/math.sqrt(X.shape[1])
+        score=centred@component
+        edges=np.quantile(score,np.linspace(0,1,RESIDUAL_REGION_BINS+1)[1:-1])
+        bins=np.searchsorted(edges,score,side="left")
+        groups.append([np.flatnonzero(bins==b) for b in range(RESIDUAL_REGION_BINS)])
+    return [[rows for rows in group if len(rows)] for group in groups]
+
+class ResidualQualityDiversityArchive(QualityDiversityArchive):
+    """Frozen-CVT map of *where* a model errs, so complementary partial models
+    survive: one that nails small targets and one that nails large targets, or
+    one per input regime, land in different cells even when neither is the
+    overall best.  The descriptor is each row group's share of the model's
+    error (target-magnitude bins per numeric output, then input-region bins),
+    so it describes the error's location, not its size; each cell still keeps
+    its lowest-loss model."""
+    policy="residual_signature_cvt"
+    def __init__(self, probe, probe_targets, cats, seed, capacity=64, landmarks=None):
+        super().__init__(probe,cats,seed,capacity,landmarks)
+        self.probe_targets=np.asarray(probe_targets,float)
+        self.groups=residual_regions(self.probe,self.probe_targets,self.cats)
+
+    def descriptor(self, model):
+        prediction=np.asarray(predict_targets(model,self.probe,self.cats),float)
+        errors=np.zeros(len(self.probe))
+        for j,labels in enumerate(self.cats):
+            y=self.probe_targets[:,j]
+            errors+=(np.abs(prediction[:,j]-y)/max(target_scale(y),EPS) if labels is None else (np.rint(prediction[:,j])!=y).astype(float))
+        errors=np.nan_to_num(errors,nan=CLIP,posinf=CLIP)
+        parts=[]
+        for group in self.groups:
+            means=np.array([float(np.mean(errors[rows])) for rows in group])
+            total=float(np.sum(means)); parts.append(means/total if total>EPS else np.full(len(means),1./len(means)))
+        return np.concatenate(parts) if parts else np.zeros(1)
+
+    def snapshot(self):
+        data=super().snapshot(); data["probe_targets"]=self.probe_targets; return data
+
+    @classmethod
+    def from_snapshot(cls, data):
+        result=cls(data["probe"],data["probe_targets"],data["cats"],data["seed"],data["capacity"],data.get("landmarks"))
+        result.cells={int(key):Model(**model) for key,model in data.get("cells",{}).items()}
+        result.updates=int(data.get("updates",0)); result.replacements=int(data.get("replacements",0)); result.last_loss_threshold=data.get("last_loss_threshold")
+        result.cell_trials={int(key):float(value) for key,value in data.get("cell_trials",{}).items()}
+        result.cell_successes={int(key):float(value) for key,value in data.get("cell_successes",{}).items()}
+        return result
+
+    def stats(self):
+        return "Residual "+super().stats()
+
 @dataclass
 class ParentChoice:
     model:Model
@@ -2999,7 +3118,7 @@ class QDOutcomeController:
         for archive in archives: archive.begin_generation(self.decay)
 
     def record(self, child, parents, archives):
-        by_source={"semantic":archives[0],"structural":archives[1]}
+        by_source=dict(zip(("semantic","structural","residual"),archives))
         for parent in parents:
             success=variation_improved(child,parent.model)
             if parent.source=="ordinary":
@@ -3031,8 +3150,19 @@ class QDOutcomeController:
         info=self.diagnostics()
         return f"QD adaptive parents={info['rate']:.0%} (bounds {info['bounds'][0]:.0%}-{info['bounds'][1]:.0%}); archive/ordinary success={info['archive_success']:.0%}/{info['ordinary_success']:.0%}"
 
-def qd_snapshot(semantic, structural, controller):
-    return {"semantic":semantic.snapshot(),"structural":structural.snapshot(),"controller":controller.snapshot()}
+def qd_snapshot(semantic, structural, controller, residual=None):
+    data={"semantic":semantic.snapshot(),"structural":structural.snapshot(),"controller":controller.snapshot()}
+    if residual is not None: data["residual"]=residual.snapshot()
+    return data
+def residual_qd_from_snapshot(data):
+    """The optional residual-signature repertoire (absent in older checkpoints)."""
+    residual=(data or {}).get("residual")
+    return None if residual is None else ResidualQualityDiversityArchive.from_snapshot(residual)
+def qd_archives(semantic, structural, residual=None):
+    """The active QD repertoires, in parent-source order."""
+    return (semantic,structural) if residual is None else (semantic,structural,residual)
+def qd_cell_models(semantic, structural, residual=None):
+    return [model for archive in qd_archives(semantic,structural,residual) for model in archive.cells.values()]
 
 def qd_from_snapshot(data):
     if not {"semantic","structural","controller"} <= set(data):
@@ -3050,12 +3180,12 @@ def blend_qd_parents(base_parents, qd_archive, count, rate):
     rng.shuffle(parents)
     return parents
 
-def dual_qd_parent_count(count, controller, semantic, structural):
-    return min(count,int(round(count*controller.rate))) if semantic.cells or structural.cells else 0
+def dual_qd_parent_count(count, controller, semantic, structural, residual=None):
+    return min(count,int(round(count*controller.rate))) if any(archive.cells for archive in qd_archives(semantic,structural,residual)) else 0
 
-def blend_dual_qd_parents(base_parents, semantic, structural, count, qd_count, uniform_rate=.25):
-    """Tag ordinary/semantic/structural parent origins and split QD equally."""
-    active=[(source,archive) for source,archive in (("semantic",semantic),("structural",structural)) if archive.cells]
+def blend_dual_qd_parents(base_parents, semantic, structural, count, qd_count, uniform_rate=.25, residual=None):
+    """Tag ordinary/semantic/structural/residual parent origins and split QD equally."""
+    active=[(source,archive) for source,archive in zip(("semantic","structural","residual"),qd_archives(semantic,structural,residual)) if archive.cells]
     if not active: return [ParentChoice(model,"ordinary") for model in base_parents[:count]]
     qd_count=min(count,qd_count); quota=[qd_count//len(active)]*len(active)
     for index in range(qd_count%len(active)): quota[index]+=1
@@ -3083,14 +3213,41 @@ def _lazy_shuffle(items):
         j=rng.randrange(n-i); value=pool[j]; pool[j]=pool[n-i-1]
         yield value
 
-def lexicase_parents(pop, count, X, Y, cats, max_cases=0, case_weights=None):
+SCALE_BALANCED_SELECTION = False
+SCALE_BALANCE_BINS = 5
+def scale_balanced_row_weights(Y, cats, bins=SCALE_BALANCE_BINS):
+    """Selection-only row weights giving every target-magnitude quantile bin
+    of every numeric output the same total weight (mean weight 1)."""
+    numeric=[j for j,labels in enumerate(cats) if labels is None]
+    if not numeric or len(Y)<2: return None
+    weights=np.zeros(len(Y))
+    for j in numeric:
+        magnitude=np.abs(np.asarray(Y[:,j],float))
+        edges=np.unique(np.quantile(magnitude,np.linspace(0,1,bins+1)[1:-1]))
+        # side="left": a tie mass sitting on an edge stays in one lower bin instead of swallowing the next.
+        bin_index=np.searchsorted(edges,magnitude,side="left")
+        counts=np.bincount(bin_index,minlength=len(edges)+1).astype(float)
+        weights+=1./counts[bin_index]
+    return weights*len(weights)/float(np.sum(weights))
+def selection_errors(prediction, y, labels, scale_balanced=False):
+    """Per-row errors that parent selection compares.  Scale-balanced mode
+    compares asinh-compressed values, so an error on a small target counts
+    like the same relative error on a large one."""
+    if labels is not None: return (np.rint(prediction)!=y).astype(float)
+    if not scale_balanced: return np.abs(prediction-y)
+    unit=max(.05*target_scale(y),EPS)
+    return np.abs(np.arcsinh(prediction/unit)-np.arcsinh(y/unit))
+def lexicase_parents(pop, count, X, Y, cats, max_cases=0, case_weights=None, scale_balanced=False):
     """Epsilon-lexicase parents.  case_weights (one per row of X, selection
     only) make heavily weighted rows tend to be examined first, which is how a
     self-organised island role steers its parents; None keeps uniform order."""
     predictions=[predict_targets(m,X,cats) for m in pop]; errors=np.empty((len(pop),len(X)*Y.shape[1]))
     for i,pred in enumerate(predictions):
-        parts=[np.abs(pred[:,j]-Y[:,j]) if cats[j] is None else (np.rint(pred[:,j])!=Y[:,j]) for j in range(Y.shape[1])]
+        parts=[selection_errors(pred[:,j],Y[:,j],cats[j],scale_balanced) for j in range(Y.shape[1])]
         errors[i]=np.concatenate(parts)
+    if scale_balanced:
+        balance=scale_balanced_row_weights(Y,cats)
+        if balance is not None: case_weights=balance if case_weights is None else np.asarray(case_weights,float)*balance
     cases=list(range(errors.shape[1]))
     if max_cases and max_cases<len(cases):
         # Informed down-sampling prioritizes cases where the population still
@@ -4061,6 +4218,7 @@ class IslandRuntime:
     island_index:int=0
     stage:int=0
     role:dict=field(default_factory=dict)
+    residual_qd:Any=None
     def __post_init__(self):
         if not self.population_size: self.population_size=len(self.population)
 
@@ -4075,7 +4233,7 @@ def island_snapshot(island):
         "runtime":{
             "mutation_portfolio":island.portfolio.snapshot(),
             "case_population":island.cases.snapshot(),
-            "quality_diversity":qd_snapshot(island.semantic_qd,island.structural_qd,island.qd_controller),
+            "quality_diversity":qd_snapshot(island.semantic_qd,island.structural_qd,island.qd_controller,island.residual_qd),
             "best_model":island.best_models.snapshot(),
             "dynamic_pressure":island.pressure.snapshot(),
             "fragment_library":island.library.snapshot(),
@@ -4105,6 +4263,7 @@ def island_from_snapshot(data, n_rows, parsimony_quality_tolerance):
         EvaluationBudget.from_snapshot(runtime.get("evaluation_budget",{})),
         data.get("population_size",len(population)),
         int(data.get("island",0)),int(data.get("stage",0)),dict(data.get("role") or {}),
+        residual_qd_from_snapshot(runtime["quality_diversity"]),
     )
 
 def snapshot_islands(state, islands, island_config):
@@ -4130,10 +4289,10 @@ def migrate_fragments(islands, count, generation=None):
     for index,island in enumerate(islands):
         source=(index-1)%len(islands)
         for item in outgoing[source]:
-            key=repr(item["tree"])
+            key=fragment_key(item["tree"])
             calls={node[0] for node in walk_tree(item["tree"]) if node[0].startswith("adf_")}
             if key in island.library.items or not calls<=set(island.adf_registry.definitions): continue
-            island.library.items[key]={**item,"support":1,"contribution":0.,"uses":0,"rejections":0,"source":"island_migrant",
+            island.library.items[key]={**item,"support":1,"contribution":0.,"uses":0,"rejections":0,"source":"island_migrant","probation":FRAGMENT_MIGRANT_PROBATION,
                                        "provenance":{"island":islands[source].island_index,"stage":islands[source].stage,"generation":generation,"origin_source":item.get("source")}}
             moved+=1
         island.library._trim_items()
@@ -4145,7 +4304,7 @@ def migrate_islands(islands, migrant_count, *, X, nsga_normalization, parsimony_
     outgoing=[]
     for island in islands:
         if evaluator is not None:
-            refresh_persistent_scores(island.archive,island.best_models,island.semantic_qd,island.structural_qd,evaluator)
+            refresh_persistent_scores(island.archive,island.best_models,island.semantic_qd,island.structural_qd,evaluator,island.residual_qd)
             evaluator.assess(island.population,"train")
         pool=[model for model in island.population if model.feasible]
         if not pool: pool=island.population
@@ -4226,7 +4385,7 @@ def promote_stages(cells, island_count, config, generation, *, X, n_features, op
         ladder=cells[island_index*stages:(island_index+1)*stages]
         if evaluator is not None:
             for cell in ladder:
-                refresh_persistent_scores(cell.archive,cell.best_models,cell.semantic_qd,cell.structural_qd,evaluator)
+                refresh_persistent_scores(cell.archive,cell.best_models,cell.semantic_qd,cell.structural_qd,evaluator,cell.residual_qd)
                 evaluator.assess(cell.population,"train")
         # Top-down, so one event moves a model at most one rung.
         for stage in range(stages-2,-1,-1):
@@ -4422,11 +4581,12 @@ def direct_feature_baselines(X, Y, cats, ops, affine_on):
 def new_island_runtime(population_size, *, X, Xt, cats, ops, nodes, depth, head_count, bayesian_particles,
                        run_seed, island_index, qd_parent_rate, nsga_normalization, parsimony_quality_tolerance,
                        dynamic_pressure_on, stagnation_window, adf_enabled, adf_mode, evaluation_budget,
-                       evaluation_refresh, interaction_discovery, cell=None):
+                       evaluation_refresh, interaction_discovery, cell=None, Yt=None):
     """Create one isolated AFPO/Bayesian search state for an island run.
 
     island_index seeds the cell's archives; cell=(island, stage) labels it
-    (defaults to (island_index, 0) for stage-free runs)."""
+    (defaults to (island_index, 0) for stage-free runs).  Yt enables the
+    residual-signature QD repertoire (when RESIDUAL_ARCHIVE is on)."""
     adf_registry=ADFRegistry(adf_enabled,allow_nested=adf_mode=="nested")
     seeds=direct_feature_baselines(X,None,cats,ops,True)[:population_size//4]
     for seed in seeds: seed.adfs=dict(adf_registry.definitions)
@@ -4446,6 +4606,8 @@ def new_island_runtime(population_size, *, X, Xt, cats, ops, nodes, depth, head_
         DynamicPressureController(dynamic_pressure_on,parsimony_quality_tolerance,qd_controller.uniform_rate,stagnation_window),
         library,adf_registry,EvaluationBudget(evaluation_budget,evaluation_refresh),
         island_index=(island_index if cell is None else cell[0]),stage=(0 if cell is None else cell[1]),
+        residual_qd=(ResidualQualityDiversityArchive(Xt[probe_indices],np.asarray(Yt)[probe_indices],cats,run_seed ^ 0x5245 ^ island_index)
+                     if RESIDUAL_ARCHIVE and Yt is not None else None),
     )
 
 # Called once per island per generation with that island's live state (the
@@ -4511,13 +4673,13 @@ def synchronize_model_ages(models, generation):
         model.age=generation-model.birth_generation
         model.objectives=(*model.objectives[:-1],model.age)
 
-def refresh_persistent_scores(archive, best_models, semantic_qd, structural_qd, evaluator):
+def refresh_persistent_scores(archive, best_models, semantic_qd, structural_qd, evaluator, residual_qd=None):
     """Every persistent comparison uses a full-training fit, including after resume."""
-    models=[*archive.items,*semantic_qd.cells.values(),*structural_qd.cells.values()]
+    models=[*archive.items,*qd_cell_models(semantic_qd,structural_qd,residual_qd)]
     if best_models.model is not None: models.append(best_models.model)
     evaluator.assess(models,"train")
     for model in archive.items: model.objectives=(*model.objectives[:-1],0)
-    for repertoire in (semantic_qd,structural_qd):
+    for repertoire in qd_archives(semantic_qd,structural_qd,residual_qd):
         previous=list(repertoire.cells.values()); repertoire.cells={}
         for model in previous:
             if not model.feasible: continue
@@ -4526,22 +4688,23 @@ def refresh_persistent_scores(archive, best_models, semantic_qd, structural_qd, 
 
 def evolve_generation(pop, generation, *, X, Xt, Yt, Xv, Yv, cats, constraints, out_names, ops, nodes, depth, affine_on, coev,
                       bayes, archive, semantic_qd, structural_qd, qd_controller, best_models, pressure, cases, portfolio, library, evaluator,
-                      bayesian_proposal_rate, crossover_rate, qd_mode, lexicase_cases, nsga_normalization, progress=None, bayesian_mode="adaptive", adf_registry=None, budget=None, population_size=None, case_weights=None):
+                      bayesian_proposal_rate, crossover_rate, qd_mode, lexicase_cases, nsga_normalization, progress=None, bayesian_mode="adaptive", adf_registry=None, budget=None, population_size=None, case_weights=None, residual_qd=None):
     """Advance one generation; fresh and resumed runs share this exact path.
 
     case_weights: optional selection-only per-training-row weights (island roles)."""
     population_size=len(pop) if population_size is None else population_size
     if population_size<1 or not pop: raise ValueError("Evolution requires a nonempty population")
     particle_models=[particle for bank in (bayes.banks if isinstance(bayes,PerOutputBayesianBanks) else [bayes]) for particle in [*bank.particles.catalog,*bank.particles.particles]]
-    owners=[*pop,*archive.items,*semantic_qd.cells.values(),*structural_qd.cells.values(),best_models.model,*particle_models]
+    owners=[*pop,*archive.items,*qd_cell_models(semantic_qd,structural_qd,residual_qd),best_models.model,*particle_models]
     synchronize_model_ages(owners,generation)
     if adf_registry is not None:
         adf_registry.import_models(owners); adf_registry.attach(owners)
     evaluator.begin_generation()
-    refresh_persistent_scores(archive,best_models,semantic_qd,structural_qd,evaluator)
+    refresh_persistent_scores(archive,best_models,semantic_qd,structural_qd,evaluator,residual_qd)
     budget=EvaluationBudget() if budget is None else budget
     pressure.apply(bayes,qd_controller); effective_tolerance=pressure.effective_parsimony()
-    qd_controller.begin_generation((semantic_qd,structural_qd))
+    repertoires=qd_archives(semantic_qd,structural_qd,residual_qd)
+    qd_controller.begin_generation(repertoires)
     # Co-evolution only subsamples above 512 rows; below that it is inert.
     coev_active=coev and len(Xt)>512
     sample=cases.sample(budget.screen_count(len(Xt))) if coev_active else slice(None)
@@ -4559,7 +4722,7 @@ def evolve_generation(pop, generation, *, X, Xt, Yt, Xv, Yv, cats, constraints, 
         # owner before Bayesian updating/rejuvenation can draw from it; those
         # paths otherwise pair a new ADF operator with a stale particle catalog.
         particle_models=[particle for bank in (bayes.banks if isinstance(bayes,PerOutputBayesianBanks) else [bayes]) for particle in [*bank.particles.catalog,*bank.particles.particles]]
-        adf_registry.attach([*pop,*archive.items,*semantic_qd.cells.values(),*structural_qd.cells.values(),best_models.model,*particle_models])
+        adf_registry.attach([*pop,*archive.items,*qd_cell_models(semantic_qd,structural_qd,residual_qd),best_models.model,*particle_models])
     stable_pop=[model.clone() for model in pop]; evaluator.assess(stable_pop,"train")
     stable_by_id={id(original):scored for original,scored in zip(pop,stable_pop)}
     stable_elite=[stable_by_id[id(model)] for model in elite]
@@ -4568,12 +4731,12 @@ def evolve_generation(pop, generation, *, X, Xt, Yt, Xv, Yv, cats, constraints, 
     archive.update(stable_elite,Xt)
     if adf_registry is not None and adf_registry.enabled:
         particle_models=[particle for bank in (bayes.banks if isinstance(bayes,PerOutputBayesianBanks) else [bayes]) for particle in [*bank.particles.catalog,*bank.particles.particles]]
-        adf_registry.mark_usage([*pop,*archive.items,*semantic_qd.cells.values(),*structural_qd.cells.values(),*particle_models],generation,elite)
+        adf_registry.mark_usage([*pop,*archive.items,*qd_cell_models(semantic_qd,structural_qd,residual_qd),*particle_models],generation,elite)
         active_ops=adf_registry.operators(ops); bayes.sync_operators(active_ops)
         for particle in particle_models: particle.adfs.update(adf_registry.definitions)
     else: active_ops=list(ops)
-    pressure.observe(generation,quality_improved,(semantic_qd,structural_qd)); pressure.apply(bayes,qd_controller)
-    diverse=[*semantic_qd.cells.values(),*structural_qd.cells.values()]
+    pressure.observe(generation,quality_improved,repertoires); pressure.apply(bayes,qd_controller)
+    diverse=qd_cell_models(semantic_qd,structural_qd,residual_qd)
     Xb,Yb=behaviour_rows(Xt,Yt)
     if isinstance(bayes,PerOutputBayesianBanks): bayes.update(stable_elite,cats,Xb,Yb,diverse,affine_on=affine_on)
     else: bayes.update(stable_elite,Xb,Yb,cats,diverse)
@@ -4587,10 +4750,10 @@ def evolve_generation(pop, generation, *, X, Xt, Yt, Xv, Yv, cats, constraints, 
     library.observe(unique_models([*stable_elite,*archive.items,*diverse]),Xb,Yb,cats)
     Xsb=behaviour_rows(Xs)
     parent_pool=novelty_pool(pop,Xs)
-    parent_count=max(1,population_size//2); qd_count=dual_qd_parent_count(parent_count,qd_controller,semantic_qd,structural_qd)
+    parent_count=max(1,population_size//2); qd_count=dual_qd_parent_count(parent_count,qd_controller,semantic_qd,structural_qd,residual_qd)
     row_weights=None if case_weights is None else (np.asarray(case_weights) if isinstance(sample,slice) else np.asarray(case_weights)[sample])
-    ordinary=lexicase_parents(parent_pool,parent_count-qd_count,Xs,Ys,cats,lexicase_cases,row_weights)
-    parents=(blend_dual_qd_parents(ordinary,semantic_qd,structural_qd,parent_count,qd_count,qd_controller.uniform_rate)
+    ordinary=lexicase_parents(parent_pool,parent_count-qd_count,Xs,Ys,cats,lexicase_cases,row_weights,SCALE_BALANCED_SELECTION)
+    parents=(blend_dual_qd_parents(ordinary,semantic_qd,structural_qd,parent_count,qd_count,qd_controller.uniform_rate,residual_qd)
              if qd_mode=="adaptive_dual" else blend_fixed_semantic_parents(ordinary,semantic_qd,parent_count,qd_count)); children=[]; feedback=[]; credits=[]; injections=[]; discovery_children=[]
     # Archive parents need the same screen fit as their children for feedback.
     evaluator.assess([parent.model for parent in parents if parent.source!="ordinary"],"train",None if isinstance(sample,slice) else sample)
@@ -4647,7 +4810,7 @@ def evolve_generation(pop, generation, *, X, Xt, Yt, Xv, Yv, cats, constraints, 
     # A correct structure with untuned constants otherwise scores like a wrong
     # one and is lost; fit every offspring's inner constants before scoring.
     evaluator.assess(children,"train",None if isinstance(sample,slice) else sample,tune=True)
-    for child,parent_choices in credits: qd_controller.record(child,parent_choices,(semantic_qd,structural_qd))
+    for child,parent_choices in credits: qd_controller.record(child,parent_choices,repertoires)
     for child,parent,kinds in feedback:
         for kind in kinds:
             if kind is not None: portfolio.record(kind,variation_improved(child,parent))
@@ -4655,14 +4818,16 @@ def evolve_generation(pop, generation, *, X, Xt, Yt, Xv, Yv, cats, constraints, 
     if best_models.update(stable_children):
         # Offspring are where new bests appear; the earlier signal only
         # rescored already-seen survivors, so the macro lane never saw one.
-        pressure.observe(generation,True,(semantic_qd,structural_qd)); library.adapt_macro_rate(generation,True)
+        pressure.observe(generation,True,repertoires); library.adapt_macro_rate(generation,True)
     if coev_active:
         promoted=[model.clone() for model in select_nsga(children,max(8,len(pop)//4),nsga_normalization,effective_tolerance)]
         anchor=budget.anchor_indices(Xt); evaluator.assess(promoted,"train",anchor); budget.record("anchor",len(anchor))
         # Anchor scores are screening evidence only; persistence always uses full training.
         evaluator.assess(promoted,"train"); best_models.update(promoted); archive.update(promoted,Xt)
     qd_candidates,qd_threshold=qd_eligible_candidates([*stable_pop,*stable_children]); semantic_qd.update(qd_candidates,qd_threshold)
-    if qd_mode=="adaptive_dual": structural_qd.update(qd_candidates,qd_threshold)
+    if qd_mode=="adaptive_dual":
+        structural_qd.update(qd_candidates,qd_threshold)
+        if residual_qd is not None: residual_qd.update(qd_candidates,qd_threshold)
     if qd_mode!="fixed_semantic": qd_controller.update_rate()
     for model in pop:
         model.age += 1; model.objectives=(*model.objectives[:-1],model.age)
@@ -4703,8 +4868,11 @@ def resume_main(args):
     if not isinstance(bayes,PerOutputBayesianBanks): raise ValueError("Checkpoint predates per-output Bayesian banks and cannot resume; start a new run")
     X,Y,Xt,Yt,Xv,Yv=(state[k] for k in ("X","Y","Xt","Yt","Xv","Yv"))
     names,out_names,cats,maps=(state[k] for k in ("names","out_names","cats","maps"))
-    global SEQUENCE_LAYOUT,EQUIVALENCE_COLLAPSE
+    global SEQUENCE_LAYOUT,EQUIVALENCE_COLLAPSE,RESIDUAL_ARCHIVE,QD_PARENT_CHOICE,SCALE_BALANCED_SELECTION
     SEQUENCE_LAYOUT=maps.get(SEQUENCE_LAYOUT_KEY)
+    # Settings that postdate a checkpoint resume with the behaviour it was searched with.
+    RESIDUAL_ARCHIVE=bool(state.get("residual_archive",False)); QD_PARENT_CHOICE=state.get("qd_parent_choice","legacy")
+    SCALE_BALANCED_SELECTION=bool(state.get("scale_balanced_selection",False))
     # Checkpoints from before equivalence keys searched without them; keep that.
     EQUIVALENCE_COLLAPSE=bool(state.get("equivalence_collapse",False)); EQUIVALENCE_STATS["children_redrawn"]=0
     ops,nodes,depth,affine_on,coev=(state[k] for k in ("operators","nodes","depth","affine_on","coev"))
@@ -4753,7 +4921,7 @@ def resume_main(args):
                 cell_crossover,cell_proposals,cell_nodes,cell_weights=cell_search_settings(island,crossover_rate,rate,nodes)
                 island.population=evolve_generation(island.population,generation,X=X,Xt=Xt,Yt=Yt,Xv=Xv,Yv=Yv,cats=cats,constraints=constraints,out_names=out_names,
                                   ops=ops,nodes=cell_nodes,depth=depth,case_weights=cell_weights,affine_on=affine_on,coev=coev,bayes=island.bayes,archive=island.archive,
-                                  semantic_qd=island.semantic_qd,structural_qd=island.structural_qd,qd_controller=island.qd_controller,best_models=island.best_models,
+                                  semantic_qd=island.semantic_qd,structural_qd=island.structural_qd,residual_qd=island.residual_qd,qd_controller=island.qd_controller,best_models=island.best_models,
                                   pressure=island.pressure,cases=island.cases,portfolio=island.portfolio,library=island.library,evaluator=evaluator,bayesian_proposal_rate=cell_proposals,
                                   crossover_rate=cell_crossover,qd_mode=qd_mode,lexicase_cases=state.get("lexicase_cases",args.lexicase_cases),nsga_normalization=nsga_normalization,bayesian_mode=state.get("bayesian_mode",args.bayesian_mode),adf_registry=island.adf_registry,budget=island.budget,progress=progress,population_size=island.population_size)
             generation+=1
@@ -4770,8 +4938,8 @@ def resume_main(args):
     for island in islands:
         if island.adf_registry.enabled:
             particle_models=[particle for bank in island.bayes.banks for particle in [*bank.particles.catalog,*bank.particles.particles]]
-            island.adf_registry.attach([*island.population,*island.archive.items,*island.semantic_qd.cells.values(),*island.structural_qd.cells.values(),island.best_models.model,*particle_models])
-        refresh_persistent_scores(island.archive,island.best_models,island.semantic_qd,island.structural_qd,evaluator)
+            island.adf_registry.attach([*island.population,*island.archive.items,*qd_cell_models(island.semantic_qd,island.structural_qd,island.residual_qd),island.best_models.model,*particle_models])
+        refresh_persistent_scores(island.archive,island.best_models,island.semantic_qd,island.structural_qd,evaluator,island.residual_qd)
         evaluator.assess(island.population,"train"); island.best_models.update(island.population); island.archive.update(island.population,Xt)
     f=[model for island in islands for model in [*island.archive.items,*island.population,island.best_models.model] if model is not None]
     chosen,selection=select_best_model(f,Xv,Yv,cats,loss_tolerance,constraints,out_names) if Xv is not None else select_best_model(f,loss_tolerance=loss_tolerance)
@@ -4807,6 +4975,9 @@ def build_arg_parser():
     ap.add_argument("--sequence-group",action="append",default=[],metavar="NAME=COL1,COL2,...",help="Ordered numeric input columns forming one sequence (repeatable, equal lengths); enables seqsum/seqprod with per-position features NAME[i], prod(NAME[<i]), sum(NAME[<i]) and i")
     ap.add_argument("--stagnation-window",type=int,default=100,help="Generations without quality/QD activity before bounded pressure escalates")
     ap.add_argument("--equivalence-collapse",choices=("on","off"),default="on",help="Treat algebraically equal equations (x+y vs y+x, x+x vs 2*x, x*x vs square(x)) as one candidate in offspring, deduplication and archives (default: on)")
+    ap.add_argument("--residual-archive",choices=("on","off"),default="on",help="Keep a third QD archive keyed by where each model errs (target-size bins and input regions), so complementary partial models survive (default: on)")
+    ap.add_argument("--qd-parent-choice",choices=QD_PARENT_CHOICES,default="quality_coverage",help="How QD archives pick parent cells beyond the uniform share: success x bounded quality rank x coverage bonus, or legacy success-only (default: quality_coverage)")
+    ap.add_argument("--scale-balanced-selection",choices=("on","off"),default="off",help="Selection-only: give every target-magnitude band equal weight and compare asinh-compressed errors in lexicase parent choice; reported loss is unchanged (default: off)")
     ap.add_argument("--gui",action="store_true",help="Start the browser GUI (training, live Pareto frontier, model explorer) instead of the terminal prompts")
     ap.add_argument("--port",type=int,default=8778,help="Browser GUI port (default: 8778)")
     return ap
@@ -4926,8 +5097,10 @@ def train_from_setup(args, setup, choose_model=None):
 
     ``choose_model(labels, choices, evaluation)`` returns the index of the model
     to save; the default asks at the terminal."""
-    global EQUIVALENCE_COLLAPSE
+    global EQUIVALENCE_COLLAPSE,RESIDUAL_ARCHIVE,QD_PARENT_CHOICE,SCALE_BALANCED_SELECTION
     EQUIVALENCE_COLLAPSE=getattr(args,"equivalence_collapse","on")=="on"; EQUIVALENCE_STATS["children_redrawn"]=0
+    RESIDUAL_ARCHIVE=getattr(args,"residual_archive","on")=="on"; QD_PARENT_CHOICE=getattr(args,"qd_parent_choice","quality_coverage")
+    SCALE_BALANCED_SELECTION=getattr(args,"scale_balanced_selection","off")=="on"
     run_seed=args.seed if args.seed is not None else random.SystemRandom().randrange(2**32)
     rng.seed(run_seed); np.random.seed(run_seed)
     print(f"Run seed: {run_seed}")
@@ -5008,7 +5181,7 @@ def train_from_setup(args, setup, choose_model=None):
         "islands":{"count":island_count,"population_total":args.population,"migration_interval":migration_interval,"migrants_per_island":migrants_per_island,"topology":"ring","state":"independent population, Bayesian banks, archive, QD, fragment library, pressure, ADF, and budget",
                    "stages":{key:stages[key] for key in ("mode","count","interval","age_gap","schedule","threshold_quantile")},
                    "roles":{key:roles[key] for key in ("enabled","interval","mix","retire_after")}},
-        "equivalence_collapse":EQUIVALENCE_COLLAPSE,
+        "equivalence_collapse":EQUIVALENCE_COLLAPSE,"residual_archive":RESIDUAL_ARCHIVE,"qd_parent_choice":QD_PARENT_CHOICE,"scale_balanced_selection":SCALE_BALANCED_SELECTION,
         "mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age",
         "test_csv":str(Path(args.test_csv).resolve()) if args.test_csv else None,
     },df,train_indices,validation_indices,external_validation)
@@ -5025,7 +5198,7 @@ def train_from_setup(args, setup, choose_model=None):
         "nsga_normalization":args.nsga_normalization,"parsimony_quality_tolerance":args.parsimony_quality_tolerance,"dynamic_pressure_enabled":dynamic_pressure_on,"adf_registry":ADFRegistry(adf_enabled,allow_nested=args.adf_mode=="nested").snapshot(),
         "profile":args.profile,"constraint_metadata":metadata,"constraints":constraints.describe(),"bayesian_particles":args.bayesian_particles,"interaction_discovery":interaction_discovery,
         "island_config":{"count":island_count,"migration_interval":migration_interval,"migrants_per_island":migrants_per_island,"topology":"ring","migration_events":0,"stages":stages,"roles":roles},
-        "equivalence_collapse":EQUIVALENCE_COLLAPSE,
+        "equivalence_collapse":EQUIVALENCE_COLLAPSE,"residual_archive":RESIDUAL_ARCHIVE,"qd_parent_choice":QD_PARENT_CHOICE,"scale_balanced_selection":SCALE_BALANCED_SELECTION,
         "mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age"}
     head_count=sum(len(heads) for heads in classification_layout(cats)[0])
     population_sizes=cell_population_sizes(args.population,cell_count)
@@ -5035,7 +5208,7 @@ def train_from_setup(args, setup, choose_model=None):
                                 parsimony_quality_tolerance=args.parsimony_quality_tolerance,dynamic_pressure_on=dynamic_pressure_on,
                                 stagnation_window=args.stagnation_window,adf_enabled=adf_enabled,adf_mode=args.adf_mode,
                                 evaluation_budget=args.evaluation_budget,evaluation_refresh=args.evaluation_refresh,
-                                interaction_discovery=interaction_discovery)
+                                interaction_discovery=interaction_discovery,Yt=Yt)
              for index,size in enumerate(population_sizes)]
     if roles["enabled"]: assign_role_parameters(islands,island_count,args.crossover_rate,args.bayesian_proposal_rate,nodes)
     snapshot_islands(checkpoint_state,islands,checkpoint_state["island_config"])
@@ -5057,7 +5230,7 @@ def train_from_setup(args, setup, choose_model=None):
                 cell_crossover,cell_proposals,cell_nodes,cell_weights=cell_search_settings(island,args.crossover_rate,args.bayesian_proposal_rate,nodes)
                 island.population=evolve_generation(island.population,gen,X=X,Xt=Xt,Yt=Yt,Xv=Xv,Yv=Yv,cats=cats,constraints=constraints,out_names=out_names,
                                   ops=ops,nodes=cell_nodes,depth=depth,case_weights=cell_weights,affine_on=affine_on,coev=coev,bayes=island.bayes,archive=island.archive,
-                                  semantic_qd=island.semantic_qd,structural_qd=island.structural_qd,qd_controller=island.qd_controller,best_models=island.best_models,
+                                  semantic_qd=island.semantic_qd,structural_qd=island.structural_qd,residual_qd=island.residual_qd,qd_controller=island.qd_controller,best_models=island.best_models,
                                   pressure=island.pressure,cases=island.cases,portfolio=island.portfolio,library=island.library,evaluator=evaluator,bayesian_proposal_rate=cell_proposals,
                                   crossover_rate=cell_crossover,qd_mode=args.qd_mode,lexicase_cases=args.lexicase_cases,nsga_normalization=args.nsga_normalization,bayesian_mode=args.bayesian_mode,adf_registry=island.adf_registry,budget=island.budget,progress=progress,population_size=island.population_size)
             gen+=1
@@ -5081,8 +5254,8 @@ def train_from_setup(args, setup, choose_model=None):
     for island in islands:
         if island.adf_registry.enabled:
             particle_models=[particle for bank in island.bayes.banks for particle in [*bank.particles.catalog,*bank.particles.particles]]
-            island.adf_registry.attach([*island.population,*island.archive.items,*island.semantic_qd.cells.values(),*island.structural_qd.cells.values(),island.best_models.model,*particle_models])
-        refresh_persistent_scores(island.archive,island.best_models,island.semantic_qd,island.structural_qd,evaluator)
+            island.adf_registry.attach([*island.population,*island.archive.items,*qd_cell_models(island.semantic_qd,island.structural_qd,island.residual_qd),island.best_models.model,*particle_models])
+        refresh_persistent_scores(island.archive,island.best_models,island.semantic_qd,island.structural_qd,evaluator,island.residual_qd)
         evaluator.assess(island.population,"train")
         island.best_models.update(island.population); island.archive.update(island.population,Xt)
     f=[model for island in islands for model in [*island.archive.items,*island.population,island.best_models.model] if model is not None]
@@ -5110,7 +5283,8 @@ def train_from_setup(args, setup, choose_model=None):
     snapshot_islands(checkpoint_state,islands,checkpoint_state["island_config"])
     save_checkpoint(checkpoint_path,gen,islands[0].population,islands[0].bayes,islands[0].archive,checkpoint_state)
     record_selection_manifest(manifest_path,selection)
-    card=write_model_card(manifest_path,chosen,names,out_names,constraints,hypotheses,islands[0].bayes,{"train_rows":len(Xt),"validation_rows":0 if Xv is None else len(Xv),"preprocessing":"fit_on_training_rows_only","schema_version":1},cats=cats,selection=selection,quality_diversity={"islands":[{"semantic":island.semantic_qd.diagnostics(),"structural":island.structural_qd.diagnostics(),"controller":island.qd_controller.diagnostics()} for island in islands]},survival={"nsga_normalization":args.nsga_normalization,"parsimony_quality_tolerance":args.parsimony_quality_tolerance,"islands":checkpoint_state["island_config"]},adf_diagnostics=[island.adf_registry.diagnostics() for island in islands if island.adf_registry.enabled] or None,evaluation={"budgets":[island.budget.snapshot() for island in islands],"evaluator":evaluator.diagnostics()},interaction_discovery=interaction_discovery,island_diagnostics={"config":checkpoint_state["island_config"],"bayesian_posteriors":[[bank.particles.last_predictive for bank in island.bayes.banks] for island in islands]})
+    card=write_model_card(manifest_path,chosen,names,out_names,constraints,hypotheses,islands[0].bayes,{"train_rows":len(Xt),"validation_rows":0 if Xv is None else len(Xv),"preprocessing":"fit_on_training_rows_only","schema_version":1},cats=cats,selection=selection,quality_diversity={"islands":[{"semantic":island.semantic_qd.diagnostics(),"structural":island.structural_qd.diagnostics(),"controller":island.qd_controller.diagnostics(),
+                                                                                         "residual":None if island.residual_qd is None else island.residual_qd.diagnostics()} for island in islands]},survival={"nsga_normalization":args.nsga_normalization,"parsimony_quality_tolerance":args.parsimony_quality_tolerance,"islands":checkpoint_state["island_config"]},adf_diagnostics=[island.adf_registry.diagnostics() for island in islands if island.adf_registry.enabled] or None,evaluation={"budgets":[island.budget.snapshot() for island in islands],"evaluator":evaluator.diagnostics()},interaction_discovery=interaction_discovery,island_diagnostics={"config":checkpoint_state["island_config"],"bayesian_posteriors":[[bank.particles.last_predictive for bank in island.bayes.banks] for island in islands]})
     evaluator.close()
     print(f"Model card: {card}")
     print("Saved best_model.py")
