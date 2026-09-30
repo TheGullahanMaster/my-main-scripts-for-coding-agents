@@ -72,6 +72,7 @@ class Cosine(nn.Module):
 # Imported custom modules (ensure these are in your PYTHONPATH)
 from pau import PAU      # PAU activation (if needed)
 from lamb import *  # Lamb, GoLU, and AdamMHD
+import mlpres_seq as seqm  # inenc / outdec columns: sequence encoders and decoders
 #from hypergrad import SGDHD
 
 
@@ -568,6 +569,40 @@ class MultiHeadSelfAttention(nn.Module):
             out = torch.cat([out, leftover], dim=-1)
         if squeeze: out = out.squeeze(0)
         return out
+
+class FeatureTokenAttention(nn.Module):
+    """Input attention across the input features: every feature becomes a token (its value times a learned
+    vector plus a learned feature-identity vector), so attention weights really compare features.
+      "basic": self-attention among the feature tokens, read back to one number per feature.
+      "cross": learned queries attend over the feature tokens, read back to a full input-width update.
+    The update is added to the raw inputs; its output projection starts at zero, so training begins
+    from the plain MLP."""
+    def __init__(self, input_dim, mode, num_heads=1, num_queries=4):
+        super().__init__()
+        self.mode = mode; h = max(1, int(num_heads or 1)); d = 8 * h
+        self.value = nn.Parameter(torch.randn(input_dim, d) * d ** -0.5)
+        self.feature = nn.Parameter(torch.randn(input_dim, d) * 0.02)
+        self.attn = nn.MultiheadAttention(d, h, batch_first=True)
+        if mode == "cross":
+            self.queries = nn.Parameter(torch.randn(1, num_queries, d) * 0.02)
+            self.out = nn.Linear(num_queries * d, input_dim)
+        else:
+            self.out = nn.Linear(d, 1)
+        nn.init.zeros_(self.out.weight); nn.init.zeros_(self.out.bias)
+
+    def forward(self, x):
+        squeeze = x.dim() == 1
+        if squeeze: x = x.unsqueeze(0)
+        tokens = x.unsqueeze(-1) * self.value + self.feature           # (B, D, d)
+        if self.mode == "cross":
+            q = self.queries.expand(x.size(0), -1, -1)
+            ctx, _ = self.attn(q, tokens, tokens, need_weights=False)   # (B, Q, d)
+            upd = self.out(ctx.flatten(1))
+        else:
+            ctx, _ = self.attn(tokens, tokens, tokens, need_weights=False)
+            upd = self.out(ctx).squeeze(-1)
+        out = x + upd
+        return out.squeeze(0) if squeeze else out
 
 ##############################################
 # MoE and LoRA components
@@ -1099,8 +1134,15 @@ class MLPO(nn.Module):
                  input_attention_type="none", moe_mode=1, dropout_prob=0.0,
                  use_noise_injection_layers=False, noise_injection_std=0.01,
                  final_lora_rank=8, final_lora_alpha=1.0, final_hyper_context_dim=64, final_lora_per_sample=True,
-                 layer_routing="none", use_grn=False):
+                 layer_routing="none", use_grn=False, output_activation=None, output_activation_idx=None):
+        """activation_cls: one activation class for every hidden layer, or a list with one per layer.
+        hidden_dims may be empty: a perceptron (inputs straight to outputs).
+        output_activation: activation class applied to the output positions output_activation_idx
+        (the numeric outputs; categorical logits are left alone)."""
         super().__init__()
+        layer_acts = list(activation_cls) if isinstance(activation_cls, (list, tuple)) else [activation_cls] * len(hidden_dims)
+        if len(layer_acts) != len(hidden_dims):
+            raise ValueError(f"{len(layer_acts)} layer activations for {len(hidden_dims)} hidden layers")
         self.residual_type = residual_type.lower(); self.dropout_prob = dropout_prob
         self.use_noise_injection_layers = use_noise_injection_layers; self.moe_mode = moe_mode
         self.layer_routing = layer_routing
@@ -1110,12 +1152,8 @@ class MLPO(nn.Module):
             raise ValueError("Adaptive layer routing requires standard residual blocks with MoE mode 1 (off).")
 
         self.input_attention_type = input_attention_type.lower()
-        if self.input_attention_type == "basic": self.input_attn = BasicSelfAttention(input_dim)
-        elif self.input_attention_type == "cross":
-            self.query = nn.Parameter(torch.randn(1, 1, input_dim))
-            # Standalone MHA for cross-attention (1 head on full dim for query→features)
-            self.input_cross_attn = nn.MultiheadAttention(input_dim, max(1, num_heads), batch_first=True)
-            self.input_attn = True  # sentinel so forward knows to run cross path
+        if self.input_attention_type in ("basic", "cross"):
+            self.input_attn = FeatureTokenAttention(input_dim, self.input_attention_type, num_heads)
         else: self.input_attn = None
 
         self.noise_injection = NoiseInjectionLayer(std=noise_injection_std) if use_noise_injection_layers else None
@@ -1129,7 +1167,7 @@ class MLPO(nn.Module):
             # DenseNet handles connectivity externally via concatenation,
             # so individual blocks should use "none" residual internally
             block_res = "none" if self.residual_type == "densenet" else residual_type
-            block = ResidualBlock(block_in_dim, hidden_dim, activation_cls, block_res,
+            block = ResidualBlock(block_in_dim, hidden_dim, layer_acts[i], block_res,
                 norm_type=norm_type, groups=groups, attention_type=attention_type, num_heads=num_heads,
                 moe_experts=moe_mode, use_noise_injection_layers=use_noise_injection_layers,
                 noise_injection_std=noise_injection_std, use_grn=use_grn)
@@ -1170,8 +1208,11 @@ class MLPO(nn.Module):
         if final_in_dim == output_dim: self.final_skip = nn.Identity()
         else: self.final_skip = nn.Linear(final_in_dim, output_dim, bias=False)
 
-        act_name = activation_cls.__name__ if hasattr(activation_cls, '__name__') else activation_cls().__class__.__name__
+        last_act = layer_acts[-1] if layer_acts else nn.Identity
+        act_name = last_act.__name__ if hasattr(last_act, '__name__') else last_act().__class__.__name__
         if self._final_is_param_linear: self._init_final_weights(act_name, final_in_dim)
+        self.output_act = output_activation() if output_activation is not None and output_activation_idx else None
+        self.register_buffer("output_act_idx", torch.tensor(list(output_activation_idx or []), dtype=torch.long), persistent=False)
 
     def _init_final_weights(self, act_name, in_features):
         if act_name in ["SELU", "lSELU", "sSELU", "sGoLU"]:
@@ -1183,13 +1224,7 @@ class MLPO(nn.Module):
         else: nn.init.kaiming_uniform_(self.final_linear.weight, a=0, mode='fan_in', nonlinearity='relu')
 
     def forward(self, x):
-        if self.input_attn is not None:
-            if self.input_attention_type == "basic": x = self.input_attn(x)
-            elif self.input_attention_type == "cross":
-                if x.dim() == 1: x_expanded = x.unsqueeze(0).unsqueeze(0); q = self.query; squeeze_back = True
-                else: x_expanded = x.unsqueeze(1); q = self.query.expand(x.size(0), -1, -1); squeeze_back = False
-                cross, _ = self.input_cross_attn(q, x_expanded, x_expanded, need_weights=False)
-                x = cross.squeeze(1) if not squeeze_back else cross.squeeze(0).squeeze(0)
+        if self.input_attn is not None: x = self.input_attn(x)
         if self.residual_type == "densenet":
             outputs = [x]
             for block in self.blocks:
@@ -1223,6 +1258,8 @@ class MLPO(nn.Module):
                     if self.dropout_prob > 0.0: out = F.dropout(out, p=self.dropout_prob, training=True)
                     elif self.noise_injection is not None: out = self.noise_injection(out)
         out = self.final_linear(out) + self.final_skip(out)
+        if self.output_act is not None:
+            out = out.index_copy(-1, self.output_act_idx, self.output_act(out.index_select(-1, self.output_act_idx)))
         return out
 
     def routing_loss(self):
@@ -1290,10 +1327,12 @@ class CombinedLoss(nn.Module):
                 losses.append(self.huber(pred_slice, tgt_slice))
             elif entry['type'] == 'outlabcat':
                 losses.append(F.cross_entropy(pred_slice, tgt_slice.squeeze(-1).long(), weight=weight))
-            elif entry['type'] == 'outexcat':
+            elif entry['type'] in ('outexcat', 'outdec'):
                 num_classes, max_len = entry['num_classes'], entry['max_len']
+                # outdec: positions after <eos> are padding and carry no loss; outexcat predicts its padding
                 losses.append(F.cross_entropy(pred_slice.reshape(-1, max_len, num_classes).reshape(-1, num_classes),
-                                              tgt_slice.long().reshape(-1), weight=weight))
+                                              tgt_slice.long().reshape(-1), weight=weight,
+                                              ignore_index=seqm.PAD if entry['type'] == 'outdec' else -100))
         return losses
 
     @torch.no_grad()
@@ -1315,7 +1354,7 @@ class CombinedLoss(nn.Module):
             elif e['type'] == 'outlabcat':
                 counts = torch.bincount(tgt.squeeze(-1).long().clamp(min=0), minlength=e['num_classes'])[:e['num_classes']].float() + 1.0
                 preds[:, e['start']:e['end']] = torch.log(counts / counts.sum())
-            elif e['type'] == 'outexcat':
+            elif e['type'] in ('outexcat', 'outdec'):
                 nc, ml = e['num_classes'], e['max_len']
                 logits = torch.stack([torch.log((torch.bincount(tgt[:, i].long().clamp(0, nc - 1), minlength=nc)[:nc].float() + 1.0)
                                                 / (len(tgt) + nc)) for i in range(ml)])
@@ -1352,6 +1391,12 @@ class CombinedLoss(nn.Module):
 ##############################################
 # Helper: build output layout from col_types + scalings
 ##############################################
+def text_num_classes(col_type, vocab):
+    """Softmax width of one text position: outexcat = its characters (ids 1..V) plus class 0 for padding
+    (so the model also predicts where the text ends); outdec = its token vocabulary incl. special tokens."""
+    return seqm.vocab_size(vocab) if col_type == 'outdec' else len(vocab) + 1
+
+
 def build_output_layout(output_cols, col_types, scalings, vocabularies):
     """
     Build the output layout describing where each output column's
@@ -1397,10 +1442,10 @@ def build_output_layout(output_cols, col_types, scalings, vocabularies):
                           'num_classes': nc})
             pred_idx += nc; tgt_idx += 1
             
-        elif ct == 'outexcat':
+        elif ct in ('outexcat', 'outdec'):
             ml = scalings[col]['max_len']
-            nc = len(vocabularies[col])
-            layout.append({'col': col, 'type': 'outexcat',
+            nc = text_num_classes(ct, vocabularies[col])
+            layout.append({'col': col, 'type': ct,
                           'start': pred_idx, 'end': pred_idx + ml * nc,
                           'tgt_start': tgt_idx, 'tgt_end': tgt_idx + ml,
                           'num_classes': nc, 'max_len': ml})
@@ -1434,7 +1479,7 @@ def compute_perplexity_metrics(predictions, targets, output_layout, vocabularies
             metrics[col_name] = ppl
             all_ce_losses.append(ce)
 
-        elif ct == 'outexcat':
+        elif ct in ('outexcat', 'outdec'):
             nc = entry['num_classes']
             ml = entry['max_len']
             pred_slice = predictions[:, entry['start']:entry['end']]
@@ -1466,7 +1511,7 @@ def calculate_input_dim(cols, col_types, scalings, vocabularies):
     dim = 0
     for col in cols:
         ct = col_types[col]
-        if ct in ['intex', 'outex']:
+        if ct in ['intex', 'outex', 'inenc']:
             dim += scalings[col]['max_len']
         elif ct == 'intexcat':
             dim += scalings[col]['max_len'] * len(vocabularies[col])
@@ -1487,8 +1532,8 @@ def calculate_output_pred_dim(cols, col_types, scalings, vocabularies):
         ct = col_types[col]
         if ct in ['outex', 'intex']:
             dim += scalings[col]['max_len']
-        elif ct == 'outexcat':
-            dim += scalings[col]['max_len'] * len(vocabularies[col])
+        elif ct in ('outexcat', 'outdec'):
+            dim += scalings[col]['max_len'] * text_num_classes(ct, vocabularies[col])
         elif ct == 'outlabcat':
             dim += len(vocabularies[col])
         else:  # out, outlab
@@ -1500,7 +1545,7 @@ def calculate_output_tgt_dim(cols, col_types, scalings):
     dim = 0
     for col in cols:
         ct = col_types[col]
-        if ct in ['outex', 'outexcat', 'intex', 'intexcat']:
+        if ct in ['outex', 'outexcat', 'intex', 'intexcat', 'outdec', 'inenc']:
             dim += scalings[col]['max_len']
         else:  # out, outlab, outlabcat
             dim += 1
@@ -1514,14 +1559,14 @@ def calculate_dims(cols, col_types, scalings, vocabularies=None):
     dim = 0
     for col in cols:
         ct = col_types[col]
-        if ct in ['intex', 'outex']:
+        if ct in ['intex', 'outex', 'inenc']:
             dim += scalings[col]['max_len']
         elif ct == 'intexcat':
             dim += scalings[col]['max_len'] * len(vocabularies.get(col, {}))
         elif ct in ['inlabcat', 'outlabcat']:
             dim += len(vocabularies.get(col, {}))
-        elif ct == 'outexcat':
-            dim += scalings[col]['max_len'] * len(vocabularies.get(col, {}))
+        elif ct in ('outexcat', 'outdec'):
+            dim += scalings[col]['max_len'] * text_num_classes(ct, vocabularies.get(col, {}))
         elif ct == 'inim':
             im_size = scalings[col]["im_size"]; patch_size = scalings[col]["patch_size"]
             num_patches = 1 if patch_size == 1 else (im_size // patch_size) ** 2
@@ -1539,7 +1584,7 @@ def calculate_dims(cols, col_types, scalings, vocabularies=None):
 ##############################################
 class CustomDataset(Dataset):
     def __init__(self, csv_file, delimiter=',', input_cols=[], output_cols=[], col_types={},
-                 vocabularies={}, scalings={}, image_params={}, df=None, keep_raw=False):
+                 vocabularies={}, scalings={}, image_params={}, df=None, keep_raw=False, scale_ranges=None):
         """df: optional already-loaded rows (e.g. the training part of a split) instead of reading csv_file.
         keep_raw: keep the cleaned, unscaled rows in self.raw_df (aligned with the dataset's rows)."""
         if df is not None:
@@ -1547,7 +1592,7 @@ class CustomDataset(Dataset):
         else:
             print(f"Loading dataset from {csv_file}...")
             try:
-                self.df = pd.read_csv(csv_file, delimiter=delimiter)
+                self.df = read_table(csv_file, delimiter=delimiter)
             except Exception as e:
                 print(f"Error reading CSV: {e}")
                 self.df = pd.DataFrame() # Empty fallback
@@ -1558,6 +1603,7 @@ class CustomDataset(Dataset):
         self.vocabularies = vocabularies
         self.scalings = scalings if scalings else {}
         self.image_params = image_params
+        self.scale_ranges = scale_ranges or {}  # numeric column -> [lo, hi] model range for new scalings
         self.inim_cache = {}
         
         # --- NEW: VALIDATION STEP ---
@@ -1591,7 +1637,8 @@ class CustomDataset(Dataset):
         for col in numeric_cols:
             # Coerce errors to NaN, then drop rows that became NaN
             # This handles cases where a number column contains "error" or garbage text
-            self.df[col] = pd.to_numeric(self.df[col], errors='coerce')
+            # True / False (bool dtype, or the words in a text column) count as 1 / 0
+            self.df[col] = pd.to_numeric(self.df[col].map(_bool_as_number), errors='coerce').astype(float)
         
         self.df.dropna(subset=numeric_cols, inplace=True)
 
@@ -1616,7 +1663,7 @@ class CustomDataset(Dataset):
 
         # 4. Validate Categorical Consistency
         # Ensure we don't have empty strings for text inputs if that matters
-        text_cols = [c for c in active_cols if self.col_types[c] in ['intex', 'outex', 'intexcat', 'outexcat']]
+        text_cols = [c for c in active_cols if self.col_types[c] in ['intex', 'outex', 'intexcat', 'outexcat', 'inenc', 'outdec']]
         for col in text_cols:
             # Remove rows where text is just whitespace or empty
             self.df = self.df[self.df[col].astype(str).str.strip().str.len() > 0]
@@ -1654,10 +1701,14 @@ class CustomDataset(Dataset):
         for col in self.input_cols + self.output_cols:
             col_type = self.col_types[col]
             
-            if col_type in ['intex', 'outex', 'intexcat', 'outexcat']:
+            if col_type in ['intex', 'outex', 'intexcat', 'outexcat', 'inenc', 'outdec']:
                 self.df[col] = self.df[col].astype(str)
                 if col in self.scalings and 'max_len' in self.scalings[col]:
                     max_len = self.scalings[col]['max_len']
+                elif col_type in seqm.SEQ_TYPES:  # tokens (+ <eos> for outputs)
+                    vocab = self.vocabularies[col]
+                    max_len = int(self.df[col].apply(lambda t: seqm.token_count(t, vocab, col_type == 'outdec')).max())
+                    self.scalings[col] = {'max_len': max_len}
                 else:
                     max_len = self.df[col].apply(len).max()
                     self.scalings[col] = {'max_len': max_len}
@@ -1739,10 +1790,9 @@ class CustomDataset(Dataset):
                 else:
                     min_val, max_val = self.df[col].min(), self.df[col].max()
                     self.scalings[col] = {'min': min_val, 'max': max_val}
-                
-                denom = max_val - min_val
-                if denom == 0: denom = 1.0
-                self.df[col] = 2 * (self.df[col] - min_val) / denom - 1
+                    if col in self.scale_ranges and tuple(self.scale_ranges[col]) != (-1.0, 1.0):
+                        self.scalings[col]['range'] = [float(x) for x in self.scale_ranges[col]]
+                self.df[col] = to_model_units(self.df[col], self.scalings[col])
         
     def __len__(self):
         return len(self.df)
@@ -1756,7 +1806,11 @@ class CustomDataset(Dataset):
         for col in self.input_cols:
             col_type = self.col_types[col]
             
-            if col_type == 'intexcat':
+            if col_type == 'inenc':
+                input_features.extend(seqm.encode_ids(self.df.at[idx, col], self.vocabularies[col],
+                                                     self.scalings[col]['max_len'], is_output=False))
+
+            elif col_type == 'intexcat':
                 value = str(self.df.at[idx, col])
                 vocab = self.vocabularies[col]
                 vocab_size = len(vocab)
@@ -1839,7 +1893,11 @@ class CustomDataset(Dataset):
         for col in self.output_cols:
             col_type = self.col_types[col]
             
-            if col_type == 'outlabcat':
+            if col_type == 'outdec':
+                output_features.extend(float(i) for i in seqm.encode_ids(self.df.at[idx, col], self.vocabularies[col],
+                                                                         self.scalings[col]['max_len'], is_output=True))
+
+            elif col_type == 'outlabcat':
                 value = int(self.df.at[idx, col])
                 output_features.append(float(value))
                 
@@ -1875,7 +1933,7 @@ class CustomDataset(Dataset):
             col_type = self.col_types[col]
             if col_type in ['outlabcat', 'outexcat']:
                 vocab = self.vocabularies[col]
-                num_classes = len(vocab)
+                num_classes = text_num_classes(col_type, vocab) if col_type == 'outexcat' else len(vocab)
                 counts = np.ones(num_classes, dtype=np.float32)
                 if col_type == 'outlabcat':
                     for val in self.df[col]:
@@ -1910,7 +1968,7 @@ def _row_group_keys(df, cols, col_types):
     for c in cols:
         v = df[c]
         if col_types.get(c) in ('in', 'out'):
-            v = pd.to_numeric(v, errors='coerce').astype(float).map(lambda x: format(x, '.12g'))
+            v = pd.to_numeric(v.map(_bool_as_number), errors='coerce').astype(float).map(lambda x: format(x, '.12g'))
         norm[c] = v.astype(str)
     return pd.util.hash_pandas_object(pd.DataFrame(norm, index=df.index), index=False)
 
@@ -1944,7 +2002,8 @@ def group_kfold_ids(keys, k, seed=0):
 
 
 def prepare_train_val(csv_file, delimiter, input_cols, output_cols, col_types, vocabularies, image_params,
-                      val_frac=0.0, val_file=None, seed=0, val_delimiter=None, scalings=None, val_is_holdout=False):
+                      val_frac=0.0, val_file=None, seed=0, val_delimiter=None, scalings=None, val_is_holdout=False,
+                      scale_ranges=None):
     """Deduplicated training set and a validation set that shares no row and no input
     combination with it. Scalings are fit on the training rows only.
     scalings: reuse these (resuming a model) instead of fitting them on the training rows.
@@ -1957,7 +2016,7 @@ def prepare_train_val(csv_file, delimiter, input_cols, output_cols, col_types, v
         if missing:
             raise ValueError(f"{path} has no column(s) {missing}; its columns are {list(frame.columns)[:12]}. "
                              f"Check the delimiter, or pick the right {'validation ' if path != csv_file else ''}file.")
-    df = pd.read_csv(csv_file, delimiter=delimiter)
+    df = read_table(csv_file, delimiter=delimiter)
     require_columns(df, csv_file)
     n_raw = len(df)
     df, dups = dedupe_rows(df, input_cols, output_cols, col_types)
@@ -1965,7 +2024,9 @@ def prepare_train_val(csv_file, delimiter, input_cols, output_cols, col_types, v
     keys = _row_group_keys(df, input_cols, col_types)
     val_df = None
     if val_file:
-        val_df = pd.read_csv(val_file, delimiter=val_delimiter or delimiter)
+        # a separate validation file has the training file's layout; model_validation.csv (holdout) is saved already renamed
+        vfmt = {"header": True} if val_is_holdout else (CSV_FORMATS.get(os.path.abspath(val_file)) or CSV_FORMATS.get(os.path.abspath(csv_file)))
+        val_df = read_table(val_file, delimiter=val_delimiter or delimiter, fmt=vfmt)
         require_columns(val_df, val_file)
         val_df, report["val_duplicates_removed"] = dedupe_rows(val_df, input_cols, output_cols, col_types)
         vkeys = _row_group_keys(val_df, input_cols, col_types)
@@ -1981,7 +2042,8 @@ def prepare_train_val(csv_file, delimiter, input_cols, output_cols, col_types, v
         mask = group_split_mask(keys, val_frac, seed)
         val_df, df = df[mask], df[~mask]
     print(f"Data: {n_raw} rows read, {dups} exact duplicates removed.")
-    train_ds = CustomDataset(csv_file, delimiter, input_cols, output_cols, col_types, vocabularies, scalings or {}, image_params, df=df)
+    train_ds = CustomDataset(csv_file, delimiter, input_cols, output_cols, col_types, vocabularies, scalings or {}, image_params, df=df,
+                             scale_ranges=scale_ranges)
     val_ds = None
     if val_df is not None:
         if report.get("train_rows_held_out"):
@@ -2016,12 +2078,14 @@ def prepare_resume(config_path="config.json", model_path="model.pt"):
     Returns (main_kwargs, val_dataset or None, report)."""
     with open(config_path) as f: cfg = json.load(f)
     if not os.path.isfile(model_path): raise FileNotFoundError(f"No trained model at {model_path}")
+    register_csv_format(cfg.get("file_path"), cfg.get("csv_format"))
     if isinstance(cfg.get("hidden_dims"), dict): raise ValueError("Auto-grow models cannot be resumed.")
     path = cfg.get("file_path")
     if not path or not os.path.isfile(path): raise FileNotFoundError(f"Training data {path!r} from config.json not found")
     col_types = cfg["col_types"]; vocab = cfg.get("vocabularies", {}); image_params = cfg.get("image_params", {})
     input_cols = [c for c, v in col_types.items() if 'in' in v]; output_cols = [c for c, v in col_types.items() if 'out' in v]
-    delim = _gui_detect_delimiter(path, input_cols + output_cols)
+    original = {new: old for old, new in (cfg.get("csv_format") or {}).get("rename", {}).items()}
+    delim = _gui_detect_delimiter(path, [original.get(c, c) for c in input_cols + output_cols])
     vfile = os.path.join(os.path.dirname(os.path.abspath(model_path)), VALIDATION_ROWS_FILE)
     if not (os.path.isfile(vfile) and os.path.getsize(vfile) > 0):
         vfile = None
@@ -2049,12 +2113,14 @@ def prepare_resume(config_path="config.json", model_path="model.pt"):
                   noise_mode=cfg.get("noise_mode", "none"), noise_params=cfg.get("noise_params", {}),
                   base_activation_cls_for_config=base, mlp_mode=cfg.get("mlp_mode", 0),
                   layer_routing=cfg.get("layer_routing", "none"), use_grn=cfg.get("use_grn", False),
-                  optimizer_choice=cfg.get("optimizer_choice", "Adam"), train_dataset=train_ds, resume_from=model_path)
+                  optimizer_choice=cfg.get("optimizer_choice", "Adam"), train_dataset=train_ds, resume_from=model_path,
+                  seq_params=cfg.get("seq_params", {}), seq_bridge=cfg.get("seq_bridge", "mlp"),
+                  layer_activations=cfg.get("layer_activations"), output_activation=cfg.get("output_activation"))
     return kwargs, val_ds, report
 
 
 def ask_validation_and_prepare(file_path, delimiter, input_cols, output_cols, col_types, vocabularies,
-                               image_params, batch_size, ask_interval=True):
+                               image_params, batch_size, ask_interval=True, scale_ranges=None):
     """CLI validation prompts + prepare_train_val. Returns (train_ds, val_loader, val_interval)."""
     print("\n--- Validation Setup ---")
     val_file = input("Enter validation CSV path (empty for percentage split): ").strip()
@@ -2065,7 +2131,8 @@ def ask_validation_and_prepare(file_path, delimiter, input_cols, output_cols, co
         try: val_frac = float(input("Validation split % (0.0-1.0, e.g. 0.1): ").strip())
         except ValueError: val_frac = 0.0
     train_ds, val_ds, _ = prepare_train_val(file_path, delimiter, input_cols, output_cols, col_types,
-                                            vocabularies, image_params, val_frac=val_frac, val_file=val_file or None)
+                                            vocabularies, image_params, val_frac=val_frac, val_file=val_file or None,
+                                            scale_ranges=scale_ranges)
     val_loader, val_interval = None, 1000
     if val_ds is not None:
         val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
@@ -2077,7 +2144,7 @@ def ask_validation_and_prepare(file_path, delimiter, input_cols, output_cols, co
 
 def ask_loss_balancing(output_cols, col_types):
     """Only asked when several outputs include a categorical one (where CombinedLoss is used)."""
-    if len(output_cols) < 2 or not any(col_types[c] in ('outlabcat', 'outexcat') for c in output_cols):
+    if len(output_cols) < 2 or not any(col_types[c] in ('outlabcat', 'outexcat', 'outdec') for c in output_cols):
         return "normalized", 20.0
     print("\nLoss balancing across outputs:")
     print("  1: Normalized (each output's loss / trivial-predictor loss) [default]")
@@ -2229,7 +2296,7 @@ def validate_model(model, val_loader, criterion, device):
     with torch.no_grad():
         for v_inputs, v_targets in val_loader:
             v_inputs, v_targets = v_inputs.to(device), v_targets.to(device)
-            v_outputs = model(v_inputs)
+            v_outputs = seqm.model_forward(model, v_inputs, v_targets)  # teacher-forced for decoders
             loss = criterion(v_outputs, v_targets)
             total_val_loss += loss.item()
     model.train(); criterion.train()
@@ -2277,6 +2344,85 @@ def materialize_lazy_modules(model, input_dim, device):
     model.train(was_training)
 
 
+CSV_FORMATS = {}  # absolute CSV path -> {"header": bool, "rename": {original name: new name}}
+
+
+def csv_format(header=True, rename=None, columns=None):
+    """Validated reading format. columns: the file's original column names, to check the renaming against."""
+    rename = {str(k): str(v).strip() for k, v in (rename or {}).items() if str(v).strip() and str(v).strip() != str(k)}
+    if columns is not None:
+        final = [rename.get(str(c), str(c)) for c in columns]
+        dup = sorted({n for n in final if final.count(n) > 1})
+        if dup: raise ValueError(f"Column names must be unique after renaming: {dup}")
+    return {"header": bool(header), "rename": rename}
+
+
+def register_csv_format(path, fmt):
+    """Every later read_table(path) applies fmt (no header row -> col1, col2, ...; then the renaming)."""
+    if path and fmt: CSV_FORMATS[os.path.abspath(os.path.expanduser(str(path)))] = csv_format(fmt.get("header", True), fmt.get("rename"))
+
+
+def headerless_names(n):
+    return [f"col{i + 1}" for i in range(n)]
+
+
+def read_table(path, delimiter=",", fmt=None, **kw):
+    """pd.read_csv honouring the file's registered format (or `fmt`): header row or not, renamed columns."""
+    fmt = fmt or CSV_FORMATS.get(os.path.abspath(os.path.expanduser(str(path)))) or {}
+    if fmt.get("header", True): df = pd.read_csv(path, delimiter=delimiter, **kw)
+    else:
+        df = pd.read_csv(path, delimiter=delimiter, header=None, **kw); df.columns = headerless_names(df.shape[1])
+    if fmt.get("rename"): df = df.rename(columns=fmt["rename"])
+    return df
+
+
+def scale_range(s):
+    """Model-side range of a numeric column's scaling (default [-1, 1])."""
+    r = s.get("range") or (-1.0, 1.0)
+    return float(r[0]), float(r[1])
+
+
+def to_model_units(v, s):
+    """Raw value(s) -> model units: [min, max] of the training rows maps onto the column's range."""
+    lo, hi = scale_range(s); d = (s["max"] - s["min"]) or 1.0
+    return lo + (hi - lo) * (v - s["min"]) / d
+
+
+def to_display_units(v, s):
+    lo, hi = scale_range(s); w = (hi - lo) or 1.0
+    return (v - lo) / w * (s["max"] - s["min"]) + s["min"]
+
+
+def _bool_as_number(v):
+    """True / False (bools or the strings, any case) -> 1 / 0; anything else unchanged."""
+    if isinstance(v, (bool, np.bool_)): return int(v)
+    if isinstance(v, str) and v.strip().lower() in ("true", "false"): return int(v.strip().lower() == "true")
+    return v
+
+
+def has_seq_columns(col_types):
+    return any(t in seqm.SEQ_TYPES for t in col_types.values())
+
+
+def build_seq_model(make_mlp, input_cols, output_cols, col_types, scalings, vocabularies, seq_params, seq_bridge="mlp",
+                    output_activation=None):
+    """The encoder -> bridge -> decoder model for datasets with inenc / outdec columns (see mlpres_seq).
+    output_activation: applied to the numeric ('out') outputs after the bridge."""
+    slots, start = [], 0
+    for c in input_cols:
+        w = calculate_input_dim([c], col_types, scalings, vocabularies); slots.append((c, start, w)); start += w
+    layout, _, _ = build_output_layout(output_cols, col_types, scalings, vocabularies)
+    return seqm.SeqMLP(slots, col_types, vocabularies, layout, seq_params or {}, seq_bridge, make_mlp,
+                       output_activation=output_activation)
+
+
+def describe_seq_model(model):
+    parts = [f"{c}: {type(model.encoders[c]).__name__}" for c, *_ in model.enc_slots]
+    parts += [f"{c}: {type(d.core).__name__}" for c, d in model.decoders.items()]
+    print(f"Sequence model: bridge={model.bridge_kind} ({type(model.bridge).__name__}); " + ", ".join(parts)
+          + f"; {sum(p.numel() for p in model.parameters()):,} parameters")
+
+
 def main(csv_file, delimiter=',', input_cols=[], output_cols=[], col_types={}, vocabularies={}, scalings={}, image_params={},
          optimizer_choice="Adam", hidden_dims=[100, 50], batch_size=32, activation_cls=nn.ReLU, activation_type=0,
          residual_type="residual", norm_type="layer", groups=1, attention_type="none", num_heads=1,
@@ -2284,12 +2430,21 @@ def main(csv_file, delimiter=',', input_cols=[], output_cols=[], col_types={}, v
          use_lsuv=False, lsuv_max_iter=10, lsuv_normalize_mean=False,
          val_loader=None, val_interval=1000, custom_lr=None, mlp_mode=0, layer_routing="none", use_grn=False,
          optim_params=None, progress_callback=None, train_dataset=None,
-         loss_balancing="normalized", loss_temperature=20.0, resume_from=None):
+         loss_balancing="normalized", loss_temperature=20.0, resume_from=None, seq_params=None, seq_bridge="mlp",
+         layer_activations=None, output_activation=None):
     """progress_callback(dict) is called every step and after each validation (GUI);
     returning True stops training exactly like Ctrl+C (best model is kept).
     train_dataset: the prepared training rows (see prepare_train_val); None reads all of csv_file.
     resume_from: a state dict file (model.pt) to continue training from; the architecture arguments
-    must match it (see prepare_resume)."""
+    must match it (see prepare_resume).
+    seq_params / seq_bridge: settings of inenc / outdec columns (see mlpres_seq.check_params, mlpres_seq.BRIDGES).
+    layer_activations: None (activation_cls everywhere) or one {"name", "params"} per hidden layer.
+    output_activation: {"name", "params"} applied to numeric outputs (None / Linear = none).
+    hidden_dims may be [] (a perceptron; with encoders / decoders the bridge becomes one linear map)."""
+    seq_params = seq_params or {}
+    check_mlp_options(mlp_mode, layer_activations, output_activation, hidden_dims)
+    if layer_activations: activation_cls = [activation_from_config(c, activation_type) for c in layer_activations]
+    out_act = None if is_linear_activation(output_activation) else activation_from_config(output_activation, wrap=False)
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
@@ -2305,39 +2460,49 @@ def main(csv_file, delimiter=',', input_cols=[], output_cols=[], col_types={}, v
     
     # Build output layout for CombinedLoss
     output_layout, output_pred_dim, output_tgt_dim = build_output_layout(output_cols, col_types, scalings, vocabularies)
-    has_categorical = any(e['type'] in ['outlabcat', 'outexcat'] for e in output_layout)
+    has_categorical = any(e['type'] in ['outlabcat', 'outexcat', 'outdec'] for e in output_layout)
     
     # Model uses prediction dim (includes logit dimensions for categorical)
     output_dims = output_pred_dim
 
-    if mlp_mode == 1:
-        # GNN mode
-        dropout_prob = noise_params.get("dropout_pct", 0.0) if noise_mode == "dropout" else 0.0
-        model = GNNMLPO(input_dims, hidden_dims, output_dims, activation_cls, residual_type,
-                        norm_type=norm_type, groups=groups, dropout_prob=dropout_prob, use_grn=use_grn).to(device)
-    elif noise_mode == "dropout":
-        dropout_prob = noise_params.get("dropout_pct", 0.0)
-        model = MLPO(input_dims, hidden_dims, output_dims, activation_cls, residual_type,
-                     norm_type=norm_type, groups=groups, attention_type=attention_type, num_heads=num_heads,
-                     input_attention_type=input_attention_type, moe_mode=moe_mode, dropout_prob=dropout_prob,
-                     layer_routing=layer_routing, use_grn=use_grn).to(device)
-    elif noise_mode == "noise injection layers":
-        injection_std = noise_params.get("std", 0.1)
-        model = MLPO(input_dims, hidden_dims, output_dims, activation_cls, residual_type,
-                     norm_type=norm_type, groups=groups, attention_type=attention_type, num_heads=num_heads,
-                     input_attention_type=input_attention_type, moe_mode=moe_mode,
-                     use_noise_injection_layers=True, noise_injection_std=injection_std,
-                     layer_routing=layer_routing, use_grn=use_grn).to(device)
+    def make_mlp(in_dim, out_dim, out_idx=None):
+        oa = dict(output_activation=out_act if out_idx else None, output_activation_idx=out_idx)
+        if mlp_mode == 1:
+            # GNN mode
+            dropout_prob = noise_params.get("dropout_pct", 0.0) if noise_mode == "dropout" else 0.0
+            return GNNMLPO(in_dim, hidden_dims, out_dim, activation_cls, residual_type,
+                           norm_type=norm_type, groups=groups, dropout_prob=dropout_prob, use_grn=use_grn)
+        elif noise_mode == "dropout":
+            dropout_prob = noise_params.get("dropout_pct", 0.0)
+            return MLPO(in_dim, hidden_dims, out_dim, activation_cls, residual_type,
+                        norm_type=norm_type, groups=groups, attention_type=attention_type, num_heads=num_heads,
+                        input_attention_type=input_attention_type, moe_mode=moe_mode, dropout_prob=dropout_prob,
+                        layer_routing=layer_routing, use_grn=use_grn, **oa)
+        elif noise_mode == "noise injection layers":
+            injection_std = noise_params.get("std", 0.1)
+            return MLPO(in_dim, hidden_dims, out_dim, activation_cls, residual_type,
+                        norm_type=norm_type, groups=groups, attention_type=attention_type, num_heads=num_heads,
+                        input_attention_type=input_attention_type, moe_mode=moe_mode,
+                        use_noise_injection_layers=True, noise_injection_std=injection_std,
+                        layer_routing=layer_routing, use_grn=use_grn, **oa)
+        return MLPO(in_dim, hidden_dims, out_dim, activation_cls, residual_type,
+                    norm_type=norm_type, groups=groups, attention_type=attention_type, num_heads=num_heads,
+                    input_attention_type=input_attention_type, moe_mode=moe_mode,
+                    layer_routing=layer_routing, use_grn=use_grn, **oa)
+
+    if has_seq_columns(col_types):
+        model = build_seq_model(make_mlp, input_cols, output_cols, col_types, scalings, vocabularies,
+                                seq_params, seq_bridge, out_act).to(device)
+        describe_seq_model(model)
     else:
-        model = MLPO(input_dims, hidden_dims, output_dims, activation_cls, residual_type,
-                     norm_type=norm_type, groups=groups, attention_type=attention_type, num_heads=num_heads,
-                     input_attention_type=input_attention_type, moe_mode=moe_mode,
-                     layer_routing=layer_routing, use_grn=use_grn).to(device)
+        model = make_mlp(input_dims, output_dims, numeric_output_positions(output_layout)).to(device)
 
     materialize_lazy_modules(model, input_dims, device)
     if resume_from:
         model.load_state_dict(torch.load(resume_from, map_location=device))
         print(f"Resume: continuing from the weights in {resume_from}.")
+    elif use_lsuv and isinstance(model, seqm.SeqMLP):
+        print("LSUV skipped: it initializes plain MLPs, not models with sequence encoders / decoders.")
     elif use_lsuv:  # LSUV would overwrite resumed weights
         lsuv_init(model, train_loader, device, max_iter=lsuv_max_iter, normalize_mean=lsuv_normalize_mean, verbose=True)
 
@@ -2360,7 +2525,8 @@ def main(csv_file, delimiter=',', input_cols=[], output_cols=[], col_types={}, v
     save_config(csv_file, col_types, hidden_dims, vocabularies, scalings, image_params,
                 optimizer_choice, batch_size, config_activation_cls, activation_type, residual_type,
                 norm_type, groups, attention_type, num_heads, input_attention_type, moe_mode, noise_mode, noise_params,
-                mlp_mode=mlp_mode, layer_routing=layer_routing, use_grn=use_grn)
+                mlp_mode=mlp_mode, layer_routing=layer_routing, use_grn=use_grn, seq_params=seq_params, seq_bridge=seq_bridge,
+                layer_activations=layer_activations, output_activation=output_activation)
     save_validation_rows(val_loader)
         
     try:
@@ -2374,7 +2540,7 @@ def main(csv_file, delimiter=',', input_cols=[], output_cols=[], col_types={}, v
                 if _is_evolution:
                     # Evolution optimizer: forward-only closure (no backward/grad clipping)
                     def closure():
-                        outputs = model(noisy_inputs)
+                        outputs = seqm.model_forward(model, noisy_inputs, targets)
                         if noise_mode == "output noise":
                             outputs = outputs + torch.randn_like(outputs) * noise_params.get("std", 0.1)
                         loss = criterion(outputs, targets) + model.routing_loss()
@@ -2382,7 +2548,7 @@ def main(csv_file, delimiter=',', input_cols=[], output_cols=[], col_types={}, v
                 else:
                     def closure():
                         optimizer.zero_grad()
-                        outputs = model(noisy_inputs)
+                        outputs = seqm.model_forward(model, noisy_inputs, targets)
                         if noise_mode == "output noise":
                             outputs = outputs + torch.randn_like(outputs) * noise_params.get("std", 0.1)
                         loss = criterion(outputs, targets) + model.routing_loss()
@@ -2405,7 +2571,7 @@ def main(csv_file, delimiter=',', input_cols=[], output_cols=[], col_types={}, v
                     # Perplexity logging for categorical outputs
                     if has_categorical and step % 1 == 0:
                         with torch.no_grad():
-                            ppl_preds = model(inputs)
+                            ppl_preds = seqm.model_forward(model, inputs, targets)
                             ppl_metrics, global_ppl = compute_perplexity_metrics(
                                 ppl_preds, targets, output_layout, vocabularies)
                             ppl_parts = [f'{k}_ppl={v:.2f}' for k, v in ppl_metrics.items()]
@@ -2459,7 +2625,8 @@ def main(csv_file, delimiter=',', input_cols=[], output_cols=[], col_types={}, v
     save_config(csv_file, col_types, hidden_dims, vocabularies, scalings, image_params,
                 optimizer_choice, batch_size, config_activation_cls, activation_type, residual_type,
                 norm_type, groups, attention_type, num_heads, input_attention_type, moe_mode, noise_mode, noise_params,
-                mlp_mode=mlp_mode, layer_routing=layer_routing, use_grn=use_grn)
+                mlp_mode=mlp_mode, layer_routing=layer_routing, use_grn=use_grn, seq_params=seq_params, seq_bridge=seq_bridge,
+                layer_activations=layer_activations, output_activation=output_activation)
 
 
 ##############################################
@@ -2549,6 +2716,8 @@ def main_auto_grow(csv_file, delimiter=',', input_cols=[], output_cols=[], col_t
                    mlp_mode=0, train_dataset=None, loss_balancing="normalized", loss_temperature=20.0):
     """Training with auto-growing architecture.
     Starts with 1 neuron, 1 layer. Adds neurons/layers when loss stagnates."""
+    if has_seq_columns(col_types):
+        raise ValueError("Auto-grow does not support inenc / outdec columns; use fixed hidden layers.")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     max_dim = auto_config["max_dim"]
@@ -4120,7 +4289,8 @@ def preprocess_input(user_input_dict):
                 smax = SCALINGS[col]["max"]
                 try:
                     fval = float(val)
-                    scaled = 2 * (fval - smin) / (smax - smin) - 1
+                    lo, hi = SCALINGS[col].get("range", [-1.0, 1.0])
+                    scaled = lo + (hi - lo) * (fval - smin) / ((smax - smin) or 1.0)
                     processed_vector.append(scaled)
                 except: processed_vector.append(0.0)
             else:
@@ -4133,7 +4303,8 @@ def preprocess_input(user_input_dict):
                 smax = SCALINGS[col]["max"]
                 try:
                     fval = float(val)
-                    scaled = 2 * (fval - smin) / (smax - smin) - 1
+                    lo, hi = SCALINGS[col].get("range", [-1.0, 1.0])
+                    scaled = lo + (hi - lo) * (fval - smin) / ((smax - smin) or 1.0)
                     processed_vector.append(scaled)
                 except: processed_vector.append(0.0)
             else:
@@ -4182,7 +4353,8 @@ def postprocess_output(raw_output):
             if col in SCALINGS and "min" in SCALINGS[col]:
                 smin = SCALINGS[col]["min"]
                 smax = SCALINGS[col]["max"]
-                val = (val + 1.0) / 2.0 * (smax - smin) + smin
+                lo, hi = SCALINGS[col].get("range", [-1.0, 1.0])
+                val = (val - lo) / ((hi - lo) or 1.0) * (smax - smin) + smin
             results[col] = val
             
         elif ctype in ["outlabcat", "outexcat"]:
@@ -4386,22 +4558,8 @@ def run_export(config_path="config.json", model_path="model.pt"):
     # --- FIX: Check MLP Mode ---
     mlp_mode = config.get("mlp_mode", 0)
     
-    if mlp_mode == 1:
-        # GNN Mode
-        model = GNNMLPO(input_dims, config["hidden_dims"], output_pred_dim, activation_cls,
-                        config.get("residual_type", "residual"),
-                        norm_type=config.get("norm_type", "layer"),
-                        groups=config.get("groups", 1)).to(device)
-    else:
-        # Standard MLP Mode
-        model = MLPO(input_dims, config["hidden_dims"], output_pred_dim, activation_cls,
-            config.get("residual_type", "residual"),
-            norm_type=config.get("norm_type", "layer"),
-            groups=config.get("groups", 1),
-            attention_type=config.get("attention_type", "none"),
-            num_heads=config.get("num_heads", 1),
-            input_attention_type=config.get("input_attention_type", "none"),
-            moe_mode=config.get("moe_mode", 1), layer_routing=config.get("layer_routing", "none")).to(device)
+    model = build_model_from_config(config, input_dims, output_pred_dim, torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+    materialize_lazy_modules(model, input_dims, next(model.parameters()).device)
     
     # Lazy init
     with torch.no_grad():
@@ -4438,7 +4596,8 @@ def convert_to_serializable(obj):
 def save_config(file_path, col_types, hidden_dims, vocabularies, scalings, image_params,
                 optimizer_choice, batch_size, activation_cls, activation_type, residual_type,
                 norm_type, groups, attention_type, num_heads, input_attention_type, moe_mode, noise_mode, noise_params,
-                mlp_mode=0, layer_routing="none", use_grn=False):
+                mlp_mode=0, layer_routing="none", use_grn=False, seq_params=None, seq_bridge="mlp",
+                layer_activations=None, output_activation=None):
     try: activation_config = activation_cls.activation_config
     except AttributeError:
         activation_name = activation_cls.__name__ if hasattr(activation_cls, '__name__') else "ReLU"
@@ -4455,22 +4614,33 @@ def save_config(file_path, col_types, hidden_dims, vocabularies, scalings, image
         "noise_mode": noise_mode, "noise_params": noise_params,
         "mlp_mode": mlp_mode, "layer_routing": layer_routing, "use_grn": use_grn,
     }
+    if has_seq_columns(col_types): config.update(seq_params=seq_params or {}, seq_bridge=seq_bridge)
+    if layer_activations: config["layer_activations"] = layer_activations
+    if not is_linear_activation(output_activation): config["output_activation"] = output_activation
+    fmt = CSV_FORMATS.get(os.path.abspath(file_path)) if file_path else None
+    if fmt: config["csv_format"] = fmt
     with open("config.json", "w") as f: json.dump(convert_to_serializable(config), f, indent=2)
 
 def load_config():
-    with open("config.json", "r") as f: return json.load(f)
+    with open("config.json", "r") as f: cfg = json.load(f)
+    register_csv_format(cfg.get("file_path"), cfg.get("csv_format"))  # headerless / renamed training file
+    return cfg
 
 ##############################################
 # Ask column types (UPDATED: supports *cat)
 ##############################################
-def _setup_vocab_for_col(col, col_type, file_path, delimiter, vocabularies, image_params):
-    """Set up vocabulary/image params for a single column."""
-    if col_type in ["inlab", "outlab", "inlabcat", "outlabcat"]:
-        df_temp = pd.read_csv(file_path, delimiter=delimiter)
+def _setup_vocab_for_col(col, col_type, file_path, delimiter, vocabularies, image_params, tokenizer="char"):
+    """Set up vocabulary/image params for a single column (tokenizer: inenc / outdec columns only)."""
+    if col_type in seqm.SEQ_TYPES:
+        df_temp = read_table(file_path, delimiter=delimiter)
+        vocabularies[col] = seqm.build_vocab(df_temp[col].dropna().astype(str), tokenizer)
+        print(f"  '{col}': {tokenizer} vocabulary of {seqm.vocab_size(vocabularies[col]) - len(seqm.SPECIALS)} tokens")
+    elif col_type in ["inlab", "outlab", "inlabcat", "outlabcat"]:
+        df_temp = read_table(file_path, delimiter=delimiter)
         sorted_unique = sorted(df_temp[col].astype(str).unique())
         vocabularies[col] = {val: idx for idx, val in enumerate(sorted_unique)}
     elif col_type in ["intex", "outex", "intexcat", "outexcat"]:
-        df_temp = pd.read_csv(file_path, delimiter=delimiter)
+        df_temp = read_table(file_path, delimiter=delimiter)
         df_temp[col] = df_temp[col].astype(str)
         all_chars = set()
         for text in df_temp[col]: all_chars.update(list(text))
@@ -4482,14 +4652,80 @@ def _setup_vocab_for_col(col, col_type, file_path, delimiter, vocabularies, imag
         image_params[col] = {"im_size": im_size, "patch_size": patch_size}
 
 
-def ask_column_types(columns, file_path, delimiter):
+ASKED_SEQ_PARAMS = {}  # inenc / outdec settings collected by ask_column_types (CLI)
+
+
+def _ask_choice(prompt, options, default):
+    keys = list(options)
+    print(prompt)
+    for i, k in enumerate(keys, 1): print(f"  {i}: {options[k]}")
+    raw = input(f"Choice [{keys.index(default) + 1}]: ").strip()
+    if raw.isdigit() and 1 <= int(raw) <= len(keys): return keys[int(raw) - 1]
+    return raw if raw in options else default
+
+
+def _ask_int(prompt, default):
+    raw = input(f"{prompt} [{default}]: ").strip()
+    try: return int(raw) if raw else default
+    except ValueError: return default
+
+
+def ask_seq_params(col, is_output):
+    """Tokenizer and model of one inenc / outdec column."""
+    d = seqm.DEFAULT_PARAMS
+    print(f"\n--- '{col}': sequence {'decoder' if is_output else 'encoder'} ---")
+    p = {"tokenizer": _ask_choice("Tokenizer:", {"char": "Characters", "word": "Words (punctuation separate)"}, d["tokenizer"])}
+    p["arch"] = _ask_choice(("Decoder" if is_output else "Encoder") + " model:", seqm.ARCHS, d["arch"])
+    if p["arch"] != "mlp" or not is_output:
+        p["dim"] = _ask_int("Width (embedding / hidden size)", d["dim"])
+    if p["arch"] not in ("mlp",):
+        p["layers"] = _ask_int("Layers", d["layers"])
+    if is_output and p["arch"] in seqm.ATTENTION_ARCHS:
+        p["attention"] = _ask_choice("Attention to the encoder memory:", seqm.DEC_ATTENTION, d["attention"])
+    if p["arch"] in ("transformer", "modern") or p.get("attention") == "multihead":
+        p["heads"] = _ask_int("Attention heads", d["heads"])
+    return seqm.check_params(p, col, is_output)
+
+
+def ask_seq_bridge(col_types, seq_params):
+    """How encoders and decoders are joined; only asked when a non-MLP encoder / decoder exists."""
+    if not any(seq_params.get(c, {}).get("arch", "mlp") != "mlp" for c, t in col_types.items() if t in seqm.SEQ_TYPES):
+        return "mlp"
+    return _ask_choice("\nBetween encoders and decoders:", seqm.BRIDGES, "mlp")
+
+
+def ask_csv_format(file_path, delimiter):
+    """CLI: header row or not, and optional new column names (the CSV itself is never changed)."""
+    no_header = input("Does the first row hold column names? [Y/n]: ").strip().lower() in ("n", "no", "0")
+    df = read_table(file_path, delimiter, fmt={"header": not no_header}, nrows=5)
+    names = [str(c) for c in df.columns]
+    if no_header: print(f"  No header: the columns are called {', '.join(names[:8])}{' ...' if len(names) > 8 else ''}")
+    rename = {}
+    if input("Rename columns? [y/N]: ").strip().lower() in ("y", "yes", "1"):
+        print("  New name for each column (Enter keeps it):")
+        for c in names:
+            sample = ", ".join(str(v) for v in df[c].head(3).tolist())
+            new = input(f"    {c}  (e.g. {sample[:40]}): ").strip()
+            if new: rename[c] = new
+    while True:
+        try: return csv_format(not no_header, rename, names)
+        except ValueError as e:
+            print(f"  {e}; enter the new names again."); rename = {}
+            for c in names:
+                new = input(f"    {c}: ").strip()
+                if new: rename[c] = new
+
+
+def ask_column_types(columns, file_path, delimiter, allow_seq=False):
+    """allow_seq: offer inenc / outdec (only regular training supports them)."""
     col_types = {}; vocabularies = {}; image_params = {}
+    ASKED_SEQ_PARAMS.clear()
     
     # --- STEP 1: Scan for Constant Columns ---
     print("\nScanning dataset for constant columns...")
     try:
         # Read the dataframe to check unique values
-        df_check = pd.read_csv(file_path, delimiter=delimiter)
+        df_check = read_table(file_path, delimiter=delimiter)
         
         active_columns = []
         ignored_columns = []
@@ -4533,12 +4769,13 @@ def ask_column_types(columns, file_path, delimiter):
     print("  5=out, 6=outlab, 7=outex,")
     print("  8=inlabcat (one-hot label input),  9=intexcat (one-hot text input),")
     print(" 10=outlabcat (categorical label output), 11=outexcat (categorical text output)")
+    print(" 12=inenc (text read by a sequence encoder), 13=outdec (text written by a sequence decoder)")
     print("\n  TIP: Use N*M to apply type N to this column and the next M-1 columns.")
     
     type_map = {
         "0": "i", "1": "in", "2": "inlab", "3": "intex", "4": "inim",
         "5": "out", "6": "outlab", "7": "outex",
-        "8": "inlabcat", "9": "intexcat", "10": "outlabcat", "11": "outexcat"
+        "8": "inlabcat", "9": "intexcat", "10": "outlabcat", "11": "outexcat", "12": "inenc", "13": "outdec"
     }
     valid_types = set(type_map.values())
     
@@ -4561,6 +4798,8 @@ def ask_column_types(columns, file_path, delimiter):
                     repeat_count = 1
             
             col_type = type_map.get(raw, raw)
+            if col_type in seqm.SEQ_TYPES and not allow_seq:
+                print("inenc / outdec columns are only supported by Train (menu 0)."); continue
             if col_type in valid_types:
                 # Apply to this column and next (repeat_count-1) columns
                 for r in range(repeat_count):
@@ -4572,7 +4811,11 @@ def ask_column_types(columns, file_path, delimiter):
                     col_types[target_col] = col_type
                     
                     # Setup vocab/params only if not ignored
-                    if col_type != 'i':
+                    if col_type in seqm.SEQ_TYPES:
+                        ASKED_SEQ_PARAMS[target_col] = ask_seq_params(target_col, col_type == "outdec")
+                        _setup_vocab_for_col(target_col, col_type, file_path, delimiter, vocabularies, image_params,
+                                             ASKED_SEQ_PARAMS[target_col]["tokenizer"])
+                    elif col_type != 'i':
                         _setup_vocab_for_col(target_col, col_type, file_path, delimiter, vocabularies, image_params)
                     
                     if r > 0:
@@ -4601,7 +4844,7 @@ def ask_column_types(columns, file_path, delimiter):
         if out_cols_str:
             out_col_names = [c.strip() for c in out_cols_str.split(',')]
             print("\nNow specify output type for each:")
-            print("  5=out, 6=outlab, 7=outex, 10=outlabcat, 11=outexcat")
+            print("  5=out, 6=outlab, 7=outex, 10=outlabcat, 11=outexcat, 13=outdec")
             for oc in out_col_names:
                 if oc not in columns:
                     print(f"  '{oc}' not found in columns, skipping.")
@@ -4609,13 +4852,60 @@ def ask_column_types(columns, file_path, delimiter):
                 while True:
                     ot_raw = input(f"  Output type for '{oc}': ").strip()
                     ot = type_map.get(ot_raw, ot_raw)
+                    if ot == "outdec" and not allow_seq:
+                        print("    outdec columns are only supported by Train (menu 0)."); continue
                     if ot in valid_types and 'out' in ot:
                         col_types[oc] = ot
-                        _setup_vocab_for_col(oc, ot, file_path, delimiter, vocabularies, image_params)
+                        if ot == "outdec": ASKED_SEQ_PARAMS[oc] = ask_seq_params(oc, True)
+                        _setup_vocab_for_col(oc, ot, file_path, delimiter, vocabularies, image_params,
+                                             ASKED_SEQ_PARAMS.get(oc, {}).get("tokenizer", "char"))
                         break
-                    print("    Invalid. Use 5, 6, 7, 10, or 11.")
+                    print("    Invalid. Use 5, 6, 7, 10, 11 or 13.")
     
     return col_types, vocabularies, image_params
+
+def activation_config_of(cls):
+    """The {"name", "params"} that save_config would store for an activation class / factory."""
+    cfg = getattr(cls, "activation_config", None)
+    if cfg: return cfg
+    name = cls.__name__ if hasattr(cls, "__name__") else "ReLU"
+    return {"name": "Linear" if name == "Identity" else name, "params": {}}
+
+
+def ask_layer_activations(hidden_dims, base_activation_cls):
+    """None = the chosen activation in every layer; else one {"name", "params"} per hidden layer."""
+    if not isinstance(hidden_dims, list) or len(hidden_dims) < 2: return None
+    if input("Different activation per hidden layer? [y/N]: ").strip().lower() not in ("y", "yes", "1"): return None
+    acts = []
+    for i, w in enumerate(hidden_dims):
+        print(f"\n--- Layer {i + 1} ({w} neurons); Enter at the menu = the global choice ---")
+        cls = ask_activation(default=base_activation_cls)
+        acts.append(activation_config_of(cls))
+    return acts
+
+
+def ask_output_activation(output_cols, col_types):
+    """Activation on numeric outputs (categorical / text outputs are logits and are never touched)."""
+    if not any(col_types[c] == "out" for c in output_cols): return None
+    if input("Activation on the numeric output nodes? (default Linear) [y/N]: ").strip().lower() not in ("y", "yes", "1"): return None
+    return activation_config_of(ask_activation())
+
+
+def ask_scale_ranges(cols, col_types):
+    """Optional per-column model range of numeric inputs / outputs (default [-1, 1], e.g. 0 1 to pair with a sigmoid)."""
+    numeric = [c for c in cols if col_types[c] in ("in", "out")]
+    if not numeric or input("Custom scaling range for numeric columns? (default -1 1) [y/N]: ").strip().lower() not in ("y", "yes", "1"):
+        return {}
+    ranges = {}
+    for c in numeric:
+        raw = input(f"  {c} range as LOW HIGH (Enter = -1 1): ").replace(",", " ").split()
+        if len(raw) != 2: continue
+        try: lo, hi = float(raw[0]), float(raw[1])
+        except ValueError: print("    not two numbers; keeping -1 1"); continue
+        if lo == hi: print("    LOW and HIGH must differ; keeping -1 1"); continue
+        ranges[c] = [lo, hi]
+    return ranges
+
 
 def ask_hidden_dims():
     print("Choose hidden dimension selection method:")
@@ -4632,6 +4922,7 @@ def ask_hidden_dims():
         patience = int(patience) if patience else 500
         return {"mode": "auto", "max_dim": max_dim, "max_layers": max_layers, "patience": patience}
     hidden_dims = []; layer_num = 1
+    print("  (finishing with no layers makes a perceptron: inputs straight to outputs)")
     while True:
         neurons = int(input(f"Neurons for layer {layer_num} (0 to finish): "))
         if neurons == 0: break
@@ -4847,6 +5138,37 @@ def plot_pwl(activation_layer, neuron_idx, layer_idx, input_or_activation_value)
     os.makedirs("MVPs", exist_ok=True); plt.savefig(f"MVPs/layer-{layer_idx+1}-neuron-{neuron_idx+1}.png"); plt.close()
 
 
+def activation_from_config(act_cfg, activation_type=0, wrap=True):
+    """{"name", "params"} (config.json form) -> activation factory; wrap applies the activation type (gating etc.)."""
+    name = (act_cfg or {}).get("name", "ReLU"); params = (act_cfg or {}).get("params", {}) or {}
+    amap = _build_activation_map()
+    if name == "Custom":
+        custom = _rebuild_custom_activation_from_config(params)
+        def base(): return custom()
+    elif name in amap:
+        def base(): return amap[name](**params)
+    else:
+        raise ValueError(f"Unknown activation {name!r}")
+    base.activation_config = {"name": name, "params": params}
+    return wrap_activation(base, activation_type) if wrap else base
+
+
+def is_linear_activation(act_cfg):
+    return not act_cfg or act_cfg.get("name") in (None, "", "Linear", "Identity")
+
+
+def numeric_output_positions(output_layout):
+    """Model-output positions of numeric ('out') columns: the only outputs an output activation touches."""
+    return [e["start"] for e in output_layout if e["type"] == "out"]
+
+
+def check_mlp_options(mlp_mode, layer_activations, output_activation, hidden_dims):
+    if layer_activations is not None and len(layer_activations) != len(hidden_dims):
+        raise ValueError(f"{len(layer_activations)} layer activations given for {len(hidden_dims)} hidden layers.")
+    if mlp_mode == 1 and (layer_activations or not is_linear_activation(output_activation)):
+        raise ValueError("Per-layer and output activations need the MLP architecture (not GNN).")
+
+
 def build_model_from_config(config, input_dims, output_dim, device, hidden_dims=None):
     """Rebuild the (untrained) network described by config.json; caller loads model.pt."""
     if hidden_dims is None: hidden_dims = config["hidden_dims"]
@@ -4874,20 +5196,32 @@ def build_model_from_config(config, input_dims, output_dim, device, hidden_dims=
     activation_type = config.get("activation_type", 0)
     activation_cls = wrap_activation(activation_cls, activation_type)
     mlp_mode = config.get("mlp_mode", 0)
+    if config.get("layer_activations"):
+        activation_cls = [activation_from_config(c, activation_type) for c in config["layer_activations"]]
+    out_cfg = config.get("output_activation")
+    out_act = None if is_linear_activation(out_cfg) else activation_from_config(out_cfg, wrap=False)
 
-    if mlp_mode == 1:
-        model = GNNMLPO(input_dims, hidden_dims, output_dim, activation_cls, residual_type,
-            norm_type=norm_type, groups=groups,
-            dropout_prob=noise_params.get("dropout_pct", 0.0) if noise_mode == "dropout" else 0.0,
-            use_grn=config.get("use_grn", False)).to(device)
-    else:
-        model = MLPO(input_dims, hidden_dims, output_dim, activation_cls, residual_type,
+    def make_mlp(in_dim, out_dim, out_idx=None):
+        if mlp_mode == 1:
+            return GNNMLPO(in_dim, hidden_dims, out_dim, activation_cls, residual_type,
+                norm_type=norm_type, groups=groups,
+                dropout_prob=noise_params.get("dropout_pct", 0.0) if noise_mode == "dropout" else 0.0,
+                use_grn=config.get("use_grn", False))
+        return MLPO(in_dim, hidden_dims, out_dim, activation_cls, residual_type,
             norm_type=norm_type, groups=groups, attention_type=attention_type, num_heads=num_heads,
             input_attention_type=input_attention_type, moe_mode=moe_mode,
             dropout_prob=noise_params.get("dropout_pct", 0.0) if noise_mode == "dropout" else 0.0,
             use_noise_injection_layers=(noise_mode == "noise injection layers"), layer_routing=config.get("layer_routing", "none"),
-            noise_injection_std=noise_params.get("std", 0.0), use_grn=config.get("use_grn", False)).to(device)
-    return model
+            noise_injection_std=noise_params.get("std", 0.0), use_grn=config.get("use_grn", False),
+            output_activation=out_act if out_idx else None, output_activation_idx=out_idx)
+
+    col_types = config["col_types"]
+    in_cols = [c for c, t in col_types.items() if 'in' in t]; out_cols = [c for c, t in col_types.items() if 'out' in t]
+    layout, _, _ = build_output_layout(out_cols, col_types, config["scalings"], config.get("vocabularies", {}))
+    if has_seq_columns(col_types):
+        return build_seq_model(make_mlp, in_cols, out_cols, col_types, config["scalings"], config.get("vocabularies", {}),
+                               config.get("seq_params", {}), config.get("seq_bridge", "mlp"), out_act).to(device)
+    return make_mlp(input_dims, output_dim, numeric_output_positions(layout)).to(device)
 
 
 def encode_sample_input(sample_input, col_types, vocabularies, scalings, image_params):
@@ -4895,11 +5229,13 @@ def encode_sample_input(sample_input, col_types, vocabularies, scalings, image_p
     processed_input = []
     input_idx = 0
     for col_name, col_type in col_types.items():
-        if col_type not in ["in", "inlab", "intex", "inim", "inlabcat", "intexcat"]:
+        if col_type not in ["in", "inlab", "intex", "inim", "inlabcat", "intexcat", "inenc"]:
             continue
         value = sample_input[input_idx]
         
-        if col_type == "inlabcat":
+        if col_type == "inenc":
+            processed_input.extend(seqm.encode_ids(value, vocabularies[col_name], scalings[col_name]['max_len'], is_output=False))
+        elif col_type == "inlabcat":
             vocab = vocabularies[col_name]; vocab_size = len(vocab)
             mapped = vocab.get(str(value), 0)
             onehot = [0.0] * vocab_size
@@ -4942,9 +5278,8 @@ def encode_sample_input(sample_input, col_types, vocabularies, scalings, image_p
             processed_input.extend(codes)
         else:
             if col_name in scalings and 'min' in scalings[col_name]:
-                smin = scalings[col_name]['min']; smax = scalings[col_name]['max']
-                value = 2 * (float(value) - smin) / (smax - smin) - 1
-            processed_input.append(float(value))
+                value = to_model_units(float(_bool_as_number(value)), scalings[col_name])
+            processed_input.append(float(_bool_as_number(value)))
         input_idx += 1
     return processed_input
 
@@ -4955,7 +5290,20 @@ def encode_sample_input(sample_input, col_types, vocabularies, scalings, image_p
 ##############################################
 # STREAMLINED Sampling/Inference with fast plots
 ##############################################
-def load_and_sample_model(sample_input, hidden_dims, vocabularies, col_types, output_dim, scalings={}, image_params={}, plot_option=None, plot_settings=None):
+def ask_generation(col_types):
+    """Sampling settings for outdec columns (temperature 0 = the most likely text)."""
+    if "outdec" not in col_types.values(): return None
+    print("\nText generation (temperature 0 = always the most likely token):")
+    t = float(input("  Temperature [0]: ").strip() or 0)
+    if t <= 0: return {"temperature": 0.0}
+    k = int(input("  Top-k (0 = off) [0]: ").strip() or 0)
+    p = float(input("  Top-p (1 = off) [1]: ").strip() or 1)
+    return seqm.check_generation({"temperature": t, "top_k": k, "top_p": p})
+
+
+def load_and_sample_model(sample_input, hidden_dims, vocabularies, col_types, output_dim, scalings={}, image_params={}, plot_option=None, plot_settings=None,
+                          generation=None):
+    """generation: sampling settings for outdec columns, see ask_generation."""
     if plot_settings is None: plot_settings = {}
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     import shutil
@@ -4966,11 +5314,11 @@ def load_and_sample_model(sample_input, hidden_dims, vocabularies, col_types, ou
             if os.path.isfile(fp) or os.path.islink(fp): os.unlink(fp)
             elif os.path.isdir(fp): shutil.rmtree(fp)
         
-    input_cols = [col for col in col_types if col_types[col] in ["in", "inlab", "intex", "inim", "inlabcat", "intexcat"]]
+    input_cols = [col for col in col_types if col_types[col] in ["in", "inlab", "intex", "inim", "inlabcat", "intexcat", "inenc"]]
     
     def calc_dim(col):
         ct = col_types[col]
-        if ct in ['intex']: return scalings[col]['max_len']
+        if ct in ['intex', 'inenc']: return scalings[col]['max_len']
         elif ct == 'intexcat': return scalings[col]['max_len'] * len(vocabularies.get(col, {}))
         elif ct == 'inlabcat': return len(vocabularies.get(col, {}))
         elif ct == 'inim':
@@ -4984,6 +5332,7 @@ def load_and_sample_model(sample_input, hidden_dims, vocabularies, col_types, ou
     print("Performing dry run to initialize lazy layers...")
     materialize_lazy_modules(model, input_dims, device)
     model.load_state_dict(torch.load('model.pt', map_location=device)); print(model); model.eval()
+    if generation and isinstance(model, seqm.SeqMLP): model.set_generation(**generation)
     os.makedirs("MVPs", exist_ok=True)
         
     with torch.no_grad():
@@ -4994,7 +5343,7 @@ def load_and_sample_model(sample_input, hidden_dims, vocabularies, col_types, ou
         model_output = model(x)
         
         # ─── Build output layout for decoding ───
-        output_cols_list = [c for c in col_types if col_types[c] in ["out", "outlab", "outex", "outlabcat", "outexcat"]]
+        output_cols_list = [c for c in col_types if col_types[c] in ["out", "outlab", "outex", "outlabcat", "outexcat", "outdec"]]
         output_layout, _, _ = build_output_layout(output_cols_list, col_types, scalings, vocabularies)
         
         # ─── Decode output ───
@@ -5012,6 +5361,12 @@ def load_and_sample_model(sample_input, hidden_dims, vocabularies, col_types, ou
                 print(f"{col_name}: {output_value} (class {predicted_class}, logits: {pred_slice.cpu().numpy()})")
                 processed_output.append(output_value)
                 
+            elif ct == 'outdec':
+                ids = pred_slice.view(entry['max_len'], entry['num_classes']).argmax(dim=-1).cpu().tolist()
+                output_value = seqm.decode_ids(ids, vocabularies[col_name])
+                print(f"{col_name}: {output_value}")
+                processed_output.append(output_value)
+
             elif ct == 'outexcat':
                 max_len = entry['max_len']; num_classes = entry['num_classes']
                 logits = pred_slice.view(max_len, num_classes)
@@ -5038,8 +5393,7 @@ def load_and_sample_model(sample_input, hidden_dims, vocabularies, col_types, ou
             else:
                 val = pred_slice[0].item()
                 if col_name in scalings and 'min' in scalings[col_name]:
-                    smin = scalings[col_name]['min']; smax = scalings[col_name]['max']
-                    val = (val + 1) / 2 * (smax - smin) + smin
+                    val = to_display_units(val, scalings[col_name])
                 print(f"{col_name}: {val}")
                 processed_output.append(val)
         
@@ -5064,12 +5418,16 @@ def load_and_sample_model(sample_input, hidden_dims, vocabularies, col_types, ou
                 for i in range(ml):
                     input_mapping.append((col_name, i+1, processed_input[global_index:global_index+vs], global_index, vs, 'onehot_char'))
                     global_index += vs
+            elif ct == "inenc":  # token ids: not plotted, but they occupy input slots
+                global_index += scalings[col_name]['max_len']
         
         output_mapping_plot = []
         for entry in output_layout:
             col_name = entry['col']; ct = entry['type']
             if ct == 'outlabcat':
                 output_mapping_plot.append((col_name, None, entry['start'], entry['end'], 'categorical', entry.get('num_classes', 1)))
+            elif ct == 'outdec':
+                continue  # generated text is not plotted
             elif ct == 'outexcat':
                 ml = entry['max_len']; nc = entry['num_classes']
                 for i in range(ml):
@@ -5117,17 +5475,12 @@ def load_and_sample_model(sample_input, hidden_dims, vocabularies, col_types, ou
 
         def _to_display_units(value, col_name):
             if _has_numeric_scaling(col_name):
-                smin = scalings[col_name]['min']
-                smax = scalings[col_name]['max']
-                return (value + 1.0) / 2.0 * (smax - smin) + smin
+                return to_display_units(value, scalings[col_name])
             return value
 
         def _to_model_units(value, col_name):
             if _has_numeric_scaling(col_name):
-                smin = scalings[col_name]['min']
-                smax = scalings[col_name]['max']
-                denom = smax - smin
-                return 0.0 if denom == 0 else 2.0 * (value - smin) / denom - 1.0
+                return to_model_units(value, scalings[col_name])
             return value
 
         def _plot_range(col_name, global_idx, sample_value):
@@ -5535,8 +5888,7 @@ def plot_all_neurons(model, processed_input, scalings, col_types, vocabularies,
         current = x_tensor
         # Input attention
         if hasattr(model, 'input_attn') and model.input_attn is not None:
-            if model.input_attention_type == "basic":
-                current = model.input_attn(current)
+            current = model.input_attn(current)
         
         for block_idx, block in enumerate(model.blocks):
             z = block.norm(current)
@@ -5671,7 +6023,8 @@ def _build_activation_map():
         "All": GumbelActivationSelector, "Maxout": lambda **p: MaxoutActivation(**p),
     }
 
-def ask_activation():
+def ask_activation(default=None):
+    """default: returned when the user just presses Enter (per-layer choices fall back to the global one)."""
     print("Choose activation function:")
     print("0: Linear  1: Sigmoid  2: Tanh  3: Scaled Tanh  4: ReLU  5: LeakyReLU")
     print("6: PReLU  7: PELU  8: SiLU  9: PSiLU  10: Sine  11: Cosine  12: ReLU6")
@@ -5690,6 +6043,7 @@ def ask_activation():
     print("78: ALL (Gumbel Softmax learnable selection)")
     print("79: Maxout (learned maximum of affine pieces)")
     choice = input("Enter number: ").strip().lower()
+    if not choice and default is not None: return default
 
     simple = {
         "0": nn.Identity, "1": nn.Sigmoid, "2": nn.Tanh, "4": nn.ReLU,
@@ -6273,16 +6627,8 @@ def run_inverse_design():
     # --- FIX: Check MLP Mode ---
     mlp_mode = config.get("mlp_mode", 0)
 
-    if mlp_mode == 1:
-        model = GNNMLPO(input_dims, config["hidden_dims"], output_pred_dim, cls,
-                        config.get("residual_type", "residual"), norm_type=config.get("norm_type", "layer"),
-                        groups=config.get("groups", 1)).to(device)
-    else:
-        model = MLPO(input_dims, config["hidden_dims"], output_pred_dim, cls,
-                     config.get("residual_type", "residual"), norm_type=config.get("norm_type", "layer"),
-                     groups=config.get("groups", 1), attention_type=config.get("attention_type", "none"),
-                     num_heads=config.get("num_heads", 1), input_attention_type=config.get("input_attention_type", "none"),
-                     moe_mode=config.get("moe_mode", 1), layer_routing=config.get("layer_routing", "none")).to(device)
+    model = build_model_from_config(config, input_dims, output_pred_dim, torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+    materialize_lazy_modules(model, input_dims, next(model.parameters()).device)
     
     with torch.no_grad(): model(torch.zeros(1, input_dims).to(device))
     model.load_state_dict(torch.load('model.pt', map_location=device)); model.eval()
@@ -6335,7 +6681,7 @@ def run_inverse_design():
                 if 0 <= idx < width: val_tensor[idx] = 1.0
             elif ct == 'in' and col in scalings:
                  smin = scalings[col]['min']; smax = scalings[col]['max']
-                 try: val_tensor = [2 * (float(user_val) - smin) / (smax - smin) - 1]
+                 try: val_tensor = [to_model_units(float(user_val), scalings[col])]
                  except: pass
             elif ct == 'in': 
                  try: val_tensor = [float(user_val)]
@@ -6365,7 +6711,7 @@ def run_inverse_design():
                  val = float(user_target)
                  if col in scalings and 'min' in scalings[col]:
                      smin, smax = scalings[col]['min'], scalings[col]['max']
-                     val = 2 * (val - smin) / (smax - smin) - 1
+                     val = to_model_units(val, scalings[col])
                  targets.append({'type': 'mse', 'slice': slice(start, end), 'target_val': torch.tensor([val], device=device)})
              except: pass
 
@@ -6454,7 +6800,7 @@ def run_inverse_design():
         if ct in ['in', 'inlab']:
             val = raw_vals[0]
             if col in scalings and 'min' in scalings[col]:
-                 val = (val + 1) / 2 * (scalings[col]['max'] - scalings[col]['min']) + scalings[col]['min']
+                 val = to_display_units(val, scalings[col])
             print(f"  {col:<20}: {val:.4f}  {tag}")
         elif ct == 'inlabcat':
              idx = np.argmax(raw_vals)
@@ -6470,7 +6816,7 @@ def run_inverse_design():
         if ct in ['out', 'outlab']:
              val = raw_out.item()
              if col in scalings and 'min' in scalings[col]:
-                 val = (val + 1) / 2 * (scalings[col]['max'] - scalings[col]['min']) + scalings[col]['min']
+                 val = to_display_units(val, scalings[col])
              print(f"  {col:<20}: {val:.4f}")
         elif ct == 'outlabcat':
              idx = raw_out.argmax().item(); inv = {v: k for k, v in vocabularies[col].items()}
@@ -6490,7 +6836,7 @@ def run_test_eval(model, test_csv, delimiter, input_cols, output_cols, col_types
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
     
     output_layout, output_pred_dim, output_tgt_dim = build_output_layout(output_cols, col_types, scalings, vocabularies)
-    has_categorical = any(e['type'] in ['outlabcat', 'outexcat'] for e in output_layout)
+    has_categorical = any(e['type'] in ['outlabcat', 'outexcat', 'outdec'] for e in output_layout)
     
     model.eval()
     all_preds = []
@@ -6507,8 +6853,8 @@ def run_test_eval(model, test_csv, delimiter, input_cols, output_cols, col_types
     with torch.no_grad():
         for inputs, targets in loader:
             inputs, targets = inputs.to(device), targets.to(device)
-            outputs = model(inputs)
-            loss = criterion(outputs, targets)
+            outputs = model(inputs)  # decoders generate freely here; the loss below is teacher-forced like training
+            loss = criterion(seqm.model_forward(model, inputs, targets), targets)
             total_loss += loss.item()
             n_batches += 1
             all_preds.append(outputs.cpu().numpy())
@@ -6546,8 +6892,8 @@ def run_test_eval(model, test_csv, delimiter, input_cols, output_cols, col_types
             if col in scalings and "min" in scalings[col]:
                 smin = scalings[col]["min"]
                 smax = scalings[col]["max"]
-                pred_unscaled = (pred_flat + 1.0) / 2.0 * (smax - smin) + smin
-                tgt_unscaled = (tgt_flat + 1.0) / 2.0 * (smax - smin) + smin
+                pred_unscaled = to_display_units(pred_flat, scalings[col])
+                tgt_unscaled = to_display_units(tgt_flat, scalings[col])
                 mae_real = np.mean(np.abs(pred_unscaled - tgt_unscaled))
                 print(f"\n  [{col}] (regression)")
                 print(f"    MSE (scaled):    {mse:.6f}")
@@ -6560,6 +6906,17 @@ def run_test_eval(model, test_csv, delimiter, input_cols, output_cols, col_types
                 print(f"    MAE:  {mae:.6f}")
                 print(f"    R²:   {r2:.6f}")
         
+        elif ctype in ["outexcat", "outdec"]:
+            ml, nc = entry["max_len"], entry["num_classes"]
+            pred_ids = pred_slice.reshape(-1, ml, nc).argmax(-1)
+            tgt_ids = all_targets[:, entry["tgt_start"]:entry["tgt_end"]].astype(int)
+            scored = tgt_ids != 0 if ctype == "outdec" else np.ones_like(tgt_ids, dtype=bool)  # outdec: up to <eos>
+            hit = pred_ids == tgt_ids
+            exact = np.mean(np.all(hit | ~scored, axis=1))
+            print(f"\n  [{col}] (text, {nc} token classes, max {ml} tokens)")
+            print(f"    Exact match:    {exact:.4f} ({int(round(exact * len(hit)))}/{len(hit)})")
+            print(f"    Token accuracy: {hit[scored].mean():.4f}")
+
         elif ctype in ["outlabcat", "outexcat"]:
             pred_classes = np.argmax(pred_slice, axis=1)
             tgt_classes = tgt_slice.flatten().astype(int) if tgt_slice.shape[1] == 1 else np.argmax(tgt_slice, axis=1)
@@ -6950,7 +7307,7 @@ def run_error_analysis(model, csv_file, delimiter, input_cols, output_cols, col_
 
     # Try to read back the original CSV for row display
     try:
-        df_orig = pd.read_csv(csv_file, delimiter=delimiter)
+        df_orig = read_table(csv_file, delimiter=delimiter)
     except Exception:
         df_orig = None
 
@@ -7018,8 +7375,8 @@ def run_error_analysis(model, csv_file, delimiter, input_cols, output_cols, col_
                     # Unscale if possible
                     if col in scalings and "min" in scalings[col]:
                         smin, smax = scalings[col]["min"], scalings[col]["max"]
-                        p_real = (p + 1.0) / 2.0 * (smax - smin) + smin
-                        t_real = (t + 1.0) / 2.0 * (smax - smin) + smin
+                        p_real = to_display_units(p, scalings[col])
+                        t_real = to_display_units(t, scalings[col])
                         err_real = abs(p_real - t_real)
                         line += f"{p_real:>14.4f} {t_real:>14.4f} {err_real:>10.4f} "
                     else:
@@ -7215,7 +7572,7 @@ def run_cross_validation(csv_file, delimiter, input_cols, output_cols, col_types
     if noise_params is None:
         noise_params = {}
     
-    raw = pd.read_csv(csv_file, delimiter=delimiter)
+    raw = read_table(csv_file, delimiter=delimiter)
     raw, dups = dedupe_rows(raw, input_cols, output_cols, col_types)
     print(f"  Exact duplicate rows removed: {dups}")
     dataset = CustomDataset(csv_file, delimiter, input_cols, output_cols,
@@ -7310,8 +7667,51 @@ def run_cross_validation(csv_file, delimiter, input_cols, output_cols, col_types
 ##############################################
 # Interactive sampling GUI (local web server, stdlib only)
 ##############################################
-_GUI_INPUT_TYPES = ["in", "inlab", "intex", "inim", "inlabcat", "intexcat"]
-_GUI_OUTPUT_TYPES = ["out", "outlab", "outex", "outlabcat", "outexcat"]
+def levenshtein_ops(a, b):
+    """Edit distance between token lists a (target) and b (prediction) plus one alignment:
+    [("match"|"sub", a_tok, b_tok) | ("del", a_tok, None) | ("ins", None, b_tok)]."""
+    n, m = len(a), len(b)
+    d = np.zeros((n + 1, m + 1), dtype=np.int32); d[:, 0] = np.arange(n + 1); d[0, :] = np.arange(m + 1)
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            d[i, j] = min(d[i - 1, j] + 1, d[i, j - 1] + 1, d[i - 1, j - 1] + (a[i - 1] != b[j - 1]))
+    ops, i, j = [], n, m
+    while i or j:
+        if i and j and d[i, j] == d[i - 1, j - 1] + (a[i - 1] != b[j - 1]):
+            ops.append(("match" if a[i - 1] == b[j - 1] else "sub", a[i - 1], b[j - 1])); i -= 1; j -= 1
+        elif i and d[i, j] == d[i - 1, j] + 1: ops.append(("del", a[i - 1], None)); i -= 1
+        else: ops.append(("ins", None, b[j - 1])); j -= 1
+    return int(d[n, m]), ops[::-1]
+
+
+def text_fit_stats(true_toks, pred_toks, max_labels=40, max_tokens=200):
+    """How well generated text matches its targets. Token lists per row (chars or words).
+    row_error: edit distance / target length per row (0 = perfect). Token confusions come from the alignment:
+    a small vocabulary gets a full matrix (with "∅" for missing / extra tokens), a large one the top mistakes."""
+    from collections import Counter
+    pairs, dists, lens = Counter(), [], []
+    for t, p in zip(true_toks, pred_toks):
+        dist, ops = levenshtein_ops(t[:max_tokens], p[:max_tokens]); dists.append(dist); lens.append(len(t))
+        for op, a, b in ops: pairs[(a if a is not None else "∅", b if b is not None else "∅")] += 1
+    dists, lens = np.asarray(dists, dtype=np.float64), np.asarray(lens, dtype=np.float64)
+    row_error = dists / np.maximum(lens, 1.0)
+    L = int(max((len(t) for t in true_toks), default=0))
+    pos_acc = [_gui_float(np.mean([len(p) > k and p[k] == t[k] for t, p in zip(true_toks, pred_toks) if len(t) > k])) for k in range(L)]
+    res = {"kind": "text", "n": len(true_toks), "exact": _gui_float(np.mean([t == p for t, p in zip(true_toks, pred_toks)])) if true_toks else None,
+           "error_rate": _gui_float(dists.sum() / max(lens.sum(), 1.0)), "pos_acc": pos_acc,
+           "len_true": [len(t) for t in true_toks], "len_pred": [len(p) for p in pred_toks]}
+    labels = sorted({a for a, _ in pairs} | {b for _, b in pairs} - {"∅"}) + (["∅"] if any("∅" in k for k in pairs) else [])
+    if len(labels) <= max_labels:
+        ix = {l: i for i, l in enumerate(labels)}; cm = np.zeros((len(labels), len(labels)), dtype=int)
+        for (a, b), c in pairs.items(): cm[ix[a], ix[b]] += c
+        res.update(labels=labels, confusion=cm.tolist())
+    else:
+        res["top_confusions"] = [[a, b, c] for (a, b), c in pairs.most_common() if a != b][:15]
+    return res, row_error
+
+
+_GUI_INPUT_TYPES = ["in", "inlab", "intex", "inim", "inlabcat", "intexcat", "inenc"]
+_GUI_OUTPUT_TYPES = ["out", "outlab", "outex", "outlabcat", "outexcat", "outdec"]
 _GUI_HTML = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mlpRes6_gui.html")
 
 
@@ -7357,6 +7757,7 @@ class InteractiveSampler:
     def _load_config(self):
         with open(self.config_path) as f: self.config = json.load(f)
         cfg = self.config
+        register_csv_format(cfg.get("file_path"), cfg.get("csv_format"))
         self.col_types = cfg["col_types"]; self.scalings = cfg["scalings"]
         self.vocabs = cfg.get("vocabularies", {}); self.image_params = cfg.get("image_params", {})
         self.input_cols = [c for c, t in self.col_types.items() if t in _GUI_INPUT_TYPES]
@@ -7413,12 +7814,11 @@ class InteractiveSampler:
 
     def _to_display(self, col, v):
         if not self._scaled(col): return v
-        s = self.scalings[col]; return (v + 1.0) / 2.0 * (s["max"] - s["min"]) + s["min"]
+        return to_display_units(v, self.scalings[col])
 
     def _to_model(self, col, v):
         if not self._scaled(col): return v
-        s = self.scalings[col]; denom = (s["max"] - s["min"]) or 1.0
-        return 2.0 * (v - s["min"]) / denom - 1.0
+        return to_model_units(v, self.scalings[col])
 
     def _labels(self, col):
         vocab = self.vocabs.get(col, {})
@@ -7430,7 +7830,7 @@ class InteractiveSampler:
         if ct == "in" and self._scaled(col):
             df = self._get_dataset()
             if df is not None and col in df:
-                vals = pd.to_numeric(df[col], errors="coerce").dropna()
+                vals = pd.to_numeric(df[col].map(_bool_as_number), errors="coerce").astype(float).dropna()
                 if len(vals): return float(vals.median())
             s = self.scalings[col]; return (s["min"] + s["max"]) / 2.0
         return 0.0 if ct == "in" else ""
@@ -7484,6 +7884,11 @@ class InteractiveSampler:
                 probs = torch.softmax(sl, 0).tolist(); k = int(sl.argmax())
                 item["value"] = inv.get(k, k)
                 item["probs"] = [[str(inv.get(i, i)), p] for i, p in enumerate(probs)]
+            elif ct == "outdec":
+                logits = sl.view(e["max_len"], e["num_classes"]); ids = logits.argmax(-1).tolist()
+                item["value"] = seqm.decode_ids(ids, self.vocabs[col])
+                n = ids.index(seqm.EOS) + 1 if seqm.EOS in ids else len(ids)
+                item["confidence"] = torch.softmax(logits[:n], -1).max(-1).values.tolist()
             elif ct == "outexcat":
                 logits = sl.view(e["max_len"], e["num_classes"])
                 item["value"] = "".join(inv.get(i, "") for i in logits.argmax(-1).tolist())
@@ -7517,7 +7922,7 @@ class InteractiveSampler:
             if cls in (None, "", "__argmax__"): return sl.argmax(-1).float()
             return torch.softmax(sl, -1)[:, self.vocabs[col].get(str(cls), 0)]
         if e["type"] == "out" and self._scaled(col):
-            s = self.scalings[col]; return (sl[:, 0] + 1.0) / 2.0 * (s["max"] - s["min"]) + s["min"]
+            return to_display_units(sl[:, 0], self.scalings[col])
         return sl[:, 0]
 
     # ─── tracing ───
@@ -7555,7 +7960,7 @@ class InteractiveSampler:
                 ct = self.col_types[c]; spec = {"col": c, "type": ct, "default": self._default_input(c)}
                 if ct in ("inlab", "inlabcat"): spec["options"] = self._labels(c)
                 if self._scaled(c): spec["min"] = self.scalings[c]["min"]; spec["max"] = self.scalings[c]["max"]
-                if ct in ("intex", "intexcat"): spec["max_len"] = self.scalings[c].get("max_len")
+                if ct in ("intex", "intexcat", "inenc"): spec["max_len"] = self.scalings[c].get("max_len")
                 spec["sweepable"] = ct in ("in", "inlab", "inlabcat")
                 inputs.append(spec)
             outputs = []
@@ -7582,6 +7987,8 @@ class InteractiveSampler:
             return {
                 "inputs": inputs, "outputs": outputs, "blocks": blocks,
                 "input_dim": self.input_dim, "output_dim": self.output_dim,
+                "generates": bool(getattr(self.model, "needs_targets", False)),  # has decoders: sampling controls apply
+                "sequence": isinstance(self.model, seqm.SeqMLP),  # encoders / decoders: the Sequence tab applies
                 "slots": {c: list(v) for c, v in self.slots.items()},
                 "params": sum(p.numel() for p in self.model.parameters()),
                 "weights": [{"name": n, "shape": list(p.shape)} for n, p in self.model.named_parameters()],
@@ -7596,11 +8003,17 @@ class InteractiveSampler:
         return {"version": self.version, "model_path": os.path.abspath(self.model_path),
                 "model_mtime": self.model_mtime, "load_error": self.load_error, "device": str(self.device)}
 
-    def predict(self, inputs):
+    def predict(self, inputs, generation=None):
+        """generation: {temperature, top_k, top_p} for text decoders (temperature 0 = most likely tokens).
+        Every other explorer view keeps generating with argmax."""
         with self.lock:
             base = self._encode(inputs)
             x = torch.as_tensor(base, device=self.device).unsqueeze(0)
-            out, rec = self._trace(x)
+            sampling = bool(generation) and isinstance(self.model, seqm.SeqMLP) and float(generation.get("temperature") or 0) > 0
+            if isinstance(self.model, seqm.SeqMLP) and generation: self.model.set_generation(**generation)
+            try: out, rec = self._trace(x)
+            finally:
+                if isinstance(self.model, seqm.SeqMLP): self.model.set_generation(temperature=0.0, top_k=0, top_p=1.0)
             raw = out[0].float().cpu()
             layers = []
             for i, r in enumerate(rec):
@@ -7609,8 +8022,63 @@ class InteractiveSampler:
                     if key in r: layer[key] = r[key].reshape(-1).cpu().tolist()
                 layers.append(layer)
             routers = [p.reshape(-1)[0].item() for p in getattr(self.model, "_last_router_probs", []) or []]
-            return {"outputs": self._decode(raw), "raw": raw.tolist(), "encoded": base.tolist(),
+            outputs = self._decode(raw)
+            if sampling:  # sampled tokens have forced logits: their softmax is not the model's confidence
+                for o in outputs: o.pop("confidence", None) if o["type"] == "outdec" else None
+            return {"outputs": outputs, "raw": raw.tolist(), "encoded": base.tolist(),
                     "layers": layers, "routers": routers, "version": self.version}
+
+    def sequence_view(self, inputs):
+        """Sequence tab: generated tokens (top-5 per step), attributions and attention maps (see mlpres_seq.explain)."""
+        if not isinstance(self.model, seqm.SeqMLP): raise ValueError("The Sequence view needs text encoder / decoder columns.")
+        with self.lock:
+            x = torch.as_tensor(self._encode(inputs), device=self.device).unsqueeze(0)
+            ex = seqm.explain(self.model, x)
+            self.model.zero_grad(set_to_none=True)
+        m = self.model
+        toks = lambda col, ids: [seqm.decoded_tokens([i], self.vocabs[col])[0] if i >= len(seqm.SPECIALS)
+                                 else {seqm.UNK: "<unk>", seqm.BOS: "<bos>", seqm.EOS: "<eos>", seqm.PAD: "<pad>"}[i] for i in ids]
+        enc = {}
+        for c, start, width, V in m.enc_slots:
+            ids = ex["enc_ids"][c]; n = max(1, sum(1 for i in ids if i != seqm.PAD))
+            enc[c] = {"tokens": toks(c, ids[:n]), "n": n, "width": width}
+        # numeric / categorical inputs: one attribution per column (one-hot groups summed)
+        plain_cols, k = [], 0
+        for c in self.input_cols:
+            if self.col_types[c] == "inenc": continue
+            plain_cols.append((c, k, self.slots[c][1])); k += self.slots[c][1]
+
+        def attr(a):
+            out = {c: a[c][:enc[c]["n"]] for c in enc}
+            out["__inputs__"] = {c: float(sum(a["__numeric__"][s:s + w])) for c, s, w in plain_cols}
+            return out
+        decs = {}
+        for col, d in ex["decoders"].items():
+            decs[col] = {"tokens": toks(col, d["ids"]), "prob": d["prob"], "attr": [attr(a) for a in d["attr"]],
+                         "top": [[[toks(col, [i])[0], p] for i, p in zip(ti, tp)] for ti, tp in zip(d["top_ids"], d["top_p"])]}
+        regular = {c: attr(a) for c, a in ex["regular"].items()}
+        # attention maps with row / column labels
+        cross_keys = [(c, i) for c in enc for i in range(enc[c]["width"])] + [("__latent__", 0)]
+        maps = []
+        for r in ex["attention"]:
+            name, w = r["module"], r["weights"]; parts = name.split(".")
+            if parts[0] == "encoders":
+                c = parts[1]; n = enc[c]["n"]
+                maps.append({"side": "encoder", "col": c, "kind": "self", "name": ".".join(parts[2:]),
+                             "rows": enc[c]["tokens"], "cols": enc[c]["tokens"], "w": w[:, :n, :n].tolist()})
+            elif parts[0] == "decoders" and parts[1] in decs:
+                c = parts[1]; d = decs[c]; n = len(d["tokens"]); sub = ".".join(parts[2:])
+                is_cross = w.shape[-1] == len(cross_keys) and ("cross" in sub or "multihead_attn" in sub)
+                if is_cross:
+                    keep = [j for j, (ec, i) in enumerate(cross_keys) if ec == "__latent__" or i < enc[ec]["n"]]
+                    labels = [("[latent]" if ec == "__latent__" else f"{ec}:{enc[ec]['tokens'][i]}") for ec, i in (cross_keys[j] for j in keep)]
+                    maps.append({"side": "decoder", "col": c, "kind": "cross", "name": sub, "rows": d["tokens"], "cols": labels,
+                                 "w": w[:, :n][:, :, keep].tolist()})
+                else:
+                    maps.append({"side": "decoder", "col": c, "kind": "self", "name": sub, "rows": d["tokens"],
+                                 "cols": ["<bos>"] + d["tokens"][:n - 1], "w": w[:, :n, :n].tolist()})
+        return {"encoders": enc, "decoders": decs, "regular": regular, "maps": maps,
+                "inputs": [c for c, _, _ in plain_cols], "version": self.version}
 
     def sweep1d(self, inputs, x_col, out_col, lo=None, hi=None, n=200, show_data=False):
         with self.lock:
@@ -7854,6 +8322,8 @@ class InteractiveSampler:
         return None if g is None else g.reshape(K, -1).float().cpu()
 
     def network_view(self, inputs, targets=None, mode="weights", max_nodes=48):
+        if isinstance(self.model, seqm.SeqMLP):
+            raise ValueError("The network view draws plain MLPs; this model has sequence encoders / decoders.")
         with self.lock:
             m = self.model; blocks = list(getattr(m, "blocks", []))
             x = torch.as_tensor(self._encode(inputs), device=self.device).unsqueeze(0).requires_grad_(True)
@@ -8009,7 +8479,7 @@ class InteractiveSampler:
             wanted = set(self.input_cols + self.output_cols)
             # config.json does not record the delimiter: pick the one whose header names the most columns
             delim = max([",", "\t", ";", " "], key=lambda d: len(wanted & {h.strip() for h in header.split(d)}))
-            df = pd.read_csv(path, delimiter=delim)
+            df = read_table(path, delimiter=delim)
             missing = [c for c in wanted if c not in df.columns]
             if missing: raise ValueError(f"columns missing from {path}: {missing}")
             self._dataset = df.dropna(subset=list(wanted)).reset_index(drop=True)
@@ -8035,7 +8505,7 @@ class InteractiveSampler:
             def plain(v):
                 return v.item() if hasattr(v, "item") else v
             return {"index": i, "rows": len(df),
-                    "inputs": {c: (str(row[c]) if self.col_types[c] in ("inlab", "inlabcat", "intex", "intexcat", "inim") else plain(row[c]))
+                    "inputs": {c: (str(row[c]) if self.col_types[c] in ("inlab", "inlabcat", "intex", "intexcat", "inim", "inenc") else plain(row[c]))
                                for c in self.input_cols},
                     "targets": {c: (str(row[c]) if self.col_types[c] != "out" else plain(row[c])) for c in self.output_cols}}
 
@@ -8086,7 +8556,41 @@ class InteractiveSampler:
                 for t, p in zip(true, pred):
                     if 0 <= t < nc and 0 <= p < nc: cm[t, p] += 1
                 res[col] = {"accuracy": _gui_float((pred == true).mean()), "labels": labels, "confusion": cm.tolist(), "n": int(len(true))}
+            elif ct == "outlab":  # label code regressed as a number: the rounded code is the predicted label
+                labels = self._labels(col); inv = {v: k for k, v in self.vocabs[col].items()}
+                pred = np.rint(out[:, e["start"]].numpy()).astype(int)
+                true = np.array([self.vocabs[col].get(str(v), -1) for v in rows[col]])
+                score += (pred != true).astype(np.float64); shown[col] = [inv.get(int(k), int(k)) for k in pred]
+                nc = len(labels); cm = np.zeros((nc, nc), dtype=int)
+                for t, p in zip(true, pred):
+                    if 0 <= t < nc and 0 <= p < nc: cm[t, p] += 1
+                res[col] = {"accuracy": _gui_float((pred == true).mean()), "labels": labels, "confusion": cm.tolist(), "n": int(len(true))}
+            elif ct in ("outdec", "outexcat", "outex"):
+                pred_toks, pred_text = self._text_predictions(e, out)
+                true_toks = [self._text_tokens(col, v) for v in rows[col]]
+                res[col], row_err = text_fit_stats(true_toks, pred_toks)
+                score += np.minimum(row_err, 1.0); shown[col] = pred_text
         return res, score, shown
+
+    def _text_tokens(self, col, value):
+        vocab = self.vocabs.get(col, {})
+        if self.col_types[col] == "outdec": return seqm.tokenize(value, seqm.tokenizer_of(vocab))
+        return list(str(value))[:self.scalings[col]["max_len"]]
+
+    def _text_predictions(self, e, out):
+        """Predicted token lists and display strings of one text output column over a batch of raw outputs."""
+        col, ct, sl = e["col"], e["type"], out[:, e["start"]:e["end"]]
+        vocab = self.vocabs.get(col, {}); inv = {v: k for k, v in vocab.items()}
+        if ct == "outex": ids = [[int(round(v)) for v in row] for row in sl.tolist()]
+        else: ids = sl.reshape(len(sl), e["max_len"], e["num_classes"]).argmax(-1).tolist()
+        toks, texts = [], []
+        for row in ids:
+            if ct == "outdec":
+                t = seqm.decoded_tokens(row, vocab); texts.append(seqm.decode_ids(row, vocab))
+            else:
+                t = [inv[i] for i in row if i > 0 and i in inv]; texts.append("".join(t))
+            toks.append(t)
+        return toks, texts
 
     def data_stats(self, compute=True, limit=2000):
         """Per-neuron activation statistics (training rows) and prediction quality on training rows and on
@@ -8158,7 +8662,7 @@ class InteractiveSampler:
             return self._data_stats
 
 
-_GUI_COL_TYPES = ["i", "in", "inlab", "intex", "inim", "inlabcat", "intexcat", "out", "outlab", "outex", "outlabcat", "outexcat"]
+_GUI_COL_TYPES = ["i", "in", "inlab", "intex", "inim", "inlabcat", "intexcat", "inenc", "out", "outlab", "outex", "outlabcat", "outexcat", "outdec"]
 _GUI_OPTIMIZERS = ["Adam", "AdamHD", "SGD", "SGDHD", "Lamb", "Adagrad", "Adadelta", "AdamW", "RMSprop", "Rprop", "ASGD",
                    "Adamax", "NAdam", "SparseAdam", "RAdamScheduleFree", "AdEMAMix", "Adam3", "AdamDelta", "AutoAdam",
                    "NormAdam", "SWATS", "AdaBoundW", "CLion", "Signum", "SRprop", "IRprop", "Adan", "Prodigy",
@@ -8205,11 +8709,12 @@ def gui_list_dir(path=None):
     return {"path": path, "parent": os.path.dirname(path), "dirs": dirs, "files": files}
 
 
-def gui_preview_dataset(path, delimiter=None, rows=15):
-    """Column statistics and a suggested type per column, for the training GUI."""
+def gui_preview_dataset(path, delimiter=None, rows=15, header=True):
+    """Column statistics and a suggested type per column, for the training GUI. Names are the file's own
+    (or col1, col2, ... without a header row); renaming is applied by the form on top of them."""
     path = os.path.abspath(os.path.expanduser(path))
     delim = delimiter or _gui_detect_delimiter(path)
-    df = pd.read_csv(path, delimiter=delim)
+    df = read_table(path, delimiter=delim, fmt={"header": header})
     cols = []
     for c in df.columns:
         s = df[c]; nun = int(s.nunique(dropna=True)); numeric = bool(pd.api.types.is_numeric_dtype(s))
@@ -8319,7 +8824,10 @@ class TrainingSession:
         path = os.path.abspath(os.path.expanduser(spec["path"]))
         if not os.path.isfile(path): raise FileNotFoundError(f"Dataset not found: {path}")
         delim = spec.get("delimiter") or _gui_detect_delimiter(path)
-        col_types = {c: t for c, t in spec["columns"].items()}
+        # the form keys columns by the file's own names (col1, col2, ... without a header); rename maps them to new ones
+        fmt = csv_format(spec.get("header", True) is not False, spec.get("rename"), list(spec["columns"]))
+        new = lambda c: fmt["rename"].get(c, c)
+        col_types = {new(c): t for c, t in spec["columns"].items()}
         bad = [t for t in col_types.values() if t not in _GUI_COL_TYPES]
         if bad: raise ValueError(f"Unknown column types: {bad}")
         input_cols = [c for c, v in col_types.items() if 'in' in v]
@@ -8327,16 +8835,26 @@ class TrainingSession:
         if not input_cols: raise ValueError("Mark at least one column as an input.")
         if not output_cols: raise ValueError("Mark at least one column as an output.")
         hidden = [int(h) for h in spec.get("hidden_dims", [])]
-        if not hidden or min(hidden) < 1: raise ValueError("Add at least one hidden layer with width >= 1.")
-        act = spec.get("activation", {"name": "ReLU"}); name = act.get("name", "ReLU")
+        if hidden and min(hidden) < 1: raise ValueError("Hidden layers need a width >= 1 (no layers at all = a perceptron).")
         amap = _build_activation_map()
-        if name not in amap or name == "Custom": raise ValueError(f"Unknown activation {name!r}")
-        params = {k: v for k, v in (act.get("params") or {}).items() if k in _GUI_ACT_PARAMS.get(name, {})}
-        for k, v in _GUI_ACT_PARAMS.get(name, {}).items():
-            params[k] = type(v)(params.get(k, v))
-        factory_cls = amap[name]
-        def base_act(): return factory_cls(**params)
-        base_act.activation_config = {"name": name, "params": params}
+
+        def act_cfg(act):
+            name = (act or {}).get("name", "ReLU")
+            if name not in amap or name == "Custom": raise ValueError(f"Unknown activation {name!r}")
+            params = {k: v for k, v in ((act or {}).get("params") or {}).items() if k in _GUI_ACT_PARAMS.get(name, {})}
+            for k, v in _GUI_ACT_PARAMS.get(name, {}).items(): params[k] = type(v)(params.get(k, v))
+            return {"name": name, "params": params}
+        glob = act_cfg(spec.get("activation", {"name": "ReLU"})); name = glob["name"]
+        base_act = activation_from_config(glob, wrap=False)
+        layer_acts = [act_cfg(a) for a in spec["layer_activations"]] if spec.get("layer_activations") else None
+        if layer_acts is not None and len(layer_acts) != len(hidden): raise ValueError("One activation per hidden layer is needed.")
+        out_act = None if is_linear_activation(spec.get("output_activation")) else act_cfg(spec["output_activation"])
+        scale_ranges = {}
+        for c, r in (spec.get("scale_ranges") or {}).items():
+            if col_types.get(new(c)) not in ("in", "out") or not r or [float(v) for v in r] == [-1.0, 1.0]: continue
+            lo, hi = map(float, r)
+            if lo == hi: raise ValueError(f"{new(c)}: the scaling range needs two different numbers.")
+            scale_ranges[new(c)] = [lo, hi]
         activation_type = int(spec.get("activation_type", 0))
         residual = spec.get("residual_type", "residual"); moe_mode = int(spec.get("moe_mode", 1))
         mlp_mode = int(spec.get("mlp_mode", 0)); routing = spec.get("layer_routing", "none")
@@ -8358,9 +8876,17 @@ class TrainingSession:
         lsuv = int(spec.get("lsuv", 0))
         balancing = spec.get("loss_balancing", "normalized")
         if balancing not in CombinedLoss.BALANCING: raise ValueError(f"Unknown loss balancing {balancing!r}")
-        return dict(path=path, delim=delim, col_types=col_types, input_cols=input_cols, output_cols=output_cols,
-                    image_params={c: {"im_size": int(p["im_size"]), "patch_size": int(p["patch_size"])}
-                                  for c, p in (spec.get("image_params") or {}).items() if col_types.get(c) == "inim"},
+        seq_in = {new(k): v for k, v in (spec.get("seq_params") or {}).items()}
+        seq_params = {c: seqm.check_params(seq_in.get(c), c, t == "outdec") for c, t in col_types.items() if t in seqm.SEQ_TYPES}
+        seq_bridge = spec.get("seq_bridge", "mlp")
+        if seq_bridge not in seqm.BRIDGES: raise ValueError(f"Unknown bridge {seq_bridge!r}")
+        if seq_params and mlp_mode != 0: raise ValueError("inenc / outdec columns need the MLP architecture (not GNN).")
+        if seq_params and not hidden and seq_bridge == "mlp": seq_bridge = "latent"  # no hidden layers: one linear map
+        check_mlp_options(mlp_mode, layer_acts, out_act, hidden)
+        return dict(path=path, delim=delim, col_types=col_types, input_cols=input_cols, output_cols=output_cols, fmt=fmt,
+                    scale_ranges=scale_ranges,
+                    image_params={new(c): {"im_size": int(p["im_size"]), "patch_size": int(p["patch_size"])}
+                                  for c, p in (spec.get("image_params") or {}).items() if col_types.get(new(c)) == "inim"},
                     kwargs=dict(hidden_dims=hidden, optimizer_choice=opt, batch_size=int(spec.get("batch_size", 32)),
                                 activation_cls=wrap_activation(base_act, activation_type), activation_type=activation_type,
                                 residual_type=residual, norm_type=norm, groups=groups, attention_type=attention,
@@ -8370,7 +8896,8 @@ class TrainingSession:
                                 lsuv_max_iter=int(spec.get("lsuv_max_iter", 10)), lsuv_normalize_mean=lsuv == 2,
                                 custom_lr=lr, mlp_mode=mlp_mode, layer_routing=routing,
                                 use_grn=bool(spec.get("use_grn", False)), optim_params=optim_params,
-                                loss_balancing=balancing, loss_temperature=float(spec.get("loss_temperature") or 20.0)),
+                                loss_balancing=balancing, loss_temperature=float(spec.get("loss_temperature") or 20.0),
+                                seq_params=seq_params, seq_bridge=seq_bridge, layer_activations=layer_acts, output_activation=out_act),
                     val=dict(mode=spec.get("val_mode", "split"), pct=float(spec.get("val_pct", 0.1)),
                              file=spec.get("val_file"), interval=int(spec.get("val_interval", 200))))
 
@@ -8390,16 +8917,18 @@ class TrainingSession:
                 with self.lock: self.state = "done"
                 return
             col_types = a["col_types"]; vocabularies = {}; image_params = dict(a["image_params"])
+            register_csv_format(a["path"], a["fmt"])
             for c, t in col_types.items():
                 if t in ("i", "inim"): continue  # inim sizes come from the GUI instead of stdin
-                _setup_vocab_for_col(c, t, a["path"], a["delim"], vocabularies, image_params)
+                _setup_vocab_for_col(c, t, a["path"], a["delim"], vocabularies, image_params,
+                                     a["kwargs"]["seq_params"].get(c, {}).get("tokenizer", "char"))
             bs = a["kwargs"]["batch_size"]; v = a["val"]; vpath = None
             if v["mode"] == "file":
                 vpath = os.path.abspath(os.path.expanduser(v["file"] or ""))
                 if not os.path.isfile(vpath): raise FileNotFoundError(f"Validation file not found: {vpath}")
             ds, vds, rep = prepare_train_val(a["path"], a["delim"], a["input_cols"], a["output_cols"], col_types,
                                              vocabularies, image_params, val_file=vpath,
-                                             val_frac=v["pct"] if v["mode"] == "split" else 0.0)
+                                             val_frac=v["pct"] if v["mode"] == "split" else 0.0, scale_ranges=a["scale_ranges"])
             scalings, vocabularies = ds.scalings, ds.vocabularies
             val_loader = DataLoader(vds, batch_size=bs, shuffle=False) if vds is not None else None
             with self.lock:
@@ -8441,6 +8970,7 @@ class BenchSession:
                 raise RuntimeError("A benchmark is already running.")
         form, b = spec.get("train") or {}, spec.get("bench") or {}
         a = TrainingSession._build_args(None, form)
+        if has_seq_columns(a["col_types"]): raise ValueError("The benchmark does not support inenc / outdec columns yet.")
         amap = _build_activation_map()
         acts = [n for n in (b.get("activations") or []) if n in amap and n != "Custom"]
         if not acts:
@@ -8503,6 +9033,7 @@ class BenchSession:
     def _run(self, a, acts, act_type, sweep, metric, steps, b, optim_params_for):
         try:
             col_types = a["col_types"]; vocabularies = {}; image_params = dict(a["image_params"])
+            register_csv_format(a["path"], a["fmt"])
             for c, t in col_types.items():
                 if t in ("i", "inim"): continue
                 _setup_vocab_for_col(c, t, a["path"], a["delim"], vocabularies, image_params)
@@ -8555,6 +9086,8 @@ def gui_train_options():
             "activations": [n for n in amap if n != "Custom"], "activation_params": _GUI_ACT_PARAMS,
             "act_subsets": {k: [n for n in globals()[v] if n in amap and n != "Custom"] for k, v in _GUI_ACT_SUBSETS.items()},
             "norms": _GUI_NORMS, "residuals": _GUI_RESIDUALS,
+            "seq": {"archs": seqm.ARCHS, "attention": seqm.DEC_ATTENTION, "attention_archs": list(seqm.ATTENTION_ARCHS),
+                    "bridges": seqm.BRIDGES, "tokenizers": list(seqm.TOKENIZERS), "defaults": seqm.DEFAULT_PARAMS},
             "cwd": os.getcwd()}
 
 
@@ -8594,7 +9127,8 @@ def run_gui(host="127.0.0.1", port=8765, open_browser=True, model_path="model.pt
                                "training": session.status(10 ** 12)["state"], "cwd": os.getcwd(), "start_page": start_page},
         "/api/meta": lambda b: sampler().meta(),
         "/api/status": status,
-        "/api/predict": lambda b: sampler().predict(b.get("inputs", {})),
+        "/api/predict": lambda b: sampler().predict(b.get("inputs", {}), b.get("generation")),
+        "/api/sequence": lambda b: sampler().sequence_view(b.get("inputs", {})),
         "/api/sweep1d": lambda b: sampler().sweep1d(b.get("inputs", {}), b["x"], b["out"], b.get("lo"), b.get("hi"),
                                                     b.get("n", 200), b.get("show_data", False)),
         "/api/sweep2d": lambda b: sampler().sweep2d(b.get("inputs", {}), b["x"], b["y"], b["out"], b.get("cls"),
@@ -8607,7 +9141,7 @@ def run_gui(host="127.0.0.1", port=8765, open_browser=True, model_path="model.pt
         "/api/dataset_row": lambda b: sampler().dataset_row(b.get("index"), b.get("source", "training")),
         "/api/data_stats": lambda b: sampler().data_stats(),
         "/api/fs": lambda b: gui_list_dir(b.get("path")),
-        "/api/dataset/preview": lambda b: gui_preview_dataset(b["path"], b.get("delimiter")),
+        "/api/dataset/preview": lambda b: gui_preview_dataset(b["path"], b.get("delimiter"), header=b.get("header", True) is not False),
         "/api/train/options": lambda b: gui_train_options(),
         "/api/train/start": lambda b: session.start(b),
         "/api/train/stop": lambda b: session.stop(),
@@ -8695,6 +9229,15 @@ if __name__ == "__main__":
     print("14: Resume Training (continue the current model)")
     
     choice = input("\nEnter choice [0-14]: ").strip().lower()
+    _seq_modes = {"0", "train", "t", "1", "sample", "s", "2", "b", "benchmark", "7", "test", "testeval", "8", "info", "modelinfo",
+                  "14", "resume", "r"}
+    if choice not in _seq_modes and os.path.exists("config.json"):
+        try: _cfg_types = load_config().get("col_types", {})
+        except Exception: _cfg_types = {}
+        if has_seq_columns(_cfg_types):
+            print("The current model (config.json) has inenc / outdec columns. Modes that support them: "
+                  "Train, Sample, Test Eval, Model Info, Resume Training.")
+            raise SystemExit(1)
     
     if choice in ["train", "t", "0"]:
         file_path = input("Enter file path: ").strip()
@@ -8703,10 +9246,14 @@ if __name__ == "__main__":
         dc = input("Choice: ").strip()
         delimiter = {"1":",","2":"\t","3":";","4":" "}.get(dc, ",")
             
-        df = pd.read_csv(file_path, delimiter=delimiter)
-        col_types, vocabularies, image_params = ask_column_types(df.columns.tolist(), file_path, delimiter)
+        register_csv_format(file_path, ask_csv_format(file_path, delimiter))
+        df = read_table(file_path, delimiter=delimiter)
+        col_types, vocabularies, image_params = ask_column_types(df.columns.tolist(), file_path, delimiter, allow_seq=True)
         input_cols = [c for c, v in col_types.items() if 'in' in v]
         output_cols = [c for c, v in col_types.items() if 'out' in v]
+        seq_params = dict(ASKED_SEQ_PARAMS); seq_bridge = ask_seq_bridge(col_types, seq_params)
+        if has_seq_columns(col_types) and seq_bridge == "mlp":
+            print("\nThe hidden layers below form the MLP between the encoders and the decoders.")
         hidden_dims = ask_hidden_dims()
         mlp_mode = ask_mlp_mode()
         batch_size = ask_batch_size()
@@ -8716,6 +9263,9 @@ if __name__ == "__main__":
         if isinstance(base_activation_cls(), MaxoutActivation) and activation_type != 0:
             raise ValueError("True Maxout must use the basic activation type.")
         wrapped_activation_cls = wrap_activation(base_activation_cls, activation_type)
+        layer_activations = ask_layer_activations(hidden_dims, base_activation_cls)
+        output_activation = ask_output_activation(output_cols, col_types)
+        scale_ranges = ask_scale_ranges(input_cols + output_cols, col_types)
         optimizer_choice = ask_optimizer()
         custom_lr = ask_learning_rate()
         residual_type = ask_residual_type()
@@ -8733,13 +9283,16 @@ if __name__ == "__main__":
 
         loss_balancing, loss_temperature = ask_loss_balancing(output_cols, col_types)
         train_ds, val_loader, val_interval = ask_validation_and_prepare(
-            file_path, delimiter, input_cols, output_cols, col_types, vocabularies, image_params, batch_size)
+            file_path, delimiter, input_cols, output_cols, col_types, vocabularies, image_params, batch_size,
+            scale_ranges=scale_ranges)
         scalings = train_ds.scalings; vocabularies = train_ds.vocabularies
 
         # Route to auto-grow or regular training
         is_auto = isinstance(hidden_dims, dict) and hidden_dims.get("mode") == "auto"
         if is_auto and layer_routing != "none":
             raise ValueError("Adaptive layer routing is not supported by auto-grow training.")
+        if is_auto and output_activation:
+            raise ValueError("An output activation is not supported by auto-grow training.")
         if is_auto:
             main_auto_grow(file_path, delimiter=delimiter, input_cols=input_cols, output_cols=output_cols,
                  col_types=col_types, vocabularies=vocabularies, scalings=scalings, image_params=image_params,
@@ -8770,7 +9323,9 @@ if __name__ == "__main__":
                  val_loader=val_loader, val_interval=val_interval,
                  custom_lr=custom_lr, mlp_mode=mlp_mode, layer_routing=layer_routing,
                  use_grn=use_grn, train_dataset=train_ds,
-                 loss_balancing=loss_balancing, loss_temperature=loss_temperature)
+                 loss_balancing=loss_balancing, loss_temperature=loss_temperature,
+                 seq_params=seq_params, seq_bridge=seq_bridge,
+                 layer_activations=layer_activations, output_activation=output_activation)
 
     elif choice in ["sample", "s", "1"]:
         if input("Launch interactive GUI (local web server)? (y/N): ").strip().lower() == 'y':
@@ -8780,11 +9335,12 @@ if __name__ == "__main__":
         config = load_config()
         sample_input = []
         for col in config["col_types"]:
-            if config["col_types"][col] in ["in", "inlab", "intex", "inim", "inlabcat", "intexcat"]:
+            if config["col_types"][col] in ["in", "inlab", "intex", "inim", "inlabcat", "intexcat", "inenc"]:
                 sample_input.append(input(f"Enter value for '{col}': ").strip())
         
         output_cols = [c for c, t in config["col_types"].items() if 'out' in t]
         output_dim = calculate_dims(output_cols, config["col_types"], config["scalings"], config.get("vocabularies", {}))
+        generation = ask_generation(config["col_types"])
         
         generate_plots = input("Generate plots? (y/n): ").strip().lower() == 'y'
         plot_option = None; plot_settings = {}
@@ -8830,10 +9386,10 @@ if __name__ == "__main__":
                 except: pass
                 result = load_and_sample_model(sample_input, config['hidden_dims'], config.get('vocabularies', {}),
                                                config['col_types'], output_dim, config['scalings'],
-                                               config.get('image_params', {}), None, plot_settings)
+                                               config.get('image_params', {}), None, plot_settings, generation=generation)
                 # Re-load for visualization
                 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-                input_cols_s = [c for c in config["col_types"] if config["col_types"][c] in ["in","inlab","intex","inim","inlabcat","intexcat"]]
+                input_cols_s = [c for c in config["col_types"] if config["col_types"][c] in ["in","inlab","intex","inim","inlabcat","intexcat","inenc"]]
                 input_dims_s = calculate_input_dim(input_cols_s, config["col_types"], config["scalings"], config.get("vocabularies", {}))
                 act_map = _build_activation_map()
                 act_cfg = config.get("activation", {"name": "ReLU", "params": {}})
@@ -8843,26 +9399,17 @@ if __name__ == "__main__":
                 else: acls = nn.ReLU
                 acls = wrap_activation(acls, config.get("activation_type", 0))
                 nplot_mlp_mode = config.get("mlp_mode", 0)
-                if nplot_mlp_mode == 1:
-                    mdl = GNNMLPO(input_dims_s, config["hidden_dims"], output_dim, acls,
-                        config.get("residual_type","residual"), norm_type=config.get("norm_type","layer"),
-                        groups=config.get("groups",1)).to(device)
-                else:
-                    mdl = MLPO(input_dims_s, config["hidden_dims"], output_dim, acls,
-                        config.get("residual_type","residual"), norm_type=config.get("norm_type","layer"),
-                        groups=config.get("groups",1), attention_type=config.get("attention_type","none"),
-                        num_heads=config.get("num_heads",1), input_attention_type=config.get("input_attention_type","none"),
-                        moe_mode=config.get("moe_mode",1)).to(device)
+                mdl = build_model_from_config(config, input_dims_s, output_dim, torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+                materialize_lazy_modules(mdl, input_dims_s, next(mdl.parameters()).device)
                 with torch.no_grad(): mdl(torch.zeros(1, input_dims_s).to(device))
                 mdl.load_state_dict(torch.load('model.pt')); mdl.eval()
                 processed = []
                 sidx = 0
                 for cn, ct in config["col_types"].items():
-                    if ct not in ["in","inlab","intex","inim","inlabcat","intexcat"]: continue
+                    if ct not in ["in","inlab","intex","inim","inlabcat","intexcat","inenc"]: continue
                     val = sample_input[sidx]
                     if ct in ["in"] and cn in config["scalings"] and 'min' in config["scalings"][cn]:
-                        smin = config["scalings"][cn]['min']; smax = config["scalings"][cn]['max']
-                        processed.append(2 * (float(val) - smin) / (smax - smin) - 1)
+                        processed.append(to_model_units(float(val), config["scalings"][cn]))
                     else: processed.append(float(val) if ct == "in" else 0.0)
                     sidx += 1
                 while len(processed) < input_dims_s: processed.append(0.0)
@@ -8872,7 +9419,7 @@ if __name__ == "__main__":
         else:
             print(load_and_sample_model(sample_input, config['hidden_dims'], config.get('vocabularies', {}),
                                            config['col_types'], output_dim, config['scalings'],
-                                           config.get('image_params', {}), plot_option, plot_settings))
+                                           config.get('image_params', {}), plot_option, plot_settings, generation=generation))
 
     elif choice in ["scatter", "sc", "3"]:
         config = load_config()
@@ -8893,16 +9440,8 @@ if __name__ == "__main__":
         else: cls = nn.ReLU
         cls = wrap_activation(cls, config.get("activation_type", 0))
         scatter_mlp_mode = config.get("mlp_mode", 0)
-        if scatter_mlp_mode == 1:
-            model = GNNMLPO(input_dims, config["hidden_dims"], output_pred_dim, cls,
-                config.get("residual_type", "residual"), norm_type=config.get("norm_type", "layer"),
-                groups=config.get("groups", 1))
-        else:
-            model = MLPO(input_dims, config["hidden_dims"], output_pred_dim, cls,
-                config.get("residual_type", "residual"), norm_type=config.get("norm_type", "layer"),
-                groups=config.get("groups", 1), attention_type=config.get("attention_type", "none"),
-                num_heads=config.get("num_heads", 1), input_attention_type=config.get("input_attention_type", "none"),
-                moe_mode=config.get("moe_mode", 1))
+        model = build_model_from_config(config, input_dims, output_pred_dim, torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+        materialize_lazy_modules(model, input_dims, next(model.parameters()).device)
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu"); model.to(device)
         with torch.no_grad(): model(torch.zeros(1, input_dims).to(device))
         model.load_state_dict(torch.load('model.pt')); model.eval()
@@ -8927,7 +9466,8 @@ if __name__ == "__main__":
     elif choice in ["benchmark", "b", "2"]:
         file_path = input("Enter file path: ").strip()
         dc = input("Delimiter: ").strip(); delimiter = {"1":",","2":"\t","3":";","4":" "}.get(dc, ",")
-        df = pd.read_csv(file_path, delimiter=delimiter)
+        register_csv_format(file_path, ask_csv_format(file_path, delimiter))
+        df = read_table(file_path, delimiter=delimiter)
         col_types, vocabularies, image_params = ask_column_types(df.columns.tolist(), file_path, delimiter)
         input_cols = [c for c, t in col_types.items() if "in" in t]
         output_cols = [c for c, t in col_types.items() if "out" in t]
@@ -8962,7 +9502,8 @@ if __name__ == "__main__":
         dc = input("Choice: ").strip()
         delimiter = {"1":",","2":"\t","3":";","4":" "}.get(dc, ",")
 
-        df = pd.read_csv(file_path, delimiter=delimiter)
+        register_csv_format(file_path, ask_csv_format(file_path, delimiter))
+        df = read_table(file_path, delimiter=delimiter)
         col_types, vocabularies, image_params = ask_column_types(df.columns.tolist(), file_path, delimiter)
         input_cols = [c for c, v in col_types.items() if 'in' in v]
         output_cols = [c for c, v in col_types.items() if 'out' in v]
@@ -9098,14 +9639,8 @@ if __name__ == "__main__":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         mlp_mode = config.get("mlp_mode", 0)
         
-        if mlp_mode == 1:
-            model = GNNMLPO(input_dims, hidden_dims, output_pred_dim, activation_cls, residual_type,
-                            norm_type=norm_type, groups=1).to(device)
-        else:
-            model = MLPO(input_dims, hidden_dims, output_pred_dim, activation_cls, residual_type,
-                         norm_type=norm_type, groups=1, attention_type=attention_type,
-                         num_heads=num_heads, input_attention_type="none", moe_mode=moe_mode,
-                         layer_routing=config.get("layer_routing", "none")).to(device)
+        model = build_model_from_config(config, input_dims, output_pred_dim, torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+        materialize_lazy_modules(model, input_dims, next(model.parameters()).device)
         with torch.no_grad(): model(torch.zeros(1, input_dims).to(device))
         model.load_state_dict(torch.load("model.pt", map_location=device))
         
@@ -9150,14 +9685,8 @@ if __name__ == "__main__":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         mlp_mode = config.get("mlp_mode", 0)
         
-        if mlp_mode == 1:
-            model = GNNMLPO(input_dims, hidden_dims, output_pred_dim, activation_cls, residual_type,
-                            norm_type=norm_type, groups=1).to(device)
-        else:
-            model = MLPO(input_dims, hidden_dims, output_pred_dim, activation_cls, residual_type,
-                         norm_type=norm_type, groups=1, attention_type=attention_type,
-                         num_heads=num_heads, input_attention_type="none", moe_mode=moe_mode,
-                         layer_routing=config.get("layer_routing", "none")).to(device)
+        model = build_model_from_config(config, input_dims, output_pred_dim, torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+        materialize_lazy_modules(model, input_dims, next(model.parameters()).device)
         with torch.no_grad(): model(torch.zeros(1, input_dims).to(device))
         if os.path.exists("model.pt"):
             model.load_state_dict(torch.load("model.pt", map_location=device))
@@ -9196,14 +9725,8 @@ if __name__ == "__main__":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         mlp_mode = config.get("mlp_mode", 0)
         
-        if mlp_mode == 1:
-            model = GNNMLPO(input_dims, hidden_dims, output_pred_dim, activation_cls, residual_type,
-                            norm_type=norm_type, groups=1).to(device)
-        else:
-            model = MLPO(input_dims, hidden_dims, output_pred_dim, activation_cls, residual_type,
-                         norm_type=norm_type, groups=1, attention_type=attention_type,
-                         num_heads=num_heads, input_attention_type="none", moe_mode=moe_mode,
-                         layer_routing=config.get("layer_routing", "none")).to(device)
+        model = build_model_from_config(config, input_dims, output_pred_dim, torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+        materialize_lazy_modules(model, input_dims, next(model.parameters()).device)
         with torch.no_grad(): model(torch.zeros(1, input_dims).to(device))
         model.load_state_dict(torch.load("model.pt", map_location=device))
         
@@ -9227,7 +9750,8 @@ if __name__ == "__main__":
         dc = input("Choice: ").strip()
         delimiter = {"1":",","2":"\t","3":";","4":" "}.get(dc, ",")
         
-        df = pd.read_csv(file_path, delimiter=delimiter)
+        register_csv_format(file_path, ask_csv_format(file_path, delimiter))
+        df = read_table(file_path, delimiter=delimiter)
         col_types_lr, vocabularies_lr, image_params_lr = ask_column_types(df.columns.tolist(), file_path, delimiter)
         input_cols_lr = [c for c, v in col_types_lr.items() if 'in' in v]
         output_cols_lr = [c for c, v in col_types_lr.items() if 'out' in v]
@@ -9269,7 +9793,8 @@ if __name__ == "__main__":
         dc = input("Choice: ").strip()
         delimiter = {"1":",","2":"\t","3":";","4":" "}.get(dc, ",")
         
-        df = pd.read_csv(file_path, delimiter=delimiter)
+        register_csv_format(file_path, ask_csv_format(file_path, delimiter))
+        df = read_table(file_path, delimiter=delimiter)
         col_types_cv, vocabularies_cv, image_params_cv = ask_column_types(df.columns.tolist(), file_path, delimiter)
         input_cols_cv = [c for c, v in col_types_cv.items() if 'in' in v]
         output_cols_cv = [c for c, v in col_types_cv.items() if 'out' in v]
@@ -9337,14 +9862,8 @@ if __name__ == "__main__":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         mlp_mode = config.get("mlp_mode", 0)
         
-        if mlp_mode == 1:
-            model = GNNMLPO(input_dims, hidden_dims, output_pred_dim, activation_cls, residual_type,
-                            norm_type=norm_type, groups=1).to(device)
-        else:
-            model = MLPO(input_dims, hidden_dims, output_pred_dim, activation_cls, residual_type,
-                         norm_type=norm_type, groups=1, attention_type=attention_type,
-                         num_heads=num_heads, input_attention_type="none", moe_mode=moe_mode,
-                         layer_routing=config.get("layer_routing", "none")).to(device)
+        model = build_model_from_config(config, input_dims, output_pred_dim, torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+        materialize_lazy_modules(model, input_dims, next(model.parameters()).device)
         with torch.no_grad(): model(torch.zeros(1, input_dims).to(device))
         model.load_state_dict(torch.load("model.pt", map_location=device))
         
@@ -9392,14 +9911,8 @@ if __name__ == "__main__":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         mlp_mode = config.get("mlp_mode", 0)
         
-        if mlp_mode == 1:
-            model = GNNMLPO(input_dims, hidden_dims, output_pred_dim, activation_cls, residual_type,
-                            norm_type=norm_type, groups=1).to(device)
-        else:
-            model = MLPO(input_dims, hidden_dims, output_pred_dim, activation_cls, residual_type,
-                         norm_type=norm_type, groups=1, attention_type=attention_type,
-                         num_heads=num_heads, input_attention_type="none", moe_mode=moe_mode,
-                         layer_routing=config.get("layer_routing", "none")).to(device)
+        model = build_model_from_config(config, input_dims, output_pred_dim, torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+        materialize_lazy_modules(model, input_dims, next(model.parameters()).device)
         model.load_state_dict(torch.load("model.pt", map_location=device))
         
         data_csv = input("Enter data CSV path (for error analysis): ").strip()

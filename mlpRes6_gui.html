@@ -524,7 +524,7 @@ function colorbar(parent, { lo, hi, colorFn, label, diverging = false }) {
 }
 
 // ───────────────────────── app state ─────────────────────────
-const TABS = [["response", "Response curves"], ["diagram", "Network diagram"], ["map", "2D map"], ["sens", "Sensitivity"], ["network", "Neuron strips"], ["acts", "Activations"], ["weights", "Weights"], ["data", "Dataset"], ["history", "History"]];
+const TABS = [["response", "Response curves"], ["diagram", "Network diagram"], ["map", "2D map"], ["sens", "Sensitivity"], ["network", "Neuron strips"], ["acts", "Activations"], ["weights", "Weights"], ["data", "Dataset"], ["seq", "Sequence"], ["history", "History"]];
 const hashTab = location.hash.slice(1);
 const S = { meta: null, inputs: {}, targets: null, pred: null, tab: TABS.some(t => t[0] === hashTab) ? hashTab : store.get("tab", "response"), seq: 0, dataStats: null, selNeuron: null };
 const tabState = store.get("tabState", {});
@@ -590,8 +590,20 @@ function setInput(col, v, refresh = true) {
 function resetInputs() { for (const s of S.meta.inputs) S.inputs[s.col] = s.default; S.targets = null; $("#rowNote").textContent = ""; syncInputs(); onInputsChanged(); }
 
 // ───────────────────────── prediction panel ─────────────────────────
+// Sampling settings for text decoders (outdec); temperature 0 = the most likely text.
+S.gen = Object.assign({ temperature: 0, top_k: 0, top_p: 1 }, store.get("gen", {}));
+function genControls() {
+  const g = S.gen, num = (k, attrs) => el("input", Object.assign({ type: "number", value: g[k], style: "width:64px",
+    onchange: e => { const v = +e.target.value; if (!Number.isFinite(v)) return; g[k] = v; store.set("gen", g); predict(); } }, attrs));
+  return el("div", { class: "row-flex", style: "gap:6px;flex-wrap:wrap;margin-bottom:8px;font-size:12px" },
+    el("span", { class: "muted", title: "0 = always the most likely token" }, "temperature"), num("temperature", { min: 0, step: 0.1 }),
+    g.temperature > 0 ? [el("span", { class: "muted", title: "0 = off" }, "top-k"), num("top_k", { min: 0, step: 1 }),
+                         el("span", { class: "muted", title: "1 = off" }, "top-p"), num("top_p", { min: 0.01, max: 1, step: 0.05 }),
+                         el("button", { onclick: () => predict() }, "Sample again")] : null);
+}
 function renderOutputs() {
   const box = $("#outputs"); box.replaceChildren();
+  if (S.meta?.generates) box.append(genControls());
   if (!S.pred) return;
   for (const o of S.pred.outputs) {
     const d = el("div", { class: "out" }, el("div", { class: "name" }, `${o.col} · ${o.type}`), el("div", { class: "value" }, typeof o.value === "number" ? fmt(o.value, 6) : String(o.value)));
@@ -617,7 +629,7 @@ const onInputsChanged = debounce(async () => { store.set("inputs", S.inputs); aw
 async function predict() {
   const t0 = performance.now(), seq = ++S.seq;
   try {
-    const p = await api("/api/predict", { inputs: S.inputs });
+    const p = await api("/api/predict", { inputs: S.inputs, generation: S.meta?.generates ? S.gen : null });
     if (seq !== S.seq) return;
     S.pred = p; $("#latency").textContent = `${Math.round(performance.now() - t0)} ms`;
     renderOutputs();
@@ -633,7 +645,7 @@ async function renderTab() {
   const token = ++renderToken, view = $("#view");
   const fresh = el("div");
   try {
-    await ({ response: tabResponse, diagram: tabDiagram, map: tabMap, sens: tabSens, network: tabNetwork, acts: tabActs, weights: tabWeights, data: tabData, history: tabHistory }[S.tab])(fresh, () => token !== renderToken);
+    await ({ response: tabResponse, diagram: tabDiagram, map: tabMap, sens: tabSens, network: tabNetwork, acts: tabActs, weights: tabWeights, data: tabData, seq: tabSeq, history: tabHistory }[S.tab])(fresh, () => token !== renderToken);
     // charts sized while detached: redraw once attached
     if (token === renderToken) keepScroll(() => { view.replaceChildren(...fresh.childNodes); fresh._after?.forEach(fn => fn()); });
   } catch (e) {
@@ -762,6 +774,62 @@ async function tabSens(root, stale) {
     notes: rows.map(x => x.kind === "gradient" ? `local slope: ${fmt(x.per_unit)} per unit of input` : `best: ${esc(x.best)} · worst: ${esc(x.worst)}`),
   }));
   card.append(el("div", { class: "legend" }, el("span", {}, el("span", { class: "sw", style: `background:${css("--s1")}` }), "increases output"), el("span", {}, el("span", { class: "sw", style: `background:${css("--s8")}` }), "decreases output"), el("span", { class: "muted" }, "(categorical spreads are always ≥ 0)")));
+}
+
+// Sequence: what the text encoders / decoders do for the current input
+function seqHeat(root, card, { rows, cols, w, signed, height, xLabel, yLabel, note }) {
+  const chart = new Chart(card, { height: height ?? Math.max(160, 22 * rows.length + 90), title: "", sub: note || "" });
+  const nx = cols.length, ny = rows.length, z = new Float32Array(nx * ny);
+  const div = divScale(), seq = seqScale();
+  for (let j = 0; j < ny; j++) {  // scale per row: each step / query is compared with itself
+    const mx = Math.max(1e-12, ...w[j].map(Math.abs));
+    for (let i = 0; i < nx; i++) z[j * nx + i] = w[j][i] / mx;
+  }
+  later(root, () => drawHeat(chart, { z, nx, ny, xVals: [...Array(nx).keys()], yVals: [...Array(ny).keys()], xCats: cols, yCats: rows,
+    xLabel, yLabel, left: 80, bottom: 60, yDown: true, colorFn: v => signed ? div(v) : seq(v),
+    valueText: (i, j) => `${esc(yLabel)} <b>${esc(rows[j])}</b> · ${esc(xLabel)} <b>${esc(cols[i])}</b>: ${fmt(w[j][i], 4)}` }));
+  return chart;
+}
+function attrMatrix(r, attrs) {  // attribution rows -> columns: every input token, then numeric / categorical inputs
+  const cols = [], pick = [];
+  for (const [c, e] of Object.entries(r.encoders)) e.tokens.forEach((t, i) => { cols.push(`${c}:${t}`); pick.push(a => a[c][i]); });
+  for (const c of r.inputs) { cols.push(c); pick.push(a => a.__inputs__[c]); }
+  return { cols, w: attrs.map(a => pick.map(f => f(a))) };
+}
+function mapCard(root, title, maps, key) {
+  if (!maps.length) return;
+  const card = el("div", { class: "card", style: "margin-top:12px" }, el("h2", {}, title)); root.append(card);
+  let mi = Math.min(+ts("seq", key, 0), maps.length - 1); const m = maps[mi], H = m.w.length;
+  let head = ts("seq", key + "_head", "mean"); if (head !== "mean" && +head >= H) head = "mean";
+  card.append(el("div", { class: "controls" },
+    selectCtl("Attention", maps.map((x, i) => [i, `${x.kind === "cross" ? "cross" : "self"} · ${x.name}`]), mi, v => { setTs("seq", key, v); renderTab(); }),
+    H > 1 ? selectCtl("Head", [["mean", "mean of heads"], ...[...Array(H).keys()].map(h => [h, `head ${h + 1}`])], head, v => { setTs("seq", key + "_head", v); renderTab(); }) : ""));
+  const w = head === "mean" ? m.rows.map((_, j) => m.cols.map((_, i) => m.w.reduce((s, hw) => s + hw[j][i], 0) / H)) : m.w[+head];
+  seqHeat(root, card, { rows: m.rows, cols: m.cols, w, signed: false, xLabel: m.kind === "cross" ? "encoder token" : "attends to", yLabel: m.side === "decoder" ? "generating" : "token",
+    note: m.kind === "cross" ? "Where each generated token looked in the encoded input ([latent] = the bridge's summary). Rows scaled to their largest weight." : "Self-attention weights, rows scaled to their largest weight." });
+}
+async function tabSeq(root, stale) {
+  if (!S.meta.sequence) { root.append(el("div", { class: "card empty" }, "The Sequence view is for models with text encoder (inenc) or decoder (outdec) columns.")); return; }
+  const r = await api("/api/sequence", { inputs: S.inputs });
+  if (stale()) return;
+  root.append(el("p", { class: "note" }, "For the current input, with the most likely tokens (temperature 0). Attribution = gradient × input: how much each input token (its embedding) or input value pushed each generated token; red pushed towards it, blue away from it, each row scaled to its largest effect. It works for every model, with or without attention. Numeric inputs are measured from 0 in model units (the middle of the default −1…1 scaling)."));
+  for (const [col, d] of Object.entries(r.decoders)) {
+    const card = el("div", { class: "card", style: "margin-top:12px" }, el("h2", {}, `${col}: generated step by step`)); root.append(card);
+    card.append(el("div", { class: "scroll" }, el("table", { class: "data" }, el("tr", {}, el("th", {}, "step"), el("th", {}, "token"), el("th", {}, "probability"), el("th", {}, "alternatives")),
+      ...d.tokens.map((t, k) => el("tr", {}, el("td", {}, k + 1), el("td", {}, el("b", {}, t)), el("td", {}, `${(d.prob[k] * 100).toFixed(1)}%`),
+        el("td", { class: "muted" }, d.top[k].filter(([tt]) => tt !== t).slice(0, 4).map(([tt, p]) => `${tt} ${(p * 100).toFixed(1)}%`).join(" · ")))))));
+    const { cols, w } = attrMatrix(r, d.attr);
+    card.append(el("h2", { style: "margin-top:12px" }, "Input attribution per generated token"));
+    seqHeat(root, card, { rows: d.tokens, cols, w, signed: true, xLabel: "input", yLabel: "generating" });
+    mapCard(root, `${col}: attention`, r.maps.filter(m => m.side === "decoder" && m.col === col), "dec_" + col);
+  }
+  for (const [c] of Object.entries(r.encoders)) mapCard(root, `${c}: encoder self-attention`, r.maps.filter(m => m.side === "encoder" && m.col === c), "enc_" + c);
+  for (const [col, a] of Object.entries(r.regular)) {
+    const card = el("div", { class: "card", style: "margin-top:12px" }); root.append(card);
+    const { cols, w } = attrMatrix(r, [a]);
+    const chart = new Chart(card, { title: `${col}: input attribution`, sub: "gradient × input for this output (the predicted class for categories)" });
+    later(root, () => drawHBars(chart, { labels: cols, values: w[0], valueLabel: "attribution", colorPos: css("--s1"), colorNeg: css("--s8") }));
+  }
 }
 
 // Network: per-layer activation strips + neuron inspector
@@ -1215,12 +1283,16 @@ function showPage(page) {
 // ───────────────────────── Train page ─────────────────────────
 const TYPE_LABELS = { i: "ignore", in: "input · numeric", inlab: "input · label code", intex: "input · text codes", inim: "input · image",
   inlabcat: "input · category (one-hot)", intexcat: "input · text (one-hot chars)", out: "output · numeric", outlab: "output · label code",
-  outex: "output · text codes", outlabcat: "output · category (softmax)", outexcat: "output · text (softmax chars)" };
+  outex: "output · text codes", outlabcat: "output · category (softmax)", outexcat: "output · text (softmax chars)",
+  inenc: "input · text → encoder", outdec: "output · text ← decoder" };
+const SEQ_TYPES = ["inenc", "outdec"];
 const DEFAULT_FORM = { path: "", delimiter: "", columns: {}, image_params: {}, hidden_dims: [64, 64], mlp_mode: 0, batch_size: 32,
   activation: { name: "ReLU", params: {} }, activation_type: 0, layer_routing: "none", optimizer: "Adam", lr: "", optim_params: {},
   residual_type: "residual", norm_type: "layer", groups: 1, attention_type: "none", num_heads: 2, input_attention_type: "none",
   moe_mode: 1, use_grn: false, noise_mode: "none", noise_value: 0.1, lsuv: 0, lsuv_max_iter: 10,
-  val_mode: "split", val_pct: 0.1, val_file: "", val_interval: 200, loss_balancing: "normalized", loss_temperature: 20 };
+  val_mode: "split", val_pct: 0.1, val_file: "", val_interval: 200, loss_balancing: "normalized", loss_temperature: 20,
+  seq_params: {}, seq_bridge: "mlp", header: true, rename: {}, layer_activations: null, output_activation: { name: "Linear", params: {} },
+  scale_ranges: {} };
 const T = { opts: null, preview: null, F: Object.assign(structuredClone(DEFAULT_FORM), store.get("trainForm", {})), sel: new Set(), lastClick: null,
   browse: null, since: 0, steps: [], losses: [], tasks: {}, st: null, timer: null, smooth: store.get("smooth", 0.95), logY: store.get("logY", true), fitSaves: -1, fit: null };
 const saveForm = () => store.set("trainForm", T.F);
@@ -1241,7 +1313,7 @@ function tCheck(label, key, onVal = [true, false]) {
 
 async function renderTrain() {
   if (!T.opts) T.opts = await api("/api/train/options");
-  if (!T.preview && F().path) { try { applyPreview(await api("/api/dataset/preview", { path: F().path, delimiter: F().delimiter || null })); } catch { /* shown when user loads */ } }
+  if (!T.preview && F().path) { try { applyPreview(await api("/api/dataset/preview", { path: F().path, delimiter: F().delimiter || null, header: F().header !== false })); } catch { /* shown when user loads */ } }
   const page = $("#trainPage");
   const setup = el("div"), mon = el("div", { class: "monitor" });
   setup.append(datasetCard(), columnsCard(), networkCard(), trainingCard());
@@ -1257,11 +1329,14 @@ function datasetCard() {
   const load = async () => {
     F().path = path.value.trim(); saveForm();
     try {
-      applyPreview(await api("/api/dataset/preview", { path: F().path, delimiter: F().delimiter || null }));
+      applyPreview(await api("/api/dataset/preview", { path: F().path, delimiter: F().delimiter || null, header: F().header !== false }));
       T.sel.clear(); renderTrain();
     } catch (e) { toast("Could not read dataset: " + e.message); }
   };
   card.append(el("div", { class: "row-flex" }, path, el("button", { onclick: () => { T.browse = T.browse ? null : (F().path || T.opts.cwd); renderTrain(); } }, T.browse ? "Close browser" : "Browse…"), delim, el("button", { class: "primary", onclick: load }, "Load")));
+  card.append(el("label", { class: "ctl check", style: "margin-top:6px", title: "Off: every row is data and the columns are called col1, col2, … (rename them below)" },
+    el("input", { type: "checkbox", checked: F().header !== false, onchange: e => { F().header = e.target.checked; F().rename = {}; T.preview = null; saveForm(); load(); } }),
+    "First row holds column names"));
   if (T.browse) {
     const filter = el("input", { type: "search", value: T.browseFilter || "", placeholder: "Type to filter by name…", style: "width:100%;margin-top:8px", autocomplete: "off", spellcheck: "false" });
     const box = el("div", { class: "browser" }, el("div", { class: "path" }, "loading…")); card.append(filter, box);
@@ -1357,10 +1432,12 @@ function columnsCard() {
       "size", el("input", { type: "number", style: "width:64px", value: F().image_params[c.name]?.im_size ?? 32, onchange: e => { (F().image_params[c.name] ??= {}).im_size = +e.target.value; saveForm(); } }),
       "patch", el("input", { type: "number", style: "width:56px", value: F().image_params[c.name]?.patch_size ?? 4, onchange: e => { (F().image_params[c.name] ??= {}).patch_size = +e.target.value; saveForm(); } })) : null;
     if (typeOf(c.name) === "inim") { F().image_params[c.name] ??= { im_size: 32, patch_size: 4 }; }
+    const seqBox = SEQ_TYPES.includes(typeOf(c.name)) ? seqSettings(c.name, typeOf(c.name) === "outdec")
+      : ["in", "out"].includes(typeOf(c.name)) ? rangeEditor(c.name) : null;
     t.append(el("tr", { class: selected ? "sel" : "" },
       el("td", {}, el("input", { type: "checkbox", checked: selected, onclick: toggle })),
-      el("td", { class: "name", onclick: toggle, title: "click to select, shift+click for a range" }, c.name),
-      el("td", {}, tsel, img), el("td", {}, c.unique.toLocaleString()), el("td", {}, c.missing ? el("span", { class: "warn" }, c.missing) : "0"),
+      el("td", { class: "name" }, nameEditor(c.name)),
+      el("td", {}, tsel, img, seqBox), el("td", {}, c.unique.toLocaleString()), el("td", {}, c.missing ? el("span", { class: "warn" }, c.missing) : "0"),
       el("td", { class: "muted", title: c.samples.join(", ") }, vals.length > 48 ? vals.slice(0, 46) + "…" : vals)));
   });
   card.append(el("div", { class: "scroll" }, t));
@@ -1368,23 +1445,87 @@ function columnsCard() {
   return card;
 }
 
+// Column name as used by the model (the CSV keeps its own; F().rename maps original -> new).
+function nameEditor(col) {
+  const cur = F().rename[col] ?? col;
+  return el("div", {},
+    el("input", { type: "text", value: cur, "data-fkey": "name:" + col, style: "width:140px", title: "Name used by the model; the CSV file is not changed",
+      onchange: e => { const v = e.target.value.trim();
+        const taken = T.preview.columns.some(o => o.name !== col && (F().rename[o.name] ?? o.name) === v);
+        if (!v || taken) { toast(taken ? `Another column is already called ${v}` : "A column name cannot be empty"); e.target.value = cur; return; }
+        if (v === col) delete F().rename[col]; else F().rename[col] = v; saveForm(); } }),
+    cur !== col ? el("div", { class: "muted", style: "font-size:11px" }, "file: " + col) : null);
+}
+// Model-side range a numeric column is scaled to (default -1 … 1; e.g. 0 … 1 with a sigmoid output).
+function rangeEditor(col) {
+  const r = F().scale_ranges[col] ?? [-1, 1];
+  const set = (i, v) => { const cur = [...(F().scale_ranges[col] ?? [-1, 1])]; cur[i] = v; F().scale_ranges[col] = cur; saveForm(); };
+  const num = i => el("input", { type: "number", step: 0.5, style: "width:56px", "data-fkey": `range:${col}:${i}`, value: r[i],
+    onchange: e => { const v = +e.target.value; if (Number.isFinite(v)) set(i, v); } });
+  return el("div", { class: "row-flex", style: "margin-top:3px;gap:4px", title: "The column's training min … max is mapped onto this range" },
+    el("span", { class: "muted" }, "scaled to"), num(0), el("span", { class: "muted" }, "…"), num(1));
+}
+
+// Tokenizer and model of one inenc / outdec column (stored in F().seq_params[col]).
+function seqSettings(col, isOut) {
+  const o = T.opts.seq, p = (F().seq_params[col] ??= { ...o.defaults });
+  for (const [k, v] of Object.entries(o.defaults)) p[k] ??= v;
+  const set = (k, v, redraw) => { p[k] = v; saveForm(); if (redraw) renderTrain(); };
+  const sel = (k, options, redraw = true) => el("select", { "data-fkey": `seq:${col}:${k}`, onchange: e => set(k, e.target.value, redraw) },
+    Object.entries(options).map(([v, t]) => el("option", { value: v, selected: v === p[k] }, t)));
+  const num = (k, w, min = 1) => el("input", { type: "number", min, step: 1, style: `width:${w}px`, "data-fkey": `seq:${col}:${k}`, value: p[k],
+    onchange: e => set(k, Math.max(min, Math.round(+e.target.value || min)), false) });
+  const mlpOut = isOut && p.arch === "mlp";
+  const heads = ["transformer", "modern"].includes(p.arch) || (isOut && o.attention_archs.includes(p.arch) && p.attention === "multihead");
+  return el("div", { class: "row-flex", style: "margin-top:3px;flex-wrap:wrap;gap:4px" },
+    sel("tokenizer", Object.fromEntries(o.tokenizers.map(t => [t, t === "char" ? "chars" : "words"])), false),
+    sel("arch", o.archs),
+    mlpOut ? null : el("span", { class: "muted" }, "width"), mlpOut ? null : num("dim", 60, 2),
+    p.arch === "mlp" ? null : el("span", { class: "muted" }, "layers"), p.arch === "mlp" ? null : num("layers", 48),
+    isOut && o.attention_archs.includes(p.arch) ? el("span", { class: "muted" }, "attention") : null,
+    isOut && o.attention_archs.includes(p.arch) ? sel("attention", o.attention) : null,
+    heads ? el("span", { class: "muted" }, "heads") : null, heads ? num("heads", 48) : null);
+}
+const seqCols = () => T.preview ? T.preview.columns.map(c => c.name).filter(n => SEQ_TYPES.includes(F().columns[n])) : [];
+
 function networkCard() {
   const f = F(), card = el("div", { class: "card" }, el("h2", {}, "3 · Network"));
   const chips = el("div", { class: "chips" });
+  const perLayer = Array.isArray(f.layer_activations);
+  if (perLayer && f.layer_activations.length !== f.hidden_dims.length)  // keep one activation per layer
+    f.layer_activations = f.hidden_dims.map((_, i) => f.layer_activations[i] ?? structuredClone(f.activation));
+  const layerAct = i => el("select", { "data-fkey": "train:layer-act" + i, title: `activation of layer ${i + 1}`, style: "max-width:110px",
+    onchange: e => { f.layer_activations[i] = { name: e.target.value, params: { ...(T.opts.activation_params[e.target.value] || {}) } }; saveForm(); } },
+    T.opts.activations.map(n => el("option", { value: n, selected: n === f.layer_activations[i].name }, n)));
   f.hidden_dims.forEach((w, i) => chips.append(el("span", { class: "chip" }, `L${i + 1}`,
     el("input", { type: "number", min: 1, step: 1, "data-fkey": "train:layer" + i, value: w, onchange: e => { f.hidden_dims[i] = Math.max(1, +e.target.value || 1); saveForm(); drawArch(); } }),
-    el("button", { title: "remove layer", onclick: () => { f.hidden_dims.splice(i, 1); saveForm(); renderTrain(); } }, "×"))));
-  chips.append(el("button", { onclick: () => { f.hidden_dims.push(f.hidden_dims.at(-1) || 64); saveForm(); renderTrain(); } }, "+ layer"));
-  const w = el("input", { type: "number", min: 1, step: 1, "data-fkey": "train:uniform-w", value: f.hidden_dims[0] || 64, style: "width:70px" }), d = el("input", { type: "number", min: 1, step: 1, "data-fkey": "train:uniform-d", value: f.hidden_dims.length || 2, style: "width:56px" });
+    perLayer ? layerAct(i) : null,
+    el("button", { title: "remove layer", onclick: () => { f.hidden_dims.splice(i, 1); if (perLayer) f.layer_activations.splice(i, 1); saveForm(); renderTrain(); } }, "×"))));
+  chips.append(el("button", { onclick: () => { f.hidden_dims.push(f.hidden_dims.at(-1) || 64); if (perLayer) f.layer_activations.push(structuredClone(f.activation)); saveForm(); renderTrain(); } }, "+ layer"));
+  const w = el("input", { type: "number", min: 1, step: 1, "data-fkey": "train:uniform-w", value: f.hidden_dims[0] || 64, style: "width:70px" }), d = el("input", { type: "number", min: 0, step: 1, "data-fkey": "train:uniform-d", value: f.hidden_dims.length, style: "width:56px" });
   card.append(el("div", { class: "row-flex", style: "margin-bottom:8px" }, el("b", {}, "Hidden layers"), chips),
+    f.hidden_dims.length ? "" : el("p", { class: "note", style: "margin:0 0 8px" }, seqCols().length
+      ? "No hidden layers: encoders feed the outputs through one linear map and decoders read the inputs directly."
+      : "No hidden layers: a perceptron — every input connects straight to every output (a useful baseline)."),
+    seqCols().length ? el("p", { class: "note", style: "margin:0 0 8px" }, f.seq_bridge === "latent" && seqCols().some(n => (f.seq_params[n]?.arch ?? "gru") !== "mlp")
+      ? "Pure latent: encoders and decoders are joined by one linear map, so these hidden layers are not used."
+      : "With text encoder / decoder columns these hidden layers form the MLP between the encoders and the decoders.") : "",
     el("div", { class: "row-flex muted", style: "margin-bottom:8px;font-size:12px" }, "uniform:", w, "wide ×", d, "deep",
-      el("button", { onclick: () => { f.hidden_dims = Array(Math.max(1, +d.value)).fill(Math.max(1, +w.value)); saveForm(); renderTrain(); } }, "Set")));
+      el("button", { onclick: () => { f.hidden_dims = Array(Math.max(0, +d.value || 0)).fill(Math.max(1, +w.value)); saveForm(); renderTrain(); } }, "Set")));
   const arch = el("canvas", { style: "width:100%;height:70px;display:block;margin-bottom:10px" }); card.append(arch); T.archCanvas = arch;
   const act = f.activation, pdefs = T.opts.activation_params[act.name] || {};
   const actSel = el("select", { onchange: e => { f.activation = { name: e.target.value, params: { ...(T.opts.activation_params[e.target.value] || {}) } }; saveForm(); renderTrain(); } },
     T.opts.activations.map(n => el("option", { value: n, selected: n === act.name }, n === "All" ? "All (Gumbel: learn which activation)" : n)));
+  const hasNumericOut = T.preview && T.preview.columns.some(c => F().columns[c.name] === "out");
+  const outSel = el("select", { "data-fkey": "train:output-act", title: "Applied to numeric outputs only; category and text outputs stay logits",
+    onchange: e => { f.output_activation = { name: e.target.value, params: { ...(T.opts.activation_params[e.target.value] || {}) } }; saveForm(); } },
+    T.opts.activations.filter(n => n !== "All" && n !== "Maxout").map(n => el("option", { value: n, selected: n === (f.output_activation?.name ?? "Linear") }, n === "Linear" ? "Linear (none)" : n)));
   const grid = el("div", { class: "form-grid" },
-    trainCtl("Activation", actSel),
+    trainCtl(perLayer ? "Activation (global)" : "Activation (all layers)", actSel),
+    el("div", { class: "ctl" }, el("label", { class: "ctl check" }, el("input", { type: "checkbox", checked: perLayer, disabled: !f.hidden_dims.length,
+        onchange: e => { f.layer_activations = e.target.checked ? f.hidden_dims.map(() => structuredClone(f.activation)) : null; saveForm(); renderTrain(); } }), "Per-layer activations"),
+      perLayer ? el("button", { onclick: () => { f.layer_activations = f.hidden_dims.map(() => structuredClone(f.activation)); saveForm(); renderTrain(); } }, "Apply global to all layers") : null),
+    hasNumericOut ? trainCtl("Output activation (numeric outputs)", outSel) : null,
     ...Object.entries(pdefs).map(([k, def]) => trainCtl(`${act.name} · ${k}`, el("input", { type: "number", step: Number.isInteger(def) ? 1 : 0.1, value: act.params?.[k] ?? def, onchange: e => { (act.params ??= {})[k] = +e.target.value; saveForm(); } }))),
     trainCtl("Activation type", tSelect("activation_type", [[0, "Basic"], [1, "Self-gated x·f(x)"], [2, "GLU"], [3, "TAAF (learned affine)"], [4, "ReZero"], [5, "Residual TAAF"], [6, "Bipolar"], [7, "GLU2"]])),
     trainCtl("Residual", tSelect("residual_type", [["none", "None"], ["highway", "Highway"], ["residual", "Residual"], ["rezero", "ReZero"], ["elementwise_rezero", "Elementwise ReZero"], ["concat", "Concat"], ["densenet", "DenseNet"]])),
@@ -1395,6 +1536,8 @@ function networkCard() {
     f.attention_type === "multi" ? trainCtl("Heads", tNumber("num_heads", { min: 1 })) : null,
     trainCtl("Input attention", tSelect("input_attention_type", [["none", "None"], ["basic", "Basic"], ["cross", "Cross"]])),
     trainCtl("Architecture", tSelect("mlp_mode", [[0, "MLP"], [1, "GNN (graph blocks)"]])),
+    seqCols().some(n => (F().seq_params[n]?.arch ?? "gru") !== "mlp")
+      ? trainCtl("Encoders → decoders via", tSelect("seq_bridge", Object.entries(T.opts.seq.bridges))) : null,
     trainCtl("Regularization", tSelect("noise_mode", [["none", "None"], ["dropout", "Dropout"], ["input noise", "Input noise"], ["output noise", "Output noise"], ["noise injection layers", "Noise injection layers"], ["weight noise", "Weight noise"]])),
     f.noise_mode !== "none" ? trainCtl(f.noise_mode === "dropout" ? "Dropout rate (0–1)" : "Noise std", tNumber("noise_value", { min: 0 })) : null,
     trainCtl("Initialization", tSelect("lsuv", [[0, "Default"], [1, "LSUV (variance)"], [2, "LSUV (mean + variance)"]])),
@@ -1626,6 +1769,8 @@ function renderFit(root, d, height = 300, laterRoot = null) {
           return best && `<span class="sw" style="background:${best[0].color}"></span>${best[0].name}<br>actual ${fmt(best[0].t[best[1]])}<br>predicted <b>${fmt(best[0].p[best[1]])}</b>`;
         };
       });
+    } else if (fitm.kind === "text") {
+      textFitCard(card, fitm, v, height, jobs, pal);
     } else {
       const cm = v || fitm, nc = fitm.labels.length;
       const chart = new Chart(card, { title: `${fitm.col}: confusion matrix${v ? " (validation)" : ""}`, sub: "rows actual, columns predicted" });
@@ -1640,13 +1785,56 @@ function renderFit(root, d, height = 300, laterRoot = null) {
   }
   if (laterRoot) later(laterRoot, () => jobs.forEach(j => j())); else jobs.forEach(j => j());
 }
+// Text outputs (outdec / outexcat / outex): exact match, error rate, accuracy by position, lengths, token confusions.
+function textFitCard(card, fitm, v, height, jobs, pal) {
+  const pct = x => x == null ? "–" : `${(x * 100).toFixed(2)}%`;
+  const metricRows = [["exact match", pct(fitm.exact), v && pct(v.exact)], ["error rate (edit distance ÷ length)", pct(fitm.error_rate), v && pct(v.error_rate)], ["rows", fitm.n, v && v.n]];
+  card.append(el("h2", {}, `${fitm.col}: generated text`),
+    el("table", { class: "data", style: "margin-top:4px" }, el("tr", {}, el("th", {}, ""), el("th", {}, "training"), v ? el("th", {}, "validation (held out)") : null),
+      ...metricRows.map(([n, a, b]) => el("tr", {}, el("td", {}, n), el("td", {}, a), v ? el("td", {}, el("b", {}, b)) : null))));
+  const sets = [["training", fitm, pal[0]], ...(v ? [["validation", v, pal[1]]] : [])];
+  const posChart = new Chart(card, { height: Math.round(height * 0.7), title: "accuracy by position", sub: "share of rows whose token at this position is right (only rows that long)" });
+  const lenChart = new Chart(card, { height: Math.round(height * 0.8), title: "length: predicted vs actual", sub: "tokens; diagonal = right length" });
+  const src = v || fitm, confTitle = `token confusions${v ? " (validation)" : ""}`;
+  const confChart = src.labels ? new Chart(card, { height: Math.max(height, 18 * src.labels.length + 60), title: confTitle, sub: "rows expected, columns generated (edit-distance alignment); ∅ = missing / extra token" }) : null;
+  if (!src.labels && src.top_confusions?.length) card.append(el("h2", { style: "margin-top:8px" }, confTitle),
+    el("table", { class: "data" }, el("tr", {}, el("th", {}, "expected"), el("th", {}, "generated"), el("th", {}, "times")),
+      ...src.top_confusions.map(([a, b, c]) => el("tr", {}, el("td", {}, a), el("td", {}, b), el("td", {}, c)))));
+  jobs.push(() => {
+    let ctx = posChart.setup(); const L = Math.max(...sets.map(([, d]) => d.pos_acc.length), 1);
+    let f = posChart.frame({ xlo: 1, xhi: Math.max(2, L), ylo: 0, yhi: 1, xLabel: "position", yLabel: "accuracy", intTicks: true });
+    for (const [, d, color] of sets) {
+      ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.beginPath(); let started = false;
+      d.pos_acc.forEach((a, k) => { if (a == null) return; const x = f.sx(k + 1), y = f.sy(a); started ? ctx.lineTo(x, y) : ctx.moveTo(x, y); started = true; });
+      ctx.stroke();
+    }
+    if (v) posChart.legend(sets.map(([n, , c]) => [n, c]));
+    ctx = lenChart.setup();
+    const hi = Math.max(1, ...sets.flatMap(([, d]) => [...d.len_true, ...d.len_pred]));
+    f = lenChart.frame({ xlo: 0, xhi: hi, ylo: 0, yhi: hi, xLabel: "actual length", yLabel: "predicted length", intTicks: true });
+    ctx.strokeStyle = css("--muted"); ctx.setLineDash([4, 3]); ctx.beginPath(); ctx.moveTo(f.sx(0), f.sy(0)); ctx.lineTo(f.sx(hi), f.sy(hi)); ctx.stroke(); ctx.setLineDash([]);
+    for (const [, d, color] of sets) {
+      ctx.fillStyle = color; ctx.globalAlpha = 0.35;
+      d.len_true.forEach((t, i) => { ctx.beginPath(); ctx.arc(f.sx(t + (Math.random() - 0.5) * 0.3), f.sy(d.len_pred[i] + (Math.random() - 0.5) * 0.3), 2.5, 0, 7); ctx.fill(); });
+    }
+    ctx.globalAlpha = 1;
+    if (v) lenChart.legend(sets.map(([n, , c]) => [n, c]));
+    if (confChart) {
+      const nc = src.labels.length, z = new Float32Array(nc * nc), seq = seqScale();
+      let mx = 1; for (let a = 0; a < nc; a++) for (let p = 0; p < nc; p++) { const val = src.confusion[a][p]; z[a * nc + p] = val; mx = Math.max(mx, val); }
+      drawHeat(confChart, { z, nx: nc, ny: nc, xVals: [...Array(nc).keys()], yVals: [...Array(nc).keys()], xCats: src.labels, yCats: src.labels,
+        xLabel: "generated", yLabel: "expected", square: true, left: 70, yDown: true, colorFn: val => seq(Math.sqrt(val / mx)),
+        valueText: (i, j, val) => `expected <b>${esc(src.labels[j])}</b>, generated <b>${esc(src.labels[i])}</b>: ${val}` });
+    }
+  });
+}
 const num = v => typeof v === "number" ? fmt(v) : (v !== "" && Number.isFinite(+v) ? fmt(+v) : v);
 function worstTable(rows) {
   const outs = Object.keys(rows[0].targets);
   const t = el("table", { class: "data" }, el("tr", {}, el("th", {}, ""), el("th", {}, "row"), el("th", {}, "badness"), ...outs.flatMap(o => [el("th", {}, o + " actual"), el("th", {}, o + " predicted")])));
   for (const r of rows) t.append(el("tr", {}, el("td", {}, el("button", { onclick: () => inspectRow(r.index, r.source), title: "Open this row in the explorer" }, "Inspect")), el("td", {}, r.index + 1), el("td", {}, fmt(r.score, 3)),
     ...outs.flatMap(o => [el("td", {}, num(r.targets[o])), el("td", {}, num(r.preds[o]))])));
-  return el("div", {}, el("h2", { style: "margin-top:12px" }, rows[0].source === "validation" ? "Worst-fit validation rows (held out)" : "Worst-fit training rows"), el("p", { class: "note" }, "Normalized error summed over outputs (numeric: |error| ÷ training range; categorical: 1 − probability of the true class)."), el("div", { class: "scroll" }, t));
+  return el("div", {}, el("h2", { style: "margin-top:12px" }, rows[0].source === "validation" ? "Worst-fit validation rows (held out)" : "Worst-fit training rows"), el("p", { class: "note" }, "Normalized error summed over outputs (numeric: |error| ÷ training range; categorical: 1 − probability of the true class; label codes: 0 right / 1 wrong; text: edit distance ÷ target length, at most 1)."), el("div", { class: "scroll" }, t));
 }
 async function inspectRow(index, source = "training") {
   try {
