@@ -2084,8 +2084,7 @@ def prepare_resume(config_path="config.json", model_path="model.pt"):
     if not path or not os.path.isfile(path): raise FileNotFoundError(f"Training data {path!r} from config.json not found")
     col_types = cfg["col_types"]; vocab = cfg.get("vocabularies", {}); image_params = cfg.get("image_params", {})
     input_cols = [c for c, v in col_types.items() if 'in' in v]; output_cols = [c for c, v in col_types.items() if 'out' in v]
-    original = {new: old for old, new in (cfg.get("csv_format") or {}).get("rename", {}).items()}
-    delim = _gui_detect_delimiter(path, [original.get(c, c) for c in input_cols + output_cols])
+    delim = training_file_delimiter(path, col_types)
     vfile = os.path.join(os.path.dirname(os.path.abspath(model_path)), VALIDATION_ROWS_FILE)
     if not (os.path.isfile(vfile) and os.path.getsize(vfile) > 0):
         vfile = None
@@ -2347,19 +2346,41 @@ def materialize_lazy_modules(model, input_dim, device):
 CSV_FORMATS = {}  # absolute CSV path -> {"header": bool, "rename": {original name: new name}}
 
 
-def csv_format(header=True, rename=None, columns=None):
-    """Validated reading format. columns: the file's original column names, to check the renaming against."""
+def csv_format(header=True, rename=None, columns=None, delimiter=None):
+    """Validated reading format. columns: the file's original column names, to check the renaming against.
+    delimiter: recorded so a headerless or renamed file can be re-read without guessing."""
     rename = {str(k): str(v).strip() for k, v in (rename or {}).items() if str(v).strip() and str(v).strip() != str(k)}
     if columns is not None:
         final = [rename.get(str(c), str(c)) for c in columns]
         dup = sorted({n for n in final if final.count(n) > 1})
         if dup: raise ValueError(f"Column names must be unique after renaming: {dup}")
-    return {"header": bool(header), "rename": rename}
+    fmt = {"header": bool(header), "rename": rename}
+    if delimiter: fmt["delimiter"] = delimiter
+    return fmt
 
 
 def register_csv_format(path, fmt):
     """Every later read_table(path) applies fmt (no header row -> col1, col2, ...; then the renaming)."""
-    if path and fmt: CSV_FORMATS[os.path.abspath(os.path.expanduser(str(path)))] = csv_format(fmt.get("header", True), fmt.get("rename"))
+    if path and fmt:
+        CSV_FORMATS[os.path.abspath(os.path.expanduser(str(path)))] = csv_format(fmt.get("header", True), fmt.get("rename"),
+                                                                                 delimiter=fmt.get("delimiter"))
+
+
+def training_file_delimiter(path, col_types, fmt=None):
+    """Delimiter of a model's training file: the recorded one; else (older configs) the one whose header names the
+    model's columns, or, without a header row / after renaming, the one splitting the first line into as many
+    fields as the model has columns."""
+    fmt = fmt or CSV_FORMATS.get(os.path.abspath(os.path.expanduser(str(path)))) or {}
+    if fmt.get("delimiter"): return fmt["delimiter"]
+    with open(path, "r", errors="replace") as f: first = f.readline().rstrip("\n\r")
+    original = {new: old for old, new in fmt.get("rename", {}).items()}
+    wanted = {original.get(c, c) for c, t in col_types.items() if t != "i"}
+    cands = [",", "\t", ";", " "]
+    if fmt.get("header", True):
+        best = max(cands, key=lambda d: len(wanted & {h.strip() for h in first.split(d)}))
+        if wanted & {h.strip() for h in first.split(best)}: return best
+    exact = [d for d in cands if len(first.split(d)) == len(col_types)]
+    return exact[0] if exact else max(cands, key=lambda d: len(first.split(d)))
 
 
 def headerless_names(n):
@@ -4708,7 +4729,7 @@ def ask_csv_format(file_path, delimiter):
             new = input(f"    {c}  (e.g. {sample[:40]}): ").strip()
             if new: rename[c] = new
     while True:
-        try: return csv_format(not no_header, rename, names)
+        try: return csv_format(not no_header, rename, names, delimiter=delimiter)
         except ValueError as e:
             print(f"  {e}; enter the new names again."); rename = {}
             for c in names:
@@ -8475,11 +8496,8 @@ class InteractiveSampler:
         path = self.config.get("file_path")
         try:
             if not path or not os.path.exists(path): raise FileNotFoundError(f"training file {path!r} not found")
-            with open(path, "r", errors="replace") as f: header = f.readline()
             wanted = set(self.input_cols + self.output_cols)
-            # config.json does not record the delimiter: pick the one whose header names the most columns
-            delim = max([",", "\t", ";", " "], key=lambda d: len(wanted & {h.strip() for h in header.split(d)}))
-            df = read_table(path, delimiter=delim)
+            df = read_table(path, delimiter=training_file_delimiter(path, self.col_types))
             missing = [c for c in wanted if c not in df.columns]
             if missing: raise ValueError(f"columns missing from {path}: {missing}")
             self._dataset = df.dropna(subset=list(wanted)).reset_index(drop=True)
@@ -8825,7 +8843,7 @@ class TrainingSession:
         if not os.path.isfile(path): raise FileNotFoundError(f"Dataset not found: {path}")
         delim = spec.get("delimiter") or _gui_detect_delimiter(path)
         # the form keys columns by the file's own names (col1, col2, ... without a header); rename maps them to new ones
-        fmt = csv_format(spec.get("header", True) is not False, spec.get("rename"), list(spec["columns"]))
+        fmt = csv_format(spec.get("header", True) is not False, spec.get("rename"), list(spec["columns"]), delimiter=delim)
         new = lambda c: fmt["rename"].get(c, c)
         col_types = {new(c): t for c, t in spec["columns"].items()}
         bad = [t for t in col_types.values() if t not in _GUI_COL_TYPES]

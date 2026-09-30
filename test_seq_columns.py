@@ -208,7 +208,7 @@ class CliPromptTests(InTempDir):
         answers = iter(["n", "y", "x", "", "y"])  # no header row; rename col1 -> x, keep col2, col3 -> y
         with mock.patch("builtins.input", lambda *_: next(answers)):
             fmt = M.ask_csv_format("h.csv", ",")
-        self.assertEqual(fmt, {"header": False, "rename": {"col1": "x", "col3": "y"}})
+        self.assertEqual(fmt, {"header": False, "rename": {"col1": "x", "col3": "y"}, "delimiter": ","})
         answers = iter(["y", "2", "", "y", "1", "y", "0 1", ""])  # per-layer: Tanh, global; sigmoid output; ranges
         with mock.patch("builtins.input", lambda *_: next(answers)):
             layers = M.ask_layer_activations([8, 8], nn.ReLU)
@@ -216,6 +216,17 @@ class CliPromptTests(InTempDir):
             ranges = M.ask_scale_ranges(["x", "y"], {"x": "in", "y": "out"})
         self.assertEqual([l["name"] for l in layers], ["Tanh", "ReLU"])
         self.assertEqual(out["name"], "Sigmoid"); self.assertEqual(ranges, {"x": [0.0, 1.0]})
+
+
+class DelimiterTests(InTempDir):
+    def test_headerless_tab_file_of_an_older_config_is_found(self):
+        with open("d.tsv", "w") as f: f.write("david\tdavídek\nauto\tautíčko\n")
+        ct = {"name": "inenc", "namecek": "outdec"}
+        old_fmt = {"header": False, "rename": {"col1": "name", "col2": "namecek"}}  # saved before delimiters were recorded
+        self.assertEqual(M.training_file_delimiter("d.tsv", ct, old_fmt), "\t")
+        self.assertEqual(M.training_file_delimiter("d.tsv", ct, dict(old_fmt, delimiter=";")), ";")  # a recorded one wins
+        with open("h.csv", "w") as f: f.write("a;b;c\n1;2;3\n")
+        self.assertEqual(M.training_file_delimiter("h.csv", {"a": "in", "c": "out", "b": "i"}), ";")
 
 
 class OutexcatTests(InTempDir):
