@@ -15,8 +15,8 @@ such targets and reports, per configuration:
 with paired (case, seed) bootstrap intervals against ``baseline``.
 
 Examples:
-  python bench_harsh.py --jobs 4                         # baseline, 10 seeds
-  python bench_harsh.py --configs baseline,<name> --jobs 4
+  python bench_jump.py --jobs 4                         # baseline, 10 seeds
+  python bench_jump.py --configs baseline,<name> --jobs 4
 """
 
 import argparse
@@ -181,7 +181,7 @@ def main():
     parser.add_argument("--jobs", type=int, default=1)
     parser.add_argument("--solve-r2", type=float, default=.999)
     parser.add_argument("--keep-logs", metavar="DIR")
-    parser.add_argument("--output", type=Path, default=Path("bench_harsh.json"))
+    parser.add_argument("--output", type=Path, default=Path("bench_jump.json"))
     args = parser.parse_args()
     args.strong_r2 = args.solve_r2  # read by benchmark_afpo.run_one
 
