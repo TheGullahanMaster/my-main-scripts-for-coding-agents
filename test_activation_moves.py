@@ -63,6 +63,11 @@ class SmoothSwapAndGateTest(unittest.TestCase):
         self.assertTrue({"sigmoid", "+"} <= shapes)
         self.assertEqual(a.gate_mutate(("x", 0), 1, ["+", "*"], 21, 6), ("x", 0))
 
+    def test_moves_that_cannot_apply_are_detected(self):
+        harsh = a.resolve_operator_groups("1,2,3,7,8".split(","))
+        self.assertFalse(any(a.activation_moves_apply(harsh, kind) for kind in ("squash", "smooth", "gate")))
+        self.assertTrue(all(a.activation_moves_apply(a.DEFAULT_OPS, kind) for kind in ("squash", "smooth", "gate")))
+
     def test_portfolio_weights(self):
         weights = a.MutationPortfolio().weights
         self.assertEqual(weights["squash"], a.SQUASH_SWAP_WEIGHT)

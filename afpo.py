@@ -2067,6 +2067,14 @@ def squash_swap_mutate(t, ops, max_nodes, max_depth):
         block=("+",("c",float(offset)),block)
     child=simplify_tree(replace_subtree(t,path,block))
     return child if node_size(child)<=max_nodes and node_depth(child)<=max_depth else t
+def activation_moves_apply(ops, kind):
+    """Whether squash_swap/smooth_swap/gate_mutate can ever change a tree built from ops."""
+    ops=set(ops); squash=ops&set(_SQUASH_FORMS)
+    if "*" not in ops: return False
+    if kind=="squash": return len(squash)>=2
+    if kind=="gate": return bool(squash)
+    return bool(("relu" in ops and ops&{"softplus","sigmoid"}) or ("abs" in ops and ops&{"tanh","erf"})
+                or ("sign" in ops and "tanh" in ops) or {"softplus","relu"}<=ops)
 _SMOOTH_SHARPNESS = 4.
 def smooth_swap_mutate(t, ops, max_nodes, max_depth):
     """Trade a hard piece for its smooth relative, or back, as one move:
@@ -2140,9 +2148,14 @@ class MutationPortfolio:
         if kind=="parametrize": return parametrize_mutate(t,ops,max_nodes,max_depth),kind
         if kind=="bilinear": return bilinear_mutate(t,n_features,ops,max_nodes,max_depth),kind
         if kind=="jump": return jump_mutate(t,n_features,ops,max_nodes,max_depth),kind
-        if kind=="squash": return squash_swap_mutate(t,ops,max_nodes,max_depth),kind
-        if kind=="smooth": return smooth_swap_mutate(t,ops,max_nodes,max_depth),kind
-        if kind=="gate": return gate_mutate(t,n_features,ops,max_nodes,max_depth),kind
+        if kind in ("squash","smooth","gate"):
+            child=(squash_swap_mutate(t,ops,max_nodes,max_depth) if kind=="squash" else smooth_swap_mutate(t,ops,max_nodes,max_depth) if kind=="smooth"
+                   else gate_mutate(t,n_features,ops,max_nodes,max_depth))
+            # These moves need particular operators or nodes; where they do not
+            # apply (no sigmoid/tanh/erf in the grammar, say), make an ordinary
+            # move instead of spending the mutation slot on a no-op.
+            if child!=t: return child,kind
+            kind="subtree"
         if kind=="constant":
             # Without constants to move, give the tree one (credited as such).
             child=constant_mutate(t)
@@ -5918,6 +5931,10 @@ def train_from_setup(args, setup, choose_model=None):
         ops=list(dict.fromkeys([*ops,"seqsum","seqprod"]))
         print(f"Sequence groups: {', '.join(group['name'] for group in SEQUENCE_LAYOUT['groups'])} (length {SEQUENCE_LAYOUT['length']}); added seqsum/seqprod.")
     else: ops=[op for op in ops if op not in ("seqsum","seqprod")]
+    # A move that can never apply would only reshuffle the portfolio's draws.
+    if not activation_moves_apply(ops,"squash"): SQUASH_SWAP_WEIGHT=0.
+    if not activation_moves_apply(ops,"smooth"): SMOOTH_SWAP_WEIGHT=0.
+    if not activation_moves_apply(ops,"gate"): GATE_MUTATION_WEIGHT=0.
     X,Y=Xt,Yt
     constraints=compile_constraints(args.profile,metadata); constraints.validate(Xt.shape[1],cats,out_names)
     Xv=Yv=None
