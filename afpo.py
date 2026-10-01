@@ -1259,41 +1259,50 @@ def _jump_candidates(flat, nodes, slot, value):
             span=float(np.ptp(other))
             if span>EPS: candidates+=[span/k for k in range(1,13)]
     return [c for c in dict.fromkeys(candidates) if math.isfinite(c) and abs(c)<=CONSTANT_LIMIT]
-def _scan_cost(prediction, y, scale, fit_readout, ones):
-    if not np.isfinite(prediction).all(): return math.inf
+def _scan_costs(predictions, y, scale, fit_readout):
+    """Huber cost after a least-squares readout, for each row of a (K, n) batch."""
+    P=np.asarray(predictions,float)
     if fit_readout:
-        line=_weighted_line(prediction,y,ones)
-        if line is None: prediction=np.full(len(y),float(np.mean(y)))
-        else:
-            slope=max(min(line[0],AFFINE_COEFFICIENT_BOUND),-AFFINE_COEFFICIENT_BOUND)
-            prediction=slope*prediction+line[1]
-    r=np.abs((prediction-y)/scale); huber=ROBUST_LOSS_DELTA
-    cost=float(np.sum(np.where(r<=huber,.5*r*r,huber*(r-.5*huber))))
-    return cost if math.isfinite(cost) else math.inf
+        mu=P.mean(axis=1,keepdims=True); du=P-mu; my=float(np.mean(y))
+        suu=np.einsum("kn,kn->k",du,du)
+        degenerate=~(suu>1e-12*np.maximum(np.einsum("kn,kn->k",P,P),EPS))
+        slope=np.einsum("kn,n->k",du,y-my)/np.where(degenerate,1.,suu)
+        slope=np.where(degenerate|~np.isfinite(slope),0.,np.clip(slope,-AFFINE_COEFFICIENT_BOUND,AFFINE_COEFFICIENT_BOUND))
+        P=slope[:,None]*du+my
+    r=np.abs((P-y)/scale); huber=ROBUST_LOSS_DELTA
+    costs=np.where(r<=huber,.5*r*r,huber*(r-.5*huber)).sum(axis=1)
+    return np.where(np.isfinite(costs),costs,np.inf)
+def _nudged_roots(flat, nodes, slot, candidates, X):
+    """Root outputs (K, n) for K values of one constant, every other node reused."""
+    changed=flat.constants[slot]; current=np.asarray(candidates,float)[:,None]; index=flat.parent[changed]
+    with np.errstate(all="ignore"):
+        while index>=0:
+            current=_op_eval_unguarded_state(flat.kind[index],[current if child==changed else nodes[child] for child in flat.children[index]])
+            changed,index=index,flat.parent[index]
+    return np.broadcast_to(current,(len(candidates),len(X)))
 def scan_jump_constants(flat, start, X, y, scale, fit_readout=True):
-    """Constant vector with jump constants placed by a candidate scan, or None."""
+    """Constant vector with jump constants placed by a candidate scan, or None.
+
+    Every candidate value of a constant is scored in one batched pass along
+    its path to the root (a (K, rows) array), not one evaluation per value."""
     slots=jump_constant_slots(flat)
     if not slots: return None
     if len(slots)>JUMP_SCAN_MAX_CONSTANTS: slots=rng.sample(slots,JUMP_SCAN_MAX_CONSTANTS)
     JUMP_SCAN_STATS["scans"]+=1
-    ones=np.ones(len(y)); current=np.array(start,float)
+    current=np.array(start,float)
     try:
-        nodes=flat.values(current,X); best=initial=_scan_cost(nodes[0],y,scale,fit_readout,ones)
+        nodes=flat.values(current,X); best=initial=float(_scan_costs(nodes[0][None,:],y,scale,fit_readout)[0])
         for slot in slots:
-            def cost(value):
-                try: return _scan_cost(flat.nudged_root(nodes,slot,value,X),y,scale,fit_readout,ones)
-                except (ArithmeticError, IndexError, ValueError): return math.inf
             chosen=current[slot]
-            for candidate in _jump_candidates(flat,nodes,slot,chosen):
-                trial=cost(candidate)
-                if trial<best: best,chosen=trial,candidate
-            # Pattern refinement: the cost is piecewise constant, so halve a step.
-            step=.05*max(abs(chosen),1e-3)
-            for _ in range(8):
-                for trial_value in (chosen-step,chosen+step):
-                    trial=cost(trial_value)
-                    if trial<best: best,chosen=trial,trial_value; break
-                else: step/=2
+            candidates=_jump_candidates(flat,nodes,slot,chosen)
+            # Then two shrinking local grids: the cost is piecewise constant.
+            for round_ in range(3):
+                if round_:
+                    step=(.05 if round_==1 else .005)*max(abs(chosen),1e-3)
+                    candidates=[chosen+step*k for k in (-8,-6,-4,-3,-2,-1,-.5,.5,1,2,3,4,6,8)]
+                costs=_scan_costs(_nudged_roots(flat,nodes,slot,candidates,X),y,scale,fit_readout)
+                pick=int(np.argmin(costs))
+                if costs[pick]<best: best,chosen=float(costs[pick]),float(candidates[pick])
             if chosen!=current[slot]:
                 current[slot]=chosen; nodes=flat.values(current,X)
     except (ArithmeticError, IndexError, ValueError): return None
