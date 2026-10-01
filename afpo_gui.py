@@ -319,7 +319,7 @@ class Telemetry:
     def __init__(self, stream, island_count, stage_count=1):
         self.stream, self.island_count = stream, max(1, int(island_count))
         self.stage_count = max(1, int(stage_count))
-        self.islands = {}          # id(archive) -> index
+        self.islands = {}          # cell label (or id(archive)) -> index
         self.latest = {}           # index -> latest hook kwargs
         self.last_snapshot = 0.
         self.validation_cache = {}
@@ -351,7 +351,9 @@ class Telemetry:
         return " ".join(parts) or f"island {index + 1}"
 
     def hook(self, **kw):
-        island = self.islands.setdefault(id(kw["archive"]), len(self.islands))
+        # Cells evolved in parallel processes arrive as fresh objects each
+        # generation, so key on the stable (island, stage) label when given.
+        island = self.islands.setdefault(kw.get("cell") or id(kw["archive"]), len(self.islands))
         self.latest[island] = kw
         names, out_names, cats = kw["names"], kw["out_names"], kw["cats"]
         if not self.announced:

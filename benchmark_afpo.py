@@ -35,6 +35,11 @@ import tempfile
 import time
 from pathlib import Path
 
+# afpo pins BLAS to one thread, but only if it loads numpy first; this script
+# imports numpy earlier, so pin it here too or timings run ~30x slow.
+for _blas_threads in ("OPENBLAS_NUM_THREADS","OMP_NUM_THREADS","MKL_NUM_THREADS"):
+    os.environ.setdefault(_blas_threads,"1")
+
 import numpy as np
 import pandas as pd
 

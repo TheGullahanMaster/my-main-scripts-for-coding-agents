@@ -4,16 +4,26 @@
 Only numpy and pandas are required; matplotlib is optional and only used by
 the exported model.  Start it with ``python afpo_symbolic_regression.py``.
 Use ``--max-generations N`` for a bounded unattended run (useful in CI).
+
+Speed: with Cython and a C compiler installed, constant fitting uses the
+compiled fitter in afpo_lib/fitcore.pyx (built on first use; ``--fit-backend
+python`` opts out).  Runs with several island/stage cells evolve the cells in
+parallel processes (``--cell-workers``; results are identical to serial).
+Above 8192 rows trees are evaluated in cache-sized row blocks (identical
+values) and the affine readout uses the compiled streaming fit, so many
+``--workers`` no longer starve each other of memory bandwidth.
 """
 from __future__ import annotations
 
 import argparse
+import contextlib
 import csv
 from concurrent.futures import ProcessPoolExecutor
 from copy import deepcopy
 from html import escape as xml_escape
 import hashlib
 import inspect
+import io
 import json
 import math
 import multiprocessing
@@ -586,6 +596,16 @@ def fast_op_eval(op: str, a: list[np.ndarray]) -> np.ndarray:
     if fn is None: return op_eval(op,a)
     with np.errstate(all="ignore"): z=fn(a[0],a)
     return clean(z)
+def _op_eval_unguarded_state(op, a):
+    """fast_op_eval for callers already inside np.errstate(all="ignore");
+    entering it per node was a measurable share of constant fitting."""
+    fn=_OP_TABLE.get(op)
+    if fn is None: return op_eval(op,a)
+    z=fn(a[0],a)
+    # In range and NaN-free (a NaN fails the comparison), clean() would return
+    # these exact values; one reduction replaces its clamp and NaN scan.
+    if type(z) is np.ndarray and z.dtype==np.float64 and z.size and np.abs(z).max()<=CLIP: return z
+    return clean(z)
 
 # Nodes: ('x', feature), ('c', constant), or (operator, child, ...).
 def node_size(t): return 1 if t[0] in ("x","c","arg") else 1+sum(node_size(q) for q in t[1:])
@@ -753,7 +773,29 @@ def sequence_value(X, layout, v, position):
 def sequence_augment(X, layout):
     if layout is None: return X
     return np.column_stack([X[:,:layout["real"]]]+[sequence_value(X,layout,v,0) for v in range(len(layout["virtual"]))])
+# Trees are evaluated in blocks of rows on large data.  Every operator works
+# row by row, so the values are bit-identical, but a block's intermediates
+# (~5 arrays of 32 KB) stay in the CPU cache.  Whole-column intermediates
+# (800 KB each at 100k rows) streamed through RAM instead, and parallel workers
+# then starved each other of memory bandwidth (15 ran slower than 4).
+EVALUATION_BLOCK_ROWS = 4096
+def _row_blocks(n):
+    """Row slices for blocked evaluation, or None when n is small enough to do whole."""
+    if n<=2*EVALUATION_BLOCK_ROWS: return None
+    return [slice(start,min(n,start+EVALUATION_BLOCK_ROWS)) for start in range(0,n,EVALUATION_BLOCK_ROWS)]
 def evaluate(t, X, adfs=None, arguments=None, position=None):
+    # One error-state context per tree instead of one per node; the values are
+    # identical (np.errstate only changes how floating-point errors are reported).
+    blocks=_row_blocks(len(X)) if isinstance(X,np.ndarray) and X.ndim==2 else None
+    with np.errstate(all="ignore"):
+        if blocks is None: return _evaluate(t,X,adfs,arguments,position)
+        out=None
+        for rows in blocks:
+            part=_evaluate(t,X[rows],adfs,None if arguments is None else [argument[rows] for argument in arguments],position)
+            if out is None: out=np.empty(len(X),dtype=np.asarray(part).dtype)
+            out[rows]=part
+        return out
+def _evaluate(t, X, adfs=None, arguments=None, position=None):
     if t[0] == "x":
         layout=SEQUENCE_LAYOUT
         if position is not None and layout is not None and t[1]>=layout["real"]: return sequence_value(X,layout,t[1]-layout["real"],position)
@@ -765,13 +807,13 @@ def evaluate(t, X, adfs=None, arguments=None, position=None):
     if t[0].startswith("adf_"):
         item=(adfs or {}).get(t[0])
         if item is None or len(t)-1 != int(item["arity"]): raise ValueError(f"Unknown or malformed ADF {t[0]!r}")
-        values=[evaluate(q,X,adfs,arguments,position) for q in t[1:]]
-        return evaluate(item["tree"],X,adfs,values,position)
+        values=[_evaluate(q,X,adfs,arguments,position) for q in t[1:]]
+        return _evaluate(item["tree"],X,adfs,values,position)
     if t[0] in ("seqsum","seqprod"):
         if SEQUENCE_LAYOUT is None: raise ValueError(f"{t[0]} needs --sequence-group")
-        parts=[evaluate(t[1],X,adfs,arguments,i) for i in range(SEQUENCE_LAYOUT["length"])]
+        parts=[_evaluate(t[1],X,adfs,arguments,i) for i in range(SEQUENCE_LAYOUT["length"])]
         with np.errstate(all="ignore"): return clean(np.sum(parts,axis=0) if t[0]=="seqsum" else np.prod(parts,axis=0))
-    return fast_op_eval(t[0],[evaluate(q,X,adfs,arguments,position) for q in t[1:]])
+    return _op_eval_unguarded_state(t[0],[_evaluate(q,X,adfs,arguments,position) for q in t[1:]])
 
 # Numeric guards exist to keep evaluation finite, not to model anything.  A
 # model whose output depends on one is rejected.  Every operator result is
@@ -836,10 +878,16 @@ def guard_engagement(trees, X, adfs=None):
     key=(tuple(repr(t) for t in trees),adf_signature(trees,adfs),interface["data"][0],X.shape,X.strides)
     hit=_GUARD_CACHE.get(key)
     if hit is not None: return hit[0]
-    reason=""
+    reason=""; blocks=_row_blocks(len(X)) if X.ndim==2 else None
     try:
         for tree in trees:
-            value,exact=_guard_walk(tree,X,adfs)
+            if blocks is None: value,exact=_guard_walk(tree,X,adfs)
+            else:
+                # Blocked like evaluate(); a clamp in any block is a clamp on X,
+                # and the spread-based comparison sees the reassembled columns.
+                parts=[_guard_walk(tree,X[rows],adfs) for rows in blocks]
+                value=np.concatenate([np.broadcast_to(v,(rows.stop-rows.start,)) for (v,_),rows in zip(parts,blocks)])
+                exact=np.concatenate([np.broadcast_to(r,(rows.stop-rows.start,)) for (_,r),rows in zip(parts,blocks)])
             if _guard_changes_output(value,exact): reason="input_clip"; break
     except _GuardEngaged as engaged: reason=str(engaged)
     if len(_GUARD_CACHE)>=20000: _GUARD_CACHE.clear()
@@ -1113,19 +1161,58 @@ class _FlatTree:
         payload=list(self.payload)
         for index,value in zip(self.constants,constants): payload[index]=float(value)
         values=[None]*len(self.kind)
-        for index in range(len(self.kind)-1,-1,-1):
-            kind=self.kind[index]
-            if kind=="x": values[index]=X[:,payload[index]]
-            elif kind=="c": values[index]=np.full(len(X),payload[index])
-            else: values[index]=fast_op_eval(kind,[values[child] for child in self.children[index]])
+        with np.errstate(all="ignore"):
+            for index in range(len(self.kind)-1,-1,-1):
+                kind=self.kind[index]
+                if kind=="x": values[index]=X[:,payload[index]]
+                elif kind=="c": values[index]=np.full(len(X),payload[index])
+                else: values[index]=_op_eval_unguarded_state(kind,[values[child] for child in self.children[index]])
         return values
     def nudged_root(self, values, constant, value, X):
         """Root output when only one constant changes, reusing every off-path value."""
         changed=self.constants[constant]; current=np.full(len(X),float(value)); index=self.parent[changed]
-        while index>=0:
-            current=fast_op_eval(self.kind[index],[current if child==changed else values[child] for child in self.children[index]])
-            changed,index=index,self.parent[index]
+        with np.errstate(all="ignore"):
+            while index>=0:
+                current=_op_eval_unguarded_state(self.kind[index],[current if child==changed else values[child] for child in self.children[index]])
+                changed,index=index,self.parent[index]
         return current
+
+# Compiled constant fitter (afpo_lib/fitcore.pyx, built on first use with
+# Cython's pyximport).  "auto" uses it when it builds and the tree's operators
+# are all compiled, else the Python fitter below; "python" always uses Python
+# (bit-for-bit reproduction of runs made before it existed).  The two agree to
+# round-off, not bit for bit: compiled sums and libm differ in the last bit.
+FIT_BACKEND = "auto"
+_FITCORE = []
+def compiled_fitter():
+    """The compiled fitter module, or None when Cython or a compiler is unavailable."""
+    if not _FITCORE:
+        try:
+            import pyximport
+            importers=pyximport.install(language_level=3)
+            try: from afpo_lib import fitcore
+            finally: pyximport.uninstall(*importers)
+            _FITCORE.append(fitcore)
+        except Exception as error:
+            print(f"Compiled constant fitter unavailable ({type(error).__name__}: {error}); using the Python fitter.",file=sys.stderr)
+            _FITCORE.append(None)
+    return _FITCORE[0]
+def _compiled_program(flat, core, feature_count):
+    """(code, arg, kid) arrays of a flat tree, or None when it needs the Python fitter."""
+    codes=core.OPERATOR_CODES; nodes=len(flat.kind)
+    code=np.empty(nodes,np.int32); arg=np.zeros(nodes,np.int32); kid=np.full((nodes,3),-1,np.int32)
+    slot={index:position for position,index in enumerate(flat.constants)}
+    for index,kind in enumerate(flat.kind):
+        if kind=="x":
+            feature=flat.payload[index]
+            if not isinstance(feature,(int,np.integer)) or not 0<=feature<feature_count: return None
+            code[index]=0; arg[index]=feature
+        elif kind=="c": code[index]=1; arg[index]=slot[index]
+        else:
+            op=codes.get(kind); children=flat.children[index]
+            if op is None or len(children)>3: return None
+            code[index]=op; kid[index,:len(children)]=children
+    return code,arg,kid
 
 def fit_tree_constants(tree, X, y, adfs=None, fit_readout=True, iterations=CONSTANT_FIT_ITERATIONS, robust=True):
     """Levenberg-Marquardt on a tree's inner constants (variable projection).
@@ -1140,27 +1227,41 @@ def fit_tree_constants(tree, X, y, adfs=None, fit_readout=True, iterations=CONST
     start=np.asarray(constant_vector(tree),float)
     if not len(start) or not len(y): return tree
     scale=target_scale(y); ones=np.ones(len(y)); flat=_FlatTree.build(tree); huber=ROBUST_LOSS_DELTA
+    if flat is not None and FIT_BACKEND=="auto" and isinstance(X,np.ndarray) and X.ndim==2:
+        core=compiled_fitter(); program=None if core is None else _compiled_program(flat,core,X.shape[1])
+        if program is not None:
+            result=core.fit(*program,start,np.ascontiguousarray(X,dtype=float),np.ascontiguousarray(y,dtype=float),scale,
+                            fit_readout,robust,iterations,AFFINE_COEFFICIENT_BOUND,huber,CONSTANT_LIMIT)
+            if result is None: return tree
+            current,cost,initial=result
+            if cost>=initial: return tree
+            tuned=with_constants(tree,current)
+            return tree if guarded_constant_divisor(tuned) or guard_engagement([tuned],X,adfs) else tuned
+    # readout() runs ~30 times per fit on <=256 rows, so numpy's per-call
+    # overhead is the cost: scalars are hoisted and wrappers (np.clip/np.all
+    # on scalars) avoided.  Every value is computed exactly as before.
+    huber_scale=huber*scale; twice_huber=2*huber; huber_squared=huber*huber; bound=AFFINE_COEFFICIENT_BOUND
     def readout(pred):
         if fit_readout:
             # Mirror affine()'s coefficient bound, or the fitter would treat any
             # overall scale as free and never move a large constant into the tree.
-            bound=AFFINE_COEFFICIENT_BOUND; weights=ones; fitted=None
+            weights=ones; fitted=None
             for _ in range(3 if robust else 1):
                 line=_weighted_line(pred,y,weights)
                 if line is None: fitted=np.full(len(y),float(np.mean(y))); break
                 slope,intercept=line
                 if abs(slope)>bound: slope=float(np.sign(slope))*bound; intercept=float(np.average(y-slope*pred,weights=weights))
-                fitted=slope*pred+float(np.clip(intercept,-bound,bound))
+                fitted=slope*pred+min(max(float(intercept),-bound),bound)
                 if robust:
-                    weights=np.minimum(1.,huber*scale/np.maximum(np.abs(fitted-y),EPS))
-                    if np.all(weights>=1.): break  # no point is in the Huber tail: least squares is exact
+                    weights=np.minimum(1.,huber_scale/np.maximum(np.abs(fitted-y),EPS))
+                    if (weights>=1.).all(): break  # no point is in the Huber tail: least squares is exact
             pred=fitted
         r=(pred-y)/scale
         if robust:
             # sum(rho**2)/2 equals the Huber loss, so least squares on rho is Huber.
-            magnitude=np.abs(r)
-            r=np.where(magnitude<=huber,r,np.sign(r)*np.sqrt(np.maximum(2*huber*magnitude-huber*huber,0.)))
-        return r if np.all(np.isfinite(r)) else None
+            magnitude=np.abs(r); inner=magnitude<=huber
+            if not inner.all(): r=np.where(inner,r,np.sign(r)*np.sqrt(np.maximum(twice_huber*magnitude-huber_squared,0.)))
+        return r if np.isfinite(r).all() else None
     def residual(values):
         """Residual plus the node values that produced it (None without the flat program)."""
         try:
@@ -1186,14 +1287,16 @@ def fit_tree_constants(tree, X, y, adfs=None, fit_readout=True, iterations=CONST
         if J is None: break
         # Constants the output ignores (absorbed by the readout, behind a step)
         # leave J all zero; no damping can move them, so stop instead of trying.
-        if not np.any(J): break
+        if not J.any(): break
         g=J.T@r; H=J.T@J; improved=False
+        regulariser=np.diag(np.diag(H))+1e-12*np.eye(len(current)); descent=-g
         for _ in range(8):
-            try: delta=np.linalg.solve(H+damping*(np.diag(np.diag(H))+1e-12*np.eye(len(current))),-g)
+            try: delta=np.linalg.solve(H+damping*regulariser,descent)
             except np.linalg.LinAlgError: damping*=10; continue
-            candidate=np.clip(current+delta,-CONSTANT_LIMIT,CONSTANT_LIMIT); rc,candidate_nodes=residual(candidate)
-            if rc is not None and float(rc@rc)<cost:
-                gain=cost-float(rc@rc); current,r,nodes,cost=candidate,rc,candidate_nodes,float(rc@rc); damping=max(damping/3,1e-9); improved=True; break
+            candidate=np.minimum(np.maximum(current+delta,-CONSTANT_LIMIT),CONSTANT_LIMIT); rc,candidate_nodes=residual(candidate)
+            candidate_cost=float(rc@rc) if rc is not None else None
+            if rc is not None and candidate_cost<cost:
+                gain=cost-candidate_cost; current,r,nodes,cost=candidate,rc,candidate_nodes,candidate_cost; damping=max(damping/3,1e-9); improved=True; break
             damping*=4
         if not improved or gain<=1e-10*max(cost,1e-30): break
     if cost>=initial: return tree
@@ -2411,13 +2514,14 @@ def robust_loss(pred, y, delta=ROBUST_LOSS_DELTA):
 AFFINE_COEFFICIENT_BOUND = 1e9
 def _weighted_line(u, y, w):
     """Closed-form weighted least-squares line y ~ c0*u+c1; None when degenerate."""
-    s=float(np.sum(w))
+    s=float(w.sum())
     if not s>0: return None
     mu=float(np.dot(w,u))/s; my=float(np.dot(w,y))/s; du=u-mu
     suu=float(np.dot(w,du*du))
-    if not np.isfinite(suu) or suu<=1e-12*max(float(np.dot(w,u*u)),EPS): return None
+    if not math.isfinite(suu) or suu<=1e-12*max(float(np.dot(w,u*u)),EPS): return None
     c0=float(np.dot(w,du*(y-my)))/suu
-    return np.asarray((c0,my-c0*mu)) if np.isfinite(c0) else None
+    # Plain floats: the same IEEE doubles, without an array per call.
+    return (c0,my-c0*mu) if math.isfinite(c0) else None
 _CONSTANT_AFFINE_CACHE={}
 def affine(pred, y):
     """Fit Huber loss with coefficient bounds enforced during weighted least squares."""
@@ -2463,9 +2567,18 @@ def simplify_affine(pred, y, a, b):
     return float(a),float(b)
 def _affine(pred, y):
     centre=float(np.mean(pred)); spread=float(np.std(pred))
-    spread=spread if spread>=EPS else 1.
-    u=(pred-centre)/spread; A=None
+    varying=spread>=EPS; spread=spread if varying else 1.
     bound=AFFINE_COEFFICIENT_BOUND
+    # (A constant prediction is a degenerate line the compiled path would only hand back.)
+    if varying and len(pred)>2*EVALUATION_BLOCK_ROWS and FIT_BACKEND=="auto":
+        # Large data: the compiled IRLS streams the rows twice per iteration
+        # instead of ~25 times (memory bandwidth, not arithmetic, was the cost).
+        # It agrees to round-off; rare degenerate/bounded fits fall through.
+        core=compiled_fitter()
+        if core is not None:
+            fitted=core.robust_affine(np.ascontiguousarray(pred,dtype=float),np.ascontiguousarray(y,dtype=float),centre,spread,1.5*target_scale(y),bound)
+            if fitted is not None: return fitted
+    u=(pred-centre)/spread; A=None
     def weighted_fit(weights):
         nonlocal A
         coefficients=_weighted_line(u,y,weights*weights)
@@ -2537,13 +2650,16 @@ def output_loss_summary(losses, output_names):
     """Format one named loss for every configured output."""
     if len(losses)!=len(output_names): raise ValueError("Loss count does not match output names")
     return " | ".join(f"{name}={loss:.6g}" for name,loss in zip(output_names,losses))
+def _mean(values):
+    """float(np.mean(values)); a single value (one output) skips numpy, with the same result."""
+    return (0.+float(values[0]))/1. if len(values)==1 else float(np.mean(values))
 def aggregate_loss(model_or_objectives):
     values=model_losses(model_or_objectives) if isinstance(model_or_objectives,Model) else tuple(model_or_objectives[:-2:2])
-    return float(np.mean(values)) if values else float("inf")
+    return _mean(values) if values else float("inf")
 def secondary_key(model):
     """Deterministic non-fitness key for duplicate handling and diagnostics."""
     # Losses that differ only by round-off are ties, so the shorter model wins.
-    return (_noise_rounded(aggregate_loss(model)),_noise_rounded(float(np.mean(model_shapes(model)))),model_complexity(model),repr(model.trees))
+    return (_noise_rounded(aggregate_loss(model)),_noise_rounded(_mean(model_shapes(model))),model_complexity(model),repr(model.trees))
 # Loss/shape differences below this (afpo's scaled units) are rounding noise,
 # not fit: a CSV holding ~7 significant digits leaves an exact model at a loss
 # of ~1e-11, and a bigger model with spare constants can "beat" it by 1e-12.
@@ -3818,6 +3934,10 @@ class ModelEvaluator:
         self.workers=workers; self.epoch=0; self.executor=None; self.datasets=datasets
         self.affine_on=affine_on; self.cats=cats; self.constraints=constraints; self.output_names=output_names
         self._score_cache={}; self.cache_hits=0; self.cache_misses=0; self.row_model_evaluations=0
+        self.journal=None  # set in forked cell processes: new cache entries to merge back
+        # Load (and on first use, build) the compiled fitter before forking, so
+        # workers inherit it instead of each racing to compile it.
+        if FIT_BACKEND=="auto": compiled_fitter()
         if workers > 1:
             global _WORKER_EVALUATION_CONTEXT
             _WORKER_EVALUATION_CONTEXT={"datasets":datasets,"affine_on":affine_on,"cats":cats,
@@ -3882,9 +4002,12 @@ class ModelEvaluator:
             for target,result in zip(models,scored): _copy_scored_model(target,result)
         for model,key in pending:
             data=self._score_data(model); self._score_cache[key]=data
+            if self.journal is not None: self.journal.append((key,data))
             # The tuned tree is itself a finished model: its later untuned
             # rescoring (stable copies, archives) is the same computation.
-            if tune: self._score_cache[self._cache_key(model,dataset,indices,fit_affine)]=data
+            if tune:
+                tuned_key=self._cache_key(model,dataset,indices,fit_affine); self._score_cache[tuned_key]=data
+                if self.journal is not None: self.journal.append((tuned_key,data))
         for model,key in duplicates: self._restore_score(model,self._score_cache[key])
     def diagnostics(self):
         return {"cache_hits":self.cache_hits,"cache_misses":self.cache_misses,"row_model_evaluations":self.row_model_evaluations}
@@ -4378,6 +4501,10 @@ class IslandRuntime:
     stage:int=0
     role:dict=field(default_factory=dict)
     residual_qd:Any=None
+    # Per-cell random streams and lineage-id counter (see cell_streams); None
+    # means the cell draws from the shared module streams (one-cell runs and
+    # checkpoints made before cells could run in parallel).
+    streams:Any=None
     def __post_init__(self):
         if not self.population_size: self.population_size=len(self.population)
 
@@ -4399,6 +4526,7 @@ def island_snapshot(island):
             "adf_registry":island.adf_registry.snapshot(),
             "evaluation_budget":island.budget.snapshot(),
         },
+        **({"streams":island.streams} if island.streams is not None else {}),
     }
 
 def island_from_snapshot(data, n_rows, parsimony_quality_tolerance):
@@ -4423,6 +4551,7 @@ def island_from_snapshot(data, n_rows, parsimony_quality_tolerance):
         data.get("population_size",len(population)),
         int(data.get("island",0)),int(data.get("stage",0)),dict(data.get("role") or {}),
         residual_qd_from_snapshot(runtime["quality_diversity"]),
+        data.get("streams"),
     )
 
 def snapshot_islands(state, islands, island_config):
@@ -4772,12 +4901,14 @@ def new_island_runtime(population_size, *, X, Xt, cats, ops, nodes, depth, head_
 # Called once per island per generation with that island's live state (the
 # browser GUI streams it); None keeps the terminal-only behaviour.
 PROGRESS_HOOK = None
-def evolution_progress(generation, elite, sample, *, started, Xt, Yt, Xv, Yv, names, out_names, cats, constraints, coev, cases, archive, semantic_qd, structural_qd, qd_controller, pressure, bayes, library=None, budget=None, evaluator=None, adf_registry=None, population=(), best_so_far=None, loss_tolerance=.01):
-    """Emit the same bounded search telemetry for fresh and resumed runs."""
+def evolution_progress(generation, elite, sample, *, started, Xt, Yt, Xv, Yv, names, out_names, cats, constraints, coev, cases, archive, semantic_qd, structural_qd, qd_controller, pressure, bayes, library=None, budget=None, evaluator=None, adf_registry=None, population=(), best_so_far=None, loss_tolerance=.01, cell=None):
+    """Emit the same bounded search telemetry for fresh and resumed runs.
+
+    cell=(island, stage) identifies the cell to PROGRESS_HOOK consumers."""
     if PROGRESS_HOOK is not None:
         PROGRESS_HOOK(generation=generation,elite=elite,population=population,archive=archive,best_so_far=best_so_far,started=started,
                       Xt=Xt,Yt=Yt,Xv=Xv,Yv=Yv,names=names,out_names=out_names,cats=cats,constraints=constraints,pressure=pressure,
-                      semantic_qd=semantic_qd,structural_qd=structural_qd,qd_controller=qd_controller,evaluator=evaluator,library=library,bayes=bayes)
+                      semantic_qd=semantic_qd,structural_qd=structural_qd,qd_controller=qd_controller,evaluator=evaluator,library=library,bayes=bayes,cell=cell)
     if generation%10==0:
         candidates=[m.clone() for m in [*population,*elite,*archive.items,best_so_far] if m is not None]
         if evaluator is not None: evaluator.assess(candidates,"train")
@@ -5022,6 +5153,152 @@ def evolve_generation(pop, generation, *, X, Xt, Yt, Xv, Yv, cats, constraints, 
         for child in discovery_children: library.record(child.origin,id(child) in survivor_ids)
     return survivors
 
+# Parallel island/stage cells.  In a multi-cell run every cell owns its random
+# streams (Python and numpy) and a disjoint lineage-id range, swapped into the
+# module globals while that cell evolves.  A cell's generation then depends only
+# on its own state, so cells may evolve in any order or in parallel processes
+# with identical results; migration, promotion and roles run serially between
+# generations.  One-cell runs keep the shared module streams (unchanged results).
+LINEAGE_RANGE_BITS=40
+def seed_cell_streams(cells, run_seed):
+    """Give every cell its own seeded streams (fresh multi-cell runs)."""
+    for index,cell in enumerate(cells):
+        numpy_seed=int(np.random.SeedSequence([int(run_seed)&0xFFFFFFFF,index]).generate_state(1)[0])
+        cell.streams={"python":random.Random(f"afpo-cell:{run_seed}:{index}").getstate(),
+                      "numpy":np.random.RandomState(numpy_seed).get_state(),"lineage_next":(index+1)<<LINEAGE_RANGE_BITS}
+
+@contextlib.contextmanager
+def cell_streams(cell):
+    """Draw from the cell's own streams inside the block (no-op without them)."""
+    global _NEXT_LINEAGE_ID
+    if cell.streams is None:
+        yield; return
+    saved=(rng.getstate(),np.random.get_state(),_NEXT_LINEAGE_ID)
+    rng.setstate(cell.streams["python"]); np.random.set_state(cell.streams["numpy"]); _NEXT_LINEAGE_ID=int(cell.streams["lineage_next"])
+    try: yield
+    finally:
+        cell.streams={"python":rng.getstate(),"numpy":np.random.get_state(),"lineage_next":_NEXT_LINEAGE_ID}
+        rng.setstate(saved[0]); np.random.set_state(saved[1]); _NEXT_LINEAGE_ID=saved[2]
+
+def resolve_cell_workers(requested, cells):
+    """Processes for evolving cells in parallel; 1 means serial."""
+    if requested<0: raise ValueError("--cell-workers must be non-negative")
+    if cells<2 or requested==1 or not sys.platform.startswith("linux"): return 1
+    return max(1,min(cells,requested or max(1,(os.cpu_count() or 1)-1)))
+
+def _buffer_identity(array):
+    interface=array.__array_interface__
+    return (interface["data"][0],array.shape,array.strides,interface["typestr"])
+class _SharedPickler(pickle.Pickler):
+    """Pickles the objects in `shared` (data arrays, the evaluator) by name.  An
+    array with a shared array's exact buffer (a full view, Xt[slice(None)])
+    maps to that array too: same address, same values."""
+    def __init__(self, file, shared):
+        super().__init__(file,protocol=pickle.HIGHEST_PROTOCOL); self._names={id(value):name for name,value in shared.items()}
+        self._buffers={_buffer_identity(value):name for name,value in shared.items() if isinstance(value,np.ndarray)}
+    def persistent_id(self, obj):
+        name=self._names.get(id(obj))
+        if name is None and type(obj) is np.ndarray: name=self._buffers.get(_buffer_identity(obj))
+        return name
+class _SharedUnpickler(pickle.Unpickler):
+    def __init__(self, file, shared): super().__init__(file); self._shared=shared
+    def persistent_load(self, name): return self._shared[name]
+def _dumps_shared(value, shared):
+    buffer=io.BytesIO(); _SharedPickler(buffer,shared).dump(value); return buffer.getvalue()
+def _loads_shared(data, shared): return _SharedUnpickler(io.BytesIO(data),shared).load()
+
+# Caches a child's new entries are merged back from, so the next generation's
+# children inherit them as a serial run would (losing them each generation cost
+# ~20%).  Content-keyed caches merge as they are; address-keyed ones (value
+# (result, X)) only when X is an array the parent holds at that same address.
+_CONTENT_KEYED_CACHES=("_FRAGMENT_FIT_CACHE","_PARTICLE_SCORE_CACHE")
+_ADDRESS_KEYED_CACHES=("_EVALUATION_CACHE","_GUARD_CACHE")
+def _cell_shared_objects(shared):
+    """shared plus every array the parent's address-keyed caches anchor to."""
+    shared=dict(shared); shared["_FRAGMENT_FIT_FAILED"]=_FRAGMENT_FIT_FAILED; seen={id(v) for v in shared.values()}
+    for name in _ADDRESS_KEYED_CACHES:
+        for _,anchor in list(globals()[name].values()):
+            if isinstance(anchor,np.ndarray) and id(anchor) not in seen:
+                seen.add(id(anchor)); shared[f"anchor:{len(shared)}"]=anchor
+    return shared
+def _merge_cache_entries(entries):
+    """Add a child's new cache entries, applying each cache's size bound."""
+    for key,value in entries.get("_FRAGMENT_FIT_CACHE",()):
+        if len(_FRAGMENT_FIT_CACHE)>=100_000: _FRAGMENT_FIT_CACHE.clear()
+        _FRAGMENT_FIT_CACHE[key]=value
+    for key,value in entries.get("_PARTICLE_SCORE_CACHE",()):
+        if len(_PARTICLE_SCORE_CACHE)>=20000: _PARTICLE_SCORE_CACHE.clear()
+        _PARTICLE_SCORE_CACHE[key]=value
+    for key,value in entries.get("_GUARD_CACHE",()):
+        if len(_GUARD_CACHE)>=20000: _GUARD_CACHE.clear()
+        _GUARD_CACHE[key]=value
+    for key,value in entries.get("_EVALUATION_CACHE",()):
+        if key in _EVALUATION_CACHE: continue
+        _EVALUATION_CACHE[key]=value; _EVALUATION_CACHE_SIZE[0]+=value[0].size
+        while _EVALUATION_CACHE_SIZE[0]>EVALUATION_CACHE_ELEMENTS and _EVALUATION_CACHE:
+            oldest=next(iter(_EVALUATION_CACHE)); _EVALUATION_CACHE_SIZE[0]-=_EVALUATION_CACHE.pop(oldest)[0].size
+
+_CELL_JOB=None
+def _evolve_cell_in_child(index):
+    """Forked child: evolve one cell serially; return its state and side effects."""
+    global PROGRESS_HOOK
+    step,cells,evaluator,shared=_CELL_JOB
+    cell=cells[index]
+    if evaluator is not None:
+        _CHILD_KEEPALIVE.append(evaluator.executor)  # the parent's pool is not usable here; never collect it
+        evaluator.executor=None; evaluator.journal=[]
+        counts=(evaluator.cache_hits,evaluator.cache_misses,evaluator.row_model_evaluations)
+    invalid=dict(INVALID_DIAGNOSTICS); redrawn=EQUIVALENCE_STATS["children_redrawn"]; frames=[]
+    if PROGRESS_HOOK is not None:
+        # Snapshot the hook's arguments when it fires, so the parent replays
+        # exactly what a serial run would have reported at that moment.
+        PROGRESS_HOOK=lambda **kw: frames.append(_dumps_shared(kw,shared))
+    caches=(*_CONTENT_KEYED_CACHES,*_ADDRESS_KEYED_CACHES); before={name:set(globals()[name]) for name in caches}
+    output=io.StringIO()
+    with contextlib.redirect_stdout(output), cell_streams(cell): step(cell)
+    anchors={_buffer_identity(value) for value in shared.values() if isinstance(value,np.ndarray)}
+    new_entries={name:[(key,value) for key,value in globals()[name].items() if key not in before[name]
+                       and (name in _CONTENT_KEYED_CACHES or (isinstance(value[1],np.ndarray) and _buffer_identity(value[1]) in anchors))]
+                 for name in caches}
+    side={"stdout":output.getvalue(),"frames":frames,"caches":new_entries,
+          "invalid":{key:value-invalid.get(key,0) for key,value in INVALID_DIAGNOSTICS.items() if value!=invalid.get(key,0)},
+          "redrawn":EQUIVALENCE_STATS["children_redrawn"]-redrawn}
+    if evaluator is not None:
+        side["journal"]=evaluator.journal
+        side["counts"]=tuple(now-before for now,before in zip((evaluator.cache_hits,evaluator.cache_misses,evaluator.row_model_evaluations),counts))
+    return _dumps_shared((cell,side),shared)
+_CHILD_KEEPALIVE=[]
+
+def evolve_cells(cells, step, workers, evaluator=None, shared=None):
+    """Advance every cell one generation with step(cell), in cell order or in
+    `workers` forked processes (identical results when every cell has streams)."""
+    global _CELL_JOB
+    if workers<=1 or len(cells)<2 or any(cell.streams is None for cell in cells):
+        for cell in cells:
+            with cell_streams(cell): step(cell)
+        return
+    shared=_cell_shared_objects(shared or {})
+    if evaluator is not None: shared["evaluator"]=evaluator
+    _CELL_JOB=(step,cells,evaluator,shared)
+    try:
+        with multiprocessing.get_context("fork").Pool(min(workers,len(cells)),initializer=_worker_init) as pool:
+            results=pool.map(_evolve_cell_in_child,range(len(cells)),chunksize=1)
+    finally: _CELL_JOB=None
+    hook=PROGRESS_HOOK
+    for index,data in enumerate(results):
+        cell,side=_loads_shared(data,shared)
+        cells[index]=cell
+        if side["stdout"]: sys.stdout.write(side["stdout"]); sys.stdout.flush()
+        for key,value in side["invalid"].items(): INVALID_DIAGNOSTICS[key]=INVALID_DIAGNOSTICS.get(key,0)+value
+        EQUIVALENCE_STATS["children_redrawn"]+=side["redrawn"]
+        _merge_cache_entries(side["caches"])
+        if evaluator is not None:
+            for key,value in side["journal"]: evaluator._score_cache[key]=value
+            hits,misses,rows=side["counts"]; evaluator.cache_hits+=hits; evaluator.cache_misses+=misses; evaluator.row_model_evaluations+=rows
+        if hook is not None:
+            for frame in side["frames"]: hook(**_loads_shared(frame,shared))
+    if evaluator is not None: evaluator.begin_generation()
+
 def resume_main(args):
     generation,pop,bayes,archive,state=load_checkpoint(args.resume,args.allow_unsafe_pickle)
     # Island snapshots, top-up proposals and final ADF refresh all need
@@ -5032,8 +5309,9 @@ def resume_main(args):
     global SEQUENCE_LAYOUT,EQUIVALENCE_COLLAPSE,RESIDUAL_ARCHIVE,QD_PARENT_CHOICE,SCALE_BALANCED_SELECTION,GUARD_EXPLOIT_CHECK
     SEQUENCE_LAYOUT=maps.get(SEQUENCE_LAYOUT_KEY)
     GUARD_EXPLOIT_CHECK=bool(state.get("numeric_guard_check",False))
-    global INTERPOLATION_CHECK
+    global INTERPOLATION_CHECK,FIT_BACKEND
     INTERPOLATION_CHECK=bool(state.get("interpolation_check",False))
+    FIT_BACKEND=state.get("fit_backend","python")
     # Settings that postdate a checkpoint resume with the behaviour it was searched with.
     RESIDUAL_ARCHIVE=bool(state.get("residual_archive",False)); QD_PARENT_CHOICE=state.get("qd_parent_choice","legacy")
     SCALE_BALANCED_SELECTION=bool(state.get("scale_balanced_selection",False))
@@ -5072,22 +5350,26 @@ def resume_main(args):
     qd_mode=state.get("qd_mode","adaptive_dual")
     workers=resolve_worker_count(args.workers if args.workers else state.get("evaluation_workers",0),sum(len(island.population) for island in islands))
     evaluator=ModelEvaluator(workers,{"train":(Xt,Yt)},affine_on,cats,constraints,out_names)
+    cell_workers=resolve_cell_workers(getattr(args,"cell_workers",0),len(islands))
+    if cell_workers>1 and any(island.streams is None for island in islands):
+        print("This checkpoint predates per-cell random streams; its cells evolve serially so the run continues exactly.")
     topology="single population" if island_config["count"]==1 else f"{island_config['count']} islands; ring migration every {island_config.get('migration_interval',0)} generations"
     if stage_count>1: topology+=f"; {stage_count} {island_config['stages']['mode']} stages per island"
     print(f"Resumed generation {generation} from {checkpoint_path} (seed {state['run_seed']}); {topology}; model scoring uses {'serial evaluation' if workers==1 else f'{workers} worker processes'}.")
     started=time.time(); stop=GracefulStop().__enter__(); interrupted=False
     try:
         while (not args.max_generations or generation < args.max_generations) and not stop.requested:
-            for island_index,island in enumerate(islands):
-                def progress(gen,elite,sample,island=island,island_index=island_index):
+            def step(island):
+                def progress(gen,elite,sample):
                     if len(islands)>1 and gen%10==0: print(cell_label(island,island_config["count"],stage_count),flush=True)
-                    evolution_progress(gen,elite,sample,started=started,Xt=Xt,Yt=Yt,Xv=Xv,Yv=Yv,names=names,out_names=out_names,cats=cats,constraints=constraints,coev=coev,cases=island.cases,archive=island.archive,semantic_qd=island.semantic_qd,structural_qd=island.structural_qd,qd_controller=island.qd_controller,pressure=island.pressure,bayes=island.bayes,library=island.library,budget=island.budget,evaluator=evaluator,adf_registry=island.adf_registry,population=island.population,best_so_far=island.best_models.model,loss_tolerance=loss_tolerance)
+                    evolution_progress(gen,elite,sample,started=started,Xt=Xt,Yt=Yt,Xv=Xv,Yv=Yv,names=names,out_names=out_names,cats=cats,constraints=constraints,coev=coev,cases=island.cases,archive=island.archive,semantic_qd=island.semantic_qd,structural_qd=island.structural_qd,qd_controller=island.qd_controller,pressure=island.pressure,bayes=island.bayes,library=island.library,budget=island.budget,evaluator=evaluator,adf_registry=island.adf_registry,population=island.population,best_so_far=island.best_models.model,loss_tolerance=loss_tolerance,cell=(island.island_index,island.stage))
                 cell_crossover,cell_proposals,cell_nodes,cell_weights=cell_search_settings(island,crossover_rate,rate,nodes)
                 island.population=evolve_generation(island.population,generation,X=X,Xt=Xt,Yt=Yt,Xv=Xv,Yv=Yv,cats=cats,constraints=constraints,out_names=out_names,
                                   ops=ops,nodes=cell_nodes,depth=depth,case_weights=cell_weights,affine_on=affine_on,coev=coev,bayes=island.bayes,archive=island.archive,
                                   semantic_qd=island.semantic_qd,structural_qd=island.structural_qd,residual_qd=island.residual_qd,qd_controller=island.qd_controller,best_models=island.best_models,
                                   pressure=island.pressure,cases=island.cases,portfolio=island.portfolio,library=island.library,evaluator=evaluator,bayesian_proposal_rate=cell_proposals,
                                   crossover_rate=cell_crossover,qd_mode=qd_mode,lexicase_cases=state.get("lexicase_cases",args.lexicase_cases),nsga_normalization=nsga_normalization,bayesian_mode=state.get("bayesian_mode",args.bayesian_mode),adf_registry=island.adf_registry,budget=island.budget,progress=progress,population_size=island.population_size)
+            evolve_cells(islands,step,cell_workers,evaluator,shared={"X":X,"Xt":Xt,"Yt":Yt,"Xv":Xv,"Yv":Yv,"constraints":constraints})
             generation+=1
             advance_topology(islands,island_config,generation,X=Xt,n_features=X.shape[1],ops=ops,nodes=nodes,depth=depth,
                              nsga_normalization=nsga_normalization,parsimony_quality_tolerance=parsimony_quality_tolerance,evaluator=evaluator,
@@ -5144,6 +5426,8 @@ def build_arg_parser():
     ap.add_argument("--residual-archive",choices=("on","off"),default="on",help="Keep a third QD archive keyed by where each model errs (target-size bins and input regions), so complementary partial models survive (default: on)")
     ap.add_argument("--qd-parent-choice",choices=QD_PARENT_CHOICES,default="quality_coverage",help="How QD archives pick parent cells beyond the uniform share: success x bounded quality rank x coverage bonus, or legacy success-only (default: quality_coverage)")
     ap.add_argument("--scale-balanced-selection",choices=("on","off"),default="on",help="Selection-only: give every target-magnitude band equal weight and compare asinh-compressed errors in lexicase parent choice; reported loss is unchanged (default: on)")
+    ap.add_argument("--cell-workers",type=int,default=0,help="Processes that evolve island/stage cells in parallel; 0=auto (one per cell, up to CPUs-1), 1=serial.  Results are identical either way (default: 0)")
+    ap.add_argument("--fit-backend",choices=("auto","python"),default="auto",help="Compiled kernels: auto uses the Cython constant fitter (and, above 8192 rows, the compiled affine readout) when they build: several times faster, agreeing with Python to round-off.  python always uses the pure-Python code (default: auto)")
     ap.add_argument("--numeric-guard-check",choices=("on","off"),default="on",help="Reject models whose values depend on afpo's numeric safety guards (the +/-1e12 value clamp, sinh/cosh/tan input clips) instead of letting them use a guard as a hidden min/max (default: on)")
     ap.add_argument("--interpolation-check",choices=("on","off"),default="on",help="Add a loss term scoring predictions between nearest-neighbour rows against interpolated targets, so equations that only memorise the training rows (e.g. short-period mod sawtooths) lose (default: on)")
     ap.add_argument("--gui",action="store_true",help="Start the browser GUI (training, live Pareto frontier, model explorer) instead of the terminal prompts")
@@ -5268,8 +5552,9 @@ def train_from_setup(args, setup, choose_model=None):
     global EQUIVALENCE_COLLAPSE,RESIDUAL_ARCHIVE,QD_PARENT_CHOICE,SCALE_BALANCED_SELECTION,GUARD_EXPLOIT_CHECK
     EQUIVALENCE_COLLAPSE=getattr(args,"equivalence_collapse","on")=="on"; EQUIVALENCE_STATS["children_redrawn"]=0
     GUARD_EXPLOIT_CHECK=getattr(args,"numeric_guard_check","on")=="on"
-    global INTERPOLATION_CHECK
+    global INTERPOLATION_CHECK,FIT_BACKEND
     INTERPOLATION_CHECK=getattr(args,"interpolation_check","on")=="on"
+    FIT_BACKEND=getattr(args,"fit_backend","auto")
     RESIDUAL_ARCHIVE=getattr(args,"residual_archive","on")=="on"; QD_PARENT_CHOICE=getattr(args,"qd_parent_choice","quality_coverage")
     SCALE_BALANCED_SELECTION=getattr(args,"scale_balanced_selection","on")=="on"
     run_seed=args.seed if args.seed is not None else random.SystemRandom().randrange(2**32)
@@ -5353,7 +5638,7 @@ def train_from_setup(args, setup, choose_model=None):
                    "stages":{key:stages[key] for key in ("mode","count","interval","age_gap","schedule","threshold_quantile")},
                    "roles":{key:roles[key] for key in ("enabled","interval","mix","retire_after")}},
         "equivalence_collapse":EQUIVALENCE_COLLAPSE,"residual_archive":RESIDUAL_ARCHIVE,"qd_parent_choice":QD_PARENT_CHOICE,"scale_balanced_selection":SCALE_BALANCED_SELECTION,
-        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age",
+        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age",
         "test_csv":str(Path(args.test_csv).resolve()) if args.test_csv else None,
     },df,train_indices,validation_indices,external_validation)
     print(f"Run manifest: {manifest_path}")
@@ -5370,7 +5655,7 @@ def train_from_setup(args, setup, choose_model=None):
         "profile":args.profile,"constraint_metadata":metadata,"constraints":constraints.describe(),"bayesian_particles":args.bayesian_particles,"interaction_discovery":interaction_discovery,
         "island_config":{"count":island_count,"migration_interval":migration_interval,"migrants_per_island":migrants_per_island,"topology":"ring","migration_events":0,"stages":stages,"roles":roles},
         "equivalence_collapse":EQUIVALENCE_COLLAPSE,"residual_archive":RESIDUAL_ARCHIVE,"qd_parent_choice":QD_PARENT_CHOICE,"scale_balanced_selection":SCALE_BALANCED_SELECTION,
-        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age"}
+        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age"}
     head_count=sum(len(heads) for heads in classification_layout(cats)[0])
     population_sizes=cell_population_sizes(args.population,cell_count)
     islands=[new_island_runtime(size,X=X,Xt=Xt,cats=cats,ops=ops,nodes=nodes,depth=depth,head_count=head_count,
@@ -5382,6 +5667,8 @@ def train_from_setup(args, setup, choose_model=None):
                                 interaction_discovery=interaction_discovery,Yt=Yt)
              for index,size in enumerate(population_sizes)]
     if roles["enabled"]: assign_role_parameters(islands,island_count,args.crossover_rate,args.bayesian_proposal_rate,nodes)
+    if cell_count>1: seed_cell_streams(islands,run_seed)
+    cell_workers=resolve_cell_workers(getattr(args,"cell_workers",0),cell_count)
     snapshot_islands(checkpoint_state,islands,checkpoint_state["island_config"])
     workers=checkpoint_state["evaluation_workers"]
     evaluator=ModelEvaluator(workers,{"train":(Xt,Yt)},affine_on,cats,constraints,out_names)
@@ -5389,21 +5676,22 @@ def train_from_setup(args, setup, choose_model=None):
     topology=("single population" if island_count==1 else f"{island_count} islands, ring migration every {migration_interval} generations")
     if stages["count"]>1: topology+=f", {stages['count']} {stages['mode']} stages per island (promotion every {stages['interval']} generations)"
     if roles["enabled"]: topology+=f", self-organising roles (generalist + {island_count-1} specialist(s), update every {roles['interval']} generations)"
-    if cell_count>1: topology+=f" ({', '.join(map(str,population_sizes))} models per cell)"
+    if cell_count>1: topology+=f" ({', '.join(map(str,population_sizes))} models per cell; {'cells evolve serially' if cell_workers==1 else f'cells evolve in {cell_workers} parallel processes'})"
     print(f"Searching indefinitely with {args.bayesian_proposal_rate:.0%} Bayesian proposals, {topology}, and {'serial evaluation' if workers==1 else f'{workers} worker processes'}; press Ctrl-C to choose and save a model.")
     stop=GracefulStop().__enter__(); interrupted=False
     try:
         while (not args.max_generations or gen<args.max_generations) and not stop.requested:
-            for island_index,island in enumerate(islands):
-                def progress(generation,elite,sample,island=island,island_index=island_index):
+            def step(island):
+                def progress(generation,elite,sample):
                     if cell_count>1 and generation%10==0: print(cell_label(island,island_count,stages["count"]),flush=True)
-                    evolution_progress(generation,elite,sample,started=start,Xt=Xt,Yt=Yt,Xv=Xv,Yv=Yv,names=names,out_names=out_names,cats=cats,constraints=constraints,coev=coev,cases=island.cases,archive=island.archive,semantic_qd=island.semantic_qd,structural_qd=island.structural_qd,qd_controller=island.qd_controller,pressure=island.pressure,bayes=island.bayes,library=island.library,budget=island.budget,evaluator=evaluator,adf_registry=island.adf_registry,population=island.population,best_so_far=island.best_models.model,loss_tolerance=args.selection_loss_tolerance)
+                    evolution_progress(generation,elite,sample,started=start,Xt=Xt,Yt=Yt,Xv=Xv,Yv=Yv,names=names,out_names=out_names,cats=cats,constraints=constraints,coev=coev,cases=island.cases,archive=island.archive,semantic_qd=island.semantic_qd,structural_qd=island.structural_qd,qd_controller=island.qd_controller,pressure=island.pressure,bayes=island.bayes,library=island.library,budget=island.budget,evaluator=evaluator,adf_registry=island.adf_registry,population=island.population,best_so_far=island.best_models.model,loss_tolerance=args.selection_loss_tolerance,cell=(island.island_index,island.stage))
                 cell_crossover,cell_proposals,cell_nodes,cell_weights=cell_search_settings(island,args.crossover_rate,args.bayesian_proposal_rate,nodes)
                 island.population=evolve_generation(island.population,gen,X=X,Xt=Xt,Yt=Yt,Xv=Xv,Yv=Yv,cats=cats,constraints=constraints,out_names=out_names,
                                   ops=ops,nodes=cell_nodes,depth=depth,case_weights=cell_weights,affine_on=affine_on,coev=coev,bayes=island.bayes,archive=island.archive,
                                   semantic_qd=island.semantic_qd,structural_qd=island.structural_qd,residual_qd=island.residual_qd,qd_controller=island.qd_controller,best_models=island.best_models,
                                   pressure=island.pressure,cases=island.cases,portfolio=island.portfolio,library=island.library,evaluator=evaluator,bayesian_proposal_rate=cell_proposals,
                                   crossover_rate=cell_crossover,qd_mode=args.qd_mode,lexicase_cases=args.lexicase_cases,nsga_normalization=args.nsga_normalization,bayesian_mode=args.bayesian_mode,adf_registry=island.adf_registry,budget=island.budget,progress=progress,population_size=island.population_size)
+            evolve_cells(islands,step,cell_workers,evaluator,shared={"X":X,"Xt":Xt,"Yt":Yt,"Xv":Xv,"Yv":Yv,"constraints":constraints})
             gen+=1
             advance_topology(islands,checkpoint_state["island_config"],gen,X=Xt,n_features=X.shape[1],ops=ops,nodes=nodes,depth=depth,
                              nsga_normalization=args.nsga_normalization,parsimony_quality_tolerance=args.parsimony_quality_tolerance,evaluator=evaluator,

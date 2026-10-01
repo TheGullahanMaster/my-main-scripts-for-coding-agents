@@ -603,5 +603,42 @@ class StagedRunTests(unittest.TestCase):
             a.train_from_setup(args, setup)
 
 
+class ParallelCellTests(unittest.TestCase):
+    """Cells own their random streams, so serial, parallel and resumed runs agree exactly."""
+    def run_cells(self, plan, cell_workers):
+        x = np.random.default_rng(0).uniform(1, 3, (40, 2))
+        df = pd.DataFrame({"a": x[:, 0], "b": x[:, 1], "y": x[:, 0] ** 2 + 2 * x[:, 1]})
+        with tempfile.TemporaryDirectory(prefix="afpo-cells-") as directory, contextlib.chdir(directory):
+            df.to_csv("d.csv", index=False)
+            flags = ["--workers", "1", "--cell-workers", str(cell_workers)]
+            args = a.parse_cli(["--population", "64", "--max-generations", str(plan[0]), "--seed", "4", *flags])[1]
+            setup = {"path": Path("d.csv"), "df": df, "types": [1, 1, 5], "delimiter": ",", "ops": ["+", "-", "*", "square"],
+                     "affine_on": True, "coev": False, "dynamic_pressure_on": True, "adf_enabled": False, "nodes": 15, "depth": 4,
+                     "island_count": 2, "migration_interval": 2, "migrants_per_island": 2, "val_path": "", "validation_percent": 20,
+                     "metadata": {}, "stages": {"mode": "both", "count": 2, "interval": 2, "age_gap": 2}, "roles": {"enabled": True, "interval": 2}}
+            with contextlib.redirect_stdout(io.StringIO()):
+                checkpoint = a.train_from_setup(args, setup, choose_model=lambda *_: 0)["checkpoint"]
+                for target in plan[1:]:
+                    a.resume_main(a.parse_cli(["--resume", checkpoint, "--max-generations", str(target), *flags])[1])
+            _, _, _, _, state = a.load_checkpoint(checkpoint, False)
+        return [[repr(m["trees"]) for m in cell["population"]] for cell in state["island_states"]], state
+
+    def test_parallel_and_resumed_cells_match_a_straight_serial_run(self):
+        serial, state = self.run_cells([6], 1)
+        parallel, _ = self.run_cells([4, 6], 4)
+        self.assertEqual(serial, parallel)
+        self.assertTrue(all("streams" in cell for cell in state["island_states"]))
+        lineages = {m["lineage_id"] for cell in state["island_states"] for m in cell["population"]}
+        self.assertTrue(any(lineage >= 1 << a.LINEAGE_RANGE_BITS for lineage in lineages))
+
+    def test_cell_streams_restore_the_shared_streams(self):
+        cell = type("Cell", (), {"streams": None})()
+        a.seed_cell_streams([cell], 7)
+        before = (a.rng.getstate(), a.np.random.get_state()[1].tobytes(), a._NEXT_LINEAGE_ID)
+        with a.cell_streams(cell): a.rng.random(); a.np.random.random(); a.next_lineage_id()
+        self.assertEqual(before, (a.rng.getstate(), a.np.random.get_state()[1].tobytes(), a._NEXT_LINEAGE_ID))
+        self.assertEqual(cell.streams["lineage_next"], (1 << a.LINEAGE_RANGE_BITS) + 1)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -578,5 +578,78 @@ class BehaviourRowTests(unittest.TestCase):
         self.assertEqual(len(keys), 3)
 
 
+class CompiledFitterTests(unittest.TestCase):
+    """afpo_lib/fitcore.pyx must evaluate every operator exactly as afpo does."""
+    def setUp(self):
+        self.core = a.compiled_fitter()
+        if self.core is None: self.skipTest("Cython or a C compiler is unavailable")
+
+    def test_every_compiled_operator_matches_numpy(self):
+        special = [0., -0., 1e-13, -1e-13, .5, -.5, 1., -1., 2., 3.7, -3.7, 50.1, -50.1, 1e11, -1e12, 1e300, np.nan, np.inf, -np.inf]
+        X = np.column_stack([special, special[::-1], np.roll(special, 5)])
+        for op in self.core.OPERATOR_CODES:
+            arity = a.OPS[op][0]
+            tree = (op, *[("x", k) for k in range(arity)])
+            program = a._compiled_program(a._FlatTree(tree), self.core, X.shape[1])
+            want, got = a.evaluate(tree, X), self.core.evaluate(*program, [], X)
+            # tanh comes from libm here and numpy's own kernel there: last bit only.
+            if op == "tanh": np.testing.assert_allclose(got, want, rtol=1e-15); continue
+            same = (want == got) & (np.signbit(want) == np.signbit(got)) | (np.isnan(want) & np.isnan(got))
+            self.assertTrue(same.all(), f"{op}: numpy {want[~same]} compiled {got[~same]}")
+
+    def test_backends_recover_the_same_constants(self):
+        x = np.linspace(.1, 2, 60)[:, None]; y = 3. + 2. * np.exp(.7 * x[:, 0])
+        tree = ("exp", ("*", ("c", .2), ("x", 0)))
+        fitted = {}
+        for backend in ("python", "auto"):
+            with patch.object(a, "FIT_BACKEND", backend): fitted[backend] = a.fit_tree_constants(tree, x, y)
+        self.assertAlmostEqual(a.constant_vector(fitted["python"])[0], .7, places=6)
+        self.assertAlmostEqual(a.constant_vector(fitted["auto"])[0], .7, places=6)
+
+    def test_unsupported_trees_fall_back_to_python(self):
+        tree = ("bitwise_and", ("x", 0), ("c", 3.))
+        self.assertIsNone(a._compiled_program(a._FlatTree(tree), self.core, 1))
+        self.assertIsNone(a._compiled_program(a._FlatTree(("+", ("x", 5), ("c", 1.))), self.core, 1))
+
+
+class BlockedEvaluationTests(unittest.TestCase):
+    """Large data is evaluated in row blocks; values and guard verdicts must not change."""
+    def setUp(self):
+        rng = np.random.default_rng(5)
+        self.X = np.column_stack([rng.uniform(-3, 3, 50), rng.uniform(.1, 2, 50)])
+        self.trees = [("+", ("*", ("c", 1.7), ("x", 0)), ("log", ("x", 1))),
+                      ("if_else", ("gt", ("x", 0), ("c", 0.)), ("square", ("x", 1)), ("neg", ("x", 0))),
+                      ("x", 1), ("c", 2.5),
+                      ("*", ("c", 1e13), ("x", 0)),                      # reaches the value clamp
+                      ("tan", ("x", 0))]                                  # tan's input clip (+/-1.55) shapes it
+
+    def test_blocked_values_are_bit_identical(self):
+        whole = [a.evaluate(t, self.X) for t in self.trees]
+        with patch.object(a, "EVALUATION_BLOCK_ROWS", 7):
+            blocked = [a.evaluate(t, self.X) for t in self.trees]
+        for t, w, b in zip(self.trees, whole, blocked):
+            self.assertEqual(np.asarray(w).tobytes(), np.asarray(b).tobytes(), t)
+
+    def test_blocked_guard_verdicts_match(self):
+        whole = [a.guard_engagement([t], self.X) for t in self.trees]
+        a._GUARD_CACHE.clear()
+        with patch.object(a, "EVALUATION_BLOCK_ROWS", 7):
+            blocked = [a.guard_engagement([t], self.X) for t in self.trees]
+        a._GUARD_CACHE.clear()
+        self.assertEqual(whole, blocked)
+        self.assertEqual(whole[-2:], ["value_clamp", "input_clip"])
+
+    def test_compiled_affine_matches_numpy(self):
+        if a.compiled_fitter() is None: self.skipTest("Cython or a C compiler is unavailable")
+        rng = np.random.default_rng(6); x = rng.uniform(0, 2, 400)
+        y = 3 * np.exp(x) + 1 + rng.standard_cauchy(400) * .1           # outliers engage the Huber weights
+        with patch.object(a, "EVALUATION_BLOCK_ROWS", 16):
+            with patch.object(a, "FIT_BACKEND", "python"): want = a._affine(np.exp(x), y)
+            got = a._affine(np.exp(x), y)
+            constant = a._affine(np.full(400, 2.), y)                     # degenerate: numpy path
+        np.testing.assert_allclose(got, want, rtol=1e-9)
+        self.assertEqual(constant[0], 0.)
+
+
 if __name__ == "__main__":
     unittest.main()
