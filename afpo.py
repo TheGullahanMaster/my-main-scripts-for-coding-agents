@@ -4190,7 +4190,10 @@ def set_selection_probe_data(X, Y, Xv=None, Yv=None, cats=None):
     rows,partner=rows[usable],partner[usable]
     if not len(rows): return
     fraction=generator.uniform(.15,.85,len(rows))[:,None]
-    discrete=np.array([len(np.unique(X[:,j]))<=10 for j in range(X.shape[1])])
+    # Few-valued and integer-valued columns have nothing between their rows
+    # (a parity or Collatz rule is undefined at n=3.4): copy, not interpolate.
+    discrete=np.array([len(np.unique(X[:,j]))<=10 or bool(np.all(X[:,j]==np.round(X[:,j]))) for j in range(X.shape[1])])
+    if discrete.all(): return
     probes=np.where(discrete,X[rows],X[rows]+(X[partner]-X[rows])*fraction)
     bands=[]
     for j in numeric:

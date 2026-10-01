@@ -96,6 +96,10 @@ class SelectionProbeFilterTest(unittest.TestCase):
         with patch.object(a, "SELECTION_PROBE_FILTER", False):
             a.set_selection_probe_data(np.zeros((8, 1)), np.zeros((8, 1)))
         self.assertIsNone(a.between_row_violation(a.Model([("x", 0)], [(1., 0.)])))
+        # Integer inputs have no in-between values (parity, Collatz): no probes.
+        n = np.arange(1., 60.)[:, None]
+        a.set_selection_probe_data(n, np.mod(n, 2.))
+        self.assertIsNone(a.between_row_violation(a.Model([("x", 0)], [(1., 0.)])))
 
 
 if __name__ == "__main__":
