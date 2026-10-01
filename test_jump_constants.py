@@ -56,7 +56,7 @@ class JumpConstantScanTest(unittest.TestCase):
 
 
 class JumpMutationTest(unittest.TestCase):
-    def test_off_by_default_and_respects_limits(self):
+    def test_portfolio_weight_and_size_limits(self):
         self.assertEqual(a.MutationPortfolio().weights["jump"], a.JUMP_MUTATION_WEIGHT)
         a.rng.seed(5)
         ops = ["+", "*", "mod", "floordiv", "if_else", "gt"]

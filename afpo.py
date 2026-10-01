@@ -2044,7 +2044,8 @@ def jump_mutate(t, n_features, ops, max_nodes, max_depth):
 # to harmful elsewhere (4-way ablation).  Set > 0 to re-enable.
 BILINEAR_MUTATION_WEIGHT = 0.
 # Initial weight of jump_mutate; the portfolio adapts it like the others.
-JUMP_MUTATION_WEIGHT = 0.
+# It only acts when mod/floordiv or if_else+gt are in the grammar.
+JUMP_MUTATION_WEIGHT = 1.
 class MutationPortfolio:
     def __init__(self):
         self.weights={"subtree":1.,"point":1.,"constant":1.,"hoist":.7,"shrink":.7,"parametrize":1.,"bilinear":BILINEAR_MUTATION_WEIGHT,"jump":JUMP_MUTATION_WEIGHT}
@@ -5491,6 +5492,8 @@ def resume_main(args):
     JUMP_CONSTANT_SCAN=bool(state.get("jump_constant_scan",False))
     global SELECTION_PROBE_FILTER
     SELECTION_PROBE_FILTER=bool(state.get("selection_probe_filter",False))
+    global JUMP_MUTATION_WEIGHT
+    JUMP_MUTATION_WEIGHT=float(state.get("jump_mutation_weight",0.))
     set_selection_probe_data(Xt,Yt,Xv,Yv,cats)
     FIT_BACKEND=state.get("fit_backend","python")
     # Settings that postdate a checkpoint resume with the behaviour it was searched with.
@@ -5612,7 +5615,7 @@ def build_arg_parser():
     ap.add_argument("--numeric-guard-check",choices=("on","off"),default="on",help="Reject models whose values depend on afpo's numeric safety guards (the +/-1e12 value clamp, sinh/cosh/tan input clips) instead of letting them use a guard as a hidden min/max (default: on)")
     ap.add_argument("--interpolation-check",choices=("on","off"),default="on",help="Add a loss term scoring predictions between nearest-neighbour rows against interpolated targets, so equations that only memorise the training rows (e.g. short-period mod sawtooths) lose (default: on)")
     ap.add_argument("--jump-constant-scan",choices=("on","off"),default="on",help="Before the gradient constant fit, scan data-driven values for constants that only move a jump (mod periods, comparison thresholds, floor scales), which the gradient fit cannot move (default: on)")
-    ap.add_argument("--jump-mutation-weight",type=float,default=0.,help="Initial portfolio weight of the jump mutation, which wraps a subtree in mod(s,c), floordiv(s,c) or if_else(gt(x,c),s,s') as one move; adapted like the other mutation kinds (default: 0, off)")
+    ap.add_argument("--jump-mutation-weight",type=float,default=1.,help="Initial portfolio weight of the jump mutation, which wraps a subtree in mod(s,c), floordiv(s,c) or if_else(gt(x,c),s,s') as one move; adapted like the other mutation kinds; 0 disables it (default: 1)")
     ap.add_argument("--selection-probe-filter",choices=("on","off"),default="on",help="Final model choice: drop candidates whose predictions between neighbouring data rows leave the neighbours' target band much more often than the best candidate's (memorised lattice tricks that tie on validation) (default: on)")
     ap.add_argument("--gui",action="store_true",help="Start the browser GUI (training, live Pareto frontier, model explorer) instead of the terminal prompts")
     ap.add_argument("--port",type=int,default=8778,help="Browser GUI port (default: 8778)")
@@ -5742,7 +5745,7 @@ def train_from_setup(args, setup, choose_model=None):
     global SELECTION_PROBE_FILTER
     SELECTION_PROBE_FILTER=getattr(args,"selection_probe_filter","on")=="on"
     global JUMP_MUTATION_WEIGHT
-    JUMP_MUTATION_WEIGHT=float(getattr(args,"jump_mutation_weight",0.))
+    JUMP_MUTATION_WEIGHT=float(getattr(args,"jump_mutation_weight",1.))
     FIT_BACKEND=getattr(args,"fit_backend","auto")
     RESIDUAL_ARCHIVE=getattr(args,"residual_archive","on")=="on"; QD_PARENT_CHOICE=getattr(args,"qd_parent_choice","quality_coverage")
     SCALE_BALANCED_SELECTION=getattr(args,"scale_balanced_selection","on")=="on"
