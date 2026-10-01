@@ -1214,6 +1214,102 @@ def _compiled_program(flat, core, feature_count):
             code[index]=op; kid[index,:len(children)]=children
     return code,arg,kid
 
+# A constant that only decides where a jump falls (a mod period, a comparison
+# threshold, the scale inside floor) has a zero finite-difference gradient
+# almost everywhere, so Levenberg-Marquardt never moves it and only random
+# nudges did.  Before the gradient fit, a small derivative-free scan tries
+# data-driven values for such constants (midpoints between the compared
+# values, fractions of a mod/floordiv operand's range, a log grid around the
+# current value, and simple numbers) and keeps the best strict improvement.
+JUMP_CONSTANT_SCAN = True
+JUMP_SCAN_MAX_CONSTANTS = 3
+_JUMP_OPERATORS = frozenset(("mod","floordiv","quantize","gt","lt","gte","lte","eq","ne","round2","floor2","ceil2",
+                             "round","floor","ceil","int","frac","sign","signbit","oom","bitwise_and","bitwise_or",
+                             "bitwise_xor","bitwise_not","lshift","rshift","gcd","lcm","cat","x_at_pos_y"))
+_JUMP_ARGUMENTS = {"if_else":(0,)}   # only the condition of if_else jumps
+_THRESHOLD_OPERATORS = frozenset(("gt","lt","gte","lte","eq","ne"))
+_PERIOD_OPERATORS = frozenset(("mod","floordiv","quantize"))
+_SIMPLE_NUMBERS = (.5,1.,1.5,2.,2.5,3.,4.,5.,6.,8.,10.)
+JUMP_SCAN_STATS = {"scans":0,"improved":0}
+def jump_constant_slots(flat):
+    """Positions (in constant order) of constants that sit under a jump."""
+    slots=[]
+    for slot,index in enumerate(flat.constants):
+        child,parent=index,flat.parent[index]
+        while parent>=0:
+            kind=flat.kind[parent]
+            if kind in _JUMP_OPERATORS or flat.children[parent].index(child) in _JUMP_ARGUMENTS.get(kind,()):
+                slots.append(slot); break
+            child,parent=parent,flat.parent[parent]
+    return slots
+def _jump_candidates(flat, nodes, slot, value):
+    index=flat.constants[slot]; parent=flat.parent[index]
+    kind=flat.kind[parent] if parent>=0 else None
+    siblings=[child for child in flat.children[parent] if child!=index] if parent>=0 else []
+    candidates=[value*factor for factor in (.25,.5,.7,.85,1.2,1.4,2.,4.)]
+    candidates+=[sign*number for number in _SIMPLE_NUMBERS for sign in (1.,-1.)]
+    if siblings:
+        other=nodes[siblings[0]]
+        if kind in _THRESHOLD_OPERATORS or kind=="if_else":
+            levels=np.unique(other)
+            if len(levels)>1:
+                middles=(levels[1:]+levels[:-1])/2
+                candidates+=middles[np.unique(np.linspace(0,len(middles)-1,min(24,len(middles))).astype(int))].tolist()
+        elif kind in _PERIOD_OPERATORS and flat.children[parent].index(index)==1:
+            span=float(np.ptp(other))
+            if span>EPS: candidates+=[span/k for k in range(1,13)]
+    return [c for c in dict.fromkeys(candidates) if math.isfinite(c) and abs(c)<=CONSTANT_LIMIT]
+def _scan_costs(predictions, y, scale, fit_readout):
+    """Huber cost after a least-squares readout, for each row of a (K, n) batch."""
+    P=np.asarray(predictions,float)
+    if fit_readout:
+        mu=P.mean(axis=1,keepdims=True); du=P-mu; my=float(np.mean(y))
+        suu=np.einsum("kn,kn->k",du,du)
+        degenerate=~(suu>1e-12*np.maximum(np.einsum("kn,kn->k",P,P),EPS))
+        slope=np.einsum("kn,n->k",du,y-my)/np.where(degenerate,1.,suu)
+        slope=np.where(degenerate|~np.isfinite(slope),0.,np.clip(slope,-AFFINE_COEFFICIENT_BOUND,AFFINE_COEFFICIENT_BOUND))
+        P=slope[:,None]*du+my
+    r=np.abs((P-y)/scale); huber=ROBUST_LOSS_DELTA
+    costs=np.where(r<=huber,.5*r*r,huber*(r-.5*huber)).sum(axis=1)
+    return np.where(np.isfinite(costs),costs,np.inf)
+def _nudged_roots(flat, nodes, slot, candidates, X):
+    """Root outputs (K, n) for K values of one constant, every other node reused."""
+    changed=flat.constants[slot]; current=np.asarray(candidates,float)[:,None]; index=flat.parent[changed]
+    with np.errstate(all="ignore"):
+        while index>=0:
+            current=_op_eval_unguarded_state(flat.kind[index],[current if child==changed else nodes[child] for child in flat.children[index]])
+            changed,index=index,flat.parent[index]
+    return np.broadcast_to(current,(len(candidates),len(X)))
+def scan_jump_constants(flat, start, X, y, scale, fit_readout=True):
+    """Constant vector with jump constants placed by a candidate scan, or None.
+
+    Every candidate value of a constant is scored in one batched pass along
+    its path to the root (a (K, rows) array), not one evaluation per value."""
+    slots=jump_constant_slots(flat)
+    if not slots: return None
+    if len(slots)>JUMP_SCAN_MAX_CONSTANTS: slots=rng.sample(slots,JUMP_SCAN_MAX_CONSTANTS)
+    JUMP_SCAN_STATS["scans"]+=1
+    current=np.array(start,float)
+    try:
+        nodes=flat.values(current,X); best=initial=float(_scan_costs(nodes[0][None,:],y,scale,fit_readout)[0])
+        for slot in slots:
+            chosen=current[slot]
+            candidates=_jump_candidates(flat,nodes,slot,chosen)
+            # Then two shrinking local grids: the cost is piecewise constant.
+            for round_ in range(3):
+                if round_:
+                    step=(.05 if round_==1 else .005)*max(abs(chosen),1e-3)
+                    candidates=[chosen+step*k for k in (-8,-6,-4,-3,-2,-1,-.5,.5,1,2,3,4,6,8)]
+                costs=_scan_costs(_nudged_roots(flat,nodes,slot,candidates,X),y,scale,fit_readout)
+                pick=int(np.argmin(costs))
+                if costs[pick]<best: best,chosen=float(costs[pick]),float(candidates[pick])
+            if chosen!=current[slot]:
+                current[slot]=chosen; nodes=flat.values(current,X)
+    except (ArithmeticError, IndexError, ValueError): return None
+    if not best<initial: return None
+    JUMP_SCAN_STATS["improved"]+=1
+    return current
+
 def fit_tree_constants(tree, X, y, adfs=None, fit_readout=True, iterations=CONSTANT_FIT_ITERATIONS, robust=True):
     """Levenberg-Marquardt on a tree's inner constants (variable projection).
 
@@ -1227,6 +1323,13 @@ def fit_tree_constants(tree, X, y, adfs=None, fit_readout=True, iterations=CONST
     start=np.asarray(constant_vector(tree),float)
     if not len(start) or not len(y): return tree
     scale=target_scale(y); ones=np.ones(len(y)); flat=_FlatTree.build(tree); huber=ROBUST_LOSS_DELTA
+    if JUMP_CONSTANT_SCAN and flat is not None and isinstance(X,np.ndarray) and X.ndim==2:
+        scanned=scan_jump_constants(flat,start,X,y,scale,fit_readout)
+        if scanned is not None:
+            placed=with_constants(tree,scanned)
+            # The gradient fit below returns its own input unless it improves
+            # further, so the scanned tree becomes that input.
+            if not guarded_constant_divisor(placed) and not guard_engagement([placed],X,adfs): tree,start=placed,scanned
     if flat is not None and FIT_BACKEND=="auto" and isinstance(X,np.ndarray) and X.ndim==2:
         core=compiled_fitter(); program=None if core is None else _compiled_program(flat,core,X.shape[1])
         if program is not None:
@@ -1918,13 +2021,34 @@ def parametrize_mutate(t, ops, max_nodes, max_depth):
     child=replace_subtree(t,path,wrapped)
     return child if node_size(child)<=max_nodes and node_depth(child)<=max_depth else t
 def shrink_mutate(t): return rng.choice(t[1:]) if t[0] not in ("x","c") else t
+def jump_mutate(t, n_features, ops, max_nodes, max_depth):
+    """Wrap a subtree in a whole jump block: mod(s,c), floordiv(s,c) or
+    if_else(gt(x,c), s, s') with s' a mutated copy of s.
+
+    A discontinuous target gives no partial credit for a comparison or a
+    modulo built one node at a time; offering the block as one move lets the
+    jump-constant scan place c right away when the child is tuned."""
+    forms=[form for form in ("mod","floordiv") if form in ops]
+    if "if_else" in ops and "gt" in ops: forms.append("branch")
+    paths=[path for path in subtree_paths(t) if subtree_at(t,path)[0]!="c"]
+    if not forms or not paths: return t
+    path=rng.choice(paths); target=subtree_at(t,path); form=rng.choice(forms)
+    if form=="branch":
+        other=mutate(target,n_features,ops,max(1,node_size(target)+2),max(1,node_depth(target)+1))
+        block=("if_else",("gt",("x",rng.randrange(n_features)),("c",rng.uniform(-1,1))),target,other)
+    else: block=(form,target,("c",float(rng.choice(_SIMPLE_NUMBERS))))
+    child=replace_subtree(t,path,block)
+    return child if node_size(child)<=max_nodes and node_depth(child)<=max_depth else t
 
 # Off by default: it did not solve the linear-system benchmark and was neutral
 # to harmful elsewhere (4-way ablation).  Set > 0 to re-enable.
 BILINEAR_MUTATION_WEIGHT = 0.
+# Initial weight of jump_mutate; the portfolio adapts it like the others.
+# It only acts when mod/floordiv or if_else+gt are in the grammar.
+JUMP_MUTATION_WEIGHT = 1.
 class MutationPortfolio:
     def __init__(self):
-        self.weights={"subtree":1.,"point":1.,"constant":1.,"hoist":.7,"shrink":.7,"parametrize":1.,"bilinear":BILINEAR_MUTATION_WEIGHT}
+        self.weights={"subtree":1.,"point":1.,"constant":1.,"hoist":.7,"shrink":.7,"parametrize":1.,"bilinear":BILINEAR_MUTATION_WEIGHT,"jump":JUMP_MUTATION_WEIGHT}
         self.tries={k:0 for k in self.weights}; self.wins={k:0 for k in self.weights}
     def choose(self): return rng.choices(list(self.weights),weights=list(self.weights.values()))[0]
     def record(self, kind, improved):
@@ -1937,6 +2061,7 @@ class MutationPortfolio:
         if kind=="shrink": return shrink_mutate(t),kind
         if kind=="parametrize": return parametrize_mutate(t,ops,max_nodes,max_depth),kind
         if kind=="bilinear": return bilinear_mutate(t,n_features,ops,max_nodes,max_depth),kind
+        if kind=="jump": return jump_mutate(t,n_features,ops,max_nodes,max_depth),kind
         if kind=="constant":
             # Without constants to move, give the tree one (credited as such).
             child=constant_mutate(t)
@@ -4038,6 +4163,51 @@ def selection_identity(model):
     """Different fitted coefficients or ADF definitions are different predictors."""
     return repr(model.trees),tuple(model.scales),adf_signature(model.trees,model.adfs),tuple(model.mdl_operators),model.mdl_feature_count
 
+# The validation rows of a gridded or integer dataset sit on the same lattice
+# as the training rows, so an equation that only memorises lattice points
+# (mod/round tricks) can tie the exact law on validation and win on MDL.  The
+# final choice therefore also probes between nearest-neighbour rows of all
+# known data (training + validation): a candidate whose in-between predictions
+# leave the neighbours' target band far more often than the best candidate's
+# is not recommended.  A real jump only disturbs the few probes straddling it.
+SELECTION_PROBE_FILTER = True
+SELECTION_PROBE_ROWS, SELECTION_PROBE_SLACK, SELECTION_PROBE_MARGIN = 200, .05, .10
+_SELECTION_PROBES = None
+def set_selection_probe_data(X, Y, Xv=None, Yv=None, cats=None):
+    """Build the between-row probes used by the final model choice (None disables)."""
+    global _SELECTION_PROBES
+    _SELECTION_PROBES=None
+    if not SELECTION_PROBE_FILTER or X is None: return
+    if Xv is not None and len(Xv): X,Y=np.vstack([X,Xv]),np.vstack([Y,Yv])
+    X=np.asarray(X,float); Y=np.asarray(Y,float)
+    if X.ndim!=2 or len(X)<4: return
+    numeric=[j for j in range(Y.shape[1]) if cats is None or cats[j] is None]
+    if not numeric: return
+    scale=X.std(axis=0); standard=np.divide(X-X.mean(axis=0),scale,out=np.zeros_like(X),where=scale>EPS)
+    generator=np.random.default_rng(len(X)+104729)
+    rows=generator.choice(len(X),min(SELECTION_PROBE_ROWS,len(X)),replace=False)
+    distance=np.sum((standard[rows,None,:]-standard[None,:,:])**2,axis=2); distance[distance<=1e-18]=np.inf
+    partner=np.argmin(distance,axis=1); usable=np.isfinite(distance[np.arange(len(rows)),partner])
+    rows,partner=rows[usable],partner[usable]
+    if not len(rows): return
+    fraction=generator.uniform(.15,.85,len(rows))[:,None]
+    # Few-valued and integer-valued columns have nothing between their rows
+    # (a parity or Collatz rule is undefined at n=3.4): copy, not interpolate.
+    discrete=np.array([len(np.unique(X[:,j]))<=10 or bool(np.all(X[:,j]==np.round(X[:,j]))) for j in range(X.shape[1])])
+    if discrete.all(): return
+    probes=np.where(discrete,X[rows],X[rows]+(X[partner]-X[rows])*fraction)
+    bands=[]
+    for j in numeric:
+        slack=SELECTION_PROBE_SLACK*max(float(np.ptp(Y[:,j])),EPS)
+        bands.append((j,np.minimum(Y[rows,j],Y[partner,j])-slack,np.maximum(Y[rows,j],Y[partner,j])+slack))
+    _SELECTION_PROBES=(probes,bands)
+def between_row_violation(model, cats=None):
+    """Share of between-row probes whose prediction leaves the neighbours' band, or None."""
+    if _SELECTION_PROBES is None: return None
+    probes,bands=_SELECTION_PROBES
+    try: prediction=predict_targets(model,probes,cats if cats is not None else [None]*len(model.trees))
+    except (ArithmeticError, IndexError, RecursionError, ValueError): return None
+    return float(np.mean([np.mean((prediction[:,j]<low)|(prediction[:,j]>high)) for j,low,high in bands]))
 def selection_evaluation(models, X=None, Y=None, cats=None, constraints=None, output_names=()):
     """One immutable score set for recommendations, rendering, and selection."""
     if (X is None)!=(Y is None): raise ValueError("Selection requires both X and Y, or neither")
@@ -4054,6 +4224,8 @@ def selection_evaluation(models, X=None, Y=None, cats=None, constraints=None, ou
         if not scored.feasible or not np.all(np.isfinite(scored.objectives)): continue
         metrics=_selection_metrics(scored,scored.objectives,cats)
         if not all(np.isfinite(value) for value in metrics.values()): continue
+        violation=between_row_violation(model,cats)
+        if violation is not None: metrics["between_row_violation"]=violation
         seen.add(key); entries.append((model,scored,metrics))
     if not entries: raise ValueError(f"No feasible model with finite {source} scores is available for selection")
     return source,entries
@@ -4096,6 +4268,12 @@ def select_best_model(models, X=None, Y=None, cats=None, loss_tolerance=.01, con
 def _select_best(evaluation, loss_tolerance):
     if not np.isfinite(loss_tolerance) or loss_tolerance < 0: raise ValueError("selection loss tolerance must be finite and non-negative")
     source,entries=evaluation
+    probed=[e[2]["between_row_violation"] for e in entries if "between_row_violation" in e[2]]
+    excluded=0
+    if probed:
+        limit=min(probed)+SELECTION_PROBE_MARGIN
+        kept=[e for e in entries if e[2].get("between_row_violation",0.)<=limit]
+        excluded=len(entries)-len(kept); entries=kept
     candidates=[e[0] for e in entries]; vectors=[tuple(e[1].objectives) for e in entries]; metrics=[e[2] for e in entries]
     best_loss=min(item["loss"] for item in metrics)
     allowed_loss=best_loss+max(loss_tolerance*abs(best_loss),LOSS_NOISE_FLOOR)
@@ -4103,7 +4281,7 @@ def _select_best(evaluation, loss_tolerance):
     index=min(eligible,key=lambda i:(metrics[i]["mdl_bits"],metrics[i]["shape"],metrics[i]["loss"],repr(candidates[i].trees)))
     return candidates[index],{"source":source,"objectives":vectors[index],"metrics":metrics[index],
         "policy":"loss_tolerance_shortest_mdl","loss_tolerance":loss_tolerance,"best_loss":best_loss,
-        "allowed_loss":allowed_loss,"eligible_candidates":len(eligible)}
+        "allowed_loss":allowed_loss,"eligible_candidates":len(eligible),"between_row_excluded":excluded}
 
 def constant_selection_warning(model, source):
     """Explain a recommended model that reads no input column, else None."""
@@ -5309,8 +5487,14 @@ def resume_main(args):
     global SEQUENCE_LAYOUT,EQUIVALENCE_COLLAPSE,RESIDUAL_ARCHIVE,QD_PARENT_CHOICE,SCALE_BALANCED_SELECTION,GUARD_EXPLOIT_CHECK
     SEQUENCE_LAYOUT=maps.get(SEQUENCE_LAYOUT_KEY)
     GUARD_EXPLOIT_CHECK=bool(state.get("numeric_guard_check",False))
-    global INTERPOLATION_CHECK,FIT_BACKEND
+    global INTERPOLATION_CHECK,FIT_BACKEND,JUMP_CONSTANT_SCAN
     INTERPOLATION_CHECK=bool(state.get("interpolation_check",False))
+    JUMP_CONSTANT_SCAN=bool(state.get("jump_constant_scan",False))
+    global SELECTION_PROBE_FILTER
+    SELECTION_PROBE_FILTER=bool(state.get("selection_probe_filter",False))
+    global JUMP_MUTATION_WEIGHT
+    JUMP_MUTATION_WEIGHT=float(state.get("jump_mutation_weight",0.))
+    set_selection_probe_data(Xt,Yt,Xv,Yv,cats)
     FIT_BACKEND=state.get("fit_backend","python")
     # Settings that postdate a checkpoint resume with the behaviour it was searched with.
     RESIDUAL_ARCHIVE=bool(state.get("residual_archive",False)); QD_PARENT_CHOICE=state.get("qd_parent_choice","legacy")
@@ -5430,6 +5614,9 @@ def build_arg_parser():
     ap.add_argument("--fit-backend",choices=("auto","python"),default="auto",help="Compiled kernels: auto uses the Cython constant fitter (and, above 8192 rows, the compiled affine readout) when they build: several times faster, agreeing with Python to round-off.  python always uses the pure-Python code (default: auto)")
     ap.add_argument("--numeric-guard-check",choices=("on","off"),default="on",help="Reject models whose values depend on afpo's numeric safety guards (the +/-1e12 value clamp, sinh/cosh/tan input clips) instead of letting them use a guard as a hidden min/max (default: on)")
     ap.add_argument("--interpolation-check",choices=("on","off"),default="on",help="Add a loss term scoring predictions between nearest-neighbour rows against interpolated targets, so equations that only memorise the training rows (e.g. short-period mod sawtooths) lose (default: on)")
+    ap.add_argument("--jump-constant-scan",choices=("on","off"),default="on",help="Before the gradient constant fit, scan data-driven values for constants that only move a jump (mod periods, comparison thresholds, floor scales), which the gradient fit cannot move (default: on)")
+    ap.add_argument("--jump-mutation-weight",type=float,default=1.,help="Initial portfolio weight of the jump mutation, which wraps a subtree in mod(s,c), floordiv(s,c) or if_else(gt(x,c),s,s') as one move; adapted like the other mutation kinds; 0 disables it (default: 1)")
+    ap.add_argument("--selection-probe-filter",choices=("on","off"),default="on",help="Final model choice: drop candidates whose predictions between neighbouring data rows leave the neighbours' target band much more often than the best candidate's (memorised lattice tricks that tie on validation) (default: on)")
     ap.add_argument("--gui",action="store_true",help="Start the browser GUI (training, live Pareto frontier, model explorer) instead of the terminal prompts")
     ap.add_argument("--port",type=int,default=8778,help="Browser GUI port (default: 8778)")
     return ap
@@ -5552,8 +5739,13 @@ def train_from_setup(args, setup, choose_model=None):
     global EQUIVALENCE_COLLAPSE,RESIDUAL_ARCHIVE,QD_PARENT_CHOICE,SCALE_BALANCED_SELECTION,GUARD_EXPLOIT_CHECK
     EQUIVALENCE_COLLAPSE=getattr(args,"equivalence_collapse","on")=="on"; EQUIVALENCE_STATS["children_redrawn"]=0
     GUARD_EXPLOIT_CHECK=getattr(args,"numeric_guard_check","on")=="on"
-    global INTERPOLATION_CHECK,FIT_BACKEND
+    global INTERPOLATION_CHECK,FIT_BACKEND,JUMP_CONSTANT_SCAN
     INTERPOLATION_CHECK=getattr(args,"interpolation_check","on")=="on"
+    JUMP_CONSTANT_SCAN=getattr(args,"jump_constant_scan","on")=="on"
+    global SELECTION_PROBE_FILTER
+    SELECTION_PROBE_FILTER=getattr(args,"selection_probe_filter","on")=="on"
+    global JUMP_MUTATION_WEIGHT
+    JUMP_MUTATION_WEIGHT=float(getattr(args,"jump_mutation_weight",1.))
     FIT_BACKEND=getattr(args,"fit_backend","auto")
     RESIDUAL_ARCHIVE=getattr(args,"residual_archive","on")=="on"; QD_PARENT_CHOICE=getattr(args,"qd_parent_choice","quality_coverage")
     SCALE_BALANCED_SELECTION=getattr(args,"scale_balanced_selection","on")=="on"
@@ -5607,6 +5799,7 @@ def train_from_setup(args, setup, choose_model=None):
     if validation_df is not None:
         Xv,Yv,names2,out2,cats2,_=encode(validation_df,types,maps)
         if names2!=names or out2!=out_names or cats2!=cats: raise ValueError("Validation CSV columns/types do not match training data")
+    set_selection_probe_data(Xt,Yt,Xv,Yv,cats)
     Xtest=Ytest=None
     if args.test_csv:
         test_df=pd.read_csv(args.test_csv,sep=delimiter,engine="python")
@@ -5638,7 +5831,7 @@ def train_from_setup(args, setup, choose_model=None):
                    "stages":{key:stages[key] for key in ("mode","count","interval","age_gap","schedule","threshold_quantile")},
                    "roles":{key:roles[key] for key in ("enabled","interval","mix","retire_after")}},
         "equivalence_collapse":EQUIVALENCE_COLLAPSE,"residual_archive":RESIDUAL_ARCHIVE,"qd_parent_choice":QD_PARENT_CHOICE,"scale_balanced_selection":SCALE_BALANCED_SELECTION,
-        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age",
+        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"selection_probe_filter":SELECTION_PROBE_FILTER,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age",
         "test_csv":str(Path(args.test_csv).resolve()) if args.test_csv else None,
     },df,train_indices,validation_indices,external_validation)
     print(f"Run manifest: {manifest_path}")
@@ -5655,7 +5848,7 @@ def train_from_setup(args, setup, choose_model=None):
         "profile":args.profile,"constraint_metadata":metadata,"constraints":constraints.describe(),"bayesian_particles":args.bayesian_particles,"interaction_discovery":interaction_discovery,
         "island_config":{"count":island_count,"migration_interval":migration_interval,"migrants_per_island":migrants_per_island,"topology":"ring","migration_events":0,"stages":stages,"roles":roles},
         "equivalence_collapse":EQUIVALENCE_COLLAPSE,"residual_archive":RESIDUAL_ARCHIVE,"qd_parent_choice":QD_PARENT_CHOICE,"scale_balanced_selection":SCALE_BALANCED_SELECTION,
-        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age"}
+        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"selection_probe_filter":SELECTION_PROBE_FILTER,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age"}
     head_count=sum(len(heads) for heads in classification_layout(cats)[0])
     population_sizes=cell_population_sizes(args.population,cell_count)
     islands=[new_island_runtime(size,X=X,Xt=Xt,cats=cats,ops=ops,nodes=nodes,depth=depth,head_count=head_count,

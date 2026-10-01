@@ -61,6 +61,8 @@ CONFIGS = {
     "no_residual_archive": {"flags": ["--residual-archive", "off"]},
     "no_guard_check": {"flags": ["--numeric-guard-check", "off"]},
     "no_interpolation_check": {"flags": ["--interpolation-check", "off"]},
+    "no_jump_scan": {"flags": ["--jump-constant-scan", "off"]},
+    "jump_mutation": {"flags": ["--jump-mutation-weight", "1"]},
     "stages_fitness": {"stages": {"mode": "fitness", "count": 3, "interval": 5}},
     "stages_age": {"stages": {"mode": "age", "count": 3, "interval": 5, "age_gap": 10}},
     "stages_both": {"stages": {"mode": "both", "count": 3, "interval": 5, "age_gap": 10}},

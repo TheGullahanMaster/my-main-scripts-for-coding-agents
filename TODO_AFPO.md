@@ -87,6 +87,36 @@ defaults, bootstrap 95% intervals, per case (pooling hides MyTempos).
 - The numeric guard check does not reduce memorisation (ratio_wrap runs
   below 0: 2 with and 2 without it, 20 seeds).
 
+## Harsh gradients 2026-10-01 (jump scan, jump mutation, between-row selection)
+
+Discontinuous targets (mod, stairs, if/else, integer rules) failed because a
+constant that only places a jump has a zero finite-difference gradient almost
+everywhere, so Levenberg-Marquardt never moved it.  Added (all default on;
+checkpoints from before them resume with them off):
+
+- `--jump-constant-scan`: before the gradient fit, constants under a jump
+  operator (mod/floordiv/quantize, comparisons, floor/round/..., if_else
+  condition) are placed by a batched candidate scan (data midpoints for
+  thresholds, range fractions for periods, a log grid, simple numbers), then
+  two shrinking local grids.
+- `--jump-mutation-weight` (1): wraps a subtree in mod(s,c), floordiv(s,c)
+  or if_else(gt(x,c),s,s') as one move; the portfolio adapts its weight.
+- `--selection-probe-filter`: the final choice drops candidates whose
+  predictions between nearest-neighbour rows (training + validation) leave
+  the neighbours' band far more often than the best candidate's.  Integer
+  valued inputs are never probed (parity/Collatz have no in-between).
+
+Results, 10 seeds, solved = held-out R^2 >= .99 (bench_harsh.py) or .999
+(bench_jump.py): bench_harsh 62 -> 89/100, bench_jump 28 -> 58/80; smooth
+benchmark_afpo cases unchanged (5 seeds); bench_complex.py (3-8 inputs,
+reused variables) 2/40 exact recoveries either way: still open.  Run time on
+bench_jump about equal (25.7 s -> 24.6 s mean) after batching the scan.
+
+Notes: `afpo_lib/fitcore.pyx` (the Cython fitter) is not in the repository,
+so every run here used the Python fitter; the scan runs before either
+fitter.  bench_harsh's kink_ifelse jumps at 0.65 but keeps the test row that
+straddles it, so some of its "failures" are that one ambiguous row.
+
 ## What already exists (do not rebuild)
 
 - Islands: `IslandRuntime` (3966), one full search state per island (population,
