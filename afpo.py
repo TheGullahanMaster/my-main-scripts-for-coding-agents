@@ -4162,6 +4162,48 @@ def selection_identity(model):
     """Different fitted coefficients or ADF definitions are different predictors."""
     return repr(model.trees),tuple(model.scales),adf_signature(model.trees,model.adfs),tuple(model.mdl_operators),model.mdl_feature_count
 
+# The validation rows of a gridded or integer dataset sit on the same lattice
+# as the training rows, so an equation that only memorises lattice points
+# (mod/round tricks) can tie the exact law on validation and win on MDL.  The
+# final choice therefore also probes between nearest-neighbour rows of all
+# known data (training + validation): a candidate whose in-between predictions
+# leave the neighbours' target band far more often than the best candidate's
+# is not recommended.  A real jump only disturbs the few probes straddling it.
+SELECTION_PROBE_FILTER = True
+SELECTION_PROBE_ROWS, SELECTION_PROBE_SLACK, SELECTION_PROBE_MARGIN = 200, .05, .10
+_SELECTION_PROBES = None
+def set_selection_probe_data(X, Y, Xv=None, Yv=None, cats=None):
+    """Build the between-row probes used by the final model choice (None disables)."""
+    global _SELECTION_PROBES
+    _SELECTION_PROBES=None
+    if not SELECTION_PROBE_FILTER or X is None: return
+    if Xv is not None and len(Xv): X,Y=np.vstack([X,Xv]),np.vstack([Y,Yv])
+    X=np.asarray(X,float); Y=np.asarray(Y,float)
+    if X.ndim!=2 or len(X)<4: return
+    numeric=[j for j in range(Y.shape[1]) if cats is None or cats[j] is None]
+    if not numeric: return
+    scale=X.std(axis=0); standard=np.divide(X-X.mean(axis=0),scale,out=np.zeros_like(X),where=scale>EPS)
+    generator=np.random.default_rng(len(X)+104729)
+    rows=generator.choice(len(X),min(SELECTION_PROBE_ROWS,len(X)),replace=False)
+    distance=np.sum((standard[rows,None,:]-standard[None,:,:])**2,axis=2); distance[distance<=1e-18]=np.inf
+    partner=np.argmin(distance,axis=1); usable=np.isfinite(distance[np.arange(len(rows)),partner])
+    rows,partner=rows[usable],partner[usable]
+    if not len(rows): return
+    fraction=generator.uniform(.15,.85,len(rows))[:,None]
+    discrete=np.array([len(np.unique(X[:,j]))<=10 for j in range(X.shape[1])])
+    probes=np.where(discrete,X[rows],X[rows]+(X[partner]-X[rows])*fraction)
+    bands=[]
+    for j in numeric:
+        slack=SELECTION_PROBE_SLACK*max(float(np.ptp(Y[:,j])),EPS)
+        bands.append((j,np.minimum(Y[rows,j],Y[partner,j])-slack,np.maximum(Y[rows,j],Y[partner,j])+slack))
+    _SELECTION_PROBES=(probes,bands)
+def between_row_violation(model, cats=None):
+    """Share of between-row probes whose prediction leaves the neighbours' band, or None."""
+    if _SELECTION_PROBES is None: return None
+    probes,bands=_SELECTION_PROBES
+    try: prediction=predict_targets(model,probes,cats if cats is not None else [None]*len(model.trees))
+    except (ArithmeticError, IndexError, RecursionError, ValueError): return None
+    return float(np.mean([np.mean((prediction[:,j]<low)|(prediction[:,j]>high)) for j,low,high in bands]))
 def selection_evaluation(models, X=None, Y=None, cats=None, constraints=None, output_names=()):
     """One immutable score set for recommendations, rendering, and selection."""
     if (X is None)!=(Y is None): raise ValueError("Selection requires both X and Y, or neither")
@@ -4178,6 +4220,8 @@ def selection_evaluation(models, X=None, Y=None, cats=None, constraints=None, ou
         if not scored.feasible or not np.all(np.isfinite(scored.objectives)): continue
         metrics=_selection_metrics(scored,scored.objectives,cats)
         if not all(np.isfinite(value) for value in metrics.values()): continue
+        violation=between_row_violation(model,cats)
+        if violation is not None: metrics["between_row_violation"]=violation
         seen.add(key); entries.append((model,scored,metrics))
     if not entries: raise ValueError(f"No feasible model with finite {source} scores is available for selection")
     return source,entries
@@ -4220,6 +4264,12 @@ def select_best_model(models, X=None, Y=None, cats=None, loss_tolerance=.01, con
 def _select_best(evaluation, loss_tolerance):
     if not np.isfinite(loss_tolerance) or loss_tolerance < 0: raise ValueError("selection loss tolerance must be finite and non-negative")
     source,entries=evaluation
+    probed=[e[2]["between_row_violation"] for e in entries if "between_row_violation" in e[2]]
+    excluded=0
+    if probed:
+        limit=min(probed)+SELECTION_PROBE_MARGIN
+        kept=[e for e in entries if e[2].get("between_row_violation",0.)<=limit]
+        excluded=len(entries)-len(kept); entries=kept
     candidates=[e[0] for e in entries]; vectors=[tuple(e[1].objectives) for e in entries]; metrics=[e[2] for e in entries]
     best_loss=min(item["loss"] for item in metrics)
     allowed_loss=best_loss+max(loss_tolerance*abs(best_loss),LOSS_NOISE_FLOOR)
@@ -4227,7 +4277,7 @@ def _select_best(evaluation, loss_tolerance):
     index=min(eligible,key=lambda i:(metrics[i]["mdl_bits"],metrics[i]["shape"],metrics[i]["loss"],repr(candidates[i].trees)))
     return candidates[index],{"source":source,"objectives":vectors[index],"metrics":metrics[index],
         "policy":"loss_tolerance_shortest_mdl","loss_tolerance":loss_tolerance,"best_loss":best_loss,
-        "allowed_loss":allowed_loss,"eligible_candidates":len(eligible)}
+        "allowed_loss":allowed_loss,"eligible_candidates":len(eligible),"between_row_excluded":excluded}
 
 def constant_selection_warning(model, source):
     """Explain a recommended model that reads no input column, else None."""
@@ -5436,6 +5486,9 @@ def resume_main(args):
     global INTERPOLATION_CHECK,FIT_BACKEND,JUMP_CONSTANT_SCAN
     INTERPOLATION_CHECK=bool(state.get("interpolation_check",False))
     JUMP_CONSTANT_SCAN=bool(state.get("jump_constant_scan",False))
+    global SELECTION_PROBE_FILTER
+    SELECTION_PROBE_FILTER=bool(state.get("selection_probe_filter",False))
+    set_selection_probe_data(Xt,Yt,Xv,Yv,cats)
     FIT_BACKEND=state.get("fit_backend","python")
     # Settings that postdate a checkpoint resume with the behaviour it was searched with.
     RESIDUAL_ARCHIVE=bool(state.get("residual_archive",False)); QD_PARENT_CHOICE=state.get("qd_parent_choice","legacy")
@@ -5557,6 +5610,7 @@ def build_arg_parser():
     ap.add_argument("--interpolation-check",choices=("on","off"),default="on",help="Add a loss term scoring predictions between nearest-neighbour rows against interpolated targets, so equations that only memorise the training rows (e.g. short-period mod sawtooths) lose (default: on)")
     ap.add_argument("--jump-constant-scan",choices=("on","off"),default="on",help="Before the gradient constant fit, scan data-driven values for constants that only move a jump (mod periods, comparison thresholds, floor scales), which the gradient fit cannot move (default: on)")
     ap.add_argument("--jump-mutation-weight",type=float,default=0.,help="Initial portfolio weight of the jump mutation, which wraps a subtree in mod(s,c), floordiv(s,c) or if_else(gt(x,c),s,s') as one move; adapted like the other mutation kinds (default: 0, off)")
+    ap.add_argument("--selection-probe-filter",choices=("on","off"),default="on",help="Final model choice: drop candidates whose predictions between neighbouring data rows leave the neighbours' target band much more often than the best candidate's (memorised lattice tricks that tie on validation) (default: on)")
     ap.add_argument("--gui",action="store_true",help="Start the browser GUI (training, live Pareto frontier, model explorer) instead of the terminal prompts")
     ap.add_argument("--port",type=int,default=8778,help="Browser GUI port (default: 8778)")
     return ap
@@ -5682,6 +5736,8 @@ def train_from_setup(args, setup, choose_model=None):
     global INTERPOLATION_CHECK,FIT_BACKEND,JUMP_CONSTANT_SCAN
     INTERPOLATION_CHECK=getattr(args,"interpolation_check","on")=="on"
     JUMP_CONSTANT_SCAN=getattr(args,"jump_constant_scan","on")=="on"
+    global SELECTION_PROBE_FILTER
+    SELECTION_PROBE_FILTER=getattr(args,"selection_probe_filter","on")=="on"
     global JUMP_MUTATION_WEIGHT
     JUMP_MUTATION_WEIGHT=float(getattr(args,"jump_mutation_weight",0.))
     FIT_BACKEND=getattr(args,"fit_backend","auto")
@@ -5737,6 +5793,7 @@ def train_from_setup(args, setup, choose_model=None):
     if validation_df is not None:
         Xv,Yv,names2,out2,cats2,_=encode(validation_df,types,maps)
         if names2!=names or out2!=out_names or cats2!=cats: raise ValueError("Validation CSV columns/types do not match training data")
+    set_selection_probe_data(Xt,Yt,Xv,Yv,cats)
     Xtest=Ytest=None
     if args.test_csv:
         test_df=pd.read_csv(args.test_csv,sep=delimiter,engine="python")
@@ -5768,7 +5825,7 @@ def train_from_setup(args, setup, choose_model=None):
                    "stages":{key:stages[key] for key in ("mode","count","interval","age_gap","schedule","threshold_quantile")},
                    "roles":{key:roles[key] for key in ("enabled","interval","mix","retire_after")}},
         "equivalence_collapse":EQUIVALENCE_COLLAPSE,"residual_archive":RESIDUAL_ARCHIVE,"qd_parent_choice":QD_PARENT_CHOICE,"scale_balanced_selection":SCALE_BALANCED_SELECTION,
-        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age",
+        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"selection_probe_filter":SELECTION_PROBE_FILTER,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age",
         "test_csv":str(Path(args.test_csv).resolve()) if args.test_csv else None,
     },df,train_indices,validation_indices,external_validation)
     print(f"Run manifest: {manifest_path}")
@@ -5785,7 +5842,7 @@ def train_from_setup(args, setup, choose_model=None):
         "profile":args.profile,"constraint_metadata":metadata,"constraints":constraints.describe(),"bayesian_particles":args.bayesian_particles,"interaction_discovery":interaction_discovery,
         "island_config":{"count":island_count,"migration_interval":migration_interval,"migrants_per_island":migrants_per_island,"topology":"ring","migration_events":0,"stages":stages,"roles":roles},
         "equivalence_collapse":EQUIVALENCE_COLLAPSE,"residual_archive":RESIDUAL_ARCHIVE,"qd_parent_choice":QD_PARENT_CHOICE,"scale_balanced_selection":SCALE_BALANCED_SELECTION,
-        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age"}
+        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"selection_probe_filter":SELECTION_PROBE_FILTER,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age"}
     head_count=sum(len(heads) for heads in classification_layout(cats)[0])
     population_sizes=cell_population_sizes(args.population,cell_count)
     islands=[new_island_runtime(size,X=X,Xt=Xt,cats=cats,ops=ops,nodes=nodes,depth=depth,head_count=head_count,

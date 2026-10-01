@@ -71,5 +71,32 @@ class JumpMutationTest(unittest.TestCase):
         self.assertEqual(a.jump_mutate(("x", 0), 1, ["+", "*"], 15, 5), ("x", 0))
 
 
+class SelectionProbeFilterTest(unittest.TestCase):
+    def tearDown(self):
+        a.set_selection_probe_data(None, None)
+
+    def test_lattice_memoriser_loses_to_the_exact_law(self):
+        X = np.linspace(0, 4, 41)[:, None]; Y = 2 * X                 # rows every 0.1
+        exact = a.Model([("x", 0)], [(2., 0.)], mdl_operators=("+", "sin"), mdl_feature_count=1)
+        # sin(10*pi*x) vanishes on every row but swings between them.
+        memoriser = a.Model([("+", ("x", 0), ("sin", ("*", ("c", 10 * np.pi), ("x", 0))))], [(2., 0.)],
+                            mdl_operators=("+", "sin"), mdl_feature_count=1)
+        a.set_selection_probe_data(X[::2], Y[::2], X[1::2], Y[1::2])
+        self.assertEqual(a.between_row_violation(exact), 0.)
+        self.assertGreater(a.between_row_violation(memoriser), .5)
+        def entry(model, bits):
+            return (model, model, {"loss": 0., "shape": 0., "mdl_bits": bits,
+                                   "between_row_violation": a.between_row_violation(model)})
+        evaluation = ("validation", [entry(exact, 50.), entry(memoriser, 10.)])   # MDL favours the memoriser
+        chosen, info = a._select_best(evaluation, .01)
+        self.assertIs(chosen, exact)
+        self.assertEqual(info["between_row_excluded"], 1)
+
+    def test_off_switch_and_missing_data_disable_it(self):
+        with patch.object(a, "SELECTION_PROBE_FILTER", False):
+            a.set_selection_probe_data(np.zeros((8, 1)), np.zeros((8, 1)))
+        self.assertIsNone(a.between_row_violation(a.Model([("x", 0)], [(1., 0.)])))
+
+
 if __name__ == "__main__":
     unittest.main()
