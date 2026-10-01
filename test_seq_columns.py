@@ -141,12 +141,43 @@ class ExplainTests(unittest.TestCase):
                     sp = {"s": {"arch": ea, "dim": 32, "heads": 4}, "t": {"arch": da, "dim": 32, "heads": 4, "attention": att}}
                     m = S.SeqMLP([("n", 0, 1), ("m", 1, 1), ("s", 2, Ti)], ct, {"s": vc, "t": vc}, layout, sp, "latent", None).to(DEV)
                     with torch.no_grad(): m.bridge.weight[:, 1] = 0; m.decoders["t"].head.bias[S.EOS] = -1e4  # input "m" is cut off
-                    ex = S.explain(m, x); steps = ex["decoders"]["t"]["attr"]
-                    self.assertEqual(len(steps), To)
-                    self.assertTrue(all(a["__numeric__"][1] == 0 for a in steps)); self.assertEqual(ex["regular"]["o"]["__numeric__"][1], 0)
-                    self.assertTrue(any(a["__numeric__"][0] != 0 for a in steps))
+                    ex = S.explain(m, x)
+                    occ = M.occlusion_attribution(m, x, [("n", 0, 1), ("m", 1, 1), ("s", 2, Ti)], ct, {"s": vc, "t": vc}, layout, {})["outputs"]
+                    steps = occ["t"]["values"]
+                    self.assertEqual(len(steps), To); self.assertEqual(len(ex["decoders"]["t"]["ids"]), To)
+                    self.assertTrue(all(a["columns"]["m"] == 0 for a in steps)); self.assertEqual(occ["o"]["columns"]["m"], 0)
+                    self.assertTrue(any(a["columns"]["n"] != 0 for a in steps))
+                    self.assertEqual(len(steps[0]["tokens"]["s"]), 4)  # one entry per real input token
                     self.assertTrue(ex["attention"])
                     for r in ex["attention"]: self.assertTrue(torch.allclose(r["weights"].sum(-1), torch.ones(1), atol=1e-4), r["module"])
+
+
+class AttributionAllModesTests(InTempDir):
+    def test_plain_mlp_attribution_finds_what_the_target_depends_on(self):
+        rng = np.random.default_rng(0); N = 3000
+        x1, noise = rng.uniform(-1, 1, N), rng.uniform(-1, 1, N)
+        txt = ["".join(rng.choice(list("abc"), rng.integers(2, 6))) for _ in range(N)]
+        cat = rng.choice(["lo", "hi"], N)
+        y = 3 * x1 + 2 * np.array([t.count("b") for t in txt]) + np.where(cat == "hi", 4.0, 0.0)
+        pd.DataFrame({"x1": x1, "noise": noise, "txt": txt, "cat": cat, "y": y, "sign": np.where(x1 > 0, "pos", "neg")}).to_csv("p.csv", index=False)
+        ct = {"x1": "in", "noise": "in", "txt": "intexcat", "cat": "inlabcat", "y": "out", "sign": "outlabcat"}
+        voc = {}
+        for c, t in ct.items(): M._setup_vocab_for_col(c, t, "p.csv", ",", voc, {})
+        ins, outs = ["x1", "noise", "txt", "cat"], ["y", "sign"]
+        ds, _, _ = M.prepare_train_val("p.csv", ",", ins, outs, ct, voc, {})
+        M.main("p.csv", ",", ins, outs, ct, ds.vocabularies, ds.scalings, {}, hidden_dims=[128, 128], activation_cls=nn.GELU,
+               custom_lr=2e-3, batch_size=64, progress_callback=lambda i: i.get("step", 0) >= 3000, train_dataset=ds)
+        smp = M.InteractiveSampler("model.pt", "config.json")
+        a = smp.attribution_view({"x1": 0.8, "noise": 0.5, "txt": "abba", "cat": "hi"})["outputs"]
+        y_cols = a["y"]["columns"]; print("y attribution by column:", {k: round(v, 2) for k, v in y_cols.items()})
+        self.assertGreater(abs(y_cols["x1"]), 5 * abs(y_cols["noise"]))
+        self.assertAlmostEqual(y_cols["cat"], 4.0, delta=1.0)  # hi instead of lo adds 4 to y
+        toks = a["y"]["tokens"]["txt"]; print("y attribution per character of 'abba':", [round(v, 2) for v in toks])
+        self.assertEqual(len(toks), 4)
+        # replacement (vocabulary a, b, c): a 'b' becomes 'a' or 'c' -> y drops by 2;
+        # an 'a' becomes 'b' (+2) or 'c' (0) -> y rises by 1 on average, so the 'a' scores -1
+        for k, want in enumerate((-1.0, 2.0, 2.0, -1.0)): self.assertAlmostEqual(toks[k], want, delta=0.4)
+        s_cols = a["sign"]["columns"]; self.assertGreater(abs(s_cols["x1"]), 5 * abs(s_cols["noise"]))
 
 
 class TextFitTests(unittest.TestCase):
@@ -227,6 +258,38 @@ class DelimiterTests(InTempDir):
         self.assertEqual(M.training_file_delimiter("d.tsv", ct, dict(old_fmt, delimiter=";")), ";")  # a recorded one wins
         with open("h.csv", "w") as f: f.write("a;b;c\n1;2;3\n")
         self.assertEqual(M.training_file_delimiter("h.csv", {"a": "in", "c": "out", "b": "i"}), ";")
+
+
+class FastDatasetTests(InTempDir):
+    def test_array_path_matches_row_encoder_for_every_column_type(self):
+        rng = np.random.default_rng(0); N = 300
+        words = ["ab", "abc", "ca", "bbbbbb", "ac b", "cab a"]
+        df = pd.DataFrame({"x": rng.normal(size=N), "lab": rng.choice(["p", "q", "r"], N), "lc": rng.choice(["u", "v"], N),
+                           "tx": rng.choice(words, N), "tc": rng.choice(words, N), "enc": rng.choice(words, N),
+                           "y": rng.normal(size=N), "ylab": rng.choice(["s", "t"], N), "ytx": rng.choice(words, N),
+                           "ycat": rng.choice(["k", "l", "m"], N), "yexc": rng.choice(words, N), "ydec": rng.choice(words, N),
+                           "flag": rng.choice([True, False], N)})
+        df.to_csv("all.csv", index=False)
+        ct = {"x": "in", "lab": "inlab", "lc": "inlabcat", "tx": "intex", "tc": "intexcat", "enc": "inenc", "flag": "in",
+              "y": "out", "ylab": "outlab", "ytx": "outex", "ycat": "outlabcat", "yexc": "outexcat", "ydec": "outdec"}
+        voc = {}
+        for c, t in ct.items(): M._setup_vocab_for_col(c, t, "all.csv", ",", voc, {}, "word" if c == "enc" else "char")
+        ins = [c for c, t in ct.items() if "in" in t]; outs = [c for c, t in ct.items() if "out" in t]
+        ds, _, _ = M.prepare_train_val("all.csv", ",", ins, outs, ct, voc, {})
+        self.assertIsNotNone(ds._in_segs)
+        idx = np.arange(len(ds)); xb, yb = ds.batch(idx)
+        for i in idx:
+            xr, yr = ds._getitem_rowwise(int(i))
+            self.assertTrue(torch.equal(xb[i], xr.float()), f"inputs differ in row {i}")
+            self.assertTrue(torch.equal(yb[i], yr.float()), f"targets differ in row {i}")
+        self.assertEqual(len(M.FastLoader(ds, 64)), -(-len(ds) // 64))
+        n = sum(len(x) for x, _ in M.FastLoader(ds, 64, shuffle=True)); self.assertEqual(n, len(ds))
+
+    def test_empty_dataset_names_the_cause(self):
+        pd.DataFrame({"a": ["x", "y", "z"], "b": [1, 2, 3]}).to_csv("bad.csv", index=False)
+        with self.assertRaises(ValueError) as cm:
+            M.prepare_train_val("bad.csv", ",", ["a"], ["b"], {"a": "in", "b": "out"}, {}, {})
+        self.assertIn("'a'", str(cm.exception)); self.assertIn("not numbers", str(cm.exception))
 
 
 class OutexcatTests(InTempDir):
@@ -311,8 +374,23 @@ class TrainingTests(InTempDir):
         self.assertTrue(any(m["side"] == "encoder" and m["kind"] == "self" for m in v["maps"]))  # transformer encoder self-attention
         att = v["regular"]["score"]["review"]; toks = v["encoders"]["review"]["tokens"]
         self.assertEqual(len(att), len(toks))
-        strongest = toks[int(np.argmax(np.abs(att)))]; print("score attribution peaks at", strongest)
-        self.assertIn(strongest, ("great", "good"))
+        # over many reviews, sentiment words must carry more of the score's attribution than filler words
+        senti, filler = [], []
+        for r in sample["review"].head(40):
+            v = s.sequence_view({"review": r})
+            for t, a in zip(v["encoders"]["review"]["tokens"], v["regular"]["score"]["review"]):
+                (senti if t in pos + neg else filler).append(abs(a))
+        print(f"mean |attribution|: sentiment words {np.mean(senti):.4f}, filler words {np.mean(filler):.4f}")
+        signed = {"pos": [], "neg": []}
+        for r in sample["review"].head(40):
+            v = s.sequence_view({"review": r})
+            for t, a in zip(v["encoders"]["review"]["tokens"], v["regular"]["score"]["review"]):
+                if t in pos: signed["pos"].append(a)
+                elif t in neg: signed["neg"].append(a)
+        up, down = np.mean(np.array(signed['pos']) > 0), np.mean(np.array(signed['neg']) < 0)
+        print(f"positive words push the score up {up:.0%} of the time, negative words down {down:.0%}")
+        self.assertGreater(np.mean(senti), 2 * np.mean(filler))
+        self.assertGreaterEqual(up, 0.8); self.assertGreaterEqual(down, 0.8)
 
 
 if __name__ == "__main__":

@@ -1343,8 +1343,10 @@ class CombinedLoss(nn.Module):
         else:
             n = len(data)
             idx = list(range(n)) if n <= max_rows else np.random.default_rng(0).choice(n, max_rows, replace=False).tolist()
-            loader = DataLoader(torch.utils.data.Subset(data, idx), batch_size=1024, shuffle=False)
-            targets = torch.cat([t.float() for _, t in loader], 0)
+            if hasattr(data, "batch"): targets = data.batch(idx)[1].float()
+            else:
+                loader = DataLoader(torch.utils.data.Subset(data, idx), batch_size=1024, shuffle=False)
+                targets = torch.cat([t.float() for _, t in loader], 0)
         pred_dim = max(e['end'] for e in self.output_layout)
         preds = torch.zeros(len(targets), pred_dim)
         for e in self.output_layout:
@@ -1616,6 +1618,7 @@ class CustomDataset(Dataset):
             self.setup_vocabularies()
             self.convert_labels_to_numbers()
             self.scale_data()
+            self._build_arrays()
         else:
             print("⚠ Warning: Dataset is empty after validation (or file was empty).")
 
@@ -1627,18 +1630,27 @@ class CustomDataset(Dataset):
         initial_count = len(self.df)
         active_cols = self.input_cols + self.output_cols
         
-        # 1. Drop basic NaNs in used columns
+        # 1. Drop basic NaNs in used columns (counted per column, to explain an empty result)
+        self.drop_report = {}  # column -> rows dropped because the value was missing or not a number
+        for col in active_cols:
+            n_missing = int(self.df[col].isna().sum())
+            if n_missing: self.drop_report[col] = f"{n_missing} missing"
         self.df.dropna(subset=active_cols, inplace=True)
         
         # 2. Validate Numeric Columns
         # We check columns marked as scalar inputs/outputs ('in', 'out')
         numeric_cols = [c for c in active_cols if self.col_types[c] in ['in', 'out']]
-        
         for col in numeric_cols:
             # Coerce errors to NaN, then drop rows that became NaN
             # This handles cases where a number column contains "error" or garbage text
             # True / False (bool dtype, or the words in a text column) count as 1 / 0
-            self.df[col] = pd.to_numeric(self.df[col].map(_bool_as_number), errors='coerce').astype(float)
+            converted = numeric_series(self.df[col])
+            bad = int(converted.isna().sum())
+            if bad:
+                sample = self.df[col][converted.isna()].astype(str).head(3).tolist()
+                self.drop_report[col] = (self.drop_report.get(col, "") + ", " if col in self.drop_report else "") + \
+                    f"{bad} not numbers (e.g. {', '.join(repr(x) for x in sample)})"
+            self.df[col] = converted
         
         self.df.dropna(subset=numeric_cols, inplace=True)
 
@@ -1706,8 +1718,8 @@ class CustomDataset(Dataset):
                 if col in self.scalings and 'max_len' in self.scalings[col]:
                     max_len = self.scalings[col]['max_len']
                 elif col_type in seqm.SEQ_TYPES:  # tokens (+ <eos> for outputs)
-                    vocab = self.vocabularies[col]
-                    max_len = int(self.df[col].apply(lambda t: seqm.token_count(t, vocab, col_type == 'outdec')).max())
+                    toks = self._tokens(col)
+                    max_len = max((len(t) for t in toks), default=0) + (1 if col_type == 'outdec' else 0)
                     self.scalings[col] = {'max_len': max_len}
                 else:
                     max_len = self.df[col].apply(len).max()
@@ -1796,8 +1808,89 @@ class CustomDataset(Dataset):
         
     def __len__(self):
         return len(self.df)
-        
+
+    def _tokens(self, col):
+        """Token lists of a text encoder / decoder column, tokenized once."""
+        cache = self.__dict__.setdefault("_tok_cache", {})
+        if col not in cache:
+            mode = seqm.tokenizer_of(self.vocabularies[col])
+            cache[col] = [seqm.tokenize(t, mode) for t in self.df[col].astype(str)]
+        return cache[col]
+
+    def _text_ids(self, col, max_len, offset=0):
+        """(N, max_len) int array of a character column's vocabulary ids (0 = padding), truncated like __getitem__."""
+        vocab = self.vocabularies[col]; out = np.zeros((len(self.df), max_len), dtype=np.int64)
+        for r, v in enumerate(self.df[col].astype(str)):
+            ids = [vocab.get(ch, 0) for ch in v[:max_len]]
+            out[r, :len(ids)] = ids
+        return out
+
+    def _seq_ids(self, col, is_output):
+        vocab, ml = self.vocabularies[col], self.scalings[col]['max_len']
+        out = np.zeros((len(self.df), ml), dtype=np.int64)
+        for r, toks in enumerate(self._tokens(col)):
+            ids = [vocab.get(t, seqm.UNK) for t in toks]
+            ids = ids[:ml - 1] + [seqm.EOS] if is_output else ids[:ml]
+            out[r, :len(ids)] = ids
+        return out
+
+    def _segments(self, cols, is_input):
+        """Encode every column once: [("dense", width, float32 (N, width)) | ("onehot", width, ids (N, L), classes)].
+        One-hot columns stay as ids (expanded per batch), so wide one-hot inputs do not fill memory."""
+        segs, N = [], len(self.df)
+        for col in cols:
+            ct = self.col_types[col]
+            if ct == 'inim': return None  # images: patch codes are built row by row (see _getitem_rowwise)
+            if ct == 'inenc' or ct == 'outdec':
+                a = self._seq_ids(col, ct == 'outdec'); segs.append(("dense", a.shape[1], a.astype(np.float32)))
+            elif ct == 'intexcat' and is_input:
+                V = len(self.vocabularies[col]); ids = self._text_ids(col, self.scalings[col]['max_len']) - 1
+                ids[(ids < 0) | (ids >= V)] = -1
+                segs.append(("onehot", ids.shape[1] * V, ids, V))
+            elif ct == 'inlabcat' and is_input:
+                V = len(self.vocabularies[col]); ids = self.df[col].to_numpy().astype(np.int64)[:, None]
+                ids[(ids < 0) | (ids >= V)] = -1
+                segs.append(("onehot", V, ids, V))
+            elif ct in ('intex', 'outex', 'outexcat') or (ct == 'intexcat' and not is_input):
+                a = self._text_ids(col, self.scalings[col]['max_len']); segs.append(("dense", a.shape[1], a.astype(np.float32)))
+            elif ct == 'outlabcat':
+                segs.append(("dense", 1, self.df[col].to_numpy().astype(np.int64).astype(np.float32)[:, None]))
+            else:  # in, out, inlab, outlab: already numeric / scaled
+                segs.append(("dense", 1, self.df[col].to_numpy(dtype=np.float32)[:, None]))
+        return segs
+
+    def _build_arrays(self):
+        self._in_segs = self._segments(self.input_cols, True)
+        self._out_segs = self._segments(self.output_cols, False) if self._in_segs is not None else None
+        if self._in_segs is None or self._out_segs is None: self._in_segs = self._out_segs = None
+
+    @staticmethod
+    def _assemble(segs, idx):
+        width = sum(sg[1] for sg in segs); out = np.zeros((len(idx), width), dtype=np.float32); start = 0
+        for sg in segs:
+            if sg[0] == "dense": out[:, start:start + sg[1]] = sg[2][idx]
+            else:
+                ids, V = sg[2][idx], sg[3]
+                rows, pos = np.nonzero(ids >= 0)
+                out[rows, start + pos * V + ids[rows, pos]] = 1.0
+            start += sg[1]
+        return out
+
+    def batch(self, idx):
+        """(inputs, targets) float tensors for the rows idx (array of positions), built from the pre-encoded columns."""
+        idx = np.asarray(idx, dtype=np.int64)
+        if getattr(self, "_in_segs", None) is None:
+            items = [self._getitem_rowwise(int(i)) for i in idx]
+            return torch.stack([a for a, _ in items]), torch.stack([b for _, b in items])
+        return torch.from_numpy(self._assemble(self._in_segs, idx)), torch.from_numpy(self._assemble(self._out_segs, idx))
+
     def __getitem__(self, idx):
+        if getattr(self, "_in_segs", None) is None: return self._getitem_rowwise(idx)
+        x, y = self.batch([idx])
+        return x[0], y[0]
+
+    def _getitem_rowwise(self, idx):
+        """Reference row encoder (used for image columns, and to test the array path against)."""
         # NOTE: Because we validated in __init__, we assume data here is generally valid.
         # However, for images, file corruption could still cause runtime crashes,
         # so we keep the try/except block for image loading specifically.
@@ -1935,11 +2028,9 @@ class CustomDataset(Dataset):
                 vocab = self.vocabularies[col]
                 num_classes = text_num_classes(col_type, vocab) if col_type == 'outexcat' else len(vocab)
                 counts = np.ones(num_classes, dtype=np.float32)
-                if col_type == 'outlabcat':
-                    for val in self.df[col]:
-                        # Values are already mapped ints
-                        idx = int(val)
-                        if 0 <= idx < num_classes: counts[idx] += 1
+                if col_type == 'outlabcat':  # values are already mapped ints
+                    v = self.df[col].to_numpy().astype(np.int64); v = v[(v >= 0) & (v < num_classes)]
+                    counts += np.bincount(v, minlength=num_classes).astype(np.float32)
                 elif col_type == 'outexcat':
                     # This logic assumes raw strings for outexcat were kept, 
                     # but scale_data didn't overwrite them for *cat types. 
@@ -1968,7 +2059,7 @@ def _row_group_keys(df, cols, col_types):
     for c in cols:
         v = df[c]
         if col_types.get(c) in ('in', 'out'):
-            v = pd.to_numeric(v.map(_bool_as_number), errors='coerce').astype(float).map(lambda x: format(x, '.12g'))
+            v = numeric_series(v).map(lambda x: format(x, '.12g'))
         norm[c] = v.astype(str)
     return pd.util.hash_pandas_object(pd.DataFrame(norm, index=df.index), index=False)
 
@@ -2044,6 +2135,10 @@ def prepare_train_val(csv_file, delimiter, input_cols, output_cols, col_types, v
     print(f"Data: {n_raw} rows read, {dups} exact duplicates removed.")
     train_ds = CustomDataset(csv_file, delimiter, input_cols, output_cols, col_types, vocabularies, scalings or {}, image_params, df=df,
                              scale_ranges=scale_ranges)
+    if len(train_ds) == 0:
+        why = "; ".join(f"'{c}': {r}" for c, r in getattr(train_ds, "drop_report", {}).items())
+        raise ValueError("No usable training rows: every row was dropped while cleaning the data"
+                         + (f" ({why}). A column typed numeric (in / out) must hold numbers." if why else "."))
     val_ds = None
     if val_df is not None:
         if report.get("train_rows_held_out"):
@@ -2134,7 +2229,7 @@ def ask_validation_and_prepare(file_path, delimiter, input_cols, output_cols, co
                                             scale_ranges=scale_ranges)
     val_loader, val_interval = None, 1000
     if val_ds is not None:
-        val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+        val_loader = make_loader(val_ds, batch_size, shuffle=False)
         if ask_interval: val_interval = int(input("Validation interval (steps): ").strip())
     else:
         print("Validation skipped.")
@@ -2414,11 +2509,41 @@ def to_display_units(v, s):
     return (v - lo) / w * (s["max"] - s["min"]) + s["min"]
 
 
+def numeric_series(s):
+    """Column -> float Series: booleans and the words true / false (any case) become 1 / 0, other text NaN. Vectorized."""
+    if pd.api.types.is_bool_dtype(s) or pd.api.types.is_numeric_dtype(s): return s.astype(float)
+    low = s.astype(str).str.strip().str.lower()
+    is_bool = low.isin(["true", "false"])
+    out = pd.to_numeric(s.where(~is_bool), errors="coerce").astype(float)
+    return out.mask(is_bool, (low == "true").astype(float))
+
+
 def _bool_as_number(v):
     """True / False (bools or the strings, any case) -> 1 / 0; anything else unchanged."""
     if isinstance(v, (bool, np.bool_)): return int(v)
     if isinstance(v, str) and v.strip().lower() in ("true", "false"): return int(v.strip().lower() == "true")
     return v
+
+
+class FastLoader:
+    """DataLoader replacement for CustomDataset: whole batches are sliced from the pre-encoded arrays
+    (no per-row Python, no collation). Iterates (inputs, targets) like DataLoader; reshuffles every epoch."""
+    def __init__(self, dataset, batch_size, shuffle=False):
+        if batch_size < 1: raise ValueError(f"batch size must be >= 1, got {batch_size}")
+        self.dataset, self.batch_size, self.shuffle = dataset, int(batch_size), shuffle
+
+    def __len__(self): return -(-len(self.dataset) // self.batch_size)
+
+    def __iter__(self):
+        n = len(self.dataset)
+        order = torch.randperm(n).numpy() if self.shuffle else np.arange(n)
+        for i in range(0, n, self.batch_size): yield self.dataset.batch(order[i:i + self.batch_size])
+
+
+def make_loader(dataset, batch_size, shuffle=False):
+    """FastLoader for CustomDataset (any batch size), else a regular DataLoader."""
+    if isinstance(dataset, CustomDataset): return FastLoader(dataset, batch_size, shuffle)
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
 
 
 def has_seq_columns(col_types):
@@ -2463,14 +2588,14 @@ def main(csv_file, delimiter=',', input_cols=[], output_cols=[], col_types={}, v
     output_activation: {"name", "params"} applied to numeric outputs (None / Linear = none).
     hidden_dims may be [] (a perceptron; with encoders / decoders the bridge becomes one linear map)."""
     seq_params = seq_params or {}
-    check_mlp_options(mlp_mode, layer_activations, output_activation, hidden_dims)
+    check_mlp_options(mlp_mode, layer_activations, output_activation, hidden_dims, norm_type, groups, batch_size)
     if layer_activations: activation_cls = [activation_from_config(c, activation_type) for c in layer_activations]
     out_act = None if is_linear_activation(output_activation) else activation_from_config(output_activation, wrap=False)
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     dataset = train_dataset if train_dataset is not None else CustomDataset(csv_file, delimiter, input_cols, output_cols, col_types, vocabularies, scalings, image_params)
-    train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    train_loader = make_loader(dataset, batch_size, shuffle=True)
     # --- NEW: Calculate Class Weights ---
     print("Calculating class weights for dynamic loss balancing...")
     class_weights = dataset.compute_class_weights(device=device)
@@ -2746,7 +2871,7 @@ def main_auto_grow(csv_file, delimiter=',', input_cols=[], output_cols=[], col_t
     patience = auto_config["patience"]
 
     dataset = train_dataset if train_dataset is not None else CustomDataset(csv_file, delimiter, input_cols, output_cols, col_types, vocabularies, scalings, image_params)
-    train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    train_loader = make_loader(dataset, batch_size, shuffle=True)
     print("Calculating class weights for dynamic loss balancing...")
     class_weights = dataset.compute_class_weights(device=device)
     for col, w in class_weights.items():
@@ -3289,7 +3414,7 @@ def _evolution_evaluate(individual, csv_file, delimiter, input_cols, output_cols
 
     dataset = train_dataset if train_dataset is not None else CustomDataset(
         csv_file, delimiter, input_cols, output_cols, col_types, vocabularies, scalings, image_params)
-    train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    train_loader = make_loader(dataset, batch_size, shuffle=True)
 
     input_dims = calculate_input_dim(input_cols, col_types, scalings, vocabularies)
     output_layout, output_pred_dim, output_tgt_dim = build_output_layout(output_cols, col_types, scalings, vocabularies)
@@ -5183,7 +5308,11 @@ def numeric_output_positions(output_layout):
     return [e["start"] for e in output_layout if e["type"] == "out"]
 
 
-def check_mlp_options(mlp_mode, layer_activations, output_activation, hidden_dims):
+def check_mlp_options(mlp_mode, layer_activations, output_activation, hidden_dims, norm_type=None, groups=None, batch_size=None):
+    if batch_size is not None and int(batch_size) < 1: raise ValueError(f"Batch size must be at least 1 (got {batch_size}).")
+    if norm_type == "group" and groups:
+        bad = [w for w in hidden_dims if w % int(groups)]
+        if bad: raise ValueError(f"Group normalization with {groups} groups needs every hidden width divisible by {groups}; {bad} is not.")
     if layer_activations is not None and len(layer_activations) != len(hidden_dims):
         raise ValueError(f"{len(layer_activations)} layer activations given for {len(hidden_dims)} hidden layers.")
     if mlp_mode == 1 and (layer_activations or not is_linear_activation(output_activation)):
@@ -6394,11 +6523,11 @@ def run_benchmark(csv_file, delimiter, input_cols, output_cols, col_types, vocab
     dataset, val_dataset, _ = prepare_train_val(csv_file, delimiter, input_cols, output_cols, col_types, vocabularies,
                                                 image_params, val_frac=vfrac, val_file=vfile, val_delimiter=val_delimiter)
     scalings = dataset.scalings
-    train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    train_loader = make_loader(dataset, batch_size, shuffle=True)
     if val_dataset is not None:
         if len(val_dataset) > 3000:  # keep evaluation fast, as before
             val_dataset = torch.utils.data.Subset(val_dataset, np.random.default_rng(0).choice(len(val_dataset), 3000, replace=False).tolist())
-        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+        val_loader = make_loader(val_dataset, batch_size, shuffle=False)
 
     input_dims = calculate_input_dim(input_cols, col_types, scalings, vocabularies)
     
@@ -7688,6 +7817,124 @@ def run_cross_validation(csv_file, delimiter, input_cols, output_cols, col_types
 ##############################################
 # Interactive sampling GUI (local web server, stdlib only)
 ##############################################
+TEXT_INPUT_TYPES = ("intex", "intexcat", "inenc")
+
+
+def _token_label(col, col_type, vocab, tok_id):
+    if col_type == "inenc":
+        return seqm.decoded_tokens([tok_id], vocab)[0] if tok_id >= len(seqm.SPECIALS) else "<unk>"
+    inv = {v: k for k, v in vocab.items()}
+    return inv.get(tok_id, "?")
+
+
+def occlusion_attribution(model, x, input_slots, col_types, vocabs, output_layout, scalings, chunk=256, samples=16):
+    """How much each output changes when one input is taken away, for any model and column types.
+    x: (1, D) encoded input row. input_slots: [(col, start, width)].
+    Taken away: numeric -> 0 in model units (middle of the default scaling); category (one-hot or label code) ->
+    replaced by each other category in turn, averaged (an all-zero one-hot is an input the model never saw);
+    image -> all patch codes 0; text (intex / intexcat / inenc) -> the whole text removed, and separately each
+    character / token replaced by every other token of the column's vocabulary (or `samples` random ones), averaged,
+    with every position unchanged (deleting would shift the later tokens, which position-aware inputs notice).
+    Value = output with the input - output without it, per output column: numeric -> real units, label code -> code,
+    category -> probability of the predicted class, text -> per position / generated step the log-probability of the
+    predicted token. Decoders are teacher-forced on the text they generate for x, so every variant is scored on it."""
+    model.eval()
+    targets = None
+    with torch.no_grad(): base_out = model(x)
+    gen = {}
+    if getattr(model, "needs_targets", False):
+        targets = x.new_zeros(1, max(e["tgt_end"] for e in output_layout))
+        for e in output_layout:
+            if e["type"] != "outdec" or e["col"] not in model.decoders: continue
+            ids = base_out[0, e["start"]:e["end"]].view(e["max_len"], e["num_classes"]).argmax(-1)
+            n = int((ids == seqm.EOS).nonzero()[0, 0]) + 1 if (ids == seqm.EOS).any() else len(ids)
+            ids[n:] = seqm.PAD; gen[e["col"]] = (ids, n); targets[0, e["tgt_start"]:e["tgt_end"]] = ids.float()
+    variants, entries, inputs = [x[0]], [], []  # entries: (col, token index or None, [variant rows averaged])
+
+    def add(v): variants.append(v); return len(variants) - 1
+    for col, start, width in input_slots:
+        ct = col_types[col]; sl = x[0, start:start + width]
+        if ct in ("inlabcat", "inlab"):
+            codes = range(width) if ct == "inlabcat" else sorted(set(vocabs[col].values()))
+            cur = int(sl.argmax()) if ct == "inlabcat" else int(round(float(sl[0])))
+            rows = []
+            for k in codes:
+                if k == cur: continue
+                v = x[0].clone()
+                if ct == "inlabcat": v[start:start + width] = 0; v[start + k] = 1.0
+                else: v[start] = float(k)
+                rows.append(add(v))
+            entries.append((col, None, rows or [0])); inputs.append({"col": col, "type": ct, "tokens": None})
+        elif ct in TEXT_INPUT_TYPES:
+            V = len(vocabs[col]) if ct == "intexcat" else None
+            ids = (sl.view(-1, V).argmax(-1) + 1) * (sl.view(-1, V).sum(-1) > 0) if ct == "intexcat" else sl.round().long()
+            n = int((ids > 0).sum())
+            v = x[0].clone(); v[start:start + width] = 0; entries.append((col, None, [add(v)]))
+            labels = []
+            # replacement candidates: the column's real token ids (intex / intexcat: 1..V, inenc: past the specials)
+            cand = (list(range(len(seqm.SPECIALS), seqm.vocab_size(vocabs[col]))) if ct == "inenc"
+                    else list(range(1, len(vocabs[col]) + 1)))
+            rng = torch.Generator().manual_seed(0)  # the same replacements every time
+            for j in range(n):
+                others = [c for c in cand if c != int(ids[j])]
+                if len(others) > samples: others = [others[i] for i in torch.randperm(len(others), generator=rng)[:samples].tolist()]
+                rows = []
+                for r in others or [int(ids[j])]:
+                    v = x[0].clone()
+                    if ct == "intexcat": blk = v[start:start + width].view(-1, V); blk[j] = 0; blk[j, r - 1] = 1.0
+                    else: v[start + j] = float(r)
+                    rows.append(add(v))
+                entries.append((col, j, rows)); labels.append(_token_label(col, ct, vocabs[col], int(ids[j])))
+            inputs.append({"col": col, "type": ct, "tokens": labels})
+        else:
+            v = x[0].clone(); v[start:start + width] = 0; entries.append((col, None, [add(v)]))
+            inputs.append({"col": col, "type": ct, "tokens": None})
+    X = torch.stack(variants); outs = []
+    with torch.no_grad():
+        for i in range(0, len(X), chunk):
+            xb = X[i:i + chunk]
+            outs.append((model(xb, targets.expand(len(xb), -1)) if targets is not None else model(xb)).float())
+    out = torch.cat(outs)
+
+    def spread(effect):  # (R,) -> {"columns": {col: v}, "tokens": {col: [per token]}}
+        res = {"columns": {}, "tokens": {}}
+        for col, j, rows in entries:
+            v = float(effect[0] - effect[rows].mean())
+            if j is None: res["columns"][col] = v
+            else: res["tokens"].setdefault(col, []).append(v)
+        return res
+    result = {}
+    for e in output_layout:
+        col, ct, sl = e["col"], e["type"], out[:, e["start"]:e["end"]]
+        if ct == "out":
+            s = scalings.get(col, {}); eff = sl[:, 0]
+            if "min" in s: eff = to_display_units(eff, s)
+            result[col] = {"kind": "scalar", "unit": "value", **spread(eff)}
+        elif ct == "outlab": result[col] = {"kind": "scalar", "unit": "label code", **spread(sl[:, 0])}
+        elif ct == "outlabcat":
+            k = int(sl[0].argmax()); inv = {v: kk for kk, v in vocabs[col].items()}
+            result[col] = {"kind": "scalar", "unit": f"probability of '{inv.get(k, k)}'", **spread(sl.softmax(-1)[:, k])}
+        elif ct in ("outexcat", "outdec"):
+            L = sl.view(len(X), e["max_len"], e["num_classes"]).log_softmax(-1)
+            if col in gen: ids, n = gen[col]
+            else:
+                ids = L[0].argmax(-1); stop = seqm.EOS if ct == "outdec" else 0
+                n = int((ids == stop).nonzero()[0, 0]) + (1 if ct == "outdec" else 0) if (ids == stop).any() else len(ids)
+                n = max(n, 1)
+            vocab = vocabs[col]
+            labels = ([seqm.decoded_tokens([int(i)], vocab)[0] if int(i) >= len(seqm.SPECIALS) else {seqm.EOS: "<eos>", seqm.UNK: "<unk>"}.get(int(i), "<pad>")
+                       for i in ids[:n]] if ct == "outdec" else [{v: kk for kk, v in vocab.items()}.get(int(i), "<end>") for i in ids[:n]])
+            chosen = L[:, torch.arange(n), ids[:n].to(L.device)]
+            result[col] = {"kind": "steps", "unit": "log-probability of the predicted token", "steps": labels,
+                           "values": [spread(chosen[:, t]) for t in range(n)]}
+        elif ct == "outex":
+            inv = {v: kk for kk, v in vocabs[col].items()}; codes = [int(round(v)) for v in sl[0].tolist()]
+            n = max(1, sum(1 for c in codes if c > 0))
+            result[col] = {"kind": "steps", "unit": "character code", "steps": [inv.get(c, "?") for c in codes[:n]],
+                           "values": [spread(sl[:, t]) for t in range(n)]}
+    return {"inputs": inputs, "outputs": result}
+
+
 def levenshtein_ops(a, b):
     """Edit distance between token lists a (target) and b (prediction) plus one alignment:
     [("match"|"sub", a_tok, b_tok) | ("del", a_tok, None) | ("ins", None, b_tok)]."""
@@ -7851,7 +8098,7 @@ class InteractiveSampler:
         if ct == "in" and self._scaled(col):
             df = self._get_dataset()
             if df is not None and col in df:
-                vals = pd.to_numeric(df[col].map(_bool_as_number), errors="coerce").astype(float).dropna()
+                vals = numeric_series(df[col]).dropna()
                 if len(vals): return float(vals.median())
             s = self.scalings[col]; return (s["min"] + s["max"]) / 2.0
         return 0.0 if ct == "in" else ""
@@ -8049,13 +8296,22 @@ class InteractiveSampler:
             return {"outputs": outputs, "raw": raw.tolist(), "encoded": base.tolist(),
                     "layers": layers, "routers": routers, "version": self.version}
 
+    def attribution_view(self, inputs):
+        """Attribution tab: occlusion attribution of every output to every input (any model)."""
+        with self.lock:
+            x = torch.as_tensor(self._encode(inputs), device=self.device).unsqueeze(0)
+            slots = [(c, self.slots[c][0], self.slots[c][1]) for c in self.input_cols]
+            res = occlusion_attribution(self.model, x, slots, self.col_types, self.vocabs, self.output_layout, self.scalings)
+        return dict(res, version=self.version)
+
     def sequence_view(self, inputs):
         """Sequence tab: generated tokens (top-5 per step), attributions and attention maps (see mlpres_seq.explain)."""
         if not isinstance(self.model, seqm.SeqMLP): raise ValueError("The Sequence view needs text encoder / decoder columns.")
         with self.lock:
             x = torch.as_tensor(self._encode(inputs), device=self.device).unsqueeze(0)
             ex = seqm.explain(self.model, x)
-            self.model.zero_grad(set_to_none=True)
+            slots = [(c, self.slots[c][0], self.slots[c][1]) for c in self.input_cols]
+            occ = occlusion_attribution(self.model, x, slots, self.col_types, self.vocabs, self.output_layout, self.scalings)["outputs"]
         m = self.model
         toks = lambda col, ids: [seqm.decoded_tokens([i], self.vocabs[col])[0] if i >= len(seqm.SPECIALS)
                                  else {seqm.UNK: "<unk>", seqm.BOS: "<bos>", seqm.EOS: "<eos>", seqm.PAD: "<pad>"}[i] for i in ids]
@@ -8063,21 +8319,17 @@ class InteractiveSampler:
         for c, start, width, V in m.enc_slots:
             ids = ex["enc_ids"][c]; n = max(1, sum(1 for i in ids if i != seqm.PAD))
             enc[c] = {"tokens": toks(c, ids[:n]), "n": n, "width": width}
-        # numeric / categorical inputs: one attribution per column (one-hot groups summed)
-        plain_cols, k = [], 0
-        for c in self.input_cols:
-            if self.col_types[c] == "inenc": continue
-            plain_cols.append((c, k, self.slots[c][1])); k += self.slots[c][1]
+        plain_cols = [c for c in self.input_cols if self.col_types[c] != "inenc"]
 
-        def attr(a):
-            out = {c: a[c][:enc[c]["n"]] for c in enc}
-            out["__inputs__"] = {c: float(sum(a["__numeric__"][s:s + w])) for c, s, w in plain_cols}
+        def attr(a):  # one occlusion result -> per encoder token, plus one value per other input column
+            out = {c: (a["tokens"].get(c) or [0.0] * enc[c]["n"])[:enc[c]["n"]] for c in enc}
+            out["__inputs__"] = {c: a["columns"].get(c, 0.0) for c in plain_cols}
             return out
         decs = {}
         for col, d in ex["decoders"].items():
-            decs[col] = {"tokens": toks(col, d["ids"]), "prob": d["prob"], "attr": [attr(a) for a in d["attr"]],
+            decs[col] = {"tokens": toks(col, d["ids"]), "prob": d["prob"], "attr": [attr(a) for a in occ[col]["values"]],
                          "top": [[[toks(col, [i])[0], p] for i, p in zip(ti, tp)] for ti, tp in zip(d["top_ids"], d["top_p"])]}
-        regular = {c: attr(a) for c, a in ex["regular"].items()}
+        regular = {c: attr(r) for c, r in occ.items() if r["kind"] == "scalar"}
         # attention maps with row / column labels
         cross_keys = [(c, i) for c in enc for i in range(enc[c]["width"])] + [("__latent__", 0)]
         maps = []
@@ -8099,7 +8351,7 @@ class InteractiveSampler:
                     maps.append({"side": "decoder", "col": c, "kind": "self", "name": sub, "rows": d["tokens"],
                                  "cols": ["<bos>"] + d["tokens"][:n - 1], "w": w[:, :n, :n].tolist()})
         return {"encoders": enc, "decoders": decs, "regular": regular, "maps": maps,
-                "inputs": [c for c, _, _ in plain_cols], "version": self.version}
+                "inputs": plain_cols, "version": self.version}
 
     def sweep1d(self, inputs, x_col, out_col, lo=None, hi=None, n=200, show_data=False):
         with self.lock:
@@ -8900,7 +9152,7 @@ class TrainingSession:
         if seq_bridge not in seqm.BRIDGES: raise ValueError(f"Unknown bridge {seq_bridge!r}")
         if seq_params and mlp_mode != 0: raise ValueError("inenc / outdec columns need the MLP architecture (not GNN).")
         if seq_params and not hidden and seq_bridge == "mlp": seq_bridge = "latent"  # no hidden layers: one linear map
-        check_mlp_options(mlp_mode, layer_acts, out_act, hidden)
+        check_mlp_options(mlp_mode, layer_acts, out_act, hidden, norm, groups, int(spec.get("batch_size", 32)))
         return dict(path=path, delim=delim, col_types=col_types, input_cols=input_cols, output_cols=output_cols, fmt=fmt,
                     scale_ranges=scale_ranges,
                     image_params={new(c): {"im_size": int(p["im_size"]), "patch_size": int(p["patch_size"])}
@@ -8925,7 +9177,7 @@ class TrainingSession:
             if a.get("resume"):
                 kwargs, vds, rep = prepare_resume("config.json", "model.pt")
                 kwargs.update(a["overrides"])
-                val_loader = DataLoader(vds, batch_size=kwargs["batch_size"], shuffle=False) if vds is not None else None
+                val_loader = make_loader(vds, kwargs["batch_size"], shuffle=False) if vds is not None else None
                 with self.lock:
                     self.summary = {"rows": len(kwargs["train_dataset"]), "inputs": kwargs["input_cols"], "outputs": kwargs["output_cols"],
                                     "duplicates_removed": rep["duplicates_removed"], "val_overlap_removed": 0, "resumed": True,
@@ -8948,7 +9200,7 @@ class TrainingSession:
                                              vocabularies, image_params, val_file=vpath,
                                              val_frac=v["pct"] if v["mode"] == "split" else 0.0, scale_ranges=a["scale_ranges"])
             scalings, vocabularies = ds.scalings, ds.vocabularies
-            val_loader = DataLoader(vds, batch_size=bs, shuffle=False) if vds is not None else None
+            val_loader = make_loader(vds, bs, shuffle=False) if vds is not None else None
             with self.lock:
                 self.summary = {"rows": len(ds), "inputs": a["input_cols"], "outputs": a["output_cols"],
                                 "duplicates_removed": rep["duplicates_removed"] + rep.get("val_duplicates_removed", 0),
@@ -9147,6 +9399,7 @@ def run_gui(host="127.0.0.1", port=8765, open_browser=True, model_path="model.pt
         "/api/status": status,
         "/api/predict": lambda b: sampler().predict(b.get("inputs", {}), b.get("generation")),
         "/api/sequence": lambda b: sampler().sequence_view(b.get("inputs", {})),
+        "/api/attribution": lambda b: sampler().attribution_view(b.get("inputs", {})),
         "/api/sweep1d": lambda b: sampler().sweep1d(b.get("inputs", {}), b["x"], b["out"], b.get("lo"), b.get("hi"),
                                                     b.get("n", 200), b.get("show_data", False)),
         "/api/sweep2d": lambda b: sampler().sweep2d(b.get("inputs", {}), b["x"], b["y"], b["out"], b.get("cls"),
@@ -9958,7 +10211,7 @@ if __name__ == "__main__":
         if bs: kwargs["batch_size"] = int(bs)
         val_loader, val_interval = None, 1000
         if val_ds is not None:
-            val_loader = DataLoader(val_ds, batch_size=kwargs["batch_size"], shuffle=False)
+            val_loader = make_loader(val_ds, kwargs["batch_size"], shuffle=False)
             vi = input("Validation interval (steps, Enter = 1000): ").strip()
             val_interval = int(vi) if vi else 1000
         kwargs["loss_balancing"], kwargs["loss_temperature"] = ask_loss_balancing(kwargs["output_cols"], kwargs["col_types"])

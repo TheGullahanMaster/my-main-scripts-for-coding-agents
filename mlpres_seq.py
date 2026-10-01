@@ -133,10 +133,9 @@ class AttentionRecorder:
 
 
 def explain(model, x):
-    """Everything the Sequence view shows for one input row x (1, D): per decoder the generated tokens with
-    top-5 alternatives per step, gradient x input attributions of every step (and of every regular output) to
-    the input tokens / numeric inputs, and all attention maps. Greedy generation, then one teacher-forced pass
-    over the generated tokens (identical logits) with recording and gradients."""
+    """Generated tokens with top-5 alternatives per step and all attention maps for one input row x (1, D):
+    greedy generation, then one teacher-forced pass over the generated tokens (identical logits) while recording.
+    Input attributions come from mlpRes6.occlusion_attribution, which works for every model type."""
     model.eval()
     with torch.no_grad(): gen_out = model(x)
     tgt_dim = max(e["tgt_end"] for e in model.output_layout)
@@ -147,45 +146,19 @@ def explain(model, x):
         n = int((ids == EOS).nonzero()[0, 0]) + 1 if (ids == EOS).any() else len(ids)
         ids[n:] = PAD; gen[dcol] = (ids, n)
         targets[0, e["tgt_start"]:e["tgt_end"]] = ids.float()
-    embeds, hooks = {}, []
-    for col, enc in model.encoders.items():
-        hooks.append(enc.emb.register_forward_hook(lambda m, i, o, col=col: embeds.__setitem__(col, o)))
-    xg = x.detach().clone().requires_grad_(True)
-    try:
-        with torch.enable_grad(), torch.backends.cudnn.flags(enabled=False), AttentionRecorder(model) as rec:
-            out = model(xg, targets) if gen else model(xg)
-    finally:
-        for h in hooks: h.remove()
-    enc_cols = [c for c, *_ in model.enc_slots]
-    sources = [embeds[c] for c in enc_cols] + [xg]
-
-    def attribute(scalar):
-        grads = torch.autograd.grad(scalar, sources, retain_graph=True, allow_unused=True)
-        per_col = {}
-        for c, emb, g in zip(enc_cols, sources, grads):
-            per_col[c] = ((g * emb).sum(-1)[0] if g is not None else torch.zeros(emb.shape[1], device=emb.device)).tolist()
-        gx = grads[-1]
-        per_col["__numeric__"] = ((gx * xg)[0, model.plain_idx] if gx is not None else torch.zeros(len(model.plain_idx))).tolist()
-        return per_col
-
+    # (grad mode on: PyTorch's encoder layers skip the attention module, and so the recording, on their no-grad fast path)
+    with torch.enable_grad(), AttentionRecorder(model) as rec:
+        out = (model(x, targets) if gen else model(x)).detach()
     decoders = {}
     for e, off, w, dcol in model.routes:
         if dcol is None: continue
         ids, n = gen[dcol]
-        L = out[0, e["start"]:e["end"]].view(e["max_len"], e["num_classes"])
-        probs = L.detach().float().softmax(-1)
+        probs = out[0, e["start"]:e["end"]].view(e["max_len"], e["num_classes"]).float().softmax(-1)
         top = probs[:n].topk(min(5, probs.size(-1)), -1)
         decoders[dcol] = {"ids": ids[:n].tolist(), "prob": probs[torch.arange(n), ids[:n]].tolist(),
-                          "top_ids": top.indices.tolist(), "top_p": top.values.tolist(),
-                          "attr": [attribute(L[t, ids[t]]) for t in range(n)]}
-    regular = {}
-    for e, off, w, dcol in model.routes:
-        if dcol is not None: continue
-        sl = out[0, e["start"]:e["end"]]
-        if e["type"] in ("out", "outlab", "outex") and e["end"] - e["start"] == 1: regular[e["col"]] = attribute(sl[0])
-        elif e["type"] == "outlabcat": regular[e["col"]] = attribute(sl[sl.argmax()])
-    enc_ids = {c: xg[0, s:s + wd].detach().round().long().clamp(0, V - 1).tolist() for c, s, wd, V in model.enc_slots}
-    return {"decoders": decoders, "regular": regular, "enc_ids": enc_ids, "attention": rec.records}
+                          "top_ids": top.indices.tolist(), "top_p": top.values.tolist()}
+    enc_ids = {c: x[0, s0:s0 + wd].round().long().clamp(0, V - 1).tolist() for c, s0, wd, V in model.enc_slots}
+    return {"decoders": decoders, "enc_ids": enc_ids, "attention": rec.records}
 
 
 def sample_tokens(logits, temperature=0.0, top_k=0, top_p=1.0):

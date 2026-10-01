@@ -1418,8 +1418,9 @@ class Sampler:
 
     def influence(self, body):
         """Which earlier tokens raised the log-probability of the token after `position`
-        (or of `target`)?  ablation: swap one token's embedding for the mean embedding
-        and measure the drop (batched forwards); gradient: gradient × input on the
+        (or of `target`)?  occlusion: replace one token with random other tokens (positions stay
+        put) and measure the average drop (batched forwards); ablation: swap one token's embedding
+        for the mean embedding and measure the drop; gradient: gradient × input on the
         embeddings (one backward pass; degenerate when a norm follows the embedding)."""
         self.require()
         emb = self.embedding
@@ -1477,9 +1478,34 @@ class Sampler:
                         h.remove()
                     lp = torch.log_softmax(out.reshape(n, -1, out.shape[-1])[:, -T:][:, pos], -1)[:, target]
                     ablation[ps] = (base_logp - lp).cpu()
+            # occlusion: token j replaced by `samples` random other tokens (positions unchanged, so sequential models
+            # see no shift); the score is the average drop in log p of the target at the same position
+            samples = max(1, int(body.get('samples', 16)))
+            V = int(emb.num_embeddings) if hasattr(emb, 'num_embeddings') else int(emb.weight.shape[0])
+            occlusion, occlusion_error = torch.zeros(T), None
+            gen = torch.Generator().manual_seed(0)  # same replacements every time: the view does not flicker
+            repl = torch.randint(0, V - 1, (pos + 1, samples), generator=gen)
+            orig = torch.tensor(ids[:pos + 1])[:, None]
+            repl = repl + (repl >= orig).long()  # skip the original token
+            try:
+                rows = [(j, k) for j in range(pos + 1) for k in range(samples)]
+                lps = torch.zeros(pos + 1, samples)
+                with torch.no_grad():
+                    for start in range(0, len(rows), chunk * 4):
+                        part = rows[start:start + chunk * 4]
+                        xs = x.expand(len(part), T).clone()
+                        js = torch.tensor([j for j, _ in part]); ks = torch.tensor([k for _, k in part])
+                        xs[torch.arange(len(part)), js.to(xs.device)] = repl[js, ks].to(xs.device)
+                        out = self._forward(xs).float()
+                        lps[js, ks] = torch.log_softmax(out.reshape(len(part), -1, out.shape[-1])[:, -T:][:, pos], -1)[:, target].cpu()
+                occlusion[:pos + 1] = base_logp - lps.mean(1)
+            except Exception as exc:
+                occlusion_error = str(exc).split('\n')[0]
         degenerate = grad_x_input is not None and float(grad_x_input.abs().max()) < 1e-4 * max(1e-12, float(grad_norm.max()) * float(e.detach().norm(dim=-1).max()))
         return clean({'position': pos, 'target': target, 'target_piece': self.piece(target), 'logp': base_logp,
-                      'ablation': ablation.tolist(), 'grad_x_input': grad_x_input.tolist() if grad_x_input is not None else None,
+                      'ablation': ablation.tolist(), 'occlusion': occlusion.tolist(), 'occlusion_error': occlusion_error,
+                      'occlusion_replacements': repl.tolist(),
+                      'grad_x_input': grad_x_input.tolist() if grad_x_input is not None else None,
                       'grad_norm': grad_norm.tolist() if grad_norm is not None else None, 'grad_error': grad_error,
                       'grad_degenerate': degenerate})
 

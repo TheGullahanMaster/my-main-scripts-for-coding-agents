@@ -250,8 +250,9 @@ const debounce = (fn, ms) => { let t; return (...a) => { clearTimeout(t); t = se
 function toast(msg) { const t = $("#toast"); t.textContent = msg; t.style.display = "block"; clearTimeout(toast.t); toast.t = setTimeout(() => t.style.display = "none", 6000); }
 async function api(path, body = {}) {
   const r = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-  const j = await r.json().catch(() => ({ error: `HTTP ${r.status}` }));
-  if (!r.ok || j.error) throw new Error(j.error || `HTTP ${r.status}`);
+  const j = await r.json().catch(() => null);
+  // failures come back as HTTP 4xx/5xx; a 200 reply may itself report a failed run in its `error` field (status polls)
+  if (!r.ok || j === null) throw new Error(j?.error || `HTTP ${r.status}`);
   return j;
 }
 const store = {
@@ -524,7 +525,7 @@ function colorbar(parent, { lo, hi, colorFn, label, diverging = false }) {
 }
 
 // ───────────────────────── app state ─────────────────────────
-const TABS = [["response", "Response curves"], ["diagram", "Network diagram"], ["map", "2D map"], ["sens", "Sensitivity"], ["network", "Neuron strips"], ["acts", "Activations"], ["weights", "Weights"], ["data", "Dataset"], ["seq", "Sequence"], ["history", "History"]];
+const TABS = [["response", "Response curves"], ["diagram", "Network diagram"], ["map", "2D map"], ["sens", "Sensitivity"], ["attr", "Attribution"], ["network", "Neuron strips"], ["acts", "Activations"], ["weights", "Weights"], ["data", "Dataset"], ["seq", "Sequence"], ["history", "History"]];
 const hashTab = location.hash.slice(1);
 const S = { meta: null, inputs: {}, targets: null, pred: null, tab: TABS.some(t => t[0] === hashTab) ? hashTab : store.get("tab", "response"), seq: 0, dataStats: null, selNeuron: null };
 const tabState = store.get("tabState", {});
@@ -645,7 +646,7 @@ async function renderTab() {
   const token = ++renderToken, view = $("#view");
   const fresh = el("div");
   try {
-    await ({ response: tabResponse, diagram: tabDiagram, map: tabMap, sens: tabSens, network: tabNetwork, acts: tabActs, weights: tabWeights, data: tabData, seq: tabSeq, history: tabHistory }[S.tab])(fresh, () => token !== renderToken);
+    await ({ response: tabResponse, diagram: tabDiagram, map: tabMap, sens: tabSens, network: tabNetwork, acts: tabActs, weights: tabWeights, data: tabData, seq: tabSeq, attr: tabAttr, history: tabHistory }[S.tab])(fresh, () => token !== renderToken);
     // charts sized while detached: redraw once attached
     if (token === renderToken) keepScroll(() => { view.replaceChildren(...fresh.childNodes); fresh._after?.forEach(fn => fn()); });
   } catch (e) {
@@ -776,6 +777,41 @@ async function tabSens(root, stale) {
   card.append(el("div", { class: "legend" }, el("span", {}, el("span", { class: "sw", style: `background:${css("--s1")}` }), "increases output"), el("span", {}, el("span", { class: "sw", style: `background:${css("--s8")}` }), "decreases output"), el("span", { class: "muted" }, "(categorical spreads are always ≥ 0)")));
 }
 
+// Attribution: occlusion importance of every input for any output (all model types)
+async function tabAttr(root, stale) {
+  const r = await api("/api/attribution", { inputs: S.inputs });
+  if (stale()) return;
+  const outs = Object.keys(r.outputs);
+  if (!outs.length) { root.append(el("div", { class: "card empty" }, "No output to attribute.")); return; }
+  let out = ts("attr", "out", outs[0]); if (!(out in r.outputs)) out = outs[0];
+  const o = r.outputs[out];
+  root.append(el("p", { class: "note" }, "Occlusion: each input is taken away and the model is run again; value = output with the input − output without it. Red: the input supported the output; blue: it worked against it. Taken away means: numbers reset to the middle of their scaling; categories replaced by each other category in turn (averaged); text removed entirely (the column bar — the model never saw empty text, so treat it as a ranking) and each character / token replaced by the other tokens of its vocabulary, averaged, every position kept (the precise per-token bars); images blanked."),
+    el("div", { class: "controls" }, selectCtl("Output", outs.map(c => [c, c]), out, v => { setTs("attr", "out", v); renderTab(); })));
+  const textCols = r.inputs.filter(i => i.tokens);
+  const bars = (title, sub, labels, values) => {
+    const card = el("div", { class: "card", style: "margin-top:12px" }); root.append(card);
+    const chart = new Chart(card, { title, sub });
+    later(root, () => drawHBars(chart, { labels, values, valueLabel: `Δ ${o.unit}`, colorPos: css("--div-pos"), colorNeg: css("--div-neg") }));
+    card.append(el("div", { class: "legend" }, el("span", {}, el("span", { class: "sw", style: `background:${css("--div-pos")}` }), "supported the output"),
+      el("span", {}, el("span", { class: "sw", style: `background:${css("--div-neg")}` }), "worked against it")));
+  };
+  if (o.kind === "scalar") {
+    const cols = r.inputs.map(i => i.col);
+    bars(`${out}: importance of each input`, `change in ${o.unit} when the input is taken away`, cols, cols.map(c => o.columns[c] ?? 0));
+    for (const t of textCols) if (t.tokens.length)
+      bars(`${out}: each character / token of ${t.col}`, "replaced by the other tokens one position at a time (averaged)", t.tokens.map((tk, k) => `${k + 1}: ${tk}`), o.tokens[t.col] ?? []);
+  } else {
+    const card = el("div", { class: "card", style: "margin-top:12px" }, el("h2", {}, `${out}: input importance per output position`)); root.append(card);
+    const cols = [], pick = [];
+    for (const i of r.inputs) {
+      cols.push(i.tokens ? `${i.col} (all)` : i.col); pick.push(v => v.columns[i.col] ?? 0);
+      if (i.tokens) i.tokens.forEach((tk, k) => { cols.push(`${i.col}:${tk}`); pick.push(v => (v.tokens[i.col] ?? [])[k] ?? 0); });
+    }
+    seqHeat(root, card, { rows: o.steps, cols, w: o.values.map(v => pick.map(f => f(v))), signed: true, xLabel: "input", yLabel: "output token",
+      note: `change in the ${o.unit} at each position; rows scaled to their largest effect, hover for raw values` });
+  }
+}
+
 // Sequence: what the text encoders / decoders do for the current input
 function seqHeat(root, card, { rows, cols, w, signed, height, xLabel, yLabel, note }) {
   const chart = new Chart(card, { height: height ?? Math.max(160, 22 * rows.length + 90), title: "", sub: note || "" });
@@ -812,7 +848,7 @@ async function tabSeq(root, stale) {
   if (!S.meta.sequence) { root.append(el("div", { class: "card empty" }, "The Sequence view is for models with text encoder (inenc) or decoder (outdec) columns.")); return; }
   const r = await api("/api/sequence", { inputs: S.inputs });
   if (stale()) return;
-  root.append(el("p", { class: "note" }, "For the current input, with the most likely tokens (temperature 0). Attribution = gradient × input: how much each input token (its embedding) or input value pushed each generated token; red pushed towards it, blue away from it, each row scaled to its largest effect. It works for every model, with or without attention. Numeric inputs are measured from 0 in model units (the middle of the default −1…1 scaling)."));
+  root.append(el("p", { class: "note" }, "For the current input, with the most likely tokens (temperature 0). Attribution = occlusion: how much each output drops when one input is taken away — a token replaced by the other tokens of its vocabulary (averaged, positions kept), or another input column reset as on the Attribution tab. For generated tokens it is the change in that token's log-probability. Value = output with the input minus output without it: positive (red) means the input supported the output, negative (blue) means it worked against it. Heatmap rows are scaled to their largest effect; hover a cell for the raw value. It works for every model, with or without attention."));
   for (const [col, d] of Object.entries(r.decoders)) {
     const card = el("div", { class: "card", style: "margin-top:12px" }, el("h2", {}, `${col}: generated step by step`)); root.append(card);
     card.append(el("div", { class: "scroll" }, el("table", { class: "data" }, el("tr", {}, el("th", {}, "step"), el("th", {}, "token"), el("th", {}, "probability"), el("th", {}, "alternatives")),
@@ -827,8 +863,10 @@ async function tabSeq(root, stale) {
   for (const [col, a] of Object.entries(r.regular)) {
     const card = el("div", { class: "card", style: "margin-top:12px" }); root.append(card);
     const { cols, w } = attrMatrix(r, [a]);
-    const chart = new Chart(card, { title: `${col}: input attribution`, sub: "gradient × input for this output (the predicted class for categories)" });
-    later(root, () => drawHBars(chart, { labels: cols, values: w[0], valueLabel: "attribution", colorPos: css("--s1"), colorNeg: css("--s8") }));
+    const chart = new Chart(card, { title: `${col}: input attribution`, sub: "how much this output drops when the input is taken away (the predicted class's probability for categories)" });
+    later(root, () => drawHBars(chart, { labels: cols, values: w[0], valueLabel: "attribution", colorPos: css("--div-pos"), colorNeg: css("--div-neg") }));
+    card.append(el("div", { class: "legend" }, el("span", {}, el("span", { class: "sw", style: `background:${css("--div-pos")}` }), "positive: removing it lowers the output (it supported it)"),
+      el("span", {}, el("span", { class: "sw", style: `background:${css("--div-neg")}` }), "negative: removing it raises the output (it worked against it)")));
   }
 }
 

@@ -1167,7 +1167,7 @@ const S = {
   info: null, P: Object.assign({ kind: "text", text: "", count: 1, max_tokens: 200, temperature: 0.8, top_k: 0, top_p: 0, rep_penalty: 1, rep_window: 64, color: "p" }, store.get("sampleForm", {})),
   hl: null,
   file: null, job: null, samples: [], timer: null, tok: null, A: null, sel: null, tab: store.get("atab", "pred"), browse: null,
-  layer: null, order: "variance", units: 96, inflMethod: store.get("inflMethod", "ablation"), att: 0, head: -1, leaf: null, infl: null, paths: store.get("modelPaths", { config: "", checkpoint: "" }),
+  layer: null, order: "variance", units: 96, inflMethod: store.get("inflMethod", "occlusion"), att: 0, head: -1, leaf: null, infl: null, paths: store.get("modelPaths", { config: "", checkpoint: "" }),
 };
 const saveS = () => { store.set("sampleForm", S.P); store.set("modelPaths", S.paths); };
 async function loadModel() {
@@ -1530,7 +1530,12 @@ async function tabState(root) {
       colorbar(hm, { lo: -m, hi: m, colorFn: dv, label: "state value", diverging: true }); });
   } catch (e) { hm.append(el("p", { class: "warn" }, e.message)); }
 }
-function inflScores() { const I = S.infl; if (!I || I.error) return null; return S.inflMethod === "gradient" && I.grad_x_input ? I.grad_x_input : I.ablation; }
+function inflScores() {
+  const I = S.infl; if (!I || I.error) return null;
+  if (S.inflMethod === "gradient" && I.grad_x_input) return I.grad_x_input;
+  if (S.inflMethod === "occlusion" && !I.occlusion_error) return I.occlusion;
+  return I.ablation;
+}
 async function runInfluence(target = null) {
   const A = S.A;
   try { S.infl = await api("/api/influence", { ids: A.ids, position: S.sel, target }); }
@@ -1548,16 +1553,19 @@ function tabInfl(root) {
       el("option", { value: "" }, S.sel + 1 < A.ids.length ? `actual next ${JSON.stringify(A.pieces[S.sel + 1])}` : "top prediction"),
       tops.map(([t, p, id]) => el("option", { value: id, selected: id === I.target && !(S.sel + 1 < A.ids.length && A.ids[S.sel + 1] === id) }, `${JSON.stringify(t)} (${(100 * p).toFixed(1)}%)`)))),
     fld("Method", el("select", { onchange: e => { S.inflMethod = e.target.value; store.set("inflMethod", S.inflMethod); renderAnalysis(); } },
-      [["ablation", "blank out each token (ablation)"], ["gradient", "gradient × input"]].map(([v, t]) => el("option", { value: v, selected: (S.inflMethod || "ablation") === v, disabled: v === "gradient" && !I.grad_x_input }, t))))));
+      [["occlusion", "replace each token with random others (occlusion)"], ["ablation", "blank out each token (ablation)"], ["gradient", "gradient × input"]].map(([v, t]) => el("option", { value: v, selected: (S.inflMethod || "occlusion") === v, disabled: (v === "gradient" && !I.grad_x_input) || (v === "occlusion" && !!I.occlusion_error) }, t))))));
   root.append(el("p", { class: "note" }, `After ${JSON.stringify(A.pieces[S.sel])} (position ${S.sel}) the model gives ${JSON.stringify(I.target_piece)} ${(100 * Math.exp(I.logp)).toFixed(2)}%. ` +
-    (S.inflMethod === "gradient" ? "Gradient × input: first-order estimate of each token's effect on log p." : "Ablation: how much log p drops when that token's embedding is replaced by the average embedding (positive = the token helped).")));
+    (S.inflMethod === "gradient" ? "Gradient × input: first-order estimate of each token's effect on log p." :
+     S.inflMethod === "occlusion" && !I.occlusion_error ? "Occlusion: how much log p of the target drops, on average, when that token is replaced by random other tokens (16, the same every time); every other token keeps its position. Positive = the token helped." :
+     "Ablation: how much log p drops when that token's embedding is replaced by the average embedding (positive = the token helped).")));
+  if (S.inflMethod === "occlusion" && I.occlusion_error) root.append(el("p", { class: "warn" }, "Occlusion unavailable here (" + I.occlusion_error + "); showing ablation."));
   if (S.inflMethod === "gradient" && I.grad_degenerate) root.append(el("p", { class: "warn" }, "Gradient × input is ≈ 0 for this model: a normalisation right after the embedding cancels it. Use ablation."));
   if (I.grad_error && S.inflMethod === "gradient") root.append(el("p", { class: "warn" }, "Gradient unavailable: " + I.grad_error));
   const sc = inflScores();
   const order = sc.map((v, i) => [v, i]).filter(([, i]) => i <= I.position).sort((a, b) => Math.abs(b[0]) - Math.abs(a[0])).slice(0, 15);
   const hb = new Chart(root, { title: "Strongest contributors" });
   requestAnimationFrame(() => drawHBars(hb, { labels: order.map(([, i]) => `${JSON.stringify(A.pieces[i])} @${i}`), values: order.map(([v]) => v),
-    valueLabel: S.inflMethod === "gradient" ? "gradient × input" : "drop in log p when blanked (nats)", colorPos: css("--div-pos"), colorNeg: css("--div-neg"), onClick: k => { S.sel = order[k][1]; runInfluence(); } }));
+    valueLabel: S.inflMethod === "gradient" ? "gradient × input" : S.inflMethod === "occlusion" && !I.occlusion_error ? "mean drop in log p when replaced (nats)" : "drop in log p when blanked (nats)", colorPos: css("--div-pos"), colorNeg: css("--div-neg"), onClick: k => { S.sel = order[k][1]; runInfluence(); } }));
 }
 
 // ───────────────────────── Benchmark page ─────────────────────────
