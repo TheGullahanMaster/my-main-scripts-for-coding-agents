@@ -1214,6 +1214,93 @@ def _compiled_program(flat, core, feature_count):
             code[index]=op; kid[index,:len(children)]=children
     return code,arg,kid
 
+# A constant that only decides where a jump falls (a mod period, a comparison
+# threshold, the scale inside floor) has a zero finite-difference gradient
+# almost everywhere, so Levenberg-Marquardt never moves it and only random
+# nudges did.  Before the gradient fit, a small derivative-free scan tries
+# data-driven values for such constants (midpoints between the compared
+# values, fractions of a mod/floordiv operand's range, a log grid around the
+# current value, and simple numbers) and keeps the best strict improvement.
+JUMP_CONSTANT_SCAN = True
+JUMP_SCAN_MAX_CONSTANTS = 3
+_JUMP_OPERATORS = frozenset(("mod","floordiv","quantize","gt","lt","gte","lte","eq","ne","round2","floor2","ceil2",
+                             "round","floor","ceil","int","frac","sign","signbit","oom","bitwise_and","bitwise_or",
+                             "bitwise_xor","bitwise_not","lshift","rshift","gcd","lcm","cat","x_at_pos_y"))
+_JUMP_ARGUMENTS = {"if_else":(0,)}   # only the condition of if_else jumps
+_THRESHOLD_OPERATORS = frozenset(("gt","lt","gte","lte","eq","ne"))
+_PERIOD_OPERATORS = frozenset(("mod","floordiv","quantize"))
+_SIMPLE_NUMBERS = (.5,1.,1.5,2.,2.5,3.,4.,5.,6.,8.,10.)
+JUMP_SCAN_STATS = {"scans":0,"improved":0}
+def jump_constant_slots(flat):
+    """Positions (in constant order) of constants that sit under a jump."""
+    slots=[]
+    for slot,index in enumerate(flat.constants):
+        child,parent=index,flat.parent[index]
+        while parent>=0:
+            kind=flat.kind[parent]
+            if kind in _JUMP_OPERATORS or flat.children[parent].index(child) in _JUMP_ARGUMENTS.get(kind,()):
+                slots.append(slot); break
+            child,parent=parent,flat.parent[parent]
+    return slots
+def _jump_candidates(flat, nodes, slot, value):
+    index=flat.constants[slot]; parent=flat.parent[index]
+    kind=flat.kind[parent] if parent>=0 else None
+    siblings=[child for child in flat.children[parent] if child!=index] if parent>=0 else []
+    candidates=[value*factor for factor in (.25,.5,.7,.85,1.2,1.4,2.,4.)]
+    candidates+=[sign*number for number in _SIMPLE_NUMBERS for sign in (1.,-1.)]
+    if siblings:
+        other=nodes[siblings[0]]
+        if kind in _THRESHOLD_OPERATORS or kind=="if_else":
+            levels=np.unique(other)
+            if len(levels)>1:
+                middles=(levels[1:]+levels[:-1])/2
+                candidates+=middles[np.unique(np.linspace(0,len(middles)-1,min(24,len(middles))).astype(int))].tolist()
+        elif kind in _PERIOD_OPERATORS and flat.children[parent].index(index)==1:
+            span=float(np.ptp(other))
+            if span>EPS: candidates+=[span/k for k in range(1,13)]
+    return [c for c in dict.fromkeys(candidates) if math.isfinite(c) and abs(c)<=CONSTANT_LIMIT]
+def _scan_cost(prediction, y, scale, fit_readout, ones):
+    if not np.isfinite(prediction).all(): return math.inf
+    if fit_readout:
+        line=_weighted_line(prediction,y,ones)
+        if line is None: prediction=np.full(len(y),float(np.mean(y)))
+        else:
+            slope=max(min(line[0],AFFINE_COEFFICIENT_BOUND),-AFFINE_COEFFICIENT_BOUND)
+            prediction=slope*prediction+line[1]
+    r=np.abs((prediction-y)/scale); huber=ROBUST_LOSS_DELTA
+    cost=float(np.sum(np.where(r<=huber,.5*r*r,huber*(r-.5*huber))))
+    return cost if math.isfinite(cost) else math.inf
+def scan_jump_constants(flat, start, X, y, scale, fit_readout=True):
+    """Constant vector with jump constants placed by a candidate scan, or None."""
+    slots=jump_constant_slots(flat)
+    if not slots: return None
+    if len(slots)>JUMP_SCAN_MAX_CONSTANTS: slots=rng.sample(slots,JUMP_SCAN_MAX_CONSTANTS)
+    JUMP_SCAN_STATS["scans"]+=1
+    ones=np.ones(len(y)); current=np.array(start,float)
+    try:
+        nodes=flat.values(current,X); best=initial=_scan_cost(nodes[0],y,scale,fit_readout,ones)
+        for slot in slots:
+            def cost(value):
+                try: return _scan_cost(flat.nudged_root(nodes,slot,value,X),y,scale,fit_readout,ones)
+                except (ArithmeticError, IndexError, ValueError): return math.inf
+            chosen=current[slot]
+            for candidate in _jump_candidates(flat,nodes,slot,chosen):
+                trial=cost(candidate)
+                if trial<best: best,chosen=trial,candidate
+            # Pattern refinement: the cost is piecewise constant, so halve a step.
+            step=.05*max(abs(chosen),1e-3)
+            for _ in range(8):
+                for trial_value in (chosen-step,chosen+step):
+                    trial=cost(trial_value)
+                    if trial<best: best,chosen=trial,trial_value; break
+                else: step/=2
+            if chosen!=current[slot]:
+                current[slot]=chosen; nodes=flat.values(current,X)
+    except (ArithmeticError, IndexError, ValueError): return None
+    if not best<initial: return None
+    JUMP_SCAN_STATS["improved"]+=1
+    return current
+
 def fit_tree_constants(tree, X, y, adfs=None, fit_readout=True, iterations=CONSTANT_FIT_ITERATIONS, robust=True):
     """Levenberg-Marquardt on a tree's inner constants (variable projection).
 
@@ -1227,6 +1314,13 @@ def fit_tree_constants(tree, X, y, adfs=None, fit_readout=True, iterations=CONST
     start=np.asarray(constant_vector(tree),float)
     if not len(start) or not len(y): return tree
     scale=target_scale(y); ones=np.ones(len(y)); flat=_FlatTree.build(tree); huber=ROBUST_LOSS_DELTA
+    if JUMP_CONSTANT_SCAN and flat is not None and isinstance(X,np.ndarray) and X.ndim==2:
+        scanned=scan_jump_constants(flat,start,X,y,scale,fit_readout)
+        if scanned is not None:
+            placed=with_constants(tree,scanned)
+            # The gradient fit below returns its own input unless it improves
+            # further, so the scanned tree becomes that input.
+            if not guarded_constant_divisor(placed) and not guard_engagement([placed],X,adfs): tree,start=placed,scanned
     if flat is not None and FIT_BACKEND=="auto" and isinstance(X,np.ndarray) and X.ndim==2:
         core=compiled_fitter(); program=None if core is None else _compiled_program(flat,core,X.shape[1])
         if program is not None:
@@ -1918,13 +2012,33 @@ def parametrize_mutate(t, ops, max_nodes, max_depth):
     child=replace_subtree(t,path,wrapped)
     return child if node_size(child)<=max_nodes and node_depth(child)<=max_depth else t
 def shrink_mutate(t): return rng.choice(t[1:]) if t[0] not in ("x","c") else t
+def jump_mutate(t, n_features, ops, max_nodes, max_depth):
+    """Wrap a subtree in a whole jump block: mod(s,c), floordiv(s,c) or
+    if_else(gt(x,c), s, s') with s' a mutated copy of s.
+
+    A discontinuous target gives no partial credit for a comparison or a
+    modulo built one node at a time; offering the block as one move lets the
+    jump-constant scan place c right away when the child is tuned."""
+    forms=[form for form in ("mod","floordiv") if form in ops]
+    if "if_else" in ops and "gt" in ops: forms.append("branch")
+    paths=[path for path in subtree_paths(t) if subtree_at(t,path)[0]!="c"]
+    if not forms or not paths: return t
+    path=rng.choice(paths); target=subtree_at(t,path); form=rng.choice(forms)
+    if form=="branch":
+        other=mutate(target,n_features,ops,max(1,node_size(target)+2),max(1,node_depth(target)+1))
+        block=("if_else",("gt",("x",rng.randrange(n_features)),("c",rng.uniform(-1,1))),target,other)
+    else: block=(form,target,("c",float(rng.choice(_SIMPLE_NUMBERS))))
+    child=replace_subtree(t,path,block)
+    return child if node_size(child)<=max_nodes and node_depth(child)<=max_depth else t
 
 # Off by default: it did not solve the linear-system benchmark and was neutral
 # to harmful elsewhere (4-way ablation).  Set > 0 to re-enable.
 BILINEAR_MUTATION_WEIGHT = 0.
+# Initial weight of jump_mutate; the portfolio adapts it like the others.
+JUMP_MUTATION_WEIGHT = 0.
 class MutationPortfolio:
     def __init__(self):
-        self.weights={"subtree":1.,"point":1.,"constant":1.,"hoist":.7,"shrink":.7,"parametrize":1.,"bilinear":BILINEAR_MUTATION_WEIGHT}
+        self.weights={"subtree":1.,"point":1.,"constant":1.,"hoist":.7,"shrink":.7,"parametrize":1.,"bilinear":BILINEAR_MUTATION_WEIGHT,"jump":JUMP_MUTATION_WEIGHT}
         self.tries={k:0 for k in self.weights}; self.wins={k:0 for k in self.weights}
     def choose(self): return rng.choices(list(self.weights),weights=list(self.weights.values()))[0]
     def record(self, kind, improved):
@@ -1937,6 +2051,7 @@ class MutationPortfolio:
         if kind=="shrink": return shrink_mutate(t),kind
         if kind=="parametrize": return parametrize_mutate(t,ops,max_nodes,max_depth),kind
         if kind=="bilinear": return bilinear_mutate(t,n_features,ops,max_nodes,max_depth),kind
+        if kind=="jump": return jump_mutate(t,n_features,ops,max_nodes,max_depth),kind
         if kind=="constant":
             # Without constants to move, give the tree one (credited as such).
             child=constant_mutate(t)
@@ -5309,8 +5424,9 @@ def resume_main(args):
     global SEQUENCE_LAYOUT,EQUIVALENCE_COLLAPSE,RESIDUAL_ARCHIVE,QD_PARENT_CHOICE,SCALE_BALANCED_SELECTION,GUARD_EXPLOIT_CHECK
     SEQUENCE_LAYOUT=maps.get(SEQUENCE_LAYOUT_KEY)
     GUARD_EXPLOIT_CHECK=bool(state.get("numeric_guard_check",False))
-    global INTERPOLATION_CHECK,FIT_BACKEND
+    global INTERPOLATION_CHECK,FIT_BACKEND,JUMP_CONSTANT_SCAN
     INTERPOLATION_CHECK=bool(state.get("interpolation_check",False))
+    JUMP_CONSTANT_SCAN=bool(state.get("jump_constant_scan",False))
     FIT_BACKEND=state.get("fit_backend","python")
     # Settings that postdate a checkpoint resume with the behaviour it was searched with.
     RESIDUAL_ARCHIVE=bool(state.get("residual_archive",False)); QD_PARENT_CHOICE=state.get("qd_parent_choice","legacy")
@@ -5430,6 +5546,8 @@ def build_arg_parser():
     ap.add_argument("--fit-backend",choices=("auto","python"),default="auto",help="Compiled kernels: auto uses the Cython constant fitter (and, above 8192 rows, the compiled affine readout) when they build: several times faster, agreeing with Python to round-off.  python always uses the pure-Python code (default: auto)")
     ap.add_argument("--numeric-guard-check",choices=("on","off"),default="on",help="Reject models whose values depend on afpo's numeric safety guards (the +/-1e12 value clamp, sinh/cosh/tan input clips) instead of letting them use a guard as a hidden min/max (default: on)")
     ap.add_argument("--interpolation-check",choices=("on","off"),default="on",help="Add a loss term scoring predictions between nearest-neighbour rows against interpolated targets, so equations that only memorise the training rows (e.g. short-period mod sawtooths) lose (default: on)")
+    ap.add_argument("--jump-constant-scan",choices=("on","off"),default="on",help="Before the gradient constant fit, scan data-driven values for constants that only move a jump (mod periods, comparison thresholds, floor scales), which the gradient fit cannot move (default: on)")
+    ap.add_argument("--jump-mutation-weight",type=float,default=0.,help="Initial portfolio weight of the jump mutation, which wraps a subtree in mod(s,c), floordiv(s,c) or if_else(gt(x,c),s,s') as one move; adapted like the other mutation kinds (default: 0, off)")
     ap.add_argument("--gui",action="store_true",help="Start the browser GUI (training, live Pareto frontier, model explorer) instead of the terminal prompts")
     ap.add_argument("--port",type=int,default=8778,help="Browser GUI port (default: 8778)")
     return ap
@@ -5552,8 +5670,11 @@ def train_from_setup(args, setup, choose_model=None):
     global EQUIVALENCE_COLLAPSE,RESIDUAL_ARCHIVE,QD_PARENT_CHOICE,SCALE_BALANCED_SELECTION,GUARD_EXPLOIT_CHECK
     EQUIVALENCE_COLLAPSE=getattr(args,"equivalence_collapse","on")=="on"; EQUIVALENCE_STATS["children_redrawn"]=0
     GUARD_EXPLOIT_CHECK=getattr(args,"numeric_guard_check","on")=="on"
-    global INTERPOLATION_CHECK,FIT_BACKEND
+    global INTERPOLATION_CHECK,FIT_BACKEND,JUMP_CONSTANT_SCAN
     INTERPOLATION_CHECK=getattr(args,"interpolation_check","on")=="on"
+    JUMP_CONSTANT_SCAN=getattr(args,"jump_constant_scan","on")=="on"
+    global JUMP_MUTATION_WEIGHT
+    JUMP_MUTATION_WEIGHT=float(getattr(args,"jump_mutation_weight",0.))
     FIT_BACKEND=getattr(args,"fit_backend","auto")
     RESIDUAL_ARCHIVE=getattr(args,"residual_archive","on")=="on"; QD_PARENT_CHOICE=getattr(args,"qd_parent_choice","quality_coverage")
     SCALE_BALANCED_SELECTION=getattr(args,"scale_balanced_selection","on")=="on"
@@ -5638,7 +5759,7 @@ def train_from_setup(args, setup, choose_model=None):
                    "stages":{key:stages[key] for key in ("mode","count","interval","age_gap","schedule","threshold_quantile")},
                    "roles":{key:roles[key] for key in ("enabled","interval","mix","retire_after")}},
         "equivalence_collapse":EQUIVALENCE_COLLAPSE,"residual_archive":RESIDUAL_ARCHIVE,"qd_parent_choice":QD_PARENT_CHOICE,"scale_balanced_selection":SCALE_BALANCED_SELECTION,
-        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age",
+        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age",
         "test_csv":str(Path(args.test_csv).resolve()) if args.test_csv else None,
     },df,train_indices,validation_indices,external_validation)
     print(f"Run manifest: {manifest_path}")
@@ -5655,7 +5776,7 @@ def train_from_setup(args, setup, choose_model=None):
         "profile":args.profile,"constraint_metadata":metadata,"constraints":constraints.describe(),"bayesian_particles":args.bayesian_particles,"interaction_discovery":interaction_discovery,
         "island_config":{"count":island_count,"migration_interval":migration_interval,"migrants_per_island":migrants_per_island,"topology":"ring","migration_events":0,"stages":stages,"roles":roles},
         "equivalence_collapse":EQUIVALENCE_COLLAPSE,"residual_archive":RESIDUAL_ARCHIVE,"qd_parent_choice":QD_PARENT_CHOICE,"scale_balanced_selection":SCALE_BALANCED_SELECTION,
-        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age"}
+        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age"}
     head_count=sum(len(heads) for heads in classification_layout(cats)[0])
     population_sizes=cell_population_sizes(args.population,cell_count)
     islands=[new_island_runtime(size,X=X,Xt=Xt,cats=cats,ops=ops,nodes=nodes,depth=depth,head_count=head_count,
