@@ -106,5 +106,23 @@ class LossModeTest(unittest.TestCase):
         self.assertEqual((args.loss, args.huber_delta), ("relative", 3.))
 
 
+class IntervalTest(unittest.TestCase):
+    def test_interval_covers_true_constant(self):
+        rng = np.random.default_rng(0)
+        X = rng.uniform(0, 2, size=(200, 1)); Y = (3 * np.exp(-1.3 * X[:, 0]) + rng.normal(0, .01, 200))[:, None]
+        model = a.Model(trees=[("exp", ("*", ("c", -1.3), ("x", 0)))], scales=[(3., 0.)])
+        report = a.constant_intervals(model, X, Y, [None])
+        constant = report[0]
+        self.assertEqual(constant["kind"], "constant")
+        self.assertLess(constant["low"], -1.3); self.assertGreater(constant["high"], -1.3)
+        self.assertLess(constant["high"] - constant["low"], .05)
+
+    def test_unidentified_constant(self):
+        X = np.linspace(0, 1, 20)[:, None]; Y = X.copy()
+        model = a.Model(trees=[("+", ("x", 0), ("*", ("c", 0.), ("gt", ("x", 0), ("c", 5.))))], scales=[(1., 0.)])
+        report = a.constant_intervals(model, X, Y, [None])
+        self.assertTrue(any(item["se"] is None for item in report if item["kind"] == "constant"))
+
+
 if __name__ == "__main__":
     unittest.main()

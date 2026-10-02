@@ -5072,6 +5072,49 @@ def write_symbolic_export(model, feature_names, output_names, cats, X=None, path
     Path(path).write_text("\n".join(lines))
     return result
 
+# --constant-intervals: approximate 95% intervals for the chosen model's
+# fitted constants and readout from the linearised least-squares covariance
+# s^2 (J^T J)^-1 on the training rows.  A constant whose interval spans zero
+# or is enormous is not pinned down by the data.  Local and approximate:
+# jump constants (zero gradient) get no interval.
+CONSTANT_INTERVALS = "on"
+
+def constant_intervals(model, X, Y, cats):
+    """[{output, kind, path, value, se, low, high}] for regression heads."""
+    targets,_=classification_layout(cats); report=[]
+    for j,heads in enumerate(targets):
+        if cats[j] is not None: continue
+        head=heads[0]; tree=model.trees[head]; a,b=model.scales[head]; y=np.asarray(Y[:,j],float)
+        values=np.asarray(constant_vector(tree),float); paths=constant_paths(tree)
+        def predict(theta):
+            return theta[-2]*np.asarray(evaluate_cached(with_constants(tree,theta[:-2]),X,model.adfs),float)+theta[-1]
+        theta=np.concatenate([values,[a,b]])
+        try:
+            base=predict(theta); J=np.empty((len(y),len(theta)))
+            for k in range(len(theta)):
+                step=1e-6*max(abs(theta[k]),1.); probe=theta.copy(); probe[k]+=step
+                J[:,k]=(predict(probe)-base)/step
+        except (ArithmeticError, IndexError, RecursionError, ValueError): continue
+        if not np.isfinite(J).all() or not np.isfinite(base).all(): continue
+        dof=len(y)-len(theta)
+        if dof<=0: continue
+        sigma2=float(np.sum((base-y)**2))/dof
+        identified=np.linalg.norm(J,axis=0)>1e-12*max(np.linalg.norm(base),1.)
+        covariance=np.full((len(theta),len(theta)),np.nan)
+        if identified.any():
+            covariance[np.ix_(identified,identified)]=sigma2*np.linalg.pinv(J[:,identified].T@J[:,identified])
+        for k,value in enumerate(theta):
+            se=float(np.sqrt(max(covariance[k,k],0.))) if np.isfinite(covariance[k,k]) else None
+            report.append({"output":j,"kind":"constant" if k<len(values) else ("scale" if k==len(values) else "intercept"),
+                           "path":list(paths[k]) if k<len(values) else None,"value":float(value),"se":se,
+                           "low":None if se is None else float(value-1.96*se),"high":None if se is None else float(value+1.96*se)})
+    return report
+
+def print_constant_intervals(report):
+    if not report: return
+    shown=", ".join(f"{item['value']:.6g}"+(f" ± {1.96*item['se']:.2g}" if item["se"] is not None else " (not identified)") for item in report)
+    print(f"Approximate 95% intervals (constants, then scale and intercept): {shown}")
+
 def export_model(m, feature_names, output_names, cats, maps, source_columns, types, fixture_df=None, input_ranges=None):
     used_indices=set(used_feature_indices(m)); input_columns=[]; offset=0
     layout=maps.get(SEQUENCE_LAYOUT_KEY)
@@ -6450,6 +6493,7 @@ def build_arg_parser():
     ap.add_argument("--symbolic-export",choices=("on","off"),default="on",help="Also write the chosen model as a simplified SymPy expression and LaTeX to best_model_symbolic.txt when sympy is installed (default: on)")
     ap.add_argument("--loss",choices=("huber","squared","relative"),default="huber",help="Regression loss: huber (MAD-scaled, robust to outliers), squared (plain least squares) or relative (Huber on the error relative to |y|, for targets spanning orders of magnitude) (default: huber)")
     ap.add_argument("--huber-delta",type=float,default=1.5,help="Huber threshold in robust target-scale units for --loss huber and relative (default: 1.5)")
+    ap.add_argument("--constant-intervals",choices=("on","off"),default="on",help="Print and record approximate 95%% intervals for the chosen model's constants from the linearised covariance (default: on)")
     ap.add_argument("--max-time",type=float,default=0.,help="Stop the search after this many seconds and go to the final choice; 0 = no limit (default: 0)")
     ap.add_argument("--stop-at-loss",type=float,default=None,help="Stop the search once the best training loss (the loss printed during the run) is at or below this value (default: off)")
     ap.add_argument("--sparse-seeding",choices=("on","off"),default="off",help="Seed the initial population with sparse linear fits over a modest basis (inputs, unary operators of inputs, pairwise products and ratios, hinges), found by orthogonal matching pursuit (default: off)")
@@ -6609,8 +6653,8 @@ def train_from_setup(args, setup, choose_model=None):
     SPARSE_SEEDING=getattr(args,"sparse_seeding","off"); SPARSE_BASIS_SIZE=int(getattr(args,"sparse_basis_size",300)); SPARSE_SEED_STATS.update(seeds=0,best_r2=None,basis=0)
     global BACKPROP_MUTATION_WEIGHT,BACKPROP_INVERSE
     global RESIDUAL_TERM_WEIGHT,NESTING_RULES
-    global SYMBOLIC_EXPORT,LOSS_MODE,ROBUST_LOSS_DELTA
-    SYMBOLIC_EXPORT=getattr(args,"symbolic_export","on")
+    global SYMBOLIC_EXPORT,LOSS_MODE,ROBUST_LOSS_DELTA,CONSTANT_INTERVALS
+    SYMBOLIC_EXPORT=getattr(args,"symbolic_export","on"); CONSTANT_INTERVALS=getattr(args,"constant_intervals","on")
     LOSS_MODE=getattr(args,"loss","huber"); ROBUST_LOSS_DELTA=float(getattr(args,"huber_delta",1.5))
     RESIDUAL_TERM_WEIGHT=float(getattr(args,"residual_term_weight",0.)); NESTING_RULES=parse_nesting_rules(getattr(args,"forbid_nesting",""))
     BACKPROP_MUTATION_WEIGHT=float(getattr(args,"backprop_mutation_weight",0.)); BACKPROP_INVERSE=getattr(args,"backprop_inverse","generic")
@@ -6806,6 +6850,8 @@ def train_from_setup(args, setup, choose_model=None):
     chosen=choices[selected_index]
     print(f"Selected model: {equations(chosen,names,out_names,cats)}")
     print("Fitted constants:", [constant_vector(tree) for tree in chosen.trees])
+    intervals=constant_intervals(chosen,Xt,Yt,cats) if CONSTANT_INTERVALS=="on" else None
+    print_constant_intervals(intervals)
     if Xv is not None:
         metrics=frozen_metrics(chosen,Xv,Yv,cats,constraints,out_names)
         print(f"Validation (used for selection): loss={metrics['loss']:.6g}, shape={metrics['shape']:.6g} | output losses={output_loss_summary(metrics['losses'],out_names)}")
@@ -6821,7 +6867,7 @@ def train_from_setup(args, setup, choose_model=None):
     snapshot_islands(checkpoint_state,islands,checkpoint_state["island_config"])
     save_checkpoint(checkpoint_path,gen,islands[0].population,islands[0].bayes,islands[0].archive,checkpoint_state)
     record_selection_manifest(manifest_path,selection)
-    card=write_model_card(manifest_path,chosen,names,out_names,constraints,hypotheses,islands[0].bayes,{"train_rows":len(Xt),"validation_rows":0 if Xv is None else len(Xv),"preprocessing":"fit_on_training_rows_only","schema_version":1},cats=cats,selection=selection,quality_diversity={"islands":[{"semantic":island.semantic_qd.diagnostics(),"structural":island.structural_qd.diagnostics(),"controller":island.qd_controller.diagnostics(),
+    card=write_model_card(manifest_path,chosen,names,out_names,constraints,hypotheses,islands[0].bayes,{"train_rows":len(Xt),"validation_rows":0 if Xv is None else len(Xv),"preprocessing":"fit_on_training_rows_only","schema_version":1},cats=cats,bootstrap=None if intervals is None else {"method":"linearised least-squares covariance on training rows","level":.95,"parameters":intervals},selection=selection,quality_diversity={"islands":[{"semantic":island.semantic_qd.diagnostics(),"structural":island.structural_qd.diagnostics(),"controller":island.qd_controller.diagnostics(),
                                                                                          "residual":None if island.residual_qd is None else island.residual_qd.diagnostics()} for island in islands]},survival={"nsga_normalization":args.nsga_normalization,"parsimony_quality_tolerance":args.parsimony_quality_tolerance,"islands":checkpoint_state["island_config"]},adf_diagnostics=[island.adf_registry.diagnostics() for island in islands if island.adf_registry.enabled] or None,evaluation={"budgets":[island.budget.snapshot() for island in islands],"evaluator":evaluator.diagnostics()},interaction_discovery=interaction_discovery,island_diagnostics={"config":checkpoint_state["island_config"],"bayesian_posteriors":[[bank.particles.last_predictive for bank in island.bayes.banks] for island in islands]})
     evaluator.close()
     print(f"Model card: {card}")
