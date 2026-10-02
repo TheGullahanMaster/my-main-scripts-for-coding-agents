@@ -34,6 +34,7 @@ import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 import warnings
 from dataclasses import dataclass, field
@@ -5126,6 +5127,7 @@ def training_input_ranges(frame, source_columns, types):
 SYMBOLIC_EXPORT = "on"
 SYMBOLIC_SIMPLIFY_NODES = 40
 READABLE_CONSTANT_TOLERANCE = 1e-8
+SYMBOLIC_TIME_LIMIT = 20.  # seconds of SymPy rearranging per form
 
 def readable_constant(value, exact=False):
     """A SymPy number for value: a fraction or multiple of pi when it is one
@@ -5249,11 +5251,29 @@ def _symbolic_form(model, head, symbols, mode):
     finish=(lambda e: e) if mode=="exact" else (lambda e: e.xreplace({f:readable_constant(float(f)) for f in e.atoms(sp.Float)}))
     candidates=[expression]
     if node_size(model.trees[head])<=SYMBOLIC_SIMPLIFY_NODES:
-        try:
+        def rearrange():
             candidates.append(sp.simplify(expression))
-            if mode=="raw": candidates+=[sp.expand(candidates[-1]),sp.factor_terms(sp.expand(candidates[-1]))]
-        except Exception: pass  # simplification is cosmetic; keep the unsimplified form
-    return min((finish(candidate) for candidate in candidates),key=lambda e: len(sp.latex(e)))
+            if mode=="raw": candidates.extend([sp.expand(candidates[-1]),sp.factor_terms(sp.expand(candidates[-1]))])
+        try: _within_time_limit(rearrange,SYMBOLIC_TIME_LIMIT)
+        except Exception: pass  # simplification is cosmetic; keep what finished
+    shown=[]
+    for candidate in candidates:
+        try: candidate=finish(candidate); shown.append((len(sp.latex(candidate)),candidate))
+        except Exception: pass  # SymPy can fail on an odd form (e.g. Max of zoo); skip that candidate
+    if not shown: raise ValueError("no printable form")
+    return min(shown,key=lambda item: item[0])[1]
+
+class _SymbolicTimeout(Exception): pass
+
+def _within_time_limit(function, seconds):
+    """Run function, raising _SymbolicTimeout after seconds where SIGALRM is
+    usable (Unix main thread); elsewhere it runs unguarded."""
+    if not hasattr(signal,"SIGALRM") or threading.current_thread() is not threading.main_thread():
+        return function()
+    def expire(*_): raise _SymbolicTimeout()
+    previous=signal.signal(signal.SIGALRM,expire); signal.setitimer(signal.ITIMER_REAL,seconds)
+    try: return function()
+    finally: signal.setitimer(signal.ITIMER_REAL,0); signal.signal(signal.SIGALRM,previous)
 
 def _raw_agreement(expression, symbols, X, reference):
     """(share of rows where the raw form is finite, max |raw - model| / output spread) or None."""
@@ -5284,16 +5304,22 @@ def symbolic_model(model, feature_names, output_names, cats, positive=(), X=None
         if cats[j] is not None: continue
         head=heads[0]; entry={}
         for mode in ("exact","raw"):
-            expression=_symbolic_form(model,head,symbols,mode)
-            entry[mode]=(expression,sp.latex(expression,symbol_names=names,ln_notation=True,mul_symbol=r"\,"))
-        entry["agreement"]=None if predictions is None else _raw_agreement(entry["raw"][0],symbols,X,predictions[:,head])
+            # An export must never stop a run: a form SymPy cannot handle is reported, not raised.
+            try:
+                expression=_symbolic_form(model,head,symbols,mode)
+                entry[mode]=(expression,sp.latex(expression,symbol_names=names,ln_notation=True,mul_symbol=r"\,"))
+            except Exception as error:
+                entry[mode]=(None,None); entry.setdefault("errors",{})[mode]=f"{type(error).__name__}: {error}"
+        entry["agreement"]=None if predictions is None or entry["raw"][0] is None else _raw_agreement(entry["raw"][0],symbols,X,predictions[:,head])
         result[output_names[j]]=entry
     return result
 
 def write_symbolic_export(model, feature_names, output_names, cats, X=None, path="best_model_symbolic.txt"):
     if SYMBOLIC_EXPORT!="on": return None
     positive=() if X is None else tuple(index for index in range(X.shape[1]) if np.all(X[:,index]>0))
-    result=symbolic_model(model,feature_names,output_names,cats,positive,X)
+    try: result=symbolic_model(model,feature_names,output_names,cats,positive,X)
+    except Exception as error:  # the export is optional; it must never stop a run
+        print(f"Symbolic export skipped: {type(error).__name__}: {error}"); return None
     if result is None:
         print("Symbolic export skipped: install sympy for a simplified equation and LaTeX."); return None
     lines=["# afpo symbolic export",
@@ -5302,13 +5328,14 @@ def write_symbolic_export(model, feature_names, output_names, cats, X=None, path
     for name,entry in result.items():
         for mode in ("exact","raw"):
             expression,latex=entry[mode]
+            if expression is None: lines.append(f"{name} ({mode}): not converted ({entry['errors'][mode]})"); continue
             lines+=[f"{name} ({mode}) = {expression}",f"LaTeX ({mode}): {name} = {latex}"]
         agreement=entry["agreement"]
         if agreement is not None:
             share,gap=agreement
             lines.append(f"raw vs model on training rows: defined on {100*share:.1f}% of rows, max |difference| = {gap:.2g} of the output range")
         lines.append("")
-        print(f"Symbolic: {name} = {entry['raw'][0]}")
+        if entry["raw"][0] is not None: print(f"Symbolic: {name} = {entry['raw'][0]}")
     Path(path).write_text("\n".join(lines))
     return result
 

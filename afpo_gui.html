@@ -1433,6 +1433,7 @@ function renderMath() {
   const mode = MATH.mode;
   body.innerHTML = d.outputs.map(o => {
     const form = o[mode], tex = `${o.name_latex} = ${form.latex}`;
+    if (!form.latex) return `<div class="math"><div class="hint">${esc(o.name)}: could not convert (${esc(form.error)})</div></div>`;
     let shown;
     if (MATH.katex) {
       try { shown = MATH.katex.renderToString(tex, {displayMode: true, throwOnError: true}); } catch (e) { shown = null; }
@@ -1451,7 +1452,7 @@ $$('#mathMode button').forEach(b => b.onclick = () => {
 $('#mathCopy').onclick = async () => {
   const d = MATH.data;
   if (!d || !d.available) return;
-  const text = d.outputs.map(o => `${o.name_latex} = ${o[MATH.mode].latex}`).join('\n');
+  const text = d.outputs.filter(o => o[MATH.mode].latex).map(o => `${o.name_latex} = ${o[MATH.mode].latex}`).join('\n');
   try { await navigator.clipboard.writeText(text); toast('LaTeX copied'); } catch (e) { toast('Copy failed: ' + e.message, true); }
 };
 function fillOutputSelect(sel, names, keep) {

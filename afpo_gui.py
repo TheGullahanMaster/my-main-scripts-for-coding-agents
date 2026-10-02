@@ -767,8 +767,9 @@ class ModelExplorer:
                 return {"available": False, "reason": "Install sympy to see the rendered equation."}
             outputs = []
             for name, entry in result.items():
-                forms = {mode: {"latex": entry[mode][1], "text": str(entry[mode][0]),
-                                "mathml": afpo.mathml_expression(entry[mode][0], entry[mode][0].free_symbols)} for mode in ("exact", "raw")}
+                forms = {mode: {"latex": None, "error": entry.get("errors", {}).get(mode)} if entry[mode][0] is None else
+                         {"latex": entry[mode][1], "text": str(entry[mode][0]),
+                          "mathml": afpo.mathml_expression(entry[mode][0], entry[mode][0].free_symbols)} for mode in ("exact", "raw")}
                 agreement = entry["agreement"]
                 outputs.append({"name": name, "name_latex": afpo.latex_symbol_name(name.replace(" ", "_")), **forms, "agreement": None if agreement is None else
                                 {"defined": agreement[0], "gap": None if not math.isfinite(agreement[1]) else agreement[1]}})

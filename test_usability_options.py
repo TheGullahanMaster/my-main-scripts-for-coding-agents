@@ -106,6 +106,22 @@ class SymbolicTest(unittest.TestCase):
         share, gap = result["agreement"]  # the raw form is undefined on most of these rows
         self.assertLess(share, .5)
 
+    def test_failed_conversion_does_not_raise(self):
+        model = a.Model(trees=[("*", ("x", 0), ("x", 1))], scales=[(3., 0.)])
+        with tempfile.TemporaryDirectory() as directory, patch("builtins.print"), \
+                patch.object(a, "_symbolic_form", side_effect=ValueError("boom")):
+            path = os.path.join(directory, "out.txt")
+            result = a.write_symbolic_export(model, ["u", "v"], ["y"], [None], np.ones((4, 2)), path)
+            with open(path) as handle:
+                content = handle.read()
+        self.assertEqual(result["y"]["errors"]["raw"], "ValueError: boom")
+        self.assertIn("y (raw): not converted (ValueError: boom)", content)
+
+    def test_slow_simplification_is_cut_off(self):
+        import time
+        with self.assertRaises(a._SymbolicTimeout):
+            a._within_time_limit(lambda: time.sleep(2), .2)
+
     def test_writes_file(self):
         model = a.Model(trees=[("*", ("x", 0), ("x", 1))], scales=[(3., 0.)])
         X = np.ones((4, 2))
