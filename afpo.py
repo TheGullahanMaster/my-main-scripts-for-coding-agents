@@ -1482,12 +1482,13 @@ def tune_model_constants(model, X, Y, affine_on, cats):
         for head in heads:
             original=trees[head]
             multiterm=READOUT_MODE=="multiterm" and affine_on
-            tree=multiterm_refit(original,Xs,Ys[:,j],model.adfs) if multiterm else original
+            grammar=model.mdl_operators or None  # never write an operator the run did not select
+            tree=multiterm_refit(original,Xs,Ys[:,j],model.adfs,grammar) if multiterm else original
             tree=fit_tree_constants(tree,Xs,Ys[:,j],model.adfs,fit_readout=affine_on)
             # Re-solve the linear coefficients after the joint fit: the readout
             # scale and the term coefficients share one degree of freedom, and
             # leaving it to Levenberg-Marquardt lets them drift apart.
-            if multiterm and tree is not original: tree=multiterm_refit(tree,Xs,Ys[:,j],model.adfs)
+            if multiterm and tree is not original: tree=multiterm_refit(tree,Xs,Ys[:,j],model.adfs,grammar)
             if tree is not original: trees[head]=tree; changed=True
     if changed: model.trees=trees
     return changed
@@ -1500,8 +1501,10 @@ def tune_model_constants(model, X, Y, affine_on, cats):
 # and MDL charges exactly the coefficients that survive.  Terms that are
 # negligible or collinear with the others are pruned (nearly identical terms
 # would otherwise get huge cancelling coefficients), and at most MAX_TERMS
-# are kept.
-READOUT_MODE = "affine"
+# are kept.  On by default since bench_diag v1 (2026-10-02, alone and with
+# the residual term): more exact solves and +0.46 held-out digits, beyond
+# paired seed noise.  Checkpoints from before the flag resume with affine.
+READOUT_MODE = "multiterm"
 MAX_TERMS = 4
 GENE_CROSSOVER_RATE = 0.    # share of crossovers that exchange whole terms in multiterm mode
 MULTITERM_CONDITION_LIMIT = 1e8
@@ -1518,18 +1521,26 @@ def split_terms(tree, sign=1.):
     if op=="*" and tree[2][0]=="c" and tree[1][0]!="c": return [(sign*float(tree[2][1]),tree[1])]
     return [(sign,tree)]
 
-def join_terms(terms):
-    """Inverse of split_terms for (coefficient, body) pairs with a body."""
-    parts=[]
+def join_terms(terms, ops=None):
+    """Inverse of split_terms for (coefficient, body) pairs with a body, written
+    only with operators in ops (None allows any).  A sign goes into "-" or "neg"
+    when allowed, else into the coefficient; returns None when ops cannot
+    express the sum (no "+", or a coefficient other than 1 without "*")."""
+    allowed=lambda op: ops is None or op in ops
+    def scaled(coefficient, body):
+        if coefficient==1.: return body
+        return ("*",("c",coefficient),body) if allowed("*") else None
+    if not terms: return ("c",0.)
+    tree=None
     for coefficient,body in terms:
-        if coefficient==1.: parts.append(("+",body))
-        elif coefficient==-1.: parts.append(("-",body))
-        elif coefficient<0: parts.append(("-",("*",("c",-coefficient),body)))
-        else: parts.append(("+",("*",("c",coefficient),body)))
-    if not parts: return ("c",0.)
-    first_sign,tree=parts[0]
-    if first_sign=="-": tree=("neg",tree)
-    for operator,term in parts[1:]: tree=(operator,tree,term)
+        magnitude=abs(coefficient); negative=coefficient<0
+        if tree is None:
+            if negative and allowed("neg") and scaled(magnitude,body) is not None: tree=("neg",scaled(magnitude,body))
+            else: tree=scaled(coefficient,body)
+        elif negative and allowed("-") and scaled(magnitude,body) is not None: tree=("-",tree,scaled(magnitude,body))
+        elif allowed("+") and scaled(coefficient,body) is not None: tree=("+",tree,scaled(coefficient,body))
+        else: return None
+        if tree is None: return None
     return tree
 
 def _multiterm_solve(F, y):
@@ -1546,7 +1557,7 @@ def _multiterm_solve(F, y):
     condition=float(singular[0]/singular[-1]) if len(singular) and singular[-1]>0 else float("inf")
     return a,b,robust_loss(F@a+b,y),condition
 
-def multiterm_refit(tree, X, y, adfs=None):
+def multiterm_refit(tree, X, y, adfs=None, ops=None):
     """Re-solve the coefficients of a tree's top-level terms; returns the tree unchanged unless it improves or shrinks at equal loss."""
     terms=[(coefficient,body) for coefficient,body in split_terms(tree) if body is not None]
     if len(terms)<2: return tree
@@ -1574,11 +1585,11 @@ def multiterm_refit(tree, X, y, adfs=None):
     pruned=len(active)<len(terms)
     if loss>before+max(LOSS_NOISE_FLOOR,1e-12*abs(before)) or (not pruned and loss>=before): return tree
     tolerance=np.sqrt(np.finfo(float).eps)
-    rebuilt=join_terms([(1. if abs(c-1.)<=tolerance else -1. if abs(c+1.)<=tolerance else float(c),terms[index][1]) for c,index in zip(coefficients,active)])
-    if rebuilt==tree or guarded_constant_divisor(rebuilt) or guard_engagement([rebuilt],X,adfs): return tree
+    rebuilt=join_terms([(1. if abs(c-1.)<=tolerance else -1. if abs(c+1.)<=tolerance else float(c),terms[index][1]) for c,index in zip(coefficients,active)],ops)
+    if rebuilt is None or rebuilt==tree or guarded_constant_divisor(rebuilt) or guard_engagement([rebuilt],X,adfs): return tree
     return rebuilt
 
-def gene_crossover(left, right, max_nodes, max_depth):
+def gene_crossover(left, right, max_nodes, max_depth, ops=None):
     """Multigene crossover: add one of right's top-level terms to left, or swap it for one of left's."""
     left_terms=[(c,body) for c,body in split_terms(left) if body is not None]
     right_terms=[(c,body) for c,body in split_terms(right) if body is not None]
@@ -1587,7 +1598,9 @@ def gene_crossover(left, right, max_nodes, max_depth):
         donor=rng.choice(right_terms); terms=list(left_terms)
         if terms and (len(terms)>=MAX_TERMS or rng.random()<.5): terms[rng.randrange(len(terms))]=donor
         else: terms.append(donor)
-        child=simplify_tree(join_terms(terms))
+        joined=join_terms(terms,ops)
+        if joined is None: continue
+        child=simplify_tree(joined)
         if child!=left and node_size(child)<=max_nodes and node_depth(child)<=max_depth: return child
     return left
 class PosteriorParticlePopulation:
@@ -2403,8 +2416,9 @@ def _best_affine_match(L, D):
 
 # Residual-driven term (boosting-style): add to the parent the library entry
 # that best matches what its readout still misses, T + c*L with L fitted to
-# (y - b)/a - T.  Shares the backpropagation library and context.
-RESIDUAL_TERM_WEIGHT = 0.
+# (y - b)/a - T.  Shares the backpropagation library and context.  On by
+# default since bench_diag v1 (+0.48 held-out digits, beyond seed noise).
+RESIDUAL_TERM_WEIGHT = 1.
 
 def residual_term_mutate(t, ops, max_nodes, max_depth, adfs=None):
     X=_BACKPROP_CONTEXT["X"]; target=_BACKPROP_CONTEXT["desired"]
@@ -2418,7 +2432,8 @@ def residual_term_mutate(t, ops, max_nodes, max_depth, adfs=None):
     index,slope,_,sse=_best_affine_match(L[valid],residual[valid])
     centred=residual[valid]-residual[valid].mean()
     if not np.isfinite(sse) or sse>=float(centred@centred)*(1-1e-6) or abs(slope)<=EPS: return t
-    term=trees[index] if abs(slope-1.)<=1e-9 else ("*",("c",slope),trees[index])
+    if "+" not in ops: return t
+    term=trees[index] if abs(slope-1.)<=1e-9 or "*" not in ops else ("*",("c",slope),trees[index])
     for addition in (term,trees[index]):
         child=simplify_tree(("+",t,addition))
         if child!=t and node_size(child)<=max_nodes and node_depth(child)<=max_depth: return child
@@ -6114,7 +6129,9 @@ def sparse_seed_models(X, Y, cats, ops, max_nodes, max_depth, count, head_count)
         if cats[j] is not None: continue
         y=np.asarray(Y[rows,j],float); options=[]
         for _,support,coefficients,_,r2 in sparse_fits(B,y,max_terms=min(MAX_TERMS,4)):
-            tree=simplify_tree(join_terms([(coefficients[index],basis[index]) for index in support]))
+            joined=join_terms([(coefficients[index],basis[index]) for index in support],ops)
+            if joined is None: continue
+            tree=simplify_tree(joined)
             if node_size(tree)<=max_nodes and node_depth(tree)<=max_depth and tree not in options:
                 options.append(tree); best_r2=r2 if best_r2 is None else max(best_r2,r2)
         if options: trees_by_head[heads[0]]=options
@@ -6346,7 +6363,7 @@ def evolve_generation(pop, generation, *, X, Xt, Yt, Xv, Yv, cats, constraints, 
             scales=list(p.model.scales); child_age=p.model.age+1; child_origin="fragment"
             sources=[p.model]
         elif rng.random() < crossover_rate and len(parents)>=2:
-            p,q=rng.sample(parents,2); trees=[gene_crossover(a,b,nodes,depth) if READOUT_MODE=="multiterm" and affine_on and rng.random()<GENE_CROSSOVER_RATE else semantic_crossover(a,b,Xsb,nodes,depth,adf_registry.definitions if adf_registry else None) for a,b in zip(p.model.trees,q.model.trees)]; scales=list(p.model.scales); child_age=max(p.model.age,q.model.age)+1
+            p,q=rng.sample(parents,2); trees=[gene_crossover(a,b,nodes,depth,active_ops) if READOUT_MODE=="multiterm" and affine_on and rng.random()<GENE_CROSSOVER_RATE else semantic_crossover(a,b,Xsb,nodes,depth,adf_registry.definitions if adf_registry else None) for a,b in zip(p.model.trees,q.model.trees)]; scales=list(p.model.scales); child_age=max(p.model.age,q.model.age)+1
             if trees==list(p.model.trees) and unchanged<unchanged_limit: unchanged+=1; continue
             if duplicate(trees): continue
             child=Model(trees,scales,child_age,origin="crossover",parent_ids=(p.model.lineage_id,q.model.lineage_id),mdl_operators=grammar_for_trees(active_ops,trees,adf_registry.definitions if adf_registry else None),mdl_feature_count=X.shape[1],adfs={} if adf_registry is None else dict(adf_registry.definitions),founder_ids=tuple(sorted(set(p.model.founder_ids).union(q.model.founder_ids))),birth_generation=generation+1-child_age)
@@ -6751,12 +6768,12 @@ def build_arg_parser():
     ap.add_argument("--semantic-max-delta",type=float,default=5.,help="Largest output change (in target standard deviations) a mutation or crossover may make before the constant fit; inf disables the cap (default: 5)")
     ap.add_argument("--constant-snapping",choices=("off","final"),default="final",help="final: before the final choice, round fitted constants of the strongest candidates to simpler values (integers, p/q, pi, e, sqrt2, ln2, powers of ten, short decimals) when training and validation loss and the numeric guard are preserved (default: final)")
     ap.add_argument("--snap-tolerance",type=float,default=1e-6,help="Relative loss increase a snapped constant may cause on training and on validation data, never below the loss noise floor (default: 1e-6)")
-    ap.add_argument("--readout",choices=("affine","multiterm"),default="affine",help="Output readout: affine fits a*tree+b; multiterm (multigene GP) gives each top-level +/- term of a regression tree its own least-squares coefficient, pruning negligible and collinear terms (default: affine)")
+    ap.add_argument("--readout",choices=("affine","multiterm"),default="multiterm",help="Output readout: affine fits a*tree+b; multiterm (multigene GP) gives each top-level +/- term of a regression tree its own least-squares coefficient, pruning negligible and collinear terms (default: multiterm)")
     ap.add_argument("--max-terms",type=int,default=4,help="Most top-level terms a multiterm tree keeps (default: 4)")
     ap.add_argument("--gene-crossover-rate",type=float,default=0.,help="Share of crossovers that add or swap one whole top-level term in multiterm mode; at 0.5 it cut bench_complex solves (2/15 vs 5/15 at 0 on products6, sum8, reuse_poly3) (default: 0)")
     ap.add_argument("--backprop-mutation-weight",type=float,default=0.,help="Initial portfolio weight of semantic backpropagation: invert the tree from its readout down to a random node and replace that subtree with the small expression or fragment that best matches the desired values; 0 disables it (default: 0)")
     ap.add_argument("--backprop-inverse",choices=("exact","generic"),default="generic",help="exact inverts only + - * / neg exp log tanh sigmoid; generic also solves every other operator numerically per row, on the branch the subtree is already on (default: generic)")
-    ap.add_argument("--residual-term-weight",type=float,default=0.,help="Initial portfolio weight of the residual-term mutation, which adds the small expression that best matches what the parent still misses (boosting-style); 0 disables it (default: 0)")
+    ap.add_argument("--residual-term-weight",type=float,default=1.,help="Initial portfolio weight of the residual-term mutation, which adds the small expression that best matches what the parent still misses (boosting-style); 0 disables it (default: 1)")
     ap.add_argument("--forbid-nesting",default="",metavar="OUTER>INNER,...",help="Operator pairs that may not nest, e.g. exp>exp,log>exp,sin>sin: INNER may not appear anywhere below OUTER (default: none)")
     ap.add_argument("--symbolic-export",choices=("on","off"),default="on",help="Also write the chosen model to best_model_symbolic.txt when sympy is installed: an exact form with afpo's protected operators and a readable raw form without them, each with LaTeX (default: on)")
     ap.add_argument("--loss",choices=("huber","squared","relative"),default="huber",help="Regression loss: huber (MAD-scaled, robust to outliers), squared (plain least squares) or relative (Huber on the error relative to |y|, for targets spanning orders of magnitude) (default: huber)")
@@ -6931,9 +6948,9 @@ def train_from_setup(args, setup, choose_model=None):
     global SYMBOLIC_EXPORT,LOSS_MODE,ROBUST_LOSS_DELTA,CONSTANT_INTERVALS
     SYMBOLIC_EXPORT=getattr(args,"symbolic_export","on"); CONSTANT_INTERVALS=getattr(args,"constant_intervals","on")
     LOSS_MODE=getattr(args,"loss","huber"); ROBUST_LOSS_DELTA=float(getattr(args,"huber_delta",1.5))
-    RESIDUAL_TERM_WEIGHT=float(getattr(args,"residual_term_weight",0.)); NESTING_RULES=parse_nesting_rules(getattr(args,"forbid_nesting",""))
+    RESIDUAL_TERM_WEIGHT=float(getattr(args,"residual_term_weight",1.)); NESTING_RULES=parse_nesting_rules(getattr(args,"forbid_nesting",""))
     BACKPROP_MUTATION_WEIGHT=float(getattr(args,"backprop_mutation_weight",0.)); BACKPROP_INVERSE=getattr(args,"backprop_inverse","generic")
-    READOUT_MODE=getattr(args,"readout","affine"); MAX_TERMS=int(getattr(args,"max_terms",4)); GENE_CROSSOVER_RATE=float(getattr(args,"gene_crossover_rate",0.))
+    READOUT_MODE=getattr(args,"readout","multiterm"); MAX_TERMS=int(getattr(args,"max_terms",4)); GENE_CROSSOVER_RATE=float(getattr(args,"gene_crossover_rate",0.))
     global SQUASH_SWAP_WEIGHT,SMOOTH_SWAP_WEIGHT,GATE_MUTATION_WEIGHT
     SQUASH_SWAP_WEIGHT=float(getattr(args,"squash_swap_weight",1.)); SMOOTH_SWAP_WEIGHT=float(getattr(args,"smooth_swap_weight",1.)); GATE_MUTATION_WEIGHT=float(getattr(args,"gate_mutation_weight",1.))
     FIT_BACKEND=getattr(args,"fit_backend","auto")

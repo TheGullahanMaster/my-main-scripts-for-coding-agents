@@ -28,6 +28,15 @@ class SplitJoinTest(unittest.TestCase):
         self.assertEqual(a.split_terms(("+", ("x", 0), ("c", 4.))), [(1., ("x", 0)), (4., None)])
 
 
+    def test_join_respects_the_grammar(self):
+        terms = [(-2., ("x", 0)), (1., ("x", 1)), (-1., ("x", 2))]
+        joined = a.join_terms(terms, ("+", "*"))
+        self.assertTrue(all(op not in repr(joined) for op in ("'-'", "'neg'")))
+        np.testing.assert_allclose(values(joined), values(a.join_terms(terms)), rtol=1e-12)
+        self.assertIsNone(a.join_terms([(2., ("x", 0)), (1., ("x", 1))], ("+",)))
+        self.assertIsNone(a.join_terms([(1., ("x", 0)), (1., ("x", 1))], ("*",)))
+
+
 class RefitTest(unittest.TestCase):
     def test_recovers_term_coefficients(self):
         y = 3.7 * X[:, 0] * X[:, 1] - 0.25 * X[:, 2] / X[:, 3] + 1.2
@@ -50,6 +59,14 @@ class RefitTest(unittest.TestCase):
         with patch.object(a, "MAX_TERMS", 3):
             refit = a.multiterm_refit(tree, X, y)
         self.assertEqual(len([b for _, b in a.split_terms(refit) if b is not None]), 3)
+
+    def test_refit_stays_inside_the_model_grammar(self):
+        y = (2 * X[:, 0] - 3 * X[:, 1])[:, None]
+        model = a.Model(trees=[("+", ("x", 0), ("x", 1))], scales=[(1., 0.)], mdl_operators=("+", "*"))
+        with patch.object(a, "READOUT_MODE", "multiterm"):
+            a.tune_model_constants(model, X, y, True, [None])
+        self.assertNotIn("'-'", repr(model.trees)); self.assertNotIn("'neg'", repr(model.trees))
+        a.model_description(model, 4)  # raises if an operator left the grammar
 
     def test_single_term_unchanged(self):
         tree = ("sin", ("x", 0))
@@ -79,6 +96,7 @@ class GeneCrossoverTest(unittest.TestCase):
     def test_cli(self):
         args = a.parse_cli(["--readout", "multiterm", "--max-terms", "6"])[1]
         self.assertEqual((args.readout, args.max_terms, args.gene_crossover_rate), ("multiterm", 6, 0.))
+        self.assertEqual(a.parse_cli([])[1].readout, "multiterm")
         with self.assertRaises(SystemExit), patch("sys.stderr"):
             a.parse_cli(["--max-terms", "1"])
 
