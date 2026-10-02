@@ -41,6 +41,14 @@ CONFIGS = {
     "jump_scan": {"flags": ["--jump-constant-scan", "on", "--jump-mutation-weight", "0"]},
     "jump_mutation": {"flags": ["--jump-constant-scan", "off", "--jump-mutation-weight", "1"]},
     "jump_scan_mutation": {"flags": ["--jump-constant-scan", "on", "--jump-mutation-weight", "1"]},
+    # Current afpo.py defaults, and each 2026-10-02 feature switched on alone.
+    "defaults": {"flags": []},
+    "no_snapping": {"flags": ["--constant-snapping", "off"]},
+    "multiterm": {"flags": ["--readout", "multiterm"]},
+    "backprop": {"flags": ["--backprop-mutation-weight", "1"]},
+    "backprop_exact": {"flags": ["--backprop-mutation-weight", "1", "--backprop-inverse", "exact"]},
+    "residual_term": {"flags": ["--residual-term-weight", "1"]},
+    "sparse_seeding": {"flags": ["--sparse-seeding", "on"]},
 }
 base.CONFIGS.update(CONFIGS)
 

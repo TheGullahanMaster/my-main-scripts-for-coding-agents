@@ -2418,6 +2418,22 @@ def residual_term_mutate(t, ops, max_nodes, max_depth, adfs=None):
         if child!=t and node_size(child)<=max_nodes and node_depth(child)<=max_depth: return child
     return t
 
+# --forbid-nesting (PySR's nested_constraints, simplified): outer>inner pairs
+# such as exp>exp or sin>sin.  Offspring that break a rule are redrawn, and
+# any model that still contains one is infeasible.
+NESTING_RULES = frozenset()
+
+def nesting_violation(tree, enclosing=frozenset()):
+    """The first forbidden outer>inner pair in the tree, or ''."""
+    if not NESTING_RULES or tree[0] in ("x","c","arg"): return ""
+    for outer in enclosing:
+        if (outer,tree[0]) in NESTING_RULES: return f"{outer}>{tree[0]}"
+    inner=enclosing|{tree[0]}
+    for child in tree[1:]:
+        found=nesting_violation(child,inner)
+        if found: return found
+    return ""
+
 def regression_head_outputs(cats):
     """Tree index -> output column for regression heads (classifier heads have no desired value)."""
     targets,_=classification_layout(cats)
@@ -4411,7 +4427,7 @@ def assess(m, X, Y, affine_on, cats, fit_affine=True, constraints=None, output_n
         return ""
     reason=""
     for tree in m.trees:
-        reason=valid(tree)
+        reason=valid(tree) or (f"nesting:{nesting_violation(tree)}" if NESTING_RULES and nesting_violation(tree) else "")
         if reason: break
     if reason:
         m.feasible=False; m.invalid_reason=reason; INVALID_DIAGNOSTICS[reason]=INVALID_DIAGNOSTICS.get(reason,0)+1
@@ -4956,6 +4972,84 @@ def training_input_ranges(frame, source_columns, types):
         values=pd.to_numeric(frame[column],errors="coerce").to_numpy(float); values=values[np.isfinite(values)]
         ranges[column]=[float(values.min()),float(values.max())] if len(values) else [0.,1.]
     return ranges
+
+# --symbolic-export: the chosen model as a SymPy expression, simplified when
+# small, written with its LaTeX to best_model_symbolic.txt.  The forms are
+# faithful to afpo's guarded operators (log|x|, signed roots, sign(x)*|x|^y)
+# up to the tiny epsilons and clips; inputs that are positive on the
+# training data are declared positive, so Abs() and sign() of them simplify
+# away.  Operators without a closed form stay as named functions.
+SYMBOLIC_EXPORT = "on"
+SYMBOLIC_SIMPLIFY_NODES = 40
+
+def sympy_expression(tree, symbols, adfs=None):
+    import sympy as sp
+    def build(t, args=None):
+        if t[0]=="x": return symbols[t[1]]
+        if t[0]=="c": return sp.Float(t[1],15)
+        if t[0]=="arg": return args[t[1]]
+        values=[build(child,args) for child in t[1:]]
+        op=t[0]
+        if op.startswith("adf_") and adfs and op in adfs: return build(adfs[op]["tree"],values)
+        x=values[0]; y=values[1] if len(values)>1 else None
+        powers={"square":2,"cube":3,**{f"pow{k}":k for k in range(4,11)}}
+        table={
+            "+":lambda:x+y,"-":lambda:x-y,"*":lambda:x*y,"/":lambda:x/y,"neg":lambda:-x,"delta":lambda:sp.Abs(x-y),
+            "max":lambda:sp.Max(x,y),"min":lambda:sp.Min(x,y),"pow":lambda:sp.sign(x)*sp.Abs(x)**y,
+            "hypot":lambda:sp.sqrt(x**2+y**2),"distance_2":lambda:sp.sqrt(x**2+y**2),
+            "log_base":lambda:sp.log(sp.Abs(x))/sp.log(sp.Abs(y)+1),"exp_decay":lambda:sp.exp(-x*y),"rbf":lambda:sp.exp(-(x-y)**2),
+            "atan2":lambda:sp.atan2(x,y),"geometric":lambda:sp.sqrt(sp.Abs(x*y)),"harmonic":lambda:2*x*y/sp.Abs(x+y),
+            "mod":lambda:sp.Mod(x,y),"floordiv":lambda:sp.floor(x/y),"copysign":lambda:sp.Abs(x)*sp.sign(y),
+            "gt":lambda:sp.Piecewise((1,x>y),(0,True)),"lt":lambda:sp.Piecewise((1,x<y),(0,True)),
+            "gte":lambda:sp.Piecewise((1,x>=y),(0,True)),"lte":lambda:sp.Piecewise((1,x<=y),(0,True)),
+            "eq":lambda:sp.Piecewise((1,sp.Eq(x,y)),(0,True)),"ne":lambda:sp.Piecewise((0,sp.Eq(x,y)),(1,True)),
+            "sin":lambda:sp.sin(x),"cos":lambda:sp.cos(x),"tan":lambda:sp.tan(x),"exp":lambda:sp.exp(x),"expm1":lambda:sp.exp(x)-1,
+            "10^x":lambda:10**x,"log":lambda:sp.log(sp.Abs(x)),"log1p":lambda:sp.log(1+sp.Abs(x)),"log10":lambda:sp.log(sp.Abs(x),10),
+            "sqrt":lambda:sp.sign(x)*sp.sqrt(sp.Abs(x)),"abs":lambda:sp.Abs(x),"inv":lambda:1/sp.Abs(x),
+            "frac":lambda:x-sp.floor(x),"round":lambda:sp.Function("round")(x),"floor":lambda:sp.floor(x),"ceil":lambda:sp.ceiling(x),
+            "int":lambda:sp.Function("trunc")(x),"sigmoid":lambda:1/(1+sp.exp(-x)),"tanh":lambda:sp.tanh(x),"sinh":lambda:sp.sinh(x),
+            "cosh":lambda:sp.cosh(x),"relu":lambda:sp.Max(x,0),"atan":lambda:sp.atan(x),"gaussian":lambda:sp.exp(-x**2),
+            "softplus":lambda:sp.log(1+sp.exp(x)),"sign":lambda:sp.sign(x),"sinc":lambda:sp.sinc(x),"xlogx":lambda:x*sp.log(sp.Abs(x)),
+            "erf":lambda:sp.erf(x),"deg2rad":lambda:x*sp.pi/180,"rad2deg":lambda:x*180/sp.pi,
+            "perceptronSigma1":lambda:1/(1+sp.exp(-x)),"perceptronReLU1":lambda:sp.Max(x,0),"perceptronCustom1":lambda:x/(1+sp.exp(-x)),
+            "perceptronSigma2":lambda:1/(1+sp.exp(-(x+y))),"perceptronReLU2":lambda:sp.Max(x+y,0),"perceptronCustom2":lambda:(x+y)/(1+sp.exp(-(x+y))),
+            "if_else":lambda:sp.Piecewise((values[1],x>sp.Rational(1,2)),(values[2],True)),
+            "lerp":lambda:x+(y-x)*values[2],"leaky_relu":lambda:sp.Piecewise((x,x>=0),(x/100,True)),
+        }
+        if op in powers: return x**powers[op]
+        if op.startswith("root") and op[4:].isdigit(): return sp.sign(x)*sp.Abs(x)**sp.Rational(1,int(op[4:]))
+        return table[op]() if op in table else sp.Function(op)(*values)
+    return build(tree)
+
+def symbolic_model(model, feature_names, output_names, cats, positive=()):
+    """{output name: (sympy expression, latex)} for regression outputs; None without SymPy."""
+    try: import sympy as sp
+    except ImportError: return None
+    symbols=[sp.Symbol(name.replace(" ","_"),real=True,positive=True if index in positive else None) for index,name in enumerate(feature_names)]
+    targets,_=classification_layout(cats); result={}
+    for j,heads in enumerate(targets):
+        if cats[j] is not None: continue
+        head=heads[0]; a,b=model.scales[head]
+        expression=sp.Float(a,15)*sympy_expression(model.trees[head],symbols,model.adfs)+sp.Float(b,15)
+        if node_size(model.trees[head])<=SYMBOLIC_SIMPLIFY_NODES:
+            try: expression=sp.simplify(expression)
+            except Exception: pass  # simplification is cosmetic; keep the faithful form
+        shown=expression.evalf(8)
+        result[output_names[j]]=(shown,sp.latex(shown))
+    return result
+
+def write_symbolic_export(model, feature_names, output_names, cats, X=None, path="best_model_symbolic.txt"):
+    if SYMBOLIC_EXPORT!="on": return None
+    positive=() if X is None else tuple(index for index in range(X.shape[1]) if np.all(X[:,index]>0))
+    result=symbolic_model(model,feature_names,output_names,cats,positive)
+    if result is None:
+        print("Symbolic export skipped: install sympy for a simplified equation and LaTeX."); return None
+    lines=["# afpo symbolic export (guard epsilons and clips omitted)"]
+    for name,(expression,latex) in result.items():
+        lines+=[f"{name} = {expression}",f"LaTeX: {name} = {latex}",""]
+        print(f"Symbolic: {name} = {expression}")
+    Path(path).write_text("\n".join(lines))
+    return result
 
 def export_model(m, feature_names, output_names, cats, maps, source_columns, types, fixture_df=None, input_ranges=None):
     used_indices=set(used_feature_indices(m)); input_columns=[]; offset=0
@@ -5899,6 +5993,8 @@ def evolve_generation(pop, generation, *, X, Xt, Yt, Xv, Yv, cats, constraints, 
     seen={model_equivalence_key(model) for model in pop}
     def duplicate(trees):
         nonlocal unchanged
+        if NESTING_RULES and unchanged<unchanged_limit and any(nesting_violation(tree) for tree in trees):
+            unchanged+=1; return True
         key=model_equivalence_key(trees)
         if EQUIVALENCE_COLLAPSE and key in seen and unchanged<unchanged_limit:
             unchanged+=1; EQUIVALENCE_STATS["children_redrawn"]+=1; return True
@@ -6164,8 +6260,9 @@ def resume_main(args):
     CONSTANT_SNAPPING=state.get("constant_snapping","off"); SNAP_TOLERANCE=float(state.get("snap_tolerance",1e-6))
     global READOUT_MODE,MAX_TERMS,GENE_CROSSOVER_RATE
     global BACKPROP_MUTATION_WEIGHT,BACKPROP_INVERSE
-    global RESIDUAL_TERM_WEIGHT
-    RESIDUAL_TERM_WEIGHT=float(state.get("residual_term_weight",0.))
+    global RESIDUAL_TERM_WEIGHT,NESTING_RULES,SYMBOLIC_EXPORT
+    SYMBOLIC_EXPORT=getattr(args,"symbolic_export","on")
+    RESIDUAL_TERM_WEIGHT=float(state.get("residual_term_weight",0.)); NESTING_RULES=parse_nesting_rules(state.get("forbid_nesting",""))
     BACKPROP_MUTATION_WEIGHT=float(state.get("backprop_mutation_weight",0.)); BACKPROP_INVERSE=state.get("backprop_inverse","generic")
     READOUT_MODE=state.get("readout","affine"); MAX_TERMS=int(state.get("max_terms",4)); GENE_CROSSOVER_RATE=float(state.get("gene_crossover_rate",.5))
     global LOSS_NOISE_FLOOR
@@ -6220,7 +6317,7 @@ def resume_main(args):
     print(f"Resumed generation {generation} from {checkpoint_path} (seed {state['run_seed']}); {topology}; model scoring uses {'serial evaluation' if workers==1 else f'{workers} worker processes'}.")
     started=time.time(); stop=GracefulStop().__enter__(); interrupted=False
     try:
-        while (not args.max_generations or generation < args.max_generations) and not stop.requested:
+        while (not args.max_generations or generation < args.max_generations) and not stop.requested and not stop_rule_reached(args,started,islands):
             def step(island):
                 def progress(gen,elite,sample):
                     if len(islands)>1 and gen%10==0: print(cell_label(island,island_config["count"],stage_count),flush=True)
@@ -6261,6 +6358,29 @@ def resume_main(args):
     if warning: print(f"WARNING: {warning}"); state["selection"]["warning"]=warning
     print(f"{selection['source'].title()} selection scores: mean loss={selection['metrics']['loss']:.6g}, mean shape={selection['metrics']['shape']:.6g}, MDL bits={selection['metrics']['mdl_bits']:.6g}")
     export_model(chosen,names,out_names,cats,maps,state["source_columns"],state["types"],state.get("export_fixture"),state.get("input_ranges")); evaluator.close()
+    write_symbolic_export(chosen,names,out_names,cats,Xt)
+
+def parse_nesting_rules(text):
+    """'exp>exp,sin>cos' -> {("exp","exp"),("sin","cos")}; outer>inner forbids inner anywhere below outer."""
+    rules=set()
+    for item in str(text or "").split(","):
+        if not item.strip(): continue
+        outer,separator,inner=item.strip().partition(">")
+        if not separator or outer.strip() not in OPS or inner.strip() not in OPS: raise ValueError(f"Bad nesting rule {item.strip()!r}: use outer>inner with operator names")
+        rules.add((outer.strip(),inner.strip()))
+    return frozenset(rules)
+
+def stop_rule_reached(args, started, islands):
+    """--max-time (seconds of search) and --stop-at-loss (best training loss) end the search like Ctrl-C."""
+    limit=getattr(args,"max_time",0.) or 0.
+    if limit and time.time()-started>=limit:
+        print(f"Stopping: --max-time {limit:g}s reached."); return True
+    target=getattr(args,"stop_at_loss",None)
+    if target is not None:
+        best=min((aggregate_loss(island.best_models.model) for island in islands if island.best_models.model is not None),default=float("inf"))
+        if best<=target:
+            print(f"Stopping: best training loss {best:.6g} reached --stop-at-loss {target:g}."); return True
+    return False
 
 def build_arg_parser():
     ap=argparse.ArgumentParser(); ap.add_argument("--max-generations",type=int,default=0); ap.add_argument("--population",type=int,default=160); ap.add_argument("--seed",type=int); ap.add_argument("--workers",type=int,default=0,help="Model-scoring processes; 0=auto, 1=serial (default: 0)"); ap.add_argument("--adf-mode",choices=("off","flat","nested"),default="nested",help="ADF experiment mode; nested is v2, flat is the v1-style ablation, off disables ADFs")
@@ -6304,6 +6424,10 @@ def build_arg_parser():
     ap.add_argument("--backprop-mutation-weight",type=float,default=0.,help="Initial portfolio weight of semantic backpropagation: invert the tree from its readout down to a random node and replace that subtree with the small expression or fragment that best matches the desired values; 0 disables it (default: 0)")
     ap.add_argument("--backprop-inverse",choices=("exact","generic"),default="generic",help="exact inverts only + - * / neg exp log tanh sigmoid; generic also solves every other operator numerically per row, on the branch the subtree is already on (default: generic)")
     ap.add_argument("--residual-term-weight",type=float,default=0.,help="Initial portfolio weight of the residual-term mutation, which adds the small expression that best matches what the parent still misses (boosting-style); 0 disables it (default: 0)")
+    ap.add_argument("--forbid-nesting",default="",metavar="OUTER>INNER,...",help="Operator pairs that may not nest, e.g. exp>exp,log>exp,sin>sin: INNER may not appear anywhere below OUTER (default: none)")
+    ap.add_argument("--symbolic-export",choices=("on","off"),default="on",help="Also write the chosen model as a simplified SymPy expression and LaTeX to best_model_symbolic.txt when sympy is installed (default: on)")
+    ap.add_argument("--max-time",type=float,default=0.,help="Stop the search after this many seconds and go to the final choice; 0 = no limit (default: 0)")
+    ap.add_argument("--stop-at-loss",type=float,default=None,help="Stop the search once the best training loss (the loss printed during the run) is at or below this value (default: off)")
     ap.add_argument("--sparse-seeding",choices=("on","off"),default="off",help="Seed the initial population with sparse linear fits over a modest basis (inputs, unary operators of inputs, pairwise products and ratios, hinges), found by orthogonal matching pursuit (default: off)")
     ap.add_argument("--sparse-basis-size",type=int,default=300,help="Most basis terms the sparse seeding searches (default: 300)")
     ap.add_argument("--jump-mutation-weight",type=float,default=1.,help="Initial portfolio weight of the jump mutation, which wraps a subtree in mod(s,c), floordiv(s,c) or if_else(gt(x,c),s,s') as one move; adapted like the other mutation kinds; 0 disables it (default: 1)")
@@ -6326,6 +6450,9 @@ def parse_cli(argv=None):
     if not .10 <= args.qd_parent_rate <= .30: ap.error("--qd-parent-rate must be between 0.10 and 0.30")
     if args.evaluation_refresh < 1 or args.stagnation_window < 1: ap.error("evaluation refresh and stagnation window must be positive")
     if args.fit_iterations < 1: ap.error("--fit-iterations must be positive")
+    try: parse_nesting_rules(args.forbid_nesting)
+    except ValueError as error: ap.error(str(error))
+    if args.max_time < 0: ap.error("--max-time must be non-negative")
     if args.residual_term_weight < 0: ap.error("--residual-term-weight must be non-negative")
     if args.backprop_mutation_weight < 0: ap.error("--backprop-mutation-weight must be non-negative")
     if args.sparse_basis_size < 1: ap.error("--sparse-basis-size must be positive")
@@ -6456,8 +6583,10 @@ def train_from_setup(args, setup, choose_model=None):
     global SPARSE_SEEDING,SPARSE_BASIS_SIZE
     SPARSE_SEEDING=getattr(args,"sparse_seeding","off"); SPARSE_BASIS_SIZE=int(getattr(args,"sparse_basis_size",300)); SPARSE_SEED_STATS.update(seeds=0,best_r2=None,basis=0)
     global BACKPROP_MUTATION_WEIGHT,BACKPROP_INVERSE
-    global RESIDUAL_TERM_WEIGHT
-    RESIDUAL_TERM_WEIGHT=float(getattr(args,"residual_term_weight",0.))
+    global RESIDUAL_TERM_WEIGHT,NESTING_RULES
+    global SYMBOLIC_EXPORT
+    SYMBOLIC_EXPORT=getattr(args,"symbolic_export","on")
+    RESIDUAL_TERM_WEIGHT=float(getattr(args,"residual_term_weight",0.)); NESTING_RULES=parse_nesting_rules(getattr(args,"forbid_nesting",""))
     BACKPROP_MUTATION_WEIGHT=float(getattr(args,"backprop_mutation_weight",0.)); BACKPROP_INVERSE=getattr(args,"backprop_inverse","generic")
     READOUT_MODE=getattr(args,"readout","affine"); MAX_TERMS=int(getattr(args,"max_terms",4)); GENE_CROSSOVER_RATE=float(getattr(args,"gene_crossover_rate",.5))
     global SQUASH_SWAP_WEIGHT,SMOOTH_SWAP_WEIGHT,GATE_MUTATION_WEIGHT
@@ -6555,7 +6684,7 @@ def train_from_setup(args, setup, choose_model=None):
                    "stages":{key:stages[key] for key in ("mode","count","interval","age_gap","schedule","threshold_quantile")},
                    "roles":{key:roles[key] for key in ("enabled","interval","mix","retire_after")}},
         "equivalence_collapse":EQUIVALENCE_COLLAPSE,"residual_archive":RESIDUAL_ARCHIVE,"qd_parent_choice":QD_PARENT_CHOICE,"scale_balanced_selection":SCALE_BALANCED_SELECTION,
-        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"selection_probe_filter":SELECTION_PROBE_FILTER,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"fit_iterations":CONSTANT_FIT_ITERATIONS,"semantic_max_delta":SEMANTIC_MAX_DELTA,"constant_snapping":CONSTANT_SNAPPING,"snap_tolerance":SNAP_TOLERANCE,"readout":READOUT_MODE,"max_terms":MAX_TERMS,"gene_crossover_rate":GENE_CROSSOVER_RATE,"backprop_mutation_weight":BACKPROP_MUTATION_WEIGHT,"backprop_inverse":BACKPROP_INVERSE,"residual_term_weight":RESIDUAL_TERM_WEIGHT,"sparse_seeding":SPARSE_SEEDING,"sparse_basis_size":SPARSE_BASIS_SIZE,"squash_swap_weight":SQUASH_SWAP_WEIGHT,"smooth_swap_weight":SMOOTH_SWAP_WEIGHT,"gate_mutation_weight":GATE_MUTATION_WEIGHT,"loss_noise_floor":LOSS_NOISE_FLOOR,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age",
+        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"selection_probe_filter":SELECTION_PROBE_FILTER,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"fit_iterations":CONSTANT_FIT_ITERATIONS,"semantic_max_delta":SEMANTIC_MAX_DELTA,"constant_snapping":CONSTANT_SNAPPING,"snap_tolerance":SNAP_TOLERANCE,"readout":READOUT_MODE,"max_terms":MAX_TERMS,"gene_crossover_rate":GENE_CROSSOVER_RATE,"backprop_mutation_weight":BACKPROP_MUTATION_WEIGHT,"backprop_inverse":BACKPROP_INVERSE,"residual_term_weight":RESIDUAL_TERM_WEIGHT,"forbid_nesting":",".join(sorted(f"{o}>{i}" for o,i in NESTING_RULES)),"sparse_seeding":SPARSE_SEEDING,"sparse_basis_size":SPARSE_BASIS_SIZE,"squash_swap_weight":SQUASH_SWAP_WEIGHT,"smooth_swap_weight":SMOOTH_SWAP_WEIGHT,"gate_mutation_weight":GATE_MUTATION_WEIGHT,"loss_noise_floor":LOSS_NOISE_FLOOR,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age",
         "test_csv":str(Path(args.test_csv).resolve()) if args.test_csv else None,
     },df,train_indices,validation_indices,external_validation)
     print(f"Run manifest: {manifest_path}")
@@ -6572,7 +6701,7 @@ def train_from_setup(args, setup, choose_model=None):
         "profile":args.profile,"constraint_metadata":metadata,"constraints":constraints.describe(),"bayesian_particles":args.bayesian_particles,"interaction_discovery":interaction_discovery,
         "island_config":{"count":island_count,"migration_interval":migration_interval,"migrants_per_island":migrants_per_island,"topology":"ring","migration_events":0,"stages":stages,"roles":roles},
         "equivalence_collapse":EQUIVALENCE_COLLAPSE,"residual_archive":RESIDUAL_ARCHIVE,"qd_parent_choice":QD_PARENT_CHOICE,"scale_balanced_selection":SCALE_BALANCED_SELECTION,
-        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"selection_probe_filter":SELECTION_PROBE_FILTER,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"fit_iterations":CONSTANT_FIT_ITERATIONS,"semantic_max_delta":SEMANTIC_MAX_DELTA,"constant_snapping":CONSTANT_SNAPPING,"snap_tolerance":SNAP_TOLERANCE,"readout":READOUT_MODE,"max_terms":MAX_TERMS,"gene_crossover_rate":GENE_CROSSOVER_RATE,"backprop_mutation_weight":BACKPROP_MUTATION_WEIGHT,"backprop_inverse":BACKPROP_INVERSE,"residual_term_weight":RESIDUAL_TERM_WEIGHT,"sparse_seeding":SPARSE_SEEDING,"sparse_basis_size":SPARSE_BASIS_SIZE,"squash_swap_weight":SQUASH_SWAP_WEIGHT,"smooth_swap_weight":SMOOTH_SWAP_WEIGHT,"gate_mutation_weight":GATE_MUTATION_WEIGHT,"loss_noise_floor":LOSS_NOISE_FLOOR,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age"}
+        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"selection_probe_filter":SELECTION_PROBE_FILTER,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"fit_iterations":CONSTANT_FIT_ITERATIONS,"semantic_max_delta":SEMANTIC_MAX_DELTA,"constant_snapping":CONSTANT_SNAPPING,"snap_tolerance":SNAP_TOLERANCE,"readout":READOUT_MODE,"max_terms":MAX_TERMS,"gene_crossover_rate":GENE_CROSSOVER_RATE,"backprop_mutation_weight":BACKPROP_MUTATION_WEIGHT,"backprop_inverse":BACKPROP_INVERSE,"residual_term_weight":RESIDUAL_TERM_WEIGHT,"forbid_nesting":",".join(sorted(f"{o}>{i}" for o,i in NESTING_RULES)),"sparse_seeding":SPARSE_SEEDING,"sparse_basis_size":SPARSE_BASIS_SIZE,"squash_swap_weight":SQUASH_SWAP_WEIGHT,"smooth_swap_weight":SMOOTH_SWAP_WEIGHT,"gate_mutation_weight":GATE_MUTATION_WEIGHT,"loss_noise_floor":LOSS_NOISE_FLOOR,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age"}
     head_count=sum(len(heads) for heads in classification_layout(cats)[0])
     population_sizes=cell_population_sizes(args.population,cell_count)
     islands=[new_island_runtime(size,X=X,Xt=Xt,cats=cats,ops=ops,nodes=nodes,depth=depth,head_count=head_count,
@@ -6601,7 +6730,7 @@ def train_from_setup(args, setup, choose_model=None):
     print(f"Searching indefinitely with {args.bayesian_proposal_rate:.0%} Bayesian proposals, {topology}, and {'serial evaluation' if workers==1 else f'{workers} worker processes'}; press Ctrl-C to choose and save a model.")
     stop=GracefulStop().__enter__(); interrupted=False
     try:
-        while (not args.max_generations or gen<args.max_generations) and not stop.requested:
+        while (not args.max_generations or gen<args.max_generations) and not stop.requested and not stop_rule_reached(args,start,islands):
             def step(island):
                 def progress(generation,elite,sample):
                     if cell_count>1 and generation%10==0: print(cell_label(island,island_count,stages["count"]),flush=True)
@@ -6658,6 +6787,7 @@ def train_from_setup(args, setup, choose_model=None):
         metrics=frozen_metrics(chosen,Xtest,Ytest,cats,constraints,out_names)
         print(f"Final held-out test (not used for selection): loss={metrics['loss']:.6g}, shape={metrics['shape']:.6g} | output losses={output_loss_summary(metrics['losses'],out_names)}")
     export_model(chosen,names,out_names,cats,maps,list(df.columns),types,train_df,input_ranges)
+    write_symbolic_export(chosen,names,out_names,cats,Xt)
     selected_entry=next(entry for entry in evaluation[1] if entry[0] is chosen)
     selection={**selection,"constant_snapping":snapping,"selected_choice":labels[selected_index],"default_selected":selected_index==0,
                "selected_metrics":selected_entry[2],"selected_objectives":tuple(selected_entry[1].objectives)}
