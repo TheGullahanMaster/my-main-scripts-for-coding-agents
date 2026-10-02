@@ -150,6 +150,8 @@ class Recorder:
         entry["best_loss"] = min(entry["best_loss"], loss)
         entry["best_r2"] = max(entry["best_r2"], score)
         entry["elapsed"] = round(time.perf_counter() - self.started, 4)
+        if self.evaluator is not None:
+            entry["evaluations"] = int(self.evaluator.row_model_evaluations)
         if self.first_strong is None and score >= self.strong_r2:
             self.first_strong = {"generation": generation, "seconds": entry["elapsed"]}
 
