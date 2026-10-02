@@ -750,6 +750,32 @@ class ModelExplorer:
                     "features_used": [names[i] for i in afpo.used_feature_indices(model) if i < len(names)],
                     "inputs_used": self._inputs_used(model)}
 
+    def latex(self, index):
+        """Exact and raw equation forms of a model for the rendered-equation view (needs sympy)."""
+        with self.lock:
+            model, state = self._model(index), self.state
+            cached = self.models[int(index)].get("latex")
+            if cached is not None:
+                return cached
+            names, out_names, cats, Xt = state["names"], state["out_names"], state["cats"], state["Xt"]
+            positive = tuple(i for i in range(Xt.shape[1]) if len(Xt) and np.all(Xt[:, i] > 0))
+            try:
+                result = afpo.symbolic_model(model, names, out_names, cats, positive, Xt)
+            except Exception as error:  # an unsupported operator must not break the model view
+                return {"available": False, "reason": f"Symbolic conversion failed: {error}"}
+            if result is None:
+                return {"available": False, "reason": "Install sympy to see the rendered equation."}
+            outputs = []
+            for name, entry in result.items():
+                forms = {mode: {"latex": entry[mode][1], "text": str(entry[mode][0]),
+                                "mathml": afpo.mathml_expression(entry[mode][0], entry[mode][0].free_symbols)} for mode in ("exact", "raw")}
+                agreement = entry["agreement"]
+                outputs.append({"name": name, "name_latex": afpo.latex_symbol_name(name.replace(" ", "_")), **forms, "agreement": None if agreement is None else
+                                {"defined": agreement[0], "gap": None if not math.isfinite(agreement[1]) else agreement[1]}})
+            payload = {"available": True, "outputs": outputs}
+            self.models[int(index)]["latex"] = payload
+            return payload
+
     def _inputs_used(self, model):
         """Source input columns the model reads (a text column counts if any of its categories is used)."""
         state = self.state
@@ -1247,6 +1273,7 @@ def run_gui(host="127.0.0.1", port=DEFAULT_PORT, open_browser=True):
         "/api/runs": lambda b: recent_runs(),
         "/api/models/load": lambda b: explorer.load(b["path"]),
         "/api/models/detail": lambda b: explorer.detail(b["index"]),
+        "/api/models/latex": lambda b: explorer.latex(b["index"]),
         "/api/models/fit": lambda b: explorer.fit(b["index"], b.get("split", "train")),
         "/api/models/predict": lambda b: explorer.predict(b["index"], b.get("row") or {}),
         "/api/models/sweep": lambda b: explorer.sweep(b["index"], b["column"], b.get("base"), b.get("lo"), b.get("hi"), b.get("points", 160)),

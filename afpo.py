@@ -30,10 +30,12 @@ import multiprocessing
 import os
 import pickle
 import random
+import re
 import signal
 import subprocess
 import sys
 import time
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -5107,81 +5109,206 @@ def training_input_ranges(frame, source_columns, types):
         ranges[column]=[float(values.min()),float(values.max())] if len(values) else [0.,1.]
     return ranges
 
-# --symbolic-export: the chosen model as a SymPy expression, simplified when
-# small, written with its LaTeX to best_model_symbolic.txt.  The forms are
-# faithful to afpo's guarded operators (log|x|, signed roots, sign(x)*|x|^y)
-# up to the tiny epsilons and clips; inputs that are positive on the
-# training data are declared positive, so Abs() and sign() of them simplify
-# away.  Operators without a closed form stay as named functions.
+# --symbolic-export: the chosen model written twice to best_model_symbolic.txt,
+# each with its LaTeX:
+# - exact: afpo's protected operators as evaluated (log(|x|+eps), guarded
+#   division, signed roots, clipped exp...) with full-precision constants, so
+#   it reproduces the model's predictions.  Only the final +/-CLIP clamp and
+#   NaN -> 0 that every node applies are left out.
+# - raw: the same model with the protections removed (log(x), x/y, x**y,
+#   x**(1/3)...) and constants written as fractions or multiples of pi when
+#   within 1e-8 relative of one, else to six significant digits.  It is the
+#   readable form, valid only where its operators are defined, so the export
+#   reports how closely it matches the model on the training rows.
+# Inputs that are positive on the training data are declared positive, so
+# Abs() and sign() of them simplify away.  Operators without a closed form
+# stay as named functions.
 SYMBOLIC_EXPORT = "on"
 SYMBOLIC_SIMPLIFY_NODES = 40
+READABLE_CONSTANT_TOLERANCE = 1e-8
 
-def sympy_expression(tree, symbols, adfs=None):
+def readable_constant(value, exact=False):
+    """A SymPy number for value: a fraction or multiple of pi when it is one
+    (exactly for exact=True, within READABLE_CONSTANT_TOLERANCE otherwise),
+    else the shortest decimal (exact) or six significant digits (raw)."""
     import sympy as sp
+    from fractions import Fraction
+    value=float(value)
+    if not math.isfinite(value): return sp.Float(value)
+    if value==int(value) and abs(value)<1e15: return sp.Integer(int(value))
+    tolerance=0. if exact else READABLE_CONSTANT_TOLERANCE*max(1.,abs(value))
+    for base,symbol,limit in ((1.,sp.Integer(1),100),(math.pi,sp.pi,12)):
+        ratio=Fraction(value/base).limit_denominator(limit)
+        if ratio and abs(float(ratio)*base-value)<=tolerance:
+            return sp.Rational(ratio.numerator,ratio.denominator)*symbol
+    text=repr(value) if exact else f"{value:.6g}"
+    digits=len(text.lower().split("e")[0].replace("-","").replace(".","").lstrip("0")) or 1
+    return sp.Float(text,max(digits,1))
+
+def sympy_expression(tree, symbols, adfs=None, mode="exact", constant=None):
+    """tree as a SymPy expression; mode "exact" keeps afpo's guards, "raw" drops them."""
+    import sympy as sp
+    constant=constant or (lambda v: readable_constant(v,mode=="exact"))
+    eps=sp.Float(EPS,1)
+    def clip(v, lo, hi): return sp.Min(sp.Max(v,lo),hi)
+    def nonzero(v, fill): return sp.Piecewise((fill,sp.Abs(v)<eps),(v,True))
     def build(t, args=None):
         if t[0]=="x": return symbols[t[1]]
-        if t[0]=="c": return sp.Float(t[1],15)
+        if t[0]=="c": return constant(t[1])
         if t[0]=="arg": return args[t[1]]
         values=[build(child,args) for child in t[1:]]
         op=t[0]
         if op.startswith("adf_") and adfs and op in adfs: return build(adfs[op]["tree"],values)
         x=values[0]; y=values[1] if len(values)>1 else None
         powers={"square":2,"cube":3,**{f"pow{k}":k for k in range(4,11)}}
+        if op in powers: return x**powers[op]
+        if op.startswith("root") and op[4:].isdigit():
+            n=sp.Rational(1,int(op[4:]))
+            return sp.sign(x)*sp.Abs(x)**n if mode=="exact" else x**n
+        sigmoid=lambda v: 1/(1+sp.exp(-v))
         table={
             "+":lambda:x+y,"-":lambda:x-y,"*":lambda:x*y,"/":lambda:x/y,"neg":lambda:-x,"delta":lambda:sp.Abs(x-y),
-            "max":lambda:sp.Max(x,y),"min":lambda:sp.Min(x,y),"pow":lambda:sp.sign(x)*sp.Abs(x)**y,
+            "max":lambda:sp.Max(x,y),"min":lambda:sp.Min(x,y),"pow":lambda:x**y,
             "hypot":lambda:sp.sqrt(x**2+y**2),"distance_2":lambda:sp.sqrt(x**2+y**2),
-            "log_base":lambda:sp.log(sp.Abs(x))/sp.log(sp.Abs(y)+1),"exp_decay":lambda:sp.exp(-x*y),"rbf":lambda:sp.exp(-(x-y)**2),
-            "atan2":lambda:sp.atan2(x,y),"geometric":lambda:sp.sqrt(sp.Abs(x*y)),"harmonic":lambda:2*x*y/sp.Abs(x+y),
+            "log_base":lambda:sp.log(x)/sp.log(y),"exp_decay":lambda:sp.exp(-x*y),"rbf":lambda:sp.exp(-(x-y)**2),
+            "atan2":lambda:sp.atan2(x,y),"geometric":lambda:sp.sqrt(x*y),"harmonic":lambda:2*x*y/(x+y),
             "mod":lambda:sp.Mod(x,y),"floordiv":lambda:sp.floor(x/y),"copysign":lambda:sp.Abs(x)*sp.sign(y),
             "gt":lambda:sp.Piecewise((1,x>y),(0,True)),"lt":lambda:sp.Piecewise((1,x<y),(0,True)),
             "gte":lambda:sp.Piecewise((1,x>=y),(0,True)),"lte":lambda:sp.Piecewise((1,x<=y),(0,True)),
             "eq":lambda:sp.Piecewise((1,sp.Eq(x,y)),(0,True)),"ne":lambda:sp.Piecewise((0,sp.Eq(x,y)),(1,True)),
             "sin":lambda:sp.sin(x),"cos":lambda:sp.cos(x),"tan":lambda:sp.tan(x),"exp":lambda:sp.exp(x),"expm1":lambda:sp.exp(x)-1,
-            "10^x":lambda:10**x,"log":lambda:sp.log(sp.Abs(x)),"log1p":lambda:sp.log(1+sp.Abs(x)),"log10":lambda:sp.log(sp.Abs(x),10),
-            "sqrt":lambda:sp.sign(x)*sp.sqrt(sp.Abs(x)),"abs":lambda:sp.Abs(x),"inv":lambda:1/sp.Abs(x),
+            "10^x":lambda:10**x,"log":lambda:sp.log(x),"log1p":lambda:sp.log(1+x),"log10":lambda:sp.log(x,10),
+            "sqrt":lambda:sp.sqrt(x),"abs":lambda:sp.Abs(x),"inv":lambda:1/x,"oom":lambda:sp.floor(sp.log(x,10)),
             "frac":lambda:x-sp.floor(x),"round":lambda:sp.Function("round")(x),"floor":lambda:sp.floor(x),"ceil":lambda:sp.ceiling(x),
-            "int":lambda:sp.Function("trunc")(x),"sigmoid":lambda:1/(1+sp.exp(-x)),"tanh":lambda:sp.tanh(x),"sinh":lambda:sp.sinh(x),
+            "int":lambda:sp.Function("trunc")(x),"sigmoid":lambda:sigmoid(x),"tanh":lambda:sp.tanh(x),"sinh":lambda:sp.sinh(x),
             "cosh":lambda:sp.cosh(x),"relu":lambda:sp.Max(x,0),"atan":lambda:sp.atan(x),"gaussian":lambda:sp.exp(-x**2),
-            "softplus":lambda:sp.log(1+sp.exp(x)),"sign":lambda:sp.sign(x),"sinc":lambda:sp.sinc(x),"xlogx":lambda:x*sp.log(sp.Abs(x)),
+            "softplus":lambda:sp.log(1+sp.exp(x)),"sign":lambda:sp.sign(x),"sinc":lambda:sp.sinc(x),"xlogx":lambda:x*sp.log(x),
             "erf":lambda:sp.erf(x),"deg2rad":lambda:x*sp.pi/180,"rad2deg":lambda:x*180/sp.pi,
-            "perceptronSigma1":lambda:1/(1+sp.exp(-x)),"perceptronReLU1":lambda:sp.Max(x,0),"perceptronCustom1":lambda:x/(1+sp.exp(-x)),
-            "perceptronSigma2":lambda:1/(1+sp.exp(-(x+y))),"perceptronReLU2":lambda:sp.Max(x+y,0),"perceptronCustom2":lambda:(x+y)/(1+sp.exp(-(x+y))),
+            "perceptronSigma1":lambda:sigmoid(x),"perceptronReLU1":lambda:sp.Max(x,0),"perceptronCustom1":lambda:x*sigmoid(x),
+            "perceptronSigma2":lambda:sigmoid(x+y),"perceptronReLU2":lambda:sp.Max(x+y,0),"perceptronCustom2":lambda:(x+y)*sigmoid(x+y),
             "if_else":lambda:sp.Piecewise((values[1],x>sp.Rational(1,2)),(values[2],True)),
+            "if_in_range":lambda:clip(x,sp.Min(values[1],values[2]),sp.Max(values[1],values[2])),
             "lerp":lambda:x+(y-x)*values[2],"leaky_relu":lambda:sp.Piecewise((x,x>=0),(x/100,True)),
+            "distance_3":lambda:sp.sqrt(x**2+y**2+values[2]**2),
         }
-        if op in powers: return x**powers[op]
-        if op.startswith("root") and op[4:].isdigit(): return sp.sign(x)*sp.Abs(x)**sp.Rational(1,int(op[4:]))
+        if mode=="exact":
+            # The guards of op_eval, operator by operator.
+            log_abs=lambda v: sp.log(sp.Abs(v)+eps)
+            table.update({
+                "/":lambda:x/nonzero(y,eps),"pow":lambda:sp.sign(x)*sp.Abs(x)**clip(y,-12,12),
+                "log_base":lambda:log_abs(x)/sp.log(sp.Abs(y)+sp.Float("1.000001",7)),
+                "exp_decay":lambda:sp.exp(-clip(x*y,-50,50)),"rbf":lambda:sp.exp(-sp.Min((x-y)**2,50)),
+                "geometric":lambda:sp.sqrt(sp.Abs(x*y)),"harmonic":lambda:2*x*y/(sp.Abs(x+y)+eps),
+                "mod":lambda:sp.Mod(x,nonzero(y,1)),"floordiv":lambda:sp.floor(x/nonzero(y,1)),
+                "tan":lambda:sp.tan(clip(x,sp.Float("-1.55",3),sp.Float("1.55",3))),
+                "exp":lambda:sp.exp(clip(x,-50,50)),"expm1":lambda:sp.exp(clip(x,-50,50))-1,"10^x":lambda:10**clip(x,-12,12),
+                "log":lambda:log_abs(x),"log1p":lambda:sp.log(1+sp.Abs(x)),"log10":lambda:sp.log(sp.Abs(x)+eps,10),
+                "sqrt":lambda:sp.sign(x)*sp.sqrt(sp.Abs(x)),"inv":lambda:1/(sp.Abs(x)+eps),
+                "oom":lambda:sp.floor(sp.log(sp.Abs(x)+eps,10)),"xlogx":lambda:x*log_abs(x),
+                "sigmoid":lambda:sigmoid(clip(x,-50,50)),"perceptronSigma1":lambda:sigmoid(clip(x,-50,50)),
+                "perceptronCustom1":lambda:x*sigmoid(clip(x,-50,50)),"perceptronSigma2":lambda:sigmoid(clip(x+y,-50,50)),
+                "perceptronCustom2":lambda:(x+y)*sigmoid(clip(x+y,-50,50)),
+                "sinh":lambda:sp.sinh(clip(x,-20,20)),"cosh":lambda:sp.cosh(clip(x,-20,20)),
+                "gaussian":lambda:sp.exp(-sp.Min(x**2,50)),
+            })
         return table[op]() if op in table else sp.Function(op)(*values)
     return build(tree)
 
-def symbolic_model(model, feature_names, output_names, cats, positive=()):
-    """{output name: (sympy expression, latex)} for regression outputs; None without SymPy."""
+GREEK_LETTERS = {"alpha","beta","gamma","delta","epsilon","zeta","eta","theta","iota","kappa","lambda","mu","nu","xi",
+                 "pi","rho","sigma","tau","upsilon","phi","chi","psi","omega","Gamma","Delta","Theta","Lambda","Xi",
+                 "Pi","Sigma","Upsilon","Phi","Psi","Omega"}
+
+def latex_symbol_name(name):
+    """x3 -> x_{3}, alpha -> \\alpha; any other multi-letter name is one upright
+    word (\\mathrm{speed\\_ms}), not a product of italic letters."""
+    match=re.fullmatch(r"([A-Za-z]|"+"|".join(sorted(GREEK_LETTERS,key=len,reverse=True))+r")_?(\d+)",name)
+    letter=lambda head: "\\"+head if head in GREEK_LETTERS else head
+    if match: return f"{letter(match.group(1))}_{{{match.group(2)}}}"
+    if name in GREEK_LETTERS or len(name)==1: return letter(name)
+    return r"\mathrm{"+re.sub(r"([_&%$#{}])",r"\\\1",name)+"}"
+
+def mathml_expression(expression, symbols):
+    """Presentation MathML, with each multi-letter input name as one upright
+    word (SymPy would split speed_ms into speed with subscript ms)."""
+    import sympy as sp
+    from html import escape
+    text=sp.mathml(expression,printer="presentation")
+    for symbol in sorted(symbols,key=lambda q: -len(q.name)):
+        if latex_symbol_name(symbol.name).startswith(r"\mathrm"):
+            text=text.replace(sp.mathml(symbol,printer="presentation"),f'<mi mathvariant="normal">{escape(symbol.name)}</mi>')
+    return text
+
+def _symbolic_form(model, head, symbols, mode):
+    """Simplified exact or raw form.  The raw form is rearranged with full
+    constants and only then rounded, so expanding a product does not compound
+    rounded factors; of the candidate forms the one with the shortest LaTeX wins."""
+    import sympy as sp
+    a,b=model.scales[head]
+    constant=lambda v: readable_constant(v,True)
+    expression=constant(a)*sympy_expression(model.trees[head],symbols,model.adfs,mode,constant)+constant(b)
+    finish=(lambda e: e) if mode=="exact" else (lambda e: e.xreplace({f:readable_constant(float(f)) for f in e.atoms(sp.Float)}))
+    candidates=[expression]
+    if node_size(model.trees[head])<=SYMBOLIC_SIMPLIFY_NODES:
+        try:
+            candidates.append(sp.simplify(expression))
+            if mode=="raw": candidates+=[sp.expand(candidates[-1]),sp.factor_terms(sp.expand(candidates[-1]))]
+        except Exception: pass  # simplification is cosmetic; keep the unsimplified form
+    return min((finish(candidate) for candidate in candidates),key=lambda e: len(sp.latex(e)))
+
+def _raw_agreement(expression, symbols, X, reference):
+    """(share of rows where the raw form is finite, max |raw - model| / output spread) or None."""
+    import sympy as sp
+    try:
+        function=sp.lambdify(symbols,expression,"numpy")
+        with np.errstate(all="ignore"), warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            values=np.broadcast_to(np.asarray(function(*[X[:,i] for i in range(X.shape[1])]),dtype=complex),reference.shape)
+    except Exception:
+        return None
+    defined=np.isfinite(values)&(np.abs(values.imag)<=1e-12*(1+np.abs(values.real)))
+    spread=max(float(np.ptp(reference)),float(np.max(np.abs(reference))),1e-300)
+    gap=float(np.max(np.abs(values.real[defined]-reference[defined])))/spread if defined.any() else float("nan")
+    return float(defined.mean()),gap
+
+def symbolic_model(model, feature_names, output_names, cats, positive=(), X=None):
+    """{output name: {"exact": (expr, latex), "raw": (expr, latex), "agreement": ...}}
+    for regression outputs; None without SymPy.  agreement compares the raw
+    form with the model on X (None without X)."""
     try: import sympy as sp
     except ImportError: return None
     symbols=[sp.Symbol(name.replace(" ","_"),real=True,positive=True if index in positive else None) for index,name in enumerate(feature_names)]
+    names={symbol:latex_symbol_name(symbol.name) for symbol in symbols}
+    predictions=None if X is None else predict_model(model,X)
     targets,_=classification_layout(cats); result={}
     for j,heads in enumerate(targets):
         if cats[j] is not None: continue
-        head=heads[0]; a,b=model.scales[head]
-        expression=sp.Float(a,15)*sympy_expression(model.trees[head],symbols,model.adfs)+sp.Float(b,15)
-        if node_size(model.trees[head])<=SYMBOLIC_SIMPLIFY_NODES:
-            try: expression=sp.simplify(expression)
-            except Exception: pass  # simplification is cosmetic; keep the faithful form
-        shown=expression.evalf(8)
-        result[output_names[j]]=(shown,sp.latex(shown))
+        head=heads[0]; entry={}
+        for mode in ("exact","raw"):
+            expression=_symbolic_form(model,head,symbols,mode)
+            entry[mode]=(expression,sp.latex(expression,symbol_names=names,ln_notation=True,mul_symbol=r"\,"))
+        entry["agreement"]=None if predictions is None else _raw_agreement(entry["raw"][0],symbols,X,predictions[:,head])
+        result[output_names[j]]=entry
     return result
 
 def write_symbolic_export(model, feature_names, output_names, cats, X=None, path="best_model_symbolic.txt"):
     if SYMBOLIC_EXPORT!="on": return None
     positive=() if X is None else tuple(index for index in range(X.shape[1]) if np.all(X[:,index]>0))
-    result=symbolic_model(model,feature_names,output_names,cats,positive)
+    result=symbolic_model(model,feature_names,output_names,cats,positive,X)
     if result is None:
         print("Symbolic export skipped: install sympy for a simplified equation and LaTeX."); return None
-    lines=["# afpo symbolic export (guard epsilons and clips omitted)"]
-    for name,(expression,latex) in result.items():
-        lines+=[f"{name} = {expression}",f"LaTeX: {name} = {latex}",""]
-        print(f"Symbolic: {name} = {expression}")
+    lines=["# afpo symbolic export",
+           "# exact: afpo's protected operators as evaluated, full-precision constants (the per-node +/-1e12 clamp and NaN->0 are omitted)",
+           "# raw: protections removed, constants as fractions or 6 significant digits; valid only where its operators are defined",""]
+    for name,entry in result.items():
+        for mode in ("exact","raw"):
+            expression,latex=entry[mode]
+            lines+=[f"{name} ({mode}) = {expression}",f"LaTeX ({mode}): {name} = {latex}"]
+        agreement=entry["agreement"]
+        if agreement is not None:
+            share,gap=agreement
+            lines.append(f"raw vs model on training rows: defined on {100*share:.1f}% of rows, max |difference| = {gap:.2g} of the output range")
+        lines.append("")
+        print(f"Symbolic: {name} = {entry['raw'][0]}")
     Path(path).write_text("\n".join(lines))
     return result
 
@@ -6604,7 +6731,7 @@ def build_arg_parser():
     ap.add_argument("--backprop-inverse",choices=("exact","generic"),default="generic",help="exact inverts only + - * / neg exp log tanh sigmoid; generic also solves every other operator numerically per row, on the branch the subtree is already on (default: generic)")
     ap.add_argument("--residual-term-weight",type=float,default=0.,help="Initial portfolio weight of the residual-term mutation, which adds the small expression that best matches what the parent still misses (boosting-style); 0 disables it (default: 0)")
     ap.add_argument("--forbid-nesting",default="",metavar="OUTER>INNER,...",help="Operator pairs that may not nest, e.g. exp>exp,log>exp,sin>sin: INNER may not appear anywhere below OUTER (default: none)")
-    ap.add_argument("--symbolic-export",choices=("on","off"),default="on",help="Also write the chosen model as a simplified SymPy expression and LaTeX to best_model_symbolic.txt when sympy is installed (default: on)")
+    ap.add_argument("--symbolic-export",choices=("on","off"),default="on",help="Also write the chosen model to best_model_symbolic.txt when sympy is installed: an exact form with afpo's protected operators and a readable raw form without them, each with LaTeX (default: on)")
     ap.add_argument("--loss",choices=("huber","squared","relative"),default="huber",help="Regression loss: huber (MAD-scaled, robust to outliers), squared (plain least squares) or relative (Huber on the error relative to |y|, for targets spanning orders of magnitude) (default: huber)")
     ap.add_argument("--huber-delta",type=float,default=1.5,help="Huber threshold in robust target-scale units for --loss huber and relative (default: 1.5)")
     ap.add_argument("--constant-intervals",choices=("on","off"),default="on",help="Print and record approximate 95%% intervals for the chosen model's constants from the linearised covariance (default: on)")

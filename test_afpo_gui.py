@@ -106,6 +106,13 @@ class GuiTests(unittest.TestCase):
         index = next(m["index"] for m in summary["models"] if m["label"])
         detail = explorer.detail(index)
         self.assertIn("<svg", detail["svg"])
+        math = explorer.latex(index)
+        if math["available"]:  # sympy is optional
+            first = math["outputs"][0]
+            self.assertEqual(first["name"], "y")
+            self.assertTrue(first["raw"]["latex"] and first["exact"]["latex"])
+            self.assertIn("<m", first["raw"]["mathml"])
+        self.assertIs(explorer.latex(index), math)  # cached per model
         fit = explorer.fit(index, "validation")
         self.assertEqual(fit["split"], "validation")
         self.assertEqual(fit["outputs"][0]["kind"], "regression")

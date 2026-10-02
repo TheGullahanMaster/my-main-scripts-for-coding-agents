@@ -57,13 +57,54 @@ class StopRuleTest(unittest.TestCase):
 @unittest.skipUnless(__import__("importlib").util.find_spec("sympy"), "sympy not installed")
 class SymbolicTest(unittest.TestCase):
     def test_positive_inputs_simplify(self):
+        import sympy as sp
         tree = ("+", ("log", ("*", ("x", 0), ("x", 0))), ("sqrt", ("x", 1)))
         model = a.Model(trees=[tree], scales=[(2., 1.)])
-        result = a.symbolic_model(model, ["u", "v"], ["y"], [None], positive=(0, 1))
-        text = str(result["y"][0])
-        self.assertNotIn("Abs", text)
-        self.assertNotIn("sign", text)
-        self.assertIn("log", result["y"][1])
+        result = a.symbolic_model(model, ["u", "v"], ["y"], [None], positive=(0, 1))["y"]
+        self.assertNotIn("Abs", str(result["exact"][0]))
+        self.assertNotIn("sign", str(result["exact"][0]))
+        u, v = sp.symbols("u v", positive=True)
+        self.assertEqual(result["raw"][0], 4 * sp.log(u) + 2 * sp.sqrt(v) + 1)
+        self.assertIn(r"\ln", result["raw"][1])
+
+    def test_raw_form_drops_guards_and_reads_constants(self):
+        tree = ("*", ("c", 3.14159265358979), ("/", ("log", ("x", 0)), ("x", 1)))
+        model = a.Model(trees=[tree], scales=[(0.333333333, 0.)])
+        result = a.symbolic_model(model, ["x1", "speed_ms"], ["y"], [None])["y"]
+        self.assertEqual(result["raw"][1], r"\frac{\pi\,\ln{\left(x_{1} \right)}}{3\,\mathrm{speed\_ms}}")
+        self.assertIn("Piecewise", str(result["exact"][0]))  # guarded division
+        self.assertIn("1.0e-12", str(result["exact"][0]))  # log(|x| + eps)
+
+    def test_multi_letter_names_stay_one_word(self):
+        import sympy as sp
+        self.assertEqual(a.latex_symbol_name("x3"), "x_{3}")
+        self.assertEqual(a.latex_symbol_name("theta2"), r"\theta_{2}")
+        self.assertEqual(a.latex_symbol_name("foobar"), r"\mathrm{foobar}")
+        speed = sp.Symbol("speed_ms")
+        self.assertIn('<mi mathvariant="normal">speed_ms</mi>', a.mathml_expression(speed ** 2, [speed]))
+
+    def test_readable_constants(self):
+        import sympy as sp
+        self.assertEqual(a.readable_constant(0.75), sp.Rational(3, 4))
+        self.assertEqual(a.readable_constant(-0.66666666667), sp.Rational(-2, 3))
+        self.assertEqual(a.readable_constant(1.570796327), sp.pi / 2)
+        self.assertEqual(str(a.readable_constant(1.2345432)), "1.23454")
+        self.assertEqual(str(a.readable_constant(0.6666667, exact=True)), "0.6666667")
+        self.assertEqual(a.readable_constant(0.1, exact=True), sp.Rational(1, 10))
+
+    def test_exact_form_reproduces_the_model(self):
+        import sympy as sp
+        rng = np.random.default_rng(0)
+        X = rng.uniform(-3, 3, size=(200, 2)); X[:4, 1] = 0
+        tree = ("+", ("exp", ("pow", ("x", 0), ("c", 1.3))), ("/", ("log", ("x", 0)), ("sqrt", ("x", 1))))
+        model = a.Model(trees=[tree], scales=[(.7, -1.2)])
+        result = a.symbolic_model(model, ["u", "v"], ["y"], [None], X=X)["y"]
+        u, v = sp.symbols("u v", real=True)
+        values = sp.lambdify((u, v), result["exact"][0], "numpy")(X[:, 0], X[:, 1])
+        # Rows with v = 0 hit the guarded division, where the per-node +/-1e12 clamp (left out) decides.
+        np.testing.assert_allclose(values[4:], a.predict_model(model, X)[4:, 0], rtol=1e-9)
+        share, gap = result["agreement"]  # the raw form is undefined on most of these rows
+        self.assertLess(share, .5)
 
     def test_writes_file(self):
         model = a.Model(trees=[("*", ("x", 0), ("x", 1))], scales=[(3., 0.)])
@@ -73,8 +114,10 @@ class SymbolicTest(unittest.TestCase):
             a.write_symbolic_export(model, ["u", "v"], ["y"], [None], X, path)
             with open(path) as handle:
                 content = handle.read()
-        self.assertIn("3.0*u*v", content)
-        self.assertIn("LaTeX", content)
+        self.assertIn("y (exact) = 3*u*v", content)
+        self.assertIn("y (raw) = 3*u*v", content)
+        self.assertIn(r"LaTeX (raw): y = 3\,u\,v", content)
+        self.assertIn("defined on 100.0% of rows", content)
 
 
 class LossModeTest(unittest.TestCase):
