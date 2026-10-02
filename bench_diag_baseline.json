@@ -212,27 +212,27 @@
       "test_rows": 63,
       "data_sha256": "b909f36d929a307a0e6ba81574a5b579a0dc32437162e3c60785d342566ce961"
     },
-    "two_freq_saw": {
+    "saw_in_exp": {
       "family": "piecewise",
-      "formula": "(x mod .7)+(x mod 1.1)",
+      "formula": "x*exp(-(x mod 1.3))",
       "operator_groups": "1,2,3,7,8",
       "nodes": 21,
       "depth": 5,
       "reserve": false,
       "train_rows": 64,
-      "test_rows": 55,
-      "data_sha256": "74bbfb3f58c7ac5d7a460233570abe90cd9dcaa62c59c715981cb0b0bc08e26b"
+      "test_rows": 60,
+      "data_sha256": "6716cb6072d5e52034b9798e265682fa283cd6869309eb64db6fad7c63aa5d2b"
     },
-    "mod_product": {
+    "mod_affine3": {
       "family": "piecewise",
-      "formula": "(x0*x1) mod 1",
+      "formula": "(x0*x1+x2) mod 1",
       "operator_groups": "1,2,3,7,8",
       "nodes": 21,
       "depth": 5,
       "reserve": false,
       "train_rows": 200,
-      "test_rows": 187,
-      "data_sha256": "c8688542f972d56edeb9799ef8ed709352f1dbcb6f690a7ee2173b501839268d"
+      "test_rows": 177,
+      "data_sha256": "3848047cd107bab6305f69ed3b1624e8ffd17782686f8d19c2d2cc4fd878c641"
     },
     "decept_small_term": {
       "family": "deceptive",
@@ -346,7 +346,7 @@
     20263009,
     20263010
   ],
-  "wall_seconds": 3474.1,
+  "wall_seconds": 3672.3,
   "summary": {
     "cond_sum": {
       "family": "multivariate",
@@ -722,49 +722,49 @@
       "reached_exact": 3,
       "median_generation_exact": 12.0
     },
-    "two_freq_saw": {
+    "saw_in_exp": {
       "family": "piecewise",
       "runs": 10,
-      "exact": 9,
-      "test_r2_0.999": 9,
-      "test_r2_0.99": 10,
-      "mean_test_digits": 11.073014078263574,
-      "mean_anytime_digits": 7.568589079934782,
-      "median_generation0_r2": 0.25353402553240906,
-      "mean_seconds": 44.333200000000005,
-      "mean_nodes": 8.8,
+      "exact": 0,
+      "test_r2_0.999": 1,
+      "test_r2_0.99": 9,
+      "mean_test_digits": 2.494928825619019,
+      "mean_anytime_digits": 2.103803997407031,
+      "median_generation0_r2": 0.6967829012044472,
+      "mean_seconds": 32.4906,
+      "mean_nodes": 15.6,
       "reached_0.9": 10,
-      "median_generation_0.9": 16.5,
+      "median_generation_0.9": 7.5,
       "reached_0.99": 10,
-      "median_generation_0.99": 21.0,
-      "reached_0.999": 9,
-      "median_generation_0.999": 21.0,
-      "reached_0.9999": 9,
-      "median_generation_0.9999": 21.0,
-      "reached_exact": 9,
-      "median_generation_exact": 21.0
+      "median_generation_0.99": 16.5,
+      "reached_0.999": 3,
+      "median_generation_0.999": 43.0,
+      "reached_0.9999": 0,
+      "median_generation_0.9999": null,
+      "reached_exact": 0,
+      "median_generation_exact": null
     },
-    "mod_product": {
+    "mod_affine3": {
       "family": "piecewise",
       "runs": 10,
-      "exact": 10,
-      "test_r2_0.999": 10,
-      "test_r2_0.99": 10,
-      "mean_test_digits": 12.0,
-      "mean_anytime_digits": 9.082410482893312,
-      "median_generation0_r2": 0.16908211837770692,
-      "mean_seconds": 40.4447,
-      "mean_nodes": 5.4,
-      "reached_0.9": 10,
-      "median_generation_0.9": 13.5,
-      "reached_0.99": 10,
-      "median_generation_0.99": 14.0,
-      "reached_0.999": 10,
-      "median_generation_0.999": 14.5,
-      "reached_0.9999": 10,
-      "median_generation_0.9999": 14.5,
-      "reached_exact": 10,
-      "median_generation_exact": 15.0
+      "exact": 1,
+      "test_r2_0.999": 1,
+      "test_r2_0.99": 2,
+      "mean_test_digits": 1.5395364271516392,
+      "mean_anytime_digits": 0.46653408482870146,
+      "median_generation0_r2": 0.04788665099007411,
+      "mean_seconds": 41.686,
+      "mean_nodes": 11.8,
+      "reached_0.9": 2,
+      "median_generation_0.9": 49.0,
+      "reached_0.99": 2,
+      "median_generation_0.99": 49.0,
+      "reached_0.999": 1,
+      "median_generation_0.999": 45.0,
+      "reached_0.9999": 1,
+      "median_generation_0.9999": 45.0,
+      "reached_exact": 1,
+      "median_generation_exact": 45.0
     },
     "decept_small_term": {
       "family": "deceptive",
@@ -8955,24 +8955,24 @@
       "exact": false
     },
     {
-      "case": "two_freq_saw",
+      "case": "saw_in_exp",
       "seed": 20263001,
       "rows": 64,
-      "test_rows": 55,
+      "test_rows": 60,
       "features": 1,
       "population": 96,
       "generations": 60,
-      "elapsed_seconds": 41.443,
-      "row_model_evaluations": 262803,
-      "train_r2": 1.0,
-      "test_r2": 1.0,
-      "validation_loss": 1.3375198775218986e-31,
-      "mdl_bits": 72.0,
-      "nodes": 7,
-      "equation": "y = (mod(x0, 0.7) + mod(x0, 1.1))",
-      "equivalence_redraws": 666,
+      "elapsed_seconds": 34.003,
+      "row_model_evaluations": 281418,
+      "train_r2": 0.9976929802189164,
+      "test_r2": 0.9980302820319042,
+      "validation_loss": 0.001101377256473843,
+      "mdl_bits": 160.0,
+      "nodes": 14,
+      "equation": "y = 0.165342 * ((((floordiv(x0, 1.28125) * mod((-4.25638 * x0), 5.54698)) + x0) + root3(x0))) + 0.0301474",
+      "equivalence_redraws": 566,
       "family": "piecewise",
-      "formula": "(x mod .7)+(x mod 1.1)",
+      "formula": "x*exp(-(x mod 1.3))",
       "reserve": false,
       "operator_groups": "1,2,3,7,8",
       "max_nodes": 21,
@@ -8980,509 +8980,45 @@
       "flags": "",
       "reached": {
         "0.9": {
-          "generation": 27,
-          "evaluations": 131478,
-          "seconds": 17.3932
+          "generation": 8,
+          "evaluations": 41463,
+          "seconds": 3.4995
         },
         "0.99": {
-          "generation": 28,
-          "evaluations": 136221,
-          "seconds": 18.1541
-        },
-        "0.999": {
-          "generation": 28,
-          "evaluations": 136221,
-          "seconds": 18.1541
-        },
-        "0.9999": {
-          "generation": 28,
-          "evaluations": 136221,
-          "seconds": 18.1541
-        },
-        "exact": {
-          "generation": 28,
-          "evaluations": 136221,
-          "seconds": 18.1541
-        }
-      },
-      "generation0_best_r2": 0.24136429880456334,
-      "generation0_best_loss": 0.28304628752453415,
-      "anytime_digits": 6.695636327539298,
-      "final_train_loss": 3.636563520850011e-32,
-      "test_digits": 12.0,
-      "exact": true
-    },
-    {
-      "case": "two_freq_saw",
-      "seed": 20263002,
-      "rows": 64,
-      "test_rows": 55,
-      "features": 1,
-      "population": 96,
-      "generations": 60,
-      "elapsed_seconds": 48.956,
-      "row_model_evaluations": 271269,
-      "train_r2": 1.0,
-      "test_r2": 1.0,
-      "validation_loss": 3.343799693804722e-32,
-      "mdl_bits": 72.0,
-      "nodes": 7,
-      "equation": "y = (mod(x0, 0.7) + mod(x0, 1.1))",
-      "equivalence_redraws": 600,
-      "family": "piecewise",
-      "formula": "(x mod .7)+(x mod 1.1)",
-      "reserve": false,
-      "operator_groups": "1,2,3,7,8",
-      "max_nodes": 21,
-      "max_depth": 5,
-      "flags": "",
-      "reached": {
-        "0.9": {
-          "generation": 13,
-          "evaluations": 65943,
-          "seconds": 8.5186
-        },
-        "0.99": {
-          "generation": 16,
-          "evaluations": 80427,
-          "seconds": 11.6395
-        },
-        "0.999": {
-          "generation": 16,
-          "evaluations": 80427,
-          "seconds": 11.6395
-        },
-        "0.9999": {
-          "generation": 16,
-          "evaluations": 80427,
-          "seconds": 11.6395
-        },
-        "exact": {
-          "generation": 16,
-          "evaluations": 80427,
-          "seconds": 11.6395
-        }
-      },
-      "generation0_best_r2": 0.27673368418256095,
-      "generation0_best_loss": 0.27989895765957296,
-      "anytime_digits": 8.98382587206572,
-      "final_train_loss": 4.2077882246656397e-32,
-      "test_digits": 12.0,
-      "exact": true
-    },
-    {
-      "case": "two_freq_saw",
-      "seed": 20263003,
-      "rows": 64,
-      "test_rows": 55,
-      "features": 1,
-      "population": 96,
-      "generations": 60,
-      "elapsed_seconds": 43.24,
-      "row_model_evaluations": 278613,
-      "train_r2": 1.0,
-      "test_r2": 1.0,
-      "validation_loss": 0.0,
-      "mdl_bits": 96.0,
-      "nodes": 10,
-      "equation": "y = (abs(mod(neg(x0), -1.1)) + abs(mod(x0, 0.7)))",
-      "equivalence_redraws": 595,
-      "family": "piecewise",
-      "formula": "(x mod .7)+(x mod 1.1)",
-      "reserve": false,
-      "operator_groups": "1,2,3,7,8",
-      "max_nodes": 21,
-      "max_depth": 5,
-      "flags": "",
-      "reached": {
-        "0.9": {
-          "generation": 13,
-          "evaluations": 66810,
-          "seconds": 9.0005
-        },
-        "0.99": {
-          "generation": 24,
-          "evaluations": 117555,
-          "seconds": 17.7536
-        },
-        "0.999": {
-          "generation": 25,
-          "evaluations": 122451,
-          "seconds": 18.5527
-        },
-        "0.9999": {
-          "generation": 25,
-          "evaluations": 122451,
-          "seconds": 18.5527
-        },
-        "exact": {
-          "generation": 25,
-          "evaluations": 122451,
-          "seconds": 18.5527
-        }
-      },
-      "generation0_best_r2": 0.27468307160546945,
-      "generation0_best_loss": 0.25720850839741877,
-      "anytime_digits": 7.410877376110943,
-      "final_train_loss": 0.0,
-      "test_digits": 12.0,
-      "exact": true
-    },
-    {
-      "case": "two_freq_saw",
-      "seed": 20263004,
-      "rows": 64,
-      "test_rows": 55,
-      "features": 1,
-      "population": 96,
-      "generations": 60,
-      "elapsed_seconds": 46.618,
-      "row_model_evaluations": 278154,
-      "train_r2": 1.0,
-      "test_r2": 1.0,
-      "validation_loss": 8.270017915117804e-32,
-      "mdl_bits": 144.0,
-      "nodes": 11,
-      "equation": "y = 0.424888 * (((2.35262 * mod(x0, 0.700279)) + mod((2.3545 * x0), 2.58892)))",
-      "equivalence_redraws": 498,
-      "family": "piecewise",
-      "formula": "(x mod .7)+(x mod 1.1)",
-      "reserve": false,
-      "operator_groups": "1,2,3,7,8",
-      "max_nodes": 21,
-      "max_depth": 5,
-      "flags": "",
-      "reached": {
-        "0.9": {
-          "generation": 9,
-          "evaluations": 47073,
-          "seconds": 5.8474
-        },
-        "0.99": {
-          "generation": 21,
-          "evaluations": 103734,
-          "seconds": 14.8425
-        },
-        "0.999": {
-          "generation": 21,
-          "evaluations": 103734,
-          "seconds": 14.8425
-        },
-        "0.9999": {
-          "generation": 21,
-          "evaluations": 103734,
-          "seconds": 14.8425
-        },
-        "exact": {
-          "generation": 21,
-          "evaluations": 103734,
-          "seconds": 14.8425
-        }
-      },
-      "generation0_best_r2": 0.20820863978431026,
-      "generation0_best_loss": 0.317578479788435,
-      "anytime_digits": 8.196052462080306,
-      "final_train_loss": 6.877502344481906e-32,
-      "test_digits": 12.0,
-      "exact": true
-    },
-    {
-      "case": "two_freq_saw",
-      "seed": 20263005,
-      "rows": 64,
-      "test_rows": 55,
-      "features": 1,
-      "population": 96,
-      "generations": 60,
-      "elapsed_seconds": 49.702,
-      "row_model_evaluations": 278052,
-      "train_r2": 1.0,
-      "test_r2": 1.0,
-      "validation_loss": 9.33439032981309e-32,
-      "mdl_bits": 72.0,
-      "nodes": 7,
-      "equation": "y = (mod(x0, 0.7) + mod(x0, 1.1))",
-      "equivalence_redraws": 560,
-      "family": "piecewise",
-      "formula": "(x mod .7)+(x mod 1.1)",
-      "reserve": false,
-      "operator_groups": "1,2,3,7,8",
-      "max_nodes": 21,
-      "max_depth": 5,
-      "flags": "",
-      "reached": {
-        "0.9": {
-          "generation": 23,
-          "evaluations": 112761,
-          "seconds": 18.8676
-        },
-        "0.99": {
-          "generation": 24,
-          "evaluations": 117453,
-          "seconds": 19.836
-        },
-        "0.999": {
-          "generation": 31,
-          "evaluations": 150399,
-          "seconds": 26.8562
-        },
-        "0.9999": {
-          "generation": 31,
-          "evaluations": 150399,
-          "seconds": 26.8562
-        },
-        "exact": {
-          "generation": 31,
-          "evaluations": 150399,
-          "seconds": 26.8562
-        }
-      },
-      "generation0_best_r2": 0.24959266068601127,
-      "generation0_best_loss": 0.32871273829484354,
-      "anytime_digits": 6.438098749008785,
-      "final_train_loss": 2.089388527574444e-31,
-      "test_digits": 12.0,
-      "exact": true
-    },
-    {
-      "case": "two_freq_saw",
-      "seed": 20263006,
-      "rows": 64,
-      "test_rows": 55,
-      "features": 1,
-      "population": 96,
-      "generations": 60,
-      "elapsed_seconds": 36.481,
-      "row_model_evaluations": 261324,
-      "train_r2": 1.0,
-      "test_r2": 1.0,
-      "validation_loss": 0.0,
-      "mdl_bits": 72.0,
-      "nodes": 7,
-      "equation": "y = (mod(x0, 0.7) + mod(x0, 1.1))",
-      "equivalence_redraws": 778,
-      "family": "piecewise",
-      "formula": "(x mod .7)+(x mod 1.1)",
-      "reserve": false,
-      "operator_groups": "1,2,3,7,8",
-      "max_nodes": 21,
-      "max_depth": 5,
-      "flags": "",
-      "reached": {
-        "0.9": {
-          "generation": 20,
-          "evaluations": 99144,
-          "seconds": 12.0422
-        },
-        "0.99": {
-          "generation": 21,
-          "evaluations": 103938,
-          "seconds": 12.8091
-        },
-        "0.999": {
-          "generation": 21,
-          "evaluations": 103938,
-          "seconds": 12.8091
-        },
-        "0.9999": {
-          "generation": 21,
-          "evaluations": 103938,
-          "seconds": 12.8091
-        },
-        "exact": {
-          "generation": 21,
-          "evaluations": 103938,
-          "seconds": 12.8091
-        }
-      },
-      "generation0_best_r2": 0.18851359228550058,
-      "generation0_best_loss": 0.2794899333291161,
-      "anytime_digits": 8.034532345702859,
-      "final_train_loss": 0.0,
-      "test_digits": 12.0,
-      "exact": true
-    },
-    {
-      "case": "two_freq_saw",
-      "seed": 20263007,
-      "rows": 64,
-      "test_rows": 55,
-      "features": 1,
-      "population": 96,
-      "generations": 60,
-      "elapsed_seconds": 49.049,
-      "row_model_evaluations": 270963,
-      "train_r2": 1.0,
-      "test_r2": 1.0,
-      "validation_loss": 5.684459479468028e-32,
-      "mdl_bits": 72.0,
-      "nodes": 7,
-      "equation": "y = (mod(x0, 0.7) + mod(x0, 1.1))",
-      "equivalence_redraws": 711,
-      "family": "piecewise",
-      "formula": "(x mod .7)+(x mod 1.1)",
-      "reserve": false,
-      "operator_groups": "1,2,3,7,8",
-      "max_nodes": 21,
-      "max_depth": 5,
-      "flags": "",
-      "reached": {
-        "0.9": {
-          "generation": 20,
-          "evaluations": 98583,
-          "seconds": 15.9078
-        },
-        "0.99": {
-          "generation": 20,
-          "evaluations": 98583,
-          "seconds": 15.9078
-        },
-        "0.999": {
-          "generation": 20,
-          "evaluations": 98583,
-          "seconds": 15.9078
-        },
-        "0.9999": {
-          "generation": 20,
-          "evaluations": 98583,
-          "seconds": 15.9078
-        },
-        "exact": {
-          "generation": 20,
-          "evaluations": 98583,
-          "seconds": 15.9078
-        }
-      },
-      "generation0_best_r2": 0.25747539037880685,
-      "generation0_best_loss": 0.2810437067001406,
-      "anytime_digits": 8.207533858842861,
-      "final_train_loss": 2.620304485359958e-31,
-      "test_digits": 12.0,
-      "exact": true
-    },
-    {
-      "case": "two_freq_saw",
-      "seed": 20263008,
-      "rows": 64,
-      "test_rows": 55,
-      "features": 1,
-      "population": 96,
-      "generations": 60,
-      "elapsed_seconds": 40.207,
-      "row_model_evaluations": 248421,
-      "train_r2": 1.0,
-      "test_r2": 1.0,
-      "validation_loss": 0.0,
-      "mdl_bits": 72.0,
-      "nodes": 7,
-      "equation": "y = (mod(x0, 1.1) + mod(x0, 0.7))",
-      "equivalence_redraws": 848,
-      "family": "piecewise",
-      "formula": "(x mod .7)+(x mod 1.1)",
-      "reserve": false,
-      "operator_groups": "1,2,3,7,8",
-      "max_nodes": 21,
-      "max_depth": 5,
-      "flags": "",
-      "reached": {
-        "0.9": {
-          "generation": 7,
-          "evaluations": 37893,
-          "seconds": 5.244
-        },
-        "0.99": {
-          "generation": 7,
-          "evaluations": 37893,
-          "seconds": 5.244
-        },
-        "0.999": {
-          "generation": 7,
-          "evaluations": 37893,
-          "seconds": 5.244
-        },
-        "0.9999": {
-          "generation": 7,
-          "evaluations": 37893,
-          "seconds": 5.244
-        },
-        "exact": {
-          "generation": 7,
-          "evaluations": 37893,
-          "seconds": 5.244
-        }
-      },
-      "generation0_best_r2": 0.7187498861154229,
-      "generation0_best_loss": 0.11425241180084256,
-      "anytime_digits": 10.67682844575407,
-      "final_train_loss": 0.0,
-      "test_digits": 12.0,
-      "exact": true
-    },
-    {
-      "case": "two_freq_saw",
-      "seed": 20263009,
-      "rows": 64,
-      "test_rows": 55,
-      "features": 1,
-      "population": 96,
-      "generations": 60,
-      "elapsed_seconds": 42.281,
-      "row_model_evaluations": 284121,
-      "train_r2": 0.9981064965262904,
-      "test_r2": 0.9981385163871231,
-      "validation_loss": 0.0007998798055943929,
-      "mdl_bits": 168.0,
-      "nodes": 12,
-      "equation": "y = 1.0634 * ((frac((0.908664 * x0)) - (mod((-1.00417 * x0), -0.701594) + 345.435))) + 367.324",
-      "equivalence_redraws": 356,
-      "family": "piecewise",
-      "formula": "(x mod .7)+(x mod 1.1)",
-      "reserve": false,
-      "operator_groups": "1,2,3,7,8",
-      "max_nodes": 21,
-      "max_depth": 5,
-      "flags": "",
-      "reached": {
-        "0.9": {
-          "generation": 51,
-          "evaluations": 241536,
-          "seconds": 35.199
-        },
-        "0.99": {
-          "generation": 58,
-          "evaluations": 274482,
-          "seconds": 40.3833
+          "generation": 11,
+          "evaluations": 55539,
+          "seconds": 4.9923
         },
         "0.999": null,
         "0.9999": null,
         "exact": null
       },
-      "generation0_best_r2": 0.654471517929889,
-      "generation0_best_loss": 0.14779298268703994,
-      "anytime_digits": 0.8152714587454959,
-      "final_train_loss": 0.0008149004531534074,
-      "test_digits": 2.7301407826357478,
+      "generation0_best_r2": 0.6572942263952604,
+      "generation0_best_loss": 0.09872037527501892,
+      "anytime_digits": 2.5064639741551287,
+      "final_train_loss": 0.0004116527525715373,
+      "test_digits": 2.7055959533654375,
       "exact": false
     },
     {
-      "case": "two_freq_saw",
-      "seed": 20263010,
+      "case": "saw_in_exp",
+      "seed": 20263002,
       "rows": 64,
-      "test_rows": 55,
+      "test_rows": 60,
       "features": 1,
       "population": 96,
       "generations": 60,
-      "elapsed_seconds": 45.355,
-      "row_model_evaluations": 268923,
-      "train_r2": 1.0,
-      "test_r2": 1.0,
-      "validation_loss": 2.7438037577303975e-24,
-      "mdl_bits": 176.0,
-      "nodes": 13,
-      "equation": "y = -1 * ((abs((-7979.63 + mod(x0, 0.7))) + abs((-4225.39 + mod(x0, 1.1))))) + 12205",
-      "equivalence_redraws": 460,
+      "elapsed_seconds": 31.762,
+      "row_model_evaluations": 284886,
+      "train_r2": 0.9972053296962271,
+      "test_r2": 0.9977842274247181,
+      "validation_loss": 0.0008452624324818491,
+      "mdl_bits": 252.0,
+      "nodes": 18,
+      "equation": "y = 1.04052e-07 * ((((-0.373404 + mod((-664.829 + x0), -1.29849)) * -106.002) * (-21813.9 + neg((-64210.3 * floordiv(x0, 1.30047)))))) + 0.530544",
+      "equivalence_redraws": 357,
       "family": "piecewise",
-      "formula": "(x mod .7)+(x mod 1.1)",
+      "formula": "x*exp(-(x mod 1.3))",
       "reserve": false,
       "operator_groups": "1,2,3,7,8",
       "max_nodes": 21,
@@ -9490,57 +9026,45 @@
       "flags": "",
       "reached": {
         "0.9": {
-          "generation": 9,
-          "evaluations": 47175,
-          "seconds": 6.3857
+          "generation": 12,
+          "evaluations": 61047,
+          "seconds": 5.0829
         },
         "0.99": {
-          "generation": 9,
-          "evaluations": 47175,
-          "seconds": 6.3857
+          "generation": 22,
+          "evaluations": 108120,
+          "seconds": 10.0364
         },
-        "0.999": {
-          "generation": 9,
-          "evaluations": 47175,
-          "seconds": 6.3857
-        },
-        "0.9999": {
-          "generation": 9,
-          "evaluations": 47175,
-          "seconds": 6.3857
-        },
-        "exact": {
-          "generation": 9,
-          "evaluations": 47175,
-          "seconds": 6.3857
-        }
+        "0.999": null,
+        "0.9999": null,
+        "exact": null
       },
-      "generation0_best_r2": 0.24652263013966103,
-      "generation0_best_loss": 0.4295629325072999,
-      "anytime_digits": 10.22723390349746,
-      "final_train_loss": 2.4520252673886405e-24,
-      "test_digits": 12.0,
-      "exact": true
+      "generation0_best_r2": 0.6965172153434263,
+      "generation0_best_loss": 0.0761393367636429,
+      "anytime_digits": 1.7923919394064691,
+      "final_train_loss": 0.0007463195752168832,
+      "test_digits": 2.6544748172146915,
+      "exact": false
     },
     {
-      "case": "mod_product",
-      "seed": 20263001,
-      "rows": 200,
-      "test_rows": 187,
-      "features": 2,
+      "case": "saw_in_exp",
+      "seed": 20263003,
+      "rows": 64,
+      "test_rows": 60,
+      "features": 1,
       "population": 96,
       "generations": 60,
-      "elapsed_seconds": 38.726,
-      "row_model_evaluations": 765920,
-      "train_r2": 1.0,
-      "test_r2": 1.0,
-      "validation_loss": 0.0,
-      "mdl_bits": 30.0,
-      "nodes": 5,
-      "equation": "y = mod((x0 * x1), 1)",
-      "equivalence_redraws": 1248,
+      "elapsed_seconds": 30.763,
+      "row_model_evaluations": 280653,
+      "train_r2": 0.9981263180332612,
+      "test_r2": 0.9961928735692465,
+      "validation_loss": 0.000435331665099832,
+      "mdl_bits": 226.0,
+      "nodes": 17,
+      "equation": "y = -0.0563637 * (((-0.350891 + floordiv(x0, 1.30047)) * floordiv(((-0.77119 * x0) + (1.25023 + floordiv(x0, 1.30047))), -0.0593759))) + 0.53425",
+      "equivalence_redraws": 415,
       "family": "piecewise",
-      "formula": "(x0*x1) mod 1",
+      "formula": "x*exp(-(x mod 1.3))",
       "reserve": false,
       "operator_groups": "1,2,3,7,8",
       "max_nodes": 21,
@@ -9548,57 +9072,141 @@
       "flags": "",
       "reached": {
         "0.9": {
-          "generation": 17,
-          "evaluations": 267840,
-          "seconds": 13.3505
+          "generation": 7,
+          "evaluations": 37689,
+          "seconds": 2.826
         },
         "0.99": {
-          "generation": 17,
-          "evaluations": 267840,
-          "seconds": 13.3505
+          "generation": 15,
+          "evaluations": 75174,
+          "seconds": 6.8777
         },
-        "0.999": {
-          "generation": 17,
-          "evaluations": 267840,
-          "seconds": 13.3505
-        },
-        "0.9999": {
-          "generation": 17,
-          "evaluations": 267840,
-          "seconds": 13.3505
-        },
-        "exact": {
-          "generation": 17,
-          "evaluations": 267840,
-          "seconds": 13.3505
-        }
+        "0.999": null,
+        "0.9999": null,
+        "exact": null
       },
-      "generation0_best_r2": 0.1503255939301057,
-      "generation0_best_loss": 0.2362979119683855,
-      "anytime_digits": 8.677271932553404,
-      "final_train_loss": 0.0,
-      "test_digits": 12.0,
-      "exact": true
+      "generation0_best_r2": 0.7718988064780777,
+      "generation0_best_loss": 0.07020260162180958,
+      "anytime_digits": 2.2628227547739446,
+      "final_train_loss": 0.0005953773864041161,
+      "test_digits": 2.419402700473032,
+      "exact": false
     },
     {
-      "case": "mod_product",
-      "seed": 20263002,
-      "rows": 200,
-      "test_rows": 187,
-      "features": 2,
+      "case": "saw_in_exp",
+      "seed": 20263004,
+      "rows": 64,
+      "test_rows": 60,
+      "features": 1,
       "population": 96,
       "generations": 60,
-      "elapsed_seconds": 43.581,
-      "row_model_evaluations": 778080,
-      "train_r2": 1.0,
-      "test_r2": 1.0,
-      "validation_loss": 4.767159973736997e-32,
-      "mdl_bits": 41.0,
+      "elapsed_seconds": 32.444,
+      "row_model_evaluations": 280857,
+      "train_r2": 0.992603568084876,
+      "test_r2": 0.9935400191286063,
+      "validation_loss": 0.02348483553652147,
+      "mdl_bits": 232.0,
+      "nodes": 20,
+      "equation": "y = 2.9318 * ((floordiv(exp(floordiv(abs(x0), 1.29812)), 1.435) * inv(exp(if_else(gt(x0, 3.90476), delta(x0, 1.61202), (0.718347 * x0)))))) + 0.278269",
+      "equivalence_redraws": 470,
+      "family": "piecewise",
+      "formula": "x*exp(-(x mod 1.3))",
+      "reserve": false,
+      "operator_groups": "1,2,3,7,8",
+      "max_nodes": 21,
+      "max_depth": 5,
+      "flags": "",
+      "reached": {
+        "0.9": {
+          "generation": 7,
+          "evaluations": 37179,
+          "seconds": 3.2876
+        },
+        "0.99": {
+          "generation": 47,
+          "evaluations": 221544,
+          "seconds": 24.2348
+        },
+        "0.999": null,
+        "0.9999": null,
+        "exact": null
+      },
+      "generation0_best_r2": 0.6305599296690816,
+      "generation0_best_loss": 0.17532851152463166,
+      "anytime_digits": 1.4539968390276599,
+      "final_train_loss": 0.003700689502931592,
+      "test_digits": 2.1897687679895106,
+      "exact": false
+    },
+    {
+      "case": "saw_in_exp",
+      "seed": 20263005,
+      "rows": 64,
+      "test_rows": 60,
+      "features": 1,
+      "population": 96,
+      "generations": 60,
+      "elapsed_seconds": 30.763,
+      "row_model_evaluations": 282489,
+      "train_r2": 0.8800117776021803,
+      "test_r2": 0.9924746729507701,
+      "validation_loss": 0.4073586292720013,
+      "mdl_bits": 104.0,
       "nodes": 7,
-      "equation": "y = (mod(x0, (1 / x1)) * x1)",
-      "equivalence_redraws": 965,
+      "equation": "y = -0.54812 * ((mod(mod(x0, 1.28348), -1.70787) * x0)) + -0.0133543",
+      "equivalence_redraws": 380,
       "family": "piecewise",
-      "formula": "(x0*x1) mod 1",
+      "formula": "x*exp(-(x mod 1.3))",
+      "reserve": false,
+      "operator_groups": "1,2,3,7,8",
+      "max_nodes": 21,
+      "max_depth": 5,
+      "flags": "",
+      "reached": {
+        "0.9": {
+          "generation": 1,
+          "evaluations": 9027,
+          "seconds": 0.4846
+        },
+        "0.99": {
+          "generation": 7,
+          "evaluations": 37587,
+          "seconds": 3.2806
+        },
+        "0.999": {
+          "generation": 50,
+          "evaluations": 236028,
+          "seconds": 24.5409
+        },
+        "0.9999": null,
+        "exact": null
+      },
+      "generation0_best_r2": 0.6970485870654681,
+      "generation0_best_loss": 0.09477707577418473,
+      "anytime_digits": 2.4115518385948045,
+      "final_train_loss": 0.00014582881269415243,
+      "test_digits": 2.123474620971408,
+      "exact": false
+    },
+    {
+      "case": "saw_in_exp",
+      "seed": 20263006,
+      "rows": 64,
+      "test_rows": 60,
+      "features": 1,
+      "population": 96,
+      "generations": 60,
+      "elapsed_seconds": 33.155,
+      "row_model_evaluations": 285753,
+      "train_r2": 0.9997167562980271,
+      "test_r2": 0.9997682737490823,
+      "validation_loss": 0.00010708691662467851,
+      "mdl_bits": 198.0,
+      "nodes": 15,
+      "equation": "y = 1.1984 * (((rbf((0.768574 * x0), (-0.670743 + floordiv(x0, 1.30896))) + 0.178117) * (x0 + 0.0112891))) + -0.00669855",
+      "equivalence_redraws": 377,
+      "family": "piecewise",
+      "formula": "x*exp(-(x mod 1.3))",
       "reserve": false,
       "operator_groups": "1,2,3,7,8",
       "max_nodes": 21,
@@ -9607,346 +9215,502 @@
       "reached": {
         "0.9": {
           "generation": 14,
-          "evaluations": 222880,
-          "seconds": 11.8721
+          "evaluations": 70227,
+          "seconds": 6.7913
         },
         "0.99": {
-          "generation": 15,
-          "evaluations": 237920,
-          "seconds": 12.9025
+          "generation": 38,
+          "evaluations": 181611,
+          "seconds": 19.6787
         },
         "0.999": {
-          "generation": 16,
-          "evaluations": 252960,
-          "seconds": 13.778
+          "generation": 43,
+          "evaluations": 205275,
+          "seconds": 22.4688
         },
-        "0.9999": {
-          "generation": 16,
-          "evaluations": 252960,
-          "seconds": 13.778
-        },
-        "exact": {
-          "generation": 17,
-          "evaluations": 268160,
-          "seconds": 14.5383
-        }
+        "0.9999": null,
+        "exact": null
       },
-      "generation0_best_r2": 0.13792166678468398,
-      "generation0_best_loss": 0.23851229813560448,
-      "anytime_digits": 8.802694692300205,
-      "final_train_loss": 2.901016625739172e-32,
-      "test_digits": 12.0,
-      "exact": true
+      "generation0_best_r2": 0.6639873863248067,
+      "generation0_best_loss": 0.09138204529904626,
+      "anytime_digits": 1.9182351019183403,
+      "final_train_loss": 7.769172452468172e-05,
+      "test_digits": 3.6350247647299625,
+      "exact": false
     },
     {
-      "case": "mod_product",
+      "case": "saw_in_exp",
+      "seed": 20263007,
+      "rows": 64,
+      "test_rows": 60,
+      "features": 1,
+      "population": 96,
+      "generations": 60,
+      "elapsed_seconds": 27.926,
+      "row_model_evaluations": 274023,
+      "train_r2": 0.9931247909406069,
+      "test_r2": 0.9940827884891198,
+      "validation_loss": 0.0033330140503331405,
+      "mdl_bits": 198.0,
+      "nodes": 15,
+      "equation": "y = 0.796291 * ((((-0.780033 * x0) + (1.46298 + floordiv(x0, 1.29812))) * floordiv(floordiv(x0, 0.326154), 4))) + 0.26666",
+      "equivalence_redraws": 471,
+      "family": "piecewise",
+      "formula": "x*exp(-(x mod 1.3))",
+      "reserve": false,
+      "operator_groups": "1,2,3,7,8",
+      "max_nodes": 21,
+      "max_depth": 5,
+      "flags": "",
+      "reached": {
+        "0.9": {
+          "generation": 10,
+          "evaluations": 51051,
+          "seconds": 3.9497
+        },
+        "0.99": {
+          "generation": 27,
+          "evaluations": 128775,
+          "seconds": 11.119
+        },
+        "0.999": null,
+        "0.9999": null,
+        "exact": null
+      },
+      "generation0_best_r2": 0.7171389582595705,
+      "generation0_best_loss": 0.09582208815756797,
+      "anytime_digits": 1.7746604923688662,
+      "final_train_loss": 0.0015735814805531783,
+      "test_digits": 2.2278829065779178,
+      "exact": false
+    },
+    {
+      "case": "saw_in_exp",
+      "seed": 20263008,
+      "rows": 64,
+      "test_rows": 60,
+      "features": 1,
+      "population": 96,
+      "generations": 60,
+      "elapsed_seconds": 30.247,
+      "row_model_evaluations": 284580,
+      "train_r2": 0.9945490647970601,
+      "test_r2": 0.9950983610537762,
+      "validation_loss": 0.004362408176242908,
+      "mdl_bits": 246.0,
+      "nodes": 21,
+      "equation": "y = 0.324849 * ((((((-1.83054 * x0) + 2.72619) * x0) + ((2.3699 * floordiv(x0, 1.29822)) * (0.0908449 + x0))) max (x0 + -0.136403))) + 0.0139529",
+      "equivalence_redraws": 460,
+      "family": "piecewise",
+      "formula": "x*exp(-(x mod 1.3))",
+      "reserve": false,
+      "operator_groups": "1,2,3,7,8",
+      "max_nodes": 21,
+      "max_depth": 5,
+      "flags": "",
+      "reached": {
+        "0.9": {
+          "generation": 3,
+          "evaluations": 18870,
+          "seconds": 1.5135
+        },
+        "0.99": {
+          "generation": 17,
+          "evaluations": 85170,
+          "seconds": 8.1712
+        },
+        "0.999": null,
+        "0.9999": null,
+        "exact": null
+      },
+      "generation0_best_r2": 0.7438940466421462,
+      "generation0_best_loss": 0.07552155033148483,
+      "anytime_digits": 1.982016401893613,
+      "final_train_loss": 0.0014702036441161864,
+      "test_digits": 2.309658681953304,
+      "exact": false
+    },
+    {
+      "case": "saw_in_exp",
+      "seed": 20263009,
+      "rows": 64,
+      "test_rows": 60,
+      "features": 1,
+      "population": 96,
+      "generations": 60,
+      "elapsed_seconds": 39.776,
+      "row_model_evaluations": 284886,
+      "train_r2": 0.9996508200182864,
+      "test_r2": 0.9982389348342046,
+      "validation_loss": 0.0002081765991584142,
+      "mdl_bits": 244.0,
+      "nodes": 20,
+      "equation": "y = -0.0414201 * (((-0.851846 + mod(x0, -1.30552)) * (floordiv((x0 + -0.0752915), 0.0748804) - ((5.75447 * x0) * root3(mod(x0, 1.2963)))))) + 0.0936226",
+      "equivalence_redraws": 369,
+      "family": "piecewise",
+      "formula": "x*exp(-(x mod 1.3))",
+      "reserve": false,
+      "operator_groups": "1,2,3,7,8",
+      "max_nodes": 21,
+      "max_depth": 5,
+      "flags": "",
+      "reached": {
+        "0.9": {
+          "generation": 5,
+          "evaluations": 28458,
+          "seconds": 2.5639
+        },
+        "0.99": {
+          "generation": 16,
+          "evaluations": 81396,
+          "seconds": 8.6823
+        },
+        "0.999": {
+          "generation": 25,
+          "evaluations": 124644,
+          "seconds": 14.6752
+        },
+        "0.9999": null,
+        "exact": null
+      },
+      "generation0_best_r2": 0.6627628617660092,
+      "generation0_best_loss": 0.10308837879747922,
+      "anytime_digits": 2.7071375995492883,
+      "final_train_loss": 0.00010178471352275371,
+      "test_digits": 2.754224573265126,
+      "exact": false
+    },
+    {
+      "case": "saw_in_exp",
+      "seed": 20263010,
+      "rows": 64,
+      "test_rows": 60,
+      "features": 1,
+      "population": 96,
+      "generations": 60,
+      "elapsed_seconds": 34.067,
+      "row_model_evaluations": 284580,
+      "train_r2": 0.9865959214292291,
+      "test_r2": 0.9882450839912508,
+      "validation_loss": 0.008733053855547433,
+      "mdl_bits": 114.0,
+      "nodes": 9,
+      "equation": "y = -0.546461 * (round2(((-1.65405 + mod(x0, 1.29702)) * x0), x0)) + 0.0300504",
+      "equivalence_redraws": 547,
+      "family": "piecewise",
+      "formula": "x*exp(-(x mod 1.3))",
+      "reserve": false,
+      "operator_groups": "1,2,3,7,8",
+      "max_nodes": 21,
+      "max_depth": 5,
+      "flags": "",
+      "reached": {
+        "0.9": {
+          "generation": 11,
+          "evaluations": 57069,
+          "seconds": 5.0378
+        },
+        "0.99": {
+          "generation": 16,
+          "evaluations": 79917,
+          "seconds": 7.1863
+        },
+        "0.999": null,
+        "0.9999": null,
+        "exact": null
+      },
+      "generation0_best_r2": 0.7409565274879031,
+      "generation0_best_loss": 0.0741809865498437,
+      "anytime_digits": 2.228763032382194,
+      "final_train_loss": 0.00042333038487212107,
+      "test_digits": 1.929780469649808,
+      "exact": false
+    },
+    {
+      "case": "mod_affine3",
+      "seed": 20263001,
+      "rows": 200,
+      "test_rows": 177,
+      "features": 3,
+      "population": 96,
+      "generations": 60,
+      "elapsed_seconds": 43.386,
+      "row_model_evaluations": 890560,
+      "train_r2": 0.15541638040807304,
+      "test_r2": -0.2588304977250777,
+      "validation_loss": 0.4754600755456968,
+      "mdl_bits": 120.0,
+      "nodes": 9,
+      "equation": "y = 36.569 * (mod(x2, (mod(x0, 0.10678) * mod(x1, 0.219744)))) + 0.332368",
+      "equivalence_redraws": 320,
+      "family": "piecewise",
+      "formula": "(x0*x1+x2) mod 1",
+      "reserve": false,
+      "operator_groups": "1,2,3,7,8",
+      "max_nodes": 21,
+      "max_depth": 5,
+      "flags": "",
+      "reached": {
+        "0.9": null,
+        "0.99": null,
+        "0.999": null,
+        "0.9999": null,
+        "exact": null
+      },
+      "generation0_best_r2": 0.06559454033816825,
+      "generation0_best_loss": 0.37743661542716045,
+      "anytime_digits": 0.1256020248312106,
+      "final_train_loss": 0.2714585078405207,
+      "test_digits": 0.0,
+      "exact": false
+    },
+    {
+      "case": "mod_affine3",
+      "seed": 20263002,
+      "rows": 200,
+      "test_rows": 177,
+      "features": 3,
+      "population": 96,
+      "generations": 60,
+      "elapsed_seconds": 47.379,
+      "row_model_evaluations": 895040,
+      "train_r2": 0.05618058427219752,
+      "test_r2": 0.03024010229774976,
+      "validation_loss": 0.24662219791536524,
+      "mdl_bits": 128.0,
+      "nodes": 10,
+      "equation": "y = -0.0797922 * (quantize((sign(mod(-5.66388, x1)) min x2), (-1.9 + x0))) + 0.496874",
+      "equivalence_redraws": 298,
+      "family": "piecewise",
+      "formula": "(x0*x1+x2) mod 1",
+      "reserve": false,
+      "operator_groups": "1,2,3,7,8",
+      "max_nodes": 21,
+      "max_depth": 5,
+      "flags": "",
+      "reached": {
+        "0.9": null,
+        "0.99": null,
+        "0.999": null,
+        "0.9999": null,
+        "exact": null
+      },
+      "generation0_best_r2": 0.051378066729493965,
+      "generation0_best_loss": 0.36073354696017446,
+      "anytime_digits": 0.13751124547391638,
+      "final_train_loss": 0.24513078472387279,
+      "test_digits": 0.013335779146792582,
+      "exact": false
+    },
+    {
+      "case": "mod_affine3",
       "seed": 20263003,
       "rows": 200,
-      "test_rows": 187,
-      "features": 2,
+      "test_rows": 177,
+      "features": 3,
       "population": 96,
       "generations": 60,
-      "elapsed_seconds": 48.975,
-      "row_model_evaluations": 866880,
-      "train_r2": 1.0,
-      "test_r2": 1.0,
-      "validation_loss": 0.0,
-      "mdl_bits": 57.0,
-      "nodes": 9,
-      "equation": "y = mod(((1 * x1) * x0), root4(sign(x0)))",
-      "equivalence_redraws": 609,
+      "elapsed_seconds": 40.459,
+      "row_model_evaluations": 890560,
+      "train_r2": 0.673219568106496,
+      "test_r2": 0.6346569821551711,
+      "validation_loss": 0.07062623986655299,
+      "mdl_bits": 168.0,
+      "nodes": 14,
+      "equation": "y = 23.6531 * (mod(frac((exp_decay(x0, (0.20125 * x1)) / ((4.35387 + x2) * -1))), 0.0369529)) + 0.0699897",
+      "equivalence_redraws": 404,
       "family": "piecewise",
-      "formula": "(x0*x1) mod 1",
+      "formula": "(x0*x1+x2) mod 1",
       "reserve": false,
       "operator_groups": "1,2,3,7,8",
       "max_nodes": 21,
       "max_depth": 5,
       "flags": "",
       "reached": {
-        "0.9": {
-          "generation": 31,
-          "evaluations": 473760,
-          "seconds": 26.6879
-        },
-        "0.99": {
-          "generation": 31,
-          "evaluations": 473760,
-          "seconds": 26.6879
-        },
-        "0.999": {
-          "generation": 31,
-          "evaluations": 473760,
-          "seconds": 26.6879
-        },
-        "0.9999": {
-          "generation": 31,
-          "evaluations": 473760,
-          "seconds": 26.6879
-        },
-        "exact": {
-          "generation": 31,
-          "evaluations": 473760,
-          "seconds": 26.6879
-        }
+        "0.9": null,
+        "0.99": null,
+        "0.999": null,
+        "0.9999": null,
+        "exact": null
       },
-      "generation0_best_r2": 0.19664331569058324,
-      "generation0_best_loss": 0.24689596375858444,
-      "anytime_digits": 5.92858379440923,
-      "final_train_loss": 3.3323428739720034e-32,
-      "test_digits": 12.0,
-      "exact": true
+      "generation0_best_r2": 0.04204445461095674,
+      "generation0_best_loss": 0.39101404370911264,
+      "anytime_digits": 0.22488931827182465,
+      "final_train_loss": 0.062005070346260925,
+      "test_digits": 0.4372991881420514,
+      "exact": false
     },
     {
-      "case": "mod_product",
+      "case": "mod_affine3",
       "seed": 20263004,
       "rows": 200,
-      "test_rows": 187,
-      "features": 2,
+      "test_rows": 177,
+      "features": 3,
       "population": 96,
       "generations": 60,
-      "elapsed_seconds": 36.726,
-      "row_model_evaluations": 735840,
-      "train_r2": 1.0,
-      "test_r2": 1.0,
-      "validation_loss": 0.0,
-      "mdl_bits": 30.0,
-      "nodes": 5,
-      "equation": "y = mod((x0 * x1), 1)",
-      "equivalence_redraws": 1398,
+      "elapsed_seconds": 45.66,
+      "row_model_evaluations": 893120,
+      "train_r2": 0.230203273827837,
+      "test_r2": -0.009627855686224152,
+      "validation_loss": 0.4879788953245175,
+      "mdl_bits": 152.0,
+      "nodes": 14,
+      "equation": "y = 0.566234 * (mod(if_else(x0, ((mod(x2, -7.13607) + x0) - neg(log1p(x1))), x2), 0.900791)) + 0.209273",
+      "equivalence_redraws": 382,
       "family": "piecewise",
-      "formula": "(x0*x1) mod 1",
+      "formula": "(x0*x1+x2) mod 1",
       "reserve": false,
       "operator_groups": "1,2,3,7,8",
       "max_nodes": 21,
       "max_depth": 5,
       "flags": "",
       "reached": {
-        "0.9": {
-          "generation": 6,
-          "evaluations": 102400,
-          "seconds": 4.1945
-        },
-        "0.99": {
-          "generation": 7,
-          "evaluations": 117600,
-          "seconds": 4.9332
-        },
-        "0.999": {
-          "generation": 7,
-          "evaluations": 117600,
-          "seconds": 4.9332
-        },
-        "0.9999": {
-          "generation": 7,
-          "evaluations": 117600,
-          "seconds": 4.9332
-        },
-        "exact": {
-          "generation": 7,
-          "evaluations": 117600,
-          "seconds": 4.9332
-        }
+        "0.9": null,
+        "0.99": null,
+        "0.999": null,
+        "0.9999": null,
+        "exact": null
       },
-      "generation0_best_r2": 0.16926157461588776,
-      "generation0_best_loss": 0.2324405516831578,
-      "anytime_digits": 10.641643719324001,
-      "final_train_loss": 0.0,
-      "test_digits": 12.0,
-      "exact": true
+      "generation0_best_r2": 0.07610257622992334,
+      "generation0_best_loss": 0.30628715641139176,
+      "anytime_digits": 0.1362177573638827,
+      "final_train_loss": 0.22706564875938362,
+      "test_digits": 0.0,
+      "exact": false
     },
     {
-      "case": "mod_product",
+      "case": "mod_affine3",
       "seed": 20263005,
       "rows": 200,
-      "test_rows": 187,
-      "features": 2,
+      "test_rows": 177,
+      "features": 3,
       "population": 96,
       "generations": 60,
-      "elapsed_seconds": 42.765,
-      "row_model_evaluations": 795840,
-      "train_r2": 1.0,
-      "test_r2": 1.0,
-      "validation_loss": 0.0,
-      "mdl_bits": 30.0,
-      "nodes": 5,
-      "equation": "y = mod((x0 * x1), 1)",
-      "equivalence_redraws": 1087,
+      "elapsed_seconds": 39.307,
+      "row_model_evaluations": 896000,
+      "train_r2": 0.3774719975710378,
+      "test_r2": 0.4607517180665469,
+      "validation_loss": 0.2824183288352479,
+      "mdl_bits": 176.0,
+      "nodes": 13,
+      "equation": "y = -1.37092 * (delta(0.347462, delta((0.822212 * mod(x2, 0.95406)), (0.291884 pow (x0 * x1))))) + 0.76129",
+      "equivalence_redraws": 350,
       "family": "piecewise",
-      "formula": "(x0*x1) mod 1",
+      "formula": "(x0*x1+x2) mod 1",
       "reserve": false,
       "operator_groups": "1,2,3,7,8",
       "max_nodes": 21,
       "max_depth": 5,
       "flags": "",
       "reached": {
-        "0.9": {
-          "generation": 22,
-          "evaluations": 343360,
-          "seconds": 18.9588
-        },
-        "0.99": {
-          "generation": 22,
-          "evaluations": 343360,
-          "seconds": 18.9588
-        },
-        "0.999": {
-          "generation": 22,
-          "evaluations": 343360,
-          "seconds": 18.9588
-        },
-        "0.9999": {
-          "generation": 22,
-          "evaluations": 343360,
-          "seconds": 18.9588
-        },
-        "exact": {
-          "generation": 22,
-          "evaluations": 343360,
-          "seconds": 18.9588
-        }
+        "0.9": null,
+        "0.99": null,
+        "0.999": null,
+        "0.9999": null,
+        "exact": null
       },
-      "generation0_best_r2": 0.1689026621395261,
-      "generation0_best_loss": 0.22436600289748476,
-      "anytime_digits": 7.68130144860225,
-      "final_train_loss": 0.0,
-      "test_digits": 12.0,
-      "exact": true
+      "generation0_best_r2": 0.04439523525065425,
+      "generation0_best_loss": 0.3381283484743499,
+      "anytime_digits": 0.20298748011440465,
+      "final_train_loss": 0.17705717771388124,
+      "test_digits": 0.2682112299027646,
+      "exact": false
     },
     {
-      "case": "mod_product",
+      "case": "mod_affine3",
       "seed": 20263006,
       "rows": 200,
-      "test_rows": 187,
-      "features": 2,
+      "test_rows": 177,
+      "features": 3,
       "population": 96,
       "generations": 60,
-      "elapsed_seconds": 37.807,
-      "row_model_evaluations": 779360,
-      "train_r2": 1.0,
-      "test_r2": 1.0,
-      "validation_loss": 0.0,
-      "mdl_bits": 30.0,
-      "nodes": 5,
-      "equation": "y = mod((x0 * x1), 1)",
-      "equivalence_redraws": 1141,
+      "elapsed_seconds": 44.053,
+      "row_model_evaluations": 894560,
+      "train_r2": 0.030476365715472076,
+      "test_r2": -0.03636135304456323,
+      "validation_loss": 0.32601136249109103,
+      "mdl_bits": 124.0,
+      "nodes": 11,
+      "equation": "y = -0.226869 * (quantize(log1p(x0), (delta(-1.84173, x1) - signbit(log10(sqrt(x0)))))) + 0.438455",
+      "equivalence_redraws": 331,
       "family": "piecewise",
-      "formula": "(x0*x1) mod 1",
+      "formula": "(x0*x1+x2) mod 1",
       "reserve": false,
       "operator_groups": "1,2,3,7,8",
       "max_nodes": 21,
       "max_depth": 5,
       "flags": "",
       "reached": {
-        "0.9": {
-          "generation": 12,
-          "evaluations": 193120,
-          "seconds": 9.3832
-        },
-        "0.99": {
-          "generation": 12,
-          "evaluations": 193120,
-          "seconds": 9.3832
-        },
-        "0.999": {
-          "generation": 12,
-          "evaluations": 193120,
-          "seconds": 9.3832
-        },
-        "0.9999": {
-          "generation": 12,
-          "evaluations": 193120,
-          "seconds": 9.3832
-        },
-        "exact": {
-          "generation": 12,
-          "evaluations": 193120,
-          "seconds": 9.3832
-        }
+        "0.9": null,
+        "0.99": null,
+        "0.999": null,
+        "0.9999": null,
+        "exact": null
       },
-      "generation0_best_r2": 0.22237120803367683,
-      "generation0_best_loss": 0.21634022462576447,
-      "anytime_digits": 9.633843389259384,
-      "final_train_loss": 0.0,
-      "test_digits": 12.0,
-      "exact": true
+      "generation0_best_r2": 0.02824701989992129,
+      "generation0_best_loss": 0.37418310168076413,
+      "anytime_digits": 0.09234744323513551,
+      "final_train_loss": 0.28499923730532106,
+      "test_digits": 0.0,
+      "exact": false
     },
     {
-      "case": "mod_product",
+      "case": "mod_affine3",
       "seed": 20263007,
       "rows": 200,
-      "test_rows": 187,
-      "features": 2,
+      "test_rows": 177,
+      "features": 3,
       "population": 96,
       "generations": 60,
-      "elapsed_seconds": 34.263,
-      "row_model_evaluations": 781440,
-      "train_r2": 1.0,
-      "test_r2": 1.0,
-      "validation_loss": 0.0,
-      "mdl_bits": 26.0,
-      "nodes": 4,
-      "equation": "y = frac((x0 * x1))",
-      "equivalence_redraws": 1542,
+      "elapsed_seconds": 36.079,
+      "row_model_evaluations": 884960,
+      "train_r2": 0.17621139025095822,
+      "test_r2": -0.270295095379405,
+      "validation_loss": 0.3386826521944758,
+      "mdl_bits": 160.0,
+      "nodes": 13,
+      "equation": "y = 0.0620849 * ((floordiv(quantize(1.03269, x0), 0.336968) * quantize(0.987456, (1 + rbf(x0, x2))))) + 0.192071",
+      "equivalence_redraws": 331,
       "family": "piecewise",
-      "formula": "(x0*x1) mod 1",
+      "formula": "(x0*x1+x2) mod 1",
       "reserve": false,
       "operator_groups": "1,2,3,7,8",
       "max_nodes": 21,
       "max_depth": 5,
       "flags": "",
       "reached": {
-        "0.9": {
-          "generation": 13,
-          "evaluations": 206560,
-          "seconds": 8.8265
-        },
-        "0.99": {
-          "generation": 13,
-          "evaluations": 206560,
-          "seconds": 8.8265
-        },
-        "0.999": {
-          "generation": 13,
-          "evaluations": 206560,
-          "seconds": 8.8265
-        },
-        "0.9999": {
-          "generation": 13,
-          "evaluations": 206560,
-          "seconds": 8.8265
-        },
-        "exact": {
-          "generation": 13,
-          "evaluations": 206560,
-          "seconds": 8.8265
-        }
+        "0.9": null,
+        "0.99": null,
+        "0.999": null,
+        "0.9999": null,
+        "exact": null
       },
-      "generation0_best_r2": 0.1485708701677807,
-      "generation0_best_loss": 0.23016217119988608,
-      "anytime_digits": 9.447687614904236,
-      "final_train_loss": 0.0,
-      "test_digits": 12.0,
-      "exact": true
+      "generation0_best_r2": 0.03020082930499779,
+      "generation0_best_loss": 0.3742938776582738,
+      "anytime_digits": 0.10126695405059341,
+      "final_train_loss": 0.2907647938568726,
+      "test_digits": 0.0,
+      "exact": false
     },
     {
-      "case": "mod_product",
+      "case": "mod_affine3",
       "seed": 20263008,
       "rows": 200,
-      "test_rows": 187,
-      "features": 2,
+      "test_rows": 177,
+      "features": 3,
       "population": 96,
       "generations": 60,
-      "elapsed_seconds": 44.93,
-      "row_model_evaluations": 793120,
-      "train_r2": 1.0,
-      "test_r2": 1.0,
-      "validation_loss": 0.0,
-      "mdl_bits": 30.0,
-      "nodes": 5,
-      "equation": "y = mod((x0 * x1), 1)",
-      "equivalence_redraws": 1076,
+      "elapsed_seconds": 42.282,
+      "row_model_evaluations": 902240,
+      "train_r2": 0.9981115464109354,
+      "test_r2": 0.9978938857544021,
+      "validation_loss": 0.00206765706933028,
+      "mdl_bits": 164.0,
+      "nodes": 13,
+      "equation": "y = 215.884 * (mod(root10((exp_decay(x0, (-0.0856601 * x1)) + pow4(exp_decay(-0.0212994, x2)))), 0.00463948)) + -0.00943288",
+      "equivalence_redraws": 314,
       "family": "piecewise",
-      "formula": "(x0*x1) mod 1",
+      "formula": "(x0*x1+x2) mod 1",
       "reserve": false,
       "operator_groups": "1,2,3,7,8",
       "max_nodes": 21,
@@ -9954,115 +9718,83 @@
       "flags": "",
       "reached": {
         "0.9": {
-          "generation": 21,
-          "evaluations": 326880,
-          "seconds": 17.9176
+          "generation": 53,
+          "evaluations": 801120,
+          "seconds": 36.2492
         },
         "0.99": {
-          "generation": 21,
-          "evaluations": 326880,
-          "seconds": 17.9176
+          "generation": 53,
+          "evaluations": 801120,
+          "seconds": 36.2492
         },
-        "0.999": {
-          "generation": 21,
-          "evaluations": 326880,
-          "seconds": 17.9176
-        },
-        "0.9999": {
-          "generation": 21,
-          "evaluations": 326880,
-          "seconds": 17.9176
-        },
-        "exact": {
-          "generation": 21,
-          "evaluations": 326880,
-          "seconds": 17.9176
-        }
+        "0.999": null,
+        "0.9999": null,
+        "exact": null
       },
-      "generation0_best_r2": 0.1781544194716499,
-      "generation0_best_loss": 0.25661508939013294,
-      "anytime_digits": 7.893387175072882,
-      "final_train_loss": 0.0,
-      "test_digits": 12.0,
-      "exact": true
+      "generation0_best_r2": 0.0642177037570083,
+      "generation0_best_loss": 0.30485961658910954,
+      "anytime_digits": 0.44570458731936813,
+      "final_train_loss": 0.0005971608050559146,
+      "test_digits": 2.676518074324784,
+      "exact": false
     },
     {
-      "case": "mod_product",
+      "case": "mod_affine3",
       "seed": 20263009,
       "rows": 200,
-      "test_rows": 187,
-      "features": 2,
+      "test_rows": 177,
+      "features": 3,
       "population": 96,
       "generations": 60,
-      "elapsed_seconds": 38.59,
-      "row_model_evaluations": 750560,
-      "train_r2": 1.0,
-      "test_r2": 1.0,
-      "validation_loss": 0.0,
-      "mdl_bits": 26.0,
-      "nodes": 4,
-      "equation": "y = frac((x0 * x1))",
-      "equivalence_redraws": 1800,
+      "elapsed_seconds": 38.628,
+      "row_model_evaluations": 887520,
+      "train_r2": 0.06244679526993868,
+      "test_r2": -0.004003123359819449,
+      "validation_loss": 0.46248494159362996,
+      "mdl_bits": 172.0,
+      "nodes": 14,
+      "equation": "y = 0.393922 * (abs(rbf(mod(quantize(4.95, x2), (0.400648 * (x1 + x1))), root9(abs(0.290491))))) + 0.162667",
+      "equivalence_redraws": 445,
       "family": "piecewise",
-      "formula": "(x0*x1) mod 1",
+      "formula": "(x0*x1+x2) mod 1",
       "reserve": false,
       "operator_groups": "1,2,3,7,8",
       "max_nodes": 21,
       "max_depth": 5,
       "flags": "",
       "reached": {
-        "0.9": {
-          "generation": 5,
-          "evaluations": 88960,
-          "seconds": 3.9718
-        },
-        "0.99": {
-          "generation": 5,
-          "evaluations": 88960,
-          "seconds": 3.9718
-        },
-        "0.999": {
-          "generation": 5,
-          "evaluations": 88960,
-          "seconds": 3.9718
-        },
-        "0.9999": {
-          "generation": 5,
-          "evaluations": 88960,
-          "seconds": 3.9718
-        },
-        "exact": {
-          "generation": 6,
-          "evaluations": 103840,
-          "seconds": 4.6812
-        }
+        "0.9": null,
+        "0.99": null,
+        "0.999": null,
+        "0.9999": null,
+        "exact": null
       },
-      "generation0_best_r2": 0.14203642130317928,
-      "generation0_best_loss": 0.25193267775348477,
-      "anytime_digits": 10.907634480284534,
-      "final_train_loss": 0.0,
-      "test_digits": 12.0,
-      "exact": true
+      "generation0_best_r2": 0.03434579503237023,
+      "generation0_best_loss": 0.31953443159006534,
+      "anytime_digits": 0.12509604385535214,
+      "final_train_loss": 0.20416670848559618,
+      "test_digits": 0.0,
+      "exact": false
     },
     {
-      "case": "mod_product",
+      "case": "mod_affine3",
       "seed": 20263010,
       "rows": 200,
-      "test_rows": 187,
-      "features": 2,
+      "test_rows": 177,
+      "features": 3,
       "population": 96,
       "generations": 60,
-      "elapsed_seconds": 38.084,
-      "row_model_evaluations": 715360,
+      "elapsed_seconds": 39.627,
+      "row_model_evaluations": 881920,
       "train_r2": 1.0,
       "test_r2": 1.0,
       "validation_loss": 0.0,
-      "mdl_bits": 30.0,
-      "nodes": 5,
-      "equation": "y = mod((x0 * x1), 1)",
-      "equivalence_redraws": 1781,
+      "mdl_bits": 44.0,
+      "nodes": 7,
+      "equation": "y = mod(((x0 * x1) + x2), 1)",
+      "equivalence_redraws": 514,
       "family": "piecewise",
-      "formula": "(x0*x1) mod 1",
+      "formula": "(x0*x1+x2) mod 1",
       "reserve": false,
       "operator_groups": "1,2,3,7,8",
       "max_nodes": 21,
@@ -10070,34 +9802,34 @@
       "flags": "",
       "reached": {
         "0.9": {
-          "generation": 4,
-          "evaluations": 74400,
-          "seconds": 3.3799
+          "generation": 45,
+          "evaluations": 684320,
+          "seconds": 30.1298
         },
         "0.99": {
-          "generation": 4,
-          "evaluations": 74400,
-          "seconds": 3.3799
+          "generation": 45,
+          "evaluations": 684320,
+          "seconds": 30.1298
         },
         "0.999": {
-          "generation": 4,
-          "evaluations": 74400,
-          "seconds": 3.3799
+          "generation": 45,
+          "evaluations": 684320,
+          "seconds": 30.1298
         },
         "0.9999": {
-          "generation": 4,
-          "evaluations": 74400,
-          "seconds": 3.3799
+          "generation": 45,
+          "evaluations": 684320,
+          "seconds": 30.1298
         },
         "exact": {
-          "generation": 4,
-          "evaluations": 74400,
-          "seconds": 3.3799
+          "generation": 45,
+          "evaluations": 684320,
+          "seconds": 30.1298
         }
       },
-      "generation0_best_r2": 0.2934363894156521,
-      "generation0_best_loss": 0.19689120665810406,
-      "anytime_digits": 11.210056582223016,
+      "generation0_best_r2": 0.05270593031283177,
+      "generation0_best_loss": 0.38342794403153724,
+      "anytime_digits": 3.073717993771326,
       "final_train_loss": 0.0,
       "test_digits": 12.0,
       "exact": true
@@ -14727,6 +14459,7 @@
     "commit": "f494553 (main)",
     "date": "2026-10-02",
     "constant_fitter": "Python (fitcore not built)",
-    "cores": 4
+    "cores": 4,
+    "note": "saw_in_exp and mod_affine3 replaced two_freq_saw and mod_product (10/10 and 9/10 exact) before the freeze; recorded in a second run on the same commit"
   }
 }
