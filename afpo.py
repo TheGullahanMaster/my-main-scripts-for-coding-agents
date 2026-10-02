@@ -971,22 +971,48 @@ def grammar_for_trees(base, trees, adfs=None):
     for tree in trees: visit(tree)
     return tuple(dict.fromkeys([*base,*found]))
 
-def canonical_adf_template(tree):
-    """Replace up to three distinct feature leaves with ordered ADF arguments."""
+def canonical_adf_template(tree, parametric=False):
+    """Replace up to three distinct feature leaves with ordered ADF arguments.
+
+    parametric=True also turns every constant into its own argument (up to
+    ADF_MAX_ARITY in all): a constant inside an ADF body is never fitted
+    (constant_paths stops at the call), while one at the call site is, and
+    tanh(2*x+3*y) and tanh(7*x-.4*y) become one motif instead of two."""
     features=[]
     def convert(node):
         if node[0]=="x":
-            if node[1] not in features: features.append(node[1])
-            return ("arg",features.index(node[1]))
+            if ("x",node[1]) not in features: features.append(("x",node[1]))
+            return ("arg",features.index(("x",node[1])))
+        if node[0]=="c" and parametric:
+            features.append(("c",len(features))); return ("arg",len(features)-1)
         if node[0] in ("c","arg"): return node
         return tuple([node[0]]+[convert(child) for child in node[1:]])
     result=convert(simplify_tree(tree))
+    inputs=sum(kind=="x" for kind,_ in features)
+    if parametric: return (result,len(features)) if inputs>=1 and len(features)<=ADF_MAX_ARITY else (None,0)
     return (result,len(features)) if 1<=len(features)<=3 else (None,0)
+def _operator_count(tree):
+    return 0 if tree[0] in ("x","c","arg") else 1+sum(_operator_count(child) for child in tree[1:])
+def adf_net_gain(item):
+    """Nodes saved by calling a motif instead of inlining it at each supporting
+    founder (inline size minus call size), less the definition's own size."""
+    size=node_size(item["tree"])
+    return len(item["founders"])*(size-1-item["arity"])-size
+
+# ADF mining (schema 3).  Schema 2 kept the most widely supported template and
+# broke ties toward the smallest, so its ADFs were single-operator aliases of
+# the grammar (arg0*arg1, arg0/arg1: 3.3 nodes on average on bench_complex)
+# with frozen inner constants.  Schema 3 parametrises constants, skips
+# single-operator templates, ranks by adf_net_gain and promotes up to
+# ADF_PROMOTIONS_PER_CHECK motifs per check.  Resumed schema-2 registries
+# keep the old rule.
+ADF_MAX_ARITY = 6
+ADF_PROMOTIONS_PER_CHECK = 3
 
 class ADFRegistry:
-    """V2 ADF catalog: founder-supported, bounded, and dependency-aware."""
+    """ADF catalog: founder-supported, bounded, and dependency-aware (schema 3 mining, see above)."""
     def __init__(self, enabled=False, capacity=8, allow_nested=True):
-        self.enabled=bool(enabled); self.capacity=int(capacity); self.allow_nested=bool(allow_nested); self.definitions={}; self.active=[]; self.history={}; self.last_used={}; self.schema_version=2; self.invalid_calls=0
+        self.enabled=bool(enabled); self.capacity=int(capacity); self.allow_nested=bool(allow_nested); self.definitions={}; self.active=[]; self.history={}; self.last_used={}; self.schema_version=3; self.invalid_calls=0
     def operators(self, base): return list(base)+[name for name in self.active if name not in base]
     def import_models(self, models):
         """Retain inherited definitions without activating foreign proposal operators."""
@@ -1045,7 +1071,7 @@ class ADFRegistry:
                 for path in subtree_paths(root):
                     subtree=subtree_at(root,path)
                     if node_size(subtree)<3 or node_size(subtree)>12 or (not self.allow_nested and tree_contains_adf(subtree)): continue
-                    template,arity=canonical_adf_template(subtree)
+                    template,arity=canonical_adf_template(subtree,parametric=self.schema_version>=3)
                     if template is None: continue
                     key=repr(template); seen.setdefault(key,{"tree":template,"arity":arity,"founders":set()})["founders"].update(model.founder_ids)
         for key,item in seen.items():
@@ -1054,12 +1080,18 @@ class ADFRegistry:
         for key in list(self.history):
             if generation-self.history[key]["last"]>50: del self.history[key]
         choices=[(key,item) for key,item in self.history.items() if len(item["founders"])>=3 and self._valid_definition(item["tree"],item["arity"]) and all(existing["tree"]!=item["tree"] for existing in self.definitions.values())]
-        if not choices: self._retire(generation); return False
-        key,item=max(choices,key=lambda pair:(len(pair[1]["founders"]),-node_size(pair[1]["tree"]),pair[0]))
-        name="adf_"+hashlib.sha256(key.encode()).hexdigest()[:10]
-        if not self._acyclic(name,item["tree"]): return False
-        self.definitions[name]={"tree":item["tree"],"arity":item["arity"],"dependencies":self._dependencies(item["tree"]),"supporting_founders":list(item["founders"]),"activated_generation":generation,"retired_generation":None,"elite_uses":0,"validation":[]}; self.active.append(name); self.last_used[name]=generation
-        self._retire(generation); return True
+        if self.schema_version>=3:
+            choices=[pair for pair in choices if _operator_count(pair[1]["tree"])>=2 and adf_net_gain(pair[1])>0]
+            ranked=sorted(choices,key=lambda pair:(-adf_net_gain(pair[1]),pair[0]))[:ADF_PROMOTIONS_PER_CHECK]
+        else:
+            ranked=[max(choices,key=lambda pair:(len(pair[1]["founders"]),-node_size(pair[1]["tree"]),pair[0]))] if choices else []
+        promoted=False
+        for key,item in ranked:
+            name="adf_"+hashlib.sha256(key.encode()).hexdigest()[:10]
+            if name in self.definitions or not self._acyclic(name,item["tree"]): continue
+            self.definitions[name]={"tree":item["tree"],"arity":item["arity"],"dependencies":self._dependencies(item["tree"]),"supporting_founders":list(item["founders"]),"activated_generation":generation,"retired_generation":None,"elite_uses":0,"validation":[]}; self.active.append(name); self.last_used[name]=generation
+            promoted=True
+        self._retire(generation); return promoted
     def mark_usage(self, models, generation, elite=()):
         used=set(); elite_used=set()
         def visit(tree):

@@ -651,5 +651,67 @@ class BlockedEvaluationTests(unittest.TestCase):
         self.assertEqual(constant[0], 0.)
 
 
+class ADFMiningTests(unittest.TestCase):
+    @staticmethod
+    def motif(k, j=1.):
+        return ("sin", ("+", ("*", ("c", k), ("x", 0)), ("*", ("c", j), ("x", 1))))
+
+    def elite(self, count):
+        # Each model carries the motif (different constants) and an x0*x1 alias.
+        models = []
+        for i in range(count):
+            m = model(("+", self.motif(1.+i, 2.-i), ("*", ("x", 0), ("x", 1))), features=2)
+            m.founder_ids = (100+i,)
+            models.append(m)
+        return models
+
+    def test_parametric_template_turns_constants_into_arguments(self):
+        first, arity = a.canonical_adf_template(self.motif(2., 3.), parametric=True)
+        second, _ = a.canonical_adf_template(self.motif(7., -.4), parametric=True)
+        self.assertEqual(first, second)
+        self.assertEqual(arity, 4)
+        self.assertNotIn("'c'", repr(first))
+        legacy, legacy_arity = a.canonical_adf_template(self.motif(2., 3.))
+        self.assertIn(("c", 2.), list(a.walk_tree(legacy)))
+        self.assertEqual(legacy_arity, 2)
+
+    def test_promotes_motifs_not_operator_aliases(self):
+        registry = a.ADFRegistry(True)
+        self.assertTrue(registry.observe(self.elite(6), 10))
+        trees = [item["tree"] for item in registry.definitions.values()]
+        self.assertNotIn(("*", ("arg", 0), ("arg", 1)), trees)
+        self.assertTrue(any(tree[0] == "sin" for tree in trees))
+        self.assertLessEqual(len(trees), a.ADF_PROMOTIONS_PER_CHECK)
+        for tree in trees:
+            self.assertFalse(any(node[0] == "c" for node in a.walk_tree(tree)))
+            self.assertGreaterEqual(a._operator_count(tree), 2)
+
+    def test_schema_2_registry_keeps_the_old_promotion_rule(self):
+        snapshot = a.ADFRegistry(True).snapshot(); snapshot["schema_version"] = 2
+        registry = a.ADFRegistry.from_snapshot(snapshot)
+        self.assertTrue(registry.observe(self.elite(6), 10))
+        self.assertEqual([item["tree"] for item in registry.definitions.values()], [("*", ("arg", 0), ("arg", 1))])
+
+    def test_call_site_constants_of_a_promoted_motif_are_fitted(self):
+        registry = a.ADFRegistry(True); registry.observe(self.elite(6), 10)
+        source = a.simplify_tree(self.motif(2., 1.5))
+        template, arity = a.canonical_adf_template(source, parametric=True)
+        name = next(n for n, item in registry.definitions.items() if item["tree"] == template)
+        found = {}
+        def bind(node, pattern):
+            if pattern[0] == "arg": found[pattern[1]] = node; return
+            for child, sub in zip(node[1:], pattern[1:]): bind(child, sub)
+        bind(source, template)
+        call = (name, *[found[i] for i in range(arity)])
+        self.assertTrue(np.allclose(a.evaluate(call, self.X, registry.definitions), a.evaluate(source, self.X)))
+        # The target needs constants 2.5 and .7 where the call holds 2 and 1.5;
+        # they sit at the call site, so the fitter can reach them.
+        y = np.sin(2.5*self.X[:, 0]+.7*self.X[:, 1])
+        fitted = a.fit_tree_constants(call, self.X, y, registry.definitions, iterations=60)
+        prediction = a.evaluate(fitted, self.X, registry.definitions)
+        self.assertGreater(abs(np.corrcoef(prediction, y)[0, 1]), 1-1e-8)
+
+    X = np.random.default_rng(3).uniform(-1, 1, (80, 2))
+
 if __name__ == "__main__":
     unittest.main()
