@@ -1500,7 +1500,7 @@ def tune_model_constants(model, X, Y, affine_on, cats):
 # are kept.
 READOUT_MODE = "affine"
 MAX_TERMS = 4
-GENE_CROSSOVER_RATE = .5    # share of crossovers that exchange whole terms in multiterm mode
+GENE_CROSSOVER_RATE = 0.    # share of crossovers that exchange whole terms in multiterm mode
 MULTITERM_CONDITION_LIMIT = 1e8
 MULTITERM_MIN_CONTRIBUTION = 1e-9  # of the target scale
 
@@ -6443,7 +6443,7 @@ def resume_main(args):
     configure_units(state.get("units",""),list(names))
     RESIDUAL_TERM_WEIGHT=float(state.get("residual_term_weight",0.)); NESTING_RULES=parse_nesting_rules(state.get("forbid_nesting",""))
     BACKPROP_MUTATION_WEIGHT=float(state.get("backprop_mutation_weight",0.)); BACKPROP_INVERSE=state.get("backprop_inverse","generic")
-    READOUT_MODE=state.get("readout","affine"); MAX_TERMS=int(state.get("max_terms",4)); GENE_CROSSOVER_RATE=float(state.get("gene_crossover_rate",.5))
+    READOUT_MODE=state.get("readout","affine"); MAX_TERMS=int(state.get("max_terms",4)); GENE_CROSSOVER_RATE=float(state.get("gene_crossover_rate",0.))
     global LOSS_NOISE_FLOOR
     LOSS_NOISE_FLOOR=float(state.get("loss_noise_floor",LOSS_NOISE_FLOOR_MAX))
     global SQUASH_SWAP_WEIGHT,SMOOTH_SWAP_WEIGHT,GATE_MUTATION_WEIGHT
@@ -6599,7 +6599,7 @@ def build_arg_parser():
     ap.add_argument("--snap-tolerance",type=float,default=1e-6,help="Relative loss increase a snapped constant may cause on training and on validation data, never below the loss noise floor (default: 1e-6)")
     ap.add_argument("--readout",choices=("affine","multiterm"),default="affine",help="Output readout: affine fits a*tree+b; multiterm (multigene GP) gives each top-level +/- term of a regression tree its own least-squares coefficient, pruning negligible and collinear terms (default: affine)")
     ap.add_argument("--max-terms",type=int,default=4,help="Most top-level terms a multiterm tree keeps (default: 4)")
-    ap.add_argument("--gene-crossover-rate",type=float,default=.5,help="Share of crossovers that add or swap one whole top-level term in multiterm mode (default: 0.5)")
+    ap.add_argument("--gene-crossover-rate",type=float,default=0.,help="Share of crossovers that add or swap one whole top-level term in multiterm mode; at 0.5 it cut bench_complex solves (2/15 vs 5/15 at 0 on products6, sum8, reuse_poly3) (default: 0)")
     ap.add_argument("--backprop-mutation-weight",type=float,default=0.,help="Initial portfolio weight of semantic backpropagation: invert the tree from its readout down to a random node and replace that subtree with the small expression or fragment that best matches the desired values; 0 disables it (default: 0)")
     ap.add_argument("--backprop-inverse",choices=("exact","generic"),default="generic",help="exact inverts only + - * / neg exp log tanh sigmoid; generic also solves every other operator numerically per row, on the branch the subtree is already on (default: generic)")
     ap.add_argument("--residual-term-weight",type=float,default=0.,help="Initial portfolio weight of the residual-term mutation, which adds the small expression that best matches what the parent still misses (boosting-style); 0 disables it (default: 0)")
@@ -6779,7 +6779,7 @@ def train_from_setup(args, setup, choose_model=None):
     LOSS_MODE=getattr(args,"loss","huber"); ROBUST_LOSS_DELTA=float(getattr(args,"huber_delta",1.5))
     RESIDUAL_TERM_WEIGHT=float(getattr(args,"residual_term_weight",0.)); NESTING_RULES=parse_nesting_rules(getattr(args,"forbid_nesting",""))
     BACKPROP_MUTATION_WEIGHT=float(getattr(args,"backprop_mutation_weight",0.)); BACKPROP_INVERSE=getattr(args,"backprop_inverse","generic")
-    READOUT_MODE=getattr(args,"readout","affine"); MAX_TERMS=int(getattr(args,"max_terms",4)); GENE_CROSSOVER_RATE=float(getattr(args,"gene_crossover_rate",.5))
+    READOUT_MODE=getattr(args,"readout","affine"); MAX_TERMS=int(getattr(args,"max_terms",4)); GENE_CROSSOVER_RATE=float(getattr(args,"gene_crossover_rate",0.))
     global SQUASH_SWAP_WEIGHT,SMOOTH_SWAP_WEIGHT,GATE_MUTATION_WEIGHT
     SQUASH_SWAP_WEIGHT=float(getattr(args,"squash_swap_weight",1.)); SMOOTH_SWAP_WEIGHT=float(getattr(args,"smooth_swap_weight",1.)); GATE_MUTATION_WEIGHT=float(getattr(args,"gate_mutation_weight",1.))
     FIT_BACKEND=getattr(args,"fit_backend","auto")

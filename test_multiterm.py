@@ -78,7 +78,7 @@ class GeneCrossoverTest(unittest.TestCase):
 
     def test_cli(self):
         args = a.parse_cli(["--readout", "multiterm", "--max-terms", "6"])[1]
-        self.assertEqual((args.readout, args.max_terms, args.gene_crossover_rate), ("multiterm", 6, .5))
+        self.assertEqual((args.readout, args.max_terms, args.gene_crossover_rate), ("multiterm", 6, 0.))
         with self.assertRaises(SystemExit), patch("sys.stderr"):
             a.parse_cli(["--max-terms", "1"])
 

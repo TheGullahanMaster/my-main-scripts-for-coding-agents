@@ -45,6 +45,8 @@ CONFIGS = {
     "defaults": {"flags": []},
     "no_snapping": {"flags": ["--constant-snapping", "off"]},
     "multiterm": {"flags": ["--readout", "multiterm"]},
+    "multiterm_no_gene": {"flags": ["--readout", "multiterm", "--gene-crossover-rate", "0"]},
+    "multiterm_sparse": {"flags": ["--readout", "multiterm", "--sparse-seeding", "on"]},
     "backprop": {"flags": ["--backprop-mutation-weight", "1"]},
     "backprop_exact": {"flags": ["--backprop-mutation-weight", "1", "--backprop-inverse", "exact"]},
     "residual_term": {"flags": ["--residual-term-weight", "1"]},
