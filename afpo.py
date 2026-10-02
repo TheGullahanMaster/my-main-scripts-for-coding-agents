@@ -1301,7 +1301,7 @@ def _scan_costs(predictions, y, scale, fit_readout):
         slope=np.einsum("kn,n->k",du,y-my)/np.where(degenerate,1.,suu)
         slope=np.where(degenerate|~np.isfinite(slope),0.,np.clip(slope,-AFFINE_COEFFICIENT_BOUND,AFFINE_COEFFICIENT_BOUND))
         P=slope[:,None]*du+my
-    r=np.abs((P-y)/scale); huber=ROBUST_LOSS_DELTA
+    r=np.abs((P-y)/scale); huber=loss_delta()
     costs=np.where(r<=huber,.5*r*r,huber*(r-.5*huber)).sum(axis=1)
     return np.where(np.isfinite(costs),costs,np.inf)
 def _nudged_roots(flat, nodes, slot, candidates, X):
@@ -1355,7 +1355,8 @@ def fit_tree_constants(tree, X, y, adfs=None, fit_readout=True, iterations=None,
     if iterations is None: iterations=CONSTANT_FIT_ITERATIONS  # read at call time: --fit-iterations sets it
     start=np.asarray(constant_vector(tree),float)
     if not len(start) or not len(y): return tree
-    scale=target_scale(y); ones=np.ones(len(y)); flat=_FlatTree.build(tree); huber=ROBUST_LOSS_DELTA
+    scale=loss_scale(y); flat=_FlatTree.build(tree); huber=loss_delta()
+    base=loss_base_weights(y); ones=np.ones(len(y)) if base is None else base*base
     if JUMP_CONSTANT_SCAN and flat is not None and isinstance(X,np.ndarray) and X.ndim==2:
         scanned=scan_jump_constants(flat,start,X,y,scale,fit_readout)
         if scanned is not None:
@@ -1363,7 +1364,7 @@ def fit_tree_constants(tree, X, y, adfs=None, fit_readout=True, iterations=None,
             # The gradient fit below returns its own input unless it improves
             # further, so the scanned tree becomes that input.
             if not guarded_constant_divisor(placed) and not guard_engagement([placed],X,adfs): tree,start=placed,scanned
-    if flat is not None and FIT_BACKEND=="auto" and isinstance(X,np.ndarray) and X.ndim==2:
+    if flat is not None and FIT_BACKEND=="auto" and LOSS_MODE=="huber" and isinstance(X,np.ndarray) and X.ndim==2:
         core=compiled_fitter(); program=None if core is None else _compiled_program(flat,core,X.shape[1])
         if program is not None:
             result=core.fit(*program,start,np.ascontiguousarray(X,dtype=float),np.ascontiguousarray(y,dtype=float),scale,
@@ -1389,8 +1390,9 @@ def fit_tree_constants(tree, X, y, adfs=None, fit_readout=True, iterations=None,
                 if abs(slope)>bound: slope=float(np.sign(slope))*bound; intercept=float(np.average(y-slope*pred,weights=weights))
                 fitted=slope*pred+min(max(float(intercept),-bound),bound)
                 if robust:
-                    weights=np.minimum(1.,huber_scale/np.maximum(np.abs(fitted-y),EPS))
-                    if (weights>=1.).all(): break  # no point is in the Huber tail: least squares is exact
+                    huber_weights=np.minimum(1.,huber_scale/np.maximum(np.abs(fitted-y),EPS))
+                    if (huber_weights>=1.).all(): break  # no point is in the Huber tail: least squares is exact
+                    weights=ones*huber_weights
             pred=fitted
         r=(pred-y)/scale
         if robust:
@@ -1530,12 +1532,13 @@ def join_terms(terms):
 def _multiterm_solve(F, y):
     """Huber-reweighted least squares y ~ F @ a + b; returns (a, b, loss, condition)."""
     centre=F.mean(axis=0); spread=F.std(axis=0); spread=np.where(spread>EPS,spread,1.)
-    A=np.column_stack(((F-centre)/spread,np.ones(len(y)))); cutoff=1.5*target_scale(y); weights=np.ones(len(y)); coefficients=None
+    A=np.column_stack(((F-centre)/spread,np.ones(len(y)))); cutoff=loss_delta()*loss_scale(y)
+    base=loss_base_weights(y); base=np.ones(len(y)) if base is None else base; weights=base; coefficients=None
     for _ in range(6):
         solution,_,_,singular=np.linalg.lstsq(A*weights[:,None],y*weights,rcond=1e-12)
         if coefficients is not None and np.allclose(solution,coefficients,rtol=1e-10,atol=1e-14): coefficients=solution; break
         coefficients=solution
-        weights=np.sqrt(np.minimum(1.,cutoff/np.maximum(np.abs(A@coefficients-y),EPS)))
+        weights=base*np.sqrt(np.minimum(1.,cutoff/np.maximum(np.abs(A@coefficients-y),EPS)))
     a=coefficients[:-1]/spread; b=float(coefficients[-1]-np.dot(a,centre))
     condition=float(singular[0]/singular[-1]) if len(singular) and singular[-1]>0 else float("inf")
     return a,b,robust_loss(F@a+b,y),condition
@@ -3091,9 +3094,26 @@ def _target_scale(y):
     return scale
 
 ROBUST_LOSS_DELTA=1.5
-def robust_loss(pred, y, delta=ROBUST_LOSS_DELTA):
+# --loss: huber (default) is the MAD-scaled Huber loss with --huber-delta;
+# squared is the same with an infinite delta; relative applies the Huber
+# loss to (pred - y) / max(|y|, 1e-3 * median |y|), for targets spanning
+# orders of magnitude.  The scorer, the constant fitter, the jump scan and
+# both readouts all go through loss_scale() and loss_delta().
+LOSS_MODE = "huber"
+RELATIVE_LOSS_FLOOR = 1e-3
+def loss_delta(): return float("inf") if LOSS_MODE=="squared" else ROBUST_LOSS_DELTA
+def loss_scale(y):
+    """Residual divisor: the target's robust scale, or per row in relative mode."""
+    if LOSS_MODE!="relative": return target_scale(y)
+    magnitude=np.abs(np.asarray(y,float))
+    return np.maximum(magnitude,max(RELATIVE_LOSS_FLOOR*float(np.median(magnitude)),EPS))
+def loss_base_weights(y):
+    """Least-squares row weights that make a readout fit minimise the relative residual."""
+    return None if LOSS_MODE!="relative" else 1./loss_scale(y)
+def robust_loss(pred, y, delta=None):
     """MAD-scaled Huber loss; a few extreme target values cannot dominate."""
-    scale=target_scale(y)
+    delta=loss_delta() if delta is None else delta
+    scale=loss_scale(y)
     r=np.abs((pred-y)/scale)
     return float(np.mean(np.where(r<=delta,.5*r*r,delta*(r-.5*delta))))
 AFFINE_COEFFICIENT_BOUND = 1e9
@@ -3155,7 +3175,7 @@ def _affine(pred, y):
     varying=spread>=EPS; spread=spread if varying else 1.
     bound=AFFINE_COEFFICIENT_BOUND
     # (A constant prediction is a degenerate line the compiled path would only hand back.)
-    if varying and len(pred)>2*EVALUATION_BLOCK_ROWS and FIT_BACKEND=="auto":
+    if varying and len(pred)>2*EVALUATION_BLOCK_ROWS and FIT_BACKEND=="auto" and LOSS_MODE=="huber":
         # Large data: the compiled IRLS streams the rows twice per iteration
         # instead of ~25 times (memory bandwidth, not arithmetic, was the cost).
         # It agrees to round-off; rare degenerate/bounded fits fall through.
@@ -3186,12 +3206,13 @@ def _affine(pred, y):
             candidates.append((a,b))
         return np.asarray(min(candidates,key=lambda ab:float(np.sum(w*(ab[0]*pred+ab[1]-y)**2))))
     try:
-        coefficients=weighted_fit(np.ones(len(pred)))
-        cutoff=1.5*target_scale(y)
+        base=loss_base_weights(y); base=np.ones(len(pred)) if base is None else base
+        coefficients=weighted_fit(base)
+        cutoff=loss_delta()*loss_scale(y)
         # Solver termination limits are numerical safeguards, not search settings.
         for _ in range(200):
             residual=coefficients[0]*pred+coefficients[1]-y
-            weights=np.sqrt(np.minimum(1.,cutoff/np.maximum(np.abs(residual),EPS)))
+            weights=base*np.sqrt(np.minimum(1.,cutoff/np.maximum(np.abs(residual),EPS)))
             updated=weighted_fit(weights)
             change=(updated[0]-coefficients[0])*pred+updated[1]-coefficients[1]
             converged=np.linalg.norm(change)<=np.sqrt(np.finfo(float).eps)*(1.+np.linalg.norm(residual+y))
@@ -6260,8 +6281,9 @@ def resume_main(args):
     CONSTANT_SNAPPING=state.get("constant_snapping","off"); SNAP_TOLERANCE=float(state.get("snap_tolerance",1e-6))
     global READOUT_MODE,MAX_TERMS,GENE_CROSSOVER_RATE
     global BACKPROP_MUTATION_WEIGHT,BACKPROP_INVERSE
-    global RESIDUAL_TERM_WEIGHT,NESTING_RULES,SYMBOLIC_EXPORT
+    global RESIDUAL_TERM_WEIGHT,NESTING_RULES,SYMBOLIC_EXPORT,LOSS_MODE,ROBUST_LOSS_DELTA
     SYMBOLIC_EXPORT=getattr(args,"symbolic_export","on")
+    LOSS_MODE=state.get("loss","huber"); ROBUST_LOSS_DELTA=float(state.get("huber_delta",1.5))
     RESIDUAL_TERM_WEIGHT=float(state.get("residual_term_weight",0.)); NESTING_RULES=parse_nesting_rules(state.get("forbid_nesting",""))
     BACKPROP_MUTATION_WEIGHT=float(state.get("backprop_mutation_weight",0.)); BACKPROP_INVERSE=state.get("backprop_inverse","generic")
     READOUT_MODE=state.get("readout","affine"); MAX_TERMS=int(state.get("max_terms",4)); GENE_CROSSOVER_RATE=float(state.get("gene_crossover_rate",.5))
@@ -6426,6 +6448,8 @@ def build_arg_parser():
     ap.add_argument("--residual-term-weight",type=float,default=0.,help="Initial portfolio weight of the residual-term mutation, which adds the small expression that best matches what the parent still misses (boosting-style); 0 disables it (default: 0)")
     ap.add_argument("--forbid-nesting",default="",metavar="OUTER>INNER,...",help="Operator pairs that may not nest, e.g. exp>exp,log>exp,sin>sin: INNER may not appear anywhere below OUTER (default: none)")
     ap.add_argument("--symbolic-export",choices=("on","off"),default="on",help="Also write the chosen model as a simplified SymPy expression and LaTeX to best_model_symbolic.txt when sympy is installed (default: on)")
+    ap.add_argument("--loss",choices=("huber","squared","relative"),default="huber",help="Regression loss: huber (MAD-scaled, robust to outliers), squared (plain least squares) or relative (Huber on the error relative to |y|, for targets spanning orders of magnitude) (default: huber)")
+    ap.add_argument("--huber-delta",type=float,default=1.5,help="Huber threshold in robust target-scale units for --loss huber and relative (default: 1.5)")
     ap.add_argument("--max-time",type=float,default=0.,help="Stop the search after this many seconds and go to the final choice; 0 = no limit (default: 0)")
     ap.add_argument("--stop-at-loss",type=float,default=None,help="Stop the search once the best training loss (the loss printed during the run) is at or below this value (default: off)")
     ap.add_argument("--sparse-seeding",choices=("on","off"),default="off",help="Seed the initial population with sparse linear fits over a modest basis (inputs, unary operators of inputs, pairwise products and ratios, hinges), found by orthogonal matching pursuit (default: off)")
@@ -6452,6 +6476,7 @@ def parse_cli(argv=None):
     if args.fit_iterations < 1: ap.error("--fit-iterations must be positive")
     try: parse_nesting_rules(args.forbid_nesting)
     except ValueError as error: ap.error(str(error))
+    if not args.huber_delta > 0: ap.error("--huber-delta must be positive")
     if args.max_time < 0: ap.error("--max-time must be non-negative")
     if args.residual_term_weight < 0: ap.error("--residual-term-weight must be non-negative")
     if args.backprop_mutation_weight < 0: ap.error("--backprop-mutation-weight must be non-negative")
@@ -6584,8 +6609,9 @@ def train_from_setup(args, setup, choose_model=None):
     SPARSE_SEEDING=getattr(args,"sparse_seeding","off"); SPARSE_BASIS_SIZE=int(getattr(args,"sparse_basis_size",300)); SPARSE_SEED_STATS.update(seeds=0,best_r2=None,basis=0)
     global BACKPROP_MUTATION_WEIGHT,BACKPROP_INVERSE
     global RESIDUAL_TERM_WEIGHT,NESTING_RULES
-    global SYMBOLIC_EXPORT
+    global SYMBOLIC_EXPORT,LOSS_MODE,ROBUST_LOSS_DELTA
     SYMBOLIC_EXPORT=getattr(args,"symbolic_export","on")
+    LOSS_MODE=getattr(args,"loss","huber"); ROBUST_LOSS_DELTA=float(getattr(args,"huber_delta",1.5))
     RESIDUAL_TERM_WEIGHT=float(getattr(args,"residual_term_weight",0.)); NESTING_RULES=parse_nesting_rules(getattr(args,"forbid_nesting",""))
     BACKPROP_MUTATION_WEIGHT=float(getattr(args,"backprop_mutation_weight",0.)); BACKPROP_INVERSE=getattr(args,"backprop_inverse","generic")
     READOUT_MODE=getattr(args,"readout","affine"); MAX_TERMS=int(getattr(args,"max_terms",4)); GENE_CROSSOVER_RATE=float(getattr(args,"gene_crossover_rate",.5))
@@ -6684,7 +6710,7 @@ def train_from_setup(args, setup, choose_model=None):
                    "stages":{key:stages[key] for key in ("mode","count","interval","age_gap","schedule","threshold_quantile")},
                    "roles":{key:roles[key] for key in ("enabled","interval","mix","retire_after")}},
         "equivalence_collapse":EQUIVALENCE_COLLAPSE,"residual_archive":RESIDUAL_ARCHIVE,"qd_parent_choice":QD_PARENT_CHOICE,"scale_balanced_selection":SCALE_BALANCED_SELECTION,
-        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"selection_probe_filter":SELECTION_PROBE_FILTER,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"fit_iterations":CONSTANT_FIT_ITERATIONS,"semantic_max_delta":SEMANTIC_MAX_DELTA,"constant_snapping":CONSTANT_SNAPPING,"snap_tolerance":SNAP_TOLERANCE,"readout":READOUT_MODE,"max_terms":MAX_TERMS,"gene_crossover_rate":GENE_CROSSOVER_RATE,"backprop_mutation_weight":BACKPROP_MUTATION_WEIGHT,"backprop_inverse":BACKPROP_INVERSE,"residual_term_weight":RESIDUAL_TERM_WEIGHT,"forbid_nesting":",".join(sorted(f"{o}>{i}" for o,i in NESTING_RULES)),"sparse_seeding":SPARSE_SEEDING,"sparse_basis_size":SPARSE_BASIS_SIZE,"squash_swap_weight":SQUASH_SWAP_WEIGHT,"smooth_swap_weight":SMOOTH_SWAP_WEIGHT,"gate_mutation_weight":GATE_MUTATION_WEIGHT,"loss_noise_floor":LOSS_NOISE_FLOOR,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age",
+        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"selection_probe_filter":SELECTION_PROBE_FILTER,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"fit_iterations":CONSTANT_FIT_ITERATIONS,"semantic_max_delta":SEMANTIC_MAX_DELTA,"constant_snapping":CONSTANT_SNAPPING,"snap_tolerance":SNAP_TOLERANCE,"readout":READOUT_MODE,"max_terms":MAX_TERMS,"gene_crossover_rate":GENE_CROSSOVER_RATE,"backprop_mutation_weight":BACKPROP_MUTATION_WEIGHT,"backprop_inverse":BACKPROP_INVERSE,"residual_term_weight":RESIDUAL_TERM_WEIGHT,"loss":LOSS_MODE,"huber_delta":ROBUST_LOSS_DELTA,"forbid_nesting":",".join(sorted(f"{o}>{i}" for o,i in NESTING_RULES)),"sparse_seeding":SPARSE_SEEDING,"sparse_basis_size":SPARSE_BASIS_SIZE,"squash_swap_weight":SQUASH_SWAP_WEIGHT,"smooth_swap_weight":SMOOTH_SWAP_WEIGHT,"gate_mutation_weight":GATE_MUTATION_WEIGHT,"loss_noise_floor":LOSS_NOISE_FLOOR,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age",
         "test_csv":str(Path(args.test_csv).resolve()) if args.test_csv else None,
     },df,train_indices,validation_indices,external_validation)
     print(f"Run manifest: {manifest_path}")
@@ -6701,7 +6727,7 @@ def train_from_setup(args, setup, choose_model=None):
         "profile":args.profile,"constraint_metadata":metadata,"constraints":constraints.describe(),"bayesian_particles":args.bayesian_particles,"interaction_discovery":interaction_discovery,
         "island_config":{"count":island_count,"migration_interval":migration_interval,"migrants_per_island":migrants_per_island,"topology":"ring","migration_events":0,"stages":stages,"roles":roles},
         "equivalence_collapse":EQUIVALENCE_COLLAPSE,"residual_archive":RESIDUAL_ARCHIVE,"qd_parent_choice":QD_PARENT_CHOICE,"scale_balanced_selection":SCALE_BALANCED_SELECTION,
-        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"selection_probe_filter":SELECTION_PROBE_FILTER,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"fit_iterations":CONSTANT_FIT_ITERATIONS,"semantic_max_delta":SEMANTIC_MAX_DELTA,"constant_snapping":CONSTANT_SNAPPING,"snap_tolerance":SNAP_TOLERANCE,"readout":READOUT_MODE,"max_terms":MAX_TERMS,"gene_crossover_rate":GENE_CROSSOVER_RATE,"backprop_mutation_weight":BACKPROP_MUTATION_WEIGHT,"backprop_inverse":BACKPROP_INVERSE,"residual_term_weight":RESIDUAL_TERM_WEIGHT,"forbid_nesting":",".join(sorted(f"{o}>{i}" for o,i in NESTING_RULES)),"sparse_seeding":SPARSE_SEEDING,"sparse_basis_size":SPARSE_BASIS_SIZE,"squash_swap_weight":SQUASH_SWAP_WEIGHT,"smooth_swap_weight":SMOOTH_SWAP_WEIGHT,"gate_mutation_weight":GATE_MUTATION_WEIGHT,"loss_noise_floor":LOSS_NOISE_FLOOR,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age"}
+        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"selection_probe_filter":SELECTION_PROBE_FILTER,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"fit_iterations":CONSTANT_FIT_ITERATIONS,"semantic_max_delta":SEMANTIC_MAX_DELTA,"constant_snapping":CONSTANT_SNAPPING,"snap_tolerance":SNAP_TOLERANCE,"readout":READOUT_MODE,"max_terms":MAX_TERMS,"gene_crossover_rate":GENE_CROSSOVER_RATE,"backprop_mutation_weight":BACKPROP_MUTATION_WEIGHT,"backprop_inverse":BACKPROP_INVERSE,"residual_term_weight":RESIDUAL_TERM_WEIGHT,"loss":LOSS_MODE,"huber_delta":ROBUST_LOSS_DELTA,"forbid_nesting":",".join(sorted(f"{o}>{i}" for o,i in NESTING_RULES)),"sparse_seeding":SPARSE_SEEDING,"sparse_basis_size":SPARSE_BASIS_SIZE,"squash_swap_weight":SQUASH_SWAP_WEIGHT,"smooth_swap_weight":SMOOTH_SWAP_WEIGHT,"gate_mutation_weight":GATE_MUTATION_WEIGHT,"loss_noise_floor":LOSS_NOISE_FLOOR,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age"}
     head_count=sum(len(heads) for heads in classification_layout(cats)[0])
     population_sizes=cell_population_sizes(args.population,cell_count)
     islands=[new_island_runtime(size,X=X,Xt=Xt,cats=cats,ops=ops,nodes=nodes,depth=depth,head_count=head_count,

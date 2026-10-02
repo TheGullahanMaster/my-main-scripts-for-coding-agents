@@ -77,5 +77,34 @@ class SymbolicTest(unittest.TestCase):
         self.assertIn("LaTeX", content)
 
 
+class LossModeTest(unittest.TestCase):
+    def test_squared_and_relative_losses(self):
+        y = np.array([1., 10., 100., 1000.]); pred = y * 1.01
+        huber = a.robust_loss(pred, y)
+        with patch.object(a, "LOSS_MODE", "relative"):
+            relative = a.robust_loss(pred, y)
+        self.assertAlmostEqual(relative, .5 * .01 ** 2, places=12)
+        self.assertNotAlmostEqual(huber, relative)
+        outlier = np.array([0., 0., 0., 100.]); flat = np.zeros(4)
+        with patch.object(a, "LOSS_MODE", "squared"):
+            squared = a.robust_loss(flat, outlier)
+        self.assertGreater(squared, a.robust_loss(flat, outlier))
+
+    def test_relative_fit_matches_small_targets(self):
+        # Targets over six decades: a relative fit must not ignore the small rows.
+        X = np.logspace(0, 3, 40)[:, None]; y = 2.5 * X[:, 0] ** 2
+        tree = ("pow", ("x", 0), ("c", 1.7))
+        with patch.object(a, "LOSS_MODE", "relative"), patch.object(a, "JUMP_CONSTANT_SCAN", False):
+            fitted = a.fit_tree_constants(tree, X, y, iterations=60)
+            a_, b_ = a.affine(a.evaluate_cached(fitted, X, {}), y)
+        self.assertAlmostEqual(a.constant_vector(fitted)[0], 2., places=4)
+        prediction = a_ * a.evaluate_cached(fitted, X, {}) + b_
+        self.assertLess(np.max(np.abs(prediction / y - 1)), 1e-3)
+
+    def test_cli(self):
+        args = a.parse_cli(["--loss", "relative", "--huber-delta", "3"])[1]
+        self.assertEqual((args.loss, args.huber_delta), ("relative", 3.))
+
+
 if __name__ == "__main__":
     unittest.main()
