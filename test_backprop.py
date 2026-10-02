@@ -83,5 +83,20 @@ class MutationTest(unittest.TestCase):
         self.assertEqual((args.backprop_mutation_weight, args.backprop_inverse), (1., "exact"))
 
 
+class ResidualTermTest(unittest.TestCase):
+    def test_adds_missing_term(self):
+        a.rng.seed(1)
+        y = np.sin(X[:, 0]) + 3 * X[:, 1] / X[:, 2]
+        a.set_backprop_context(X, y)
+        try:
+            child = a.residual_term_mutate(("sin", ("x", 0)), OPS, 21, 6)
+        finally:
+            a.set_backprop_context()
+        np.testing.assert_allclose(values(child), y, rtol=1e-9)
+
+    def test_cli(self):
+        self.assertEqual(a.parse_cli(["--residual-term-weight", "1"])[1].residual_term_weight, 1.)
+
+
 if __name__ == "__main__":
     unittest.main()

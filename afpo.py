@@ -2395,6 +2395,29 @@ def _best_affine_match(L, D):
     index=int(np.argmin(sse)); intercept=float(D.mean()-slope[index]*L[:,index].mean())
     return index,float(slope[index]),intercept,float(sse[index])
 
+# Residual-driven term (boosting-style): add to the parent the library entry
+# that best matches what its readout still misses, T + c*L with L fitted to
+# (y - b)/a - T.  Shares the backpropagation library and context.
+RESIDUAL_TERM_WEIGHT = 0.
+
+def residual_term_mutate(t, ops, max_nodes, max_depth, adfs=None):
+    X=_BACKPROP_CONTEXT["X"]; target=_BACKPROP_CONTEXT["desired"]
+    if X is None or target is None or len(target)!=len(X): return t
+    try: residual=np.asarray(target,float)-np.asarray(evaluate_cached(t,X,adfs),float)
+    except (ArithmeticError, IndexError, RecursionError, ValueError): return t
+    valid=np.isfinite(residual)
+    if valid.sum()<5 or residual[valid].std()<=EPS: return t
+    trees,L=backprop_library(X,ops,adfs)
+    if not L.shape[1]: return t
+    index,slope,_,sse=_best_affine_match(L[valid],residual[valid])
+    centred=residual[valid]-residual[valid].mean()
+    if not np.isfinite(sse) or sse>=float(centred@centred)*(1-1e-6) or abs(slope)<=EPS: return t
+    term=trees[index] if abs(slope-1.)<=1e-9 else ("*",("c",slope),trees[index])
+    for addition in (term,trees[index]):
+        child=simplify_tree(("+",t,addition))
+        if child!=t and node_size(child)<=max_nodes and node_depth(child)<=max_depth: return child
+    return t
+
 def regression_head_outputs(cats):
     """Tree index -> output column for regression heads (classifier heads have no desired value)."""
     targets,_=classification_layout(cats)
@@ -2451,7 +2474,7 @@ def backprop_mutate(t, ops, max_nodes, max_depth, adfs=None):
 class MutationPortfolio:
     def __init__(self):
         self.weights={"subtree":1.,"point":1.,"constant":1.,"hoist":.7,"shrink":.7,"parametrize":1.,"bilinear":BILINEAR_MUTATION_WEIGHT,"jump":JUMP_MUTATION_WEIGHT,
-                      "squash":SQUASH_SWAP_WEIGHT,"smooth":SMOOTH_SWAP_WEIGHT,"gate":GATE_MUTATION_WEIGHT,"backprop":BACKPROP_MUTATION_WEIGHT}
+                      "squash":SQUASH_SWAP_WEIGHT,"smooth":SMOOTH_SWAP_WEIGHT,"gate":GATE_MUTATION_WEIGHT,"backprop":BACKPROP_MUTATION_WEIGHT,"residual_term":RESIDUAL_TERM_WEIGHT}
         self.tries={k:0 for k in self.weights}; self.wins={k:0 for k in self.weights}
     def choose(self): return rng.choices(list(self.weights),weights=list(self.weights.values()))[0]
     def record(self, kind, improved):
@@ -2465,8 +2488,8 @@ class MutationPortfolio:
         if kind=="parametrize": return parametrize_mutate(t,ops,max_nodes,max_depth),kind
         if kind=="bilinear": return bilinear_mutate(t,n_features,ops,max_nodes,max_depth),kind
         if kind=="jump": return jump_mutate(t,n_features,ops,max_nodes,max_depth),kind
-        if kind=="backprop":
-            child=backprop_mutate(t,ops,max_nodes,max_depth,adfs)
+        if kind in ("backprop","residual_term"):
+            child=(backprop_mutate if kind=="backprop" else residual_term_mutate)(t,ops,max_nodes,max_depth,adfs)
             if child!=t: return child,kind
             kind="subtree"  # no defined desired output or no better match: make an ordinary move
         if kind in ("squash","smooth","gate"):
@@ -5857,7 +5880,7 @@ def evolve_generation(pop, generation, *, X, Xt, Yt, Xv, Yv, cats, constraints, 
     if progress is not None: progress(generation,elite,sample)
     library.observe(unique_models([*stable_elite,*archive.items,*diverse]),Xb,Yb,cats)
     Xsb=behaviour_rows(Xs)
-    if BACKPROP_MUTATION_WEIGHT>0:
+    if BACKPROP_MUTATION_WEIGHT>0 or RESIDUAL_TERM_WEIGHT>0:
         _,Ysb=behaviour_rows(Xs,Ys); head_outputs=regression_head_outputs(cats)
         fragment_trees=[item["tree"] for item in library.items.values()]
     parent_pool=novelty_pool(pop,Xs)
@@ -5907,7 +5930,7 @@ def evolve_generation(pop, generation, *, X, Xt, Yt, Xv, Yv, cats, constraints, 
             trees=[]; kinds=[]; macro_used=False
             for index,tree in enumerate(p.model.trees):
                 proposal=None if bayesian_mode=="off" else (bayes[index] if isinstance(bayes,PerOutputBayesianBanks) else bayes)
-                if BACKPROP_MUTATION_WEIGHT>0: set_backprop_context(Xsb,backprop_desired(p.model,index,Ysb,head_outputs),fragment_trees)
+                if BACKPROP_MUTATION_WEIGHT>0 or RESIDUAL_TERM_WEIGHT>0: set_backprop_context(Xsb,backprop_desired(p.model,index,Ysb,head_outputs),fragment_trees)
                 child_tree,kind,macro=semantic_mutate(tree,Xsb,portfolio,X.shape[1],active_ops,nodes,depth,proposal,adf_registry.definitions if adf_registry else None,library)
                 trees.append(child_tree); kinds.append(kind); macro_used|=macro
             if trees==list(p.model.trees) and unchanged<unchanged_limit: unchanged+=1; continue
@@ -6141,6 +6164,8 @@ def resume_main(args):
     CONSTANT_SNAPPING=state.get("constant_snapping","off"); SNAP_TOLERANCE=float(state.get("snap_tolerance",1e-6))
     global READOUT_MODE,MAX_TERMS,GENE_CROSSOVER_RATE
     global BACKPROP_MUTATION_WEIGHT,BACKPROP_INVERSE
+    global RESIDUAL_TERM_WEIGHT
+    RESIDUAL_TERM_WEIGHT=float(state.get("residual_term_weight",0.))
     BACKPROP_MUTATION_WEIGHT=float(state.get("backprop_mutation_weight",0.)); BACKPROP_INVERSE=state.get("backprop_inverse","generic")
     READOUT_MODE=state.get("readout","affine"); MAX_TERMS=int(state.get("max_terms",4)); GENE_CROSSOVER_RATE=float(state.get("gene_crossover_rate",.5))
     global LOSS_NOISE_FLOOR
@@ -6278,6 +6303,7 @@ def build_arg_parser():
     ap.add_argument("--gene-crossover-rate",type=float,default=.5,help="Share of crossovers that add or swap one whole top-level term in multiterm mode (default: 0.5)")
     ap.add_argument("--backprop-mutation-weight",type=float,default=0.,help="Initial portfolio weight of semantic backpropagation: invert the tree from its readout down to a random node and replace that subtree with the small expression or fragment that best matches the desired values; 0 disables it (default: 0)")
     ap.add_argument("--backprop-inverse",choices=("exact","generic"),default="generic",help="exact inverts only + - * / neg exp log tanh sigmoid; generic also solves every other operator numerically per row, on the branch the subtree is already on (default: generic)")
+    ap.add_argument("--residual-term-weight",type=float,default=0.,help="Initial portfolio weight of the residual-term mutation, which adds the small expression that best matches what the parent still misses (boosting-style); 0 disables it (default: 0)")
     ap.add_argument("--sparse-seeding",choices=("on","off"),default="off",help="Seed the initial population with sparse linear fits over a modest basis (inputs, unary operators of inputs, pairwise products and ratios, hinges), found by orthogonal matching pursuit (default: off)")
     ap.add_argument("--sparse-basis-size",type=int,default=300,help="Most basis terms the sparse seeding searches (default: 300)")
     ap.add_argument("--jump-mutation-weight",type=float,default=1.,help="Initial portfolio weight of the jump mutation, which wraps a subtree in mod(s,c), floordiv(s,c) or if_else(gt(x,c),s,s') as one move; adapted like the other mutation kinds; 0 disables it (default: 1)")
@@ -6300,6 +6326,7 @@ def parse_cli(argv=None):
     if not .10 <= args.qd_parent_rate <= .30: ap.error("--qd-parent-rate must be between 0.10 and 0.30")
     if args.evaluation_refresh < 1 or args.stagnation_window < 1: ap.error("evaluation refresh and stagnation window must be positive")
     if args.fit_iterations < 1: ap.error("--fit-iterations must be positive")
+    if args.residual_term_weight < 0: ap.error("--residual-term-weight must be non-negative")
     if args.backprop_mutation_weight < 0: ap.error("--backprop-mutation-weight must be non-negative")
     if args.sparse_basis_size < 1: ap.error("--sparse-basis-size must be positive")
     if args.max_terms < 2: ap.error("--max-terms must be at least 2")
@@ -6429,6 +6456,8 @@ def train_from_setup(args, setup, choose_model=None):
     global SPARSE_SEEDING,SPARSE_BASIS_SIZE
     SPARSE_SEEDING=getattr(args,"sparse_seeding","off"); SPARSE_BASIS_SIZE=int(getattr(args,"sparse_basis_size",300)); SPARSE_SEED_STATS.update(seeds=0,best_r2=None,basis=0)
     global BACKPROP_MUTATION_WEIGHT,BACKPROP_INVERSE
+    global RESIDUAL_TERM_WEIGHT
+    RESIDUAL_TERM_WEIGHT=float(getattr(args,"residual_term_weight",0.))
     BACKPROP_MUTATION_WEIGHT=float(getattr(args,"backprop_mutation_weight",0.)); BACKPROP_INVERSE=getattr(args,"backprop_inverse","generic")
     READOUT_MODE=getattr(args,"readout","affine"); MAX_TERMS=int(getattr(args,"max_terms",4)); GENE_CROSSOVER_RATE=float(getattr(args,"gene_crossover_rate",.5))
     global SQUASH_SWAP_WEIGHT,SMOOTH_SWAP_WEIGHT,GATE_MUTATION_WEIGHT
@@ -6526,7 +6555,7 @@ def train_from_setup(args, setup, choose_model=None):
                    "stages":{key:stages[key] for key in ("mode","count","interval","age_gap","schedule","threshold_quantile")},
                    "roles":{key:roles[key] for key in ("enabled","interval","mix","retire_after")}},
         "equivalence_collapse":EQUIVALENCE_COLLAPSE,"residual_archive":RESIDUAL_ARCHIVE,"qd_parent_choice":QD_PARENT_CHOICE,"scale_balanced_selection":SCALE_BALANCED_SELECTION,
-        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"selection_probe_filter":SELECTION_PROBE_FILTER,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"fit_iterations":CONSTANT_FIT_ITERATIONS,"semantic_max_delta":SEMANTIC_MAX_DELTA,"constant_snapping":CONSTANT_SNAPPING,"snap_tolerance":SNAP_TOLERANCE,"readout":READOUT_MODE,"max_terms":MAX_TERMS,"gene_crossover_rate":GENE_CROSSOVER_RATE,"backprop_mutation_weight":BACKPROP_MUTATION_WEIGHT,"backprop_inverse":BACKPROP_INVERSE,"sparse_seeding":SPARSE_SEEDING,"sparse_basis_size":SPARSE_BASIS_SIZE,"squash_swap_weight":SQUASH_SWAP_WEIGHT,"smooth_swap_weight":SMOOTH_SWAP_WEIGHT,"gate_mutation_weight":GATE_MUTATION_WEIGHT,"loss_noise_floor":LOSS_NOISE_FLOOR,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age",
+        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"selection_probe_filter":SELECTION_PROBE_FILTER,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"fit_iterations":CONSTANT_FIT_ITERATIONS,"semantic_max_delta":SEMANTIC_MAX_DELTA,"constant_snapping":CONSTANT_SNAPPING,"snap_tolerance":SNAP_TOLERANCE,"readout":READOUT_MODE,"max_terms":MAX_TERMS,"gene_crossover_rate":GENE_CROSSOVER_RATE,"backprop_mutation_weight":BACKPROP_MUTATION_WEIGHT,"backprop_inverse":BACKPROP_INVERSE,"residual_term_weight":RESIDUAL_TERM_WEIGHT,"sparse_seeding":SPARSE_SEEDING,"sparse_basis_size":SPARSE_BASIS_SIZE,"squash_swap_weight":SQUASH_SWAP_WEIGHT,"smooth_swap_weight":SMOOTH_SWAP_WEIGHT,"gate_mutation_weight":GATE_MUTATION_WEIGHT,"loss_noise_floor":LOSS_NOISE_FLOOR,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age",
         "test_csv":str(Path(args.test_csv).resolve()) if args.test_csv else None,
     },df,train_indices,validation_indices,external_validation)
     print(f"Run manifest: {manifest_path}")
@@ -6543,7 +6572,7 @@ def train_from_setup(args, setup, choose_model=None):
         "profile":args.profile,"constraint_metadata":metadata,"constraints":constraints.describe(),"bayesian_particles":args.bayesian_particles,"interaction_discovery":interaction_discovery,
         "island_config":{"count":island_count,"migration_interval":migration_interval,"migrants_per_island":migrants_per_island,"topology":"ring","migration_events":0,"stages":stages,"roles":roles},
         "equivalence_collapse":EQUIVALENCE_COLLAPSE,"residual_archive":RESIDUAL_ARCHIVE,"qd_parent_choice":QD_PARENT_CHOICE,"scale_balanced_selection":SCALE_BALANCED_SELECTION,
-        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"selection_probe_filter":SELECTION_PROBE_FILTER,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"fit_iterations":CONSTANT_FIT_ITERATIONS,"semantic_max_delta":SEMANTIC_MAX_DELTA,"constant_snapping":CONSTANT_SNAPPING,"snap_tolerance":SNAP_TOLERANCE,"readout":READOUT_MODE,"max_terms":MAX_TERMS,"gene_crossover_rate":GENE_CROSSOVER_RATE,"backprop_mutation_weight":BACKPROP_MUTATION_WEIGHT,"backprop_inverse":BACKPROP_INVERSE,"sparse_seeding":SPARSE_SEEDING,"sparse_basis_size":SPARSE_BASIS_SIZE,"squash_swap_weight":SQUASH_SWAP_WEIGHT,"smooth_swap_weight":SMOOTH_SWAP_WEIGHT,"gate_mutation_weight":GATE_MUTATION_WEIGHT,"loss_noise_floor":LOSS_NOISE_FLOOR,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age"}
+        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"selection_probe_filter":SELECTION_PROBE_FILTER,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"fit_iterations":CONSTANT_FIT_ITERATIONS,"semantic_max_delta":SEMANTIC_MAX_DELTA,"constant_snapping":CONSTANT_SNAPPING,"snap_tolerance":SNAP_TOLERANCE,"readout":READOUT_MODE,"max_terms":MAX_TERMS,"gene_crossover_rate":GENE_CROSSOVER_RATE,"backprop_mutation_weight":BACKPROP_MUTATION_WEIGHT,"backprop_inverse":BACKPROP_INVERSE,"residual_term_weight":RESIDUAL_TERM_WEIGHT,"sparse_seeding":SPARSE_SEEDING,"sparse_basis_size":SPARSE_BASIS_SIZE,"squash_swap_weight":SQUASH_SWAP_WEIGHT,"smooth_swap_weight":SMOOTH_SWAP_WEIGHT,"gate_mutation_weight":GATE_MUTATION_WEIGHT,"loss_noise_floor":LOSS_NOISE_FLOOR,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age"}
     head_count=sum(len(heads) for heads in classification_layout(cats)[0])
     population_sizes=cell_population_sizes(args.population,cell_count)
     islands=[new_island_runtime(size,X=X,Xt=Xt,cats=cats,ops=ops,nodes=nodes,depth=depth,head_count=head_count,
