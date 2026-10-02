@@ -124,5 +124,43 @@ class IntervalTest(unittest.TestCase):
         self.assertTrue(any(item["se"] is None for item in report if item["kind"] == "constant"))
 
 
+class UnitTest(unittest.TestCase):
+    def setUp(self):
+        a.configure_units("x=m,t=s,v=m/s^1,k=1/s", ["x", "t", "v", "k", "free"])
+
+    def tearDown(self):
+        a.configure_units("", [])
+
+    def test_parse(self):
+        self.assertEqual(a.parse_unit("kg*m/s^2"), {"kg": 1., "m": 1., "s": -2.})
+        self.assertEqual(a.parse_unit("m^(1/2)"), {"m": .5})
+        self.assertEqual(a.parse_unit("1/s"), {"s": -1.})
+        self.assertEqual(a.parse_unit("1"), {})
+
+    def test_consistent_trees_pass(self):
+        for tree in (("+", ("x", 0), ("*", ("x", 2), ("x", 1))),          # x + v*t
+                     ("exp", ("neg", ("*", ("x", 3), ("x", 1)))),          # exp(-k t)
+                     ("sin", ("*", ("c", 2.), ("x", 0))),                  # constant carries 1/m
+                     ("gt", ("x", 0), ("c", 1.)),
+                     ("sqrt", ("*", ("x", 0), ("x", 0))),
+                     ("+", ("x", 4), ("x", 0))):                           # unlisted column is free
+            self.assertEqual(a.unit_violation(tree), "", tree)
+
+    def test_inconsistent_trees_fail(self):
+        for tree in (("+", ("x", 0), ("x", 1)),                            # m + s
+                     ("exp", ("x", 0)),                                    # exp(m)
+                     ("gt", ("x", 0), ("x", 2)),                           # m > m/s
+                     ("pow", ("x", 0), ("x", 1))):                         # m ** s
+            self.assertNotEqual(a.unit_violation(tree), "", tree)
+
+    def test_assess_and_cli(self):
+        X = np.ones((4, 5)); Y = np.ones((4, 1))
+        model = a.Model(trees=[("+", ("x", 0), ("x", 1))], scales=[(1., 0.)])
+        a.assess(model, X, Y, True, [None])
+        self.assertTrue(model.invalid_reason.startswith("units:"))
+        with self.assertRaises(SystemExit), patch("sys.stderr"):
+            a.parse_cli(["--units", "x=m$"])
+
+
 if __name__ == "__main__":
     unittest.main()

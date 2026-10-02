@@ -2437,6 +2437,119 @@ def nesting_violation(tree, enclosing=frozenset()):
         if found: return found
     return ""
 
+# --units (dimensional analysis, as in PySR): units per input column, e.g.
+# "x=m,t=s,F=kg*m/s^2".  Trees whose subexpressions add, compare or feed
+# a transcendental function with inconsistent units are infeasible, and such
+# offspring are redrawn.  Constants are unit wildcards (they may carry any
+# unit), as is the affine readout, so the output unit is not constrained.
+# Columns without a unit are wildcards too.
+UNIT_FEATURES = {}           # feature index -> unit vector (tuple over UNIT_BASES)
+UNIT_SPEC = ""
+UNIT_BASES = ()
+WILDCARD = None
+_COMPARE_OPS = {"gt","lt","gte","lte","eq","ne"}
+_UNIT_PRESERVING = {"abs","neg","relu","leaky_relu","floor","ceil","round","int","perceptronReLU1"}
+_POWERS = {"square":2,"cube":3,**{f"pow{k}":k for k in range(4,11)},"sqrt":.5,"inv":-1,**{f"root{k}":1/k for k in range(3,11)}}
+
+def parse_unit(text):
+    """'kg*m/s^2' -> {base: exponent}; '' or '1' is dimensionless."""
+    text=str(text).strip().replace(" ","")
+    result={}
+    if text in ("","1","-"): return result
+    sign=1; token=""
+    def flush(token, sign):
+        if not token or token=="1": return
+        base,_,exponent=token.partition("^")
+        if not base.replace("_","").isalpha(): raise ValueError(f"Bad unit {base!r}")
+        value=float(eval_fraction(exponent)) if exponent else 1.
+        result[base]=result.get(base,0.)+sign*value
+    depth=0
+    for char in text:
+        depth+=(char=="(")-(char==")")
+        if char in "*/" and depth==0:  # m^(1/2): a fraction exponent stays in its token
+            flush(token,sign); token=""; sign=1 if char=="*" else -1
+        else: token+=char
+    flush(token,sign)
+    return {base:value for base,value in result.items() if value}
+
+def eval_fraction(text):
+    numerator,_,denominator=text.strip("()").partition("/")
+    return float(numerator)/(float(denominator) if denominator else 1.)
+
+def configure_units(spec, feature_names):
+    """Set UNIT_FEATURES from 'name=unit,...'; returns {name: unit dict}."""
+    global UNIT_FEATURES,UNIT_BASES,UNIT_SPEC
+    UNIT_SPEC=str(spec or ""); parsed={}
+    for item in str(spec or "").split(","):
+        if not item.strip(): continue
+        name,separator,unit=item.partition("=")
+        if not separator: raise ValueError(f"Bad unit entry {item.strip()!r}: use column=unit")
+        if name.strip() not in feature_names: raise ValueError(f"Unknown column {name.strip()!r} in --units")
+        parsed[name.strip()]=parse_unit(unit)
+    UNIT_BASES=tuple(sorted({base for unit in parsed.values() for base in unit}))
+    UNIT_FEATURES={feature_names.index(name):tuple(unit.get(base,0.) for base in UNIT_BASES) for name,unit in parsed.items()}
+    return parsed
+
+def tree_units(tree):
+    """(unit or WILDCARD, violation text or '')."""
+    if tree[0]=="x": return UNIT_FEATURES.get(tree[1],WILDCARD),""
+    if tree[0] in ("c","arg"): return WILDCARD,""
+    children=[]
+    for child in tree[1:]:
+        unit,violation=tree_units(child)
+        if violation: return None,violation
+        children.append(unit)
+    op=tree[0]; zero=tuple(0. for _ in UNIT_BASES)
+    def same(units):
+        concrete=[u for u in units if u is not WILDCARD]
+        if any(not np.allclose(u,concrete[0]) for u in concrete[1:]): return None
+        return concrete[0] if concrete else WILDCARD
+    def dimensionless(unit): return unit is WILDCARD or np.allclose(unit,zero)
+    if op in ("+","-","max","min","delta","hypot","distance_2","harmonic"):
+        unit=same(children); return (unit,"") if unit is not None else (None,f"{op} of unlike units")
+    if op in ("mod","quantize","copysign","geometric"):
+        if op=="geometric":
+            return (WILDCARD if WILDCARD in children else tuple(.5*(a+b) for a,b in zip(*children))),""
+        if op=="copysign": return children[0],""
+        unit=same(children); return (unit,"") if unit is not None else (None,f"{op} of unlike units")
+    if op in _COMPARE_OPS:
+        return (WILDCARD,"") if same(children) is not None else (None,f"{op} of unlike units")
+    if op=="if_else":
+        unit=same(children[1:]); return (unit,"") if unit is not None else (None,"if_else branches of unlike units")
+    if op=="lerp":
+        unit=same(children[:2]); ok=dimensionless(children[2]) and unit is not None
+        return (unit,"") if ok else (None,"lerp of unlike units")
+    if op in ("if_in_range","if_out_of_range"):
+        unit=same(children); return (unit,"") if unit is not None else (None,f"{op} of unlike units")
+    if op=="*": return (WILDCARD if WILDCARD in children else tuple(a+b for a,b in zip(*children))),""
+    if op=="/": return (WILDCARD if WILDCARD in children else tuple(a-b for a,b in zip(*children))),""
+    if op=="floordiv": return (WILDCARD if WILDCARD in children else tuple(a-b for a,b in zip(*children))),""
+    if op in _UNIT_PRESERVING: return children[0],""
+    if op in _POWERS: return (WILDCARD if children[0] is WILDCARD else tuple(_POWERS[op]*a for a in children[0])),""
+    if op=="pow":
+        if not dimensionless(children[1]): return None,"pow exponent has units"
+        exponent=tree[2]
+        if children[0] is WILDCARD or dimensionless(children[0]): return children[0],""
+        return (tuple(float(exponent[1])*a for a in children[0]),"") if exponent[0]=="c" else (None,"pow of a dimensional base by a non-constant exponent")
+    if op=="atan2":
+        return (zero,"") if same(children) is not None else (None,"atan2 of unlike units")
+    if op=="sign": return zero,""
+    # Everything else (exp, log, sin, tanh, sigmoid, erf, ...) needs dimensionless arguments.
+    if all(dimensionless(unit) for unit in children): return zero,""
+    return None,f"{op} of a dimensional argument"
+
+def unit_violation(tree):
+    if not UNIT_FEATURES or tree[0] in ("x","c","arg"): return ""
+    return tree_units(tree)[1]
+
+def admissible_random_tree(n_features, ops, max_nodes, max_depth, attempts=25, **kwargs):
+    """A random tree that passes --forbid-nesting and --units, when one turns up within a few draws."""
+    tree=random_tree(n_features,ops,max_nodes,max_depth,**kwargs)
+    for _ in range(attempts):
+        if not (nesting_violation(tree) or unit_violation(tree)): break
+        tree=random_tree(n_features,ops,max_nodes,max_depth,**kwargs)
+    return tree
+
 def regression_head_outputs(cats):
     """Tree index -> output column for regression heads (classifier heads have no desired value)."""
     targets,_=classification_layout(cats)
@@ -4448,7 +4561,7 @@ def assess(m, X, Y, affine_on, cats, fit_affine=True, constraints=None, output_n
         return ""
     reason=""
     for tree in m.trees:
-        reason=valid(tree) or (f"nesting:{nesting_violation(tree)}" if NESTING_RULES and nesting_violation(tree) else "")
+        reason=valid(tree) or (f"nesting:{nesting_violation(tree)}" if NESTING_RULES and nesting_violation(tree) else "") or (f"units:{unit_violation(tree)}" if UNIT_FEATURES and unit_violation(tree) else "")
         if reason: break
     if reason:
         m.feasible=False; m.invalid_reason=reason; INVALID_DIAGNOSTICS[reason]=INVALID_DIAGNOSTICS.get(reason,0)+1
@@ -5875,7 +5988,7 @@ def new_island_runtime(population_size, *, X, Xt, cats, ops, nodes, depth, head_
     if SPARSE_SEEDING=="on" and Yt is not None and (cell is None or cell[1]==0):
         seeds+=sparse_seed_models(Xt,Yt,cats,ops,nodes,depth,max(1,int(SPARSE_SEED_SHARE*population_size)),head_count)
     for seed in seeds: seed.adfs=dict(adf_registry.definitions)
-    population=seeds+[Model([random_tree(X.shape[1],ops,nodes,depth) for _ in range(head_count)],[(1.,0.)]*head_count,
+    population=seeds+[Model([admissible_random_tree(X.shape[1],ops,nodes,depth) for _ in range(head_count)],[(1.,0.)]*head_count,
                       mdl_operators=tuple(ops),mdl_feature_count=X.shape[1],adfs=dict(adf_registry.definitions))
                 for _ in range(population_size-len(seeds))]
     probe_indices=stratified_probe_indices(Xt,256)
@@ -6057,7 +6170,7 @@ def evolve_generation(pop, generation, *, X, Xt, Yt, Xv, Yv, cats, constraints, 
     seen={model_equivalence_key(model) for model in pop}
     def duplicate(trees):
         nonlocal unchanged
-        if NESTING_RULES and unchanged<unchanged_limit and any(nesting_violation(tree) for tree in trees):
+        if (NESTING_RULES or UNIT_FEATURES) and unchanged<unchanged_limit and any(nesting_violation(tree) or unit_violation(tree) for tree in trees):
             unchanged+=1; return True
         key=model_equivalence_key(trees)
         if EQUIVALENCE_COLLAPSE and key in seen and unchanged<unchanged_limit:
@@ -6327,6 +6440,7 @@ def resume_main(args):
     global RESIDUAL_TERM_WEIGHT,NESTING_RULES,SYMBOLIC_EXPORT,LOSS_MODE,ROBUST_LOSS_DELTA
     SYMBOLIC_EXPORT=getattr(args,"symbolic_export","on")
     LOSS_MODE=state.get("loss","huber"); ROBUST_LOSS_DELTA=float(state.get("huber_delta",1.5))
+    configure_units(state.get("units",""),list(names))
     RESIDUAL_TERM_WEIGHT=float(state.get("residual_term_weight",0.)); NESTING_RULES=parse_nesting_rules(state.get("forbid_nesting",""))
     BACKPROP_MUTATION_WEIGHT=float(state.get("backprop_mutation_weight",0.)); BACKPROP_INVERSE=state.get("backprop_inverse","generic")
     READOUT_MODE=state.get("readout","affine"); MAX_TERMS=int(state.get("max_terms",4)); GENE_CROSSOVER_RATE=float(state.get("gene_crossover_rate",.5))
@@ -6494,6 +6608,7 @@ def build_arg_parser():
     ap.add_argument("--loss",choices=("huber","squared","relative"),default="huber",help="Regression loss: huber (MAD-scaled, robust to outliers), squared (plain least squares) or relative (Huber on the error relative to |y|, for targets spanning orders of magnitude) (default: huber)")
     ap.add_argument("--huber-delta",type=float,default=1.5,help="Huber threshold in robust target-scale units for --loss huber and relative (default: 1.5)")
     ap.add_argument("--constant-intervals",choices=("on","off"),default="on",help="Print and record approximate 95%% intervals for the chosen model's constants from the linearised covariance (default: on)")
+    ap.add_argument("--units",default="",metavar="COLUMN=UNIT,...",help="Units of input columns for dimensional analysis, e.g. x=m,t=s,F=kg*m/s^2 (exponents with ^, fractions in parentheses like m^(1/2)); trees that add, compare or exponentiate unlike units are rejected; constants and unlisted columns are unit-free wildcards (default: none)")
     ap.add_argument("--max-time",type=float,default=0.,help="Stop the search after this many seconds and go to the final choice; 0 = no limit (default: 0)")
     ap.add_argument("--stop-at-loss",type=float,default=None,help="Stop the search once the best training loss (the loss printed during the run) is at or below this value (default: off)")
     ap.add_argument("--sparse-seeding",choices=("on","off"),default="off",help="Seed the initial population with sparse linear fits over a modest basis (inputs, unary operators of inputs, pairwise products and ratios, hinges), found by orthogonal matching pursuit (default: off)")
@@ -6518,6 +6633,12 @@ def parse_cli(argv=None):
     if not .10 <= args.qd_parent_rate <= .30: ap.error("--qd-parent-rate must be between 0.10 and 0.30")
     if args.evaluation_refresh < 1 or args.stagnation_window < 1: ap.error("evaluation refresh and stagnation window must be positive")
     if args.fit_iterations < 1: ap.error("--fit-iterations must be positive")
+    try:
+        for item in args.units.split(","):
+            if item.strip():
+                if "=" not in item: raise ValueError(f"Bad unit entry {item.strip()!r}: use column=unit")
+                parse_unit(item.partition("=")[2])
+    except ValueError as error: ap.error(str(error))
     try: parse_nesting_rules(args.forbid_nesting)
     except ValueError as error: ap.error(str(error))
     if not args.huber_delta > 0: ap.error("--huber-delta must be positive")
@@ -6732,6 +6853,8 @@ def train_from_setup(args, setup, choose_model=None):
         raise ValueError("Validation needs at least three rows when affine scaling is enabled")
     if len(Xt)<4 and Xv is not None: raise ValueError("Need at least four training rows after validation split")
     if coev and len(Xt)<=512: print(f"Co-evolution subsamples only above 512 training rows; with {len(Xt)} rows every generation scores all rows.")
+    configure_units(getattr(args,"units",""),list(names))
+    if UNIT_FEATURES: print(f"Dimensional analysis on {len(UNIT_FEATURES)} column(s) over base units {', '.join(UNIT_BASES)}.")
     hypotheses=discover_hypotheses(Xt,Yt,names,out_names)
     interaction_discovery=discover_interaction_fragments(Xt,Yt,names,out_names,ops,Xv,Yv)
     if interaction_discovery["status"]=="ok":
@@ -6754,7 +6877,7 @@ def train_from_setup(args, setup, choose_model=None):
                    "stages":{key:stages[key] for key in ("mode","count","interval","age_gap","schedule","threshold_quantile")},
                    "roles":{key:roles[key] for key in ("enabled","interval","mix","retire_after")}},
         "equivalence_collapse":EQUIVALENCE_COLLAPSE,"residual_archive":RESIDUAL_ARCHIVE,"qd_parent_choice":QD_PARENT_CHOICE,"scale_balanced_selection":SCALE_BALANCED_SELECTION,
-        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"selection_probe_filter":SELECTION_PROBE_FILTER,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"fit_iterations":CONSTANT_FIT_ITERATIONS,"semantic_max_delta":SEMANTIC_MAX_DELTA,"constant_snapping":CONSTANT_SNAPPING,"snap_tolerance":SNAP_TOLERANCE,"readout":READOUT_MODE,"max_terms":MAX_TERMS,"gene_crossover_rate":GENE_CROSSOVER_RATE,"backprop_mutation_weight":BACKPROP_MUTATION_WEIGHT,"backprop_inverse":BACKPROP_INVERSE,"residual_term_weight":RESIDUAL_TERM_WEIGHT,"loss":LOSS_MODE,"huber_delta":ROBUST_LOSS_DELTA,"forbid_nesting":",".join(sorted(f"{o}>{i}" for o,i in NESTING_RULES)),"sparse_seeding":SPARSE_SEEDING,"sparse_basis_size":SPARSE_BASIS_SIZE,"squash_swap_weight":SQUASH_SWAP_WEIGHT,"smooth_swap_weight":SMOOTH_SWAP_WEIGHT,"gate_mutation_weight":GATE_MUTATION_WEIGHT,"loss_noise_floor":LOSS_NOISE_FLOOR,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age",
+        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"selection_probe_filter":SELECTION_PROBE_FILTER,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"fit_iterations":CONSTANT_FIT_ITERATIONS,"semantic_max_delta":SEMANTIC_MAX_DELTA,"constant_snapping":CONSTANT_SNAPPING,"snap_tolerance":SNAP_TOLERANCE,"readout":READOUT_MODE,"max_terms":MAX_TERMS,"gene_crossover_rate":GENE_CROSSOVER_RATE,"backprop_mutation_weight":BACKPROP_MUTATION_WEIGHT,"backprop_inverse":BACKPROP_INVERSE,"residual_term_weight":RESIDUAL_TERM_WEIGHT,"loss":LOSS_MODE,"huber_delta":ROBUST_LOSS_DELTA,"forbid_nesting":",".join(sorted(f"{o}>{i}" for o,i in NESTING_RULES)),"units":UNIT_SPEC,"sparse_seeding":SPARSE_SEEDING,"sparse_basis_size":SPARSE_BASIS_SIZE,"squash_swap_weight":SQUASH_SWAP_WEIGHT,"smooth_swap_weight":SMOOTH_SWAP_WEIGHT,"gate_mutation_weight":GATE_MUTATION_WEIGHT,"loss_noise_floor":LOSS_NOISE_FLOOR,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age",
         "test_csv":str(Path(args.test_csv).resolve()) if args.test_csv else None,
     },df,train_indices,validation_indices,external_validation)
     print(f"Run manifest: {manifest_path}")
@@ -6771,7 +6894,7 @@ def train_from_setup(args, setup, choose_model=None):
         "profile":args.profile,"constraint_metadata":metadata,"constraints":constraints.describe(),"bayesian_particles":args.bayesian_particles,"interaction_discovery":interaction_discovery,
         "island_config":{"count":island_count,"migration_interval":migration_interval,"migrants_per_island":migrants_per_island,"topology":"ring","migration_events":0,"stages":stages,"roles":roles},
         "equivalence_collapse":EQUIVALENCE_COLLAPSE,"residual_archive":RESIDUAL_ARCHIVE,"qd_parent_choice":QD_PARENT_CHOICE,"scale_balanced_selection":SCALE_BALANCED_SELECTION,
-        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"selection_probe_filter":SELECTION_PROBE_FILTER,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"fit_iterations":CONSTANT_FIT_ITERATIONS,"semantic_max_delta":SEMANTIC_MAX_DELTA,"constant_snapping":CONSTANT_SNAPPING,"snap_tolerance":SNAP_TOLERANCE,"readout":READOUT_MODE,"max_terms":MAX_TERMS,"gene_crossover_rate":GENE_CROSSOVER_RATE,"backprop_mutation_weight":BACKPROP_MUTATION_WEIGHT,"backprop_inverse":BACKPROP_INVERSE,"residual_term_weight":RESIDUAL_TERM_WEIGHT,"loss":LOSS_MODE,"huber_delta":ROBUST_LOSS_DELTA,"forbid_nesting":",".join(sorted(f"{o}>{i}" for o,i in NESTING_RULES)),"sparse_seeding":SPARSE_SEEDING,"sparse_basis_size":SPARSE_BASIS_SIZE,"squash_swap_weight":SQUASH_SWAP_WEIGHT,"smooth_swap_weight":SMOOTH_SWAP_WEIGHT,"gate_mutation_weight":GATE_MUTATION_WEIGHT,"loss_noise_floor":LOSS_NOISE_FLOOR,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age"}
+        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"selection_probe_filter":SELECTION_PROBE_FILTER,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"fit_iterations":CONSTANT_FIT_ITERATIONS,"semantic_max_delta":SEMANTIC_MAX_DELTA,"constant_snapping":CONSTANT_SNAPPING,"snap_tolerance":SNAP_TOLERANCE,"readout":READOUT_MODE,"max_terms":MAX_TERMS,"gene_crossover_rate":GENE_CROSSOVER_RATE,"backprop_mutation_weight":BACKPROP_MUTATION_WEIGHT,"backprop_inverse":BACKPROP_INVERSE,"residual_term_weight":RESIDUAL_TERM_WEIGHT,"loss":LOSS_MODE,"huber_delta":ROBUST_LOSS_DELTA,"forbid_nesting":",".join(sorted(f"{o}>{i}" for o,i in NESTING_RULES)),"units":UNIT_SPEC,"sparse_seeding":SPARSE_SEEDING,"sparse_basis_size":SPARSE_BASIS_SIZE,"squash_swap_weight":SQUASH_SWAP_WEIGHT,"smooth_swap_weight":SMOOTH_SWAP_WEIGHT,"gate_mutation_weight":GATE_MUTATION_WEIGHT,"loss_noise_floor":LOSS_NOISE_FLOOR,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age"}
     head_count=sum(len(heads) for heads in classification_layout(cats)[0])
     population_sizes=cell_population_sizes(args.population,cell_count)
     islands=[new_island_runtime(size,X=X,Xt=Xt,cats=cats,ops=ops,nodes=nodes,depth=depth,head_count=head_count,
