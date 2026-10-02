@@ -117,6 +117,33 @@ so every run here used the Python fitter; the scan runs before either
 fitter.  bench_harsh's kink_ifelse jumps at 0.65 but keeps the test row that
 straddles it, so some of its "failures" are that one ambiguous row.
 
+## Smooth activations and the loss noise floor 2026-10-01
+
+SiLU came out exact in 6/10 seeds and GELU in 0/10. The search stopped at
+x*sigmoid(1.6x) (R^2 0.99996), because a plain point swap to erf gives
+x*erf(kx) (R^2 0.23: erf is centred on 0, sigmoid on 0.5).  Added (default
+weight 1; switched off when the grammar lacks their operators; checkpoints
+from before them resume with them off):
+
+- `--squash-swap-weight`: sigmoid/tanh/erf swapped for one another at the
+  same level, range and slope (sigmoid(z) -> 0.5+0.5*erf(0.443z)).
+- `--smooth-swap-weight`: relu <-> softplus(4z)/4 or z*sigmoid(4z),
+  abs -> z*tanh(4z), sign -> tanh(4z).
+- `--gate-mutation-weight`: s -> s*sigmoid(c*u), s*(1+erf(c*u)) or
+  s*(1+tanh(c*u)), with u = s or an input.
+- `--loss-noise-floor auto`: the tie band (formerly a fixed 1e-9) is
+  1000x the loss of rounding the targets to their written digits, within
+  [1e-18, 1e-9].  With float64 targets the old band let a 1e-11
+  approximation tie a 1e-20 model, so the shorter approximation won the
+  final choice and the best-so-far archive never replaced it.
+
+bench_activation.py, 10 seeds, solved = test R^2 >= 0.99999 and R^2 >= 0.9999
+for |x| in [4.2, 8]: with / without the moves, SiLU 10 / 8, GELU-erf
+10 / 0, GELU-tanh 10 / 1 (found as the erf form, R^2 1-3e-8 apart), Mish 6 / 3,
+soft switch 1 / 0 (of 9).  Regressions vs main: bench_harsh 89 = 89/100
+and bench_jump (jump_scan_mutation) 58 = 58/80, identical because those
+grammars have no squash operators. Smooth benchmark_afpo (5 seeds) 34 vs 33/40.
+
 ## What already exists (do not rebuild)
 
 - Islands: `IslandRuntime` (3966), one full search state per island (population,

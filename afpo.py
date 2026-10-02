@@ -2040,15 +2040,101 @@ def jump_mutate(t, n_features, ops, max_nodes, max_depth):
     child=replace_subtree(t,path,block)
     return child if node_size(child)<=max_nodes and node_depth(child)<=max_depth else t
 
+# Each squashing operator written as a + b*tanh(k*z), matched in level,
+# range and slope at z=0 (exact for sigmoid; erf to within 2% of its range).
+_SQUASH_FORMS = {"sigmoid":(.5,.5,.5), "tanh":(0.,1.,1.), "erf":(0.,1.,2./math.sqrt(math.pi))}
+def _scaled(tree, factor):
+    return tree if abs(factor-1.)<1e-12 else ("*",("c",float(factor)),tree)
+def squash_swap_mutate(t, ops, max_nodes, max_depth):
+    """Swap one sigmoid/tanh/erf for another, rewritten to the same level,
+    range and slope: sigmoid(z) -> 0.5+0.5*erf(0.443*z), tanh(z) -> erf(0.886*z).
+
+    A plain point swap turns x*sigmoid(kx) into x*erf(kx), an even function
+    (R^2 0.23 against GELU), because sigmoid sits on 0.5 and erf on 0; no
+    single move then reaches x*(1+erf(kx)).  This move lands next to the
+    parent, so the constant fitter only refines it."""
+    paths=[path for path in subtree_paths(t) if subtree_at(t,path)[0] in _SQUASH_FORMS]
+    if not paths or "*" not in ops: return t
+    path=rng.choice(paths); node=subtree_at(t,path); source=node[0]
+    targets=[op for op in _SQUASH_FORMS if op!=source and op in ops]
+    if not targets: return t
+    target=rng.choice(targets)
+    (a_f,b_f,k_f),(a_g,b_g,k_g)=_SQUASH_FORMS[source],_SQUASH_FORMS[target]
+    offset,scale=a_f-b_f*a_g/b_g,b_f/b_g
+    block=_scaled((target,_scaled(node[1],k_f/k_g)),scale)
+    if abs(offset)>1e-12:
+        if "+" not in ops: return t
+        block=("+",("c",float(offset)),block)
+    child=simplify_tree(replace_subtree(t,path,block))
+    return child if node_size(child)<=max_nodes and node_depth(child)<=max_depth else t
+def activation_moves_apply(ops, kind):
+    """Whether squash_swap/smooth_swap/gate_mutate can ever change a tree built from ops."""
+    ops=set(ops); squash=ops&set(_SQUASH_FORMS)
+    if "*" not in ops: return False
+    if kind=="squash": return len(squash)>=2
+    if kind=="gate": return bool(squash)
+    return bool(("relu" in ops and ops&{"softplus","sigmoid"}) or ("abs" in ops and ops&{"tanh","erf"})
+                or ("sign" in ops and "tanh" in ops) or {"softplus","relu"}<=ops)
+_SMOOTH_SHARPNESS = 4.
+def smooth_swap_mutate(t, ops, max_nodes, max_depth):
+    """Trade a hard piece for its smooth relative, or back, as one move:
+    relu(z) <-> softplus(4z)/4 or z*sigmoid(4z); abs(z) -> z*tanh(4z);
+    sign(z) -> tanh(4z).  The constant 4 is fitted afterwards.
+
+    A smooth target (SiLU, GELU, softplus) is otherwise approximated by more
+    and more relu kinks, each a local optimum the next kink only refines."""
+    c=_SMOOTH_SHARPNESS*float(np.exp(rng.gauss(0,.3)))
+    choices=[]
+    for path in subtree_paths(t):
+        node=subtree_at(t,path); op=node[0]
+        if op=="relu":
+            if "softplus" in ops and "*" in ops: choices.append((path,_scaled(("softplus",_scaled(node[1],c)),1./c)))
+            if "sigmoid" in ops and "*" in ops: choices.append((path,("*",node[1],("sigmoid",_scaled(node[1],c)))))
+        elif op=="abs":
+            for squash in ("tanh","erf"):
+                if squash in ops and "*" in ops: choices.append((path,("*",node[1],(squash,_scaled(node[1],c)))))
+        elif op=="sign" and "tanh" in ops and "*" in ops: choices.append((path,("tanh",_scaled(node[1],c))))
+        elif op=="softplus" and "relu" in ops: choices.append((path,("relu",node[1])))
+    if not choices: return t
+    path,block=rng.choice(choices); child=simplify_tree(replace_subtree(t,path,block))
+    return child if node_size(child)<=max_nodes and node_depth(child)<=max_depth else t
+def gate_mutate(t, n_features, ops, max_nodes, max_depth):
+    """Multiply a subtree by a fitted soft gate as one move: s*sigmoid(c*u),
+    s*(1+erf(c*u)) or s*(1+tanh(c*u)), with u = s itself or an input.
+
+    x*sigmoid(x) (SiLU), x*(1+erf(x/sqrt 2)) (GELU) and smooth switches
+    between two regimes are gates; built a node at a time, the half-built
+    gate scores worse than the ungated parent and is discarded."""
+    gates=[op for op in _SQUASH_FORMS if op in ops]
+    if "*" not in ops or not gates: return t
+    paths=[path for path in subtree_paths(t) if subtree_at(t,path)[0]!="c"]
+    if not paths: return t
+    path=rng.choice(paths); target=subtree_at(t,path); gate=rng.choice(gates)
+    driver=target if rng.random()<.5 else ("x",rng.randrange(n_features))
+    c=float(rng.choice((-1.,1.))*np.exp(rng.gauss(0,.5)))
+    factor=(gate,("*",("c",c),driver))
+    if gate!="sigmoid":
+        if "+" not in ops: return t
+        factor=("+",("c",1.),factor)
+    child=simplify_tree(replace_subtree(t,path,("*",target,factor)))
+    return child if node_size(child)<=max_nodes and node_depth(child)<=max_depth else t
+
 # Off by default: it did not solve the linear-system benchmark and was neutral
 # to harmful elsewhere (4-way ablation).  Set > 0 to re-enable.
 BILINEAR_MUTATION_WEIGHT = 0.
 # Initial weight of jump_mutate; the portfolio adapts it like the others.
 # It only acts when mod/floordiv or if_else+gt are in the grammar.
 JUMP_MUTATION_WEIGHT = 1.
+# Initial weights of squash_swap_mutate, smooth_swap_mutate and gate_mutate.
+# Each acts only when its operators (sigmoid/tanh/erf, relu/softplus/abs/sign)
+# are in the grammar.
+SQUASH_SWAP_WEIGHT = 1.
+SMOOTH_SWAP_WEIGHT = 1.
+GATE_MUTATION_WEIGHT = 1.
 class MutationPortfolio:
     def __init__(self):
-        self.weights={"subtree":1.,"point":1.,"constant":1.,"hoist":.7,"shrink":.7,"parametrize":1.,"bilinear":BILINEAR_MUTATION_WEIGHT,"jump":JUMP_MUTATION_WEIGHT}
+        self.weights={"subtree":1.,"point":1.,"constant":1.,"hoist":.7,"shrink":.7,"parametrize":1.,"bilinear":BILINEAR_MUTATION_WEIGHT,"jump":JUMP_MUTATION_WEIGHT,
+                      "squash":SQUASH_SWAP_WEIGHT,"smooth":SMOOTH_SWAP_WEIGHT,"gate":GATE_MUTATION_WEIGHT}
         self.tries={k:0 for k in self.weights}; self.wins={k:0 for k in self.weights}
     def choose(self): return rng.choices(list(self.weights),weights=list(self.weights.values()))[0]
     def record(self, kind, improved):
@@ -2062,6 +2148,14 @@ class MutationPortfolio:
         if kind=="parametrize": return parametrize_mutate(t,ops,max_nodes,max_depth),kind
         if kind=="bilinear": return bilinear_mutate(t,n_features,ops,max_nodes,max_depth),kind
         if kind=="jump": return jump_mutate(t,n_features,ops,max_nodes,max_depth),kind
+        if kind in ("squash","smooth","gate"):
+            child=(squash_swap_mutate(t,ops,max_nodes,max_depth) if kind=="squash" else smooth_swap_mutate(t,ops,max_nodes,max_depth) if kind=="smooth"
+                   else gate_mutate(t,n_features,ops,max_nodes,max_depth))
+            # These moves need particular operators or nodes; where they do not
+            # apply (no sigmoid/tanh/erf in the grammar, say), make an ordinary
+            # move instead of spending the mutation slot on a no-op.
+            if child!=t: return child,kind
+            kind="subtree"
         if kind=="constant":
             # Without constants to move, give the tree one (credited as such).
             child=constant_mutate(t)
@@ -2790,6 +2884,40 @@ def secondary_key(model):
 # of ~1e-11, and a bigger model with spare constants can "beat" it by 1e-12.
 # Near-tie comparisons use max(relative tolerance, this floor).
 LOSS_NOISE_FLOOR = 1e-9
+# The floor is set per run from the targets' own precision (below): a
+# float64 target lets an exact model reach 1e-20..1e-30, and a fixed 1e-9
+# then ranked a 1e-11 approximation as equal to it, so the shorter
+# approximation won the final choice and the best-so-far archive kept it.
+# The 1e-18 minimum (relative error ~1e-9) is where the constant fitter's own
+# convergence leaves exact models, so those still tie and the shortest wins.
+LOSS_NOISE_FLOOR_MAX, LOSS_NOISE_FLOOR_MIN, LOSS_NOISE_MULTIPLE = 1e-9, 1e-18, 1e3
+def estimate_loss_noise_floor(Y, cats=None, Yv=None, sample=4000):
+    """LOSS_NOISE_MULTIPLE x the loss that rounding the numeric targets to the
+    digits they are written with would cost, in [LOSS_NOISE_FLOOR_MIN, LOSS_NOISE_FLOOR_MAX].
+
+    Each value's rounding step is its last significant digit (shortest decimal
+    that reads back as the same double); the median over a column guards
+    against short values such as 0.5 in an otherwise 7-digit column."""
+    Y=np.asarray(Y,float)
+    if Y.ndim==1: Y=Y[:,None]
+    if Yv is not None and len(Yv): Y=np.vstack([Y,np.asarray(Yv,float).reshape(len(Yv),-1)])
+    floors=[]
+    for j in range(Y.shape[1]):
+        if cats is not None and cats[j] is not None: continue
+        column=Y[:,j]; column=column[np.isfinite(column)]
+        if len(column)<2: continue
+        scale=float(target_scale(column))
+        values=column[column!=0]
+        if len(values)>sample: values=values[np.random.default_rng(len(values)).choice(len(values),sample,replace=False)]
+        if not len(values) or not scale>0: continue
+        steps=[]
+        for value in values.tolist():
+            digits=next(d for d in range(1,18) if float(f"{value:.{d}g}")==value)
+            steps.append(.5*10.**(math.floor(math.log10(abs(value)))-digits+1))
+        step=float(np.median(steps))/scale
+        floors.append(LOSS_NOISE_MULTIPLE*.5*step*step/3.)
+    if not floors: return LOSS_NOISE_FLOOR_MAX
+    return float(min(LOSS_NOISE_FLOOR_MAX,max(LOSS_NOISE_FLOOR_MIN,max(floors))))
 def _noise_rounded(value):
     return 0. if abs(value)<1e-20 else float(f"{value:.10g}")
 def objective_labels(output_names, include_violations=False):
@@ -5494,6 +5622,10 @@ def resume_main(args):
     SELECTION_PROBE_FILTER=bool(state.get("selection_probe_filter",False))
     global JUMP_MUTATION_WEIGHT
     JUMP_MUTATION_WEIGHT=float(state.get("jump_mutation_weight",0.))
+    global LOSS_NOISE_FLOOR
+    LOSS_NOISE_FLOOR=float(state.get("loss_noise_floor",LOSS_NOISE_FLOOR_MAX))
+    global SQUASH_SWAP_WEIGHT,SMOOTH_SWAP_WEIGHT,GATE_MUTATION_WEIGHT
+    SQUASH_SWAP_WEIGHT=float(state.get("squash_swap_weight",0.)); SMOOTH_SWAP_WEIGHT=float(state.get("smooth_swap_weight",0.)); GATE_MUTATION_WEIGHT=float(state.get("gate_mutation_weight",0.))
     set_selection_probe_data(Xt,Yt,Xv,Yv,cats)
     FIT_BACKEND=state.get("fit_backend","python")
     # Settings that postdate a checkpoint resume with the behaviour it was searched with.
@@ -5616,6 +5748,10 @@ def build_arg_parser():
     ap.add_argument("--interpolation-check",choices=("on","off"),default="on",help="Add a loss term scoring predictions between nearest-neighbour rows against interpolated targets, so equations that only memorise the training rows (e.g. short-period mod sawtooths) lose (default: on)")
     ap.add_argument("--jump-constant-scan",choices=("on","off"),default="on",help="Before the gradient constant fit, scan data-driven values for constants that only move a jump (mod periods, comparison thresholds, floor scales), which the gradient fit cannot move (default: on)")
     ap.add_argument("--jump-mutation-weight",type=float,default=1.,help="Initial portfolio weight of the jump mutation, which wraps a subtree in mod(s,c), floordiv(s,c) or if_else(gt(x,c),s,s') as one move; adapted like the other mutation kinds; 0 disables it (default: 1)")
+    ap.add_argument("--loss-noise-floor",default="auto",help="Loss differences below this count as ties (the shorter model wins). 'auto' derives it from the targets' written precision: about 3e-12 for 7-digit CSV values, down to 1e-18 for full doubles, never above the old fixed 1e-9 (default: auto)")
+    ap.add_argument("--squash-swap-weight",type=float,default=1.,help="Initial portfolio weight of the squash swap, which replaces one sigmoid/tanh/erf with another rewritten to the same level, range and slope (sigmoid(z) -> 0.5+0.5*erf(0.443z)); 0 disables it (default: 1)")
+    ap.add_argument("--smooth-swap-weight",type=float,default=1.,help="Initial portfolio weight of the smooth swap: relu(z) <-> softplus(4z)/4 or z*sigmoid(4z), abs(z) -> z*tanh(4z), sign(z) -> tanh(4z); 0 disables it (default: 1)")
+    ap.add_argument("--gate-mutation-weight",type=float,default=1.,help="Initial portfolio weight of the gate mutation, which multiplies a subtree s by sigmoid(c*u), 1+erf(c*u) or 1+tanh(c*u) with u = s or an input; 0 disables it (default: 1)")
     ap.add_argument("--selection-probe-filter",choices=("on","off"),default="on",help="Final model choice: drop candidates whose predictions between neighbouring data rows leave the neighbours' target band much more often than the best candidate's (memorised lattice tricks that tie on validation) (default: on)")
     ap.add_argument("--gui",action="store_true",help="Start the browser GUI (training, live Pareto frontier, model explorer) instead of the terminal prompts")
     ap.add_argument("--port",type=int,default=8778,help="Browser GUI port (default: 8778)")
@@ -5746,6 +5882,8 @@ def train_from_setup(args, setup, choose_model=None):
     SELECTION_PROBE_FILTER=getattr(args,"selection_probe_filter","on")=="on"
     global JUMP_MUTATION_WEIGHT
     JUMP_MUTATION_WEIGHT=float(getattr(args,"jump_mutation_weight",1.))
+    global SQUASH_SWAP_WEIGHT,SMOOTH_SWAP_WEIGHT,GATE_MUTATION_WEIGHT
+    SQUASH_SWAP_WEIGHT=float(getattr(args,"squash_swap_weight",1.)); SMOOTH_SWAP_WEIGHT=float(getattr(args,"smooth_swap_weight",1.)); GATE_MUTATION_WEIGHT=float(getattr(args,"gate_mutation_weight",1.))
     FIT_BACKEND=getattr(args,"fit_backend","auto")
     RESIDUAL_ARCHIVE=getattr(args,"residual_archive","on")=="on"; QD_PARENT_CHOICE=getattr(args,"qd_parent_choice","quality_coverage")
     SCALE_BALANCED_SELECTION=getattr(args,"scale_balanced_selection","on")=="on"
@@ -5793,6 +5931,10 @@ def train_from_setup(args, setup, choose_model=None):
         ops=list(dict.fromkeys([*ops,"seqsum","seqprod"]))
         print(f"Sequence groups: {', '.join(group['name'] for group in SEQUENCE_LAYOUT['groups'])} (length {SEQUENCE_LAYOUT['length']}); added seqsum/seqprod.")
     else: ops=[op for op in ops if op not in ("seqsum","seqprod")]
+    # A move that can never apply would only reshuffle the portfolio's draws.
+    if not activation_moves_apply(ops,"squash"): SQUASH_SWAP_WEIGHT=0.
+    if not activation_moves_apply(ops,"smooth"): SMOOTH_SWAP_WEIGHT=0.
+    if not activation_moves_apply(ops,"gate"): GATE_MUTATION_WEIGHT=0.
     X,Y=Xt,Yt
     constraints=compile_constraints(args.profile,metadata); constraints.validate(Xt.shape[1],cats,out_names)
     Xv=Yv=None
@@ -5800,6 +5942,10 @@ def train_from_setup(args, setup, choose_model=None):
         Xv,Yv,names2,out2,cats2,_=encode(validation_df,types,maps)
         if names2!=names or out2!=out_names or cats2!=cats: raise ValueError("Validation CSV columns/types do not match training data")
     set_selection_probe_data(Xt,Yt,Xv,Yv,cats)
+    global LOSS_NOISE_FLOOR
+    floor_setting=getattr(args,"loss_noise_floor","auto")
+    LOSS_NOISE_FLOOR=estimate_loss_noise_floor(Yt,cats,Yv) if floor_setting=="auto" else float(floor_setting)
+    print(f"Loss noise floor: {LOSS_NOISE_FLOOR:.3g} ({'from the precision of the targets' if floor_setting=='auto' else 'set'})")
     Xtest=Ytest=None
     if args.test_csv:
         test_df=pd.read_csv(args.test_csv,sep=delimiter,engine="python")
@@ -5831,7 +5977,7 @@ def train_from_setup(args, setup, choose_model=None):
                    "stages":{key:stages[key] for key in ("mode","count","interval","age_gap","schedule","threshold_quantile")},
                    "roles":{key:roles[key] for key in ("enabled","interval","mix","retire_after")}},
         "equivalence_collapse":EQUIVALENCE_COLLAPSE,"residual_archive":RESIDUAL_ARCHIVE,"qd_parent_choice":QD_PARENT_CHOICE,"scale_balanced_selection":SCALE_BALANCED_SELECTION,
-        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"selection_probe_filter":SELECTION_PROBE_FILTER,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age",
+        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"selection_probe_filter":SELECTION_PROBE_FILTER,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"squash_swap_weight":SQUASH_SWAP_WEIGHT,"smooth_swap_weight":SMOOTH_SWAP_WEIGHT,"gate_mutation_weight":GATE_MUTATION_WEIGHT,"loss_noise_floor":LOSS_NOISE_FLOOR,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age",
         "test_csv":str(Path(args.test_csv).resolve()) if args.test_csv else None,
     },df,train_indices,validation_indices,external_validation)
     print(f"Run manifest: {manifest_path}")
@@ -5848,7 +5994,7 @@ def train_from_setup(args, setup, choose_model=None):
         "profile":args.profile,"constraint_metadata":metadata,"constraints":constraints.describe(),"bayesian_particles":args.bayesian_particles,"interaction_discovery":interaction_discovery,
         "island_config":{"count":island_count,"migration_interval":migration_interval,"migrants_per_island":migrants_per_island,"topology":"ring","migration_events":0,"stages":stages,"roles":roles},
         "equivalence_collapse":EQUIVALENCE_COLLAPSE,"residual_archive":RESIDUAL_ARCHIVE,"qd_parent_choice":QD_PARENT_CHOICE,"scale_balanced_selection":SCALE_BALANCED_SELECTION,
-        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"selection_probe_filter":SELECTION_PROBE_FILTER,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age"}
+        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"selection_probe_filter":SELECTION_PROBE_FILTER,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"squash_swap_weight":SQUASH_SWAP_WEIGHT,"smooth_swap_weight":SMOOTH_SWAP_WEIGHT,"gate_mutation_weight":GATE_MUTATION_WEIGHT,"loss_noise_floor":LOSS_NOISE_FLOOR,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age"}
     head_count=sum(len(heads) for heads in classification_layout(cats)[0])
     population_sizes=cell_population_sizes(args.population,cell_count)
     islands=[new_island_runtime(size,X=X,Xt=Xt,cats=cats,ops=ops,nodes=nodes,depth=depth,head_count=head_count,
