@@ -1342,7 +1342,7 @@ def scan_jump_constants(flat, start, X, y, scale, fit_readout=True):
     JUMP_SCAN_STATS["improved"]+=1
     return current
 
-def fit_tree_constants(tree, X, y, adfs=None, fit_readout=True, iterations=CONSTANT_FIT_ITERATIONS, robust=True):
+def fit_tree_constants(tree, X, y, adfs=None, fit_readout=True, iterations=None, robust=True):
     """Levenberg-Marquardt on a tree's inner constants (variable projection).
 
     The affine readout a*f+b is re-solved in closed form for every constant
@@ -1352,6 +1352,7 @@ def fit_tree_constants(tree, X, y, adfs=None, fit_readout=True, iterations=CONST
     Huber cost.  Plain least squares let a few outliers drag correct
     constants away, and the result is written back into the model.
     """
+    if iterations is None: iterations=CONSTANT_FIT_ITERATIONS  # read at call time: --fit-iterations sets it
     start=np.asarray(constant_vector(tree),float)
     if not len(start) or not len(y): return tree
     scale=target_scale(y); ones=np.ones(len(y)); flat=_FlatTree.build(tree); huber=ROBUST_LOSS_DELTA
@@ -2205,6 +2206,10 @@ class MutationPortfolio:
 # Off by default: in a 4-seed benchmark (.02) it lost to the fixed rate in 10
 # of 16 matched runs and cancelled most of the age cap's gains.
 MACRO_STAGNATION_STEP, MACRO_MAX_RATE = 0., .50
+# --semantic-max-delta.  The 2026-10-02 audit found 33-38% of subtree, point
+# and hoist tries rejected as too big; inf trended up on cond2d (26 vs 23/30,
+# not significant), so the default stays 5 until a harder benchmark decides.
+SEMANTIC_MAX_DELTA = 5.0
 _FRAGMENT_FIT_CACHE={}; _FRAGMENT_FIT_FAILED=object()
 FRAGMENT_MIN_CONTRIBUTION = 5e-3   # held-out share of the residual loss a fragment must remove
 FRAGMENT_CONTRIBUTION_DECAY = .95
@@ -2451,7 +2456,8 @@ def semantic_distance(baseline, candidate):
         scale=max(float(np.std(candidate)),float(np.sqrt(np.mean(difference**2))),EPS)
     return float(np.sqrt(np.mean((difference/scale)**2)))
 
-def semantic_mutate(tree, X, portfolio, n_features, ops, max_nodes, max_depth, proposal=None, adfs=None, library=None, min_delta=1e-8, max_delta=5.0):
+def semantic_mutate(tree, X, portfolio, n_features, ops, max_nodes, max_depth, proposal=None, adfs=None, library=None, min_delta=1e-8, max_delta=None):
+    if max_delta is None: max_delta=SEMANTIC_MAX_DELTA
     # A returned kind of None means "no move was applied": the unchanged
     # parent must not be credited (or blamed) to any mutation kind.
     try: baseline=evaluate_cached(tree,X,adfs)
@@ -2505,8 +2511,9 @@ def crossover(left, right, max_nodes, max_depth):
         if node_size(child)<=max_nodes and node_depth(child)<=max_depth and child!=left: return child
     return left
 
-def semantic_crossover(left, right, X, max_nodes, max_depth, adfs=None, min_delta=1e-8, max_delta=5.0):
+def semantic_crossover(left, right, X, max_nodes, max_depth, adfs=None, min_delta=1e-8, max_delta=None):
     """Prefer bounded semantic moves over syntactically random exchanges."""
+    if max_delta is None: max_delta=SEMANTIC_MAX_DELTA
     try: baseline=evaluate_cached(left,X,adfs)
     except ValueError: return left
     for _ in range(8):
@@ -4483,6 +4490,101 @@ def model_options(models, X=None, Y=None, cats=None, loss_tolerance=.01, constra
             labels.append(label); choices.append(model); seen.add(key)
     return labels,choices,selection
 
+# --constant-snapping final: before the final choice, fitted constants of the
+# strongest candidates are rounded to simpler values (integers, p/q, multiples
+# of pi/e/sqrt2/ln2, powers of ten, short decimals) when neither training nor
+# validation loss rises by more than max(noise floor, SNAP_TOLERANCE * loss)
+# and the numeric guard and constraints still pass.  Validation is required
+# too: a snapped jump threshold can match every sampled row and still move
+# the jump between them.  Selection only sees the result; search is untouched.
+CONSTANT_SNAPPING = "final"
+SNAP_TOLERANCE = 1e-6
+SNAP_WINDOW = .02          # only values within 2% (absolute .02 near zero) are tried
+SNAP_CANDIDATE_LIMIT = 64  # models snapped: the loss/MDL front plus the lowest-loss rest
+_SNAP_BASES = ((math.pi,"pi"),(math.e,"e"),(math.sqrt(2.),"sqrt2"),(math.log(2.),"ln2"))
+_SNAP_MULTIPLIERS = (1.,2.,.5,3.,1/3,4.,.25)
+
+def snap_values(value):
+    """Simpler candidate values near ``value``, simplest first."""
+    value=float(value); window=SNAP_WINDOW*max(abs(value),1.)
+    options=[0.,float(round(value))]
+    options+=[round(value*q)/q for q in range(2,13)]
+    sign=1. if value>=0 else -1.
+    options+=[sign*base*multiplier for base,_ in _SNAP_BASES for multiplier in _SNAP_MULTIPLIERS]
+    if value: options.append(sign*10.**round(math.log10(abs(value))))
+    options+=[float(f"{value:.{digits}g}") for digits in range(1,5)]
+    seen=set(); result=[]
+    for option in options:
+        option=float(option)
+        if option==value or option in seen or not math.isfinite(option) or abs(option-value)>window: continue
+        seen.add(option); result.append(option)
+    return result
+
+def _snap_scores(model, Xt, Yt, Xv, Yv, affine_on, cats, constraints, output_names):
+    """Re-fit the readout on training data and return (model, train loss, validation loss, violations)."""
+    scored=model.clone()
+    assess(scored,Xt,Yt,affine_on,cats,fit_affine=True,constraints=constraints,output_names=output_names)
+    if not scored.feasible: return scored,float("inf"),float("inf"),()
+    violations=tuple(scored.objectives[2*len(cats):2*len(cats)+scored.constraint_count])
+    validation=frozen_metrics(scored,Xv,Yv,cats,constraints,output_names)["loss"] if Xv is not None else 0.
+    return scored,aggregate_loss(scored),validation,violations
+
+def snap_model_constants(model, Xt, Yt, Xv, Yv, affine_on, cats, constraints=None, output_names=()):
+    """Greedy constant snapping; returns (model, constants snapped).
+
+    Every snap is compared against the unsnapped model, so tolerances do not
+    accumulate across constants."""
+    if not any(constant_paths(tree) for tree in model.trees): return model,0
+    base,train,validation,violations=_snap_scores(model,Xt,Yt,Xv,Yv,affine_on,cats,constraints,output_names)
+    if not base.feasible or not np.isfinite(train): return model,0
+    train_bound=train+max(LOSS_NOISE_FLOOR,SNAP_TOLERANCE*abs(train))
+    validation_bound=validation+max(LOSS_NOISE_FLOOR,SNAP_TOLERANCE*abs(validation))
+    current=base; snapped=0
+    for head in range(len(model.trees)):
+        for path in constant_paths(current.trees[head]):
+            value=float(subtree_at(current.trees[head],path)[1])
+            for option in snap_values(value):
+                trial=current.clone(); trial.trees[head]=replace_subtree(trial.trees[head],path,("c",option))
+                scored,trial_train,trial_validation,trial_violations=_snap_scores(trial,Xt,Yt,Xv,Yv,affine_on,cats,constraints,output_names)
+                if (scored.feasible and trial_train<=train_bound and trial_validation<=validation_bound
+                        and all(a<=b+1e-12 for a,b in zip(trial_violations,violations))):
+                    current=scored; snapped+=1; break
+    if not snapped: return model,0
+    # Snapping to 0 or 1 can make subtrees removable; keep the shorter tree only if it scores the same.
+    simplified=current.clone(); simplified.trees=[simplify_tree(tree) for tree in current.trees]
+    if simplified.trees!=current.trees:
+        scored,trial_train,trial_validation,trial_violations=_snap_scores(simplified,Xt,Yt,Xv,Yv,affine_on,cats,constraints,output_names)
+        if scored.feasible and trial_train<=train_bound and trial_validation<=validation_bound: current=scored
+    current.origin=getattr(model,"origin","")
+    return current,snapped
+
+def report_snapping(summary):
+    if summary["mode"]=="final" and summary["models_tried"]:
+        print(f"Constant snapping: {summary['constants_snapped']} constant(s) simplified in {summary['models_snapped']} of {summary['models_tried']} final candidates.")
+
+def snap_final_candidates(models, Xt, Yt, Xv, Yv, affine_on, cats, constraints=None, output_names=(), limit=None):
+    """Return ``models`` with the strongest candidates replaced by snapped copies, plus a summary."""
+    limit=SNAP_CANDIDATE_LIMIT if limit is None else limit
+    summary={"mode":CONSTANT_SNAPPING,"tolerance":SNAP_TOLERANCE,"models_tried":0,"models_snapped":0,"constants_snapped":0}
+    if CONSTANT_SNAPPING!="final": return list(models),summary
+    unique={}
+    for model in models:
+        if model is not None and model.feasible and np.all(np.isfinite(model.scales)): unique.setdefault(selection_identity(model),model)
+    pool=sorted(unique.values(),key=lambda m:(aggregate_loss(m),model_complexity(m)))
+    front=[]; best_bits=float("inf")
+    for model in pool:  # loss/MDL front: each member is shorter than every lower-loss model
+        bits=model_complexity(model)
+        if bits<best_bits: front.append(model); best_bits=bits
+    chosen=list({id(model):model for model in [*front,*pool]}.values())[:limit]
+    replacements={}
+    for model in chosen:
+        summary["models_tried"]+=1
+        snapped,count=snap_model_constants(model,Xt,Yt,Xv,Yv,affine_on,cats,constraints,output_names)
+        if count:
+            replacements[selection_identity(model)]=snapped; summary["models_snapped"]+=1; summary["constants_snapped"]+=count
+    # Replace every copy, or an unsnapped twin would still compete for "Lowest Loss".
+    return [replacements.get(selection_identity(model),model) if model is not None else None for model in models],summary
+
 def used_feature_indices(model):
     """Return encoded feature indices referenced by any output tree."""
     used=set()
@@ -5654,6 +5756,9 @@ def resume_main(args):
     SELECTION_PROBE_FILTER=bool(state.get("selection_probe_filter",False))
     global JUMP_MUTATION_WEIGHT
     JUMP_MUTATION_WEIGHT=float(state.get("jump_mutation_weight",0.))
+    global CONSTANT_FIT_ITERATIONS,SEMANTIC_MAX_DELTA,CONSTANT_SNAPPING,SNAP_TOLERANCE
+    CONSTANT_FIT_ITERATIONS=int(state.get("fit_iterations",12)); SEMANTIC_MAX_DELTA=float(state.get("semantic_max_delta",5.))
+    CONSTANT_SNAPPING=state.get("constant_snapping","off"); SNAP_TOLERANCE=float(state.get("snap_tolerance",1e-6))
     global LOSS_NOISE_FLOOR
     LOSS_NOISE_FLOOR=float(state.get("loss_noise_floor",LOSS_NOISE_FLOOR_MAX))
     global SQUASH_SWAP_WEIGHT,SMOOTH_SWAP_WEIGHT,GATE_MUTATION_WEIGHT
@@ -5736,9 +5841,10 @@ def resume_main(args):
         refresh_persistent_scores(island.archive,island.best_models,island.semantic_qd,island.structural_qd,evaluator,island.residual_qd)
         evaluator.assess(island.population,"train"); island.best_models.update(island.population); island.archive.update(island.population,Xt)
     f=[model for island in islands for model in [*island.archive.items,*island.population,island.best_models.model] if model is not None]
+    f,snapping=snap_final_candidates(f,Xt,Yt,Xv,Yv,affine_on,cats,constraints,out_names); report_snapping(snapping)
     chosen,selection=select_best_model(f,Xv,Yv,cats,loss_tolerance,constraints,out_names) if Xv is not None else select_best_model(f,loss_tolerance=loss_tolerance)
     state["selection"]={**selection,"selected_choice":"default","default_selected":True,
-                        "selected_metrics":selection["metrics"],"selected_objectives":selection["objectives"]}
+                        "selected_metrics":selection["metrics"],"selected_objectives":selection["objectives"],"constant_snapping":snapping}
     snapshot_islands(state,islands,island_config)
     save_checkpoint(checkpoint_path,generation,islands[0].population,islands[0].bayes,islands[0].archive,state)
     print(f"Resume complete at generation {generation}. {selection['source'].title()} loss-tolerance shortest-MDL model selected: {equations(chosen,names,out_names,cats)}")
@@ -5779,6 +5885,10 @@ def build_arg_parser():
     ap.add_argument("--numeric-guard-check",choices=("on","off"),default="on",help="Reject models whose values depend on afpo's numeric safety guards (the +/-1e12 value clamp, sinh/cosh/tan input clips) instead of letting them use a guard as a hidden min/max (default: on)")
     ap.add_argument("--interpolation-check",choices=("on","off"),default="on",help="Add a loss term scoring predictions between nearest-neighbour rows against interpolated targets, so equations that only memorise the training rows (e.g. short-period mod sawtooths) lose (default: on)")
     ap.add_argument("--jump-constant-scan",choices=("on","off"),default="on",help="Before the gradient constant fit, scan data-driven values for constants that only move a jump (mod periods, comparison thresholds, floor scales), which the gradient fit cannot move (default: on)")
+    ap.add_argument("--fit-iterations",type=int,default=12,help="Levenberg-Marquardt iterations per constant fit; the 2026-10-02 audit found 15%% of fits stop at 12 while still improving (default: 12)")
+    ap.add_argument("--semantic-max-delta",type=float,default=5.,help="Largest output change (in target standard deviations) a mutation or crossover may make before the constant fit; inf disables the cap (default: 5)")
+    ap.add_argument("--constant-snapping",choices=("off","final"),default="final",help="final: before the final choice, round fitted constants of the strongest candidates to simpler values (integers, p/q, pi, e, sqrt2, ln2, powers of ten, short decimals) when training and validation loss and the numeric guard are preserved (default: final)")
+    ap.add_argument("--snap-tolerance",type=float,default=1e-6,help="Relative loss increase a snapped constant may cause on training and on validation data, never below the loss noise floor (default: 1e-6)")
     ap.add_argument("--jump-mutation-weight",type=float,default=1.,help="Initial portfolio weight of the jump mutation, which wraps a subtree in mod(s,c), floordiv(s,c) or if_else(gt(x,c),s,s') as one move; adapted like the other mutation kinds; 0 disables it (default: 1)")
     ap.add_argument("--loss-noise-floor",default="auto",help="Loss differences below this count as ties (the shorter model wins). 'auto' derives it from the targets' written precision: about 3e-12 for 7-digit CSV values, down to 1e-18 for full doubles, never above the old fixed 1e-9 (default: auto)")
     ap.add_argument("--squash-swap-weight",type=float,default=1.,help="Initial portfolio weight of the squash swap, which replaces one sigmoid/tanh/erf with another rewritten to the same level, range and slope (sigmoid(z) -> 0.5+0.5*erf(0.443z)); 0 disables it (default: 1)")
@@ -5798,6 +5908,9 @@ def parse_cli(argv=None):
     if args.parsimony_quality_tolerance < 0: ap.error("--parsimony-quality-tolerance must be non-negative")
     if not .10 <= args.qd_parent_rate <= .30: ap.error("--qd-parent-rate must be between 0.10 and 0.30")
     if args.evaluation_refresh < 1 or args.stagnation_window < 1: ap.error("evaluation refresh and stagnation window must be positive")
+    if args.fit_iterations < 1: ap.error("--fit-iterations must be positive")
+    if not args.semantic_max_delta > 0: ap.error("--semantic-max-delta must be positive (inf disables the cap)")
+    if not 0 <= args.snap_tolerance < 1: ap.error("--snap-tolerance must be in [0, 1)")
     return ap,args
 
 def main():
@@ -5914,6 +6027,9 @@ def train_from_setup(args, setup, choose_model=None):
     SELECTION_PROBE_FILTER=getattr(args,"selection_probe_filter","on")=="on"
     global JUMP_MUTATION_WEIGHT
     JUMP_MUTATION_WEIGHT=float(getattr(args,"jump_mutation_weight",1.))
+    global CONSTANT_FIT_ITERATIONS,SEMANTIC_MAX_DELTA,CONSTANT_SNAPPING,SNAP_TOLERANCE
+    CONSTANT_FIT_ITERATIONS=int(getattr(args,"fit_iterations",12)); SEMANTIC_MAX_DELTA=float(getattr(args,"semantic_max_delta",5.))
+    CONSTANT_SNAPPING=getattr(args,"constant_snapping","final"); SNAP_TOLERANCE=float(getattr(args,"snap_tolerance",1e-6))
     global SQUASH_SWAP_WEIGHT,SMOOTH_SWAP_WEIGHT,GATE_MUTATION_WEIGHT
     SQUASH_SWAP_WEIGHT=float(getattr(args,"squash_swap_weight",1.)); SMOOTH_SWAP_WEIGHT=float(getattr(args,"smooth_swap_weight",1.)); GATE_MUTATION_WEIGHT=float(getattr(args,"gate_mutation_weight",1.))
     FIT_BACKEND=getattr(args,"fit_backend","auto")
@@ -6009,7 +6125,7 @@ def train_from_setup(args, setup, choose_model=None):
                    "stages":{key:stages[key] for key in ("mode","count","interval","age_gap","schedule","threshold_quantile")},
                    "roles":{key:roles[key] for key in ("enabled","interval","mix","retire_after")}},
         "equivalence_collapse":EQUIVALENCE_COLLAPSE,"residual_archive":RESIDUAL_ARCHIVE,"qd_parent_choice":QD_PARENT_CHOICE,"scale_balanced_selection":SCALE_BALANCED_SELECTION,
-        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"selection_probe_filter":SELECTION_PROBE_FILTER,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"squash_swap_weight":SQUASH_SWAP_WEIGHT,"smooth_swap_weight":SMOOTH_SWAP_WEIGHT,"gate_mutation_weight":GATE_MUTATION_WEIGHT,"loss_noise_floor":LOSS_NOISE_FLOOR,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age",
+        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"selection_probe_filter":SELECTION_PROBE_FILTER,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"fit_iterations":CONSTANT_FIT_ITERATIONS,"semantic_max_delta":SEMANTIC_MAX_DELTA,"constant_snapping":CONSTANT_SNAPPING,"snap_tolerance":SNAP_TOLERANCE,"squash_swap_weight":SQUASH_SWAP_WEIGHT,"smooth_swap_weight":SMOOTH_SWAP_WEIGHT,"gate_mutation_weight":GATE_MUTATION_WEIGHT,"loss_noise_floor":LOSS_NOISE_FLOOR,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age",
         "test_csv":str(Path(args.test_csv).resolve()) if args.test_csv else None,
     },df,train_indices,validation_indices,external_validation)
     print(f"Run manifest: {manifest_path}")
@@ -6026,7 +6142,7 @@ def train_from_setup(args, setup, choose_model=None):
         "profile":args.profile,"constraint_metadata":metadata,"constraints":constraints.describe(),"bayesian_particles":args.bayesian_particles,"interaction_discovery":interaction_discovery,
         "island_config":{"count":island_count,"migration_interval":migration_interval,"migrants_per_island":migrants_per_island,"topology":"ring","migration_events":0,"stages":stages,"roles":roles},
         "equivalence_collapse":EQUIVALENCE_COLLAPSE,"residual_archive":RESIDUAL_ARCHIVE,"qd_parent_choice":QD_PARENT_CHOICE,"scale_balanced_selection":SCALE_BALANCED_SELECTION,
-        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"selection_probe_filter":SELECTION_PROBE_FILTER,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"squash_swap_weight":SQUASH_SWAP_WEIGHT,"smooth_swap_weight":SMOOTH_SWAP_WEIGHT,"gate_mutation_weight":GATE_MUTATION_WEIGHT,"loss_noise_floor":LOSS_NOISE_FLOOR,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age"}
+        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"selection_probe_filter":SELECTION_PROBE_FILTER,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"fit_iterations":CONSTANT_FIT_ITERATIONS,"semantic_max_delta":SEMANTIC_MAX_DELTA,"constant_snapping":CONSTANT_SNAPPING,"snap_tolerance":SNAP_TOLERANCE,"squash_swap_weight":SQUASH_SWAP_WEIGHT,"smooth_swap_weight":SMOOTH_SWAP_WEIGHT,"gate_mutation_weight":GATE_MUTATION_WEIGHT,"loss_noise_floor":LOSS_NOISE_FLOOR,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age"}
     head_count=sum(len(heads) for heads in classification_layout(cats)[0])
     population_sizes=cell_population_sizes(args.population,cell_count)
     islands=[new_island_runtime(size,X=X,Xt=Xt,cats=cats,ops=ops,nodes=nodes,depth=depth,head_count=head_count,
@@ -6089,6 +6205,7 @@ def train_from_setup(args, setup, choose_model=None):
         evaluator.assess(island.population,"train")
         island.best_models.update(island.population); island.archive.update(island.population,Xt)
     f=[model for island in islands for model in [*island.archive.items,*island.population,island.best_models.model] if model is not None]
+    f,snapping=snap_final_candidates(f,Xt,Yt,Xv,Yv,affine_on,cats,constraints,out_names); report_snapping(snapping)
     evaluation=selection_evaluation(f,Xv,Yv,cats,constraints,out_names)
     labels,choices,selection=model_options(f,cats=cats,loss_tolerance=args.selection_loss_tolerance,evaluation=evaluation)
     print_frontier(f,names,out_names,cats,recommendations=(labels,choices),evaluation=evaluation)
@@ -6108,7 +6225,7 @@ def train_from_setup(args, setup, choose_model=None):
         print(f"Final held-out test (not used for selection): loss={metrics['loss']:.6g}, shape={metrics['shape']:.6g} | output losses={output_loss_summary(metrics['losses'],out_names)}")
     export_model(chosen,names,out_names,cats,maps,list(df.columns),types,train_df,input_ranges)
     selected_entry=next(entry for entry in evaluation[1] if entry[0] is chosen)
-    selection={**selection,"selected_choice":labels[selected_index],"default_selected":selected_index==0,
+    selection={**selection,"constant_snapping":snapping,"selected_choice":labels[selected_index],"default_selected":selected_index==0,
                "selected_metrics":selected_entry[2],"selected_objectives":tuple(selected_entry[1].objectives)}
     checkpoint_state["selection"]=selection
     snapshot_islands(checkpoint_state,islands,checkpoint_state["island_config"])
