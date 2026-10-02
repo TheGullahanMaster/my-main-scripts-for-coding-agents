@@ -5594,6 +5594,92 @@ def direct_feature_baselines(X, Y, cats, ops, affine_on):
         for model in models: assess(model,X,Y,affine_on,cats)
     return models
 
+# --sparse-seeding (FFX, McConaghy 2011; SINDy, Brunton 2016): before the
+# search, a modest basis (inputs, unary operators of inputs, pairwise
+# products and ratios, hinges at quartiles when max is in the grammar) is
+# searched by orthogonal matching pursuit, branching on the best first
+# terms, and the sparse fits with the best BIC become starting models.  It is
+# an initialiser, not a search mechanism: the basis is never composed
+# recursively.  SPARSE_SEED_STATS records the best seed's training R^2 so a
+# benchmark can tell a good start from better evolution.
+SPARSE_SEEDING = "off"
+SPARSE_BASIS_SIZE = 300
+SPARSE_SEED_SHARE = .1      # of each stage-0 cell's population
+SPARSE_SEED_STATS = {"seeds":0,"best_r2":None,"basis":0}
+
+def sparse_basis(X, ops, limit=None):
+    """(trees, columns) of the seeding basis, in priority order, without duplicates."""
+    limit=SPARSE_BASIS_SIZE if limit is None else limit; n_features=X.shape[1]
+    trees=[("x",i) for i in range(n_features)]
+    if "*" in ops: trees+=[("*",("x",i),("x",j)) for i in range(n_features) for j in range(i,n_features)]
+    if "/" in ops: trees+=[("/",("x",i),("x",j)) for i in range(n_features) for j in range(n_features) if i!=j]
+    unary=[op for op in ops if op in OPS and OPS[op][0]==1 and op not in _LIBRARY_EXCLUDED]
+    trees+=[(op,("x",i)) for op in unary for i in range(n_features)]
+    if "max" in ops:
+        for i in range(n_features):
+            trees+=[("max",("x",i),("c",float(q))) for q in np.unique(np.round(np.quantile(X[:,i],(.25,.5,.75)),6))]
+    kept=[]; columns=[]; seen=set()
+    for tree in trees:
+        if len(kept)>=limit: break
+        try: values=np.asarray(evaluate_cached(tree,X,None),float)
+        except (ArithmeticError, IndexError, RecursionError, ValueError): continue
+        if not np.isfinite(values).all() or values.std()<=EPS: continue
+        signature=np.round((values-values.mean())/values.std(),9).tobytes()
+        if signature in seen: continue
+        seen.add(signature); kept.append(tree); columns.append(values)
+    return kept,(np.column_stack(columns) if columns else np.zeros((len(X),0)))
+
+def sparse_fits(B, y, max_terms=4, branches=6):
+    """Orthogonal matching pursuit from the `branches` best first terms; returns [(bic, support, coefficients, intercept, r2)]."""
+    n,p=B.shape
+    if not p or n<4: return []
+    Z=(B-B.mean(axis=0))/B.std(axis=0); yc=y-y.mean(); total=float(yc@yc)
+    if total<=0: return []
+    first=np.argsort(-np.abs(Z.T@yc))[:branches]; results={}
+    for start in first:
+        support=[int(start)]
+        while True:
+            A=np.column_stack([B[:,support],np.ones(n)])
+            solution=np.linalg.lstsq(A,y,rcond=None)[0]; residual=y-A@solution
+            # Floor at round-off, or an exact fit's extra terms 'win' BIC on 1e-28 vs 1e-27.
+            rss=max(float(residual@residual),1e-20*total)
+            key=tuple(sorted(support))
+            if key not in results:
+                results[key]=(n*math.log(rss/n)+(len(support)+1)*math.log(n),key,
+                              {index:float(c) for index,c in zip(support,solution[:-1])},float(solution[-1]),1-rss/total)
+            if len(support)>=max_terms: break
+            Q,_=np.linalg.qr(Z[:,support]); perpendicular=Z-Q@(Q.T@Z)
+            norms=np.einsum("ij,ij->j",perpendicular,perpendicular); norms[support]=np.inf
+            scores=np.where(norms>1e-10*n,(perpendicular.T@residual)**2/np.maximum(norms,1e-300),-1.)
+            scores[support]=-1.; best=int(np.argmax(scores))
+            if scores[best]<=1e-12*total: break
+            support.append(best)
+    return sorted(results.values(),key=lambda item:item[0])
+
+def sparse_seed_models(X, Y, cats, ops, max_nodes, max_depth, count, head_count):
+    """Up to `count` seed models whose regression heads are sparse fits of their outputs."""
+    targets,_=classification_layout(cats)
+    rows=stratified_probe_indices(X,1000) if len(X)>1000 else slice(None)
+    Xs=X[rows]; trees_by_head={}; best_r2=None
+    basis,B=sparse_basis(Xs,ops)
+    for j,heads in enumerate(targets):
+        if cats[j] is not None: continue
+        y=np.asarray(Y[rows,j],float); options=[]
+        for _,support,coefficients,_,r2 in sparse_fits(B,y,max_terms=min(MAX_TERMS,4)):
+            tree=simplify_tree(join_terms([(coefficients[index],basis[index]) for index in support]))
+            if node_size(tree)<=max_nodes and node_depth(tree)<=max_depth and tree not in options:
+                options.append(tree); best_r2=r2 if best_r2 is None else max(best_r2,r2)
+        if options: trees_by_head[heads[0]]=options
+    SPARSE_SEED_STATS.update(basis=len(basis))
+    if not trees_by_head: return []
+    models=[]
+    for index in range(min(count,max(len(options) for options in trees_by_head.values()))):
+        trees=[trees_by_head[head][index%len(trees_by_head[head])] if head in trees_by_head else ("x",0) for head in range(head_count)]
+        models.append(Model(trees,[(1.,0.)]*head_count,origin="sparse_seed",mdl_operators=tuple(ops),mdl_feature_count=X.shape[1]))
+    SPARSE_SEED_STATS["seeds"]+=len(models)
+    if best_r2 is not None: SPARSE_SEED_STATS["best_r2"]=max(best_r2,SPARSE_SEED_STATS["best_r2"] or -np.inf)
+    return models
+
 def new_island_runtime(population_size, *, X, Xt, cats, ops, nodes, depth, head_count, bayesian_particles,
                        run_seed, island_index, qd_parent_rate, nsga_normalization, parsimony_quality_tolerance,
                        dynamic_pressure_on, stagnation_window, adf_enabled, adf_mode, evaluation_budget,
@@ -5605,6 +5691,8 @@ def new_island_runtime(population_size, *, X, Xt, cats, ops, nodes, depth, head_
     residual-signature QD repertoire (when RESIDUAL_ARCHIVE is on)."""
     adf_registry=ADFRegistry(adf_enabled,allow_nested=adf_mode=="nested")
     seeds=direct_feature_baselines(X,None,cats,ops,True)[:population_size//4]
+    if SPARSE_SEEDING=="on" and Yt is not None and (cell is None or cell[1]==0):
+        seeds+=sparse_seed_models(Xt,Yt,cats,ops,nodes,depth,max(1,int(SPARSE_SEED_SHARE*population_size)),head_count)
     for seed in seeds: seed.adfs=dict(adf_registry.definitions)
     population=seeds+[Model([random_tree(X.shape[1],ops,nodes,depth) for _ in range(head_count)],[(1.,0.)]*head_count,
                       mdl_operators=tuple(ops),mdl_feature_count=X.shape[1],adfs=dict(adf_registry.definitions))
@@ -6190,6 +6278,8 @@ def build_arg_parser():
     ap.add_argument("--gene-crossover-rate",type=float,default=.5,help="Share of crossovers that add or swap one whole top-level term in multiterm mode (default: 0.5)")
     ap.add_argument("--backprop-mutation-weight",type=float,default=0.,help="Initial portfolio weight of semantic backpropagation: invert the tree from its readout down to a random node and replace that subtree with the small expression or fragment that best matches the desired values; 0 disables it (default: 0)")
     ap.add_argument("--backprop-inverse",choices=("exact","generic"),default="generic",help="exact inverts only + - * / neg exp log tanh sigmoid; generic also solves every other operator numerically per row, on the branch the subtree is already on (default: generic)")
+    ap.add_argument("--sparse-seeding",choices=("on","off"),default="off",help="Seed the initial population with sparse linear fits over a modest basis (inputs, unary operators of inputs, pairwise products and ratios, hinges), found by orthogonal matching pursuit (default: off)")
+    ap.add_argument("--sparse-basis-size",type=int,default=300,help="Most basis terms the sparse seeding searches (default: 300)")
     ap.add_argument("--jump-mutation-weight",type=float,default=1.,help="Initial portfolio weight of the jump mutation, which wraps a subtree in mod(s,c), floordiv(s,c) or if_else(gt(x,c),s,s') as one move; adapted like the other mutation kinds; 0 disables it (default: 1)")
     ap.add_argument("--loss-noise-floor",default="auto",help="Loss differences below this count as ties (the shorter model wins). 'auto' derives it from the targets' written precision: about 3e-12 for 7-digit CSV values, down to 1e-18 for full doubles, never above the old fixed 1e-9 (default: auto)")
     ap.add_argument("--squash-swap-weight",type=float,default=1.,help="Initial portfolio weight of the squash swap, which replaces one sigmoid/tanh/erf with another rewritten to the same level, range and slope (sigmoid(z) -> 0.5+0.5*erf(0.443z)); 0 disables it (default: 1)")
@@ -6211,6 +6301,7 @@ def parse_cli(argv=None):
     if args.evaluation_refresh < 1 or args.stagnation_window < 1: ap.error("evaluation refresh and stagnation window must be positive")
     if args.fit_iterations < 1: ap.error("--fit-iterations must be positive")
     if args.backprop_mutation_weight < 0: ap.error("--backprop-mutation-weight must be non-negative")
+    if args.sparse_basis_size < 1: ap.error("--sparse-basis-size must be positive")
     if args.max_terms < 2: ap.error("--max-terms must be at least 2")
     if not 0 <= args.gene_crossover_rate <= 1: ap.error("--gene-crossover-rate must be between 0 and 1")
     if not args.semantic_max_delta > 0: ap.error("--semantic-max-delta must be positive (inf disables the cap)")
@@ -6335,6 +6426,8 @@ def train_from_setup(args, setup, choose_model=None):
     CONSTANT_FIT_ITERATIONS=int(getattr(args,"fit_iterations",12)); SEMANTIC_MAX_DELTA=float(getattr(args,"semantic_max_delta",5.))
     CONSTANT_SNAPPING=getattr(args,"constant_snapping","final"); SNAP_TOLERANCE=float(getattr(args,"snap_tolerance",1e-6))
     global READOUT_MODE,MAX_TERMS,GENE_CROSSOVER_RATE
+    global SPARSE_SEEDING,SPARSE_BASIS_SIZE
+    SPARSE_SEEDING=getattr(args,"sparse_seeding","off"); SPARSE_BASIS_SIZE=int(getattr(args,"sparse_basis_size",300)); SPARSE_SEED_STATS.update(seeds=0,best_r2=None,basis=0)
     global BACKPROP_MUTATION_WEIGHT,BACKPROP_INVERSE
     BACKPROP_MUTATION_WEIGHT=float(getattr(args,"backprop_mutation_weight",0.)); BACKPROP_INVERSE=getattr(args,"backprop_inverse","generic")
     READOUT_MODE=getattr(args,"readout","affine"); MAX_TERMS=int(getattr(args,"max_terms",4)); GENE_CROSSOVER_RATE=float(getattr(args,"gene_crossover_rate",.5))
@@ -6433,7 +6526,7 @@ def train_from_setup(args, setup, choose_model=None):
                    "stages":{key:stages[key] for key in ("mode","count","interval","age_gap","schedule","threshold_quantile")},
                    "roles":{key:roles[key] for key in ("enabled","interval","mix","retire_after")}},
         "equivalence_collapse":EQUIVALENCE_COLLAPSE,"residual_archive":RESIDUAL_ARCHIVE,"qd_parent_choice":QD_PARENT_CHOICE,"scale_balanced_selection":SCALE_BALANCED_SELECTION,
-        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"selection_probe_filter":SELECTION_PROBE_FILTER,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"fit_iterations":CONSTANT_FIT_ITERATIONS,"semantic_max_delta":SEMANTIC_MAX_DELTA,"constant_snapping":CONSTANT_SNAPPING,"snap_tolerance":SNAP_TOLERANCE,"readout":READOUT_MODE,"max_terms":MAX_TERMS,"gene_crossover_rate":GENE_CROSSOVER_RATE,"backprop_mutation_weight":BACKPROP_MUTATION_WEIGHT,"backprop_inverse":BACKPROP_INVERSE,"squash_swap_weight":SQUASH_SWAP_WEIGHT,"smooth_swap_weight":SMOOTH_SWAP_WEIGHT,"gate_mutation_weight":GATE_MUTATION_WEIGHT,"loss_noise_floor":LOSS_NOISE_FLOOR,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age",
+        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"selection_probe_filter":SELECTION_PROBE_FILTER,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"fit_iterations":CONSTANT_FIT_ITERATIONS,"semantic_max_delta":SEMANTIC_MAX_DELTA,"constant_snapping":CONSTANT_SNAPPING,"snap_tolerance":SNAP_TOLERANCE,"readout":READOUT_MODE,"max_terms":MAX_TERMS,"gene_crossover_rate":GENE_CROSSOVER_RATE,"backprop_mutation_weight":BACKPROP_MUTATION_WEIGHT,"backprop_inverse":BACKPROP_INVERSE,"sparse_seeding":SPARSE_SEEDING,"sparse_basis_size":SPARSE_BASIS_SIZE,"squash_swap_weight":SQUASH_SWAP_WEIGHT,"smooth_swap_weight":SMOOTH_SWAP_WEIGHT,"gate_mutation_weight":GATE_MUTATION_WEIGHT,"loss_noise_floor":LOSS_NOISE_FLOOR,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age",
         "test_csv":str(Path(args.test_csv).resolve()) if args.test_csv else None,
     },df,train_indices,validation_indices,external_validation)
     print(f"Run manifest: {manifest_path}")
@@ -6450,7 +6543,7 @@ def train_from_setup(args, setup, choose_model=None):
         "profile":args.profile,"constraint_metadata":metadata,"constraints":constraints.describe(),"bayesian_particles":args.bayesian_particles,"interaction_discovery":interaction_discovery,
         "island_config":{"count":island_count,"migration_interval":migration_interval,"migrants_per_island":migrants_per_island,"topology":"ring","migration_events":0,"stages":stages,"roles":roles},
         "equivalence_collapse":EQUIVALENCE_COLLAPSE,"residual_archive":RESIDUAL_ARCHIVE,"qd_parent_choice":QD_PARENT_CHOICE,"scale_balanced_selection":SCALE_BALANCED_SELECTION,
-        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"selection_probe_filter":SELECTION_PROBE_FILTER,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"fit_iterations":CONSTANT_FIT_ITERATIONS,"semantic_max_delta":SEMANTIC_MAX_DELTA,"constant_snapping":CONSTANT_SNAPPING,"snap_tolerance":SNAP_TOLERANCE,"readout":READOUT_MODE,"max_terms":MAX_TERMS,"gene_crossover_rate":GENE_CROSSOVER_RATE,"backprop_mutation_weight":BACKPROP_MUTATION_WEIGHT,"backprop_inverse":BACKPROP_INVERSE,"squash_swap_weight":SQUASH_SWAP_WEIGHT,"smooth_swap_weight":SMOOTH_SWAP_WEIGHT,"gate_mutation_weight":GATE_MUTATION_WEIGHT,"loss_noise_floor":LOSS_NOISE_FLOOR,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age"}
+        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"selection_probe_filter":SELECTION_PROBE_FILTER,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"fit_iterations":CONSTANT_FIT_ITERATIONS,"semantic_max_delta":SEMANTIC_MAX_DELTA,"constant_snapping":CONSTANT_SNAPPING,"snap_tolerance":SNAP_TOLERANCE,"readout":READOUT_MODE,"max_terms":MAX_TERMS,"gene_crossover_rate":GENE_CROSSOVER_RATE,"backprop_mutation_weight":BACKPROP_MUTATION_WEIGHT,"backprop_inverse":BACKPROP_INVERSE,"sparse_seeding":SPARSE_SEEDING,"sparse_basis_size":SPARSE_BASIS_SIZE,"squash_swap_weight":SQUASH_SWAP_WEIGHT,"smooth_swap_weight":SMOOTH_SWAP_WEIGHT,"gate_mutation_weight":GATE_MUTATION_WEIGHT,"loss_noise_floor":LOSS_NOISE_FLOOR,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age"}
     head_count=sum(len(heads) for heads in classification_layout(cats)[0])
     population_sizes=cell_population_sizes(args.population,cell_count)
     islands=[new_island_runtime(size,X=X,Xt=Xt,cats=cats,ops=ops,nodes=nodes,depth=depth,head_count=head_count,
@@ -6461,6 +6554,10 @@ def train_from_setup(args, setup, choose_model=None):
                                 evaluation_budget=args.evaluation_budget,evaluation_refresh=args.evaluation_refresh,
                                 interaction_discovery=interaction_discovery,Yt=Yt)
              for index,size in enumerate(population_sizes)]
+    if SPARSE_SEEDING=="on":
+        best=SPARSE_SEED_STATS["best_r2"]
+        print(f"Sparse seeding: {SPARSE_SEED_STATS['seeds']} seed model(s) from a {SPARSE_SEED_STATS['basis']}-term basis"+(f"; best seed training R2={best:.6g}" if best is not None else ""))
+        checkpoint_state["sparse_seed_stats"]=dict(SPARSE_SEED_STATS)
     if roles["enabled"]: assign_role_parameters(islands,island_count,args.crossover_rate,args.bayesian_proposal_rate,nodes)
     if cell_count>1: seed_cell_streams(islands,run_seed)
     cell_workers=resolve_cell_workers(getattr(args,"cell_workers",0),cell_count)
