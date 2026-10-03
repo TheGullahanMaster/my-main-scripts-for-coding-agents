@@ -897,6 +897,18 @@ def _guard_walk(t, X, adfs, arguments=None, position=None):
         if np.isnan(raw).any(): exact=raw
         else: return value,value
     return value,exact
+_COMPILED_TREES={}
+def _compiled_tree(tree, feature_count):
+    """(core, program, constants) of a tree the compiled kernels can run, else None (memoized)."""
+    if FIT_BACKEND!="auto": return None
+    key=(repr(tree),feature_count); hit=_COMPILED_TREES.get(key)
+    if hit is None:
+        core=compiled_fitter(); flat=None if core is None else _FlatTree.build(tree)
+        program=None if flat is None else _compiled_program(flat,core,feature_count)
+        hit=(None,) if program is None else (core,program,np.array([flat.payload[index] for index in flat.constants],float))
+        if len(_COMPILED_TREES)>=20000: _COMPILED_TREES.clear()
+        _COMPILED_TREES[key]=hit
+    return None if hit[0] is None else hit
 def _guard_changes_output(value, exact):
     spread=float(np.std(value)) if np.size(value)>1 else 0.
     tolerance=GUARD_TOLERANCE*(spread+1e-9*(1.+np.abs(value)))
@@ -911,6 +923,14 @@ def guard_engagement(trees, X, adfs=None):
     reason=""; blocks=_row_blocks(len(X)) if X.ndim==2 else None
     try:
         for tree in trees:
+            compiled=_compiled_tree(tree,X.shape[1]) if X.ndim==2 else None
+            if compiled is not None:
+                # One compiled pass computes both the guarded and the exact
+                # values (blocked like evaluate()), with the same verdicts.
+                verdict=compiled[0].guard_verdict(*compiled[1],compiled[2],X,GUARD_TOLERANCE,EVALUATION_BLOCK_ROWS)
+                if verdict==1: raise _GuardEngaged("value_clamp")
+                if verdict==2: reason="input_clip"; break
+                continue
             if blocks is None: value,exact=_guard_walk(tree,X,adfs)
             else:
                 # Blocked like evaluate(); a clamp in any block is a clamp on X,
@@ -1347,18 +1367,33 @@ def _nudged_roots(flat, nodes, slot, candidates, X):
             current=_op_eval_unguarded_state(flat.kind[index],[current if child==changed else nodes[child] for child in flat.children[index]])
             changed,index=index,flat.parent[index]
     return np.broadcast_to(current,(len(candidates),len(X)))
-def scan_jump_constants(flat, start, X, y, scale, fit_readout=True):
+def scan_jump_constants(flat, start, X, y, scale, fit_readout=True, program=None):
     """Constant vector with jump constants placed by a candidate scan, or None.
 
     Every candidate value of a constant is scored in one batched pass along
-    its path to the root (a (K, rows) array), not one evaluation per value."""
+    its path to the root (a (K, rows) array), not one evaluation per value.
+    ``program`` (from _compiled_program) runs the scan in the compiled kernel."""
     slots=jump_constant_slots(flat)
     if not slots: return None
     if len(slots)>JUMP_SCAN_MAX_CONSTANTS: slots=rng.sample(slots,JUMP_SCAN_MAX_CONSTANTS)
     JUMP_SCAN_STATS["scans"]+=1
     current=np.array(start,float)
+    core=compiled_fitter() if program is not None else None
+    if core is not None:
+        code,arg,kid=program; Xc=np.ascontiguousarray(X,dtype=float); yc=np.ascontiguousarray(y,dtype=float)
+        bound,huber=AFFINE_COEFFICIENT_BOUND,loss_delta()
+        def node_values(constants): return core.node_values(code,arg,kid,constants,Xc)
+        def root_cost(nodes): return float(core.prediction_costs(nodes[0][None,:],yc,scale,fit_readout,huber,bound)[0])
+        def candidate_costs(nodes, slot, candidates):
+            changed=flat.constants[slot]; path=[]; index=flat.parent[changed]
+            while index>=0: path.append(index); index=flat.parent[index]
+            return core.scan_costs(code,kid,nodes,changed,np.asarray(path,np.int32),np.asarray(candidates,float),yc,scale,fit_readout,huber,bound)
+    else:
+        def node_values(constants): return flat.values(constants,X)
+        def root_cost(nodes): return float(_scan_costs(nodes[0][None,:],y,scale,fit_readout)[0])
+        def candidate_costs(nodes, slot, candidates): return _scan_costs(_nudged_roots(flat,nodes,slot,candidates,X),y,scale,fit_readout)
     try:
-        nodes=flat.values(current,X); best=initial=float(_scan_costs(nodes[0][None,:],y,scale,fit_readout)[0])
+        nodes=node_values(current); best=initial=root_cost(nodes)
         for slot in slots:
             chosen=current[slot]
             candidates=_jump_candidates(flat,nodes,slot,chosen)
@@ -1367,11 +1402,11 @@ def scan_jump_constants(flat, start, X, y, scale, fit_readout=True):
                 if round_:
                     step=(.05 if round_==1 else .005)*max(abs(chosen),1e-3)
                     candidates=[chosen+step*k for k in (-8,-6,-4,-3,-2,-1,-.5,.5,1,2,3,4,6,8)]
-                costs=_scan_costs(_nudged_roots(flat,nodes,slot,candidates,X),y,scale,fit_readout)
+                costs=candidate_costs(nodes,slot,candidates)
                 pick=int(np.argmin(costs))
                 if costs[pick]<best: best,chosen=float(costs[pick]),float(candidates[pick])
             if chosen!=current[slot]:
-                current[slot]=chosen; nodes=flat.values(current,X)
+                current[slot]=chosen; nodes=node_values(current)
     except (ArithmeticError, IndexError, ValueError): return None
     if not best<initial: return None
     JUMP_SCAN_STATS["improved"]+=1
@@ -1392,23 +1427,24 @@ def fit_tree_constants(tree, X, y, adfs=None, fit_readout=True, iterations=None,
     if not len(start) or not len(y): return tree
     scale=loss_scale(y); flat=_FlatTree.build(tree); huber=loss_delta()
     base=loss_base_weights(y); ones=np.ones(len(y)) if base is None else base*base
+    program=None
+    if flat is not None and FIT_BACKEND=="auto" and LOSS_MODE=="huber" and isinstance(X,np.ndarray) and X.ndim==2:
+        core=compiled_fitter(); program=None if core is None else _compiled_program(flat,core,X.shape[1])
     if JUMP_CONSTANT_SCAN and flat is not None and isinstance(X,np.ndarray) and X.ndim==2:
-        scanned=scan_jump_constants(flat,start,X,y,scale,fit_readout)
+        scanned=scan_jump_constants(flat,start,X,y,scale,fit_readout,program)
         if scanned is not None:
             placed=with_constants(tree,scanned)
             # The gradient fit below returns its own input unless it improves
             # further, so the scanned tree becomes that input.
             if not guarded_constant_divisor(placed) and not guard_engagement([placed],X,adfs): tree,start=placed,scanned
-    if flat is not None and FIT_BACKEND=="auto" and LOSS_MODE=="huber" and isinstance(X,np.ndarray) and X.ndim==2:
-        core=compiled_fitter(); program=None if core is None else _compiled_program(flat,core,X.shape[1])
-        if program is not None:
-            result=core.fit(*program,start,np.ascontiguousarray(X,dtype=float),np.ascontiguousarray(y,dtype=float),scale,
-                            fit_readout,robust,iterations,AFFINE_COEFFICIENT_BOUND,huber,CONSTANT_LIMIT)
-            if result is None: return tree
-            current,cost,initial=result
-            if cost>=initial: return tree
-            tuned=with_constants(tree,current)
-            return tree if guarded_constant_divisor(tuned) or guard_engagement([tuned],X,adfs) else tuned
+    if program is not None:
+        result=core.fit(*program,start,np.ascontiguousarray(X,dtype=float),np.ascontiguousarray(y,dtype=float),scale,
+                        fit_readout,robust,iterations,AFFINE_COEFFICIENT_BOUND,huber,CONSTANT_LIMIT)
+        if result is None: return tree
+        current,cost,initial=result
+        if cost>=initial: return tree
+        tuned=with_constants(tree,current)
+        return tree if guarded_constant_divisor(tuned) or guard_engagement([tuned],X,adfs) else tuned
     # readout() runs ~30 times per fit on <=256 rows, so numpy's per-call
     # overhead is the cost: scalars are hoisted and wrappers (np.clip/np.all
     # on scalars) avoided.  Every value is computed exactly as before.
@@ -3377,10 +3413,11 @@ def _affine(pred, y):
     varying=spread>=EPS; spread=spread if varying else 1.
     bound=AFFINE_COEFFICIENT_BOUND
     # (A constant prediction is a degenerate line the compiled path would only hand back.)
-    if varying and len(pred)>2*EVALUATION_BLOCK_ROWS and FIT_BACKEND=="auto" and LOSS_MODE=="huber":
-        # Large data: the compiled IRLS streams the rows twice per iteration
-        # instead of ~25 times (memory bandwidth, not arithmetic, was the cost).
-        # It agrees to round-off; rare degenerate/bounded fits fall through.
+    if varying and FIT_BACKEND=="auto" and LOSS_MODE=="huber":
+        # The compiled IRLS streams the rows twice per iteration instead of ~25
+        # times (memory bandwidth on large data) and has no per-iteration numpy
+        # overhead (which dominated on small data).  It agrees to the solver's
+        # sqrt(eps) tolerance; rare degenerate/bounded fits fall through.
         core=compiled_fitter()
         if core is not None:
             fitted=core.robust_affine(np.ascontiguousarray(pred,dtype=float),np.ascontiguousarray(y,dtype=float),centre,spread,loss_delta()*target_scale(y),bound)

@@ -16,8 +16,11 @@ pow-based ones come from libm, which can differ from numpy's own kernels in
 the last bit (LIBM_OPERATORS), so the two fitters agree to round-off.
 
 fit() is the Levenberg-Marquardt / variable-projection loop of
-afpo.fit_tree_constants (same readout, damping, step and stopping rules);
-robust_affine() is the Huber IRLS of afpo._affine for large data;
+afpo.fit_tree_constants (same readout, damping, step and stopping rules),
+entirely in C: the small normal-equation solve is Gaussian elimination with
+partial pivoting instead of LAPACK, so it too agrees to round-off;
+node_values(), scan_costs() and prediction_costs() are the jump-constant scan
+(afpo.scan_jump_constants); robust_affine() is the Huber IRLS of afpo._affine;
 numeric_inverse() is afpo.numeric_inverse (the per-row root finding of
 semantic backpropagation) on the same operator kernels.
 
@@ -388,16 +391,98 @@ cdef class _Problem:
         self.code = code; self.arg = arg; self.kid = kid; self.X = X; self.y = y
         self.values = np.empty((len(code), X.shape[0])); self.w = np.empty(X.shape[0])
         self.scale = scale; self.fit_readout = fit_readout; self.robust = robust; self.bound = bound; self.huber = huber
+    cdef bint residual_into(self, const double[::1] constants, double[::1] r) noexcept nogil:
+        run(self.code, self.arg, self.kid, constants, self.X, self.values)
+        return readout(self.values[0], self.y, self.scale, self.fit_readout, self.robust, self.bound, self.huber, self.w, r)
     def residual(self, constants):
         cdef double[::1] c = np.ascontiguousarray(constants, dtype=float)
         r = np.empty(self.X.shape[0])
         cdef double[::1] rv = r
-        cdef double[::1] root = self.values[0]
         cdef bint ok
-        with nogil:
-            run(self.code, self.arg, self.kid, c, self.X, self.values)
-            ok = readout(root, self.y, self.scale, self.fit_readout, self.robust, self.bound, self.huber, self.w, rv)
+        with nogil: ok = self.residual_into(c, rv)
         return r if ok else None
+
+cdef bint solve_in_place(double* A, double* b, Py_ssize_t k) noexcept nogil:
+    """A x = b by Gaussian elimination with partial pivoting (A is k x k, row major);
+    x overwrites b.  False on an exactly zero pivot, where LAPACK's gesv (which
+    numpy.linalg.solve calls) reports a singular matrix."""
+    cdef Py_ssize_t i, j, col, pivot
+    cdef double best, factor, t
+    for col in range(k):
+        pivot = col; best = fabs(A[col*k+col])
+        for i in range(col+1, k):
+            if fabs(A[i*k+col]) > best: best = fabs(A[i*k+col]); pivot = i
+        if A[pivot*k+col] == 0.: return False
+        if pivot != col:
+            for j in range(k):
+                t = A[col*k+j]; A[col*k+j] = A[pivot*k+j]; A[pivot*k+j] = t
+            t = b[col]; b[col] = b[pivot]; b[pivot] = t
+        for i in range(col+1, k):
+            factor = A[i*k+col]/A[col*k+col]
+            if factor != 0.:
+                for j in range(col, k): A[i*k+j] -= factor*A[col*k+j]
+                b[i] -= factor*b[col]
+    for i in range(k-1, -1, -1):
+        t = b[i]
+        for j in range(i+1, k): t -= A[i*k+j]*b[j]
+        b[i] = t/A[i*k+i]
+    return True
+
+cdef int lm_fit(_Problem problem, double[::1] current, double[::1] probe, double[::1] candidate,
+                double[::1] r, double[::1] rk, double[::1] rc, double[:, ::1] J, double* H, double* A,
+                double* g, double* delta, int iterations, double limit, double* cost_out, double* initial_out) noexcept nogil:
+    """The Levenberg-Marquardt loop of afpo.fit_tree_constants (same damping,
+    step and stopping rules), entirely in C.  Returns 0 when the start is not
+    finite, else 1 with the result in current/cost_out/initial_out."""
+    cdef Py_ssize_t n = r.shape[0], k = current.shape[0], i, j, index, row
+    cdef int iteration, attempt
+    cdef double cost, initial, damping = 1e-3, step, gain, candidate_cost, s
+    cdef bint improved, nonzero, failed
+    if not problem.residual_into(current, r): return 0
+    cost = 0.
+    for row in range(n): cost += r[row]*r[row]
+    initial = cost
+    for iteration in range(iterations):
+        if cost <= 1e-24: break
+        failed = False; nonzero = False
+        for index in range(k):
+            step = 1e-6*(fabs(current[index]) if fabs(current[index]) > 1. else 1.)
+            for i in range(k): probe[i] = current[i]
+            probe[index] += step
+            if not problem.residual_into(probe, rk): failed = True; break
+            for row in range(n):
+                J[row, index] = (rk[row]-r[row])/step
+                if J[row, index] != 0.: nonzero = True
+        if failed or not nonzero: break
+        for i in range(k):
+            s = 0.
+            for row in range(n): s += J[row, i]*r[row]
+            g[i] = s
+            for j in range(i, k):
+                s = 0.
+                for row in range(n): s += J[row, i]*J[row, j]
+                H[i*k+j] = s; H[j*k+i] = s
+        improved = False; gain = 0.
+        for attempt in range(8):
+            for i in range(k):
+                for j in range(k): A[i*k+j] = H[i*k+j]
+                A[i*k+i] = H[i*k+i]+damping*(H[i*k+i]+1e-12)
+                delta[i] = -g[i]
+            if not solve_in_place(A, delta, k): damping *= 10; continue
+            for i in range(k): candidate[i] = clip(current[i]+delta[i], -limit, limit)   # NaN passes, as in numpy
+            if problem.residual_into(candidate, rc):
+                candidate_cost = 0.
+                for row in range(n): candidate_cost += rc[row]*rc[row]
+                if candidate_cost < cost:
+                    gain = cost-candidate_cost; cost = candidate_cost
+                    for i in range(k): current[i] = candidate[i]
+                    for row in range(n): r[row] = rc[row]
+                    damping = damping/3 if damping/3 > 1e-9 else 1e-9
+                    improved = True; break
+            damping *= 4
+        if not improved or gain <= 1e-10*(cost if cost > 1e-30 else 1e-30): break
+    cost_out[0] = cost; initial_out[0] = initial
+    return 1
 
 def fit(code, arg, kid, start, X, y, scale, fit_readout, robust, iterations, bound, huber, limit):
     """(constants, cost, initial cost) after Levenberg-Marquardt, or None when the start is not finite."""
@@ -406,33 +491,161 @@ def fit(code, arg, kid, start, X, y, scale, fit_readout, robust, iterations, bou
                        np.ascontiguousarray(X, dtype=float), np.ascontiguousarray(y, dtype=float), float(scale),
                        bool(fit_readout), bool(robust), float(bound), float(huber))
     current = np.array(start, dtype=float)
-    r = problem.residual(current)
-    if r is None: return None
-    cost = initial = float(r@r); damping = 1e-3; k = len(current)
-    for _ in range(int(iterations)):
-        if cost <= 1e-24: break
-        J = np.empty((len(r), k))
-        for index in range(k):
-            step = 1e-6*max(1., abs(current[index])); probe = current.copy(); probe[index] += step
-            rk = problem.residual(probe)
-            if rk is None: J = None; break
-            J[:, index] = (rk-r)/step
-        if J is None or not J.any(): break
-        g = J.T@r; H = J.T@J; improved = False; gain = 0.
-        regulariser = np.diag(np.diag(H))+1e-12*np.eye(k); descent = -g
-        for _ in range(8):
-            try: delta = np.linalg.solve(H+damping*regulariser, descent)
-            except np.linalg.LinAlgError: damping *= 10; continue
-            candidate = np.minimum(np.maximum(current+delta, -limit), limit)
-            rc = problem.residual(candidate)
-            if rc is not None:
-                candidate_cost = float(rc@rc)
-                if candidate_cost < cost:
-                    gain = cost-candidate_cost; current, r, cost = candidate, rc, candidate_cost
-                    damping = max(damping/3, 1e-9); improved = True; break
-            damping *= 4
-        if not improved or gain <= 1e-10*max(cost, 1e-30): break
+    cdef Py_ssize_t k = current.shape[0], n = problem.X.shape[0]
+    cdef double[::1] cv = current
+    cdef double[::1] probe = np.empty(k), candidate = np.empty(k), r = np.empty(n), rk = np.empty(n), rc = np.empty(n)
+    cdef double[:, ::1] J = np.empty((n, k))
+    cdef double[::1] work = np.empty(2*k*k+2*k+1)
+    cdef double cost = 0., initial = 0.
+    cdef int ok, steps = int(iterations)
+    cdef double bound_limit = float(limit)
+    with nogil:
+        ok = lm_fit(problem, cv, probe, candidate, r, rk, rc, J, &work[0], &work[k*k], &work[2*k*k], &work[2*k*k+k],
+                    steps, bound_limit, &cost, &initial)
+    if not ok: return None
     return current, cost, initial
+
+def node_values(code, arg, kid, constants, X):
+    """Every node's values on X (row 0 is the root): afpo._FlatTree.values on the compiled operators."""
+    cdef const double[:, ::1] Xc = np.ascontiguousarray(X, dtype=float)
+    result = np.empty((len(code), Xc.shape[0]))
+    cdef double[:, ::1] values = result
+    run(np.ascontiguousarray(code, np.int32), np.ascontiguousarray(arg, np.int32), np.ascontiguousarray(kid, np.int32),
+        np.ascontiguousarray(constants, dtype=float).reshape(-1), Xc, values)
+    return result
+
+cdef double scan_cost(const double* P, const double[::1] y, double scale, bint fit_readout, double huber, double bound) noexcept nogil:
+    """afpo._scan_costs for one prediction row: Huber cost after a least-squares readout."""
+    cdef Py_ssize_t i, n = y.shape[0]
+    cdef double mu = 0., my = 0., suu = 0., spp = 0., sdy = 0., du, slope = 0., p, r, cost = 0.
+    cdef bint degenerate
+    if fit_readout:
+        for i in range(n): mu += P[i]; my += y[i]
+        mu /= n; my /= n
+        for i in range(n):
+            du = P[i]-mu; suu += du*du; spp += P[i]*P[i]; sdy += du*(y[i]-my)
+        degenerate = not (suu > 1e-12*(spp if spp > EPS else EPS))
+        slope = sdy/(1. if degenerate else suu)
+        if degenerate or not isfinite(slope): slope = 0.
+        else: slope = clip(slope, -bound, bound)
+    for i in range(n):
+        p = slope*(P[i]-mu)+my if fit_readout else P[i]
+        r = fabs((p-y[i])/scale)
+        cost += .5*r*r if r <= huber else huber*(r-.5*huber)
+    return cost if isfinite(cost) else INFINITY
+
+def prediction_costs(P, y, double scale, bint fit_readout, double huber, double bound):
+    """afpo._scan_costs of a (K, n) prediction batch."""
+    cdef const double[:, ::1] Pc = np.ascontiguousarray(P, dtype=float)
+    cdef const double[::1] yc = np.ascontiguousarray(y, dtype=float)
+    costs = np.empty(Pc.shape[0])
+    cdef double[::1] out = costs
+    cdef Py_ssize_t k
+    with nogil:
+        for k in range(Pc.shape[0]): out[k] = scan_cost(&Pc[k, 0], yc, scale, fit_readout, huber, bound)
+    return costs
+
+def scan_costs(code, kid, values, int slot_node, path, candidates, y, double scale, bint fit_readout, double huber, double bound):
+    """Costs of K values of one constant (node slot_node): only the nodes on
+    its path to the root (path: parent first, root last) are recomputed, row
+    by row, from the other nodes' stored values (afpo._nudged_roots)."""
+    cdef const int[::1] codes = np.ascontiguousarray(code, np.int32)
+    cdef const int[:, ::1] kids = np.ascontiguousarray(kid, np.int32)
+    cdef const double[:, ::1] V = np.ascontiguousarray(values, dtype=float)
+    cdef const int[::1] up = np.ascontiguousarray(path, np.int32)
+    cdef const double[::1] cand = np.ascontiguousarray(candidates, dtype=float)
+    cdef const double[::1] yc = np.ascontiguousarray(y, dtype=float)
+    cdef Py_ssize_t K = cand.shape[0], n = V.shape[1], c, row, step
+    cdef double[:, ::1] P = np.empty((K, n))
+    costs = np.empty(K)
+    cdef double[::1] out = costs
+    cdef int node, changed, a, b, e
+    cdef double current, u, v, w
+    with nogil:
+        for c in range(K):
+            for row in range(n):
+                current = cand[c]; changed = slot_node
+                for step in range(up.shape[0]):
+                    node = up[step]; a = kids[node, 0]; b = kids[node, 1]; e = kids[node, 2]
+                    u = current if a == changed else V[a, row]
+                    v = (current if b == changed else V[b, row]) if b >= 0 else 0.
+                    w = (current if e == changed else V[e, row]) if e >= 0 else 0.
+                    current = clean(apply(codes[node], u, v, w)); changed = node
+                P[c, row] = current
+            out[c] = scan_cost(&P[c, 0], yc, scale, fit_readout, huber, bound)
+    return costs
+
+cdef inline double apply_exact(int op, double x, double y, double z) noexcept nogil:
+    """afpo._UNGUARDED: the operators' mathematics without their input clips."""
+    if op == 30: return sign(x)*pow(fabs(x), y)
+    elif op == 17: return exp(x)
+    elif op == 18: return expm1(x)
+    elif op == 65: return pow(10., x)
+    elif op == 33: return exp(-x*y)
+    elif op == 26: return exp(-x*x)
+    elif op == 25 or op == 95: return 1./(1.+exp(-x))
+    elif op == 53: return 1./(1.+exp(-(x+y)))
+    elif op == 97: return x/(1.+exp(-x))
+    elif op == 55: return (x+y)/(1.+exp(-(x+y)))
+    elif op == 28: return sinh(x)
+    elif op == 29: return cosh(x)
+    elif op == 23: return tan(x)
+    return apply(op, x, y, z)
+
+cdef int guard_block(const int[::1] code, const int[::1] arg, const int[:, ::1] kid, const double[::1] constants,
+                     const double[:, ::1] X, Py_ssize_t start, Py_ssize_t stop, double[:, ::1] value, double[:, ::1] exact,
+                     double[::1] root_value, double[::1] root_exact) noexcept nogil:
+    """Guarded and exact values of rows start..stop; 1 when a value reaches the clamp."""
+    cdef Py_ssize_t node, row, i
+    cdef int op, a, b, c
+    cdef double v, y, z, ey, ez
+    for node in range(code.shape[0]-1, -1, -1):
+        op = code[node]
+        for row in range(start, stop):
+            i = row-start
+            if op == 0: value[node, i] = X[row, arg[node]]; exact[node, i] = value[node, i]
+            elif op == 1: value[node, i] = constants[arg[node]]; exact[node, i] = value[node, i]
+            else:
+                a = kid[node, 0]; b = kid[node, 1]; c = kid[node, 2]
+                y = value[b, i] if b >= 0 else 0.; z = value[c, i] if c >= 0 else 0.
+                ey = exact[b, i] if b >= 0 else 0.; ez = exact[c, i] if c >= 0 else 0.
+                v = clean(apply(op, value[a, i], y, z))
+                if fabs(v) >= CLIP: return 1
+                value[node, i] = v; exact[node, i] = apply_exact(op, exact[a, i], ey, ez)
+    for row in range(start, stop):
+        root_value[row] = value[0, row-start]; root_exact[row] = exact[0, row-start]
+    return 0
+
+def guard_verdict(code, arg, kid, constants, X, double tolerance, int block=4096):
+    """afpo.guard_engagement for one compiled tree: 0 when no numeric guard
+    shapes its values on X, 1 at the value clamp, 2 when an input clip changes
+    the output beyond tolerance relative to the output's spread."""
+    cdef const int[::1] codes = np.ascontiguousarray(code, np.int32)
+    cdef const int[::1] args = np.ascontiguousarray(arg, np.int32)
+    cdef const int[:, ::1] kids = np.ascontiguousarray(kid, np.int32)
+    cdef const double[::1] c = np.ascontiguousarray(constants, dtype=float).reshape(-1)
+    cdef const double[:, ::1] Xc = np.ascontiguousarray(X, dtype=float)
+    cdef Py_ssize_t n = Xc.shape[0], width = n if n <= 2*block else block, start, row
+    cdef double[:, ::1] value = np.empty((codes.shape[0], width)), exact = np.empty((codes.shape[0], width))
+    cdef double[::1] root_value = np.empty(n), root_exact = np.empty(n)
+    cdef double mean = 0., spread = 0., d, limit
+    cdef int verdict = 0
+    with nogil:
+        start = 0
+        while start < n and verdict == 0:
+            verdict = guard_block(codes, args, kids, c, Xc, start, start+width if start+width < n else n, value, exact, root_value, root_exact)
+            start += width
+        if verdict == 0 and n > 0:
+            if n > 1:
+                for row in range(n): mean += root_value[row]
+                mean /= n
+                for row in range(n):
+                    d = root_value[row]-mean; spread += d*d
+                spread = sqrt(spread/n)
+            for row in range(n):
+                limit = tolerance*(spread+1e-9*(1.+fabs(root_value[row])))
+                if not fabs(root_exact[row]-root_value[row]) <= limit: verdict = 2; break
+    return verdict
 
 cdef bint irls_affine(const double[::1] p, const double[::1] t, double centre, double spread, double cutoff, double bound,
                       double[::1] u, double[::1] w, double* a_out, double* b_out) noexcept nogil:

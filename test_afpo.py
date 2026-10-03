@@ -607,6 +607,47 @@ class CompiledFitterTests(unittest.TestCase):
         self.assertAlmostEqual(a.constant_vector(fitted["python"])[0], .7, places=6)
         self.assertAlmostEqual(a.constant_vector(fitted["auto"])[0], .7, places=6)
 
+    def test_compiled_jump_scan_matches_python(self):
+        rng = np.random.default_rng(4); X = rng.uniform(-2, 2, (64, 2)); y = np.where(X[:, 0] > .3, 2., -1.) + X[:, 1]
+        tree = ("+", ("*", ("c", 1.5), ("gt", ("x", 0), ("c", -.4))), ("mod", ("x", 1), ("c", 3.)))
+        flat = a._FlatTree(tree); program = a._compiled_program(flat, self.core, 2)
+        start = np.array(a.constant_vector(tree)); scale = a.loss_scale(y)
+        nodes = flat.values(start, X)
+        np.testing.assert_allclose(self.core.node_values(*program, start, X), np.array(nodes), rtol=0, atol=0)
+        for slot, index in enumerate(flat.constants):
+            candidates = a._jump_candidates(flat, nodes, slot, start[slot])
+            want = a._scan_costs(a._nudged_roots(flat, nodes, slot, candidates, X), y, scale, True)
+            path = []; parent = flat.parent[index]
+            while parent >= 0: path.append(parent); parent = flat.parent[parent]
+            got = self.core.scan_costs(program[0], program[2], nodes, index, np.asarray(path, np.int32), np.asarray(candidates),
+                                       y, scale, True, a.loss_delta(), a.AFFINE_COEFFICIENT_BOUND)
+            np.testing.assert_allclose(got, want, rtol=1e-12)
+        a.rng.seed(0); compiled = a.scan_jump_constants(flat, start, X, y, scale, True, program)
+        a.rng.seed(0); python = a.scan_jump_constants(flat, start, X, y, scale, True)
+        np.testing.assert_allclose(compiled, python, rtol=1e-12)
+        self.assertGreater(compiled[1], -.4)                                # the threshold moved toward the jump at .3
+
+    def test_compiled_guard_verdicts_match_python(self):
+        rng = np.random.default_rng(1); a.rng.seed(2)
+        ops = ["+", "*", "/", "pow", "exp", "tan", "sinh", "sigmoid", "exp_decay", "10^x", "log", "floor", "mod", "cube"]
+        verdicts = set()
+        for rows, count in ((64, 300), (9000, 20)):                        # 9000 rows: blocked evaluation
+            X = rng.uniform(-30, 30, (rows, 2))
+            for tree in [a.random_tree(2, ops, 13, 5) for _ in range(count)]:
+                a._GUARD_CACHE.clear()
+                with patch.object(a, "FIT_BACKEND", "python"): want = a.guard_engagement([tree], X)
+                a._GUARD_CACHE.clear()
+                self.assertEqual(a.guard_engagement([tree], X), want, tree); verdicts.add(want)
+        a._GUARD_CACHE.clear()
+        self.assertEqual(verdicts, {"", "value_clamp", "input_clip"})
+
+    def test_compiled_solver_handles_singular_steps(self):
+        # x*c1*c2 has one identifiable product: J^T J is singular; damping must still find the fit.
+        x = np.linspace(.1, 2, 40)[:, None]; y = 6. * x[:, 0]
+        tree = ("*", ("*", ("x", 0), ("c", 1.)), ("c", 2.))
+        fitted = a.fit_tree_constants(tree, x, y, fit_readout=False)
+        c = a.constant_vector(fitted); self.assertAlmostEqual(c[0] * c[1], 6., places=6)
+
     def test_unsupported_trees_fall_back_to_python(self):
         tree = ("bitwise_and", ("x", 0), ("c", 3.))
         with patch.dict(self.core.OPERATOR_CODES):
