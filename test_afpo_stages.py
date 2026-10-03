@@ -631,6 +631,34 @@ class ParallelCellTests(unittest.TestCase):
         lineages = {m["lineage_id"] for cell in state["island_states"] for m in cell["population"]}
         self.assertTrue(any(lineage >= 1 << a.LINEAGE_RANGE_BITS for lineage in lineages))
 
+    def test_scoring_workers_do_not_change_results(self):
+        # Scoring (tuning, the jump-constant scan) runs in --workers processes;
+        # nothing there may draw from the run's random streams.
+        x = np.random.default_rng(1).uniform(-2, 2, (60, 2))
+        df = pd.DataFrame({"a": x[:, 0], "b": x[:, 1], "y": np.where(x[:, 0] > .4, 3., 1.) + np.mod(x[:, 1], 1.3)})
+        def run(workers):
+            with tempfile.TemporaryDirectory(prefix="afpo-workers-") as directory, contextlib.chdir(directory):
+                df.to_csv("d.csv", index=False)
+                args = a.parse_cli(["--population", "48", "--max-generations", "4", "--seed", "9", "--workers", str(workers)])[1]
+                setup = {"path": Path("d.csv"), "df": df, "types": [1, 1, 5], "delimiter": ",",
+                         "ops": ["+", "-", "*", "gt", "mod", "floor", "if_else"], "affine_on": True, "coev": False,
+                         "dynamic_pressure_on": True, "adf_enabled": False, "nodes": 21, "depth": 5, "island_count": 1,
+                         "migration_interval": 0, "migrants_per_island": 0, "val_path": "", "validation_percent": 20, "metadata": {}}
+                with contextlib.redirect_stdout(io.StringIO()):
+                    checkpoint = a.train_from_setup(args, setup, choose_model=lambda *_: 0)["checkpoint"]
+                population = a.load_checkpoint(checkpoint, False)[1]
+            return [(repr(m.trees), m.objectives[:-1]) for m in population]
+        self.assertEqual(run(1), run(3))
+
+    def test_jump_scan_leaves_the_run_streams_alone(self):
+        X = np.random.default_rng(2).uniform(-2, 2, (40, 1)); y = np.floor(X[:, 0])
+        tree = ("+", ("+", ("gt", ("x", 0), ("c", .1)), ("gt", ("x", 0), ("c", -.9))),
+                ("+", ("gt", ("x", 0), ("c", 1.2)), ("mod", ("x", 0), ("c", 2.))))   # 4 jump constants, 3 are scanned
+        flat = a._FlatTree(tree); start = np.array(a.constant_vector(tree))
+        state = a.rng.getstate(); first = a.scan_jump_constants(flat, start, X, y, a.loss_scale(y))
+        self.assertEqual(a.rng.getstate(), state)
+        a.rng.seed(123); np.testing.assert_array_equal(a.scan_jump_constants(flat, start, X, y, a.loss_scale(y)), first)
+
     def test_cell_streams_restore_the_shared_streams(self):
         cell = type("Cell", (), {"streams": None})()
         a.seed_cell_streams([cell], 7)

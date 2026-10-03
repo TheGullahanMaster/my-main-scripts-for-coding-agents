@@ -5,14 +5,16 @@ Only numpy and pandas are required; matplotlib is optional and only used by
 the exported model.  Start it with ``python afpo.py``.
 Use ``--max-generations N`` for a bounded unattended run (useful in CI).
 
-Speed: with Cython and a C compiler installed, constant fitting and the
-numeric inversion of semantic backpropagation use the compiled kernels in
-afpo_lib/fitcore.pyx (built on first use; every operator except
-seqsum/seqprod is compiled; ``--fit-backend python`` opts out).  Runs with several island/stage cells evolve the cells in
-parallel processes (``--cell-workers``; results are identical to serial).
-Above 8192 rows trees are evaluated in cache-sized row blocks (identical
-values) and the affine readout uses the compiled streaming fit, so many
-``--workers`` no longer starve each other of memory bandwidth.
+Speed: with Cython and a C compiler installed, constant fitting (the
+Levenberg-Marquardt loop and the jump-constant scan), the Huber affine
+readout, the numeric guard check and the numeric inversion of semantic
+backpropagation use the compiled kernels in afpo_lib/fitcore.pyx (built on
+first use; every operator except seqsum/seqprod is compiled; they agree with
+Python to round-off; ``--fit-backend python`` opts out).  Runs with several
+island/stage cells evolve the cells in parallel processes (``--cell-workers``;
+results are identical to serial).  Above 8192 rows trees are evaluated in
+cache-sized row blocks (identical values), so many ``--workers`` no longer
+starve each other of memory bandwidth.
 """
 from __future__ import annotations
 
@@ -413,8 +415,25 @@ def model_description(model, n_features=None, operators=None, adfs=None):
             "adf_definition_bits":definition_bits,
             "total_bits":sum(item["bits"] for item in trees)+sum(item["bits"] for item in affine)+definition_bits}
 
+# Tree and ADF-definition bits depend only on the trees, the grammar, the
+# feature count and the called ADFs; scoring asks for them for every model it
+# scores and the Bayesian banks for every particle, each time building the full
+# audit record.  Memoize that structural part (exact integers, so the total is
+# unchanged); the readout coefficients are priced fresh.  Invalid models raise
+# from model_description() and are never cached.
+_DESCRIPTION_BITS_CACHE={}
 def model_description_bits(model, n_features=None, operators=None, adfs=None):
-    return float(model_description(model,n_features,operators,adfs)["total_bits"])
+    n_features=model.mdl_feature_count if n_features is None else n_features
+    operators=tuple(model.mdl_operators if operators is None else operators)
+    adfs=getattr(model,"adfs",{}) if adfs is None else adfs
+    key=(repr(model.trees),n_features,operators,adf_signature(model.trees,adfs))
+    structural=_DESCRIPTION_BITS_CACHE.get(key)
+    if structural is None:
+        description=model_description(model,n_features,operators,adfs)
+        if len(_DESCRIPTION_BITS_CACHE)>=50_000: _DESCRIPTION_BITS_CACHE.clear()
+        _DESCRIPTION_BITS_CACHE[key]=description["tree_bits"]+description["adf_definition_bits"]
+        return float(description["total_bits"])
+    return float(structural+sum(exact_float_code(scale)["bits"]+exact_float_code(intercept)["bits"] for scale,intercept in model.scales))
 
 def clean(x: Any) -> np.ndarray:
     # Same result as nan_to_num(nan=0, posinf=CLIP, neginf=-CLIP) then clip
@@ -867,10 +886,31 @@ def _guard_walk(t, X, adfs, arguments=None, position=None):
             pairs=[_guard_walk(q,X,adfs,arguments,position) for q in t[1:]]
             values=[v for v,_ in pairs]; references=[r for _,r in pairs]
             raw=np.asarray(_OP_TABLE[t[0]](values[0],values),float)
-            exact=np.asarray(_UNGUARDED.get(t[0],_OP_TABLE[t[0]])(references[0],references),float)
+            # While every input is still its exact reference and the operator
+            # has no unguarded form, the exact pass would repeat this very
+            # computation; share it (the common case: no guard on the path).
+            if t[0] not in _UNGUARDED and all(v is r for v,r in pairs): exact=None
+            else: exact=np.asarray(_UNGUARDED.get(t[0],_OP_TABLE[t[0]])(references[0],references),float)
     value=clean(raw)
     if np.any(np.abs(value)>=CLIP): raise _GuardEngaged("value_clamp")
+    if exact is None:
+        # Below the clamp, clean() changes only NaNs (to 0): with none, the
+        # guarded value is bitwise the exact one and can stand for it.
+        if np.isnan(raw).any(): exact=raw
+        else: return value,value
     return value,exact
+_COMPILED_TREES={}
+def _compiled_tree(tree, feature_count):
+    """(core, program, constants) of a tree the compiled kernels can run, else None (memoized)."""
+    if FIT_BACKEND!="auto": return None
+    key=(repr(tree),feature_count); hit=_COMPILED_TREES.get(key)
+    if hit is None:
+        core=compiled_fitter(); flat=None if core is None else _FlatTree.build(tree)
+        program=None if flat is None else _compiled_program(flat,core,feature_count)
+        hit=(None,) if program is None else (core,program,np.array([flat.payload[index] for index in flat.constants],float))
+        if len(_COMPILED_TREES)>=20000: _COMPILED_TREES.clear()
+        _COMPILED_TREES[key]=hit
+    return None if hit[0] is None else hit
 def _guard_changes_output(value, exact):
     spread=float(np.std(value)) if np.size(value)>1 else 0.
     tolerance=GUARD_TOLERANCE*(spread+1e-9*(1.+np.abs(value)))
@@ -885,6 +925,14 @@ def guard_engagement(trees, X, adfs=None):
     reason=""; blocks=_row_blocks(len(X)) if X.ndim==2 else None
     try:
         for tree in trees:
+            compiled=_compiled_tree(tree,X.shape[1]) if X.ndim==2 else None
+            if compiled is not None:
+                # One compiled pass computes both the guarded and the exact
+                # values (blocked like evaluate()), with the same verdicts.
+                verdict=compiled[0].guard_verdict(*compiled[1],compiled[2],X,GUARD_TOLERANCE,EVALUATION_BLOCK_ROWS)
+                if verdict==1: raise _GuardEngaged("value_clamp")
+                if verdict==2: reason="input_clip"; break
+                continue
             if blocks is None: value,exact=_guard_walk(tree,X,adfs)
             else:
                 # Blocked like evaluate(); a clamp in any block is a clamp on X,
@@ -1321,18 +1369,38 @@ def _nudged_roots(flat, nodes, slot, candidates, X):
             current=_op_eval_unguarded_state(flat.kind[index],[current if child==changed else nodes[child] for child in flat.children[index]])
             changed,index=index,flat.parent[index]
     return np.broadcast_to(current,(len(candidates),len(X)))
-def scan_jump_constants(flat, start, X, y, scale, fit_readout=True):
+def scan_jump_constants(flat, start, X, y, scale, fit_readout=True, program=None):
     """Constant vector with jump constants placed by a candidate scan, or None.
 
     Every candidate value of a constant is scored in one batched pass along
-    its path to the root (a (K, rows) array), not one evaluation per value."""
+    its path to the root (a (K, rows) array), not one evaluation per value.
+    ``program`` (from _compiled_program) runs the scan in the compiled kernel."""
     slots=jump_constant_slots(flat)
     if not slots: return None
-    if len(slots)>JUMP_SCAN_MAX_CONSTANTS: slots=rng.sample(slots,JUMP_SCAN_MAX_CONSTANTS)
+    if len(slots)>JUMP_SCAN_MAX_CONSTANTS:
+        # Drawn from the tree itself, not the run's random stream: scoring runs
+        # in --workers processes whose stream copies diverge with scheduling,
+        # so a stream draw here made parallel runs irreproducible.
+        seed=hashlib.blake2b(repr((flat.kind,flat.payload,[float(value) for value in start])).encode(),digest_size=8).digest()
+        slots=random.Random(int.from_bytes(seed,"little")).sample(slots,JUMP_SCAN_MAX_CONSTANTS)
     JUMP_SCAN_STATS["scans"]+=1
     current=np.array(start,float)
+    core=compiled_fitter() if program is not None else None
+    if core is not None:
+        code,arg,kid=program; Xc=np.ascontiguousarray(X,dtype=float); yc=np.ascontiguousarray(y,dtype=float)
+        bound,huber=AFFINE_COEFFICIENT_BOUND,loss_delta()
+        def node_values(constants): return core.node_values(code,arg,kid,constants,Xc)
+        def root_cost(nodes): return float(core.prediction_costs(nodes[0][None,:],yc,scale,fit_readout,huber,bound)[0])
+        def candidate_costs(nodes, slot, candidates):
+            changed=flat.constants[slot]; path=[]; index=flat.parent[changed]
+            while index>=0: path.append(index); index=flat.parent[index]
+            return core.scan_costs(code,kid,nodes,changed,np.asarray(path,np.int32),np.asarray(candidates,float),yc,scale,fit_readout,huber,bound)
+    else:
+        def node_values(constants): return flat.values(constants,X)
+        def root_cost(nodes): return float(_scan_costs(nodes[0][None,:],y,scale,fit_readout)[0])
+        def candidate_costs(nodes, slot, candidates): return _scan_costs(_nudged_roots(flat,nodes,slot,candidates,X),y,scale,fit_readout)
     try:
-        nodes=flat.values(current,X); best=initial=float(_scan_costs(nodes[0][None,:],y,scale,fit_readout)[0])
+        nodes=node_values(current); best=initial=root_cost(nodes)
         for slot in slots:
             chosen=current[slot]
             candidates=_jump_candidates(flat,nodes,slot,chosen)
@@ -1341,11 +1409,11 @@ def scan_jump_constants(flat, start, X, y, scale, fit_readout=True):
                 if round_:
                     step=(.05 if round_==1 else .005)*max(abs(chosen),1e-3)
                     candidates=[chosen+step*k for k in (-8,-6,-4,-3,-2,-1,-.5,.5,1,2,3,4,6,8)]
-                costs=_scan_costs(_nudged_roots(flat,nodes,slot,candidates,X),y,scale,fit_readout)
+                costs=candidate_costs(nodes,slot,candidates)
                 pick=int(np.argmin(costs))
                 if costs[pick]<best: best,chosen=float(costs[pick]),float(candidates[pick])
             if chosen!=current[slot]:
-                current[slot]=chosen; nodes=flat.values(current,X)
+                current[slot]=chosen; nodes=node_values(current)
     except (ArithmeticError, IndexError, ValueError): return None
     if not best<initial: return None
     JUMP_SCAN_STATS["improved"]+=1
@@ -1366,23 +1434,24 @@ def fit_tree_constants(tree, X, y, adfs=None, fit_readout=True, iterations=None,
     if not len(start) or not len(y): return tree
     scale=loss_scale(y); flat=_FlatTree.build(tree); huber=loss_delta()
     base=loss_base_weights(y); ones=np.ones(len(y)) if base is None else base*base
+    program=None
+    if flat is not None and FIT_BACKEND=="auto" and LOSS_MODE=="huber" and isinstance(X,np.ndarray) and X.ndim==2:
+        core=compiled_fitter(); program=None if core is None else _compiled_program(flat,core,X.shape[1])
     if JUMP_CONSTANT_SCAN and flat is not None and isinstance(X,np.ndarray) and X.ndim==2:
-        scanned=scan_jump_constants(flat,start,X,y,scale,fit_readout)
+        scanned=scan_jump_constants(flat,start,X,y,scale,fit_readout,program)
         if scanned is not None:
             placed=with_constants(tree,scanned)
             # The gradient fit below returns its own input unless it improves
             # further, so the scanned tree becomes that input.
             if not guarded_constant_divisor(placed) and not guard_engagement([placed],X,adfs): tree,start=placed,scanned
-    if flat is not None and FIT_BACKEND=="auto" and LOSS_MODE=="huber" and isinstance(X,np.ndarray) and X.ndim==2:
-        core=compiled_fitter(); program=None if core is None else _compiled_program(flat,core,X.shape[1])
-        if program is not None:
-            result=core.fit(*program,start,np.ascontiguousarray(X,dtype=float),np.ascontiguousarray(y,dtype=float),scale,
-                            fit_readout,robust,iterations,AFFINE_COEFFICIENT_BOUND,huber,CONSTANT_LIMIT)
-            if result is None: return tree
-            current,cost,initial=result
-            if cost>=initial: return tree
-            tuned=with_constants(tree,current)
-            return tree if guarded_constant_divisor(tuned) or guard_engagement([tuned],X,adfs) else tuned
+    if program is not None:
+        result=core.fit(*program,start,np.ascontiguousarray(X,dtype=float),np.ascontiguousarray(y,dtype=float),scale,
+                        fit_readout,robust,iterations,AFFINE_COEFFICIENT_BOUND,huber,CONSTANT_LIMIT)
+        if result is None: return tree
+        current,cost,initial=result
+        if cost>=initial: return tree
+        tuned=with_constants(tree,current)
+        return tree if guarded_constant_divisor(tuned) or guard_engagement([tuned],X,adfs) else tuned
     # readout() runs ~30 times per fit on <=256 rows, so numpy's per-call
     # overhead is the cost: scalars are hoisted and wrappers (np.clip/np.all
     # on scalars) avoided.  Every value is computed exactly as before.
@@ -1684,9 +1753,22 @@ class PosteriorParticlePopulation:
             return float(np.mean(np.where(valid,-np.log(np.maximum(probability[row,np.clip(truth,0,probability.shape[1]-1)],EPS)),-np.log(EPS))))
         return float("inf")
 
+    def _cached_likelihood_energy(self, model, X, Y, cats):
+        """_likelihood_energy, memoized: the catalog carries over between
+        generations, so the same particles were re-predicted every update."""
+        if not (isinstance(X,np.ndarray) and isinstance(Y,np.ndarray)): return self._likelihood_energy(model,X,Y,cats)
+        key=(repr(model.trees),repr(model.scales),adf_signature(model.trees,model.adfs),array_digest(X),array_digest(Y),
+             repr(cats),self.likelihood_kind,self.noise_scale,self.student_t_df)
+        hit=_LIKELIHOOD_ENERGY_CACHE.get(key)
+        if hit is None:
+            hit=self._likelihood_energy(model,X,Y,cats)
+            if len(_LIKELIHOOD_ENERGY_CACHE)>=20000: _LIKELIHOOD_ENERGY_CACHE.clear()
+            _LIKELIHOOD_ENERGY_CACHE[key]=hit
+        return hit
+
     def _energies(self, models, X=None, Y=None, cats=None):
         if X is not None and self.likelihood_kind!="legacy":
-            return np.asarray([self._likelihood_energy(model,X,Y,cats)+self.complexity_prior*model_complexity(model) for model in models])
+            return np.asarray([self._cached_likelihood_energy(model,X,Y,cats)+self.complexity_prior*model_complexity(model) for model in models])
         losses=np.asarray([max(0.0,aggregate_loss(m)) for m in models])
         finite=losses[np.isfinite(losses)]
         scale=max(EPS,float(np.median(finite))) if len(finite) else 1.0
@@ -1987,6 +2069,7 @@ class BayesianEquationGenerator:
 # rescored on all training rows each generation.  Scoring is deterministic in
 # the trees, called ADFs, grammar and data, so reuse it (age is live state).
 _PARTICLE_SCORE_CACHE={}
+_LIKELIHOOD_ENERGY_CACHE={}
 def assess_particle_cached(particle, X, Y, affine_on, cats):
     key=(repr(particle.trees),adf_signature(particle.trees,particle.adfs),tuple(particle.mdl_operators),particle.mdl_feature_count,
          array_digest(X),array_digest(Y),bool(affine_on),repr(cats))
@@ -2707,21 +2790,33 @@ def _fragment_halves(n):
     """Deterministic interleaved row halves for cross-fitting (None when too few rows)."""
     if n<8: return None
     rows=np.arange(n); return rows[0::2],rows[1::2]
-def cross_fitted_reduction(values, residual, halves):
+def constant_baselines(residual, halves):
+    """Held-out loss of the best constant, per cross-fitting direction: the
+    part of cross_fitted_reduction that depends on the residual alone, so one
+    model's fragments can share it."""
+    if halves is None: return None
+    baselines=[]
+    for fit,score in (halves,halves[::-1]):
+        _,level=affine(np.zeros(len(fit)),residual[fit])
+        baselines.append(robust_loss(np.full(len(score),level),residual[score]))
+    return baselines
+def cross_fitted_reduction(values, residual, halves, baselines=None):
     """Held-out residual reduction of an affinely fitted fragment beyond the best constant.
 
     Fit on one half, score on the other, both ways, and average.  A fragment
     that is constant on the rows earns nothing (it can only move the mean,
-    which the model's own affine readout already does)."""
+    which the model's own affine readout already does).  ``baselines``: a
+    list the caller shares across one residual's fragments; it is filled with
+    constant_baselines(residual, halves) on first need."""
     values=np.asarray(values,float)
     if not np.all(np.isfinite(values)) or float(np.std(values))<=1e-12*(1.+float(np.mean(np.abs(values)))): return 0.
     if halves is None: return 0.
+    if baselines is None: baselines=[]
+    if not baselines: baselines.extend(constant_baselines(residual,halves))
     gains=[]
-    for fit,score in (halves,halves[::-1]):
+    for (fit,score),baseline in zip((halves,halves[::-1]),baselines):
         scale,offset=affine(values[fit],residual[fit])
-        _,level=affine(np.zeros(len(fit)),residual[fit])
-        target=residual[score]
-        gains.append(robust_loss(np.full(len(score),level),target)-robust_loss(clean(scale*values[score]+offset),target))
+        gains.append(baseline-robust_loss(clean(scale*values[score]+offset),residual[score]))
     return float(np.mean(gains))
 class FragmentLibrary:
     """Small, checkpointable store of partial symbolic discoveries."""
@@ -2790,7 +2885,7 @@ class FragmentLibrary:
                 if labels is not None or not heads: continue
                 residual=np.asarray(Y[:,output]-prediction[:,output],float)
                 residual_key=(hashlib.blake2b(np.ascontiguousarray(residual).view(np.uint8),digest_size=16).digest(),array_digest(X),adf_signature(model.trees,model.adfs))
-                tree=model.trees[heads[0]]
+                tree=model.trees[heads[0]]; baselines=[]
                 for path in subtree_paths(tree):
                     fragment=subtree_at(tree,path); size=node_size(fragment)
                     if not 2<=size<=12: continue
@@ -2807,7 +2902,7 @@ class FragmentLibrary:
                     # is deterministic, so reuse it (failures included).
                     fit_key=(key,residual_key); reduction=_FRAGMENT_FIT_CACHE.get(fit_key)
                     if reduction is None:
-                        try: reduction=cross_fitted_reduction(evaluate_cached(fragment,X,model.adfs),residual,halves)
+                        try: reduction=cross_fitted_reduction(evaluate_cached(fragment,X,model.adfs),residual,halves,baselines)
                         except (ArithmeticError, IndexError, ValueError): reduction=_FRAGMENT_FIT_FAILED
                         if len(_FRAGMENT_FIT_CACHE)>=100_000: _FRAGMENT_FIT_CACHE.clear()
                         _FRAGMENT_FIT_CACHE[fit_key]=reduction
@@ -3325,10 +3420,11 @@ def _affine(pred, y):
     varying=spread>=EPS; spread=spread if varying else 1.
     bound=AFFINE_COEFFICIENT_BOUND
     # (A constant prediction is a degenerate line the compiled path would only hand back.)
-    if varying and len(pred)>2*EVALUATION_BLOCK_ROWS and FIT_BACKEND=="auto" and LOSS_MODE=="huber":
-        # Large data: the compiled IRLS streams the rows twice per iteration
-        # instead of ~25 times (memory bandwidth, not arithmetic, was the cost).
-        # It agrees to round-off; rare degenerate/bounded fits fall through.
+    if varying and FIT_BACKEND=="auto" and LOSS_MODE=="huber":
+        # The compiled IRLS streams the rows twice per iteration instead of ~25
+        # times (memory bandwidth on large data) and has no per-iteration numpy
+        # overhead (which dominated on small data).  It agrees to the solver's
+        # sqrt(eps) tolerance; rare degenerate/bounded fits fall through.
         core=compiled_fitter()
         if core is not None:
             fitted=core.robust_affine(np.ascontiguousarray(pred,dtype=float),np.ascontiguousarray(y,dtype=float),centre,spread,loss_delta()*target_scale(y),bound)
@@ -3882,8 +3978,25 @@ class QualityDiversityArchive:
         scale=np.std(centred,axis=0,keepdims=True)
         return np.divide(centred,scale,out=np.zeros_like(centred),where=scale>=EPS).reshape(-1)
 
+    # Descriptors are pure functions of a model's trees, readout and called
+    # ADFs (and the archive's fixed probe), but update() needs each one twice
+    # (initialize, then cell) and every cell model is re-binned each
+    # generation, so most were recomputed.  The memo is per archive, bounded,
+    # and never pickled or snapshotted.
+    DESCRIPTOR_CACHE_LIMIT=8192
+    def descriptor_key(self, model): return (repr(model.trees),repr(model.scales),adf_signature(model.trees,model.adfs))
+    def cached_descriptor(self, model):
+        cache=self.__dict__.setdefault("_descriptor_cache",{})
+        key=self.descriptor_key(model); hit=cache.get(key)
+        if hit is None:
+            if len(cache)>=self.DESCRIPTOR_CACHE_LIMIT: cache.clear()
+            hit=np.asarray(self.descriptor(model)); hit.setflags(write=False); cache[key]=hit
+        return hit
+    def __getstate__(self):
+        state=dict(self.__dict__); state.pop("_descriptor_cache",None); return state
+
     def initialize(self, candidates):
-        descriptors=[self.descriptor(model) for model in candidates if model.feasible]
+        descriptors=[self.cached_descriptor(model) for model in candidates if model.feasible]
         if descriptors and not self.initialized:
             self.landmarks=cvt_landmarks(np.asarray(descriptors),self.capacity)
         elif descriptors and len(self.landmarks)<self.capacity:
@@ -3906,7 +4019,7 @@ class QualityDiversityArchive:
 
     def cell(self, model):
         if not self.initialized: raise ValueError("QD landmarks have not been initialized")
-        descriptor=self.descriptor(model)
+        descriptor=self.cached_descriptor(model)
         return int(np.argmin(np.sum((self.landmarks-descriptor)**2,axis=1)))
 
     def update(self, candidates, loss_threshold=None):
@@ -4011,6 +4124,7 @@ class StructuralQualityDiversityArchive(QualityDiversityArchive):
         super().__init__(np.empty((0,self.n_features)),(),seed,capacity,landmarks)
 
     def descriptor(self, model): return structural_descriptor(model,self.n_features)
+    def descriptor_key(self, model): return repr(model.trees)
 
     def snapshot(self):
         data=super().snapshot(); data["n_features"]=self.n_features; return data
@@ -6389,7 +6503,7 @@ def reset_run_caches():
     and data alone.  A fresh process starts empty; benchmarks and tests run
     several configurations in one process, which then reused the previous
     configuration's particle scores, fragment fits and constant readouts."""
-    for cache in (_PARTICLE_SCORE_CACHE,_FRAGMENT_FIT_CACHE,_CONSTANT_AFFINE_CACHE): cache.clear()
+    for cache in (_PARTICLE_SCORE_CACHE,_LIKELIHOOD_ENERGY_CACHE,_FRAGMENT_FIT_CACHE,_CONSTANT_AFFINE_CACHE): cache.clear()
     INVALID_DIAGNOSTICS.clear()
 
 def synchronize_model_ages(models, generation):
@@ -6890,7 +7004,7 @@ def stop_rule_reached(args, started, islands):
     return False
 
 def build_arg_parser():
-    ap=argparse.ArgumentParser(); ap.add_argument("--max-generations",type=int,default=0); ap.add_argument("--population",type=int,default=160); ap.add_argument("--seed",type=int); ap.add_argument("--workers",type=int,default=0,help="Model-scoring processes; 0=auto, 1=serial (default: 0)"); ap.add_argument("--adf-mode",choices=("off","flat","nested"),default="nested",help="ADF experiment mode; nested is v2, flat is the v1-style ablation, off disables ADFs")
+    ap=argparse.ArgumentParser(); ap.add_argument("--max-generations",type=int,default=0); ap.add_argument("--population",type=int,default=160); ap.add_argument("--seed",type=int); ap.add_argument("--workers",type=int,default=0,help="Model-scoring processes; 0=auto, 1=serial.  Results are identical for any count (default: 0)"); ap.add_argument("--adf-mode",choices=("off","flat","nested"),default="nested",help="ADF experiment mode; nested is v2, flat is the v1-style ablation, off disables ADFs")
     ap.add_argument("--bayesian-proposal-rate",type=float,default=.25,help="Fraction of offspring drawn from the Bayesian equation generator (0..1)")
     ap.add_argument("--bayesian-mode",choices=("off","grammar","fixed","adaptive"),default="adaptive",help="Bayesian injection policy: off, grammar-only, fixed particle mix, or adaptive particle mix")
     ap.add_argument("--crossover-rate",type=float,default=.35,help="Fraction of non-Bayesian offspring made by subtree crossover (0..1)")
@@ -6918,7 +7032,7 @@ def build_arg_parser():
     ap.add_argument("--qd-parent-choice",choices=QD_PARENT_CHOICES,default="quality_coverage",help="How QD archives pick parent cells beyond the uniform share: success x bounded quality rank x coverage bonus, or legacy success-only (default: quality_coverage)")
     ap.add_argument("--scale-balanced-selection",choices=("on","off"),default="on",help="Selection-only: give every target-magnitude band equal weight and compare asinh-compressed errors in lexicase parent choice; reported loss is unchanged (default: on)")
     ap.add_argument("--cell-workers",type=int,default=0,help="Processes that evolve island/stage cells in parallel; 0=auto (one per cell, up to CPUs-1), 1=serial.  Results are identical either way (default: 0)")
-    ap.add_argument("--fit-backend",choices=("auto","python"),default="auto",help="Compiled kernels: auto uses the Cython constant fitter (and, above 8192 rows, the compiled affine readout) when they build: several times faster, agreeing with Python to round-off.  python always uses the pure-Python code (default: auto)")
+    ap.add_argument("--fit-backend",choices=("auto","python"),default="auto",help="Compiled kernels: auto uses the Cython constant fitter, jump-constant scan, affine readout and numeric guard check when they build: several times faster, agreeing with Python to round-off.  python always uses the pure-Python code (default: auto)")
     ap.add_argument("--numeric-guard-check",choices=("on","off"),default="on",help="Reject models whose values depend on afpo's numeric safety guards (the +/-1e12 value clamp, sinh/cosh/tan input clips) instead of letting them use a guard as a hidden min/max (default: on)")
     ap.add_argument("--interpolation-check",choices=("on","off"),default="on",help="Add a loss term scoring predictions between nearest-neighbour rows against interpolated targets, so equations that only memorise the training rows (e.g. short-period mod sawtooths) lose (default: on)")
     ap.add_argument("--jump-constant-scan",choices=("on","off"),default="on",help="Before the gradient constant fit, scan data-driven values for constants that only move a jump (mod periods, comparison thresholds, floor scales), which the gradient fit cannot move (default: on)")
