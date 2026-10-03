@@ -1704,7 +1704,7 @@ class PosteriorParticlePopulation:
         return {"trees":model.trees,"scales":model.scales,"age":model.age,"objectives":model.objectives,
                 "lineage_id":model.lineage_id,"origin":model.origin,"parent_ids":model.parent_ids,
                 "feasible":model.feasible,"invalid_reason":model.invalid_reason,"constraint_count":model.constraint_count,
-                "mdl_operators":model.mdl_operators,"mdl_feature_count":model.mdl_feature_count,"adfs":checkpoint_adfs(model),"founder_ids":model.founder_ids,"birth_generation":model.birth_generation}
+                "mdl_operators":model.mdl_operators,"mdl_feature_count":model.mdl_feature_count,"adfs":checkpoint_adfs(model),"founder_ids":model.founder_ids,"birth_generation":model.birth_generation,"history":list(model.history)}
 
     def snapshot(self):
         return {"capacity":self.capacity,"complexity_prior":self.complexity_prior,"ess_ratio":self.ess_ratio,
@@ -3518,10 +3518,168 @@ class Model:
     adfs:dict=field(default_factory=dict)
     founder_ids:tuple=field(default_factory=tuple)
     birth_generation:int|None=None
+    # Main-line history (see HISTORY_LIMIT): observational only, never read
+    # by the search.  Records are never mutated in place, so clones share them.
+    history:tuple=field(default_factory=tuple,compare=False)
     def __post_init__(self):
         if not self.founder_ids: self.founder_ids=(self.lineage_id,)
         else: self.founder_ids=tuple(sorted(set(self.founder_ids)))
-    def clone(self): return Model(trees=list(self.trees),scales=list(self.scales),age=self.age,objectives=tuple(self.objectives),lineage_id=self.lineage_id,origin=self.origin,parent_ids=tuple(self.parent_ids),feasible=self.feasible,invalid_reason=self.invalid_reason,constraint_count=self.constraint_count,mdl_operators=tuple(self.mdl_operators),mdl_feature_count=self.mdl_feature_count,adfs=dict(self.adfs),founder_ids=tuple(self.founder_ids),birth_generation=self.birth_generation)
+        if not isinstance(self.history,tuple): self.history=tuple(self.history or ())
+    def clone(self): return Model(trees=list(self.trees),scales=list(self.scales),age=self.age,objectives=tuple(self.objectives),lineage_id=self.lineage_id,origin=self.origin,parent_ids=tuple(self.parent_ids),feasible=self.feasible,invalid_reason=self.invalid_reason,constraint_count=self.constraint_count,mdl_operators=tuple(self.mdl_operators),mdl_feature_count=self.mdl_feature_count,adfs=dict(self.adfs),founder_ids=tuple(self.founder_ids),birth_generation=self.birth_generation,history=self.history)
+
+# Main-line model history.  Every model carries a short timeline of its main
+# line of descent: where it was born (generation, island, stage, role, how),
+# runs of variation on one island (consecutive mutations collapsed into one
+# record with the generation span, the count and kinds of moves, and MDL bits
+# and loss at the start and end of the run), crossovers (partner lineage id
+# and the island and role the partner was last made on), migrations (ring or
+# gathered by a simplifier), stage promotions and the final constant
+# snapping.  A child inherits its main parent's timeline (the first parent of
+# a crossover).  Runs never merge across an island, stage, role, crossover or
+# migration.  Past HISTORY_LIMIT records the oldest block of variation and
+# crossover records is merged into one summary record, so births,
+# migrations, promotions and snapping are kept preferentially.  Purely
+# observational: no equivalence key, MDL, selection, deduplication or random
+# draw reads it.
+HISTORY_LIMIT = 64
+HISTORY_LANDMARKS = frozenset(("born","migrated","promoted","snapped"))
+def history_place(cell=None, role=None):
+    """{"island", "stage", "role"} of a cell (island/stage numbers are 0-based)."""
+    if cell is None: return {"island":0,"stage":0,"role":role}
+    return {"island":int(cell.island_index),"stage":int(cell.stage),"role":role if role is not None else (role_kind(cell) if cell.role else None)}
+def _history_number(value):
+    """4 significant digits keep timelines readable and checkpoints small."""
+    return float(f"{value:.4g}") if value is not None and np.isfinite(value) else None
+def _history_score(model):
+    bits=model_complexity(model)
+    return (int(round(bits)) if np.isfinite(bits) else None),_history_number(aggregate_loss(model))
+def _history_start(parent, place):
+    """A parent's timeline, or a birth record built from the parent itself
+    (Bayesian particles and pre-history checkpoints carry none)."""
+    if parent.history: return parent.history
+    bits,loss=_history_score(parent)
+    return ({"event":"born","generation":parent.birth_generation,**place,"how":parent.origin,"bits":bits,"loss":loss},)
+def _history_same_place(record, place):
+    return all(record.get(key)==place.get(key) for key in ("island","stage","role"))
+def _history_compact(history):
+    """Merge the oldest run of 2+ adjacent variation/crossover records into one summary record."""
+    history=list(history)
+    while len(history)>HISTORY_LIMIT:
+        start=None
+        for index in range(len(history)-1):
+            if history[index]["event"] not in HISTORY_LANDMARKS and history[index+1]["event"] not in HISTORY_LANDMARKS:
+                start=index; break
+        if start is None:
+            # No two adjacent ordinary records: drop the oldest one (or, failing
+            # that, the oldest landmark after the birth).
+            index=next((i for i,r in enumerate(history) if r["event"] not in HISTORY_LANDMARKS),1)
+            del history[index]; continue
+        end=start
+        while end+1<len(history) and history[end+1]["event"] not in HISTORY_LANDMARKS: end+=1
+        block=history[start:end+1]; kinds={}; count=0
+        for record in block:
+            if record["event"]=="crossover": kinds["crossover"]=kinds.get("crossover",0)+1; count+=1
+            else:
+                for kind,n in record.get("kinds",{}).items(): kinds[kind]=kinds.get(kind,0)+n
+                count+=record.get("count",1)
+        first,last=block[0],block[-1]
+        places={(r.get("island"),r.get("stage"),r.get("role")) for r in block}
+        island,stage,role=next(iter(places)) if len(places)==1 else (None,None,None)
+        history[start:end+1]=[{"event":"variation","start":first.get("start",first.get("generation")),"end":last.get("end",last.get("generation")),
+                               "island":island,"stage":stage,"role":role,"count":count,"kinds":kinds,"merged":True,
+                               "bits":[first["bits"][0],last["bits"][1]],"loss":[first["loss"][0],last["loss"][1]]}]
+    return tuple(history)
+def history_append(history, record):
+    return _history_compact((*history,record)) if len(history)>=HISTORY_LIMIT else (*history,record)
+def history_born(model, generation, place):
+    """Start a timeline for a model that has none (seeds, fresh and injected models)."""
+    if model.history: return
+    bits,loss=_history_score(model)
+    model.history=({"event":"born","generation":int(generation),**place,"how":model.origin,"bits":bits,"loss":loss},)
+def history_varied(child, parent, generation, place, kinds):
+    """A mutation-like move on the parent's island: extend the open run or start one."""
+    history=_history_start(parent,place)
+    before,after=_history_score(parent),_history_score(child)
+    kinds=[kind for kind in kinds if kind]
+    last=history[-1]
+    if last["event"]=="variation" and not last.get("merged") and _history_same_place(last,place):
+        merged=dict(last.get("kinds",{}))
+        for kind in kinds: merged[kind]=merged.get(kind,0)+1
+        child.history=(*history[:-1],{**last,"end":int(generation),"count":last["count"]+1,"kinds":merged,
+                                       "bits":[last["bits"][0],after[0]],"loss":[last["loss"][0],after[1]]})
+    else:
+        counted={}
+        for kind in kinds: counted[kind]=counted.get(kind,0)+1
+        child.history=history_append(history,{"event":"variation","start":int(generation),"end":int(generation),**place,"count":1,
+                                              "kinds":counted,"bits":[before[0],after[0]],"loss":[before[1],after[1]]})
+def history_last_made(model):
+    """{"island", "role"} where a model was last made (its latest non-migration record), or None."""
+    for record in reversed(model.history):
+        if record["event"] in ("born","variation","crossover"): return {"island":record.get("island"),"role":record.get("role")}
+    return None
+def history_crossed(child, first, second, generation, place):
+    history=_history_start(first,place)
+    before,after=_history_score(first),_history_score(child)
+    child.history=history_append(history,{"event":"crossover","generation":int(generation),**place,"partner":second.lineage_id,
+                                          "partner_from":history_last_made(second),"bits":[before[0],after[0]],"loss":[before[1],after[1]]})
+def _history_where(place):
+    if not place or place.get("island") is None: return "several islands"
+    text=f"island {place['island']+1}"
+    if place.get("stage"): text+=f" stage {place['stage']+1}"
+    return text+(f" ({place['role']})" if place.get("role") else "")
+def _history_span(record):
+    start,end=record.get("start",record.get("generation")),record.get("end",record.get("generation"))
+    if start is None: return "gen ?"
+    return f"gen {start}" if start==end or end is None else f"gen {start}-{end}"
+def _history_change(record):
+    """' (74->96 bits, loss 0.076->0.0043)' from a record's bits/loss pairs (or single values)."""
+    def pair(value): return list(value) if isinstance(value,(list,tuple)) else [None,value]
+    pieces=[]
+    for (before,after),unit,form in ((pair(record.get("bits")),"bits","{:g}"),(pair(record.get("loss")),"loss","{:.4g}")):
+        if after is None: continue
+        text=form.format(after) if before is None or before==after else f"{form.format(before)}->{form.format(after)}"
+        pieces.append(f"{text} bits" if unit=="bits" else f"loss {text}")
+    return f" ({', '.join(pieces)})" if pieces else ""
+def describe_history(history):
+    """One readable line per history record (CLI output and the model card)."""
+    lines=[]
+    for record in history:
+        event=record.get("event"); span=_history_span(record); change=_history_change(record)
+        if event=="born":
+            lines.append(f"{span}: born on {_history_where(record)} as {record.get('how')}{change}")
+        elif event=="variation":
+            kinds=", ".join(f"{kind} {count}" for kind,count in sorted(record.get("kinds",{}).items(),key=lambda item:-item[1]))
+            count=record.get("count",1); noun="variation" if count==1 else "variations"
+            detail=f" [{kinds}]" if kinds else ""
+            lines.append(f"{span}: {count} {noun} on {_history_where(record)}{detail}{change}")
+        elif event=="crossover":
+            partner=record.get("partner_from")
+            detail=f" (last made on {_history_where(partner)})" if partner else ""
+            lines.append(f"{span}: crossover on {_history_where(record)} with #{record.get('partner')}{detail}{change}")
+        elif event in ("migrated","promoted"):
+            how=record.get("how"); detail=f" [{how}]" if how else ""
+            lines.append(f"{span}: {event} {_history_where(record.get('from'))} -> {_history_where(record.get('to'))}{detail}")
+        elif event=="snapped":
+            values=", ".join(f"{a:g}->{b:g}" for a,b in record.get("values",[])[:6])
+            detail=f" ({values})" if values else ""
+            simplified=" and simplified" if record.get("changed") else ""
+            lines.append(f"final: snapped {record.get('constants')} constant(s){detail}{simplified}{change}")
+        else: lines.append(str(record))
+    return lines
+def history_path(history):
+    """Places a model's main line passed through, in order ("island 2 (explorer)", ...), repeats collapsed."""
+    path=[]
+    for record in history:
+        place=record.get("to") if record.get("event") in ("migrated","promoted") else record if record.get("event") in ("born","variation","crossover") else None
+        if place is None or place.get("island") is None: continue
+        where=_history_where(place)
+        if not path or path[-1]!=where: path.append(where)
+    return path
+def history_moved(model, event, generation, source, destination, how=None):
+    """A migration (between islands) or stage promotion."""
+    record={"event":event,"generation":None if generation is None else int(generation),"from":source,"to":destination}
+    if how: record["how"]=how
+    model.history=history_append(model.history,record)
 
 def predict_model(m, X): return np.column_stack([clean(a*evaluate_cached(t,X,m.adfs)+b) for t,(a,b) in zip(m.trees,m.scales)])
 
@@ -4555,6 +4713,7 @@ def record_selection_manifest(path, selection):
 def write_model_card(path, model, feature_names, output_names, constraints, hypotheses, bayes, split, cats=None, bootstrap=None, selection=None, quality_diversity=None, survival=None, adf_diagnostics=None, evaluation=None, interaction_discovery=None, island_diagnostics=None):
     """Write auditable, machine-readable evidence beside a run manifest."""
     card={"format_version":1,"formulae":equations(model,feature_names,output_names,cats),
+          "history":{"records":list(model.history),"summary":describe_history(model.history)},
           "adf_definitions":adf_display_definitions(model,feature_names),
           "profile":constraints.profile,"constraints":constraints.describe(),
           "mdl":model_description(model,len(feature_names)),
@@ -4590,6 +4749,48 @@ def checkpoint_arrays(state):
     Xt,Yt=state["Xt"],state["Yt"]
     return state.get("X",Xt),state.get("Y",Yt),Xt,Yt,state["Xv"],state["Yv"]
 
+def _is_model_data(value):
+    return isinstance(value,dict) and "history" in value and "trees" in value and "lineage_id" in value
+def _walk_model_data(value, visit):
+    """Call visit(data) once on every serialized model (PosteriorParticlePopulation._model_data)
+    in a payload; containers shared between places (island 0's runtime is also
+    mirrored into the run state) are visited once."""
+    stack=[value]; seen=set()
+    while stack:
+        item=stack.pop()
+        if isinstance(item,(dict,list,tuple)):
+            if id(item) in seen: continue
+            seen.add(id(item))
+        if isinstance(item,dict):
+            if _is_model_data(item): visit(item)
+            stack.extend(item.values())
+        elif isinstance(item,(list,tuple)): stack.extend(item)
+def _intern_histories(payload):
+    """Store each distinct history record once (siblings share most of their
+    timeline); models keep indices into payload["history_records"].  Some
+    model dicts are live run state (island snapshots), so the returned undo
+    list puts their record lists back once the payload is written."""
+    table=[]; by_id={}; by_text={}; undo=[]
+    def visit(data):
+        undo.append((data,data["history"]))
+        indices=[]
+        for record in data["history"]:
+            index=by_id.get(id(record))
+            if index is None:
+                text=json.dumps(record,sort_keys=True,default=str)
+                index=by_text.get(text)
+                if index is None: index=by_text[text]=len(table); table.append(record)
+                by_id[id(record)]=index
+            indices.append(index)
+        data["history"]=indices
+    _walk_model_data(payload,visit)
+    payload["history_records"]=table
+    return undo
+def _restore_histories(payload):
+    table=payload.pop("history_records",None)
+    if table is None: return
+    def visit(data): data["history"]=[table[index] for index in data["history"]]
+    _walk_model_data(payload,visit)
 def save_checkpoint(path, generation, population, bayes, archive, state):
     """Atomically persist all stochastic/evolutionary state as safe JSON."""
     state=_checkpoint_state_for_save(state)
@@ -4606,8 +4807,12 @@ def save_checkpoint(path, generation, population, bayes, archive, state):
         archive_data={"capacity":archive.capacity,"items":[PosteriorParticlePopulation._model_data(m) for m in archive.items]}
         payload={"format_version":14,"generation":generation,"population":population_data,"bayes":bayes_data,"archive":archive_data,"next_lineage_id":_NEXT_LINEAGE_ID,
                  "python_rng_state":rng.getstate(),"numpy_rng_state":np.random.get_state(),"state":state}
-    encoded=_json_checkpoint_value(payload)
-    body=json.dumps(encoded,sort_keys=True,separators=(",",":"),allow_nan=False); del encoded
+    undo=_intern_histories(payload)
+    try:
+        encoded=_json_checkpoint_value(payload)
+        body=json.dumps(encoded,sort_keys=True,separators=(",",":"),allow_nan=False); del encoded
+    finally:
+        for data,history in undo: data["history"]=history
     checksum=hashlib.sha256(body.encode()).hexdigest()
     temporary=Path(str(path)+".tmp")
     # Exactly json.dumps(wrapper,sort_keys=True,separators=(",",":")), written
@@ -4630,6 +4835,7 @@ def load_checkpoint(path, allow_unsafe_pickle=False):
         body=json.dumps(wrapper["payload"],sort_keys=True,separators=(",",":"),allow_nan=False)
         if hashlib.sha256(body.encode()).hexdigest()!=wrapper.get("checksum"): raise ValueError("Checkpoint checksum does not match")
         payload=_from_json_checkpoint_value(wrapper["payload"])
+        _restore_histories(payload)
     version=payload.get("format_version")
     if version in (10,11,12,13) and payload.get("state",{}).get("adf_registry",{}).get("enabled"):
         raise ValueError("Checkpoint contains v1 ADF state and cannot resume under v2; start a new ADF run")
@@ -5342,6 +5548,10 @@ def snap_model_constants(model, Xt, Yt, Xv, Yv, affine_on, cats, constraints=Non
         scored,trial_train,trial_validation,trial_violations=_snap_scores(simplified,Xt,Yt,Xv,Yv,affine_on,cats,constraints,output_names)
         if scored.feasible and trial_train<=train_bound and trial_validation<=validation_bound: current=scored
     current.origin=getattr(model,"origin","")
+    before,after=[constant_vector(tree) for tree in model.trees],[constant_vector(tree) for tree in current.trees]
+    current.history=history_append(model.history,{"event":"snapped","constants":snapped,"changed":current.trees!=model.trees,
+        "values":[[float(a),float(b)] for old,new in zip(before,after) if len(old)==len(new) for a,b in zip(old,new) if a!=b],
+        "bits":[_history_score(model)[0],_history_score(current)[0]],"loss":[_history_number(train),_history_number(aggregate_loss(current))]})
     return current,snapped
 
 def report_snapping(summary):
@@ -6074,7 +6284,7 @@ def migrate_fragments(islands, count, generation=None):
         island.library._trim_items()
     return moved
 
-def migrate_islands(islands, migrant_count, *, X, nsga_normalization, parsimony_quality_tolerance, evaluator=None):
+def migrate_islands(islands, migrant_count, *, X, nsga_normalization, parsimony_quality_tolerance, evaluator=None, generation=None):
     """Send local Pareto elites around a ring, keeping each island's size fixed."""
     if len(islands)<2 or migrant_count<1: return 0
     outgoing=[]
@@ -6088,12 +6298,20 @@ def migrate_islands(islands, migrant_count, *, X, nsga_normalization, parsimony_
                  if (island.role.get("params") or {}).get("anchored") else
                  select_nsga(pool,min(migrant_count,len(pool)),nsga_normalization,parsimony_quality_tolerance))
         outgoing.append([model.clone() for model in leaving])
+    # A simplifier island takes every other island's elites, not just its
+    # ring neighbour's: shortening them is its whole job.  Every island's
+    # arrivals are drawn before any is stamped, so a gathered copy never
+    # inherits the ring copy's migration record.
+    gathers=[bool((island.role.get("params") or {}).get("gather_migrants")) for island in islands]
+    arrivals=[[(source,model.clone()) for source,models in enumerate(outgoing) if source!=index for model in models] if gathers[index] else
+              [((index-1)%len(islands),model) for model in outgoing[(index-1)%len(islands)]] for index in range(len(islands))]
     for index,island in enumerate(islands):
-        incoming=outgoing[(index-1)%len(islands)]
-        if (island.role.get("params") or {}).get("gather_migrants"):
-            # A simplifier island takes every other island's elites, not just
-            # its ring neighbour's: shortening them is its whole job.
-            incoming=[model.clone() for source,models in enumerate(outgoing) if source!=index for model in models]
+        destination=history_place(island)
+        for source,migrant in arrivals[index]:
+            anchored=(islands[source].role.get("params") or {}).get("anchored")
+            history_moved(migrant,"migrated",generation,history_place(islands[source]),destination,
+                          "gathered" if gathers[index] else "anchored emigrant" if anchored else "ring")
+        incoming=[migrant for _,migrant in arrivals[index]]
         island.adf_registry.import_models(incoming)
         for migrant in incoming: migrant.origin="island_migrant"
         island.population=select_nsga([*island.population,*incoming],len(island.population),nsga_normalization,parsimony_quality_tolerance)
@@ -6191,7 +6409,8 @@ def promote_stages(cells, island_count, config, generation, *, X, n_features, op
             offered=[m for m in leaving.values() if id(m) in good_ids or (mode=="age" and m.feasible)
                      or (mode=="both" and m.feasible and threshold is not None and aggregate_loss(m)<threshold)]
             incoming=[m.clone() for m in offered]
-            for m in incoming: m.origin="stage_promotion"
+            for m in incoming:
+                m.origin="stage_promotion"; history_moved(m,"promoted",generation,history_place(source),history_place(receiver))
             if incoming:
                 receiver.adf_registry.import_models(incoming)
                 incoming_ids={id(m) for m in incoming}
@@ -6227,7 +6446,7 @@ def advance_topology(cells, island_config, generation, *, X, n_features, ops, no
         migrated=0
         for stage in range(stage_count):
             level=[cells[index*stage_count+stage] for index in range(island_count)]
-            migrated+=migrate_islands(level,island_config["migrants_per_island"],X=X,nsga_normalization=nsga_normalization,
+            migrated+=migrate_islands(level,island_config["migrants_per_island"],X=X,nsga_normalization=nsga_normalization,generation=generation,
                                       parsimony_quality_tolerance=parsimony_quality_tolerance,evaluator=evaluator)
             if roles["enabled"]:
                 roles["fragment_migrants"]+=migrate_fragments(level,ROLE_FRAGMENT_MIGRANTS,generation)
@@ -6369,7 +6588,7 @@ def assign_role_parameters(cells, island_count, crossover_rate, bayesian_proposa
     assignments=list(assignments) or ["auto"]*max(0,island_count-1)
     auto=[index for index in range(1,island_count) if assignments[index-1]=="auto"]
     for cell in cells:
-        if cell.island_index==0: cell.role={}; continue
+        if cell.island_index==0: cell.role={"kind":"generalist"}; continue   # named for histories; no settings
         role=assignments[cell.island_index-1]
         if role=="auto":
             t=auto.index(cell.island_index)/max(1,len(auto)-1)
@@ -6722,7 +6941,7 @@ def refresh_persistent_scores(archive, best_models, semantic_qd, structural_qd, 
 
 def evolve_generation(pop, generation, *, X, Xt, Yt, Xv, Yv, cats, constraints, out_names, ops, nodes, depth, affine_on, coev,
                       bayes, archive, semantic_qd, structural_qd, qd_controller, best_models, pressure, cases, portfolio, library, evaluator,
-                      bayesian_proposal_rate, crossover_rate, qd_mode, lexicase_cases, nsga_normalization, progress=None, bayesian_mode="adaptive", adf_registry=None, budget=None, population_size=None, case_weights=None, residual_qd=None, role_settings=None):
+                      bayesian_proposal_rate, crossover_rate, qd_mode, lexicase_cases, nsga_normalization, progress=None, bayesian_mode="adaptive", adf_registry=None, budget=None, population_size=None, case_weights=None, residual_qd=None, role_settings=None, place=None):
     """Advance one generation; fresh and resumed runs share this exact path.
 
     case_weights: optional selection-only per-training-row weights (island roles).
@@ -6730,7 +6949,7 @@ def evolve_generation(pop, generation, *, X, Xt, Yt, Xv, Yv, cats, constraints, 
     (operators that build new structure; the MDL grammar stays the run's),
     "parsimony" (near-tie band floor), "semantic_max_delta", "novelty" (fresh
     random share of offspring), "neutral_shrink" and "mutation_bias"."""
-    role_settings=role_settings or {}
+    role_settings=role_settings or {}; place=place or history_place()
     portfolio.bias=role_settings.get("mutation_bias")
     role_delta=role_settings.get("semantic_max_delta"); neutral_shrink=bool(role_settings.get("neutral_shrink"))
     population_size=len(pop) if population_size is None else population_size
@@ -6755,6 +6974,7 @@ def evolve_generation(pop, generation, *, X, Xt, Yt, Xv, Yv, cats, constraints, 
     Xs,Ys=row_subset(Xt,sample),row_subset(Yt,sample)
     budget.record("screen",len(Xt) if isinstance(sample,slice) else len(sample))
     evaluator.assess(pop,"train",None if isinstance(sample,slice) else sample,tune=generation==0)
+    for model in pop: history_born(model,model.birth_generation if model.birth_generation is not None else generation,place)
     elite=select_nsga(pop,max(8,len(pop)//8),nsga_normalization,effective_tolerance)
     if coev_active: cases.update(elite,Xt,Yt,cats)
     if adf_registry is not None and adf_registry.enabled:
@@ -6834,6 +7054,7 @@ def evolve_generation(pop, generation, *, X, Xt, Yt, Xv, Yv, cats, constraints, 
             unchanged+=1; EQUIVALENCE_STATS["children_redrawn"]+=1; return True
         seen.add(key); return False
     novelty_rate=max(pressure.novelty_rate(),float(role_settings.get("novelty",0.)))
+    made=[]   # (child, main parent or None, kinds, crossover partner or None) for the history
     while len(children)<population_size:
         sources=[]
         if novelty_rate and rng.random()<novelty_rate:
@@ -6855,7 +7076,7 @@ def evolve_generation(pop, generation, *, X, Xt, Yt, Xv, Yv, cats, constraints, 
             if trees==list(p.model.trees) and unchanged<unchanged_limit: unchanged+=1; continue
             if duplicate(trees): continue
             child=Model(trees,scales,child_age,origin="crossover",parent_ids=(p.model.lineage_id,q.model.lineage_id),mdl_operators=grammar_for_trees(active_ops,trees,adf_registry.definitions if adf_registry else None),mdl_feature_count=X.shape[1],adfs={} if adf_registry is None else dict(adf_registry.definitions),founder_ids=tuple(sorted(set(p.model.founder_ids).union(q.model.founder_ids))),birth_generation=generation+1-child_age)
-            children.append(child); credits.append((child,(p,q))); continue
+            children.append(child); credits.append((child,(p,q))); made.append((child,p.model,None,q.model)); continue
         else:
             p=rng.choice(parents)
             if bayesian_mode!="off": bayes.begin_equation()
@@ -6871,12 +7092,18 @@ def evolve_generation(pop, generation, *, X, Xt, Yt, Xv, Yv, cats, constraints, 
         if duplicate(trees): continue
         child=Model(trees,scales,child_age,origin=child_origin,parent_ids=tuple(model.lineage_id for model in sources),mdl_operators=grammar_for_trees(active_ops,trees,adf_registry.definitions if adf_registry else None),mdl_feature_count=X.shape[1],adfs={} if adf_registry is None else dict(adf_registry.definitions),founder_ids=tuple(sorted({founder for model in sources for founder in model.founder_ids})),birth_generation=generation+1-child_age)
         children.append(child)
+        move=kinds+(["macro"] if macro_used else []) if child_origin in ("mutation","macro_mutation") else [{"fragment":"fragment","bayesian_injection":"bayesian"}.get(child_origin,child_origin)]
+        made.append((child,sources[0] if sources else None,move,None))
         if child.origin=="bayesian_injection": injections.append(child)
         if child.origin in {"fragment","macro_mutation"}: discovery_children.append(child)
         if child.origin=="mutation": feedback.append((child,p.model,kinds)); credits.append((child,(p,)))
     # A correct structure with untuned constants otherwise scores like a wrong
     # one and is lost; fit every offspring's inner constants before scoring.
     evaluator.assess(children,"train",None if isinstance(sample,slice) else sample,tune=True)
+    for child,parent,kinds,partner in made:
+        if partner is not None: history_crossed(child,parent,partner,generation,place)
+        elif parent is not None: history_varied(child,parent,generation,place,kinds)
+        else: history_born(child,generation,place)
     for child,parent_choices in credits: qd_controller.record(child,parent_choices,repertoires)
     for child,parent,kinds in feedback:
         for kind in kinds:
@@ -6907,6 +7134,7 @@ def evolve_generation(pop, generation, *, X, Xt, Yt, Xv, Yv, cats, constraints, 
             fresh_trees=[random_tree(X.shape[1],variation_ops,nodes,depth,proposal=None if bayesian_mode=="off" else (bayes[index] if isinstance(bayes,PerOutputBayesianBanks) else bayes),adfs=adf_registry.definitions if adf_registry else None) for index in range(len(pop[0].trees))]
             batch.append(Model(fresh_trees,[(1.,0.)]*len(pop[0].trees),0,origin="novelty_injection",mdl_operators=grammar_for_trees(active_ops,fresh_trees,adf_registry.definitions if adf_registry else None),mdl_feature_count=X.shape[1],adfs={} if adf_registry is None else dict(adf_registry.definitions),birth_generation=generation+1))
         evaluator.assess(batch,"train",None if isinstance(sample,slice) else sample,tune=True)
+        for model in batch: history_born(model,generation,place)
         survivor_pool=novelty_pool([*survivor_pool,*batch],Xs); attempts+=len(batch)
     survivors=(anchored_survivors(survivor_pool,min(population_size,len(survivor_pool)),nsga_normalization,effective_tolerance)
                if role_settings.get("anchored") else
@@ -7169,7 +7397,7 @@ def resume_main(args):
                                   semantic_qd=island.semantic_qd,structural_qd=island.structural_qd,residual_qd=island.residual_qd,qd_controller=island.qd_controller,best_models=island.best_models,
                                   pressure=island.pressure,cases=island.cases,portfolio=island.portfolio,library=island.library,evaluator=evaluator,bayesian_proposal_rate=cell_proposals,
                                   crossover_rate=cell_crossover,qd_mode=qd_mode,lexicase_cases=state.get("lexicase_cases",args.lexicase_cases),nsga_normalization=nsga_normalization,bayesian_mode=state.get("bayesian_mode",args.bayesian_mode),adf_registry=island.adf_registry,budget=island.budget,progress=progress,population_size=island.population_size,
-                                  role_settings=cell_role_settings(island))
+                                  role_settings=cell_role_settings(island),place=history_place(island))
             evolve_cells(islands,step,cell_workers,evaluator,shared={"X":X,"Xt":Xt,"Yt":Yt,"Xv":Xv,"Yv":Yv,"constraints":constraints})
             generation+=1
             advance_topology(islands,island_config,generation,X=Xt,n_features=X.shape[1],ops=ops,nodes=nodes,depth=depth,
@@ -7199,6 +7427,7 @@ def resume_main(args):
     warning=constant_selection_warning(chosen,selection["source"])
     if warning: print(f"WARNING: {warning}"); state["selection"]["warning"]=warning
     print(f"{selection['source'].title()} selection scores: mean loss={selection['metrics']['loss']:.6g}, mean shape={selection['metrics']['shape']:.6g}, MDL bits={selection['metrics']['mdl_bits']:.6g}")
+    if chosen.history: print("History:\n  "+"\n  ".join(describe_history(chosen.history)))
     export_model(chosen,names,out_names,cats,maps,state["source_columns"],state["types"],state.get("export_fixture"),state.get("input_ranges")); evaluator.close()
     write_symbolic_export(chosen,names,out_names,cats,Xt)
 
@@ -7618,7 +7847,7 @@ def train_from_setup(args, setup, choose_model=None):
                                   semantic_qd=island.semantic_qd,structural_qd=island.structural_qd,residual_qd=island.residual_qd,qd_controller=island.qd_controller,best_models=island.best_models,
                                   pressure=island.pressure,cases=island.cases,portfolio=island.portfolio,library=island.library,evaluator=evaluator,bayesian_proposal_rate=cell_proposals,
                                   crossover_rate=cell_crossover,qd_mode=args.qd_mode,lexicase_cases=args.lexicase_cases,nsga_normalization=args.nsga_normalization,bayesian_mode=args.bayesian_mode,adf_registry=island.adf_registry,budget=island.budget,progress=progress,population_size=island.population_size,
-                                  role_settings=cell_role_settings(island))
+                                  role_settings=cell_role_settings(island),place=history_place(island))
             evolve_cells(islands,step,cell_workers,evaluator,shared={"X":X,"Xt":Xt,"Yt":Yt,"Xv":Xv,"Yv":Yv,"constraints":constraints})
             gen+=1
             advance_topology(islands,checkpoint_state["island_config"],gen,X=Xt,n_features=X.shape[1],ops=ops,nodes=nodes,depth=depth,
@@ -7658,6 +7887,7 @@ def train_from_setup(args, setup, choose_model=None):
     chosen=choices[selected_index]
     print(f"Selected model: {equations(chosen,names,out_names,cats)}")
     print("Fitted constants:", [constant_vector(tree) for tree in chosen.trees])
+    if chosen.history: print("History:\n  "+"\n  ".join(describe_history(chosen.history)))
     intervals=constant_intervals(chosen,Xt,Yt,cats) if CONSTANT_INTERVALS=="on" else None
     print_constant_intervals(intervals)
     if Xv is not None:

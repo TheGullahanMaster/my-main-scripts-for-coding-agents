@@ -66,6 +66,11 @@ main { padding: 14px 16px 40px; max-width: 1500px; margin: 0 auto; }
 .field > label .hint { font-weight: 400; margin-left: 6px; }
 .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .roleWide { grid-column: 1 / -1; }
+.lineage { display: grid; grid-template-columns: max-content max-content minmax(0, 1fr); gap: 5px 12px; margin-top: 6px; font-size: 13px; align-items: baseline; }
+.lineage .gen { color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.lineage .place { border-left: 3px solid var(--role, var(--border)); padding-left: 6px; white-space: nowrap; color: var(--text-2); }
+.lineage .what .hint { margin-left: 6px; }
+@media (max-width: 640px) { .lineage { grid-template-columns: max-content minmax(0, 1fr); } .lineage .what { grid-column: 1 / -1; padding-left: 9px; margin-bottom: 4px; } }
 .roleGrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 8px 12px; }
 .roleGrid label { display: block; font-weight: 550; margin-bottom: 3px; }
 .roleGrid .hint { display: block; margin-top: 2px; }
@@ -460,6 +465,7 @@ input, select, textarea { max-width: 100%; }
           <div><div class="kv" id="detailKv"></div></div>
           <div><table id="detailOutputs"></table></div>
         </div>
+        <details style="margin-top:8px" open><summary>History <span class="hint">where this model's line was born, changed and migrated</span></summary><div class="lineage" id="lineageView"></div></details>
         <details style="margin-top:8px"><summary>Expression tree</summary><div class="svgbox" id="treeBox"></div></details>
       </div>
 
@@ -1364,8 +1370,9 @@ function drawPareto() {
     x: {title: 'Model size (MDL bits)'}, y: {title: log ? 'Training loss (log)' : 'Training loss', log}, layers,
     tooltip: (d, L) => `<div class="t">${L.kind === 'best' ? 'Best so far' : L.kind === 'archive' ? 'Archive model' : 'Population member'}</div>
       loss ${fmt(d.loss)} · ${fmt(d.bits, 4)} bits · ${d.nodes} nodes · age ${d.age}<div class="hint">${esc(d.origin)}${d.cell ? ' · ' + esc(d.cell) : d.island != null && snap.archive.some(a => a.island > 0) ? ' · island ' + (d.island + 1) : ''}</div>
+      ${d.path && d.path.length > 1 ? `<div class="hint">path: ${esc(d.path.join(' → '))}</div>` : ''}
       ${d.equation ? `<div class="eq" style="margin-top:4px">${esc(d.equation)}</div>` : ''}`,
-    onClick: (d) => { if (d.equation) { T.pinned = d; const p = $('#pinned'); p.classList.remove('hidden'); p.innerHTML = `${esc(d.equation)}<div class="hint" style="margin-top:4px">loss ${fmt(d.loss)} · ${fmt(d.bits, 4)} bits · ${d.nodes} nodes</div>`; } },
+    onClick: (d) => { if (d.equation) { T.pinned = d; const p = $('#pinned'); p.classList.remove('hidden'); p.innerHTML = `${esc(d.equation)}<div class="hint" style="margin-top:4px">loss ${fmt(d.loss)} · ${fmt(d.bits, 4)} bits · ${d.nodes} nodes</div>${d.path && d.path.length ? `<div class="hint">path: ${esc(d.path.join(' → '))}</div>` : ''}`; } },
   });
 }
 function drawHistory() {
@@ -1492,10 +1499,51 @@ async function selectModel(index) {
     $('#detailOutputs').innerHTML = `<thead><tr><th>Output</th><th class="num">Training loss</th><th class="num">Validation loss</th></tr></thead><tbody>${d.per_output.map(o => `<tr><td>${esc(o.name)}</td><td class="num">${fmt(o.train_loss)}</td><td class="num">${fmt(o.validation_loss)}</td></tr>`).join('')}</tbody>`;
     const url = URL.createObjectURL(new Blob([d.svg], {type: 'image/svg+xml'}));
     $('#treeBox').innerHTML = `<img alt="Expression tree" src="${url}">`;
+    renderLineage(d.history || []);
     defaultAxes(); syncAxisControls();
     loadMath(index);
     await Promise.all([loadFit(), loadExplore(), loadGenDefaults()]);
   } catch (e) { toast(e.message, true); }
+}
+// Model history (afpo's main-line timeline): one row per record, the place
+// chip coloured by the island's role.
+const ROLE_COLORS = {simplifier: '--s3', explorer: '--s2', refiner: '--s1', auto: '--muted', generalist: '--text-2'};
+function lineagePlace(p) {
+  if (!p || p.island == null) return {text: p ? 'several islands' : '', color: '--border'};
+  const role = p.role || '';
+  return {text: `island ${p.island + 1}${p.stage ? ' · stage ' + (p.stage + 1) : ''}${role ? ' · ' + role : ''}`,
+          color: ROLE_COLORS[role] || (role.startsWith('family:') ? '--warn' : '--border')};
+}
+function lineageChange(r) {
+  const pair = v => Array.isArray(v) ? v : [null, v], parts = [];
+  const [b0, b1] = pair(r.bits), [l0, l1] = pair(r.loss);
+  if (b1 != null) parts.push(b0 == null || b0 === b1 ? `${fmt(b1, 4)} bits` : `${fmt(b0, 4)} → ${fmt(b1, 4)} bits`);
+  if (l1 != null) parts.push(l0 == null || l0 === l1 ? `loss ${fmt(l1)}` : `loss ${fmt(l0)} → ${fmt(l1)}`);
+  return parts.length ? `<span class="hint">${parts.join(' · ')}</span>` : '';
+}
+function renderLineage(history) {
+  const box = $('#lineageView');
+  if (!history.length) { box.innerHTML = '<span class="hint">No history recorded (models from runs before histories existed).</span>'; return; }
+  box.innerHTML = history.map(r => {
+    const span = r.start != null ? (r.end != null && r.end !== r.start ? `gen ${r.start}–${r.end}` : `gen ${r.start}`) : r.generation != null ? `gen ${r.generation}` : r.event === 'snapped' ? 'final' : 'gen ?';
+    let place = lineagePlace(r), what = '';
+    if (r.event === 'born') what = `born as ${esc(r.how || 'seed')}`;
+    else if (r.event === 'variation') {
+      const kinds = Object.entries(r.kinds || {}).sort((a, b) => b[1] - a[1]).map(([k, n]) => `${k} ${n}`).join(', ');
+      what = `${r.count} variation${r.count === 1 ? '' : 's'}${kinds ? ` <span class="hint">${esc(kinds)}</span>` : ''}${r.merged ? ' <span class="hint">(older records merged)</span>' : ''}`;
+    } else if (r.event === 'crossover') {
+      const partner = r.partner_from ? lineagePlace(r.partner_from).text : '';
+      what = `crossover with #${esc(r.partner)}${partner ? ` <span class="hint">last made on ${esc(partner)}</span>` : ''}`;
+    } else if (r.event === 'migrated' || r.event === 'promoted') {
+      place = lineagePlace(r.to);
+      what = `${r.event} from ${esc(lineagePlace(r.from).text)}${r.how ? ` <span class="hint">${esc(r.how)}</span>` : ''}`;
+    } else if (r.event === 'snapped') {
+      const values = (r.values || []).slice(0, 6).map(([a, b]) => `${fmt(a, 6)} → ${fmt(b, 6)}`).join(', ');
+      what = `snapped ${r.constants} constant${r.constants === 1 ? '' : 's'}${values ? ` <span class="hint">${esc(values)}</span>` : ''}${r.changed ? ' and simplified' : ''}`;
+      place = {text: '', color: '--border'};
+    } else what = esc(JSON.stringify(r));
+    return `<span class="gen">${span}</span><span class="place" style="--role: var(${place.color})">${esc(place.text)}</span><span class="what">${what} ${lineageChange(r)}</span>`;
+  }).join('');
 }
 // Rendered equation: KaTeX from the CDN when reachable, else the browser's
 // native MathML (converted by SymPy on the server), so it also works offline.

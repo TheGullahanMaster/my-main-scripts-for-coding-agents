@@ -62,6 +62,23 @@ GUI form test in `test_afpo_gui.py`):
   afterwards: 29-32 in-band models (other islands 0-7) and the shortest one
   within 1% is the simplifier's own child. `afpo_og.py` freezes the earlier
   version (`AFPO_MODULE=afpo_og python bench_roles.py ...`).
+- **Main-line model history** (2026-10-03, `history_*`, `describe_history`):
+  every model carries a timeline of its main line of descent: born
+  (generation, island, stage, role, how), variation runs on one island
+  (collapsed: span, count, move kinds, MDL bits and loss at start and end),
+  crossovers (partner lineage id and where the partner was last made),
+  migrations (ring / gathered by a simplifier / anchored emigrant), stage
+  promotions and final constant snapping. Children inherit the main parent's
+  timeline; runs never merge across an island, stage, role, crossover or
+  migration; past 64 records the oldest block of variation/crossover records
+  is merged, keeping landmarks. Observational only (not in equality,
+  equivalence keys, MDL, selection or RNG): seeded runs are bit-identical to
+  before. Checkpoints store each distinct record once (`history_records`),
+  +7% size on a 5-island coffee run. Shown in the CLI after the final choice,
+  in the model card, as a timeline in the GUI's Models tab, and as island
+  paths in the live view's tooltips; live island labels carry their roles.
+  Not built: a full ancestry DAG (both parents at every step); `lineage_id`
+  and `parent_ids` leave room for an optional on-disk ledger later.
 
 Not done: role-specific ALPS reseeding uses global tree size; residual-signature
 descriptors (Phase 3) and everything in Phases 4-5 other than the above.

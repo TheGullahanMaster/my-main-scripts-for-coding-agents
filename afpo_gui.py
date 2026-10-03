@@ -330,9 +330,11 @@ def check_form(form):
 class Telemetry:
     """Turns afpo.PROGRESS_HOOK calls into JSON lines the GUI server tails."""
 
-    def __init__(self, stream, island_count, stage_count=1):
+    def __init__(self, stream, island_count, stage_count=1, roles=None):
         self.stream, self.island_count = stream, max(1, int(island_count))
         self.stage_count = max(1, int(stage_count))
+        # Role per island (island 1 the generalist) when island roles are on.
+        self.roles = ["generalist", *roles] if roles else None
         self.islands = {}          # cell label (or id(archive)) -> index
         self.latest = {}           # index -> latest hook kwargs
         self.last_snapshot = 0.
@@ -362,6 +364,8 @@ class Telemetry:
         parts = [f"island {island + 1}"] if self.island_count > 1 else []
         if self.stage_count > 1:
             parts.append(f"stage {stage + 1}")
+        if self.roles and island < len(self.roles):
+            parts.append(f"({self.roles[island]})")
         return " ".join(parts) or f"island {index + 1}"
 
     def hook(self, **kw):
@@ -397,6 +401,7 @@ class Telemetry:
                  "nodes": int(sum(afpo.node_size(t) for t in model.trees))}
         if equation:
             point["equation"] = afpo.equations(model, names, out_names, cats)
+            point["path"] = afpo.history_path(model.history)
         return point
 
     def snapshot(self, generation):
@@ -410,7 +415,7 @@ class Telemetry:
                 point = self._point(model, names, out_names, cats, equation=True)
                 if point:
                     point["island"] = index
-                    if self.stage_count > 1:
+                    if self.stage_count > 1 or self.roles:
                         point["cell"] = self.cell_name(index)
                     archive.append(point)
             for model in kw["population"]:
@@ -418,7 +423,7 @@ class Telemetry:
                 point = self._point(model, names, out_names, cats)
                 if point and len(population) < MAX_POPULATION_POINTS:
                     point["island"] = index
-                    if self.stage_count > 1:
+                    if self.stage_count > 1 or self.roles:
                         point["cell"] = self.cell_name(index)
                     population.append(point)
             candidate = kw["best_so_far"]
@@ -469,7 +474,9 @@ def run_spec(spec_path):
     spec = json.loads(Path(spec_path).read_text())
     with open(spec["events"], "a", encoding="utf-8") as stream:
         setup_spec = spec.get("setup") or {}
-        telemetry = Telemetry(stream, setup_spec.get("island_count", 1), (setup_spec.get("stages") or {}).get("count", 1))
+        roles = setup_spec.get("roles") or {}
+        telemetry = Telemetry(stream, setup_spec.get("island_count", 1), (setup_spec.get("stages") or {}).get("count", 1),
+                              (roles.get("assignments") or ["auto"] * (setup_spec.get("island_count", 1) - 1)) if roles.get("enabled") else None)
         telemetry.emit("started", pid=os.getpid(), mode=spec["mode"], argv=spec["argv"])
         try:
             args = afpo.parse_cli(spec["argv"])[1]
@@ -764,7 +771,8 @@ class ModelExplorer:
                     "per_output": per_output, "svg": afpo.tree_map_svg(model, names, out_names, cats),
                     "nodes": int(sum(afpo.node_size(t) for t in model.trees)), "age": int(model.age), "origin": model.origin,
                     "features_used": [names[i] for i in afpo.used_feature_indices(model) if i < len(names)],
-                    "inputs_used": self._inputs_used(model)}
+                    "inputs_used": self._inputs_used(model),
+                    "history": [dict(record) for record in model.history], "history_text": afpo.describe_history(model.history)}
 
     def latex(self, index):
         """Exact and raw equation forms of a model for the rendered-equation view (needs sympy)."""

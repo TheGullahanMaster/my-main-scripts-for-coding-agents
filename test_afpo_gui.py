@@ -96,6 +96,15 @@ class GuiTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "one entry per island"):
             gui.setup_answers(form(self.csv, islands=3, roles=True, island_roles=["auto"]))
 
+    def test_live_labels_carry_island_roles(self):
+        telemetry = gui.Telemetry(None, 3, 2, ["simplifier", "auto"])
+        self.assertEqual([telemetry.cell_name(i) for i in (0, 3, 5)], ["island 1 stage 1 (generalist)", "island 2 stage 2 (simplifier)", "island 3 stage 2 (auto)"])
+        self.assertEqual(gui.Telemetry(None, 2).cell_name(1), "island 2")
+        history = ({"event": "born", "generation": 0, "island": 1, "stage": 0, "role": "explorer", "how": "seed", "bits": 5, "loss": 1.},
+                   {"event": "migrated", "generation": 5, "from": {"island": 1, "stage": 0, "role": "explorer"},
+                    "to": {"island": 3, "stage": 0, "role": "simplifier"}, "how": "gathered"})
+        self.assertEqual(gui.afpo.history_path(history), ["island 2 (explorer)", "island 4 (simplifier)"])
+
     def test_train_choose_then_explore(self):
         session = gui.TrainingSession()
         session.start(form(self.csv))
@@ -120,6 +129,9 @@ class GuiTests(unittest.TestCase):
         index = next(m["index"] for m in summary["models"] if m["label"])
         detail = explorer.detail(index)
         self.assertIn("<svg", detail["svg"])
+        self.assertTrue(detail["history"])
+        self.assertEqual(detail["history"][0]["event"], "born")
+        self.assertEqual(len(detail["history_text"]), len(detail["history"]))
         math = explorer.latex(index)
         if math["available"]:  # sympy is optional
             first = math["outputs"][0]

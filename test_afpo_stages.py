@@ -219,7 +219,7 @@ class RoleTests(unittest.TestCase):
     def test_parameters_spread_and_generalist_keeps_defaults(self):
         cells = self.cells(4)
         a.assign_role_parameters(cells, 4, .35, .25, 20)
-        self.assertEqual(cells[0].role, {})
+        self.assertEqual(cells[0].role, {"kind": "generalist"})
         nodes = [cell.role["params"]["nodes"] for cell in cells[1:]]
         self.assertEqual(nodes, sorted(nodes)); self.assertEqual((nodes[0], nodes[-1]), (10, 20))
         self.assertEqual(a.cell_search_settings(cells[0], .35, .25, 20), (.35, .25, 20, None))
@@ -330,7 +330,7 @@ class PresetRoleTests(unittest.TestCase):
     def test_assignment_spreads_auto_islands_and_applies_presets(self):
         cells = self.cells(5)
         a.assign_role_parameters(cells, 5, .35, .25, 20, ["auto", "simplifier", "auto", "family:3"], self.OPS)
-        self.assertEqual(cells[0].role, {})
+        self.assertEqual(cells[0].role, {"kind": "generalist"})
         self.assertEqual([a.role_kind(c) for c in cells], ["generalist", "auto", "simplifier", "auto", "family:3"])
         self.assertEqual((cells[1].role["params"]["t"], cells[3].role["params"]["t"]), (0., 1.))   # spread over auto islands only
         simplifier = cells[2].role["params"]
@@ -431,12 +431,18 @@ class PresetRoleTests(unittest.TestCase):
                     for target in plan[1:]:
                         a.resume_main(a.parse_cli(["--resume", checkpoint, "--max-generations", str(target), *flags])[1])
                 _, _, _, _, state = a.load_checkpoint(checkpoint, False)
-            return [[repr(m["trees"]) for m in cell["population"]] for cell in state["island_states"]], state, log.getvalue()
+            # Lineage ids are bookkeeping that already differs between serial and
+            # parallel cells, so crossover partner ids are left out of the comparison.
+            histories = lambda m: [{k: v for k, v in r.items() if k != "partner"} for r in m["history"]]
+            return [[(repr(m["trees"]), histories(m)) for m in cell["population"]] for cell in state["island_states"]], state, log.getvalue()
         serial, state, log = run([6], 1)
         parallel, _, _ = run([4, 6], 4)
-        self.assertEqual(serial, parallel)
+        self.assertEqual(serial, parallel)                                   # trees and histories alike
+        records = [r for cell in state["island_states"] for m in cell["population"] for r in m["history"]]
+        self.assertTrue(any(r["event"] == "migrated" and r.get("how") == "gathered" for r in records))
+        self.assertTrue(all(m["history"] and m["history"][0]["event"] == "born" for cell in state["island_states"] for m in cell["population"]))
         self.assertEqual(state["island_config"]["roles"]["assignments"], roles["assignments"])
-        self.assertEqual([cell["role"].get("kind") for cell in state["island_states"]], [None, "simplifier", "family:2", "explorer"])
+        self.assertEqual([cell["role"].get("kind") for cell in state["island_states"]], ["generalist", "simplifier", "family:2", "explorer"])
         self.assertIn("island 2 simplifier, island 3 family:2, island 4 explorer", log)
         self.assertIn("(simplifier)=", log)
 
@@ -511,6 +517,101 @@ class PresetRoleTests(unittest.TestCase):
                  "roles": {"enabled": True, "assignments": ["family:3"]}}
         with contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(ValueError, "Unknown island role"):
             a.train_from_setup(args, setup)
+
+
+class HistoryTests(unittest.TestCase):
+    """Main-line model history: observational records of birth, variation, crossover and movement."""
+    PLACE = {"island": 1, "stage": 0, "role": "simplifier"}
+
+    def scored(self, tree, loss, bits, history=()):
+        m = model(tree); m.objectives = (loss, 0., float(bits), 0); m.history = tuple(history); return m
+
+    def test_variations_on_one_island_collapse_into_one_run(self):
+        parent = self.scored(X0, 1., 50); a.history_born(parent, 3, self.PLACE)
+        child = self.scored(("square", X0), .5, 60); a.history_varied(child, parent, 4, self.PLACE, ["subtree", None])
+        grandchild = self.scored(("square", X0), .4, 40); a.history_varied(grandchild, child, 6, self.PLACE, ["prune"])
+        self.assertEqual([r["event"] for r in grandchild.history], ["born", "variation"])
+        run = grandchild.history[-1]
+        self.assertEqual((run["start"], run["end"], run["count"], run["kinds"]), (4, 6, 2, {"subtree": 1, "prune": 1}))
+        self.assertEqual((run["bits"], run["loss"]), ([50, 40], [1., .4]))
+        self.assertEqual(child.history[-1]["count"], 1)                       # the parent's record was not mutated
+        moved = self.scored(X0, .4, 40); a.history_varied(moved, grandchild, 7, {**self.PLACE, "island": 2}, ["point"])
+        self.assertEqual(len(moved.history), 3)                               # a new place starts a new run
+
+    def test_crossover_inherits_the_first_parent_and_names_the_partner(self):
+        first = self.scored(X0, 1., 50); a.history_born(first, 0, self.PLACE)
+        second = self.scored(X1, 2., 30); a.history_born(second, 0, {"island": 3, "stage": 0, "role": "explorer"})
+        child = self.scored(("+", X0, X1), .5, 70); a.history_crossed(child, first, second, 5, self.PLACE)
+        record = child.history[-1]
+        self.assertEqual(child.history[0], first.history[0])
+        self.assertEqual((record["event"], record["partner"], record["partner_from"]), ("crossover", second.lineage_id, {"island": 3, "role": "explorer"}))
+        later = self.scored(("+", X0, X1), .4, 60); a.history_varied(later, child, 6, self.PLACE, ["constant"])
+        self.assertEqual([r["event"] for r in later.history], ["born", "crossover", "variation"])   # never merged across a crossover
+
+    def test_long_histories_keep_their_landmarks(self):
+        m = self.scored(X0, 1., 50); a.history_born(m, 0, self.PLACE)
+        for generation in range(300):
+            place = {"island": generation % 3, "stage": 0, "role": "auto"}
+            child = self.scored(X0, 1., 50)
+            if generation % 7 == 0: a.history_crossed(child, m, m, generation, place)
+            else: a.history_varied(child, m, generation, place, ["subtree"])
+            if generation % 50 == 0: a.history_moved(child, "migrated", generation, place, {**place, "island": 9}, "ring")
+            m = child
+        self.assertLessEqual(len(m.history), a.HISTORY_LIMIT)
+        self.assertEqual(m.history[0]["event"], "born")
+        self.assertEqual(sum(r["event"] == "migrated" for r in m.history), 6)
+        self.assertTrue(any(r.get("merged") for r in m.history))
+        self.assertEqual(m.history[-1]["end"], 299)
+        self.assertEqual(len(a.describe_history(m.history)), len(m.history))
+
+    def test_history_is_observational(self):
+        m = self.scored(X0, 1., 50); twin = m.clone(); a.history_born(twin, 0, self.PLACE)
+        self.assertEqual(m, twin)                                             # not part of equality
+        self.assertEqual(a.model_equivalence_key(m), a.model_equivalence_key(twin))
+        self.assertIs(twin.clone().history, twin.history)
+
+    def test_checkpoint_interning_round_trip_leaves_live_state_alone(self):
+        shared = ({"event": "born", "generation": 0, "island": 0, "stage": 0, "role": None, "how": "seed", "bits": 3, "loss": 1.},)
+        models = [self.scored(X0, 1., 3, shared + ({"event": "variation", "start": i, "end": i, "island": 0, "stage": 0, "role": None,
+                                                   "count": 1, "kinds": {}, "bits": [3, 3], "loss": [1., 1.]},)) for i in range(3)]
+        data = [a.PosteriorParticlePopulation._model_data(m) for m in models]
+        live = {"island_states": [{"population": data}], "adf": {"history": {"keep": "me"}}, "mirror": data}   # shared, as island 0's runtime is
+        payload = {"population": [dict(d) for d in data], "state": live}
+        undo = a._intern_histories(payload)
+        self.assertEqual(len(payload["history_records"]), 4)                  # the shared birth is stored once
+        self.assertTrue(all(isinstance(i, int) for i in payload["population"][0]["history"]))
+        restored = {"population": [dict(d) for d in payload["population"]], "history_records": payload["history_records"]}
+        a._restore_histories(restored)
+        self.assertEqual(restored["population"][2]["history"], list(models[2].history))
+        for record, history in undo: record["history"] = history
+        self.assertEqual(live["island_states"][0]["population"][1]["history"], list(models[1].history))
+        self.assertEqual(live["adf"]["history"], {"keep": "me"})              # other "history" keys are untouched
+
+    def test_snapping_is_the_final_record(self):
+        X = np.linspace(.5, 2, 30)[:, None]; Y = 2. * X
+        m = model(("*", ("c", 2.0000001), X0)); a.assess(m, X, Y, True, [None]); a.history_born(m, 0, self.PLACE)
+        snapped, count = a.snap_model_constants(m, X, Y, None, None, True, [None])
+        self.assertEqual(count, 1)
+        record = snapped.history[-1]
+        self.assertEqual((record["event"], record["constants"], record["values"]), ("snapped", 1, [[2.0000001, 2.]]))
+        self.assertIn("final: snapped 1 constant(s)", a.describe_history(snapped.history)[-1])
+
+    def test_gathered_copies_do_not_inherit_the_ring_record(self):
+        X = np.random.default_rng(1).uniform(-2, 2, (40, 1)); Y = X ** 2; cats = [None]; ops = ["+", "-", "*", "square"]
+        ev = a.ModelEvaluator(1, {"train": (X, Y)}, True, cats, a.compile_constraints(), ["y0"]); self.addCleanup(ev.close)
+        cells = []
+        for index in range(4):
+            cell = island(X, cats, ops, index=index); cell.island_index, cell.stage = index, 0; cells.append(cell)
+        a.assign_role_parameters(cells, 4, .35, .25, 15, ["auto", "simplifier", "auto"], ops)
+        for cell in cells: advance(cell, 0, X, Y, cats, ops, ev, place=a.history_place(cell))
+        a.migrate_islands(cells, 1, X=X, nsga_normalization="intercept", parsimony_quality_tolerance=.01, evaluator=ev, generation=7)
+        for index, cell in enumerate(cells):
+            for m in cell.population:
+                moves = [r for r in m.history if r["event"] == "migrated" and r["generation"] == 7]
+                self.assertLessEqual(len(moves), 1)
+                if moves:
+                    self.assertEqual(moves[0]["to"]["island"], index)
+                    self.assertEqual(moves[0]["how"], "gathered" if index == 2 else "anchored emigrant" if index == 3 else "ring")
 
 
 class FragmentAdmissionTests(unittest.TestCase):
