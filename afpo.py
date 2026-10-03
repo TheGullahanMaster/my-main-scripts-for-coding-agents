@@ -5521,8 +5521,26 @@ def constant_selection_warning(model, source):
                 "the search did not find structure that carries over to held-out data (common with tiny validation sets or rules it never found). "
                 "The 'Lowest Training Loss' choice shows the best training fit.")
     return "The recommended model is a constant: no candidate that uses the inputs fit the training data better."
-def model_options(models, X=None, Y=None, cats=None, loss_tolerance=.01, constraints=None, output_names=(), best_so_far=None, evaluation=None):
-    """Return the deduplicated candidates shown when the user saves a model."""
+def simplifier_identities(cells, models_of=lambda cell:[*cell.archive.items,*cell.population,cell.best_models.model]):
+    """selection_identity keys of every model held by a simplifier island (any stage)."""
+    return {selection_identity(model) for cell in cells if role_kind(cell)=="simplifier" for model in models_of(cell) if model is not None}
+def simplifier_choice(entries, simplifier_keys, band=None):
+    """The shortest simplifier-island model whose selection loss is within band of the best
+    candidate's (the anchored lane's band, noise-floor aware), or None.
+
+    The Best Score choice uses the tighter --selection-loss-tolerance across all
+    islands, and an accurate anchor can push the simplifier's short models just
+    outside it; this entry keeps them selectable."""
+    if not simplifier_keys or not entries: return None
+    band=SIMPLIFIER_BAND if band is None else band
+    best=min(e[2]["loss"] for e in entries); limit=best+max(band*abs(best),LOSS_NOISE_FLOOR)
+    inside=[e for e in entries if e[2]["loss"]<=limit and selection_identity(e[0]) in simplifier_keys]
+    return min(inside,key=lambda e:(e[2]["mdl_bits"],e[2]["loss"],e[2]["shape"]))[0] if inside else None
+def model_options(models, X=None, Y=None, cats=None, loss_tolerance=.01, constraints=None, output_names=(), best_so_far=None, evaluation=None, simplifier_keys=None):
+    """Return the deduplicated candidates shown when the user saves a model.
+
+    simplifier_keys (simplifier_identities) adds the simplifier island's
+    shortest model within SIMPLIFIER_BAND of the best loss as its own choice."""
     models=[*models]+([best_so_far] if best_so_far is not None else [])
     evaluation=evaluation or selection_evaluation(models,X,Y,cats,constraints,output_names)
     best,selection=_select_best(evaluation,loss_tolerance)
@@ -5534,6 +5552,8 @@ def model_options(models, X=None, Y=None, cats=None, loss_tolerance=.01, constra
         *(((("Best-so-far retained",best_so_far),) if best_so_far is not None and any(e[0] is best_so_far for e in entries) else ())),
         (f"Lowest {selection['source'].title()} Loss",lowest_loss),
         (("Pareto Knee (loss/MDL bits)" if knee_info['interior_knee'] else "Pareto Knee fallback (no interior bend; lowest loss)"),knee),
+        *(((f"Shortest within {SIMPLIFIER_BAND:.0%} of the best {selection['source']} loss (simplifier island)",shortest),)
+          if (shortest:=simplifier_choice(entries,simplifier_keys)) is not None else ()),
         ("Shortest MDL Model",min(entries,key=lambda e:(e[2]["mdl_bits"],e[2]["loss"],e[2]["shape"]))[0]),
         ("Most Correct Shape",min(entries,key=lambda e:(e[2]["shape"],e[2]["loss"],e[2]["mdl_bits"]))[0]),
         ("Youngest Model",min(entries,key=lambda e:(model_age(e[0]),e[2]["loss"],e[2]["mdl_bits"]))[0]),
@@ -7984,9 +8004,13 @@ def train_from_setup(args, setup, choose_model=None):
         evaluator.assess(island.population,"train")
         island.best_models.update(island.population); island.archive.update(island.population,Xt)
     f=[model for island in islands for model in [*island.archive.items,*island.population,island.best_models.model] if model is not None]
+    from_simplifier=[role_kind(island)=="simplifier" for island in islands for model in [*island.archive.items,*island.population,island.best_models.model] if model is not None]
     f,snapping=snap_final_candidates(f,Xt,Yt,Xv,Yv,affine_on,cats,constraints,out_names); report_snapping(snapping)
+    # Snapping swaps in snapped copies position by position, so identify the
+    # simplifier's candidates after it.
+    simplifier_keys={selection_identity(model) for model,flag in zip(f,from_simplifier) if flag}
     evaluation=selection_evaluation(f,Xv,Yv,cats,constraints,out_names)
-    labels,choices,selection=model_options(f,cats=cats,loss_tolerance=args.selection_loss_tolerance,evaluation=evaluation)
+    labels,choices,selection=model_options(f,cats=cats,loss_tolerance=args.selection_loss_tolerance,evaluation=evaluation,simplifier_keys=simplifier_keys)
     print_frontier(f,names,out_names,cats,recommendations=(labels,choices),evaluation=evaluation)
     if selection.get("warning"): print(f"WARNING: {selection['warning']}")
     if len(islands)==1: print(islands[0].archive.stats())

@@ -508,6 +508,25 @@ class PresetRoleTests(unittest.TestCase):
         self.assertTrue(lane)
         self.assertTrue(all(a.tree_size_cap(m) <= cap for m in lane))
 
+    def test_menu_offers_the_simplifiers_shortest_near_best_model(self):
+        def entry(tree, loss, bits):
+            m = model(tree, ops=tuple(self.OPS)); m.objectives = (loss, 0., float(bits), 0)
+            return (m, m, {"loss": loss, "shape": 0., "mdl_bits": float(bits)})
+        best = entry(("+", ("square", X0), ("sin", X0)), 1., 120)
+        near = entry(("square", X0), 1.03, 60)                                   # within 5%, outside 1%
+        nearer_elsewhere = entry(("+", X0, ("c", 1.)), 1.04, 40)                   # within 5%, not the simplifier's
+        far = entry(X0, 2., 10)
+        entries = [best, near, nearer_elsewhere, far]
+        keys = {a.selection_identity(near[0]), a.selection_identity(far[0])}
+        self.assertIs(a.simplifier_choice(entries, keys), near[0])
+        self.assertIsNone(a.simplifier_choice(entries, {a.selection_identity(far[0])}))   # nothing in band
+        self.assertIsNone(a.simplifier_choice(entries, set()))
+        labels, choices, _ = a.model_options([e[0] for e in entries], cats=[None], evaluation=("training", entries), simplifier_keys=keys)
+        index = next(i for i, label in enumerate(labels) if "simplifier island" in label)
+        self.assertIs(choices[index], near[0]); self.assertIn("5%", labels[index])
+        plain, _, _ = a.model_options([e[0] for e in entries], cats=[None], evaluation=("training", entries))
+        self.assertFalse(any("simplifier" in label for label in plain))
+
     def test_unknown_role_in_setup_is_rejected(self):
         df = pd.DataFrame({"a": np.arange(40.), "y": np.arange(40.)})
         args = a.parse_cli(["--population", "32", "--max-generations", "1", "--seed", "1"])[1]

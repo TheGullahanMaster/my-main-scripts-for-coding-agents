@@ -689,8 +689,10 @@ class ModelExplorer:
             maps = state["maps"]
             afpo.SEQUENCE_LAYOUT = maps.get(afpo.SEQUENCE_LAYOUT_KEY)
             tolerance = state.get("parsimony_quality_tolerance", 0.)
+            simplifier_keys = set()
             if state.get("island_states"):
                 islands = [afpo.island_from_snapshot(item, len(state["Xt"]), tolerance) for item in state["island_states"]]
+                simplifier_keys = afpo.simplifier_identities(islands)
                 pool = [m for island in islands for m in [*island.archive.items, island.best_models.model] if m is not None]
                 populations = [m for island in islands for m in island.population]
             else:
@@ -704,7 +706,8 @@ class ModelExplorer:
             loss_tolerance = state.get("selection_loss_tolerance", .01)
             candidates = afpo.unique_models([*pool, *populations])
             evaluation = afpo.selection_evaluation(candidates, Xv, Yv, cats, constraints, out_names)
-            labels, choices, selection = afpo.model_options([e[0] for e in evaluation[1]], cats=cats, loss_tolerance=loss_tolerance, evaluation=evaluation)
+            labels, choices, selection = afpo.model_options([e[0] for e in evaluation[1]], cats=cats, loss_tolerance=loss_tolerance, evaluation=evaluation,
+                                                           simplifier_keys=simplifier_keys)
             recommended = {id(model): label for label, model in zip(labels, choices)}
             pool_ids = {afpo.selection_identity(m) for m in pool}
             frontier_ids = {id(e[0]) for e in afpo.selection_frontier(evaluation[1])}

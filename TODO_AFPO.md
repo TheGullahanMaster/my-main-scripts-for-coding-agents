@@ -112,9 +112,12 @@ GUI form test in `test_afpo_gui.py`):
   anchored simplifier recovers the old one's losses (vs old: 2 solves
   gained, 0 lost) but its chosen models are ~12 bits longer [+2, +22]:
   likely because it lowers the best validation loss, which tightens the 1%
-  final-choice band. Untested follow-ups: offer the simplifier's shortest
-  near-best models as their own final choice, or bench a looser
-  --selection-loss-tolerance. Raw runs: bench_roles.py output (not kept in
+  final-choice band. Follow-up done: the final menu (terminal and GUI
+  Models tab) now offers "Shortest within 5% of the best loss (simplifier
+  island)" (`simplifier_choice`); on the coffee data (seed 1) it surfaced
+  the exact Newton law at 111 bits where Best Score picked a 182-bit
+  ceil2 hack 1.5% better on validation. Untested: a looser
+  --selection-loss-tolerance in the benchmark. Raw runs: bench_roles.py output (not kept in
   the repo).
 
 Not done: role-specific ALPS reseeding uses global tree size; residual-signature
