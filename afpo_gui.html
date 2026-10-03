@@ -1108,7 +1108,7 @@ async function inspect() {
     if (savedTypes && savedTypes.key === key && savedTypes.types.length === INSPECT.columns.length) INSPECT.columns.forEach((c, i) => { if (!c.constant) c.type = savedTypes.types[i]; });
     COL_SEL = new Set(); COL_LAST = null;
     renderColumns();
-    $('#datasetInfo').textContent = `${INSPECT.rows.toLocaleString()} rows · ${INSPECT.columns.length} columns · ${INSPECT.path}`;
+    $('#datasetInfo').textContent = `${INSPECT.rows.toLocaleString()} rows${INSPECT.sampled_rows ? ` (column statistics from a ${INSPECT.sampled_rows.toLocaleString()}-row sample)` : ''} · ${INSPECT.columns.length} columns · ${INSPECT.path}`;
   } catch (e) { $('#datasetInfo').textContent = ''; toast(e.message, true); }
   finally { $('#inspectBtn').disabled = false; }
 }
@@ -1203,7 +1203,7 @@ function collectForm() {
 }
 function showCheck(msg, err) { $('#checkMsg').innerHTML = msg ? `<div class="notice ${err ? 'err' : ''}">${esc(msg)}</div>` : ''; }
 $('#checkBtn').onclick = async () => {
-  try { const j = await api('/api/train/check', collectForm()); showCheck(`Looks good: ${j.rows.toLocaleString()} rows, ${j.operators} operators. Command-line equivalent options: ${j.argv.join(' ')}`); }
+  try { const j = await api('/api/train/check', collectForm()); showCheck(`Looks good: ${j.rows.toLocaleString()} rows${j.training_rows < j.rows ? ` (training on a ${j.training_rows.toLocaleString()}-row sample)` : ''}, ${j.operators} operators. Command-line equivalent options: ${j.argv.join(' ')}`); }
   catch (e) { showCheck(e.message, true); }
 };
 $('#startBtn').onclick = async () => {
