@@ -192,7 +192,7 @@ input, select, textarea { max-width: 100%; }
 .frozen .field > label { display: flex; justify-content: space-between; gap: 6px; font-weight: 500; }
 .frozen .unused { color: var(--muted); font-weight: 400; font-size: 11px; }
 .chart.h480 { height: 480px; }
-.chart canvas.grab { cursor: grab; } .chart canvas.grab:active { cursor: grabbing; }
+.chart canvas.grab { cursor: grab; touch-action: none; } .chart canvas.grab:active { cursor: grabbing; }
 .colorbar { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 8px; align-items: center; font-size: 12px; color: var(--text-2); margin-top: 8px; font-variant-numeric: tabular-nums; }
 .colorbar .ramp { height: 10px; border-radius: 3px; }
 .colorbar .title { grid-column: 1 / -1; color: var(--text-2); font-size: 12px; }
@@ -826,19 +826,44 @@ class Surface3D {
     this.c = canvas; this.ctx = canvas.getContext('2d'); this.spec = null; this.verts = [];
     this.reset();
     this.tip = document.createElement('div'); this.tip.className = 'tip'; canvas.parentElement.appendChild(this.tip);
-    canvas.addEventListener('pointerdown', e => { this.drag = {x: e.clientX, y: e.clientY, yaw: this.yaw, elev: this.elev}; canvas.setPointerCapture(e.pointerId); this.tip.style.display = 'none'; });
-    canvas.addEventListener('pointerup', e => { this.drag = null; canvas.releasePointerCapture(e.pointerId); });
+    // One pointer rotates (elevation from below the floor to overhead), two
+    // pinch-zoom; a tap shows the value under the finger, a double tap resets.
+    // touch-action: none (CSS) keeps the browser from scrolling instead.
+    this.pointers = new Map(); this.lastTap = 0;
+    const span = () => { const [a, b] = [...this.pointers.values()]; return Math.hypot(a.x - b.x, a.y - b.y) || 1; };
+    canvas.addEventListener('pointerdown', e => {
+      this.pointers.set(e.pointerId, {x: e.clientX, y: e.clientY}); canvas.setPointerCapture(e.pointerId); this.tip.style.display = 'none';
+      if (this.pointers.size === 1) this.drag = {x: e.clientX, y: e.clientY, yaw: this.yaw, elev: this.elev, time: Date.now(), moved: false};
+      else if (this.pointers.size === 2) { this.drag = null; this.pinch = {span: span(), zoom: this.zoom}; }
+    });
+    const release = e => {
+      const tap = this.drag && !this.drag.moved && Date.now() - this.drag.time < 300 && this.pointers.size === 1;
+      this.pointers.delete(e.pointerId); if (canvas.hasPointerCapture(e.pointerId)) canvas.releasePointerCapture(e.pointerId);
+      this.drag = null; if (this.pointers.size < 2) this.pinch = null;
+      if (tap && e.type === 'pointerup') {
+        if (Date.now() - this.lastTap < 350) { this.lastTap = 0; this.reset(); this.draw(); return; }
+        this.lastTap = Date.now();
+        if (e.pointerType !== 'mouse') this.hover(e);
+      }
+    };
+    canvas.addEventListener('pointerup', release); canvas.addEventListener('pointercancel', release);
     canvas.addEventListener('pointermove', e => {
+      if (this.pointers.has(e.pointerId)) this.pointers.set(e.pointerId, {x: e.clientX, y: e.clientY});
+      if (this.pinch && this.pointers.size === 2) {
+        this.zoom = Math.min(3, Math.max(.5, this.pinch.zoom * span() / this.pinch.span)); this.draw(); return;
+      }
       if (this.drag) {
+        if (Math.hypot(e.clientX - this.drag.x, e.clientY - this.drag.y) > 6) this.drag.moved = true;
+        if (!this.drag.moved) return;
         this.yaw = this.drag.yaw - (e.clientX - this.drag.x) * .01;
-        this.elev = Math.min(1.53, Math.max(.02, this.drag.elev + (e.clientY - this.drag.y) * .01));
+        this.elev = Math.min(1.53, Math.max(-1.53, this.drag.elev + (e.clientY - this.drag.y) * .01));
         this.draw(); return;
       }
-      this.hover(e);
+      if (e.pointerType === 'mouse') this.hover(e);
     });
-    canvas.addEventListener('pointerleave', () => { this.tip.style.display = 'none'; });
+    canvas.addEventListener('pointerleave', e => { if (e.pointerType === 'mouse') this.tip.style.display = 'none'; });
     canvas.addEventListener('wheel', e => { e.preventDefault(); this.zoom = Math.min(3, Math.max(.5, this.zoom * Math.exp(-e.deltaY * .0012))); this.draw(); }, {passive: false});
-    canvas.addEventListener('dblclick', () => { this.reset(); this.draw(); });
+    canvas.addEventListener('dblclick', e => { e.preventDefault(); });   // double taps/clicks reset through pointerup
     new ResizeObserver(() => this.draw()).observe(canvas.parentElement);
     charts.push(this);
   }
@@ -864,18 +889,35 @@ class Surface3D {
     const {xs, ys, z, lo, hi} = spec, nx = xs.length, ny = ys.length, Z = .65;
     const X = i => nx > 1 ? i / (nx - 1) * 2 - 1 : 0, Y = i => ny > 1 ? i / (ny - 1) * 2 - 1 : 0;
     const zn = v => hi > lo ? (v - lo) / (hi - lo) * 2 * Z - Z : 0;
-    // Fit the whole box (with room for tick labels) to the canvas at the current angle.
-    this.cx = 0; this.cy = 0; this.scale = 1;
-    let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
-    for (const a of [-1.3, 1.3]) for (const b of [-1.3, 1.3]) for (const c of [-Z, Z * 1.3]) {
-      const q = this.project(a, b, c); x0 = Math.min(x0, q[0]); x1 = Math.max(x1, q[0]); y0 = Math.min(y0, q[1]); y1 = Math.max(y1, q[1]);
+    // One scale for every angle: the box (with room for tick labels) fits the
+    // canvas at its widest and tallest views, so rotating or levelling it
+    // never zooms; only the centring follows the angle.
+    const extent = (yaw, elev) => {
+      const saved = [this.yaw, this.elev, this.cx, this.cy, this.scale];
+      this.yaw = yaw; this.elev = elev; this.cx = 0; this.cy = 0; this.scale = 1;
+      let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
+      for (const a of [-1.3, 1.3]) for (const b of [-1.3, 1.3]) for (const c of [-Z, Z * 1.3]) {
+        const q = this.project(a, b, c); x0 = Math.min(x0, q[0]); x1 = Math.max(x1, q[0]); y0 = Math.min(y0, q[1]); y1 = Math.max(y1, q[1]);
+      }
+      [this.yaw, this.elev, this.cx, this.cy, this.scale] = saved;
+      return [x0, x1, y0, y1];
+    };
+    if (!this.span) {
+      let width = 0, height = 0;
+      for (let i = 0; i < 24; i++) for (let j = -6; j <= 6; j++) {
+        const [x0, x1, y0, y1] = extent(i / 24 * 2 * Math.PI, j / 6 * 1.53); width = Math.max(width, x1 - x0); height = Math.max(height, y1 - y0);
+      }
+      this.span = [width, height];
     }
-    this.scale = Math.min((w - 40) / (x1 - x0), (h - 30) / (y1 - y0)) * this.zoom;
+    const [x0, x1, y0, y1] = extent(this.yaw, this.elev);
+    this.scale = Math.min((w - 40) / this.span[0], (h - 30) / this.span[1]) * this.zoom;
     this.cx = w / 2 - this.scale * (x0 + x1) / 2; this.cy = h / 2 - this.scale * (y0 + y1) / 2;
     const line = (a, b, color, width = 1) => { const p = this.project(...a), q = this.project(...b); ctx.strokeStyle = color; ctx.lineWidth = width; ctx.beginPath(); ctx.moveTo(p[0], p[1]); ctx.lineTo(q[0], q[1]); ctx.stroke(); };
     const label = (pt, text, align = 'center', color = muted, max = w * .3) => { const p = this.project(...pt); ctx.fillStyle = color; ctx.textAlign = align; ctx.textBaseline = 'middle'; ctx.fillText(fitText(ctx, text, max), p[0], p[1]); };
-    // Floor grid, then the vertical axis at the back corner.
-    for (let t = 0; t <= 4; t++) { const v = -1 + t / 2; line([v, -1, -Z], [v, 1, -Z], grid); line([-1, v, -Z], [1, v, -Z], grid); }
+    // Floor grid (under the surface, or over it when seen from below), then
+    // the vertical axis at the back corner.
+    const floor = () => { for (let t = 0; t <= 4; t++) { const v = -1 + t / 2; line([v, -1, -Z], [v, 1, -Z], grid); line([-1, v, -Z], [1, v, -Z], grid); } };
+    if (this.elev >= 0) floor();
     const corners = [[-1, -1], [1, -1], [1, 1], [-1, 1]].map(([a, b]) => ({a, b, d: this.project(a, b, -Z)[2]}));
     const back = corners.reduce((m, k) => k.d > m.d ? k : m), front = corners.reduce((m, k) => k.d < m.d ? k : m);
     line([back.a, back.b, -Z], [back.a, back.b, Z], grid, 1.5);
@@ -908,6 +950,7 @@ class Surface3D {
       ctx.beginPath(); ctx.moveTo(it.P[0][0], it.P[0][1]); for (let k = 1; k < 4; k++) ctx.lineTo(it.P[k][0], it.P[k][1]); ctx.closePath();
       ctx.fillStyle = col; ctx.fill(); ctx.strokeStyle = col; ctx.lineWidth = .7; ctx.stroke();
     }
+    if (this.elev < 0) { ctx.save(); ctx.globalAlpha = .6; floor(); ctx.restore(); }
     for (let yi = 0; yi < ny; yi++) for (let xi = 0; xi < nx; xi++) { const v = V[yi][xi]; if (v) { const P = this.project(v[0], v[1], v[2]); this.verts.push({sx: P[0], sy: P[1], d: P[2], x: xs[xi], y: ys[yi], z: v[3]}); } }
     // Axis ticks along the two front floor edges.
     const tickText = (values, labels, t) => labels ? labels[Math.round(t * (labels.length - 1))] : fmt(values[0] + (values[values.length - 1] - values[0]) * t, 3);
@@ -1779,7 +1822,7 @@ async function loadExplore() {
   $('#exLegend').innerHTML = pts.length ? `<span><i class="sw" style="background:var(--s2)"></i>Training rows at their actual value</span>` : '';
   ex3d.set({xs, ys, z, lo, hi, xlabel: xName, ylabel: yName, zlabel: outLabel, xlabels: xc ? r.x.values.map(String) : null, ylabels: yc ? r.y.values.map(String) : null,
     xspan: [xs[0], xs[xs.length - 1]], yspan: [ys[0], ys[ys.length - 1]], points: pts, tooltip: valueTip});
-  $('#exHint').textContent = 'Drag to rotate · scroll to zoom · double-click to reset the view. Training rows outside the plotted ranges are hidden.';
+  $('#exHint').textContent = 'Drag to rotate (down to look from below) · scroll or pinch to zoom · tap for a value · double-click or double-tap to reset. Training rows outside the plotted ranges are hidden.';
 }
 $$('#exMode button').forEach(b => b.onclick = () => {
   EX.mode = b.dataset.mode;
