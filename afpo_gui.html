@@ -90,6 +90,9 @@ tr.selected td { background: color-mix(in srgb, var(--accent) 14%, transparent);
 .badge { display: inline-block; font-size: 11px; padding: 1px 7px; border-radius: 10px; background: var(--surface-2); border: 1px solid var(--border); color: var(--text-2); white-space: nowrap;  max-width: 100%; overflow: hidden; text-overflow: ellipsis; vertical-align: middle; }
 .badge.accent { border-color: var(--accent); color: var(--accent); }
 .eq { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; word-break: break-word; }
+.math { background: var(--surface-2); border-radius: 8px; padding: 10px 12px; margin-bottom: 6px; overflow-x: auto; font-size: 15px; }
+.math .name { color: var(--muted); font-size: 12px; margin-bottom: 4px; }
+.math math { font-size: 17px; }
 .eq-big { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 14px; word-break: break-word; background: var(--surface-2); border-radius: 8px; padding: 10px 12px; }
 .tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 10px; margin-bottom: 14px; }
 .tile { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; }
@@ -429,6 +432,13 @@ input, select, textarea { max-width: 100%; }
       <div class="card">
         <h2>Selected model <span class="grow"></span><button class="btn" id="exportBtn">Export as best_model.py</button></h2>
         <div id="detailEq"></div>
+        <details id="mathBox" open style="margin-top:8px"><summary>Rendered equation</summary>
+          <div class="row" style="margin:6px 0">
+            <span class="seg" id="mathMode"><button data-mode="raw" class="active" title="Protections removed, constants as fractions or 6 significant digits">Readable</button><button data-mode="exact" title="afpo's protected operators and full-precision constants: reproduces the model's predictions">Exact</button></span>
+            <span class="grow"></span><button class="btn" id="mathCopy">Copy LaTeX</button>
+          </div>
+          <div id="mathBody"><div class="hint">Converting…</div></div>
+        </details>
         <div class="grid2" style="margin-top:10px">
           <div><div class="kv" id="detailKv"></div></div>
           <div><table id="detailOutputs"></table></div>
@@ -1388,9 +1398,63 @@ async function selectModel(index) {
     const url = URL.createObjectURL(new Blob([d.svg], {type: 'image/svg+xml'}));
     $('#treeBox').innerHTML = `<img alt="Expression tree" src="${url}">`;
     defaultAxes(); syncAxisControls();
+    loadMath(index);
     await Promise.all([loadFit(), loadExplore(), loadGenDefaults()]);
   } catch (e) { toast(e.message, true); }
 }
+// Rendered equation: KaTeX from the CDN when reachable, else the browser's
+// native MathML (converted by SymPy on the server), so it also works offline.
+let katexLoad = null;
+function loadKatex() {
+  if (!katexLoad) katexLoad = new Promise(resolve => {
+    const base = 'https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/';
+    const link = document.createElement('link'); link.rel = 'stylesheet'; link.href = base + 'katex.min.css';
+    const script = document.createElement('script'); script.src = base + 'katex.min.js';
+    script.onload = () => resolve(window.katex || null); script.onerror = () => resolve(null);
+    document.head.append(link, script);
+    setTimeout(() => resolve(window.katex || null), 4000);
+  });
+  return katexLoad;
+}
+const MATH = {mode: 'raw', data: null};
+async function loadMath(index) {
+  MATH.data = null;
+  $('#mathBody').innerHTML = '<div class="hint">Converting…</div>';
+  try {
+    const [data, katex] = await Promise.all([api('/api/models/latex', {index}), loadKatex()]);
+    if (M.index !== index) return;
+    MATH.data = data; MATH.katex = katex; renderMath();
+  } catch (e) { if (M.index === index) $('#mathBody').innerHTML = `<div class="hint">${esc(e.message)}</div>`; }
+}
+function renderMath() {
+  const d = MATH.data, body = $('#mathBody');
+  if (!d) return;
+  if (!d.available) { body.innerHTML = `<div class="hint">${esc(d.reason)}</div>`; return; }
+  const mode = MATH.mode;
+  body.innerHTML = d.outputs.map(o => {
+    const form = o[mode], tex = `${o.name_latex} = ${form.latex}`;
+    if (!form.latex) return `<div class="math"><div class="hint">${esc(o.name)}: could not convert (${esc(form.error)})</div></div>`;
+    let shown;
+    if (MATH.katex) {
+      try { shown = MATH.katex.renderToString(tex, {displayMode: true, throwOnError: true}); } catch (e) { shown = null; }
+    }
+    if (!shown) shown = `<math display="block"><mi${o.name.length > 1 ? ' mathvariant="normal"' : ''}>${esc(o.name)}</mi><mo>=</mo>${form.mathml}</math>`;
+    const a = o.agreement;
+    const note = mode === 'raw' && a ? `<div class="hint">Matches the model on ${(100 * a.defined).toFixed(1)}% of training rows${a.gap == null ? '' : `, max difference ${fmt(a.gap, 2)} of the output range`}.</div>` : '';
+    return `<div class="math">${d.outputs.length > 1 ? `<div class="name">${esc(o.name)}</div>` : ''}${shown}${note}</div>`;
+  }).join('') + (mode === 'exact' ? '<div class="hint">Exact: afpo\'s guards as evaluated (the per-node ±1e12 clamp is left out).</div>' : '');
+}
+$$('#mathMode button').forEach(b => b.onclick = () => {
+  MATH.mode = b.dataset.mode;
+  $$('#mathMode button').forEach(x => x.classList.toggle('active', x === b));
+  renderMath();
+});
+$('#mathCopy').onclick = async () => {
+  const d = MATH.data;
+  if (!d || !d.available) return;
+  const text = d.outputs.filter(o => o[MATH.mode].latex).map(o => `${o.name_latex} = ${o[MATH.mode].latex}`).join('\n');
+  try { await navigator.clipboard.writeText(text); toast('LaTeX copied'); } catch (e) { toast('Copy failed: ' + e.message, true); }
+};
 function fillOutputSelect(sel, names, keep) {
   const prev = sel.value;
   sel.innerHTML = names.map(n => `<option>${esc(n)}</option>`).join('');

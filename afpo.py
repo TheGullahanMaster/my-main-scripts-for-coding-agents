@@ -30,10 +30,13 @@ import multiprocessing
 import os
 import pickle
 import random
+import re
 import signal
 import subprocess
 import sys
+import threading
 import time
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -1301,7 +1304,7 @@ def _scan_costs(predictions, y, scale, fit_readout):
         slope=np.einsum("kn,n->k",du,y-my)/np.where(degenerate,1.,suu)
         slope=np.where(degenerate|~np.isfinite(slope),0.,np.clip(slope,-AFFINE_COEFFICIENT_BOUND,AFFINE_COEFFICIENT_BOUND))
         P=slope[:,None]*du+my
-    r=np.abs((P-y)/scale); huber=ROBUST_LOSS_DELTA
+    r=np.abs((P-y)/scale); huber=loss_delta()
     costs=np.where(r<=huber,.5*r*r,huber*(r-.5*huber)).sum(axis=1)
     return np.where(np.isfinite(costs),costs,np.inf)
 def _nudged_roots(flat, nodes, slot, candidates, X):
@@ -1342,7 +1345,7 @@ def scan_jump_constants(flat, start, X, y, scale, fit_readout=True):
     JUMP_SCAN_STATS["improved"]+=1
     return current
 
-def fit_tree_constants(tree, X, y, adfs=None, fit_readout=True, iterations=CONSTANT_FIT_ITERATIONS, robust=True):
+def fit_tree_constants(tree, X, y, adfs=None, fit_readout=True, iterations=None, robust=True):
     """Levenberg-Marquardt on a tree's inner constants (variable projection).
 
     The affine readout a*f+b is re-solved in closed form for every constant
@@ -1352,9 +1355,11 @@ def fit_tree_constants(tree, X, y, adfs=None, fit_readout=True, iterations=CONST
     Huber cost.  Plain least squares let a few outliers drag correct
     constants away, and the result is written back into the model.
     """
+    if iterations is None: iterations=CONSTANT_FIT_ITERATIONS  # read at call time: --fit-iterations sets it
     start=np.asarray(constant_vector(tree),float)
     if not len(start) or not len(y): return tree
-    scale=target_scale(y); ones=np.ones(len(y)); flat=_FlatTree.build(tree); huber=ROBUST_LOSS_DELTA
+    scale=loss_scale(y); flat=_FlatTree.build(tree); huber=loss_delta()
+    base=loss_base_weights(y); ones=np.ones(len(y)) if base is None else base*base
     if JUMP_CONSTANT_SCAN and flat is not None and isinstance(X,np.ndarray) and X.ndim==2:
         scanned=scan_jump_constants(flat,start,X,y,scale,fit_readout)
         if scanned is not None:
@@ -1362,7 +1367,7 @@ def fit_tree_constants(tree, X, y, adfs=None, fit_readout=True, iterations=CONST
             # The gradient fit below returns its own input unless it improves
             # further, so the scanned tree becomes that input.
             if not guarded_constant_divisor(placed) and not guard_engagement([placed],X,adfs): tree,start=placed,scanned
-    if flat is not None and FIT_BACKEND=="auto" and isinstance(X,np.ndarray) and X.ndim==2:
+    if flat is not None and FIT_BACKEND=="auto" and LOSS_MODE=="huber" and isinstance(X,np.ndarray) and X.ndim==2:
         core=compiled_fitter(); program=None if core is None else _compiled_program(flat,core,X.shape[1])
         if program is not None:
             result=core.fit(*program,start,np.ascontiguousarray(X,dtype=float),np.ascontiguousarray(y,dtype=float),scale,
@@ -1388,8 +1393,9 @@ def fit_tree_constants(tree, X, y, adfs=None, fit_readout=True, iterations=CONST
                 if abs(slope)>bound: slope=float(np.sign(slope))*bound; intercept=float(np.average(y-slope*pred,weights=weights))
                 fitted=slope*pred+min(max(float(intercept),-bound),bound)
                 if robust:
-                    weights=np.minimum(1.,huber_scale/np.maximum(np.abs(fitted-y),EPS))
-                    if (weights>=1.).all(): break  # no point is in the Huber tail: least squares is exact
+                    huber_weights=np.minimum(1.,huber_scale/np.maximum(np.abs(fitted-y),EPS))
+                    if (huber_weights>=1.).all(): break  # no point is in the Huber tail: least squares is exact
+                    weights=ones*huber_weights
             pred=fitted
         r=(pred-y)/scale
         if robust:
@@ -1474,10 +1480,129 @@ def tune_model_constants(model, X, Y, affine_on, cats):
             if len(cats[j])>=2 and affine_on and _tune_classifier_heads(trees,heads,Xs,Ys[:,j],len(cats[j]),model.adfs): changed=True
             continue
         for head in heads:
-            tuned=fit_tree_constants(trees[head],Xs,Ys[:,j],model.adfs,fit_readout=affine_on)
-            if tuned is not trees[head]: trees[head]=tuned; changed=True
+            original=trees[head]
+            multiterm=READOUT_MODE=="multiterm" and affine_on
+            grammar=model.mdl_operators or None  # never write an operator the run did not select
+            tree=multiterm_refit(original,Xs,Ys[:,j],model.adfs,grammar) if multiterm else original
+            tree=fit_tree_constants(tree,Xs,Ys[:,j],model.adfs,fit_readout=affine_on)
+            # Re-solve the linear coefficients after the joint fit: the readout
+            # scale and the term coefficients share one degree of freedom, and
+            # leaving it to Levenberg-Marquardt lets them drift apart.
+            if multiterm and tree is not original: tree=multiterm_refit(tree,Xs,Ys[:,j],model.adfs,grammar)
+            if tree is not original: trees[head]=tree; changed=True
     if changed: model.trees=trees
     return changed
+
+# --readout multiterm (multigene GP: GPTIPS, MRGP).  The top-level +/- terms
+# of a regression tree each get their own least-squares coefficient,
+# b + a1*T1 + a2*T2 + ..., solved in closed form (Huber IRLS on an SVD
+# least-squares solve) during constant tuning and written back into the tree
+# as constants, so the export format and the scored semantics are unchanged
+# and MDL charges exactly the coefficients that survive.  Terms that are
+# negligible or collinear with the others are pruned (nearly identical terms
+# would otherwise get huge cancelling coefficients), and at most MAX_TERMS
+# are kept.  On by default since bench_diag v1 (2026-10-02, alone and with
+# the residual term): more exact solves and +0.46 held-out digits, beyond
+# paired seed noise.  Checkpoints from before the flag resume with affine.
+READOUT_MODE = "multiterm"
+MAX_TERMS = 4
+GENE_CROSSOVER_RATE = 0.    # share of crossovers that exchange whole terms in multiterm mode
+MULTITERM_CONDITION_LIMIT = 1e8
+MULTITERM_MIN_CONTRIBUTION = 1e-9  # of the target scale
+
+def split_terms(tree, sign=1.):
+    """Top-level additive terms as (coefficient, body); body None is a pure constant."""
+    op=tree[0]
+    if op=="+": return split_terms(tree[1],sign)+split_terms(tree[2],sign)
+    if op=="-": return split_terms(tree[1],sign)+split_terms(tree[2],-sign)
+    if op=="neg": return split_terms(tree[1],-sign)
+    if op=="c": return [(sign*float(tree[1]),None)]
+    if op=="*" and tree[1][0]=="c" and tree[2][0]!="c": return [(sign*float(tree[1][1]),tree[2])]
+    if op=="*" and tree[2][0]=="c" and tree[1][0]!="c": return [(sign*float(tree[2][1]),tree[1])]
+    return [(sign,tree)]
+
+def join_terms(terms, ops=None):
+    """Inverse of split_terms for (coefficient, body) pairs with a body, written
+    only with operators in ops (None allows any).  A sign goes into "-" or "neg"
+    when allowed, else into the coefficient; returns None when ops cannot
+    express the sum (no "+", or a coefficient other than 1 without "*")."""
+    allowed=lambda op: ops is None or op in ops
+    def scaled(coefficient, body):
+        if coefficient==1.: return body
+        return ("*",("c",coefficient),body) if allowed("*") else None
+    if not terms: return ("c",0.)
+    tree=None
+    for coefficient,body in terms:
+        magnitude=abs(coefficient); negative=coefficient<0
+        if tree is None:
+            if negative and allowed("neg") and scaled(magnitude,body) is not None: tree=("neg",scaled(magnitude,body))
+            else: tree=scaled(coefficient,body)
+        elif negative and allowed("-") and scaled(magnitude,body) is not None: tree=("-",tree,scaled(magnitude,body))
+        elif allowed("+") and scaled(coefficient,body) is not None: tree=("+",tree,scaled(coefficient,body))
+        else: return None
+        if tree is None: return None
+    return tree
+
+def _multiterm_solve(F, y):
+    """Huber-reweighted least squares y ~ F @ a + b; returns (a, b, loss, condition)."""
+    centre=F.mean(axis=0); spread=F.std(axis=0); spread=np.where(spread>EPS,spread,1.)
+    A=np.column_stack(((F-centre)/spread,np.ones(len(y)))); cutoff=loss_delta()*loss_scale(y)
+    base=loss_base_weights(y); base=np.ones(len(y)) if base is None else base; weights=base; coefficients=None
+    for _ in range(6):
+        solution,_,_,singular=np.linalg.lstsq(A*weights[:,None],y*weights,rcond=1e-12)
+        if coefficients is not None and np.allclose(solution,coefficients,rtol=1e-10,atol=1e-14): coefficients=solution; break
+        coefficients=solution
+        weights=base*np.sqrt(np.minimum(1.,cutoff/np.maximum(np.abs(A@coefficients-y),EPS)))
+    a=coefficients[:-1]/spread; b=float(coefficients[-1]-np.dot(a,centre))
+    condition=float(singular[0]/singular[-1]) if len(singular) and singular[-1]>0 else float("inf")
+    return a,b,robust_loss(F@a+b,y),condition
+
+def multiterm_refit(tree, X, y, adfs=None, ops=None):
+    """Re-solve the coefficients of a tree's top-level terms; returns the tree unchanged unless it improves or shrinks at equal loss."""
+    terms=[(coefficient,body) for coefficient,body in split_terms(tree) if body is not None]
+    if len(terms)<2: return tree
+    try:
+        F=np.column_stack([evaluate_cached(body,X,adfs) for _,body in terms]).astype(float)
+        current_raw=evaluate_cached(tree,X,adfs)
+    except (ArithmeticError, IndexError, RecursionError, ValueError): return tree
+    if not np.isfinite(F).all(): return tree
+    a,b=affine(current_raw,y); before=robust_loss(a*current_raw+b,y)
+    scale=target_scale(y); active=[index for index in range(len(terms)) if F[:,index].std()>EPS]
+    if len(active)<1: return tree
+    def solve(columns): return _multiterm_solve(F[:,columns],y)
+    coefficients,_,loss,condition=solve(active)
+    while len(active)>1:
+        contribution=np.abs(coefficients)*F[:,active].std(axis=0)
+        if condition<=MULTITERM_CONDITION_LIMIT and len(active)<=MAX_TERMS and contribution.min()>MULTITERM_MIN_CONTRIBUTION*scale: break
+        # Drop the term whose removal costs least; ties go to the larger body.
+        options=[]
+        for position in range(len(active)):
+            rest=active[:position]+active[position+1:]
+            options.append((solve(rest)[2],-node_size(terms[active[position]][1]),position))
+        _,_,position=min(options); active.pop(position)
+        coefficients,_,loss,condition=solve(active)
+    if not np.isfinite(coefficients).all() or np.max(np.abs(coefficients))>CONSTANT_LIMIT: return tree
+    pruned=len(active)<len(terms)
+    if loss>before+max(LOSS_NOISE_FLOOR,1e-12*abs(before)) or (not pruned and loss>=before): return tree
+    tolerance=np.sqrt(np.finfo(float).eps)
+    rebuilt=join_terms([(1. if abs(c-1.)<=tolerance else -1. if abs(c+1.)<=tolerance else float(c),terms[index][1]) for c,index in zip(coefficients,active)],ops)
+    if rebuilt is None or rebuilt==tree or guarded_constant_divisor(rebuilt) or guard_engagement([rebuilt],X,adfs): return tree
+    return rebuilt
+
+def gene_crossover(left, right, max_nodes, max_depth, ops=None):
+    """Multigene crossover: add one of right's top-level terms to left, or swap it for one of left's."""
+    left_terms=[(c,body) for c,body in split_terms(left) if body is not None]
+    right_terms=[(c,body) for c,body in split_terms(right) if body is not None]
+    if not right_terms: return left
+    for _ in range(4):
+        donor=rng.choice(right_terms); terms=list(left_terms)
+        if terms and (len(terms)>=MAX_TERMS or rng.random()<.5): terms[rng.randrange(len(terms))]=donor
+        else: terms.append(donor)
+        joined=join_terms(terms,ops)
+        if joined is None: continue
+        child=simplify_tree(joined)
+        if child!=left and node_size(child)<=max_nodes and node_depth(child)<=max_depth: return child
+    return left
 class PosteriorParticlePopulation:
     """Adaptive finite-catalogue search distribution, not an exact SMC posterior.
 
@@ -2163,10 +2288,343 @@ JUMP_MUTATION_WEIGHT = 1.
 SQUASH_SWAP_WEIGHT = 1.
 SMOOTH_SWAP_WEIGHT = 1.
 GATE_MUTATION_WEIGHT = 1.
+# Semantic backpropagation mutation (RDO; Pawlak, Wieloch and Krawiec 2015).
+# The desired raw output of the parent tree, T* = (y - b) / a from its affine
+# readout, is inverted down a random path to the values the subtree there
+# should output; the subtree is replaced by the library entry that best
+# matches them after an affine fit.  The library is every input, every unary
+# operator of an input and every binary operator of two inputs (bounded),
+# plus the fragment library.  "exact" inverts only the single-valued
+# operators (+ - * / neg exp log tanh sigmoid); "generic" also inverts every
+# other operator numerically per row, taking the solution nearest the
+# subtree's current value (the branch it is already on).
+BACKPROP_MUTATION_WEIGHT = 0.
+BACKPROP_INVERSE = "generic"
+BACKPROP_LIBRARY_LIMIT = 2000
+BACKPROP_MIN_VALID = .5            # share of rows whose desired value must be defined
+_BACKPROP_CONTEXT = {"X":None,"desired":None,"fragments":()}
+_BACKPROP_LIBRARY_CACHE = {}
+_INVERSE_GRID = np.concatenate([-np.logspace(-6,6,121)[::-1],[0.],np.logspace(-6,6,121)])
+_LIBRARY_EXCLUDED = {"python_rng","perlin_noise","seqsum","seqprod","cat","x_at_pos_y"}
+
+def set_backprop_context(X=None, desired=None, fragments=()):
+    _BACKPROP_CONTEXT.update(X=X,desired=desired,fragments=tuple(fragments))
+
+def exact_inverse(op, k, desired, args):
+    """Desired value of child k of op, or None when op is not single-valued there."""
+    d=desired
+    with np.errstate(all="ignore"):
+        if op=="+": return d-args[1-k]
+        if op=="-": return d+args[1] if k==0 else args[0]-d
+        if op=="*":
+            other=args[1-k]; return np.where(np.abs(other)>EPS,d/other,np.nan)
+        if op=="/":
+            if k==0: return d*np.where(np.abs(args[1])<EPS,EPS,args[1])
+            return np.where(np.abs(d)>EPS,args[0]/d,np.nan)
+        if op=="neg": return -d
+        if op=="exp": return np.where(d>0,np.log(d),np.nan)
+        if op=="log":  # log(|x|+eps): keep the sign the child already has
+            magnitude=np.exp(np.clip(d,-700,700))-EPS
+            return np.where(magnitude>0,np.where(args[0]<0,-magnitude,magnitude),np.nan)
+        if op=="tanh": return np.where(np.abs(d)<1,np.arctanh(np.clip(d,-1+1e-15,1-1e-15)),np.nan)
+        if op=="sigmoid": return np.where((d>0)&(d<1),np.log(d/(1-d)),np.nan)
+    return None
+
+def numeric_inverse(op, k, desired, args):
+    """Per-row solution z of op(..., z at k, ...) = desired nearest the current child value."""
+    current=np.asarray(args[k],float); n=len(current)
+    span=np.maximum(np.abs(current),1.)
+    grid=np.concatenate([current[:,None]+span[:,None]*np.linspace(-4,4,161)[None,:],current[:,None]+span[:,None]*np.linspace(-.25,.25,51)[None,:],np.broadcast_to(_INVERSE_GRID,(n,len(_INVERSE_GRID)))],axis=1)
+    grid.sort(axis=1); G=grid.shape[1]
+    def apply(z):
+        values=[np.repeat(np.asarray(a,float),z.shape[1]) if i!=k else z.ravel() for i,a in enumerate(args)]
+        return op_eval(op,values).reshape(z.shape)
+    try: f=apply(grid)-desired[:,None]
+    except (ArithmeticError, IndexError, ValueError): return None
+    f=np.where(np.isfinite(f),f,np.nan)
+    crossing=(np.sign(f[:,:-1])*np.sign(f[:,1:])<=0)&np.isfinite(f[:,:-1])&np.isfinite(f[:,1:])
+    distance=np.where(crossing,np.abs(.5*(grid[:,:-1]+grid[:,1:])-current[:,None]),np.inf)
+    best=np.argmin(distance,axis=1); found=np.isfinite(distance[np.arange(n),best])
+    lo=grid[np.arange(n),best]; hi=grid[np.arange(n),best+1]
+    flo=f[np.arange(n),best]; fhi=f[np.arange(n),best+1]
+    with np.errstate(all="ignore"):
+        for _ in range(30):  # bisection keeps a sign change bracketed, so jumps cannot fool it
+            mid=.5*(lo+hi); fmid=apply(mid[:,None])[:,0]-desired
+            left=np.sign(flo)*np.sign(fmid)<=0
+            hi=np.where(left,mid,hi); fhi=np.where(left,fmid,fhi); lo=np.where(left,lo,mid); flo=np.where(left,flo,fmid)
+        root=np.where(np.abs(flo)<=np.abs(fhi),lo,hi)
+        tolerance=1e-6*np.maximum(np.abs(desired),1.)
+        # Two roots inside one grid cell (or a touch at an extremum, sin
+        # reaching 1) show no sign change: also minimise |f| around the
+        # nearest dip of |f| and keep whichever valid root is closer.
+        magnitude=np.where(np.isfinite(f),np.abs(f),np.inf)
+        padded=np.pad(magnitude,((0,0),(1,1)),constant_values=np.inf)
+        dip=(magnitude<=padded[:,:-2])&(magnitude<padded[:,2:])&np.isfinite(magnitude)  # strict on one side: duplicate grid points are not dips
+        near=np.where(dip,np.abs(grid-current[:,None]),np.inf); index=np.argmin(near,axis=1)
+        a_=grid[np.arange(n),np.maximum(index-1,0)]; b_=grid[np.arange(n),np.minimum(index+1,G-1)]
+        for _ in range(60):
+            m1=a_+(b_-a_)/3; m2=b_-(b_-a_)/3
+            f1=np.abs(apply(m1[:,None])[:,0]-desired); f2=np.abs(apply(m2[:,None])[:,0]-desired)
+            smaller=np.where(np.isfinite(f1),f1,np.inf)<=np.where(np.isfinite(f2),f2,np.inf)
+            b_=np.where(smaller,m2,b_); a_=np.where(smaller,a_,m1)
+        dip_root=.5*(a_+b_)
+        crossing_ok=found&(np.abs(apply(root[:,None])[:,0]-desired)<=tolerance)
+        dip_ok=np.abs(apply(dip_root[:,None])[:,0]-desired)<=tolerance
+        closer=dip_ok&(~crossing_ok|(np.abs(dip_root-current)<np.abs(root-current)))
+        root=np.where(closer,dip_root,root)
+        residual=np.abs(apply(root[:,None])[:,0]-desired)
+    return np.where(residual<=tolerance,root,np.nan)
+
+def child_desired(op, k, desired, args):
+    exact=exact_inverse(op,k,desired,args)
+    if exact is not None or BACKPROP_INVERSE=="exact": return exact
+    return numeric_inverse(op,k,desired,args)
+
+def backprop_library(X, ops, adfs=None):
+    """(trees, semantics matrix) of small candidate subtrees, cached per data and grammar."""
+    key=(array_digest(X),tuple(ops))
+    cached=_BACKPROP_LIBRARY_CACHE.get(key)
+    if cached is not None: return cached
+    n_features=X.shape[1]; trees=[("x",i) for i in range(n_features)]
+    usable=[op for op in ops if op in OPS and op not in _LIBRARY_EXCLUDED]
+    trees+=[(op,("x",i)) for op in usable if OPS[op][0]==1 for i in range(n_features)]
+    pairs=[(op,("x",i),("x",j)) for op in usable if OPS[op][0]==2 for i in range(n_features) for j in range(n_features) if i!=j]
+    local=random.Random(len(X)*1009+n_features)  # fixed subsample; the run's RNG streams are untouched
+    room=max(0,BACKPROP_LIBRARY_LIMIT-len(trees))
+    trees+=pairs if len(pairs)<=room else local.sample(pairs,room)
+    kept=[]; columns=[]; seen=set()
+    for tree in trees:
+        try: values=np.asarray(evaluate_cached(tree,X,adfs),float)
+        except (ArithmeticError, IndexError, RecursionError, ValueError): continue
+        if not np.isfinite(values).all() or values.std()<=EPS: continue
+        signature=np.round(values,10).tobytes()
+        if signature in seen: continue
+        seen.add(signature); kept.append(tree); columns.append(values)
+    result=(kept,np.column_stack(columns) if columns else np.zeros((len(X),0)))
+    if len(_BACKPROP_LIBRARY_CACHE)>8: _BACKPROP_LIBRARY_CACHE.clear()
+    _BACKPROP_LIBRARY_CACHE[key]=result
+    return result
+
+def _best_affine_match(L, D):
+    """Index, slope, intercept and SSE of the column of L best matching D affinely."""
+    Lc=L-L.mean(axis=0); Dc=D-D.mean(); var=np.einsum("ij,ij->j",Lc,Lc)
+    with np.errstate(all="ignore"):
+        slope=np.where(var>EPS,(Lc.T@Dc)/var,0.)
+        sse=np.where(var>EPS,float(Dc@Dc)-slope*slope*var,np.inf)
+    index=int(np.argmin(sse)); intercept=float(D.mean()-slope[index]*L[:,index].mean())
+    return index,float(slope[index]),intercept,float(sse[index])
+
+# Residual-driven term (boosting-style): add to the parent the library entry
+# that best matches what its readout still misses, T + c*L with L fitted to
+# (y - b)/a - T.  Shares the backpropagation library and context.  On by
+# default since bench_diag v1 (+0.48 held-out digits, beyond seed noise).
+RESIDUAL_TERM_WEIGHT = 1.
+
+def residual_term_mutate(t, ops, max_nodes, max_depth, adfs=None):
+    X=_BACKPROP_CONTEXT["X"]; target=_BACKPROP_CONTEXT["desired"]
+    if X is None or target is None or len(target)!=len(X): return t
+    try: residual=np.asarray(target,float)-np.asarray(evaluate_cached(t,X,adfs),float)
+    except (ArithmeticError, IndexError, RecursionError, ValueError): return t
+    valid=np.isfinite(residual)
+    if valid.sum()<5 or residual[valid].std()<=EPS: return t
+    trees,L=backprop_library(X,ops,adfs)
+    if not L.shape[1]: return t
+    index,slope,_,sse=_best_affine_match(L[valid],residual[valid])
+    centred=residual[valid]-residual[valid].mean()
+    if not np.isfinite(sse) or sse>=float(centred@centred)*(1-1e-6) or abs(slope)<=EPS: return t
+    if "+" not in ops: return t
+    term=trees[index] if abs(slope-1.)<=1e-9 or "*" not in ops else ("*",("c",slope),trees[index])
+    for addition in (term,trees[index]):
+        child=simplify_tree(("+",t,addition))
+        if child!=t and node_size(child)<=max_nodes and node_depth(child)<=max_depth: return child
+    return t
+
+# --forbid-nesting (PySR's nested_constraints, simplified): outer>inner pairs
+# such as exp>exp or sin>sin.  Offspring that break a rule are redrawn, and
+# any model that still contains one is infeasible.
+NESTING_RULES = frozenset()
+
+def nesting_violation(tree, enclosing=frozenset()):
+    """The first forbidden outer>inner pair in the tree, or ''."""
+    if not NESTING_RULES or tree[0] in ("x","c","arg"): return ""
+    for outer in enclosing:
+        if (outer,tree[0]) in NESTING_RULES: return f"{outer}>{tree[0]}"
+    inner=enclosing|{tree[0]}
+    for child in tree[1:]:
+        found=nesting_violation(child,inner)
+        if found: return found
+    return ""
+
+# --units (dimensional analysis, as in PySR): units per input column, e.g.
+# "x=m,t=s,F=kg*m/s^2".  Trees whose subexpressions add, compare or feed
+# a transcendental function with inconsistent units are infeasible, and such
+# offspring are redrawn.  Constants are unit wildcards (they may carry any
+# unit), as is the affine readout, so the output unit is not constrained.
+# Columns without a unit are wildcards too.
+UNIT_FEATURES = {}           # feature index -> unit vector (tuple over UNIT_BASES)
+UNIT_SPEC = ""
+UNIT_BASES = ()
+WILDCARD = None
+_COMPARE_OPS = {"gt","lt","gte","lte","eq","ne"}
+_UNIT_PRESERVING = {"abs","neg","relu","leaky_relu","floor","ceil","round","int","perceptronReLU1"}
+_POWERS = {"square":2,"cube":3,**{f"pow{k}":k for k in range(4,11)},"sqrt":.5,"inv":-1,**{f"root{k}":1/k for k in range(3,11)}}
+
+def parse_unit(text):
+    """'kg*m/s^2' -> {base: exponent}; '' or '1' is dimensionless."""
+    text=str(text).strip().replace(" ","")
+    result={}
+    if text in ("","1","-"): return result
+    sign=1; token=""
+    def flush(token, sign):
+        if not token or token=="1": return
+        base,_,exponent=token.partition("^")
+        if not base.replace("_","").isalpha(): raise ValueError(f"Bad unit {base!r}")
+        value=float(eval_fraction(exponent)) if exponent else 1.
+        result[base]=result.get(base,0.)+sign*value
+    depth=0
+    for char in text:
+        depth+=(char=="(")-(char==")")
+        if char in "*/" and depth==0:  # m^(1/2): a fraction exponent stays in its token
+            flush(token,sign); token=""; sign=1 if char=="*" else -1
+        else: token+=char
+    flush(token,sign)
+    return {base:value for base,value in result.items() if value}
+
+def eval_fraction(text):
+    numerator,_,denominator=text.strip("()").partition("/")
+    return float(numerator)/(float(denominator) if denominator else 1.)
+
+def configure_units(spec, feature_names):
+    """Set UNIT_FEATURES from 'name=unit,...'; returns {name: unit dict}."""
+    global UNIT_FEATURES,UNIT_BASES,UNIT_SPEC
+    UNIT_SPEC=str(spec or ""); parsed={}
+    for item in str(spec or "").split(","):
+        if not item.strip(): continue
+        name,separator,unit=item.partition("=")
+        if not separator: raise ValueError(f"Bad unit entry {item.strip()!r}: use column=unit")
+        if name.strip() not in feature_names: raise ValueError(f"Unknown column {name.strip()!r} in --units")
+        parsed[name.strip()]=parse_unit(unit)
+    UNIT_BASES=tuple(sorted({base for unit in parsed.values() for base in unit}))
+    UNIT_FEATURES={feature_names.index(name):tuple(unit.get(base,0.) for base in UNIT_BASES) for name,unit in parsed.items()}
+    return parsed
+
+def tree_units(tree):
+    """(unit or WILDCARD, violation text or '')."""
+    if tree[0]=="x": return UNIT_FEATURES.get(tree[1],WILDCARD),""
+    if tree[0] in ("c","arg"): return WILDCARD,""
+    children=[]
+    for child in tree[1:]:
+        unit,violation=tree_units(child)
+        if violation: return None,violation
+        children.append(unit)
+    op=tree[0]; zero=tuple(0. for _ in UNIT_BASES)
+    def same(units):
+        concrete=[u for u in units if u is not WILDCARD]
+        if any(not np.allclose(u,concrete[0]) for u in concrete[1:]): return None
+        return concrete[0] if concrete else WILDCARD
+    def dimensionless(unit): return unit is WILDCARD or np.allclose(unit,zero)
+    if op in ("+","-","max","min","delta","hypot","distance_2","harmonic"):
+        unit=same(children); return (unit,"") if unit is not None else (None,f"{op} of unlike units")
+    if op in ("mod","quantize","copysign","geometric"):
+        if op=="geometric":
+            return (WILDCARD if WILDCARD in children else tuple(.5*(a+b) for a,b in zip(*children))),""
+        if op=="copysign": return children[0],""
+        unit=same(children); return (unit,"") if unit is not None else (None,f"{op} of unlike units")
+    if op in _COMPARE_OPS:
+        return (WILDCARD,"") if same(children) is not None else (None,f"{op} of unlike units")
+    if op=="if_else":
+        unit=same(children[1:]); return (unit,"") if unit is not None else (None,"if_else branches of unlike units")
+    if op=="lerp":
+        unit=same(children[:2]); ok=dimensionless(children[2]) and unit is not None
+        return (unit,"") if ok else (None,"lerp of unlike units")
+    if op in ("if_in_range","if_out_of_range"):
+        unit=same(children); return (unit,"") if unit is not None else (None,f"{op} of unlike units")
+    if op=="*": return (WILDCARD if WILDCARD in children else tuple(a+b for a,b in zip(*children))),""
+    if op=="/": return (WILDCARD if WILDCARD in children else tuple(a-b for a,b in zip(*children))),""
+    if op=="floordiv": return (WILDCARD if WILDCARD in children else tuple(a-b for a,b in zip(*children))),""
+    if op in _UNIT_PRESERVING: return children[0],""
+    if op in _POWERS: return (WILDCARD if children[0] is WILDCARD else tuple(_POWERS[op]*a for a in children[0])),""
+    if op=="pow":
+        if not dimensionless(children[1]): return None,"pow exponent has units"
+        exponent=tree[2]
+        if children[0] is WILDCARD or dimensionless(children[0]): return children[0],""
+        return (tuple(float(exponent[1])*a for a in children[0]),"") if exponent[0]=="c" else (None,"pow of a dimensional base by a non-constant exponent")
+    if op=="atan2":
+        return (zero,"") if same(children) is not None else (None,"atan2 of unlike units")
+    if op=="sign": return zero,""
+    # Everything else (exp, log, sin, tanh, sigmoid, erf, ...) needs dimensionless arguments.
+    if all(dimensionless(unit) for unit in children): return zero,""
+    return None,f"{op} of a dimensional argument"
+
+def unit_violation(tree):
+    if not UNIT_FEATURES or tree[0] in ("x","c","arg"): return ""
+    return tree_units(tree)[1]
+
+def admissible_random_tree(n_features, ops, max_nodes, max_depth, attempts=25, **kwargs):
+    """A random tree that passes --forbid-nesting and --units, when one turns up within a few draws."""
+    tree=random_tree(n_features,ops,max_nodes,max_depth,**kwargs)
+    for _ in range(attempts):
+        if not (nesting_violation(tree) or unit_violation(tree)): break
+        tree=random_tree(n_features,ops,max_nodes,max_depth,**kwargs)
+    return tree
+
+def regression_head_outputs(cats):
+    """Tree index -> output column for regression heads (classifier heads have no desired value)."""
+    targets,_=classification_layout(cats)
+    return {heads[0]:j for j,heads in enumerate(targets) if cats[j] is None}
+
+def backprop_desired(model, head, Y, head_outputs):
+    """Desired raw tree output (y - b) / a from the model's affine readout, or None when a is ~0."""
+    j=head_outputs.get(head)
+    if j is None or head>=len(model.scales): return None
+    a,b=model.scales[head]; y=np.asarray(Y[:,j],float)
+    if not np.isfinite(a) or abs(a)<=1e-9*max(target_scale(y),EPS): return None
+    return (y-b)/a
+
+def backprop_mutate(t, ops, max_nodes, max_depth, adfs=None):
+    """Replace a random subtree by the library entry closest to its back-propagated desired output."""
+    X=_BACKPROP_CONTEXT["X"]; target=_BACKPROP_CONTEXT["desired"]
+    if X is None or target is None or len(target)!=len(X): return t
+    path=rng.choice(subtree_paths(t)); desired=np.asarray(target,float); node=t
+    try:
+        for k in path:
+            args=[np.asarray(evaluate_cached(child,X,adfs),float) for child in node[1:]]
+            desired=child_desired(node[0],k,desired,args)
+            if desired is None: return t
+            node=node[k+1]
+        current=np.asarray(evaluate_cached(node,X,adfs),float)
+    except (ArithmeticError, IndexError, RecursionError, ValueError): return t
+    valid=np.isfinite(desired)
+    if valid.sum()<max(5,BACKPROP_MIN_VALID*len(desired)): return t
+    centre=np.median(desired[valid]); spread=np.median(np.abs(desired[valid]-centre))+EPS
+    valid&=np.abs(np.where(valid,desired,centre)-centre)<=50*spread  # inversions near a pole explode
+    if valid.sum()<max(5,BACKPROP_MIN_VALID*len(desired)): return t
+    trees,L=backprop_library(X,ops,adfs)
+    fragments=[tree for tree in _BACKPROP_CONTEXT["fragments"] if tree[0]!="c"]
+    if fragments:
+        extra=[];kept=[]
+        for tree in fragments:
+            try: values=np.asarray(evaluate_cached(tree,X,adfs),float)
+            except (ArithmeticError, IndexError, RecursionError, ValueError): continue
+            if np.isfinite(values).all(): extra.append(values); kept.append(tree)
+        if extra: trees=[*trees,*kept]; L=np.column_stack([L,*extra])
+    if not L.shape[1]: return t
+    D=desired[valid]; index,slope,intercept,sse=_best_affine_match(L[valid],D)
+    _,_,_,own=_best_affine_match(current[valid][:,None],D)
+    if not np.isfinite(sse) or sse>=own*(1-1e-6): return t
+    candidate=trees[index]
+    tolerance=1e-9*max(abs(slope),1.)
+    if abs(slope-1.)>tolerance: candidate=("*",("c",slope),candidate)
+    if abs(intercept)>1e-9*(abs(slope)+1.)*max(spread,1.): candidate=("+",candidate,("c",intercept))
+    for replacement in (candidate,trees[index]):
+        child=simplify_tree(replace_subtree(t,path,replacement))
+        if child!=t and node_size(child)<=max_nodes and node_depth(child)<=max_depth: return child
+    return t
+
 class MutationPortfolio:
     def __init__(self):
         self.weights={"subtree":1.,"point":1.,"constant":1.,"hoist":.7,"shrink":.7,"parametrize":1.,"bilinear":BILINEAR_MUTATION_WEIGHT,"jump":JUMP_MUTATION_WEIGHT,
-                      "squash":SQUASH_SWAP_WEIGHT,"smooth":SMOOTH_SWAP_WEIGHT,"gate":GATE_MUTATION_WEIGHT}
+                      "squash":SQUASH_SWAP_WEIGHT,"smooth":SMOOTH_SWAP_WEIGHT,"gate":GATE_MUTATION_WEIGHT,"backprop":BACKPROP_MUTATION_WEIGHT,"residual_term":RESIDUAL_TERM_WEIGHT}
         self.tries={k:0 for k in self.weights}; self.wins={k:0 for k in self.weights}
     def choose(self): return rng.choices(list(self.weights),weights=list(self.weights.values()))[0]
     def record(self, kind, improved):
@@ -2180,6 +2638,10 @@ class MutationPortfolio:
         if kind=="parametrize": return parametrize_mutate(t,ops,max_nodes,max_depth),kind
         if kind=="bilinear": return bilinear_mutate(t,n_features,ops,max_nodes,max_depth),kind
         if kind=="jump": return jump_mutate(t,n_features,ops,max_nodes,max_depth),kind
+        if kind in ("backprop","residual_term"):
+            child=(backprop_mutate if kind=="backprop" else residual_term_mutate)(t,ops,max_nodes,max_depth,adfs)
+            if child!=t: return child,kind
+            kind="subtree"  # no defined desired output or no better match: make an ordinary move
         if kind in ("squash","smooth","gate"):
             child=(squash_swap_mutate(t,ops,max_nodes,max_depth) if kind=="squash" else smooth_swap_mutate(t,ops,max_nodes,max_depth) if kind=="smooth"
                    else gate_mutate(t,n_features,ops,max_nodes,max_depth))
@@ -2205,6 +2667,10 @@ class MutationPortfolio:
 # Off by default: in a 4-seed benchmark (.02) it lost to the fixed rate in 10
 # of 16 matched runs and cancelled most of the age cap's gains.
 MACRO_STAGNATION_STEP, MACRO_MAX_RATE = 0., .50
+# --semantic-max-delta.  The 2026-10-02 audit found 33-38% of subtree, point
+# and hoist tries rejected as too big; inf trended up on cond2d (26 vs 23/30,
+# not significant), so the default stays 5 until a harder benchmark decides.
+SEMANTIC_MAX_DELTA = 5.0
 _FRAGMENT_FIT_CACHE={}; _FRAGMENT_FIT_FAILED=object()
 FRAGMENT_MIN_CONTRIBUTION = 5e-3   # held-out share of the residual loss a fragment must remove
 FRAGMENT_CONTRIBUTION_DECAY = .95
@@ -2451,7 +2917,8 @@ def semantic_distance(baseline, candidate):
         scale=max(float(np.std(candidate)),float(np.sqrt(np.mean(difference**2))),EPS)
     return float(np.sqrt(np.mean((difference/scale)**2)))
 
-def semantic_mutate(tree, X, portfolio, n_features, ops, max_nodes, max_depth, proposal=None, adfs=None, library=None, min_delta=1e-8, max_delta=5.0):
+def semantic_mutate(tree, X, portfolio, n_features, ops, max_nodes, max_depth, proposal=None, adfs=None, library=None, min_delta=1e-8, max_delta=None):
+    if max_delta is None: max_delta=SEMANTIC_MAX_DELTA
     # A returned kind of None means "no move was applied": the unchanged
     # parent must not be credited (or blamed) to any mutation kind.
     try: baseline=evaluate_cached(tree,X,adfs)
@@ -2505,8 +2972,9 @@ def crossover(left, right, max_nodes, max_depth):
         if node_size(child)<=max_nodes and node_depth(child)<=max_depth and child!=left: return child
     return left
 
-def semantic_crossover(left, right, X, max_nodes, max_depth, adfs=None, min_delta=1e-8, max_delta=5.0):
+def semantic_crossover(left, right, X, max_nodes, max_depth, adfs=None, min_delta=1e-8, max_delta=None):
     """Prefer bounded semantic moves over syntactically random exchanges."""
+    if max_delta is None: max_delta=SEMANTIC_MAX_DELTA
     try: baseline=evaluate_cached(left,X,adfs)
     except ValueError: return left
     for _ in range(8):
@@ -2757,9 +3225,26 @@ def _target_scale(y):
     return scale
 
 ROBUST_LOSS_DELTA=1.5
-def robust_loss(pred, y, delta=ROBUST_LOSS_DELTA):
+# --loss: huber (default) is the MAD-scaled Huber loss with --huber-delta;
+# squared is the same with an infinite delta; relative applies the Huber
+# loss to (pred - y) / max(|y|, 1e-3 * median |y|), for targets spanning
+# orders of magnitude.  The scorer, the constant fitter, the jump scan and
+# both readouts all go through loss_scale() and loss_delta().
+LOSS_MODE = "huber"
+RELATIVE_LOSS_FLOOR = 1e-3
+def loss_delta(): return float("inf") if LOSS_MODE=="squared" else ROBUST_LOSS_DELTA
+def loss_scale(y):
+    """Residual divisor: the target's robust scale, or per row in relative mode."""
+    if LOSS_MODE!="relative": return target_scale(y)
+    magnitude=np.abs(np.asarray(y,float))
+    return np.maximum(magnitude,max(RELATIVE_LOSS_FLOOR*float(np.median(magnitude)),EPS))
+def loss_base_weights(y):
+    """Least-squares row weights that make a readout fit minimise the relative residual."""
+    return None if LOSS_MODE!="relative" else 1./loss_scale(y)
+def robust_loss(pred, y, delta=None):
     """MAD-scaled Huber loss; a few extreme target values cannot dominate."""
-    scale=target_scale(y)
+    delta=loss_delta() if delta is None else delta
+    scale=loss_scale(y)
     r=np.abs((pred-y)/scale)
     return float(np.mean(np.where(r<=delta,.5*r*r,delta*(r-.5*delta))))
 AFFINE_COEFFICIENT_BOUND = 1e9
@@ -2821,7 +3306,7 @@ def _affine(pred, y):
     varying=spread>=EPS; spread=spread if varying else 1.
     bound=AFFINE_COEFFICIENT_BOUND
     # (A constant prediction is a degenerate line the compiled path would only hand back.)
-    if varying and len(pred)>2*EVALUATION_BLOCK_ROWS and FIT_BACKEND=="auto":
+    if varying and len(pred)>2*EVALUATION_BLOCK_ROWS and FIT_BACKEND=="auto" and LOSS_MODE=="huber":
         # Large data: the compiled IRLS streams the rows twice per iteration
         # instead of ~25 times (memory bandwidth, not arithmetic, was the cost).
         # It agrees to round-off; rare degenerate/bounded fits fall through.
@@ -2852,12 +3337,13 @@ def _affine(pred, y):
             candidates.append((a,b))
         return np.asarray(min(candidates,key=lambda ab:float(np.sum(w*(ab[0]*pred+ab[1]-y)**2))))
     try:
-        coefficients=weighted_fit(np.ones(len(pred)))
-        cutoff=1.5*target_scale(y)
+        base=loss_base_weights(y); base=np.ones(len(pred)) if base is None else base
+        coefficients=weighted_fit(base)
+        cutoff=loss_delta()*loss_scale(y)
         # Solver termination limits are numerical safeguards, not search settings.
         for _ in range(200):
             residual=coefficients[0]*pred+coefficients[1]-y
-            weights=np.sqrt(np.minimum(1.,cutoff/np.maximum(np.abs(residual),EPS)))
+            weights=base*np.sqrt(np.minimum(1.,cutoff/np.maximum(np.abs(residual),EPS)))
             updated=weighted_fit(weights)
             change=(updated[0]-coefficients[0])*pred+updated[1]-coefficients[1]
             converged=np.linalg.norm(change)<=np.sqrt(np.finfo(float).eps)*(1.+np.linalg.norm(residual+y))
@@ -4093,7 +4579,7 @@ def assess(m, X, Y, affine_on, cats, fit_affine=True, constraints=None, output_n
         return ""
     reason=""
     for tree in m.trees:
-        reason=valid(tree)
+        reason=valid(tree) or (f"nesting:{nesting_violation(tree)}" if NESTING_RULES and nesting_violation(tree) else "") or (f"units:{unit_violation(tree)}" if UNIT_FEATURES and unit_violation(tree) else "")
         if reason: break
     if reason:
         m.feasible=False; m.invalid_reason=reason; INVALID_DIAGNOSTICS[reason]=INVALID_DIAGNOSTICS.get(reason,0)+1
@@ -4483,6 +4969,101 @@ def model_options(models, X=None, Y=None, cats=None, loss_tolerance=.01, constra
             labels.append(label); choices.append(model); seen.add(key)
     return labels,choices,selection
 
+# --constant-snapping final: before the final choice, fitted constants of the
+# strongest candidates are rounded to simpler values (integers, p/q, multiples
+# of pi/e/sqrt2/ln2, powers of ten, short decimals) when neither training nor
+# validation loss rises by more than max(noise floor, SNAP_TOLERANCE * loss)
+# and the numeric guard and constraints still pass.  Validation is required
+# too: a snapped jump threshold can match every sampled row and still move
+# the jump between them.  Selection only sees the result; search is untouched.
+CONSTANT_SNAPPING = "final"
+SNAP_TOLERANCE = 1e-6
+SNAP_WINDOW = .02          # only values within 2% (absolute .02 near zero) are tried
+SNAP_CANDIDATE_LIMIT = 64  # models snapped: the loss/MDL front plus the lowest-loss rest
+_SNAP_BASES = ((math.pi,"pi"),(math.e,"e"),(math.sqrt(2.),"sqrt2"),(math.log(2.),"ln2"))
+_SNAP_MULTIPLIERS = (1.,2.,.5,3.,1/3,4.,.25)
+
+def snap_values(value):
+    """Simpler candidate values near ``value``, simplest first."""
+    value=float(value); window=SNAP_WINDOW*max(abs(value),1.)
+    options=[0.,float(round(value))]
+    options+=[round(value*q)/q for q in range(2,13)]
+    sign=1. if value>=0 else -1.
+    options+=[sign*base*multiplier for base,_ in _SNAP_BASES for multiplier in _SNAP_MULTIPLIERS]
+    if value: options.append(sign*10.**round(math.log10(abs(value))))
+    options+=[float(f"{value:.{digits}g}") for digits in range(1,5)]
+    seen=set(); result=[]
+    for option in options:
+        option=float(option)
+        if option==value or option in seen or not math.isfinite(option) or abs(option-value)>window: continue
+        seen.add(option); result.append(option)
+    return result
+
+def _snap_scores(model, Xt, Yt, Xv, Yv, affine_on, cats, constraints, output_names):
+    """Re-fit the readout on training data and return (model, train loss, validation loss, violations)."""
+    scored=model.clone()
+    assess(scored,Xt,Yt,affine_on,cats,fit_affine=True,constraints=constraints,output_names=output_names)
+    if not scored.feasible: return scored,float("inf"),float("inf"),()
+    violations=tuple(scored.objectives[2*len(cats):2*len(cats)+scored.constraint_count])
+    validation=frozen_metrics(scored,Xv,Yv,cats,constraints,output_names)["loss"] if Xv is not None else 0.
+    return scored,aggregate_loss(scored),validation,violations
+
+def snap_model_constants(model, Xt, Yt, Xv, Yv, affine_on, cats, constraints=None, output_names=()):
+    """Greedy constant snapping; returns (model, constants snapped).
+
+    Every snap is compared against the unsnapped model, so tolerances do not
+    accumulate across constants."""
+    if not any(constant_paths(tree) for tree in model.trees): return model,0
+    base,train,validation,violations=_snap_scores(model,Xt,Yt,Xv,Yv,affine_on,cats,constraints,output_names)
+    if not base.feasible or not np.isfinite(train): return model,0
+    train_bound=train+max(LOSS_NOISE_FLOOR,SNAP_TOLERANCE*abs(train))
+    validation_bound=validation+max(LOSS_NOISE_FLOOR,SNAP_TOLERANCE*abs(validation))
+    current=base; snapped=0
+    for head in range(len(model.trees)):
+        for path in constant_paths(current.trees[head]):
+            value=float(subtree_at(current.trees[head],path)[1])
+            for option in snap_values(value):
+                trial=current.clone(); trial.trees[head]=replace_subtree(trial.trees[head],path,("c",option))
+                scored,trial_train,trial_validation,trial_violations=_snap_scores(trial,Xt,Yt,Xv,Yv,affine_on,cats,constraints,output_names)
+                if (scored.feasible and trial_train<=train_bound and trial_validation<=validation_bound
+                        and all(a<=b+1e-12 for a,b in zip(trial_violations,violations))):
+                    current=scored; snapped+=1; break
+    if not snapped: return model,0
+    # Snapping to 0 or 1 can make subtrees removable; keep the shorter tree only if it scores the same.
+    simplified=current.clone(); simplified.trees=[simplify_tree(tree) for tree in current.trees]
+    if simplified.trees!=current.trees:
+        scored,trial_train,trial_validation,trial_violations=_snap_scores(simplified,Xt,Yt,Xv,Yv,affine_on,cats,constraints,output_names)
+        if scored.feasible and trial_train<=train_bound and trial_validation<=validation_bound: current=scored
+    current.origin=getattr(model,"origin","")
+    return current,snapped
+
+def report_snapping(summary):
+    if summary["mode"]=="final" and summary["models_tried"]:
+        print(f"Constant snapping: {summary['constants_snapped']} constant(s) simplified in {summary['models_snapped']} of {summary['models_tried']} final candidates.")
+
+def snap_final_candidates(models, Xt, Yt, Xv, Yv, affine_on, cats, constraints=None, output_names=(), limit=None):
+    """Return ``models`` with the strongest candidates replaced by snapped copies, plus a summary."""
+    limit=SNAP_CANDIDATE_LIMIT if limit is None else limit
+    summary={"mode":CONSTANT_SNAPPING,"tolerance":SNAP_TOLERANCE,"models_tried":0,"models_snapped":0,"constants_snapped":0}
+    if CONSTANT_SNAPPING!="final": return list(models),summary
+    unique={}
+    for model in models:
+        if model is not None and model.feasible and np.all(np.isfinite(model.scales)): unique.setdefault(selection_identity(model),model)
+    pool=sorted(unique.values(),key=lambda m:(aggregate_loss(m),model_complexity(m)))
+    front=[]; best_bits=float("inf")
+    for model in pool:  # loss/MDL front: each member is shorter than every lower-loss model
+        bits=model_complexity(model)
+        if bits<best_bits: front.append(model); best_bits=bits
+    chosen=list({id(model):model for model in [*front,*pool]}.values())[:limit]
+    replacements={}
+    for model in chosen:
+        summary["models_tried"]+=1
+        snapped,count=snap_model_constants(model,Xt,Yt,Xv,Yv,affine_on,cats,constraints,output_names)
+        if count:
+            replacements[selection_identity(model)]=snapped; summary["models_snapped"]+=1; summary["constants_snapped"]+=count
+    # Replace every copy, or an unsnapped twin would still compete for "Lowest Loss".
+    return [replacements.get(selection_identity(model),model) if model is not None else None for model in models],summary
+
 def used_feature_indices(model):
     """Return encoded feature indices referenced by any output tree."""
     used=set()
@@ -4543,6 +5124,278 @@ def training_input_ranges(frame, source_columns, types):
         values=pd.to_numeric(frame[column],errors="coerce").to_numpy(float); values=values[np.isfinite(values)]
         ranges[column]=[float(values.min()),float(values.max())] if len(values) else [0.,1.]
     return ranges
+
+# --symbolic-export: the chosen model written twice to best_model_symbolic.txt,
+# each with its LaTeX:
+# - exact: afpo's protected operators as evaluated (log(|x|+eps), guarded
+#   division, signed roots, clipped exp...) with full-precision constants, so
+#   it reproduces the model's predictions.  Only the final +/-CLIP clamp and
+#   NaN -> 0 that every node applies are left out.
+# - raw: the same model with the protections removed (log(x), x/y, x**y,
+#   x**(1/3)...) and constants written as fractions or multiples of pi when
+#   within 1e-8 relative of one, else to six significant digits.  It is the
+#   readable form, valid only where its operators are defined, so the export
+#   reports how closely it matches the model on the training rows.
+# Inputs that are positive on the training data are declared positive, so
+# Abs() and sign() of them simplify away.  Operators without a closed form
+# stay as named functions.
+SYMBOLIC_EXPORT = "on"
+SYMBOLIC_SIMPLIFY_NODES = 40
+READABLE_CONSTANT_TOLERANCE = 1e-8
+SYMBOLIC_TIME_LIMIT = 20.  # seconds of SymPy rearranging per form
+
+def readable_constant(value, exact=False):
+    """A SymPy number for value: a fraction or multiple of pi when it is one
+    (exactly for exact=True, within READABLE_CONSTANT_TOLERANCE otherwise),
+    else the shortest decimal (exact) or six significant digits (raw)."""
+    import sympy as sp
+    from fractions import Fraction
+    value=float(value)
+    if not math.isfinite(value): return sp.Float(value)
+    if value==int(value) and abs(value)<1e15: return sp.Integer(int(value))
+    tolerance=0. if exact else READABLE_CONSTANT_TOLERANCE*max(1.,abs(value))
+    for base,symbol,limit in ((1.,sp.Integer(1),100),(math.pi,sp.pi,12)):
+        ratio=Fraction(value/base).limit_denominator(limit)
+        if ratio and abs(float(ratio)*base-value)<=tolerance:
+            return sp.Rational(ratio.numerator,ratio.denominator)*symbol
+    text=repr(value) if exact else f"{value:.6g}"
+    digits=len(text.lower().split("e")[0].replace("-","").replace(".","").lstrip("0")) or 1
+    return sp.Float(text,max(digits,1))
+
+def sympy_expression(tree, symbols, adfs=None, mode="exact", constant=None):
+    """tree as a SymPy expression; mode "exact" keeps afpo's guards, "raw" drops them."""
+    import sympy as sp
+    constant=constant or (lambda v: readable_constant(v,mode=="exact"))
+    eps=sp.Float(EPS,1)
+    def clip(v, lo, hi): return sp.Min(sp.Max(v,lo),hi)
+    def nonzero(v, fill): return sp.Piecewise((fill,sp.Abs(v)<eps),(v,True))
+    def build(t, args=None):
+        if t[0]=="x": return symbols[t[1]]
+        if t[0]=="c": return constant(t[1])
+        if t[0]=="arg": return args[t[1]]
+        values=[build(child,args) for child in t[1:]]
+        op=t[0]
+        if op.startswith("adf_") and adfs and op in adfs: return build(adfs[op]["tree"],values)
+        x=values[0]; y=values[1] if len(values)>1 else None
+        powers={"square":2,"cube":3,**{f"pow{k}":k for k in range(4,11)}}
+        if op in powers: return x**powers[op]
+        if op.startswith("root") and op[4:].isdigit():
+            n=sp.Rational(1,int(op[4:]))
+            return sp.sign(x)*sp.Abs(x)**n if mode=="exact" else x**n
+        sigmoid=lambda v: 1/(1+sp.exp(-v))
+        table={
+            "+":lambda:x+y,"-":lambda:x-y,"*":lambda:x*y,"/":lambda:x/y,"neg":lambda:-x,"delta":lambda:sp.Abs(x-y),
+            "max":lambda:sp.Max(x,y),"min":lambda:sp.Min(x,y),"pow":lambda:x**y,
+            "hypot":lambda:sp.sqrt(x**2+y**2),"distance_2":lambda:sp.sqrt(x**2+y**2),
+            "log_base":lambda:sp.log(x)/sp.log(y),"exp_decay":lambda:sp.exp(-x*y),"rbf":lambda:sp.exp(-(x-y)**2),
+            "atan2":lambda:sp.atan2(x,y),"geometric":lambda:sp.sqrt(x*y),"harmonic":lambda:2*x*y/(x+y),
+            "mod":lambda:sp.Mod(x,y),"floordiv":lambda:sp.floor(x/y),"copysign":lambda:sp.Abs(x)*sp.sign(y),
+            "gt":lambda:sp.Piecewise((1,x>y),(0,True)),"lt":lambda:sp.Piecewise((1,x<y),(0,True)),
+            "gte":lambda:sp.Piecewise((1,x>=y),(0,True)),"lte":lambda:sp.Piecewise((1,x<=y),(0,True)),
+            "eq":lambda:sp.Piecewise((1,sp.Eq(x,y)),(0,True)),"ne":lambda:sp.Piecewise((0,sp.Eq(x,y)),(1,True)),
+            "sin":lambda:sp.sin(x),"cos":lambda:sp.cos(x),"tan":lambda:sp.tan(x),"exp":lambda:sp.exp(x),"expm1":lambda:sp.exp(x)-1,
+            "10^x":lambda:10**x,"log":lambda:sp.log(x),"log1p":lambda:sp.log(1+x),"log10":lambda:sp.log(x,10),
+            "sqrt":lambda:sp.sqrt(x),"abs":lambda:sp.Abs(x),"inv":lambda:1/x,"oom":lambda:sp.floor(sp.log(x,10)),
+            "frac":lambda:x-sp.floor(x),"round":lambda:sp.Function("round")(x),"floor":lambda:sp.floor(x),"ceil":lambda:sp.ceiling(x),
+            "int":lambda:sp.Function("trunc")(x),"sigmoid":lambda:sigmoid(x),"tanh":lambda:sp.tanh(x),"sinh":lambda:sp.sinh(x),
+            "cosh":lambda:sp.cosh(x),"relu":lambda:sp.Max(x,0),"atan":lambda:sp.atan(x),"gaussian":lambda:sp.exp(-x**2),
+            "softplus":lambda:sp.log(1+sp.exp(x)),"sign":lambda:sp.sign(x),"sinc":lambda:sp.sinc(x),"xlogx":lambda:x*sp.log(x),
+            "erf":lambda:sp.erf(x),"deg2rad":lambda:x*sp.pi/180,"rad2deg":lambda:x*180/sp.pi,
+            "perceptronSigma1":lambda:sigmoid(x),"perceptronReLU1":lambda:sp.Max(x,0),"perceptronCustom1":lambda:x*sigmoid(x),
+            "perceptronSigma2":lambda:sigmoid(x+y),"perceptronReLU2":lambda:sp.Max(x+y,0),"perceptronCustom2":lambda:(x+y)*sigmoid(x+y),
+            "if_else":lambda:sp.Piecewise((values[1],x>sp.Rational(1,2)),(values[2],True)),
+            "if_in_range":lambda:clip(x,sp.Min(values[1],values[2]),sp.Max(values[1],values[2])),
+            "lerp":lambda:x+(y-x)*values[2],"leaky_relu":lambda:sp.Piecewise((x,x>=0),(x/100,True)),
+            "distance_3":lambda:sp.sqrt(x**2+y**2+values[2]**2),
+        }
+        if mode=="exact":
+            # The guards of op_eval, operator by operator.
+            log_abs=lambda v: sp.log(sp.Abs(v)+eps)
+            table.update({
+                "/":lambda:x/nonzero(y,eps),"pow":lambda:sp.sign(x)*sp.Abs(x)**clip(y,-12,12),
+                "log_base":lambda:log_abs(x)/sp.log(sp.Abs(y)+sp.Float("1.000001",7)),
+                "exp_decay":lambda:sp.exp(-clip(x*y,-50,50)),"rbf":lambda:sp.exp(-sp.Min((x-y)**2,50)),
+                "geometric":lambda:sp.sqrt(sp.Abs(x*y)),"harmonic":lambda:2*x*y/(sp.Abs(x+y)+eps),
+                "mod":lambda:sp.Mod(x,nonzero(y,1)),"floordiv":lambda:sp.floor(x/nonzero(y,1)),
+                "tan":lambda:sp.tan(clip(x,sp.Float("-1.55",3),sp.Float("1.55",3))),
+                "exp":lambda:sp.exp(clip(x,-50,50)),"expm1":lambda:sp.exp(clip(x,-50,50))-1,"10^x":lambda:10**clip(x,-12,12),
+                "log":lambda:log_abs(x),"log1p":lambda:sp.log(1+sp.Abs(x)),"log10":lambda:sp.log(sp.Abs(x)+eps,10),
+                "sqrt":lambda:sp.sign(x)*sp.sqrt(sp.Abs(x)),"inv":lambda:1/(sp.Abs(x)+eps),
+                "oom":lambda:sp.floor(sp.log(sp.Abs(x)+eps,10)),"xlogx":lambda:x*log_abs(x),
+                "sigmoid":lambda:sigmoid(clip(x,-50,50)),"perceptronSigma1":lambda:sigmoid(clip(x,-50,50)),
+                "perceptronCustom1":lambda:x*sigmoid(clip(x,-50,50)),"perceptronSigma2":lambda:sigmoid(clip(x+y,-50,50)),
+                "perceptronCustom2":lambda:(x+y)*sigmoid(clip(x+y,-50,50)),
+                "sinh":lambda:sp.sinh(clip(x,-20,20)),"cosh":lambda:sp.cosh(clip(x,-20,20)),
+                "gaussian":lambda:sp.exp(-sp.Min(x**2,50)),
+            })
+        return table[op]() if op in table else sp.Function(op)(*values)
+    return build(tree)
+
+GREEK_LETTERS = {"alpha","beta","gamma","delta","epsilon","zeta","eta","theta","iota","kappa","lambda","mu","nu","xi",
+                 "pi","rho","sigma","tau","upsilon","phi","chi","psi","omega","Gamma","Delta","Theta","Lambda","Xi",
+                 "Pi","Sigma","Upsilon","Phi","Psi","Omega"}
+
+def latex_symbol_name(name):
+    """x3 -> x_{3}, alpha -> \\alpha; any other multi-letter name is one upright
+    word (\\mathrm{speed\\_ms}), not a product of italic letters."""
+    match=re.fullmatch(r"([A-Za-z]|"+"|".join(sorted(GREEK_LETTERS,key=len,reverse=True))+r")_?(\d+)",name)
+    letter=lambda head: "\\"+head if head in GREEK_LETTERS else head
+    if match: return f"{letter(match.group(1))}_{{{match.group(2)}}}"
+    if name in GREEK_LETTERS or len(name)==1: return letter(name)
+    return r"\mathrm{"+re.sub(r"([_&%$#{}])",r"\\\1",name)+"}"
+
+def mathml_expression(expression, symbols):
+    """Presentation MathML, with each multi-letter input name as one upright
+    word (SymPy would split speed_ms into speed with subscript ms)."""
+    import sympy as sp
+    from html import escape
+    text=sp.mathml(expression,printer="presentation")
+    for symbol in sorted(symbols,key=lambda q: -len(q.name)):
+        if latex_symbol_name(symbol.name).startswith(r"\mathrm"):
+            text=text.replace(sp.mathml(symbol,printer="presentation"),f'<mi mathvariant="normal">{escape(symbol.name)}</mi>')
+    return text
+
+def _symbolic_form(model, head, symbols, mode):
+    """Simplified exact or raw form.  The raw form is rearranged with full
+    constants and only then rounded, so expanding a product does not compound
+    rounded factors; of the candidate forms the one with the shortest LaTeX wins."""
+    import sympy as sp
+    a,b=model.scales[head]
+    constant=lambda v: readable_constant(v,True)
+    expression=constant(a)*sympy_expression(model.trees[head],symbols,model.adfs,mode,constant)+constant(b)
+    finish=(lambda e: e) if mode=="exact" else (lambda e: e.xreplace({f:readable_constant(float(f)) for f in e.atoms(sp.Float)}))
+    candidates=[expression]
+    if node_size(model.trees[head])<=SYMBOLIC_SIMPLIFY_NODES:
+        def rearrange():
+            candidates.append(sp.simplify(expression))
+            if mode=="raw": candidates.extend([sp.expand(candidates[-1]),sp.factor_terms(sp.expand(candidates[-1]))])
+        try: _within_time_limit(rearrange,SYMBOLIC_TIME_LIMIT)
+        except Exception: pass  # simplification is cosmetic; keep what finished
+    shown=[]
+    for candidate in candidates:
+        try: candidate=finish(candidate); shown.append((len(sp.latex(candidate)),candidate))
+        except Exception: pass  # SymPy can fail on an odd form (e.g. Max of zoo); skip that candidate
+    if not shown: raise ValueError("no printable form")
+    return min(shown,key=lambda item: item[0])[1]
+
+class _SymbolicTimeout(Exception): pass
+
+def _within_time_limit(function, seconds):
+    """Run function, raising _SymbolicTimeout after seconds where SIGALRM is
+    usable (Unix main thread); elsewhere it runs unguarded."""
+    if not hasattr(signal,"SIGALRM") or threading.current_thread() is not threading.main_thread():
+        return function()
+    def expire(*_): raise _SymbolicTimeout()
+    previous=signal.signal(signal.SIGALRM,expire); signal.setitimer(signal.ITIMER_REAL,seconds)
+    try: return function()
+    finally: signal.setitimer(signal.ITIMER_REAL,0); signal.signal(signal.SIGALRM,previous)
+
+def _raw_agreement(expression, symbols, X, reference):
+    """(share of rows where the raw form is finite, max |raw - model| / output spread) or None."""
+    import sympy as sp
+    try:
+        function=sp.lambdify(symbols,expression,"numpy")
+        with np.errstate(all="ignore"), warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            values=np.broadcast_to(np.asarray(function(*[X[:,i] for i in range(X.shape[1])]),dtype=complex),reference.shape)
+    except Exception:
+        return None
+    defined=np.isfinite(values)&(np.abs(values.imag)<=1e-12*(1+np.abs(values.real)))
+    spread=max(float(np.ptp(reference)),float(np.max(np.abs(reference))),1e-300)
+    gap=float(np.max(np.abs(values.real[defined]-reference[defined])))/spread if defined.any() else float("nan")
+    return float(defined.mean()),gap
+
+def symbolic_model(model, feature_names, output_names, cats, positive=(), X=None):
+    """{output name: {"exact": (expr, latex), "raw": (expr, latex), "agreement": ...}}
+    for regression outputs; None without SymPy.  agreement compares the raw
+    form with the model on X (None without X)."""
+    try: import sympy as sp
+    except ImportError: return None
+    symbols=[sp.Symbol(name.replace(" ","_"),real=True,positive=True if index in positive else None) for index,name in enumerate(feature_names)]
+    names={symbol:latex_symbol_name(symbol.name) for symbol in symbols}
+    predictions=None if X is None else predict_model(model,X)
+    targets,_=classification_layout(cats); result={}
+    for j,heads in enumerate(targets):
+        if cats[j] is not None: continue
+        head=heads[0]; entry={}
+        for mode in ("exact","raw"):
+            # An export must never stop a run: a form SymPy cannot handle is reported, not raised.
+            try:
+                expression=_symbolic_form(model,head,symbols,mode)
+                entry[mode]=(expression,sp.latex(expression,symbol_names=names,ln_notation=True,mul_symbol=r"\,"))
+            except Exception as error:
+                entry[mode]=(None,None); entry.setdefault("errors",{})[mode]=f"{type(error).__name__}: {error}"
+        entry["agreement"]=None if predictions is None or entry["raw"][0] is None else _raw_agreement(entry["raw"][0],symbols,X,predictions[:,head])
+        result[output_names[j]]=entry
+    return result
+
+def write_symbolic_export(model, feature_names, output_names, cats, X=None, path="best_model_symbolic.txt"):
+    if SYMBOLIC_EXPORT!="on": return None
+    positive=() if X is None else tuple(index for index in range(X.shape[1]) if np.all(X[:,index]>0))
+    try: result=symbolic_model(model,feature_names,output_names,cats,positive,X)
+    except Exception as error:  # the export is optional; it must never stop a run
+        print(f"Symbolic export skipped: {type(error).__name__}: {error}"); return None
+    if result is None:
+        print("Symbolic export skipped: install sympy for a simplified equation and LaTeX."); return None
+    lines=["# afpo symbolic export",
+           "# exact: afpo's protected operators as evaluated, full-precision constants (the per-node +/-1e12 clamp and NaN->0 are omitted)",
+           "# raw: protections removed, constants as fractions or 6 significant digits; valid only where its operators are defined",""]
+    for name,entry in result.items():
+        for mode in ("exact","raw"):
+            expression,latex=entry[mode]
+            if expression is None: lines.append(f"{name} ({mode}): not converted ({entry['errors'][mode]})"); continue
+            lines+=[f"{name} ({mode}) = {expression}",f"LaTeX ({mode}): {name} = {latex}"]
+        agreement=entry["agreement"]
+        if agreement is not None:
+            share,gap=agreement
+            lines.append(f"raw vs model on training rows: defined on {100*share:.1f}% of rows, max |difference| = {gap:.2g} of the output range")
+        lines.append("")
+        if entry["raw"][0] is not None: print(f"Symbolic: {name} = {entry['raw'][0]}")
+    Path(path).write_text("\n".join(lines))
+    return result
+
+# --constant-intervals: approximate 95% intervals for the chosen model's
+# fitted constants and readout from the linearised least-squares covariance
+# s^2 (J^T J)^-1 on the training rows.  A constant whose interval spans zero
+# or is enormous is not pinned down by the data.  Local and approximate:
+# jump constants (zero gradient) get no interval.
+CONSTANT_INTERVALS = "on"
+
+def constant_intervals(model, X, Y, cats):
+    """[{output, kind, path, value, se, low, high}] for regression heads."""
+    targets,_=classification_layout(cats); report=[]
+    for j,heads in enumerate(targets):
+        if cats[j] is not None: continue
+        head=heads[0]; tree=model.trees[head]; a,b=model.scales[head]; y=np.asarray(Y[:,j],float)
+        values=np.asarray(constant_vector(tree),float); paths=constant_paths(tree)
+        def predict(theta):
+            return theta[-2]*np.asarray(evaluate_cached(with_constants(tree,theta[:-2]),X,model.adfs),float)+theta[-1]
+        theta=np.concatenate([values,[a,b]])
+        try:
+            base=predict(theta); J=np.empty((len(y),len(theta)))
+            for k in range(len(theta)):
+                step=1e-6*max(abs(theta[k]),1.); probe=theta.copy(); probe[k]+=step
+                J[:,k]=(predict(probe)-base)/step
+        except (ArithmeticError, IndexError, RecursionError, ValueError): continue
+        if not np.isfinite(J).all() or not np.isfinite(base).all(): continue
+        dof=len(y)-len(theta)
+        if dof<=0: continue
+        sigma2=float(np.sum((base-y)**2))/dof
+        identified=np.linalg.norm(J,axis=0)>1e-12*max(np.linalg.norm(base),1.)
+        covariance=np.full((len(theta),len(theta)),np.nan)
+        if identified.any():
+            covariance[np.ix_(identified,identified)]=sigma2*np.linalg.pinv(J[:,identified].T@J[:,identified])
+        for k,value in enumerate(theta):
+            se=float(np.sqrt(max(covariance[k,k],0.))) if np.isfinite(covariance[k,k]) else None
+            report.append({"output":j,"kind":"constant" if k<len(values) else ("scale" if k==len(values) else "intercept"),
+                           "path":list(paths[k]) if k<len(values) else None,"value":float(value),"se":se,
+                           "low":None if se is None else float(value-1.96*se),"high":None if se is None else float(value+1.96*se)})
+    return report
+
+def print_constant_intervals(report):
+    if not report: return
+    shown=", ".join(f"{item['value']:.6g}"+(f" ± {1.96*item['se']:.2g}" if item["se"] is not None else " (not identified)") for item in report)
+    print(f"Approximate 95% intervals (constants, then scale and intercept): {shown}")
 
 def export_model(m, feature_names, output_names, cats, maps, source_columns, types, fixture_df=None, input_ranges=None):
     used_indices=set(used_feature_indices(m)); input_columns=[]; offset=0
@@ -5204,6 +6057,94 @@ def direct_feature_baselines(X, Y, cats, ops, affine_on):
         for model in models: assess(model,X,Y,affine_on,cats)
     return models
 
+# --sparse-seeding (FFX, McConaghy 2011; SINDy, Brunton 2016): before the
+# search, a modest basis (inputs, unary operators of inputs, pairwise
+# products and ratios, hinges at quartiles when max is in the grammar) is
+# searched by orthogonal matching pursuit, branching on the best first
+# terms, and the sparse fits with the best BIC become starting models.  It is
+# an initialiser, not a search mechanism: the basis is never composed
+# recursively.  SPARSE_SEED_STATS records the best seed's training R^2 so a
+# benchmark can tell a good start from better evolution.
+SPARSE_SEEDING = "off"
+SPARSE_BASIS_SIZE = 300
+SPARSE_SEED_SHARE = .1      # of each stage-0 cell's population
+SPARSE_SEED_STATS = {"seeds":0,"best_r2":None,"basis":0}
+
+def sparse_basis(X, ops, limit=None):
+    """(trees, columns) of the seeding basis, in priority order, without duplicates."""
+    limit=SPARSE_BASIS_SIZE if limit is None else limit; n_features=X.shape[1]
+    trees=[("x",i) for i in range(n_features)]
+    if "*" in ops: trees+=[("*",("x",i),("x",j)) for i in range(n_features) for j in range(i,n_features)]
+    if "/" in ops: trees+=[("/",("x",i),("x",j)) for i in range(n_features) for j in range(n_features) if i!=j]
+    unary=[op for op in ops if op in OPS and OPS[op][0]==1 and op not in _LIBRARY_EXCLUDED]
+    trees+=[(op,("x",i)) for op in unary for i in range(n_features)]
+    if "max" in ops:
+        for i in range(n_features):
+            trees+=[("max",("x",i),("c",float(q))) for q in np.unique(np.round(np.quantile(X[:,i],(.25,.5,.75)),6))]
+    kept=[]; columns=[]; seen=set()
+    for tree in trees:
+        if len(kept)>=limit: break
+        try: values=np.asarray(evaluate_cached(tree,X,None),float)
+        except (ArithmeticError, IndexError, RecursionError, ValueError): continue
+        if not np.isfinite(values).all() or values.std()<=EPS: continue
+        signature=np.round((values-values.mean())/values.std(),9).tobytes()
+        if signature in seen: continue
+        seen.add(signature); kept.append(tree); columns.append(values)
+    return kept,(np.column_stack(columns) if columns else np.zeros((len(X),0)))
+
+def sparse_fits(B, y, max_terms=4, branches=6):
+    """Orthogonal matching pursuit from the `branches` best first terms; returns [(bic, support, coefficients, intercept, r2)]."""
+    n,p=B.shape
+    if not p or n<4: return []
+    Z=(B-B.mean(axis=0))/B.std(axis=0); yc=y-y.mean(); total=float(yc@yc)
+    if total<=0: return []
+    first=np.argsort(-np.abs(Z.T@yc))[:branches]; results={}
+    for start in first:
+        support=[int(start)]
+        while True:
+            A=np.column_stack([B[:,support],np.ones(n)])
+            solution=np.linalg.lstsq(A,y,rcond=None)[0]; residual=y-A@solution
+            # Floor at round-off, or an exact fit's extra terms 'win' BIC on 1e-28 vs 1e-27.
+            rss=max(float(residual@residual),1e-20*total)
+            key=tuple(sorted(support))
+            if key not in results:
+                results[key]=(n*math.log(rss/n)+(len(support)+1)*math.log(n),key,
+                              {index:float(c) for index,c in zip(support,solution[:-1])},float(solution[-1]),1-rss/total)
+            if len(support)>=max_terms: break
+            Q,_=np.linalg.qr(Z[:,support]); perpendicular=Z-Q@(Q.T@Z)
+            norms=np.einsum("ij,ij->j",perpendicular,perpendicular); norms[support]=np.inf
+            scores=np.where(norms>1e-10*n,(perpendicular.T@residual)**2/np.maximum(norms,1e-300),-1.)
+            scores[support]=-1.; best=int(np.argmax(scores))
+            if scores[best]<=1e-12*total: break
+            support.append(best)
+    return sorted(results.values(),key=lambda item:item[0])
+
+def sparse_seed_models(X, Y, cats, ops, max_nodes, max_depth, count, head_count):
+    """Up to `count` seed models whose regression heads are sparse fits of their outputs."""
+    targets,_=classification_layout(cats)
+    rows=stratified_probe_indices(X,1000) if len(X)>1000 else slice(None)
+    Xs=X[rows]; trees_by_head={}; best_r2=None
+    basis,B=sparse_basis(Xs,ops)
+    for j,heads in enumerate(targets):
+        if cats[j] is not None: continue
+        y=np.asarray(Y[rows,j],float); options=[]
+        for _,support,coefficients,_,r2 in sparse_fits(B,y,max_terms=min(MAX_TERMS,4)):
+            joined=join_terms([(coefficients[index],basis[index]) for index in support],ops)
+            if joined is None: continue
+            tree=simplify_tree(joined)
+            if node_size(tree)<=max_nodes and node_depth(tree)<=max_depth and tree not in options:
+                options.append(tree); best_r2=r2 if best_r2 is None else max(best_r2,r2)
+        if options: trees_by_head[heads[0]]=options
+    SPARSE_SEED_STATS.update(basis=len(basis))
+    if not trees_by_head: return []
+    models=[]
+    for index in range(min(count,max(len(options) for options in trees_by_head.values()))):
+        trees=[trees_by_head[head][index%len(trees_by_head[head])] if head in trees_by_head else ("x",0) for head in range(head_count)]
+        models.append(Model(trees,[(1.,0.)]*head_count,origin="sparse_seed",mdl_operators=tuple(ops),mdl_feature_count=X.shape[1]))
+    SPARSE_SEED_STATS["seeds"]+=len(models)
+    if best_r2 is not None: SPARSE_SEED_STATS["best_r2"]=max(best_r2,SPARSE_SEED_STATS["best_r2"] or -np.inf)
+    return models
+
 def new_island_runtime(population_size, *, X, Xt, cats, ops, nodes, depth, head_count, bayesian_particles,
                        run_seed, island_index, qd_parent_rate, nsga_normalization, parsimony_quality_tolerance,
                        dynamic_pressure_on, stagnation_window, adf_enabled, adf_mode, evaluation_budget,
@@ -5215,8 +6156,10 @@ def new_island_runtime(population_size, *, X, Xt, cats, ops, nodes, depth, head_
     residual-signature QD repertoire (when RESIDUAL_ARCHIVE is on)."""
     adf_registry=ADFRegistry(adf_enabled,allow_nested=adf_mode=="nested")
     seeds=direct_feature_baselines(X,None,cats,ops,True)[:population_size//4]
+    if SPARSE_SEEDING=="on" and Yt is not None and (cell is None or cell[1]==0):
+        seeds+=sparse_seed_models(Xt,Yt,cats,ops,nodes,depth,max(1,int(SPARSE_SEED_SHARE*population_size)),head_count)
     for seed in seeds: seed.adfs=dict(adf_registry.definitions)
-    population=seeds+[Model([random_tree(X.shape[1],ops,nodes,depth) for _ in range(head_count)],[(1.,0.)]*head_count,
+    population=seeds+[Model([admissible_random_tree(X.shape[1],ops,nodes,depth) for _ in range(head_count)],[(1.,0.)]*head_count,
                       mdl_operators=tuple(ops),mdl_feature_count=X.shape[1],adfs=dict(adf_registry.definitions))
                 for _ in range(population_size-len(seeds))]
     probe_indices=stratified_probe_indices(Xt,256)
@@ -5379,6 +6322,9 @@ def evolve_generation(pop, generation, *, X, Xt, Yt, Xv, Yv, cats, constraints, 
     if progress is not None: progress(generation,elite,sample)
     library.observe(unique_models([*stable_elite,*archive.items,*diverse]),Xb,Yb,cats)
     Xsb=behaviour_rows(Xs)
+    if BACKPROP_MUTATION_WEIGHT>0 or RESIDUAL_TERM_WEIGHT>0:
+        _,Ysb=behaviour_rows(Xs,Ys); head_outputs=regression_head_outputs(cats)
+        fragment_trees=[item["tree"] for item in library.items.values()]
     parent_pool=novelty_pool(pop,Xs)
     parent_count=max(1,population_size//2); qd_count=dual_qd_parent_count(parent_count,qd_controller,semantic_qd,structural_qd,residual_qd)
     row_weights=None if case_weights is None else (np.asarray(case_weights) if isinstance(sample,slice) else np.asarray(case_weights)[sample])
@@ -5395,6 +6341,8 @@ def evolve_generation(pop, generation, *, X, Xt, Yt, Xv, Yv, cats, constraints, 
     seen={model_equivalence_key(model) for model in pop}
     def duplicate(trees):
         nonlocal unchanged
+        if (NESTING_RULES or UNIT_FEATURES) and unchanged<unchanged_limit and any(nesting_violation(tree) or unit_violation(tree) for tree in trees):
+            unchanged+=1; return True
         key=model_equivalence_key(trees)
         if EQUIVALENCE_COLLAPSE and key in seen and unchanged<unchanged_limit:
             unchanged+=1; EQUIVALENCE_STATS["children_redrawn"]+=1; return True
@@ -5415,7 +6363,7 @@ def evolve_generation(pop, generation, *, X, Xt, Yt, Xv, Yv, cats, constraints, 
             scales=list(p.model.scales); child_age=p.model.age+1; child_origin="fragment"
             sources=[p.model]
         elif rng.random() < crossover_rate and len(parents)>=2:
-            p,q=rng.sample(parents,2); trees=[semantic_crossover(a,b,Xsb,nodes,depth,adf_registry.definitions if adf_registry else None) for a,b in zip(p.model.trees,q.model.trees)]; scales=list(p.model.scales); child_age=max(p.model.age,q.model.age)+1
+            p,q=rng.sample(parents,2); trees=[gene_crossover(a,b,nodes,depth,active_ops) if READOUT_MODE=="multiterm" and affine_on and rng.random()<GENE_CROSSOVER_RATE else semantic_crossover(a,b,Xsb,nodes,depth,adf_registry.definitions if adf_registry else None) for a,b in zip(p.model.trees,q.model.trees)]; scales=list(p.model.scales); child_age=max(p.model.age,q.model.age)+1
             if trees==list(p.model.trees) and unchanged<unchanged_limit: unchanged+=1; continue
             if duplicate(trees): continue
             child=Model(trees,scales,child_age,origin="crossover",parent_ids=(p.model.lineage_id,q.model.lineage_id),mdl_operators=grammar_for_trees(active_ops,trees,adf_registry.definitions if adf_registry else None),mdl_feature_count=X.shape[1],adfs={} if adf_registry is None else dict(adf_registry.definitions),founder_ids=tuple(sorted(set(p.model.founder_ids).union(q.model.founder_ids))),birth_generation=generation+1-child_age)
@@ -5426,6 +6374,7 @@ def evolve_generation(pop, generation, *, X, Xt, Yt, Xv, Yv, cats, constraints, 
             trees=[]; kinds=[]; macro_used=False
             for index,tree in enumerate(p.model.trees):
                 proposal=None if bayesian_mode=="off" else (bayes[index] if isinstance(bayes,PerOutputBayesianBanks) else bayes)
+                if BACKPROP_MUTATION_WEIGHT>0 or RESIDUAL_TERM_WEIGHT>0: set_backprop_context(Xsb,backprop_desired(p.model,index,Ysb,head_outputs),fragment_trees)
                 child_tree,kind,macro=semantic_mutate(tree,Xsb,portfolio,X.shape[1],active_ops,nodes,depth,proposal,adf_registry.definitions if adf_registry else None,library)
                 trees.append(child_tree); kinds.append(kind); macro_used|=macro
             if trees==list(p.model.trees) and unchanged<unchanged_limit: unchanged+=1; continue
@@ -5654,6 +6603,18 @@ def resume_main(args):
     SELECTION_PROBE_FILTER=bool(state.get("selection_probe_filter",False))
     global JUMP_MUTATION_WEIGHT
     JUMP_MUTATION_WEIGHT=float(state.get("jump_mutation_weight",0.))
+    global CONSTANT_FIT_ITERATIONS,SEMANTIC_MAX_DELTA,CONSTANT_SNAPPING,SNAP_TOLERANCE
+    CONSTANT_FIT_ITERATIONS=int(state.get("fit_iterations",12)); SEMANTIC_MAX_DELTA=float(state.get("semantic_max_delta",5.))
+    CONSTANT_SNAPPING=state.get("constant_snapping","off"); SNAP_TOLERANCE=float(state.get("snap_tolerance",1e-6))
+    global READOUT_MODE,MAX_TERMS,GENE_CROSSOVER_RATE
+    global BACKPROP_MUTATION_WEIGHT,BACKPROP_INVERSE
+    global RESIDUAL_TERM_WEIGHT,NESTING_RULES,SYMBOLIC_EXPORT,LOSS_MODE,ROBUST_LOSS_DELTA
+    SYMBOLIC_EXPORT=getattr(args,"symbolic_export","on")
+    LOSS_MODE=state.get("loss","huber"); ROBUST_LOSS_DELTA=float(state.get("huber_delta",1.5))
+    configure_units(state.get("units",""),list(names))
+    RESIDUAL_TERM_WEIGHT=float(state.get("residual_term_weight",0.)); NESTING_RULES=parse_nesting_rules(state.get("forbid_nesting",""))
+    BACKPROP_MUTATION_WEIGHT=float(state.get("backprop_mutation_weight",0.)); BACKPROP_INVERSE=state.get("backprop_inverse","generic")
+    READOUT_MODE=state.get("readout","affine"); MAX_TERMS=int(state.get("max_terms",4)); GENE_CROSSOVER_RATE=float(state.get("gene_crossover_rate",0.))
     global LOSS_NOISE_FLOOR
     LOSS_NOISE_FLOOR=float(state.get("loss_noise_floor",LOSS_NOISE_FLOOR_MAX))
     global SQUASH_SWAP_WEIGHT,SMOOTH_SWAP_WEIGHT,GATE_MUTATION_WEIGHT
@@ -5706,7 +6667,7 @@ def resume_main(args):
     print(f"Resumed generation {generation} from {checkpoint_path} (seed {state['run_seed']}); {topology}; model scoring uses {'serial evaluation' if workers==1 else f'{workers} worker processes'}.")
     started=time.time(); stop=GracefulStop().__enter__(); interrupted=False
     try:
-        while (not args.max_generations or generation < args.max_generations) and not stop.requested:
+        while (not args.max_generations or generation < args.max_generations) and not stop.requested and not stop_rule_reached(args,started,islands):
             def step(island):
                 def progress(gen,elite,sample):
                     if len(islands)>1 and gen%10==0: print(cell_label(island,island_config["count"],stage_count),flush=True)
@@ -5736,9 +6697,10 @@ def resume_main(args):
         refresh_persistent_scores(island.archive,island.best_models,island.semantic_qd,island.structural_qd,evaluator,island.residual_qd)
         evaluator.assess(island.population,"train"); island.best_models.update(island.population); island.archive.update(island.population,Xt)
     f=[model for island in islands for model in [*island.archive.items,*island.population,island.best_models.model] if model is not None]
+    f,snapping=snap_final_candidates(f,Xt,Yt,Xv,Yv,affine_on,cats,constraints,out_names); report_snapping(snapping)
     chosen,selection=select_best_model(f,Xv,Yv,cats,loss_tolerance,constraints,out_names) if Xv is not None else select_best_model(f,loss_tolerance=loss_tolerance)
     state["selection"]={**selection,"selected_choice":"default","default_selected":True,
-                        "selected_metrics":selection["metrics"],"selected_objectives":selection["objectives"]}
+                        "selected_metrics":selection["metrics"],"selected_objectives":selection["objectives"],"constant_snapping":snapping}
     snapshot_islands(state,islands,island_config)
     save_checkpoint(checkpoint_path,generation,islands[0].population,islands[0].bayes,islands[0].archive,state)
     print(f"Resume complete at generation {generation}. {selection['source'].title()} loss-tolerance shortest-MDL model selected: {equations(chosen,names,out_names,cats)}")
@@ -5746,6 +6708,29 @@ def resume_main(args):
     if warning: print(f"WARNING: {warning}"); state["selection"]["warning"]=warning
     print(f"{selection['source'].title()} selection scores: mean loss={selection['metrics']['loss']:.6g}, mean shape={selection['metrics']['shape']:.6g}, MDL bits={selection['metrics']['mdl_bits']:.6g}")
     export_model(chosen,names,out_names,cats,maps,state["source_columns"],state["types"],state.get("export_fixture"),state.get("input_ranges")); evaluator.close()
+    write_symbolic_export(chosen,names,out_names,cats,Xt)
+
+def parse_nesting_rules(text):
+    """'exp>exp,sin>cos' -> {("exp","exp"),("sin","cos")}; outer>inner forbids inner anywhere below outer."""
+    rules=set()
+    for item in str(text or "").split(","):
+        if not item.strip(): continue
+        outer,separator,inner=item.strip().partition(">")
+        if not separator or outer.strip() not in OPS or inner.strip() not in OPS: raise ValueError(f"Bad nesting rule {item.strip()!r}: use outer>inner with operator names")
+        rules.add((outer.strip(),inner.strip()))
+    return frozenset(rules)
+
+def stop_rule_reached(args, started, islands):
+    """--max-time (seconds of search) and --stop-at-loss (best training loss) end the search like Ctrl-C."""
+    limit=getattr(args,"max_time",0.) or 0.
+    if limit and time.time()-started>=limit:
+        print(f"Stopping: --max-time {limit:g}s reached."); return True
+    target=getattr(args,"stop_at_loss",None)
+    if target is not None:
+        best=min((aggregate_loss(island.best_models.model) for island in islands if island.best_models.model is not None),default=float("inf"))
+        if best<=target:
+            print(f"Stopping: best training loss {best:.6g} reached --stop-at-loss {target:g}."); return True
+    return False
 
 def build_arg_parser():
     ap=argparse.ArgumentParser(); ap.add_argument("--max-generations",type=int,default=0); ap.add_argument("--population",type=int,default=160); ap.add_argument("--seed",type=int); ap.add_argument("--workers",type=int,default=0,help="Model-scoring processes; 0=auto, 1=serial (default: 0)"); ap.add_argument("--adf-mode",choices=("off","flat","nested"),default="nested",help="ADF experiment mode; nested is v2, flat is the v1-style ablation, off disables ADFs")
@@ -5779,6 +6764,26 @@ def build_arg_parser():
     ap.add_argument("--numeric-guard-check",choices=("on","off"),default="on",help="Reject models whose values depend on afpo's numeric safety guards (the +/-1e12 value clamp, sinh/cosh/tan input clips) instead of letting them use a guard as a hidden min/max (default: on)")
     ap.add_argument("--interpolation-check",choices=("on","off"),default="on",help="Add a loss term scoring predictions between nearest-neighbour rows against interpolated targets, so equations that only memorise the training rows (e.g. short-period mod sawtooths) lose (default: on)")
     ap.add_argument("--jump-constant-scan",choices=("on","off"),default="on",help="Before the gradient constant fit, scan data-driven values for constants that only move a jump (mod periods, comparison thresholds, floor scales), which the gradient fit cannot move (default: on)")
+    ap.add_argument("--fit-iterations",type=int,default=12,help="Levenberg-Marquardt iterations per constant fit; the 2026-10-02 audit found 15%% of fits stop at 12 while still improving (default: 12)")
+    ap.add_argument("--semantic-max-delta",type=float,default=5.,help="Largest output change (in target standard deviations) a mutation or crossover may make before the constant fit; inf disables the cap (default: 5)")
+    ap.add_argument("--constant-snapping",choices=("off","final"),default="final",help="final: before the final choice, round fitted constants of the strongest candidates to simpler values (integers, p/q, pi, e, sqrt2, ln2, powers of ten, short decimals) when training and validation loss and the numeric guard are preserved (default: final)")
+    ap.add_argument("--snap-tolerance",type=float,default=1e-6,help="Relative loss increase a snapped constant may cause on training and on validation data, never below the loss noise floor (default: 1e-6)")
+    ap.add_argument("--readout",choices=("affine","multiterm"),default="multiterm",help="Output readout: affine fits a*tree+b; multiterm (multigene GP) gives each top-level +/- term of a regression tree its own least-squares coefficient, pruning negligible and collinear terms (default: multiterm)")
+    ap.add_argument("--max-terms",type=int,default=4,help="Most top-level terms a multiterm tree keeps (default: 4)")
+    ap.add_argument("--gene-crossover-rate",type=float,default=0.,help="Share of crossovers that add or swap one whole top-level term in multiterm mode; at 0.5 it cut bench_complex solves (2/15 vs 5/15 at 0 on products6, sum8, reuse_poly3) (default: 0)")
+    ap.add_argument("--backprop-mutation-weight",type=float,default=0.,help="Initial portfolio weight of semantic backpropagation: invert the tree from its readout down to a random node and replace that subtree with the small expression or fragment that best matches the desired values; 0 disables it (default: 0)")
+    ap.add_argument("--backprop-inverse",choices=("exact","generic"),default="generic",help="exact inverts only + - * / neg exp log tanh sigmoid; generic also solves every other operator numerically per row, on the branch the subtree is already on (default: generic)")
+    ap.add_argument("--residual-term-weight",type=float,default=1.,help="Initial portfolio weight of the residual-term mutation, which adds the small expression that best matches what the parent still misses (boosting-style); 0 disables it (default: 1)")
+    ap.add_argument("--forbid-nesting",default="",metavar="OUTER>INNER,...",help="Operator pairs that may not nest, e.g. exp>exp,log>exp,sin>sin: INNER may not appear anywhere below OUTER (default: none)")
+    ap.add_argument("--symbolic-export",choices=("on","off"),default="on",help="Also write the chosen model to best_model_symbolic.txt when sympy is installed: an exact form with afpo's protected operators and a readable raw form without them, each with LaTeX (default: on)")
+    ap.add_argument("--loss",choices=("huber","squared","relative"),default="huber",help="Regression loss: huber (MAD-scaled, robust to outliers), squared (plain least squares) or relative (Huber on the error relative to |y|, for targets spanning orders of magnitude) (default: huber)")
+    ap.add_argument("--huber-delta",type=float,default=1.5,help="Huber threshold in robust target-scale units for --loss huber and relative (default: 1.5)")
+    ap.add_argument("--constant-intervals",choices=("on","off"),default="on",help="Print and record approximate 95%% intervals for the chosen model's constants from the linearised covariance (default: on)")
+    ap.add_argument("--units",default="",metavar="COLUMN=UNIT,...",help="Units of input columns for dimensional analysis, e.g. x=m,t=s,F=kg*m/s^2 (exponents with ^, fractions in parentheses like m^(1/2)); trees that add, compare or exponentiate unlike units are rejected; constants and unlisted columns are unit-free wildcards (default: none)")
+    ap.add_argument("--max-time",type=float,default=0.,help="Stop the search after this many seconds and go to the final choice; 0 = no limit (default: 0)")
+    ap.add_argument("--stop-at-loss",type=float,default=None,help="Stop the search once the best training loss (the loss printed during the run) is at or below this value (default: off)")
+    ap.add_argument("--sparse-seeding",choices=("on","off"),default="off",help="Seed the initial population with sparse linear fits over a modest basis (inputs, unary operators of inputs, pairwise products and ratios, hinges), found by orthogonal matching pursuit (default: off)")
+    ap.add_argument("--sparse-basis-size",type=int,default=300,help="Most basis terms the sparse seeding searches (default: 300)")
     ap.add_argument("--jump-mutation-weight",type=float,default=1.,help="Initial portfolio weight of the jump mutation, which wraps a subtree in mod(s,c), floordiv(s,c) or if_else(gt(x,c),s,s') as one move; adapted like the other mutation kinds; 0 disables it (default: 1)")
     ap.add_argument("--loss-noise-floor",default="auto",help="Loss differences below this count as ties (the shorter model wins). 'auto' derives it from the targets' written precision: about 3e-12 for 7-digit CSV values, down to 1e-18 for full doubles, never above the old fixed 1e-9 (default: auto)")
     ap.add_argument("--squash-swap-weight",type=float,default=1.,help="Initial portfolio weight of the squash swap, which replaces one sigmoid/tanh/erf with another rewritten to the same level, range and slope (sigmoid(z) -> 0.5+0.5*erf(0.443z)); 0 disables it (default: 1)")
@@ -5798,6 +6803,24 @@ def parse_cli(argv=None):
     if args.parsimony_quality_tolerance < 0: ap.error("--parsimony-quality-tolerance must be non-negative")
     if not .10 <= args.qd_parent_rate <= .30: ap.error("--qd-parent-rate must be between 0.10 and 0.30")
     if args.evaluation_refresh < 1 or args.stagnation_window < 1: ap.error("evaluation refresh and stagnation window must be positive")
+    if args.fit_iterations < 1: ap.error("--fit-iterations must be positive")
+    try:
+        for item in args.units.split(","):
+            if item.strip():
+                if "=" not in item: raise ValueError(f"Bad unit entry {item.strip()!r}: use column=unit")
+                parse_unit(item.partition("=")[2])
+    except ValueError as error: ap.error(str(error))
+    try: parse_nesting_rules(args.forbid_nesting)
+    except ValueError as error: ap.error(str(error))
+    if not args.huber_delta > 0: ap.error("--huber-delta must be positive")
+    if args.max_time < 0: ap.error("--max-time must be non-negative")
+    if args.residual_term_weight < 0: ap.error("--residual-term-weight must be non-negative")
+    if args.backprop_mutation_weight < 0: ap.error("--backprop-mutation-weight must be non-negative")
+    if args.sparse_basis_size < 1: ap.error("--sparse-basis-size must be positive")
+    if args.max_terms < 2: ap.error("--max-terms must be at least 2")
+    if not 0 <= args.gene_crossover_rate <= 1: ap.error("--gene-crossover-rate must be between 0 and 1")
+    if not args.semantic_max_delta > 0: ap.error("--semantic-max-delta must be positive (inf disables the cap)")
+    if not 0 <= args.snap_tolerance < 1: ap.error("--snap-tolerance must be in [0, 1)")
     return ap,args
 
 def main():
@@ -5914,6 +6937,20 @@ def train_from_setup(args, setup, choose_model=None):
     SELECTION_PROBE_FILTER=getattr(args,"selection_probe_filter","on")=="on"
     global JUMP_MUTATION_WEIGHT
     JUMP_MUTATION_WEIGHT=float(getattr(args,"jump_mutation_weight",1.))
+    global CONSTANT_FIT_ITERATIONS,SEMANTIC_MAX_DELTA,CONSTANT_SNAPPING,SNAP_TOLERANCE
+    CONSTANT_FIT_ITERATIONS=int(getattr(args,"fit_iterations",12)); SEMANTIC_MAX_DELTA=float(getattr(args,"semantic_max_delta",5.))
+    CONSTANT_SNAPPING=getattr(args,"constant_snapping","final"); SNAP_TOLERANCE=float(getattr(args,"snap_tolerance",1e-6))
+    global READOUT_MODE,MAX_TERMS,GENE_CROSSOVER_RATE
+    global SPARSE_SEEDING,SPARSE_BASIS_SIZE
+    SPARSE_SEEDING=getattr(args,"sparse_seeding","off"); SPARSE_BASIS_SIZE=int(getattr(args,"sparse_basis_size",300)); SPARSE_SEED_STATS.update(seeds=0,best_r2=None,basis=0)
+    global BACKPROP_MUTATION_WEIGHT,BACKPROP_INVERSE
+    global RESIDUAL_TERM_WEIGHT,NESTING_RULES
+    global SYMBOLIC_EXPORT,LOSS_MODE,ROBUST_LOSS_DELTA,CONSTANT_INTERVALS
+    SYMBOLIC_EXPORT=getattr(args,"symbolic_export","on"); CONSTANT_INTERVALS=getattr(args,"constant_intervals","on")
+    LOSS_MODE=getattr(args,"loss","huber"); ROBUST_LOSS_DELTA=float(getattr(args,"huber_delta",1.5))
+    RESIDUAL_TERM_WEIGHT=float(getattr(args,"residual_term_weight",1.)); NESTING_RULES=parse_nesting_rules(getattr(args,"forbid_nesting",""))
+    BACKPROP_MUTATION_WEIGHT=float(getattr(args,"backprop_mutation_weight",0.)); BACKPROP_INVERSE=getattr(args,"backprop_inverse","generic")
+    READOUT_MODE=getattr(args,"readout","multiterm"); MAX_TERMS=int(getattr(args,"max_terms",4)); GENE_CROSSOVER_RATE=float(getattr(args,"gene_crossover_rate",0.))
     global SQUASH_SWAP_WEIGHT,SMOOTH_SWAP_WEIGHT,GATE_MUTATION_WEIGHT
     SQUASH_SWAP_WEIGHT=float(getattr(args,"squash_swap_weight",1.)); SMOOTH_SWAP_WEIGHT=float(getattr(args,"smooth_swap_weight",1.)); GATE_MUTATION_WEIGHT=float(getattr(args,"gate_mutation_weight",1.))
     FIT_BACKEND=getattr(args,"fit_backend","auto")
@@ -5987,6 +7024,8 @@ def train_from_setup(args, setup, choose_model=None):
         raise ValueError("Validation needs at least three rows when affine scaling is enabled")
     if len(Xt)<4 and Xv is not None: raise ValueError("Need at least four training rows after validation split")
     if coev and len(Xt)<=512: print(f"Co-evolution subsamples only above 512 training rows; with {len(Xt)} rows every generation scores all rows.")
+    configure_units(getattr(args,"units",""),list(names))
+    if UNIT_FEATURES: print(f"Dimensional analysis on {len(UNIT_FEATURES)} column(s) over base units {', '.join(UNIT_BASES)}.")
     hypotheses=discover_hypotheses(Xt,Yt,names,out_names)
     interaction_discovery=discover_interaction_fragments(Xt,Yt,names,out_names,ops,Xv,Yv)
     if interaction_discovery["status"]=="ok":
@@ -6009,7 +7048,7 @@ def train_from_setup(args, setup, choose_model=None):
                    "stages":{key:stages[key] for key in ("mode","count","interval","age_gap","schedule","threshold_quantile")},
                    "roles":{key:roles[key] for key in ("enabled","interval","mix","retire_after")}},
         "equivalence_collapse":EQUIVALENCE_COLLAPSE,"residual_archive":RESIDUAL_ARCHIVE,"qd_parent_choice":QD_PARENT_CHOICE,"scale_balanced_selection":SCALE_BALANCED_SELECTION,
-        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"selection_probe_filter":SELECTION_PROBE_FILTER,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"squash_swap_weight":SQUASH_SWAP_WEIGHT,"smooth_swap_weight":SMOOTH_SWAP_WEIGHT,"gate_mutation_weight":GATE_MUTATION_WEIGHT,"loss_noise_floor":LOSS_NOISE_FLOOR,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age",
+        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"selection_probe_filter":SELECTION_PROBE_FILTER,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"fit_iterations":CONSTANT_FIT_ITERATIONS,"semantic_max_delta":SEMANTIC_MAX_DELTA,"constant_snapping":CONSTANT_SNAPPING,"snap_tolerance":SNAP_TOLERANCE,"readout":READOUT_MODE,"max_terms":MAX_TERMS,"gene_crossover_rate":GENE_CROSSOVER_RATE,"backprop_mutation_weight":BACKPROP_MUTATION_WEIGHT,"backprop_inverse":BACKPROP_INVERSE,"residual_term_weight":RESIDUAL_TERM_WEIGHT,"loss":LOSS_MODE,"huber_delta":ROBUST_LOSS_DELTA,"forbid_nesting":",".join(sorted(f"{o}>{i}" for o,i in NESTING_RULES)),"units":UNIT_SPEC,"sparse_seeding":SPARSE_SEEDING,"sparse_basis_size":SPARSE_BASIS_SIZE,"squash_swap_weight":SQUASH_SWAP_WEIGHT,"smooth_swap_weight":SMOOTH_SWAP_WEIGHT,"gate_mutation_weight":GATE_MUTATION_WEIGHT,"loss_noise_floor":LOSS_NOISE_FLOOR,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age",
         "test_csv":str(Path(args.test_csv).resolve()) if args.test_csv else None,
     },df,train_indices,validation_indices,external_validation)
     print(f"Run manifest: {manifest_path}")
@@ -6026,7 +7065,7 @@ def train_from_setup(args, setup, choose_model=None):
         "profile":args.profile,"constraint_metadata":metadata,"constraints":constraints.describe(),"bayesian_particles":args.bayesian_particles,"interaction_discovery":interaction_discovery,
         "island_config":{"count":island_count,"migration_interval":migration_interval,"migrants_per_island":migrants_per_island,"topology":"ring","migration_events":0,"stages":stages,"roles":roles},
         "equivalence_collapse":EQUIVALENCE_COLLAPSE,"residual_archive":RESIDUAL_ARCHIVE,"qd_parent_choice":QD_PARENT_CHOICE,"scale_balanced_selection":SCALE_BALANCED_SELECTION,
-        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"selection_probe_filter":SELECTION_PROBE_FILTER,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"squash_swap_weight":SQUASH_SWAP_WEIGHT,"smooth_swap_weight":SMOOTH_SWAP_WEIGHT,"gate_mutation_weight":GATE_MUTATION_WEIGHT,"loss_noise_floor":LOSS_NOISE_FLOOR,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age"}
+        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"selection_probe_filter":SELECTION_PROBE_FILTER,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"fit_iterations":CONSTANT_FIT_ITERATIONS,"semantic_max_delta":SEMANTIC_MAX_DELTA,"constant_snapping":CONSTANT_SNAPPING,"snap_tolerance":SNAP_TOLERANCE,"readout":READOUT_MODE,"max_terms":MAX_TERMS,"gene_crossover_rate":GENE_CROSSOVER_RATE,"backprop_mutation_weight":BACKPROP_MUTATION_WEIGHT,"backprop_inverse":BACKPROP_INVERSE,"residual_term_weight":RESIDUAL_TERM_WEIGHT,"loss":LOSS_MODE,"huber_delta":ROBUST_LOSS_DELTA,"forbid_nesting":",".join(sorted(f"{o}>{i}" for o,i in NESTING_RULES)),"units":UNIT_SPEC,"sparse_seeding":SPARSE_SEEDING,"sparse_basis_size":SPARSE_BASIS_SIZE,"squash_swap_weight":SQUASH_SWAP_WEIGHT,"smooth_swap_weight":SMOOTH_SWAP_WEIGHT,"gate_mutation_weight":GATE_MUTATION_WEIGHT,"loss_noise_floor":LOSS_NOISE_FLOOR,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age"}
     head_count=sum(len(heads) for heads in classification_layout(cats)[0])
     population_sizes=cell_population_sizes(args.population,cell_count)
     islands=[new_island_runtime(size,X=X,Xt=Xt,cats=cats,ops=ops,nodes=nodes,depth=depth,head_count=head_count,
@@ -6037,6 +7076,10 @@ def train_from_setup(args, setup, choose_model=None):
                                 evaluation_budget=args.evaluation_budget,evaluation_refresh=args.evaluation_refresh,
                                 interaction_discovery=interaction_discovery,Yt=Yt)
              for index,size in enumerate(population_sizes)]
+    if SPARSE_SEEDING=="on":
+        best=SPARSE_SEED_STATS["best_r2"]
+        print(f"Sparse seeding: {SPARSE_SEED_STATS['seeds']} seed model(s) from a {SPARSE_SEED_STATS['basis']}-term basis"+(f"; best seed training R2={best:.6g}" if best is not None else ""))
+        checkpoint_state["sparse_seed_stats"]=dict(SPARSE_SEED_STATS)
     if roles["enabled"]: assign_role_parameters(islands,island_count,args.crossover_rate,args.bayesian_proposal_rate,nodes)
     if cell_count>1: seed_cell_streams(islands,run_seed)
     cell_workers=resolve_cell_workers(getattr(args,"cell_workers",0),cell_count)
@@ -6051,7 +7094,7 @@ def train_from_setup(args, setup, choose_model=None):
     print(f"Searching indefinitely with {args.bayesian_proposal_rate:.0%} Bayesian proposals, {topology}, and {'serial evaluation' if workers==1 else f'{workers} worker processes'}; press Ctrl-C to choose and save a model.")
     stop=GracefulStop().__enter__(); interrupted=False
     try:
-        while (not args.max_generations or gen<args.max_generations) and not stop.requested:
+        while (not args.max_generations or gen<args.max_generations) and not stop.requested and not stop_rule_reached(args,start,islands):
             def step(island):
                 def progress(generation,elite,sample):
                     if cell_count>1 and generation%10==0: print(cell_label(island,island_count,stages["count"]),flush=True)
@@ -6089,6 +7132,7 @@ def train_from_setup(args, setup, choose_model=None):
         evaluator.assess(island.population,"train")
         island.best_models.update(island.population); island.archive.update(island.population,Xt)
     f=[model for island in islands for model in [*island.archive.items,*island.population,island.best_models.model] if model is not None]
+    f,snapping=snap_final_candidates(f,Xt,Yt,Xv,Yv,affine_on,cats,constraints,out_names); report_snapping(snapping)
     evaluation=selection_evaluation(f,Xv,Yv,cats,constraints,out_names)
     labels,choices,selection=model_options(f,cats=cats,loss_tolerance=args.selection_loss_tolerance,evaluation=evaluation)
     print_frontier(f,names,out_names,cats,recommendations=(labels,choices),evaluation=evaluation)
@@ -6100,6 +7144,8 @@ def train_from_setup(args, setup, choose_model=None):
     chosen=choices[selected_index]
     print(f"Selected model: {equations(chosen,names,out_names,cats)}")
     print("Fitted constants:", [constant_vector(tree) for tree in chosen.trees])
+    intervals=constant_intervals(chosen,Xt,Yt,cats) if CONSTANT_INTERVALS=="on" else None
+    print_constant_intervals(intervals)
     if Xv is not None:
         metrics=frozen_metrics(chosen,Xv,Yv,cats,constraints,out_names)
         print(f"Validation (used for selection): loss={metrics['loss']:.6g}, shape={metrics['shape']:.6g} | output losses={output_loss_summary(metrics['losses'],out_names)}")
@@ -6107,14 +7153,15 @@ def train_from_setup(args, setup, choose_model=None):
         metrics=frozen_metrics(chosen,Xtest,Ytest,cats,constraints,out_names)
         print(f"Final held-out test (not used for selection): loss={metrics['loss']:.6g}, shape={metrics['shape']:.6g} | output losses={output_loss_summary(metrics['losses'],out_names)}")
     export_model(chosen,names,out_names,cats,maps,list(df.columns),types,train_df,input_ranges)
+    write_symbolic_export(chosen,names,out_names,cats,Xt)
     selected_entry=next(entry for entry in evaluation[1] if entry[0] is chosen)
-    selection={**selection,"selected_choice":labels[selected_index],"default_selected":selected_index==0,
+    selection={**selection,"constant_snapping":snapping,"selected_choice":labels[selected_index],"default_selected":selected_index==0,
                "selected_metrics":selected_entry[2],"selected_objectives":tuple(selected_entry[1].objectives)}
     checkpoint_state["selection"]=selection
     snapshot_islands(checkpoint_state,islands,checkpoint_state["island_config"])
     save_checkpoint(checkpoint_path,gen,islands[0].population,islands[0].bayes,islands[0].archive,checkpoint_state)
     record_selection_manifest(manifest_path,selection)
-    card=write_model_card(manifest_path,chosen,names,out_names,constraints,hypotheses,islands[0].bayes,{"train_rows":len(Xt),"validation_rows":0 if Xv is None else len(Xv),"preprocessing":"fit_on_training_rows_only","schema_version":1},cats=cats,selection=selection,quality_diversity={"islands":[{"semantic":island.semantic_qd.diagnostics(),"structural":island.structural_qd.diagnostics(),"controller":island.qd_controller.diagnostics(),
+    card=write_model_card(manifest_path,chosen,names,out_names,constraints,hypotheses,islands[0].bayes,{"train_rows":len(Xt),"validation_rows":0 if Xv is None else len(Xv),"preprocessing":"fit_on_training_rows_only","schema_version":1},cats=cats,bootstrap=None if intervals is None else {"method":"linearised least-squares covariance on training rows","level":.95,"parameters":intervals},selection=selection,quality_diversity={"islands":[{"semantic":island.semantic_qd.diagnostics(),"structural":island.structural_qd.diagnostics(),"controller":island.qd_controller.diagnostics(),
                                                                                          "residual":None if island.residual_qd is None else island.residual_qd.diagnostics()} for island in islands]},survival={"nsga_normalization":args.nsga_normalization,"parsimony_quality_tolerance":args.parsimony_quality_tolerance,"islands":checkpoint_state["island_config"]},adf_diagnostics=[island.adf_registry.diagnostics() for island in islands if island.adf_registry.enabled] or None,evaluation={"budgets":[island.budget.snapshot() for island in islands],"evaluator":evaluator.diagnostics()},interaction_discovery=interaction_discovery,island_diagnostics={"config":checkpoint_state["island_config"],"bayesian_posteriors":[[bank.particles.last_predictive for bank in island.bayes.banks] for island in islands]})
     evaluator.close()
     print(f"Model card: {card}")
