@@ -202,14 +202,23 @@ class UnitTest(unittest.TestCase):
                      ("sin", ("*", ("c", 2.), ("x", 0))),                  # constant carries 1/m
                      ("gt", ("x", 0), ("c", 1.)),
                      ("sqrt", ("*", ("x", 0), ("x", 0))),
-                     ("+", ("x", 4), ("x", 0))):                           # unlisted column is free
+                     ("+", ("x", 4), ("x", 0)),                            # unlisted column is free
+                     ("exp_decay", ("x", 1), ("x", 3)),                    # exp(-t k): s * 1/s
+                     ("exp_decay", ("x", 3), ("x", 1)),
+                     ("exp_decay", ("x", 1), ("c", .5)),                   # constant carries 1/s
+                     ("+", ("x", 0), ("round2", ("x", 0), ("c", 2.))),     # round2 keeps m
+                     ("+", ("x", 0), ("perceptronReLU2", ("x", 0), ("c", 1.)))):
             self.assertEqual(a.unit_violation(tree), "", tree)
 
     def test_inconsistent_trees_fail(self):
         for tree in (("+", ("x", 0), ("x", 1)),                            # m + s
                      ("exp", ("x", 0)),                                    # exp(m)
                      ("gt", ("x", 0), ("x", 2)),                           # m > m/s
-                     ("pow", ("x", 0), ("x", 1))):                         # m ** s
+                     ("pow", ("x", 0), ("x", 1)),                          # m ** s
+                     ("exp_decay", ("x", 0), ("x", 1)),                    # exp(-m s)
+                     ("exp_decay", ("x", 1), ("x", 1)),                    # exp(-s^2)
+                     ("round2", ("x", 0), ("x", 1)),                       # s decimal places
+                     ("perceptronReLU2", ("x", 0), ("x", 1))):             # m + s
             self.assertNotEqual(a.unit_violation(tree), "", tree)
 
     def test_assess_and_cli(self):
@@ -219,6 +228,61 @@ class UnitTest(unittest.TestCase):
         self.assertTrue(model.invalid_reason.startswith("units:"))
         with self.assertRaises(SystemExit), patch("sys.stderr"):
             a.parse_cli(["--units", "x=m$"])
+
+
+class ClassifierSymbolicTest(unittest.TestCase):
+    def test_classifier_scores_and_decisions_are_rendered(self):
+        X = np.random.default_rng(0).uniform(0, 1, (30, 2))
+        binary = a.Model([("-", ("x", 0), ("x", 1))], [(2., .5)])
+        result = a.symbolic_model(binary, ["a", "b"], ["flag"], [["no", "yes"]], (), X)
+        entry = result["flag score"]
+        self.assertEqual(entry["raw"][1], r"2\,a - 2\,b + \frac{1}{2}")
+        self.assertEqual(entry["name_latex"], r"s_{\mathrm{flag}}")
+        self.assertIn(r"\text{yes} & s_{\mathrm{flag}} \ge \tfrac{1}{2}", entry["decision"]["latex"][0])
+        self.assertIn(r"\widehat{\mathrm{flag}}", entry["decision"]["latex"][0])
+        self.assertEqual(entry["agreement"][0], 1.)
+        multi = a.Model([("x", 0), ("x", 1), ("c", .3)], [(1., 0.)] * 3)
+        result = a.symbolic_model(multi, ["a", "b"], ["kind"], [["cat", "dog", "b_ird"]], (), X)
+        self.assertEqual(list(result), ["kind[cat] score", "kind[dog] score", "kind[b_ird] score"])
+        self.assertEqual(result["kind[b_ird] score"]["name_latex"], r"s_{\text{b\_ird}}")
+        self.assertNotIn("decision", result["kind[cat] score"])
+        self.assertIn("arg", result["kind[b_ird] score"]["decision"]["latex"][0])
+        mixed = a.symbolic_model(a.Model([("x", 0), ("x", 1)], [(1., 0.)] * 2), ["a", "b"], ["y", "c"], [None, ["p", "q"]], (), X)
+        self.assertEqual(list(mixed), ["y", "c score"])                       # regression keys unchanged
+        self.assertNotIn("decision", mixed["y"])
+
+
+class CacheMemoryTest(unittest.TestCase):
+    def setUp(self):
+        self.budget = a.EVALUATION_CACHE_ELEMENTS
+        self.addCleanup(lambda: setattr(a, "EVALUATION_CACHE_ELEMENTS", self.budget))
+        self.addCleanup(a._EVALUATION_CACHE.clear)
+
+    def test_tree_keys_are_compact_digests_of_the_full_identity(self):
+        big = ("x", 0)
+        for i in range(400): big = ("+", big, ("c", float(i)))
+        self.assertEqual(len(a.tree_digest(big)), 16)
+        self.assertIs(a.tree_fingerprint(big), a.tree_fingerprint(big))          # memoized per tree object
+        self.assertNotEqual(a.tree_digest(("c", 0.)), a.tree_digest(("c", -0.)))  # repr decides identity
+        self.assertNotEqual(a.tree_digest(("c", 1.)), a.tree_digest(("c", 1)))
+        self.assertNotEqual(a.tree_digest([big, ("x", 1)]), a.tree_digest([("x", 1), big]))
+        self.assertEqual(len(a.equivalence_key(big)), 16)
+        self.assertIs(a.interned_grammar(["+", "-"]), a.interned_grammar(("+", "-")))
+        X = np.ones((5, 1)); a.evaluate_cached(big, X)
+        self.assertTrue(all(len(key[0]) == 16 for key in a._EVALUATION_CACHE))   # no repr text in the keys
+
+    def test_budget_counts_entries_and_workers_get_a_share(self):
+        a.configure_cache_memory(1)                                              # 125,000 elements
+        X = np.ones((10, 1))
+        for i in range(5000): a.evaluate_cached(("+", ("x", 0), ("c", float(i))), X)
+        self.assertLessEqual(a._EVALUATION_CACHE_SIZE[0], a.EVALUATION_CACHE_ELEMENTS)
+        self.assertLessEqual(len(a._EVALUATION_CACHE), a.EVALUATION_CACHE_ELEMENTS // (10 + a.EVALUATION_CACHE_ENTRY_COST) + 1)
+        a.configure_cache_memory(128)
+        with patch("signal.signal"): a._worker_init()
+        self.assertEqual(a.EVALUATION_CACHE_ELEMENTS, int(16_000_000 * a.WORKER_CACHE_SHARE))
+        self.assertFalse(a._EVALUATION_CACHE)
+        with self.assertRaises(ValueError): a.configure_cache_memory(0)
+        self.assertEqual(a.parse_cli(["--cache-memory", "32"])[1].cache_memory, 32.)
 
 
 if __name__ == "__main__":

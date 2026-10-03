@@ -65,6 +65,15 @@ main { padding: 14px 16px 40px; max-width: 1500px; margin: 0 auto; }
 .field > label { display: block; font-weight: 550; margin-bottom: 3px; }
 .field > label .hint { font-weight: 400; margin-left: 6px; }
 .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.roleWide { grid-column: 1 / -1; }
+.lineage { display: grid; grid-template-columns: max-content max-content minmax(0, 1fr); gap: 5px 12px; margin-top: 6px; font-size: 13px; align-items: baseline; }
+.lineage .gen { color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.lineage .place { border-left: 3px solid var(--role, var(--border)); padding-left: 6px; white-space: nowrap; color: var(--text-2); }
+.lineage .what .hint { margin-left: 6px; }
+@media (max-width: 640px) { .lineage { grid-template-columns: max-content minmax(0, 1fr); } .lineage .what { grid-column: 1 / -1; padding-left: 9px; margin-bottom: 4px; } }
+.roleGrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 8px 12px; }
+.roleGrid label { display: block; font-weight: 550; margin-bottom: 3px; }
+.roleGrid .hint { display: block; margin-top: 2px; }
 .row > .grow { flex: 1; min-width: 160px; }
 .fields { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 4px 12px; }
 input[type=text], input[type=number], select, textarea { width: 100%; background: var(--surface); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 5px 8px; font: inherit; min-width: 0; }
@@ -183,7 +192,7 @@ input, select, textarea { max-width: 100%; }
 .frozen .field > label { display: flex; justify-content: space-between; gap: 6px; font-weight: 500; }
 .frozen .unused { color: var(--muted); font-weight: 400; font-size: 11px; }
 .chart.h480 { height: 480px; }
-.chart canvas.grab { cursor: grab; } .chart canvas.grab:active { cursor: grabbing; }
+.chart canvas.grab { cursor: grab; touch-action: none; } .chart canvas.grab:active { cursor: grabbing; }
 .colorbar { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 8px; align-items: center; font-size: 12px; color: var(--text-2); margin-top: 8px; font-variant-numeric: tabular-nums; }
 .colorbar .ramp { height: 10px; border-radius: 3px; }
 .colorbar .title { grid-column: 1 / -1; color: var(--text-2); font-size: 12px; }
@@ -283,8 +292,9 @@ input, select, textarea { max-width: 100%; }
           <div class="field"><label>Islands <span class="hint">1 = single population</span></label><input type="number" id="islands" value="1" min="1"></div>
           <div class="field islandOnly"><label>Migration interval</label><input type="number" id="migrationInterval" value="25" min="1"></div>
           <div class="field islandOnly"><label>Migrants per island</label><input type="number" id="migrants" value="2" min="1"></div>
-          <div class="field islandOnly"><label class="check"><input type="checkbox" id="roles"> Self-organising roles <span class="hint">island 1 generalist, others specialise</span></label></div>
-          <div class="field islandOnly"><label>Role update interval</label><input type="number" id="roleInterval" value="10" min="1"></div>
+          <div class="field islandOnly"><label class="check"><input type="checkbox" id="roles"> Island roles</label></div>
+          <div class="field islandOnly roleOnly"><label>Role update interval</label><input type="number" id="roleInterval" value="10" min="1"></div>
+          <div class="field islandOnly roleOnly roleWide"><label>Role of each island <span class="hint">Auto learns its niche from the data; island 1 stays the generalist</span></label><div class="roleGrid" id="islandRoles"></div></div>
           <div class="field"><label>AFPO stages <span class="hint">newcomers climb a ladder</span></label><select id="stageMode"><option value="off">Off</option><option value="fitness">Fitness (HFC)</option><option value="age">Age (ALPS)</option><option value="both">Fitness + age</option></select></div>
           <div class="field stageOnly"><label>Stages per island</label><input type="number" id="stages" value="3" min="2"></div>
           <div class="field stageOnly"><label>Promotion interval</label><input type="number" id="stageInterval" value="5" min="1"></div>
@@ -455,6 +465,7 @@ input, select, textarea { max-width: 100%; }
           <div><div class="kv" id="detailKv"></div></div>
           <div><table id="detailOutputs"></table></div>
         </div>
+        <details style="margin-top:8px" open><summary>History <span class="hint">where this model's line was born, changed and migrated</span></summary><div class="lineage" id="lineageView"></div></details>
         <details style="margin-top:8px"><summary>Expression tree</summary><div class="svgbox" id="treeBox"></div></details>
       </div>
 
@@ -815,19 +826,44 @@ class Surface3D {
     this.c = canvas; this.ctx = canvas.getContext('2d'); this.spec = null; this.verts = [];
     this.reset();
     this.tip = document.createElement('div'); this.tip.className = 'tip'; canvas.parentElement.appendChild(this.tip);
-    canvas.addEventListener('pointerdown', e => { this.drag = {x: e.clientX, y: e.clientY, yaw: this.yaw, elev: this.elev}; canvas.setPointerCapture(e.pointerId); this.tip.style.display = 'none'; });
-    canvas.addEventListener('pointerup', e => { this.drag = null; canvas.releasePointerCapture(e.pointerId); });
+    // One pointer rotates (elevation from below the floor to overhead), two
+    // pinch-zoom; a tap shows the value under the finger, a double tap resets.
+    // touch-action: none (CSS) keeps the browser from scrolling instead.
+    this.pointers = new Map(); this.lastTap = 0;
+    const span = () => { const [a, b] = [...this.pointers.values()]; return Math.hypot(a.x - b.x, a.y - b.y) || 1; };
+    canvas.addEventListener('pointerdown', e => {
+      this.pointers.set(e.pointerId, {x: e.clientX, y: e.clientY}); canvas.setPointerCapture(e.pointerId); this.tip.style.display = 'none';
+      if (this.pointers.size === 1) this.drag = {x: e.clientX, y: e.clientY, yaw: this.yaw, elev: this.elev, time: Date.now(), moved: false};
+      else if (this.pointers.size === 2) { this.drag = null; this.pinch = {span: span(), zoom: this.zoom}; }
+    });
+    const release = e => {
+      const tap = this.drag && !this.drag.moved && Date.now() - this.drag.time < 300 && this.pointers.size === 1;
+      this.pointers.delete(e.pointerId); if (canvas.hasPointerCapture(e.pointerId)) canvas.releasePointerCapture(e.pointerId);
+      this.drag = null; if (this.pointers.size < 2) this.pinch = null;
+      if (tap && e.type === 'pointerup') {
+        if (Date.now() - this.lastTap < 350) { this.lastTap = 0; this.reset(); this.draw(); return; }
+        this.lastTap = Date.now();
+        if (e.pointerType !== 'mouse') this.hover(e);
+      }
+    };
+    canvas.addEventListener('pointerup', release); canvas.addEventListener('pointercancel', release);
     canvas.addEventListener('pointermove', e => {
+      if (this.pointers.has(e.pointerId)) this.pointers.set(e.pointerId, {x: e.clientX, y: e.clientY});
+      if (this.pinch && this.pointers.size === 2) {
+        this.zoom = Math.min(3, Math.max(.5, this.pinch.zoom * span() / this.pinch.span)); this.draw(); return;
+      }
       if (this.drag) {
+        if (Math.hypot(e.clientX - this.drag.x, e.clientY - this.drag.y) > 6) this.drag.moved = true;
+        if (!this.drag.moved) return;
         this.yaw = this.drag.yaw - (e.clientX - this.drag.x) * .01;
-        this.elev = Math.min(1.53, Math.max(.02, this.drag.elev + (e.clientY - this.drag.y) * .01));
+        this.elev = Math.min(1.53, Math.max(-1.53, this.drag.elev + (e.clientY - this.drag.y) * .01));
         this.draw(); return;
       }
-      this.hover(e);
+      if (e.pointerType === 'mouse') this.hover(e);
     });
-    canvas.addEventListener('pointerleave', () => { this.tip.style.display = 'none'; });
+    canvas.addEventListener('pointerleave', e => { if (e.pointerType === 'mouse') this.tip.style.display = 'none'; });
     canvas.addEventListener('wheel', e => { e.preventDefault(); this.zoom = Math.min(3, Math.max(.5, this.zoom * Math.exp(-e.deltaY * .0012))); this.draw(); }, {passive: false});
-    canvas.addEventListener('dblclick', () => { this.reset(); this.draw(); });
+    canvas.addEventListener('dblclick', e => { e.preventDefault(); });   // double taps/clicks reset through pointerup
     new ResizeObserver(() => this.draw()).observe(canvas.parentElement);
     charts.push(this);
   }
@@ -853,18 +889,35 @@ class Surface3D {
     const {xs, ys, z, lo, hi} = spec, nx = xs.length, ny = ys.length, Z = .65;
     const X = i => nx > 1 ? i / (nx - 1) * 2 - 1 : 0, Y = i => ny > 1 ? i / (ny - 1) * 2 - 1 : 0;
     const zn = v => hi > lo ? (v - lo) / (hi - lo) * 2 * Z - Z : 0;
-    // Fit the whole box (with room for tick labels) to the canvas at the current angle.
-    this.cx = 0; this.cy = 0; this.scale = 1;
-    let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
-    for (const a of [-1.3, 1.3]) for (const b of [-1.3, 1.3]) for (const c of [-Z, Z * 1.3]) {
-      const q = this.project(a, b, c); x0 = Math.min(x0, q[0]); x1 = Math.max(x1, q[0]); y0 = Math.min(y0, q[1]); y1 = Math.max(y1, q[1]);
+    // One scale for every angle: the box (with room for tick labels) fits the
+    // canvas at its widest and tallest views, so rotating or levelling it
+    // never zooms; only the centring follows the angle.
+    const extent = (yaw, elev) => {
+      const saved = [this.yaw, this.elev, this.cx, this.cy, this.scale];
+      this.yaw = yaw; this.elev = elev; this.cx = 0; this.cy = 0; this.scale = 1;
+      let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
+      for (const a of [-1.3, 1.3]) for (const b of [-1.3, 1.3]) for (const c of [-Z, Z * 1.3]) {
+        const q = this.project(a, b, c); x0 = Math.min(x0, q[0]); x1 = Math.max(x1, q[0]); y0 = Math.min(y0, q[1]); y1 = Math.max(y1, q[1]);
+      }
+      [this.yaw, this.elev, this.cx, this.cy, this.scale] = saved;
+      return [x0, x1, y0, y1];
+    };
+    if (!this.span) {
+      let width = 0, height = 0;
+      for (let i = 0; i < 24; i++) for (let j = -6; j <= 6; j++) {
+        const [x0, x1, y0, y1] = extent(i / 24 * 2 * Math.PI, j / 6 * 1.53); width = Math.max(width, x1 - x0); height = Math.max(height, y1 - y0);
+      }
+      this.span = [width, height];
     }
-    this.scale = Math.min((w - 40) / (x1 - x0), (h - 30) / (y1 - y0)) * this.zoom;
+    const [x0, x1, y0, y1] = extent(this.yaw, this.elev);
+    this.scale = Math.min((w - 40) / this.span[0], (h - 30) / this.span[1]) * this.zoom;
     this.cx = w / 2 - this.scale * (x0 + x1) / 2; this.cy = h / 2 - this.scale * (y0 + y1) / 2;
     const line = (a, b, color, width = 1) => { const p = this.project(...a), q = this.project(...b); ctx.strokeStyle = color; ctx.lineWidth = width; ctx.beginPath(); ctx.moveTo(p[0], p[1]); ctx.lineTo(q[0], q[1]); ctx.stroke(); };
     const label = (pt, text, align = 'center', color = muted, max = w * .3) => { const p = this.project(...pt); ctx.fillStyle = color; ctx.textAlign = align; ctx.textBaseline = 'middle'; ctx.fillText(fitText(ctx, text, max), p[0], p[1]); };
-    // Floor grid, then the vertical axis at the back corner.
-    for (let t = 0; t <= 4; t++) { const v = -1 + t / 2; line([v, -1, -Z], [v, 1, -Z], grid); line([-1, v, -Z], [1, v, -Z], grid); }
+    // Floor grid (under the surface, or over it when seen from below), then
+    // the vertical axis at the back corner.
+    const floor = () => { for (let t = 0; t <= 4; t++) { const v = -1 + t / 2; line([v, -1, -Z], [v, 1, -Z], grid); line([-1, v, -Z], [1, v, -Z], grid); } };
+    if (this.elev >= 0) floor();
     const corners = [[-1, -1], [1, -1], [1, 1], [-1, 1]].map(([a, b]) => ({a, b, d: this.project(a, b, -Z)[2]}));
     const back = corners.reduce((m, k) => k.d > m.d ? k : m), front = corners.reduce((m, k) => k.d < m.d ? k : m);
     line([back.a, back.b, -Z], [back.a, back.b, Z], grid, 1.5);
@@ -897,6 +950,7 @@ class Surface3D {
       ctx.beginPath(); ctx.moveTo(it.P[0][0], it.P[0][1]); for (let k = 1; k < 4; k++) ctx.lineTo(it.P[k][0], it.P[k][1]); ctx.closePath();
       ctx.fillStyle = col; ctx.fill(); ctx.strokeStyle = col; ctx.lineWidth = .7; ctx.stroke();
     }
+    if (this.elev < 0) { ctx.save(); ctx.globalAlpha = .6; floor(); ctx.restore(); }
     for (let yi = 0; yi < ny; yi++) for (let xi = 0; xi < nx; xi++) { const v = V[yi][xi]; if (v) { const P = this.project(v[0], v[1], v[2]); this.verts.push({sx: P[0], sy: P[1], d: P[2], x: xs[xi], y: ys[yi], z: v[3]}); } }
     // Axis ticks along the two front floor edges.
     const tickText = (values, labels, t) => labels ? labels[Math.round(t * (labels.length - 1))] : fmt(values[0] + (values[values.length - 1] - values[0]) * t, 3);
@@ -1045,7 +1099,46 @@ function updateOpCount() {
   for (const g of OPTIONS.groups) if (groups.includes(g.id)) g.ops.forEach(o => { if (!excluded.includes(o)) set.add(o); });
   $$('#opGroups .group').forEach(div => div.querySelector('.chips').style.opacity = div.querySelector('input').checked ? 1 : .45);
   $('#opCount').textContent = `${set.size} operators enabled`;
+  renderIslandRoles();
 }
+// Island roles: one dropdown per island after the first.  The operator-family
+// roles follow the ticked groups (arithmetic + one group each).  Choices are
+// remembered per island position, so shrinking and regrowing the island
+// count keeps them; the server validates them again.
+function roleChoices() {
+  const base = OPTIONS ? OPTIONS.roles : [{id: 'auto', name: 'Auto', description: 'learns its niche from the data'}];
+  if (!OPTIONS) return base;
+  const {groups, excluded} = operatorForm();
+  const enabled = g => groups.includes(g.id) && g.ops.some(o => !excluded.includes(o));
+  const arithmetic = enabled(OPTIONS.groups.find(g => g.id === '1') || {id: '', ops: []});
+  const families = OPTIONS.groups.filter(enabled).map(g => {
+    const what = g.id === '1' || !arithmetic ? g.name.toLowerCase() : 'arithmetic + ' + g.name.toLowerCase();
+    return {id: 'family:' + g.id, name: 'Operators: ' + g.name.toLowerCase(), description: `builds new structure from ${what} operators only`};
+  });
+  return [...base, ...families];
+}
+function renderIslandRoles() {
+  const box = $('#islandRoles'); if (!box) return;
+  const n = Math.max(1, Math.floor(+$('#islands').value || 1)), stored = store.get('islandRoles', []), choices = roleChoices();
+  box.innerHTML = '';
+  for (let i = 2; i <= n; i++) {
+    const value = choices.some(c => c.id === stored[i - 2]) ? stored[i - 2] : 'auto';
+    const div = document.createElement('div');
+    div.innerHTML = `<label for="islandRole${i}">Island ${i}</label><select id="islandRole${i}" data-island-role="${i - 2}">${choices.map(c => `<option value="${esc(c.id)}" ${c.id === value ? 'selected' : ''}>${esc(c.name)}</option>`).join('')}</select><span class="hint"></span>`;
+    box.appendChild(div);
+  }
+  describeIslandRoles();
+}
+function describeIslandRoles() {
+  const choices = roleChoices();
+  $$('#islandRoles select').forEach(sel => { const c = choices.find(x => x.id === sel.value); sel.nextElementSibling.textContent = c ? c.description : ''; });
+}
+function islandRoleValues() { return $$('#islandRoles select').map(sel => sel.value); }
+$('#islandRoles').addEventListener('change', e => {
+  const sel = e.target.closest('select[data-island-role]'); if (!sel) return;
+  const stored = store.get('islandRoles', []); stored[+sel.dataset.islandRole] = sel.value; store.set('islandRoles', stored);
+  describeIslandRoles();
+});
 function renderAdvanced() {
   const saved = store.get('advanced', {});
   const box = $('#advancedFields'); box.innerHTML = '';
@@ -1072,6 +1165,8 @@ function saveForm() {
   store.set('form', v);
   if (OPTIONS) { store.set('ops', operatorForm()); store.set('advanced', advancedValues()); }
   $$('.islandOnly').forEach(e => e.classList.toggle('hidden', +$('#islands').value <= 1));
+  $$('.roleOnly').forEach(e => e.classList.toggle('hidden', +$('#islands').value <= 1 || !$('#roles').checked));
+  if ($$('#islandRoles select').length !== Math.max(0, Math.floor(+$('#islands').value || 1) - 1)) renderIslandRoles();
   const stageMode = $('#stageMode').value;
   $$('.stageOnly').forEach(e => e.classList.toggle('hidden', stageMode === 'off'));
   $$('.stageFitness').forEach(e => e.classList.toggle('hidden', stageMode !== 'fitness' && stageMode !== 'both'));
@@ -1195,7 +1290,7 @@ function collectForm() {
       migration_interval: +$('#migrationInterval').value, migrants: +$('#migrants').value,
       stage_mode: $('#stageMode').value, stages: +$('#stages').value, stage_interval: +$('#stageInterval').value,
       stage_quantile: +$('#stageQuantile').value, stage_age_gap: +$('#stageAgeGap').value, stage_schedule: $('#stageSchedule').value,
-      roles: $('#roles').checked, role_interval: +$('#roleInterval').value},
+      roles: $('#roles').checked, role_interval: +$('#roleInterval').value, island_roles: islandRoleValues()},
     run: {max_generations: $('#maxGenerations').value, population: $('#population').value, seed: $('#seed').value, workers: $('#workers').value,
       adf_mode: $('#adf').checked ? $('#adfMode').value : 'off'},
     advanced: advancedValues(),
@@ -1318,8 +1413,9 @@ function drawPareto() {
     x: {title: 'Model size (MDL bits)'}, y: {title: log ? 'Training loss (log)' : 'Training loss', log}, layers,
     tooltip: (d, L) => `<div class="t">${L.kind === 'best' ? 'Best so far' : L.kind === 'archive' ? 'Archive model' : 'Population member'}</div>
       loss ${fmt(d.loss)} · ${fmt(d.bits, 4)} bits · ${d.nodes} nodes · age ${d.age}<div class="hint">${esc(d.origin)}${d.cell ? ' · ' + esc(d.cell) : d.island != null && snap.archive.some(a => a.island > 0) ? ' · island ' + (d.island + 1) : ''}</div>
+      ${d.path && d.path.length > 1 ? `<div class="hint">path: ${esc(d.path.join(' → '))}</div>` : ''}
       ${d.equation ? `<div class="eq" style="margin-top:4px">${esc(d.equation)}</div>` : ''}`,
-    onClick: (d) => { if (d.equation) { T.pinned = d; const p = $('#pinned'); p.classList.remove('hidden'); p.innerHTML = `${esc(d.equation)}<div class="hint" style="margin-top:4px">loss ${fmt(d.loss)} · ${fmt(d.bits, 4)} bits · ${d.nodes} nodes</div>`; } },
+    onClick: (d) => { if (d.equation) { T.pinned = d; const p = $('#pinned'); p.classList.remove('hidden'); p.innerHTML = `${esc(d.equation)}<div class="hint" style="margin-top:4px">loss ${fmt(d.loss)} · ${fmt(d.bits, 4)} bits · ${d.nodes} nodes</div>${d.path && d.path.length ? `<div class="hint">path: ${esc(d.path.join(' → '))}</div>` : ''}`; } },
   });
 }
 function drawHistory() {
@@ -1446,10 +1542,51 @@ async function selectModel(index) {
     $('#detailOutputs').innerHTML = `<thead><tr><th>Output</th><th class="num">Training loss</th><th class="num">Validation loss</th></tr></thead><tbody>${d.per_output.map(o => `<tr><td>${esc(o.name)}</td><td class="num">${fmt(o.train_loss)}</td><td class="num">${fmt(o.validation_loss)}</td></tr>`).join('')}</tbody>`;
     const url = URL.createObjectURL(new Blob([d.svg], {type: 'image/svg+xml'}));
     $('#treeBox').innerHTML = `<img alt="Expression tree" src="${url}">`;
+    renderLineage(d.history || []);
     defaultAxes(); syncAxisControls();
     loadMath(index);
     await Promise.all([loadFit(), loadExplore(), loadGenDefaults()]);
   } catch (e) { toast(e.message, true); }
+}
+// Model history (afpo's main-line timeline): one row per record, the place
+// chip coloured by the island's role.
+const ROLE_COLORS = {simplifier: '--s3', explorer: '--s2', refiner: '--s1', auto: '--muted', generalist: '--text-2'};
+function lineagePlace(p) {
+  if (!p || p.island == null) return {text: p ? 'several islands' : '', color: '--border'};
+  const role = p.role || '';
+  return {text: `island ${p.island + 1}${p.stage ? ' · stage ' + (p.stage + 1) : ''}${role ? ' · ' + role : ''}`,
+          color: ROLE_COLORS[role] || (role.startsWith('family:') ? '--warn' : '--border')};
+}
+function lineageChange(r) {
+  const pair = v => Array.isArray(v) ? v : [null, v], parts = [];
+  const [b0, b1] = pair(r.bits), [l0, l1] = pair(r.loss);
+  if (b1 != null) parts.push(b0 == null || b0 === b1 ? `${fmt(b1, 4)} bits` : `${fmt(b0, 4)} → ${fmt(b1, 4)} bits`);
+  if (l1 != null) parts.push(l0 == null || l0 === l1 ? `loss ${fmt(l1)}` : `loss ${fmt(l0)} → ${fmt(l1)}`);
+  return parts.length ? `<span class="hint">${parts.join(' · ')}</span>` : '';
+}
+function renderLineage(history) {
+  const box = $('#lineageView');
+  if (!history.length) { box.innerHTML = '<span class="hint">No history recorded (models from runs before histories existed).</span>'; return; }
+  box.innerHTML = history.map(r => {
+    const span = r.start != null ? (r.end != null && r.end !== r.start ? `gen ${r.start}–${r.end}` : `gen ${r.start}`) : r.generation != null ? `gen ${r.generation}` : r.event === 'snapped' ? 'final' : 'gen ?';
+    let place = lineagePlace(r), what = '';
+    if (r.event === 'born') what = `born as ${esc(r.how || 'seed')}`;
+    else if (r.event === 'variation') {
+      const kinds = Object.entries(r.kinds || {}).sort((a, b) => b[1] - a[1]).map(([k, n]) => `${k} ${n}`).join(', ');
+      what = `${r.count} variation${r.count === 1 ? '' : 's'}${kinds ? ` <span class="hint">${esc(kinds)}</span>` : ''}${r.merged ? ' <span class="hint">(older records merged)</span>' : ''}`;
+    } else if (r.event === 'crossover') {
+      const partner = r.partner_from ? lineagePlace(r.partner_from).text : '';
+      what = `crossover with #${esc(r.partner)}${partner ? ` <span class="hint">last made on ${esc(partner)}</span>` : ''}`;
+    } else if (r.event === 'migrated' || r.event === 'promoted') {
+      place = lineagePlace(r.to);
+      what = `${r.event} from ${esc(lineagePlace(r.from).text)}${r.how ? ` <span class="hint">${esc(r.how)}</span>` : ''}`;
+    } else if (r.event === 'snapped') {
+      const values = (r.values || []).slice(0, 6).map(([a, b]) => `${fmt(a, 6)} → ${fmt(b, 6)}`).join(', ');
+      what = `snapped ${r.constants} constant${r.constants === 1 ? '' : 's'}${values ? ` <span class="hint">${esc(values)}</span>` : ''}${r.changed ? ' and simplified' : ''}`;
+      place = {text: '', color: '--border'};
+    } else what = esc(JSON.stringify(r));
+    return `<span class="gen">${span}</span><span class="place" style="--role: var(${place.color})">${esc(place.text)}</span><span class="what">${what} ${lineageChange(r)}</span>`;
+  }).join('');
 }
 // Rendered equation: KaTeX from the CDN when reachable, else the browser's
 // native MathML (converted by SymPy on the server), so it also works offline.
@@ -1490,7 +1627,13 @@ function renderMath() {
     if (!shown) shown = `<math display="block"><mi${o.name.length > 1 ? ' mathvariant="normal"' : ''}>${esc(o.name)}</mi><mo>=</mo>${form.mathml}</math>`;
     const a = o.agreement;
     const note = mode === 'raw' && a ? `<div class="hint">Matches the model on ${(100 * a.defined).toFixed(1)}% of training rows${a.gap == null ? '' : `, max difference ${fmt(a.gap, 2)} of the output range`}.</div>` : '';
-    return `<div class="math">${d.outputs.length > 1 ? `<div class="name">${esc(o.name)}</div>` : ''}${shown}${note}</div>`;
+    // Classifier: after the last score equation, how the scores become a class.
+    const decision = o.decision ? `<div class="name" style="margin-top:8px">${esc(o.output || o.name)}: predicted class</div>` + o.decision.latex.map((line, i) => {
+      let html = null;
+      if (MATH.katex) { try { html = MATH.katex.renderToString(line, {displayMode: true, throwOnError: true}); } catch (e) { html = null; } }
+      return html || `<div class="mono" style="margin:6px 0">${esc(o.decision.text[i] || line)}</div>`;
+    }).join('') : '';
+    return `<div class="math">${d.outputs.length > 1 ? `<div class="name">${esc(o.name)}</div>` : ''}${shown}${note}${decision}</div>`;
   }).join('') + (mode === 'exact' ? '<div class="hint">Exact: afpo\'s guards as evaluated (the per-node ±1e12 clamp is left out).</div>' : '');
 }
 $$('#mathMode button').forEach(b => b.onclick = () => {
@@ -1501,7 +1644,7 @@ $$('#mathMode button').forEach(b => b.onclick = () => {
 $('#mathCopy').onclick = async () => {
   const d = MATH.data;
   if (!d || !d.available) return;
-  const text = d.outputs.filter(o => o[MATH.mode].latex).map(o => `${o.name_latex} = ${o[MATH.mode].latex}`).join('\n');
+  const text = d.outputs.filter(o => o[MATH.mode].latex).map(o => [`${o.name_latex} = ${o[MATH.mode].latex}`, ...(o.decision ? o.decision.latex : [])].join('\n')).join('\n');
   try { await navigator.clipboard.writeText(text); toast('LaTeX copied'); } catch (e) { toast('Copy failed: ' + e.message, true); }
 };
 function fillOutputSelect(sel, names, keep) {
@@ -1685,7 +1828,7 @@ async function loadExplore() {
   $('#exLegend').innerHTML = pts.length ? `<span><i class="sw" style="background:var(--s2)"></i>Training rows at their actual value</span>` : '';
   ex3d.set({xs, ys, z, lo, hi, xlabel: xName, ylabel: yName, zlabel: outLabel, xlabels: xc ? r.x.values.map(String) : null, ylabels: yc ? r.y.values.map(String) : null,
     xspan: [xs[0], xs[xs.length - 1]], yspan: [ys[0], ys[ys.length - 1]], points: pts, tooltip: valueTip});
-  $('#exHint').textContent = 'Drag to rotate · scroll to zoom · double-click to reset the view. Training rows outside the plotted ranges are hidden.';
+  $('#exHint').textContent = 'Drag to rotate (down to look from below) · scroll or pinch to zoom · tap for a value · double-click or double-tap to reset. Training rows outside the plotted ranges are hidden.';
 }
 $$('#exMode button').forEach(b => b.onclick = () => {
   EX.mode = b.dataset.mode;
