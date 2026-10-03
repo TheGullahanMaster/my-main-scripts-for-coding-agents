@@ -2,7 +2,7 @@
 """Interactive AFPO/NSGA-II symbolic regression.
 
 Only numpy and pandas are required; matplotlib is optional and only used by
-the exported model.  Start it with ``python afpo_symbolic_regression.py``.
+the exported model.  Start it with ``python afpo.py``.
 Use ``--max-generations N`` for a bounded unattended run (useful in CI).
 
 Speed: with Cython and a C compiler installed, constant fitting uses the
@@ -1756,7 +1756,8 @@ class PosteriorParticlePopulation:
 
     def _resample(self):
         positions=(np.arange(len(self.particles))+rng.random())/len(self.particles)
-        indices=np.searchsorted(np.cumsum(self.weights),positions,side="right")
+        # A cumulative sum that rounds to just below 1 would index one past the end.
+        indices=np.minimum(np.searchsorted(np.cumsum(self.weights),positions,side="right"),len(self.particles)-1)
         self.particles=[self.particles[int(index)].clone() for index in indices]
         self.weights=np.full(len(self.particles),1.0/len(self.particles)); self.resample_count+=1
 
@@ -2057,7 +2058,7 @@ def bayesian_banks_from_snapshot(items):
         payload=items["banks"]; result=PerOutputBayesianBanks(payload[0]["ops"],payload[0]["n_features"],len(payload),payload[0]["particles"]["capacity"])
         result.head_groups=tuple(tuple(group) for group in items["head_groups"]); result.head_to_bank={head:index for index,group in enumerate(result.head_groups) for head in group}; result.banks=[BayesianEquationGenerator(data["ops"],data["n_features"]) for data in payload]
     for target,data in zip(result.banks,payload):
-        for key in ("exploration","pressure_exploration","op_alpha","feature_alpha","op_draw","feature_draw","entropy","depth_alpha","constant_abs_sum","constant_weight","constant_scale"):
+        for key in ("base_exploration","decay","floor","temperature","exploration","pressure_exploration","op_alpha","feature_alpha","op_draw","feature_draw","entropy","depth_alpha","constant_abs_sum","constant_weight","constant_scale"):
             if key in data: setattr(target,key,data[key])
         target.particles=PosteriorParticlePopulation.from_snapshot(data["particles"])
     return result
@@ -2614,8 +2615,9 @@ def backprop_mutate(t, ops, max_nodes, max_depth, adfs=None):
     if not np.isfinite(sse) or sse>=own*(1-1e-6): return t
     candidate=trees[index]
     tolerance=1e-9*max(abs(slope),1.)
-    if abs(slope-1.)>tolerance: candidate=("*",("c",slope),candidate)
-    if abs(intercept)>1e-9*(abs(slope)+1.)*max(spread,1.): candidate=("+",candidate,("c",intercept))
+    # Only wrap with operators the run selected, or the child leaves its grammar.
+    if abs(slope-1.)>tolerance and "*" in ops: candidate=("*",("c",slope),candidate)
+    if abs(intercept)>1e-9*(abs(slope)+1.)*max(spread,1.) and "+" in ops: candidate=("+",candidate,("c",intercept))
     for replacement in (candidate,trees[index]):
         child=simplify_tree(replace_subtree(t,path,replacement))
         if child!=t and node_size(child)<=max_nodes and node_depth(child)<=max_depth: return child
@@ -3269,7 +3271,8 @@ def affine(pred, y):
     # The bound branch reads pred directly, so only cache when it cannot fire.
     if np.ndim(y)==1 and len(y) and len(pred)==len(y) and np.all(pred==float(np.mean(pred))):
         y=np.asarray(y,dtype=float)
-        key=y.tobytes() if len(y)<=4096 else array_digest(y)
+        # The robust location depends on the loss, so the loss settings are part of the key.
+        key=(LOSS_MODE,ROBUST_LOSS_DELTA,y.tobytes() if len(y)<=4096 else array_digest(y))
         cached=_CONSTANT_AFFINE_CACHE.get(key)
         if cached is not None: return cached
         result=_affine(pred,y)
@@ -3312,7 +3315,7 @@ def _affine(pred, y):
         # It agrees to round-off; rare degenerate/bounded fits fall through.
         core=compiled_fitter()
         if core is not None:
-            fitted=core.robust_affine(np.ascontiguousarray(pred,dtype=float),np.ascontiguousarray(y,dtype=float),centre,spread,1.5*target_scale(y),bound)
+            fitted=core.robust_affine(np.ascontiguousarray(pred,dtype=float),np.ascontiguousarray(y,dtype=float),centre,spread,loss_delta()*target_scale(y),bound)
             if fitted is not None: return fitted
     u=(pred-centre)/spread; A=None
     def weighted_fit(weights):
@@ -4354,7 +4357,7 @@ def save_checkpoint(path, generation, population, bayes, archive, state):
     temporary.write_text(json.dumps(wrapper,sort_keys=True,separators=(",",":"))+"\n")
     temporary.replace(path)
 
-def load_checkpoint(path, allow_unsafe_pickle=True):
+def load_checkpoint(path, allow_unsafe_pickle=False):
     global _NEXT_LINEAGE_ID
     source=Path(path)
     try:
@@ -4481,9 +4484,12 @@ def encode(df, types, fitted_maps=None):
     maps["__afpo_numeric_fills__"]=numeric_fills
     X=np.column_stack(features)
     layout=(fitted_maps or {}).get(SEQUENCE_LAYOUT_KEY) or build_sequence_layout(names,SEQUENCE_GROUP_REQUEST)
+    # Assigned even when None: a layout left over from an earlier run in this
+    # process would otherwise add seqsum/seqprod to a run without sequences.
+    global SEQUENCE_LAYOUT
+    SEQUENCE_LAYOUT=layout
     if layout is not None:
-        global SEQUENCE_LAYOUT
-        SEQUENCE_LAYOUT=layout; maps[SEQUENCE_LAYOUT_KEY]=layout
+        maps[SEQUENCE_LAYOUT_KEY]=layout
         X=sequence_augment(X,layout); names=names+sequence_feature_names(layout)
     return X,np.column_stack(outputs),names,output_names,categorical,maps
 
@@ -5458,7 +5464,7 @@ def transform(df):
         offset+=width
     return X if SEQUENCE_LAYOUT is None else sequence_augment(X,SEQUENCE_LAYOUT)
 def predict_frame(df):
-    X=transform(df); raw=np.column_stack([a*ev(t,X)+b for t,(a,b) in zip(MODEL['trees'],MODEL['scales'])]); out=pd.DataFrame(index=df.index); head=0
+    X=transform(df); raw=np.column_stack([clean(a*ev(t,X)+b) for t,(a,b) in zip(MODEL['trees'],MODEL['scales'])]); out=pd.DataFrame(index=df.index); head=0
     for i,n in enumerate(MODEL['outputs']):
         labels=MODEL['cats'][i]; count=len(labels) if labels is not None and len(labels)>2 else 1
         if labels is not None and count>1:
@@ -5660,16 +5666,6 @@ if __name__=='__main__': main()
             expected[name]=([cats[index][int(value)] for value in decoded[:,index]] if cats[index] else decoded[:,index])
         fixture.loc[:,input_columns].to_csv("best_model_fixture.csv",index=False)
         expected.to_csv("best_model_fixture_predictions.csv",index=False)
-
-def snapshot_evolution_state(state, portfolio, cases, semantic_qd, structural_qd, qd_controller, best_models, pressure, library=None, adf_registry=None, budget=None):
-    state["mutation_portfolio"]=portfolio.snapshot()
-    state["case_population"]=cases.snapshot()
-    state["quality_diversity"]=qd_snapshot(semantic_qd,structural_qd,qd_controller)
-    state["best_model"]=best_models.snapshot()
-    state["dynamic_pressure"]=pressure.snapshot()
-    if library is not None: state["fragment_library"]=library.snapshot()
-    if budget is not None: state["evaluation_budget"]=budget.snapshot()
-    if adf_registry is not None: state["adf_registry"]=adf_registry.snapshot()
 
 @dataclass
 class IslandRuntime:
@@ -6236,6 +6232,15 @@ class GracefulStop:
         if self.previous is not None: signal.signal(signal.SIGINT,self.previous)
         return False
 
+def reset_run_caches():
+    """Forget module-level results that depend on run settings (loss, numeric
+    guard, interpolation check, units, nesting rules) rather than on the trees
+    and data alone.  A fresh process starts empty; benchmarks and tests run
+    several configurations in one process, which then reused the previous
+    configuration's particle scores, fragment fits and constant readouts."""
+    for cache in (_PARTICLE_SCORE_CACHE,_FRAGMENT_FIT_CACHE,_CONSTANT_AFFINE_CACHE): cache.clear()
+    INVALID_DIAGNOSTICS.clear()
+
 def synchronize_model_ages(models, generation):
     """Age archived copies by elapsed generations, not by how often they are drawn."""
     for model in models:
@@ -6587,6 +6592,7 @@ def evolve_cells(cells, step, workers, evaluator=None, shared=None):
     if evaluator is not None: evaluator.begin_generation()
 
 def resume_main(args):
+    reset_run_caches()
     generation,pop,bayes,archive,state=load_checkpoint(args.resume,args.allow_unsafe_pickle)
     # Island snapshots, top-up proposals and final ADF refresh all need
     # per-output banks; a single shared generator failed at the first save.
@@ -6927,6 +6933,7 @@ def train_from_setup(args, setup, choose_model=None):
 
     ``choose_model(labels, choices, evaluation)`` returns the index of the model
     to save; the default asks at the terminal."""
+    reset_run_caches()
     global EQUIVALENCE_COLLAPSE,RESIDUAL_ARCHIVE,QD_PARENT_CHOICE,SCALE_BALANCED_SELECTION,GUARD_EXPLOIT_CHECK
     EQUIVALENCE_COLLAPSE=getattr(args,"equivalence_collapse","on")=="on"; EQUIVALENCE_STATS["children_redrawn"]=0
     GUARD_EXPLOIT_CHECK=getattr(args,"numeric_guard_check","on")=="on"

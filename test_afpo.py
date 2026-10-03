@@ -592,8 +592,9 @@ class CompiledFitterTests(unittest.TestCase):
             tree = (op, *[("x", k) for k in range(arity)])
             program = a._compiled_program(a._FlatTree(tree), self.core, X.shape[1])
             want, got = a.evaluate(tree, X), self.core.evaluate(*program, [], X)
-            # tanh comes from libm here and numpy's own kernel there: last bit only.
-            if op == "tanh": np.testing.assert_allclose(got, want, rtol=1e-15); continue
+            # Transcendental operators (and pow-based cube) come from libm here and
+            # numpy's own kernels there: they may differ in the last bit only.
+            if op in self.core.LIBM_OPERATORS: np.testing.assert_allclose(got, want, rtol=4e-16, atol=0, err_msg=op); continue
             same = (want == got) & (np.signbit(want) == np.signbit(got)) | (np.isnan(want) & np.isnan(got))
             self.assertTrue(same.all(), f"{op}: numpy {want[~same]} compiled {got[~same]}")
 
