@@ -299,7 +299,7 @@ def main():
     parser.add_argument("--operator-groups", default="1,2,3,7", help="afpo operator group IDs (default: arithmetic, powers, exp/log, conditionals)")
     parser.add_argument("--nodes", type=int, default=21)
     parser.add_argument("--depth", type=int, default=5)
-    parser.add_argument("--workers", type=int, default=1, help="afpo scoring processes per run (1 keeps runs deterministic)")
+    parser.add_argument("--workers", type=int, default=1, help="afpo scoring processes per run (results are identical for any count; 1 avoids nesting process pools under --jobs)")
     parser.add_argument("--jobs", type=int, default=1, help="Runs executed in parallel processes (results are identical; wall-clock timings get noisier)")
     parser.add_argument("--strong-r2", type=float, default=.99)
     parser.add_argument("--quick", action="store_true", help="Smoke-sized matrix: 12 generations, population 48, one seed")

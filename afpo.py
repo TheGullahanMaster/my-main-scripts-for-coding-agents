@@ -1377,7 +1377,12 @@ def scan_jump_constants(flat, start, X, y, scale, fit_readout=True, program=None
     ``program`` (from _compiled_program) runs the scan in the compiled kernel."""
     slots=jump_constant_slots(flat)
     if not slots: return None
-    if len(slots)>JUMP_SCAN_MAX_CONSTANTS: slots=rng.sample(slots,JUMP_SCAN_MAX_CONSTANTS)
+    if len(slots)>JUMP_SCAN_MAX_CONSTANTS:
+        # Drawn from the tree itself, not the run's random stream: scoring runs
+        # in --workers processes whose stream copies diverge with scheduling,
+        # so a stream draw here made parallel runs irreproducible.
+        seed=hashlib.blake2b(repr((flat.kind,flat.payload,[float(value) for value in start])).encode(),digest_size=8).digest()
+        slots=random.Random(int.from_bytes(seed,"little")).sample(slots,JUMP_SCAN_MAX_CONSTANTS)
     JUMP_SCAN_STATS["scans"]+=1
     current=np.array(start,float)
     core=compiled_fitter() if program is not None else None
@@ -6999,7 +7004,7 @@ def stop_rule_reached(args, started, islands):
     return False
 
 def build_arg_parser():
-    ap=argparse.ArgumentParser(); ap.add_argument("--max-generations",type=int,default=0); ap.add_argument("--population",type=int,default=160); ap.add_argument("--seed",type=int); ap.add_argument("--workers",type=int,default=0,help="Model-scoring processes; 0=auto, 1=serial (default: 0)"); ap.add_argument("--adf-mode",choices=("off","flat","nested"),default="nested",help="ADF experiment mode; nested is v2, flat is the v1-style ablation, off disables ADFs")
+    ap=argparse.ArgumentParser(); ap.add_argument("--max-generations",type=int,default=0); ap.add_argument("--population",type=int,default=160); ap.add_argument("--seed",type=int); ap.add_argument("--workers",type=int,default=0,help="Model-scoring processes; 0=auto, 1=serial.  Results are identical for any count (default: 0)"); ap.add_argument("--adf-mode",choices=("off","flat","nested"),default="nested",help="ADF experiment mode; nested is v2, flat is the v1-style ablation, off disables ADFs")
     ap.add_argument("--bayesian-proposal-rate",type=float,default=.25,help="Fraction of offspring drawn from the Bayesian equation generator (0..1)")
     ap.add_argument("--bayesian-mode",choices=("off","grammar","fixed","adaptive"),default="adaptive",help="Bayesian injection policy: off, grammar-only, fixed particle mix, or adaptive particle mix")
     ap.add_argument("--crossover-rate",type=float,default=.35,help="Fraction of non-Bayesian offspring made by subtree crossover (0..1)")
