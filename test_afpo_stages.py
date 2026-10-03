@@ -7,6 +7,7 @@ import io
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
@@ -283,6 +284,185 @@ class RoleTests(unittest.TestCase):
                  "migration_interval": 0, "migrants_per_island": 0, "val_path": "0", "validation_percent": None, "metadata": {},
                  "roles": {"enabled": True}}
         with contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(ValueError, "at least two islands"):
+            a.train_from_setup(args, setup)
+
+
+class PresetRoleTests(unittest.TestCase):
+    """Fixed, user-chosen island roles beside the self-organising "auto" ones."""
+    OPS = ["+", "-", "*", "square", "sin", "exp"]
+
+    def setUp(self):
+        # train_from_setup sets module settings (the loss noise floor, ...);
+        # restore them so later tests see the import-time values.
+        saved = {name: value for name, value in vars(a).items()
+                 if name.isupper() and isinstance(value, (bool, int, float, str, tuple, frozenset, type(None)))}
+        self.addCleanup(lambda: vars(a).update(saved))
+        r = np.random.default_rng(3)
+        self.X = r.uniform(-2, 2, (60, 1)); self.Y = np.where(self.X > 0, self.X ** 2, -self.X)
+        self.cats = [None]
+        self.ev = a.ModelEvaluator(1, {"train": (self.X, self.Y)}, True, self.cats, a.compile_constraints(), ["y0"])
+        self.addCleanup(self.ev.close)
+
+    def cells(self, islands):
+        cells = []
+        for index in range(islands):
+            cell = island(self.X, self.cats, self.OPS, index=index); cell.island_index, cell.stage = index, 0
+            cells.append(cell)
+        return cells
+
+    def test_role_choices_follow_the_selected_operator_groups(self):
+        choices = a.island_role_choices(self.OPS)
+        for role in ("auto", "generalist", "simplifier", "explorer", "refiner", "family:1", "family:2", "family:3", "family:4"):
+            self.assertIn(role, choices)
+        self.assertNotIn("family:7", choices)                         # no comparison operators selected
+        self.assertEqual(a.family_role_operators("family:4", self.OPS), ["+", "-", "*", "sin"])
+
+    def test_validation(self):
+        self.assertEqual(a.validate_island_roles([], 4, self.OPS), ["auto"] * 3)
+        self.assertEqual(a.validate_island_roles(["simplifier", " auto", "family:3"], 4, self.OPS), ["simplifier", "auto", "family:3"])
+        with self.assertRaisesRegex(ValueError, "one entry per island"):
+            a.validate_island_roles(["auto"], 4, self.OPS)
+        with self.assertRaisesRegex(ValueError, "Unknown island role"):
+            a.validate_island_roles(["auto", "wizard", "auto"], 4, self.OPS)
+        with self.assertRaisesRegex(ValueError, "Unknown island role"):
+            a.validate_island_roles(["family:7", "auto", "auto"], 4, self.OPS)
+
+    def test_assignment_spreads_auto_islands_and_applies_presets(self):
+        cells = self.cells(5)
+        a.assign_role_parameters(cells, 5, .35, .25, 20, ["auto", "simplifier", "auto", "family:3"], self.OPS)
+        self.assertEqual(cells[0].role, {})
+        self.assertEqual([a.role_kind(c) for c in cells], ["generalist", "auto", "simplifier", "auto", "family:3"])
+        self.assertEqual((cells[1].role["params"]["t"], cells[3].role["params"]["t"]), (0., 1.))   # spread over auto islands only
+        simplifier = cells[2].role["params"]
+        self.assertEqual(simplifier["nodes"], 12); self.assertTrue(simplifier["gather_migrants"])
+        self.assertEqual(a.cell_role_settings(cells[4]), {"ops": ["+", "-", "*", "exp"]})
+        self.assertIsNone(a.cell_role_settings(cells[1])); self.assertIsNone(a.cell_role_settings(cells[0]))
+
+    def test_role_updates_leave_fixed_roles_alone(self):
+        cells = self.cells(3)
+        a.assign_role_parameters(cells, 3, .35, .25, 15, ["auto", "refiner"], self.OPS)
+        for cell in cells:
+            m = model(("square", X0)); a.assess(m, self.X, self.Y, True, self.cats); cell.best_models.model = m
+        config = {"count": 3, "stages": a.stage_config(), "roles": a.role_config(True, retire_after=1, assignments=["auto", "refiner"])}
+        before = dict(cells[2].role["params"])
+        for _ in range(3):
+            a.update_roles(cells, config, 10, X=self.X, Y=self.Y, cats=self.cats, crossover_rate=.35, bayesian_proposal_rate=.25, nodes=15)
+        self.assertIn("case_weights", cells[1].role)
+        self.assertNotIn("case_weights", cells[2].role); self.assertNotIn("stale", cells[2].role)
+        self.assertEqual(cells[2].role["params"], before)
+        self.assertIn("contribution", cells[2].role)
+        self.assertEqual(config["roles"]["retirements"], 3)          # only the auto island is ever retired
+
+    def test_simplifier_gathers_every_islands_elites(self):
+        cells = self.cells(4)
+        a.assign_role_parameters(cells, 4, .35, .25, 15, ["auto", "simplifier", "auto"], self.OPS)
+        for cell in cells: advance(cell, 0, self.X, self.Y, self.cats, self.OPS, self.ev)
+        a.migrate_islands(cells, 1, X=self.X, nsga_normalization="intercept", parsimony_quality_tolerance=.01, evaluator=self.ev)
+        arrived = [m for m in cells[2].population if m.origin == "island_migrant"]
+        ring = [m for m in cells[3].population if m.origin == "island_migrant"]
+        self.assertLessEqual(len(ring), 1)
+        self.assertGreaterEqual(len(arrived), 1)
+        self.assertEqual(len(cells[2].population), cells[2].population_size)
+        self.assertEqual(len({id(m) for cell in cells for m in cell.population}), sum(len(cell.population) for cell in cells))
+
+    def test_prune_always_shrinks_and_neutral_shrink_is_accepted(self):
+        a.rng.seed(1)
+        tree = ("+", ("sin", ("*", X0, ("c", 2.))), ("square", ("+", X0, ("c", 1.))))
+        for _ in range(50):
+            self.assertLess(a.node_size(a.prune_mutate(tree)), a.node_size(tree))
+        dead = ("abs", ("square", X0))                                # abs of a square changes nothing
+        portfolio = a.MutationPortfolio(); portfolio.bias = {kind: 0. for kind in portfolio.weights}; portfolio.bias["shrink"] = 1.
+        child, kind, _ = a.semantic_mutate(dead, self.X, portfolio, 1, self.OPS, 15, 4)
+        self.assertEqual((child, kind), (dead, None))                # the default guard rejects an unchanged output
+        child, kind, _ = a.semantic_mutate(dead, self.X, portfolio, 1, self.OPS, 15, 4, neutral_shrink=True)
+        self.assertEqual((child, kind), (("square", X0), "shrink"))
+
+    def test_portfolio_bias_steers_and_records_role_only_kinds(self):
+        portfolio = a.MutationPortfolio(); portfolio.bias = {kind: 0. for kind in portfolio.weights}; portfolio.bias["prune"] = 1.
+        self.assertEqual({portfolio.choose() for _ in range(20)}, {"prune"})
+        portfolio.record("prune", True)
+        self.assertEqual((portfolio.tries["prune"], portfolio.wins["prune"]), (1, 1))
+
+    def test_family_island_builds_from_its_operators_but_is_priced_on_the_full_grammar(self):
+        state = self.cells(2)[1]
+        calls = []
+        original = a.random_tree
+        def recording(n_features, ops, *args, **kwargs):
+            calls.append(tuple(ops)); return original(n_features, ops, *args, **kwargs)
+        a.random_tree = recording
+        try:
+            # Generation 1: every 5th generation the Bayesian bank also
+            # rejuvenates its particle catalogue, which keeps the run's grammar.
+            advance(state, 1, self.X, self.Y, self.cats, self.OPS, self.ev, role_settings={"ops": ["+", "-", "*", "exp"]})
+        finally:
+            a.random_tree = original
+        self.assertTrue(calls)
+        self.assertTrue(all(set(ops) <= {"+", "-", "*", "exp"} for ops in calls))
+        for m in state.population:
+            self.assertTrue({"+", "-", "*", "exp"} <= set(m.mdl_operators), m.mdl_operators)
+            used = {node[0] for tree in m.trees for node in a.walk_tree(tree) if node[0] not in ("x", "c")}
+            self.assertTrue(used <= set(m.mdl_operators))
+
+    def test_role_settings_change_selection_and_novelty(self):
+        state = self.cells(2)[1]
+        advance(state, 0, self.X, self.Y, self.cats, self.OPS, self.ev,
+                role_settings={"novelty": 1., "parsimony": .05, "semantic_max_delta": float("inf"), "mutation_bias": {"prune": 2.}})
+        self.assertEqual(len(state.population), state.population_size)
+        self.assertEqual(state.portfolio.bias, {"prune": 2.})
+        advance(state, 1, self.X, self.Y, self.cats, self.OPS, self.ev)
+        self.assertIsNone(state.portfolio.bias)                       # a generation without a role clears it
+
+    def test_preset_roles_run_parallel_and_resume_exactly(self):
+        x = np.random.default_rng(0).uniform(1, 3, (40, 2))
+        df = pd.DataFrame({"a": x[:, 0], "b": x[:, 1], "y": x[:, 0] ** 2 + 2 * x[:, 1]})
+        roles = {"enabled": True, "interval": 2, "assignments": ["simplifier", "family:2", "explorer"]}
+        def run(plan, cell_workers):
+            with tempfile.TemporaryDirectory(prefix="afpo-roles-") as directory, contextlib.chdir(directory):
+                df.to_csv("d.csv", index=False)
+                flags = ["--workers", "1", "--cell-workers", str(cell_workers)]
+                args = a.parse_cli(["--population", "64", "--max-generations", str(plan[0]), "--seed", "4", *flags])[1]
+                setup = {"path": Path("d.csv"), "df": df, "types": [1, 1, 5], "delimiter": ",", "ops": ["+", "-", "*", "square"],
+                         "affine_on": True, "coev": False, "dynamic_pressure_on": True, "adf_enabled": False, "nodes": 15, "depth": 4,
+                         "island_count": 4, "migration_interval": 2, "migrants_per_island": 2, "val_path": "", "validation_percent": 20,
+                         "metadata": {}, "roles": dict(roles)}
+                with contextlib.redirect_stdout(io.StringIO()) as log:
+                    checkpoint = a.train_from_setup(args, setup, choose_model=lambda *_: 0)["checkpoint"]
+                    for target in plan[1:]:
+                        a.resume_main(a.parse_cli(["--resume", checkpoint, "--max-generations", str(target), *flags])[1])
+                _, _, _, _, state = a.load_checkpoint(checkpoint, False)
+            return [[repr(m["trees"]) for m in cell["population"]] for cell in state["island_states"]], state, log.getvalue()
+        serial, state, log = run([6], 1)
+        parallel, _, _ = run([4, 6], 4)
+        self.assertEqual(serial, parallel)
+        self.assertEqual(state["island_config"]["roles"]["assignments"], roles["assignments"])
+        self.assertEqual([cell["role"].get("kind") for cell in state["island_states"]], [None, "simplifier", "family:2", "explorer"])
+        self.assertIn("island 2 simplifier, island 3 family:2, island 4 explorer", log)
+        self.assertIn("(simplifier)=", log)
+
+    def test_terminal_setup_asks_for_each_islands_role(self):
+        answers = {"Island count": "3", "Island roles": "1", "Roles for islands": "simplifier, family:3"}
+        def ask(prompt, default=""):
+            return next((value for key, value in answers.items() if prompt.startswith(key)), str(default))
+        df = pd.DataFrame({"a": np.arange(10.), "y": np.arange(10.)})
+        args = a.parse_cli(["--population", "48"])[1]
+        with tempfile.NamedTemporaryFile(suffix=".csv") as handle, \
+                patch.object(a, "ask", side_effect=lambda prompt, default="": handle.name if prompt == "Dataset path" else ask(prompt, default)), \
+                patch.object(a, "configure", return_value=(df, [1, 5], ",")), \
+                patch.object(a, "choose_operator_groups", return_value=self.OPS), \
+                contextlib.redirect_stdout(io.StringIO()) as log:
+            setup = a.collect_training_setup(args)
+        self.assertEqual(setup["roles"]["assignments"], ["simplifier", "family:3"])
+        self.assertTrue(setup["roles"]["enabled"])
+        self.assertIn("family:3 = Operators: arithmetic + exponential and logarithmic", log.getvalue())
+
+    def test_unknown_role_in_setup_is_rejected(self):
+        df = pd.DataFrame({"a": np.arange(40.), "y": np.arange(40.)})
+        args = a.parse_cli(["--population", "32", "--max-generations", "1", "--seed", "1"])[1]
+        setup = {"path": Path("unused.csv"), "df": df, "types": [1, 5], "delimiter": ",", "ops": ["+"], "affine_on": True,
+                 "coev": False, "dynamic_pressure_on": False, "adf_enabled": False, "nodes": 7, "depth": 3, "island_count": 2,
+                 "migration_interval": 5, "migrants_per_island": 1, "val_path": "0", "validation_percent": None, "metadata": {},
+                 "roles": {"enabled": True, "assignments": ["family:3"]}}
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(ValueError, "Unknown island role"):
             a.train_from_setup(args, setup)
 
 

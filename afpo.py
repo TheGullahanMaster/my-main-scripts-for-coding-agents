@@ -15,6 +15,10 @@ island/stage cells evolve the cells in parallel processes (``--cell-workers``;
 results are identical to serial).  Above 8192 rows trees are evaluated in
 cache-sized row blocks (identical values), so many ``--workers`` no longer
 starve each other of memory bandwidth.
+
+Island roles: with roles on, each island after the first is "auto"
+(self-organising) or a fixed role picked per island: generalist, simplifier,
+explorer, refiner, or an operator family.
 """
 from __future__ import annotations
 
@@ -2268,6 +2272,17 @@ def parametrize_mutate(t, ops, max_nodes, max_depth):
     child=replace_subtree(t,path,wrapped)
     return child if node_size(child)<=max_nodes and node_depth(child)<=max_depth else t
 def shrink_mutate(t): return rng.choice(t[1:]) if t[0] not in ("x","c") else t
+def prune_mutate(t):
+    """Collapse one inner node, anywhere in the tree, into one of its children
+    or a constant (refitted with the child), so the tree always gets smaller.
+
+    shrink and hoist only cut at the root; the simplifier island uses this
+    to remove the redundant middle of an expression."""
+    paths=[path for path in subtree_paths(t) if subtree_at(t,path)[0] not in ("x","c","arg")]
+    if not paths: return t
+    path=rng.choice(paths); node=subtree_at(t,path)
+    replacement=("c",1.) if rng.random()<.25 else rng.choice(node[1:])
+    return simplify_tree(replace_subtree(t,path,replacement))
 def jump_mutate(t, n_features, ops, max_nodes, max_depth):
     """Wrap a subtree in a whole jump block: mod(s,c), floordiv(s,c) or
     if_else(gt(x,c), s, s') with s' a mutated copy of s.
@@ -2737,15 +2752,23 @@ class MutationPortfolio:
         self.weights={"subtree":1.,"point":1.,"constant":1.,"hoist":.7,"shrink":.7,"parametrize":1.,"bilinear":BILINEAR_MUTATION_WEIGHT,"jump":JUMP_MUTATION_WEIGHT,
                       "squash":SQUASH_SWAP_WEIGHT,"smooth":SMOOTH_SWAP_WEIGHT,"gate":GATE_MUTATION_WEIGHT,"backprop":BACKPROP_MUTATION_WEIGHT,"residual_term":RESIDUAL_TERM_WEIGHT}
         self.tries={k:0 for k in self.weights}; self.wins={k:0 for k in self.weights}
-    def choose(self): return rng.choices(list(self.weights),weights=list(self.weights.values()))[0]
+    # Island-role multipliers on the adaptive weights, set before each
+    # generation by the island's role (never checkpointed: the role is).
+    # A kind only a role uses (prune) starts at weight 1 times its bias.
+    bias=None
+    def choose(self):
+        if not self.bias: return rng.choices(list(self.weights),weights=list(self.weights.values()))[0]
+        kinds=list(dict.fromkeys([*self.weights,*self.bias]))
+        return rng.choices(kinds,weights=[self.weights.get(k,1.)*self.bias.get(k,1.) for k in kinds])[0]
     def record(self, kind, improved):
-        self.tries[kind]+=1; self.wins[kind]+=int(improved)
+        self.tries[kind]=self.tries.get(kind,0)+1; self.wins[kind]=self.wins.get(kind,0)+int(improved)
         if self.tries[kind]%8==0: self.weights[kind]=max(.15,min(4.,.5+3*self.wins[kind]/self.tries[kind]))
     def apply(self,t,n_features,ops,max_nodes,max_depth,proposal=None,adfs=None):
         kind=self.choose()
         if kind=="point": return point_mutate(t,ops,adfs),kind
         if kind=="hoist": return hoist_mutate(t),kind
         if kind=="shrink": return shrink_mutate(t),kind
+        if kind=="prune": return prune_mutate(t),kind
         if kind=="parametrize": return parametrize_mutate(t,ops,max_nodes,max_depth),kind
         if kind=="bilinear": return bilinear_mutate(t,n_features,ops,max_nodes,max_depth),kind
         if kind=="jump": return jump_mutate(t,n_features,ops,max_nodes,max_depth),kind
@@ -3040,7 +3063,9 @@ def semantic_distance(baseline, candidate):
         scale=max(float(np.std(candidate)),float(np.sqrt(np.mean(difference**2))),EPS)
     return float(np.sqrt(np.mean((difference/scale)**2)))
 
-def semantic_mutate(tree, X, portfolio, n_features, ops, max_nodes, max_depth, proposal=None, adfs=None, library=None, min_delta=1e-8, max_delta=None):
+def semantic_mutate(tree, X, portfolio, n_features, ops, max_nodes, max_depth, proposal=None, adfs=None, library=None, min_delta=1e-8, max_delta=None, neutral_shrink=False):
+    """neutral_shrink (simplifier islands) also accepts a smaller child with
+    unchanged output: exactly the rewrite a simplifier is looking for."""
     if max_delta is None: max_delta=SEMANTIC_MAX_DELTA
     # A returned kind of None means "no move was applied": the unchanged
     # parent must not be credited (or blamed) to any mutation kind.
@@ -3051,6 +3076,7 @@ def semantic_mutate(tree, X, portfolio, n_features, ops, max_nodes, max_depth, p
         try: delta=semantic_distance(baseline,evaluate_cached(child,X,adfs))
         except ValueError: continue
         if min_delta < delta <= max_delta: return child,kind,False
+        if neutral_shrink and delta<=min_delta and node_size(child)<node_size(tree): return child,kind,False
     # A rare macro lane keeps the normal semantic guard as the default while
     # allowing a finite, genuinely different step across distant basins.
     if library is not None and rng.random()<library.macro_rate:
@@ -6061,6 +6087,10 @@ def migrate_islands(islands, migrant_count, *, X, nsga_normalization, parsimony_
         outgoing.append([model.clone() for model in select_nsga(pool,min(migrant_count,len(pool)),nsga_normalization,parsimony_quality_tolerance)])
     for index,island in enumerate(islands):
         incoming=outgoing[(index-1)%len(islands)]
+        if (island.role.get("params") or {}).get("gather_migrants"):
+            # A simplifier island takes every other island's elites, not just
+            # its ring neighbour's: shortening them is its whole job.
+            incoming=[model.clone() for source,models in enumerate(outgoing) if source!=index for model in models]
         island.adf_registry.import_models(incoming)
         for migrant in incoming: migrant.origin="island_migrant"
         island.population=select_nsga([*island.population,*incoming],len(island.population),nsga_normalization,parsimony_quality_tolerance)
@@ -6209,14 +6239,14 @@ def advance_topology(cells, island_config, generation, *, X, n_features, ops, no
     if roles["enabled"] and island_count>1 and Y is not None and generation%roles["interval"]==0:
         retired,collapsed=update_roles(cells,island_config,generation,X=X,Y=Y,cats=cats,Xv=Xv,Yv=Yv,crossover_rate=crossover_rate,
                                        bayesian_proposal_rate=bayesian_proposal_rate,nodes=nodes)
-        contributions=", ".join(f"{cell_label(cell,island_count,stage_count)}={cell.role.get('contribution',0.):.3g}" for cell in cells if cell.island_index>0)
+        contributions=", ".join(f"{cell_label(cell,island_count,stage_count)} ({role_kind(cell)})={cell.role.get('contribution',0.):.3g}" for cell in cells if cell.island_index>0)
         extra="".join([f"; retired {retired}" if retired else "",f"; split {collapsed} collapsed pair(s)" if collapsed else ""])
         print(f"Island roles {roles['updates']}: held-out contribution {contributions}{extra}.",flush=True)
-# Self-organising island roles.  No role is named in advance: each specialist
-# island's parent selection weights the training rows it already handles
+# Self-organising island roles ("auto").  No niche is named in advance: each
+# auto island's parent selection weights the training rows it already handles
 # better than the other islands (soft responsibilities, as in a mixture of
 # experts), so the positive feedback splits the data into niches for any
-# island count.  Island 0 of each stage level stays a generalist.  Specialists
+# island count.  Island 0 of each stage level stays a generalist.  Auto islands
 # also get a deterministic spread of search settings (tree size, crossover,
 # Bayesian proposals), a held-out complementarity check retires specialists
 # that stop contributing, and fragment libraries migrate with the ring.  All
@@ -6225,10 +6255,58 @@ def advance_topology(cells, island_config, generation, *, X, n_features, ops, no
 ROLE_FRAGMENT_MIGRANTS = 4
 ROLE_COLLAPSE_CORRELATION = .95
 ROLE_MIN_CONTRIBUTION = 1e-3
-def role_config(enabled=False, interval=10, mix=.5, retire_after=5, **state):
+# Island roles.  Every island after the first gets one: "auto" is the
+# self-organising specialist above; the others are fixed presets the user
+# picks per island.  A preset only changes how that island searches (tree
+# size, variation mix, step size, parsimony, which operators build new
+# structure, where its migrants come from); every model is still scored,
+# priced (MDL over the run's whole grammar) and selected on the same
+# objectives, so roles cannot bias the final choice.
+ISLAND_ROLES={
+    "auto":"Auto: learns its niche from the data (self-organising specialist)",
+    "generalist":"Generalist: default settings, no specialisation",
+    "simplifier":"Simplifier: gathers every island's elites and searches for shorter equivalents",
+    "explorer":"Explorer: fresh random structures and large jumps to escape plateaus",
+    "refiner":"Refiner: small steps that polish the structures it receives",
+}
+FAMILY_ROLE_PREFIX="family:"
+def family_role_choices(ops):
+    """{role: label} for the operator-family roles available with these operators.
+
+    A family island builds new structure from arithmetic (group 1) plus one
+    other operator group, restricted to the run's operators."""
+    enabled=set(ops); arithmetic=set(OPERATOR_GROUPS["1"][1])&enabled; choices={}
+    for key,(name,members) in OPERATOR_GROUPS.items():
+        if not set(members)&enabled: continue
+        label=f"Operators: {name.lower()}" if key=="1" or not arithmetic else f"Operators: arithmetic + {name.lower()}"
+        choices[FAMILY_ROLE_PREFIX+key]=label
+    return choices
+def island_role_choices(ops):
+    """Every role selectable for a run with these operators, in menu order."""
+    return {**ISLAND_ROLES,**family_role_choices(ops)}
+def family_role_operators(role, ops):
+    """Operators a family-role island builds new structure from."""
+    group=role[len(FAMILY_ROLE_PREFIX):]
+    if group not in OPERATOR_GROUPS: raise ValueError(f"Unknown operator group in island role {role!r}")
+    members=set(OPERATOR_GROUPS[group][1])|set(OPERATOR_GROUPS["1"][1])
+    chosen=[op for op in ops if op in members]
+    if not chosen: raise ValueError(f"Island role {role!r} has no operators among the selected ones")
+    return chosen
+def validate_island_roles(assignments, island_count, ops):
+    """Per-island roles for islands 2..N; an empty list means all auto."""
+    assignments=[str(role).strip() for role in (assignments or [])]
+    if not assignments: assignments=["auto"]*max(0,island_count-1)
+    if len(assignments)!=island_count-1:
+        raise ValueError(f"Island roles need one entry per island after the first ({island_count-1}), got {len(assignments)}")
+    choices=island_role_choices(ops)
+    for role in assignments:
+        if role not in choices: raise ValueError(f"Unknown island role {role!r}; choose from {', '.join(choices)}")
+    return assignments
+def role_config(enabled=False, interval=10, mix=.5, retire_after=5, assignments=(), **state):
     if int(interval)<1 or int(retire_after)<1: raise ValueError("Role interval and retirement window must be positive")
     if not 0<=float(mix)<=.9: raise ValueError("Role mix must be in [0, 0.9] so every island still sees all rows")
     return {"enabled":bool(enabled),"interval":int(interval),"mix":float(mix),"retire_after":int(retire_after),
+            "assignments":[str(role) for role in (assignments or [])],
             "updates":int(state.get("updates",0)),"retirements":int(state.get("retirements",0)),
             "collapses":int(state.get("collapses",0)),"fragment_migrants":int(state.get("fragment_migrants",0))}
 def role_parameters(t, crossover_rate, bayesian_proposal_rate, nodes):
@@ -6238,18 +6316,64 @@ def role_parameters(t, crossover_rate, bayesian_proposal_rate, nodes):
     return {"t":t,"crossover_rate":float(np.clip(crossover_rate*(.5+t),0.,.9)),
             "bayesian_proposal_rate":float(np.clip(bayesian_proposal_rate*(1.5-t),0.,1.)),
             "nodes":max(3,int(round(nodes*(.5+.5*t))))}
-def assign_role_parameters(cells, island_count, crossover_rate, bayesian_proposal_rate, nodes):
-    """Spread specialist settings evenly over [0,1] by island index; island 0 keeps the defaults."""
+# Mutation-portfolio multipliers per preset (kinds not listed keep x1).
+ROLE_MUTATION_BIAS={
+    "simplifier":{"prune":4.,"hoist":3.,"shrink":3.,"constant":1.5,"subtree":.5,"bilinear":0.,"residual_term":0.,"backprop":.5,
+                  "jump":.3,"gate":.3,"squash":.5,"smooth":.5},
+    "explorer":{"subtree":2.,"point":1.5,"constant":.5},
+    "refiner":{"constant":3.,"parametrize":2.,"point":1.5,"subtree":.5,"jump":.5,"hoist":.3,"shrink":.3,"bilinear":.5},
+}
+SIMPLIFIER_PARSIMONY = .05      # near-tie band in which the simplifier keeps the lower-MDL model
+EXPLORER_NOVELTY = .25          # share of an explorer's offspring drawn as fresh random trees
+REFINER_MAX_DELTA = 1.          # refiner's semantic step cap (target standard deviations)
+def preset_role_parameters(role, crossover_rate, bayesian_proposal_rate, nodes, ops):
+    """Search settings of a fixed (non-auto) island role."""
+    if role=="generalist": return {}
+    if role=="simplifier":
+        return {"crossover_rate":.5*crossover_rate,"bayesian_proposal_rate":.5*bayesian_proposal_rate,
+                "nodes":max(3,int(round(.6*nodes))),"parsimony":SIMPLIFIER_PARSIMONY,"neutral_shrink":True,
+                "gather_migrants":True,"mutation_bias":ROLE_MUTATION_BIAS["simplifier"]}
+    if role=="explorer":
+        return {"crossover_rate":float(min(.9,1.5*crossover_rate)),"bayesian_proposal_rate":float(min(1.,1.5*bayesian_proposal_rate)),
+                "novelty":EXPLORER_NOVELTY,"semantic_max_delta":float("inf"),"mutation_bias":ROLE_MUTATION_BIAS["explorer"]}
+    if role=="refiner":
+        return {"crossover_rate":.5*crossover_rate,"bayesian_proposal_rate":.3*bayesian_proposal_rate,
+                "semantic_max_delta":REFINER_MAX_DELTA,"mutation_bias":ROLE_MUTATION_BIAS["refiner"]}
+    if role.startswith(FAMILY_ROLE_PREFIX): return {"ops":family_role_operators(role,ops)}
+    raise ValueError(f"Unknown island role {role!r}")
+def assign_role_parameters(cells, island_count, crossover_rate, bayesian_proposal_rate, nodes, assignments=(), ops=()):
+    """Give every island after the first its role (all stages of an island share it).
+
+    Auto islands spread their settings evenly over [0,1] in island order;
+    island 0 keeps the defaults."""
+    assignments=list(assignments) or ["auto"]*max(0,island_count-1)
+    auto=[index for index in range(1,island_count) if assignments[index-1]=="auto"]
     for cell in cells:
         if cell.island_index==0: cell.role={}; continue
-        t=(cell.island_index-1)/max(1,island_count-2)
-        cell.role={"params":role_parameters(t,crossover_rate,bayesian_proposal_rate,nodes),"stale":0}
+        role=assignments[cell.island_index-1]
+        if role=="auto":
+            t=auto.index(cell.island_index)/max(1,len(auto)-1)
+            cell.role={"params":role_parameters(t,crossover_rate,bayesian_proposal_rate,nodes),"stale":0}
+        else:
+            cell.role={"kind":role,"params":preset_role_parameters(role,crossover_rate,bayesian_proposal_rate,nodes,ops)}
+def describe_island_roles(assignments):
+    """'island 2 auto, island 3 simplifier' for the run banner."""
+    return ", ".join(f"island {index+2} {role}" for index,role in enumerate(assignments))
+def role_kind(cell):
+    """'generalist' for island 0, 'auto' for self-organising islands, else the preset's name."""
+    if cell.island_index==0 and not cell.role.get("kind"): return "generalist"
+    return cell.role.get("kind","auto")
 def cell_search_settings(cell, crossover_rate, bayesian_proposal_rate, nodes):
     """(crossover_rate, bayesian_proposal_rate, nodes, case_weights) for one cell's generation."""
     params=cell.role.get("params") or {}
     weights=cell.role.get("case_weights")
     return (params.get("crossover_rate",crossover_rate),params.get("bayesian_proposal_rate",bayesian_proposal_rate),
             params.get("nodes",nodes),None if weights is None else np.asarray(weights,float))
+def cell_role_settings(cell):
+    """The preset-only settings evolve_generation takes as role_settings (None for defaults)."""
+    params=cell.role.get("params") or {}
+    settings={key:params[key] for key in ("ops","parsimony","semantic_max_delta","novelty","neutral_shrink","mutation_bias") if key in params}
+    return settings or None
 def row_errors(model, X, Y, cats):
     """Scale-free per-row error (mean over outputs) used for responsibilities."""
     pred=predict_targets(model,X,cats); parts=[]
@@ -6284,12 +6408,15 @@ def update_roles(cells, island_config, generation, *, X, Y, cats, Xv=None, Yv=No
         best=held.min(axis=0); scale=float(np.mean(best))+EPS
         for index,cell in enumerate(level):
             if index==0: cell.role.pop("case_weights",None); continue
+            others=np.delete(held,index,axis=0).min(axis=0)
+            if role_kind(cell)!="auto":
+                # A fixed role keeps its preset: reported, never reweighted or retired.
+                cell.role["contribution"]=float(np.mean(others-best))/scale; continue
             target=responsibility[index]*island_count
             previous=cell.role.get("specialization")
             if previous is None or len(previous)!=len(target):
                 specialization=_normalized(.5*_normalized(target)+.5*_normalized(_random_affinity(len(target))))
             else: specialization=_normalized(.5*np.asarray(previous,float)+.5*_normalized(target))
-            others=np.delete(held,index,axis=0).min(axis=0)
             contribution=float(np.mean(others-best))/scale
             cell.role["contribution"]=contribution
             cell.role["stale"]=0 if contribution>ROLE_MIN_CONTRIBUTION else int(cell.role.get("stale",0))+1
@@ -6299,7 +6426,7 @@ def update_roles(cells, island_config, generation, *, X, Y, cats, Xv=None, Yv=No
                 cell.role["params"]=role_parameters(rng.random(),crossover_rate,bayesian_proposal_rate,nodes)
                 cell.role["stale"]=0; retired+=1
             cell.role["specialization"]=specialization
-        specialists=level[1:]
+        specialists=[cell for cell in level[1:] if role_kind(cell)=="auto"]
         for i,left in enumerate(specialists):
             for right in specialists[i+1:]:
                 a,b=left.role["specialization"],right.role["specialization"]
@@ -6539,10 +6666,17 @@ def refresh_persistent_scores(archive, best_models, semantic_qd, structural_qd, 
 
 def evolve_generation(pop, generation, *, X, Xt, Yt, Xv, Yv, cats, constraints, out_names, ops, nodes, depth, affine_on, coev,
                       bayes, archive, semantic_qd, structural_qd, qd_controller, best_models, pressure, cases, portfolio, library, evaluator,
-                      bayesian_proposal_rate, crossover_rate, qd_mode, lexicase_cases, nsga_normalization, progress=None, bayesian_mode="adaptive", adf_registry=None, budget=None, population_size=None, case_weights=None, residual_qd=None):
+                      bayesian_proposal_rate, crossover_rate, qd_mode, lexicase_cases, nsga_normalization, progress=None, bayesian_mode="adaptive", adf_registry=None, budget=None, population_size=None, case_weights=None, residual_qd=None, role_settings=None):
     """Advance one generation; fresh and resumed runs share this exact path.
 
-    case_weights: optional selection-only per-training-row weights (island roles)."""
+    case_weights: optional selection-only per-training-row weights (island roles).
+    role_settings: a fixed island role's preset (cell_role_settings): "ops"
+    (operators that build new structure; the MDL grammar stays the run's),
+    "parsimony" (near-tie band floor), "semantic_max_delta", "novelty" (fresh
+    random share of offspring), "neutral_shrink" and "mutation_bias"."""
+    role_settings=role_settings or {}
+    portfolio.bias=role_settings.get("mutation_bias")
+    role_delta=role_settings.get("semantic_max_delta"); neutral_shrink=bool(role_settings.get("neutral_shrink"))
     population_size=len(pop) if population_size is None else population_size
     if population_size<1 or not pop: raise ValueError("Evolution requires a nonempty population")
     particle_models=[particle for bank in (bayes.banks if isinstance(bayes,PerOutputBayesianBanks) else [bayes]) for particle in [*bank.particles.catalog,*bank.particles.particles]]
@@ -6553,7 +6687,7 @@ def evolve_generation(pop, generation, *, X, Xt, Yt, Xv, Yv, cats, constraints, 
     evaluator.begin_generation()
     refresh_persistent_scores(archive,best_models,semantic_qd,structural_qd,evaluator,residual_qd)
     budget=EvaluationBudget() if budget is None else budget
-    pressure.apply(bayes,qd_controller); effective_tolerance=pressure.effective_parsimony()
+    pressure.apply(bayes,qd_controller); effective_tolerance=max(pressure.effective_parsimony(),float(role_settings.get("parsimony",0.)))
     repertoires=qd_archives(semantic_qd,structural_qd,residual_qd)
     qd_controller.begin_generation(repertoires)
     # Co-evolution only subsamples above 512 rows; below that it is inert.
@@ -6588,6 +6722,12 @@ def evolve_generation(pop, generation, *, X, Xt, Yt, Xv, Yv, cats, constraints, 
         active_ops=adf_registry.operators(ops); bayes.sync_operators(active_ops)
         for particle in particle_models: particle.adfs.update(adf_registry.definitions)
     else: active_ops=list(ops)
+    # Operators that build new structure: a family role narrows them (ADF
+    # calls stay available); models are still priced over active_ops, and the
+    # Bayesian bank's particle catalogue keeps the run's grammar (its draws
+    # are mutated with these operators before they become offspring).
+    family=role_settings.get("ops")
+    variation_ops=active_ops if not family else [op for op in active_ops if op in family or op.startswith("adf_")]
     pressure.observe(generation,quality_improved,repertoires); pressure.apply(bayes,qd_controller)
     diverse=qd_cell_models(semantic_qd,structural_qd,residual_qd)
     Xb,Yb=behaviour_rows(Xt,Yt)
@@ -6627,23 +6767,24 @@ def evolve_generation(pop, generation, *, X, Xt, Yt, Xv, Yv, cats, constraints, 
         if EQUIVALENCE_COLLAPSE and key in seen and unchanged<unchanged_limit:
             unchanged+=1; EQUIVALENCE_STATS["children_redrawn"]+=1; return True
         seen.add(key); return False
+    novelty_rate=max(pressure.novelty_rate(),float(role_settings.get("novelty",0.)))
     while len(children)<population_size:
         sources=[]
-        if pressure.novelty_rate() and rng.random()<pressure.novelty_rate():
-            trees=[random_tree(X.shape[1],active_ops,nodes,depth,adfs=adf_registry.definitions if adf_registry else None) for _ in range(len(pop[0].trees))]; scales=[(1.,0.)]*len(trees); child_age=0; child_origin="novelty_injection"
+        if novelty_rate and rng.random()<novelty_rate:
+            trees=[random_tree(X.shape[1],variation_ops,nodes,depth,adfs=adf_registry.definitions if adf_registry else None) for _ in range(len(pop[0].trees))]; scales=[(1.,0.)]*len(trees); child_age=0; child_origin="novelty_injection"
         elif bayesian_mode!="off" and rng.random() < bayesian_proposal_rate:
-            trees,scales,sources=bayesian_injection_trees(bayes,len(pop[0].trees),X.shape[1],active_ops,nodes,depth,"grammar" if bayesian_mode=="grammar" else bayesian_mode,adf_registry.definitions if adf_registry else None,return_sources=True)
+            trees,scales,sources=bayesian_injection_trees(bayes,len(pop[0].trees),X.shape[1],variation_ops,nodes,depth,"grammar" if bayesian_mode=="grammar" else bayesian_mode,adf_registry.definitions if adf_registry else None,return_sources=True)
             child_age=max((model.age+1 for model in sources),default=0); child_origin="bayesian_injection"
         elif library.items and rng.random()<library.fragment_rate:
             p=rng.choice(parents); trees=[]; composed=False
             for tree in p.model.trees:
-                candidate=library.compose(tree,active_ops,nodes,depth)
+                candidate=library.compose(tree,variation_ops,nodes,depth)
                 trees.append(candidate if candidate is not None else tree); composed|=candidate is not None
             if not composed and unchanged<unchanged_limit: unchanged+=1; continue
             scales=list(p.model.scales); child_age=p.model.age+1; child_origin="fragment"
             sources=[p.model]
         elif rng.random() < crossover_rate and len(parents)>=2:
-            p,q=rng.sample(parents,2); trees=[gene_crossover(a,b,nodes,depth,active_ops) if READOUT_MODE=="multiterm" and affine_on and rng.random()<GENE_CROSSOVER_RATE else semantic_crossover(a,b,Xsb,nodes,depth,adf_registry.definitions if adf_registry else None) for a,b in zip(p.model.trees,q.model.trees)]; scales=list(p.model.scales); child_age=max(p.model.age,q.model.age)+1
+            p,q=rng.sample(parents,2); trees=[gene_crossover(a,b,nodes,depth,variation_ops) if READOUT_MODE=="multiterm" and affine_on and rng.random()<GENE_CROSSOVER_RATE else semantic_crossover(a,b,Xsb,nodes,depth,adf_registry.definitions if adf_registry else None,max_delta=role_delta) for a,b in zip(p.model.trees,q.model.trees)]; scales=list(p.model.scales); child_age=max(p.model.age,q.model.age)+1
             if trees==list(p.model.trees) and unchanged<unchanged_limit: unchanged+=1; continue
             if duplicate(trees): continue
             child=Model(trees,scales,child_age,origin="crossover",parent_ids=(p.model.lineage_id,q.model.lineage_id),mdl_operators=grammar_for_trees(active_ops,trees,adf_registry.definitions if adf_registry else None),mdl_feature_count=X.shape[1],adfs={} if adf_registry is None else dict(adf_registry.definitions),founder_ids=tuple(sorted(set(p.model.founder_ids).union(q.model.founder_ids))),birth_generation=generation+1-child_age)
@@ -6655,7 +6796,7 @@ def evolve_generation(pop, generation, *, X, Xt, Yt, Xv, Yv, cats, constraints, 
             for index,tree in enumerate(p.model.trees):
                 proposal=None if bayesian_mode=="off" else (bayes[index] if isinstance(bayes,PerOutputBayesianBanks) else bayes)
                 if BACKPROP_MUTATION_WEIGHT>0 or RESIDUAL_TERM_WEIGHT>0: set_backprop_context(Xsb,backprop_desired(p.model,index,Ysb,head_outputs),fragment_trees)
-                child_tree,kind,macro=semantic_mutate(tree,Xsb,portfolio,X.shape[1],active_ops,nodes,depth,proposal,adf_registry.definitions if adf_registry else None,library)
+                child_tree,kind,macro=semantic_mutate(tree,Xsb,portfolio,X.shape[1],variation_ops,nodes,depth,proposal,adf_registry.definitions if adf_registry else None,library,max_delta=role_delta,neutral_shrink=neutral_shrink)
                 trees.append(child_tree); kinds.append(kind); macro_used|=macro
             if trees==list(p.model.trees) and unchanged<unchanged_limit: unchanged+=1; continue
             scales=list(p.model.scales); child_age=p.model.age+1; child_origin="macro_mutation" if macro_used else "mutation"
@@ -6696,7 +6837,7 @@ def evolve_generation(pop, generation, *, X, Xt, Yt, Xv, Yv, cats, constraints, 
     while len(survivor_pool)<population_size and attempts<population_size*8:
         batch=[]
         for _ in range(min(population_size-len(survivor_pool),population_size*8-attempts)):
-            fresh_trees=[random_tree(X.shape[1],active_ops,nodes,depth,proposal=None if bayesian_mode=="off" else (bayes[index] if isinstance(bayes,PerOutputBayesianBanks) else bayes),adfs=adf_registry.definitions if adf_registry else None) for index in range(len(pop[0].trees))]
+            fresh_trees=[random_tree(X.shape[1],variation_ops,nodes,depth,proposal=None if bayesian_mode=="off" else (bayes[index] if isinstance(bayes,PerOutputBayesianBanks) else bayes),adfs=adf_registry.definitions if adf_registry else None) for index in range(len(pop[0].trees))]
             batch.append(Model(fresh_trees,[(1.,0.)]*len(pop[0].trees),0,origin="novelty_injection",mdl_operators=grammar_for_trees(active_ops,fresh_trees,adf_registry.definitions if adf_registry else None),mdl_feature_count=X.shape[1],adfs={} if adf_registry is None else dict(adf_registry.definitions),birth_generation=generation+1))
         evaluator.assess(batch,"train",None if isinstance(sample,slice) else sample,tune=True)
         survivor_pool=novelty_pool([*survivor_pool,*batch],Xs); attempts+=len(batch)
@@ -6958,7 +7099,8 @@ def resume_main(args):
                                   ops=ops,nodes=cell_nodes,depth=depth,case_weights=cell_weights,affine_on=affine_on,coev=coev,bayes=island.bayes,archive=island.archive,
                                   semantic_qd=island.semantic_qd,structural_qd=island.structural_qd,residual_qd=island.residual_qd,qd_controller=island.qd_controller,best_models=island.best_models,
                                   pressure=island.pressure,cases=island.cases,portfolio=island.portfolio,library=island.library,evaluator=evaluator,bayesian_proposal_rate=cell_proposals,
-                                  crossover_rate=cell_crossover,qd_mode=qd_mode,lexicase_cases=state.get("lexicase_cases",args.lexicase_cases),nsga_normalization=nsga_normalization,bayesian_mode=state.get("bayesian_mode",args.bayesian_mode),adf_registry=island.adf_registry,budget=island.budget,progress=progress,population_size=island.population_size)
+                                  crossover_rate=cell_crossover,qd_mode=qd_mode,lexicase_cases=state.get("lexicase_cases",args.lexicase_cases),nsga_normalization=nsga_normalization,bayesian_mode=state.get("bayesian_mode",args.bayesian_mode),adf_registry=island.adf_registry,budget=island.budget,progress=progress,population_size=island.population_size,
+                                  role_settings=cell_role_settings(island))
             evolve_cells(islands,step,cell_workers,evaluator,shared={"X":X,"Xt":Xt,"Yt":Yt,"Xv":Xv,"Yv":Yv,"constraints":constraints})
             generation+=1
             advance_topology(islands,island_config,generation,X=Xt,n_features=X.shape[1],ops=ops,nodes=nodes,depth=depth,
@@ -7161,8 +7303,12 @@ def collect_training_setup(args):
         migration_interval=max(1,int(ask("Migration interval (generations)","25")))
         migrants_per_island=max(1,int(ask("Migrants per island","2")))
     roles=role_config()
-    if island_count>1 and yes(ask("Self-organising island roles (island 1 generalist, the rest specialise)? 1=yes, 0=no","0")):
-        roles=role_config(True,interval=int(ask("Role update interval (generations)","10")))
+    if island_count>1 and yes(ask("Island roles (island 1 generalist, the rest specialise)? 1=yes, 0=no","0")):
+        choices=island_role_choices(ops)
+        print("Island roles: "+"; ".join(f"{name} = {label}" for name,label in choices.items()))
+        answer=ask(f"Roles for islands 2-{island_count}, comma separated (blank = all auto)","")
+        assignments=validate_island_roles([item for item in answer.split(",") if item.strip()],island_count,ops)
+        roles=role_config(True,interval=int(ask("Role update interval (generations)","10")),assignments=assignments)
     stages=ask_stage_setup()
     if island_count*stages["count"]>args.population//8: raise ValueError("Islands x stages need at least eight models each; raise --population or choose fewer islands/stages")
     val_path=ask("Validation CSV (blank=random split; 0=disabled)","")
@@ -7254,6 +7400,7 @@ def train_from_setup(args, setup, choose_model=None):
     stages=stage_config(**(setup.get("stages") or {}))
     roles=role_config(**(setup.get("roles") or {}))
     if roles["enabled"] and island_count<2: raise ValueError("Island roles need at least two islands (one generalist plus specialists)")
+    if roles["enabled"]: roles["assignments"]=validate_island_roles(roles["assignments"],island_count,ops)
     cell_count=island_count*stages["count"]
     if cell_count>args.population//8: raise ValueError("Islands x stages need at least eight models each; raise --population or choose fewer islands/stages")
     perceptron_enabled=any(operator.startswith("perceptron") for operator in ops)
@@ -7343,7 +7490,7 @@ def train_from_setup(args, setup, choose_model=None):
         "bayesian_particles_per_output":args.bayesian_particles,
         "islands":{"count":island_count,"population_total":args.population,"migration_interval":migration_interval,"migrants_per_island":migrants_per_island,"topology":"ring","state":"independent population, Bayesian banks, archive, QD, fragment library, pressure, ADF, and budget",
                    "stages":{key:stages[key] for key in ("mode","count","interval","age_gap","schedule","threshold_quantile")},
-                   "roles":{key:roles[key] for key in ("enabled","interval","mix","retire_after")}},
+                   "roles":{key:roles[key] for key in ("enabled","interval","mix","retire_after","assignments")}},
         "equivalence_collapse":EQUIVALENCE_COLLAPSE,"residual_archive":RESIDUAL_ARCHIVE,"qd_parent_choice":QD_PARENT_CHOICE,"scale_balanced_selection":SCALE_BALANCED_SELECTION,
         "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"selection_probe_filter":SELECTION_PROBE_FILTER,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"fit_iterations":CONSTANT_FIT_ITERATIONS,"semantic_max_delta":SEMANTIC_MAX_DELTA,"constant_snapping":CONSTANT_SNAPPING,"snap_tolerance":SNAP_TOLERANCE,"readout":READOUT_MODE,"max_terms":MAX_TERMS,"gene_crossover_rate":GENE_CROSSOVER_RATE,"backprop_mutation_weight":BACKPROP_MUTATION_WEIGHT,"backprop_inverse":BACKPROP_INVERSE,"residual_term_weight":RESIDUAL_TERM_WEIGHT,"loss":LOSS_MODE,"huber_delta":ROBUST_LOSS_DELTA,"forbid_nesting":",".join(sorted(f"{o}>{i}" for o,i in NESTING_RULES)),"units":UNIT_SPEC,"sparse_seeding":SPARSE_SEEDING,"sparse_basis_size":SPARSE_BASIS_SIZE,"squash_swap_weight":SQUASH_SWAP_WEIGHT,"smooth_swap_weight":SMOOTH_SWAP_WEIGHT,"gate_mutation_weight":GATE_MUTATION_WEIGHT,"loss_noise_floor":LOSS_NOISE_FLOOR,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age",
         "test_csv":str(Path(args.test_csv).resolve()) if args.test_csv else None,
@@ -7377,7 +7524,7 @@ def train_from_setup(args, setup, choose_model=None):
         best=SPARSE_SEED_STATS["best_r2"]
         print(f"Sparse seeding: {SPARSE_SEED_STATS['seeds']} seed model(s) from a {SPARSE_SEED_STATS['basis']}-term basis"+(f"; best seed training R2={best:.6g}" if best is not None else ""))
         checkpoint_state["sparse_seed_stats"]=dict(SPARSE_SEED_STATS)
-    if roles["enabled"]: assign_role_parameters(islands,island_count,args.crossover_rate,args.bayesian_proposal_rate,nodes)
+    if roles["enabled"]: assign_role_parameters(islands,island_count,args.crossover_rate,args.bayesian_proposal_rate,nodes,roles["assignments"],ops)
     if cell_count>1: seed_cell_streams(islands,run_seed)
     cell_workers=resolve_cell_workers(getattr(args,"cell_workers",0),cell_count)
     snapshot_islands(checkpoint_state,islands,checkpoint_state["island_config"])
@@ -7386,7 +7533,7 @@ def train_from_setup(args, setup, choose_model=None):
     gen=0; start=time.time()
     topology=("single population" if island_count==1 else f"{island_count} islands, ring migration every {migration_interval} generations")
     if stages["count"]>1: topology+=f", {stages['count']} {stages['mode']} stages per island (promotion every {stages['interval']} generations)"
-    if roles["enabled"]: topology+=f", self-organising roles (generalist + {island_count-1} specialist(s), update every {roles['interval']} generations)"
+    if roles["enabled"]: topology+=f", island roles (island 1 generalist; {describe_island_roles(roles['assignments'])}; update every {roles['interval']} generations)"
     if cell_count>1: topology+=f" ({', '.join(map(str,population_sizes))} models per cell; {'cells evolve serially' if cell_workers==1 else f'cells evolve in {cell_workers} parallel processes'})"
     print(f"Searching indefinitely with {args.bayesian_proposal_rate:.0%} Bayesian proposals, {topology}, and {'serial evaluation' if workers==1 else f'{workers} worker processes'}; press Ctrl-C to choose and save a model.")
     stop=GracefulStop().__enter__(); interrupted=False
@@ -7401,7 +7548,8 @@ def train_from_setup(args, setup, choose_model=None):
                                   ops=ops,nodes=cell_nodes,depth=depth,case_weights=cell_weights,affine_on=affine_on,coev=coev,bayes=island.bayes,archive=island.archive,
                                   semantic_qd=island.semantic_qd,structural_qd=island.structural_qd,residual_qd=island.residual_qd,qd_controller=island.qd_controller,best_models=island.best_models,
                                   pressure=island.pressure,cases=island.cases,portfolio=island.portfolio,library=island.library,evaluator=evaluator,bayesian_proposal_rate=cell_proposals,
-                                  crossover_rate=cell_crossover,qd_mode=args.qd_mode,lexicase_cases=args.lexicase_cases,nsga_normalization=args.nsga_normalization,bayesian_mode=args.bayesian_mode,adf_registry=island.adf_registry,budget=island.budget,progress=progress,population_size=island.population_size)
+                                  crossover_rate=cell_crossover,qd_mode=args.qd_mode,lexicase_cases=args.lexicase_cases,nsga_normalization=args.nsga_normalization,bayesian_mode=args.bayesian_mode,adf_registry=island.adf_registry,budget=island.budget,progress=progress,population_size=island.population_size,
+                                  role_settings=cell_role_settings(island))
             evolve_cells(islands,step,cell_workers,evaluator,shared={"X":X,"Xt":Xt,"Yt":Yt,"Xv":Xv,"Yv":Yv,"constraints":constraints})
             gen+=1
             advance_topology(islands,checkpoint_state["island_config"],gen,X=Xt,n_features=X.shape[1],ops=ops,nodes=nodes,depth=depth,

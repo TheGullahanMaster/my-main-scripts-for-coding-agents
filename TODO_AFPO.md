@@ -27,6 +27,28 @@ GUI form test in `test_afpo_gui.py`):
   `novelty_pool`, `unique_models` and `ParetoArchive`; `--equivalence-collapse
   off` restores syntactic identity; checkpoints from before it resume with it off.
 - **Benchmark**: `benchmark_afpo.py` (Phase 6 harness).
+- **Per-island roles** (2026-10-03): with roles on, every island after the
+  first gets its own role, chosen in the terminal setup (comma list) or with
+  one GUI dropdown per island; the setup key is `roles.assignments`. `auto` is
+  the self-organising specialist above (the default, so older setups and
+  checkpoints behave exactly as before); the fixed presets
+  (`preset_role_parameters`) are `generalist`, `simplifier` (60% tree size,
+  hoist/shrink/new `prune` moves, 5% parsimony band, accepts smaller trees
+  with unchanged output, gathers every island's migrants), `explorer` (25%
+  fresh random offspring, no semantic step cap, more crossover/proposals),
+  `refiner` (constant/point moves, step cap 1 target s.d.), and
+  `family:<group>` (new structure from arithmetic + one operator group; MDL
+  still priced on the run's whole grammar). Fixed roles are never reweighted
+  or retired; their held-out contribution is still logged. Only a first
+  look so far (coffee cooling, Newton's law, 4 islands, population 120, 60
+  generations, groups 1-9, 4 seeds): all-auto reached the noise floor 4/4
+  (mean 136 MDL bits, 2 readable exponentials); auto + simplifier +
+  family:3 reached it 4/4 but with rbf/sigmoid-tail forms (mean 183 bits);
+  auto + auto + simplifier reached it 2/4 (mean 166 bits). So no preset is a
+  default; benchmark them (`benchmark_afpo.py` takes `roles.assignments`)
+  before tuning `SIMPLIFIER_PARSIMONY`, `EXPLORER_NOVELTY`,
+  `REFINER_MAX_DELTA` or `ROLE_MUTATION_BIAS`. Stages with roles are covered
+  by tests only.
 
 Not done: role-specific ALPS reseeding uses global tree size; residual-signature
 descriptors (Phase 3) and everything in Phases 4-5 other than the above.

@@ -82,6 +82,20 @@ class GuiTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "eight models each"):
             gui.check_form(crowded)
 
+    def test_island_role_dropdowns_reach_the_setup(self):
+        options = gui.options()
+        self.assertEqual([r["id"] for r in options["roles"]], ["auto", "generalist", "simplifier", "explorer", "refiner"])
+        self.assertTrue(all(r["name"] and r["description"] for r in options["roles"]))
+        chosen = form(self.csv, islands=4, roles=True, island_roles=["simplifier", "auto", "family:4"])
+        setup = gui.setup_answers(chosen)
+        self.assertEqual(setup["roles"]["assignments"], ["simplifier", "auto", "family:4"])
+        self.assertEqual(gui.setup_answers(form(self.csv, islands=3, roles=True))["roles"]["assignments"], ["auto", "auto"])
+        self.assertEqual(gui.setup_answers(form(self.csv, islands=3, roles=False, island_roles=["simplifier", "auto"]))["roles"]["assignments"], [])
+        with self.assertRaisesRegex(ValueError, "Unknown island role"):                     # group 3 is not ticked
+            gui.setup_answers(form(self.csv, islands=2, roles=True, island_roles=["family:3"]))
+        with self.assertRaisesRegex(ValueError, "one entry per island"):
+            gui.setup_answers(form(self.csv, islands=3, roles=True, island_roles=["auto"]))
+
     def test_train_choose_then_explore(self):
         session = gui.TrainingSession()
         session.start(form(self.csv))

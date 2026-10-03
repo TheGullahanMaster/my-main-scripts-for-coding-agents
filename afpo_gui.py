@@ -204,7 +204,9 @@ def options():
     defaults = {a.dest: a.default for a in parser._actions if a.option_strings}
     groups = [{"id": gid, "name": name, "ops": list(ops), "default": gid in afpo.DEFAULT_GROUP_IDS}
               for gid, (name, ops) in afpo.OPERATOR_GROUPS.items()]
-    return {"groups": groups, "advanced": advanced, "defaults": defaults, "profiles": list(afpo.PROFILES),
+    roles = [{"id": role, "name": label.split(":", 1)[0], "description": label.split(":", 1)[1].strip()}
+             for role, label in afpo.ISLAND_ROLES.items()]
+    return {"groups": groups, "roles": roles, "advanced": advanced, "defaults": defaults, "profiles": list(afpo.PROFILES),
             "adf_modes": ["off", "flat", "nested"], "cwd": os.getcwd(),
             "op_cost": {op: afpo.OP_COMPLEXITY_BONUS.get(op, 2) for op in afpo.OPS}}
 
@@ -284,11 +286,15 @@ def setup_answers(form):
         except ValueError as exc:
             raise ValueError(f"Constraint metadata is not valid JSON: {exc}")
     islands = max(1, int(search.get("islands") or 1))
+    ops = selected_operators(form)
+    roles_on = bool(search.get("roles")) and islands > 1
+    # One dropdown per island after the first; island 1 stays the generalist.
+    assignments = afpo.validate_island_roles(search.get("island_roles") or [], islands, ops) if roles_on else []
     stage_mode = search.get("stage_mode") or "off"
     stages = afpo.stage_config(stage_mode, count=int(search.get("stages") or 3), interval=int(search.get("stage_interval") or 5),
                                age_gap=int(search.get("stage_age_gap") or 10), schedule=search.get("stage_schedule") or "polynomial",
                                threshold_quantile=float(search.get("stage_quantile") or .5))
-    return {"path": str(path), "delimiter": data.get("delimiter") or ",", "types": types, "ops": selected_operators(form),
+    return {"path": str(path), "delimiter": data.get("delimiter") or ",", "types": types, "ops": ops,
             "affine_on": bool(search.get("affine", True)), "coev": bool(search.get("coev", False)),
             "dynamic_pressure_on": bool(search.get("dynamic_pressure", True)), "adf_enabled": bool(search.get("adf", False)),
             "nodes": max(3, int(search.get("nodes") or 31)), "depth": max(1, int(search.get("depth") or 6)),
@@ -296,7 +302,7 @@ def setup_answers(form):
             "migration_interval": max(1, int(search.get("migration_interval") or 25)) if islands > 1 else 0,
             "migrants_per_island": max(1, int(search.get("migrants") or 2)) if islands > 1 else 0,
             "stages": stages,
-            "roles": afpo.role_config(bool(search.get("roles")) and islands > 1, interval=int(search.get("role_interval") or 10)),
+            "roles": afpo.role_config(roles_on, interval=int(search.get("role_interval") or 10), assignments=assignments),
             "val_path": val_path, "validation_percent": float(data.get("validation_percent") or 0) if mode == "percent" else None,
             "metadata": metadata}
 

@@ -65,6 +65,10 @@ main { padding: 14px 16px 40px; max-width: 1500px; margin: 0 auto; }
 .field > label { display: block; font-weight: 550; margin-bottom: 3px; }
 .field > label .hint { font-weight: 400; margin-left: 6px; }
 .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.roleWide { grid-column: 1 / -1; }
+.roleGrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 8px 12px; }
+.roleGrid label { display: block; font-weight: 550; margin-bottom: 3px; }
+.roleGrid .hint { display: block; margin-top: 2px; }
 .row > .grow { flex: 1; min-width: 160px; }
 .fields { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 4px 12px; }
 input[type=text], input[type=number], select, textarea { width: 100%; background: var(--surface); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 5px 8px; font: inherit; min-width: 0; }
@@ -283,8 +287,9 @@ input, select, textarea { max-width: 100%; }
           <div class="field"><label>Islands <span class="hint">1 = single population</span></label><input type="number" id="islands" value="1" min="1"></div>
           <div class="field islandOnly"><label>Migration interval</label><input type="number" id="migrationInterval" value="25" min="1"></div>
           <div class="field islandOnly"><label>Migrants per island</label><input type="number" id="migrants" value="2" min="1"></div>
-          <div class="field islandOnly"><label class="check"><input type="checkbox" id="roles"> Self-organising roles <span class="hint">island 1 generalist, others specialise</span></label></div>
-          <div class="field islandOnly"><label>Role update interval</label><input type="number" id="roleInterval" value="10" min="1"></div>
+          <div class="field islandOnly"><label class="check"><input type="checkbox" id="roles"> Island roles</label></div>
+          <div class="field islandOnly roleOnly"><label>Role update interval</label><input type="number" id="roleInterval" value="10" min="1"></div>
+          <div class="field islandOnly roleOnly roleWide"><label>Role of each island <span class="hint">Auto learns its niche from the data; island 1 stays the generalist</span></label><div class="roleGrid" id="islandRoles"></div></div>
           <div class="field"><label>AFPO stages <span class="hint">newcomers climb a ladder</span></label><select id="stageMode"><option value="off">Off</option><option value="fitness">Fitness (HFC)</option><option value="age">Age (ALPS)</option><option value="both">Fitness + age</option></select></div>
           <div class="field stageOnly"><label>Stages per island</label><input type="number" id="stages" value="3" min="2"></div>
           <div class="field stageOnly"><label>Promotion interval</label><input type="number" id="stageInterval" value="5" min="1"></div>
@@ -1045,7 +1050,46 @@ function updateOpCount() {
   for (const g of OPTIONS.groups) if (groups.includes(g.id)) g.ops.forEach(o => { if (!excluded.includes(o)) set.add(o); });
   $$('#opGroups .group').forEach(div => div.querySelector('.chips').style.opacity = div.querySelector('input').checked ? 1 : .45);
   $('#opCount').textContent = `${set.size} operators enabled`;
+  renderIslandRoles();
 }
+// Island roles: one dropdown per island after the first.  The operator-family
+// roles follow the ticked groups (arithmetic + one group each).  Choices are
+// remembered per island position, so shrinking and regrowing the island
+// count keeps them; the server validates them again.
+function roleChoices() {
+  const base = OPTIONS ? OPTIONS.roles : [{id: 'auto', name: 'Auto', description: 'learns its niche from the data'}];
+  if (!OPTIONS) return base;
+  const {groups, excluded} = operatorForm();
+  const enabled = g => groups.includes(g.id) && g.ops.some(o => !excluded.includes(o));
+  const arithmetic = enabled(OPTIONS.groups.find(g => g.id === '1') || {id: '', ops: []});
+  const families = OPTIONS.groups.filter(enabled).map(g => {
+    const what = g.id === '1' || !arithmetic ? g.name.toLowerCase() : 'arithmetic + ' + g.name.toLowerCase();
+    return {id: 'family:' + g.id, name: 'Operators: ' + g.name.toLowerCase(), description: `builds new structure from ${what} operators only`};
+  });
+  return [...base, ...families];
+}
+function renderIslandRoles() {
+  const box = $('#islandRoles'); if (!box) return;
+  const n = Math.max(1, Math.floor(+$('#islands').value || 1)), stored = store.get('islandRoles', []), choices = roleChoices();
+  box.innerHTML = '';
+  for (let i = 2; i <= n; i++) {
+    const value = choices.some(c => c.id === stored[i - 2]) ? stored[i - 2] : 'auto';
+    const div = document.createElement('div');
+    div.innerHTML = `<label for="islandRole${i}">Island ${i}</label><select id="islandRole${i}" data-island-role="${i - 2}">${choices.map(c => `<option value="${esc(c.id)}" ${c.id === value ? 'selected' : ''}>${esc(c.name)}</option>`).join('')}</select><span class="hint"></span>`;
+    box.appendChild(div);
+  }
+  describeIslandRoles();
+}
+function describeIslandRoles() {
+  const choices = roleChoices();
+  $$('#islandRoles select').forEach(sel => { const c = choices.find(x => x.id === sel.value); sel.nextElementSibling.textContent = c ? c.description : ''; });
+}
+function islandRoleValues() { return $$('#islandRoles select').map(sel => sel.value); }
+$('#islandRoles').addEventListener('change', e => {
+  const sel = e.target.closest('select[data-island-role]'); if (!sel) return;
+  const stored = store.get('islandRoles', []); stored[+sel.dataset.islandRole] = sel.value; store.set('islandRoles', stored);
+  describeIslandRoles();
+});
 function renderAdvanced() {
   const saved = store.get('advanced', {});
   const box = $('#advancedFields'); box.innerHTML = '';
@@ -1072,6 +1116,8 @@ function saveForm() {
   store.set('form', v);
   if (OPTIONS) { store.set('ops', operatorForm()); store.set('advanced', advancedValues()); }
   $$('.islandOnly').forEach(e => e.classList.toggle('hidden', +$('#islands').value <= 1));
+  $$('.roleOnly').forEach(e => e.classList.toggle('hidden', +$('#islands').value <= 1 || !$('#roles').checked));
+  if ($$('#islandRoles select').length !== Math.max(0, Math.floor(+$('#islands').value || 1) - 1)) renderIslandRoles();
   const stageMode = $('#stageMode').value;
   $$('.stageOnly').forEach(e => e.classList.toggle('hidden', stageMode === 'off'));
   $$('.stageFitness').forEach(e => e.classList.toggle('hidden', stageMode !== 'fitness' && stageMode !== 'both'));
@@ -1195,7 +1241,7 @@ function collectForm() {
       migration_interval: +$('#migrationInterval').value, migrants: +$('#migrants').value,
       stage_mode: $('#stageMode').value, stages: +$('#stages').value, stage_interval: +$('#stageInterval').value,
       stage_quantile: +$('#stageQuantile').value, stage_age_gap: +$('#stageAgeGap').value, stage_schedule: $('#stageSchedule').value,
-      roles: $('#roles').checked, role_interval: +$('#roleInterval').value},
+      roles: $('#roles').checked, role_interval: +$('#roleInterval').value, island_roles: islandRoleValues()},
     run: {max_generations: $('#maxGenerations').value, population: $('#population').value, seed: $('#seed').value, workers: $('#workers').value,
       adf_mode: $('#adf').checked ? $('#adfMode').value : 'off'},
     advanced: advancedValues(),
