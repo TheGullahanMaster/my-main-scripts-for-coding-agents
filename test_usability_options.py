@@ -230,5 +230,38 @@ class UnitTest(unittest.TestCase):
             a.parse_cli(["--units", "x=m$"])
 
 
+class CacheMemoryTest(unittest.TestCase):
+    def setUp(self):
+        self.budget = a.EVALUATION_CACHE_ELEMENTS
+        self.addCleanup(lambda: setattr(a, "EVALUATION_CACHE_ELEMENTS", self.budget))
+        self.addCleanup(a._EVALUATION_CACHE.clear)
+
+    def test_tree_keys_are_compact_digests_of_the_full_identity(self):
+        big = ("x", 0)
+        for i in range(400): big = ("+", big, ("c", float(i)))
+        self.assertEqual(len(a.tree_digest(big)), 16)
+        self.assertIs(a.tree_fingerprint(big), a.tree_fingerprint(big))          # memoized per tree object
+        self.assertNotEqual(a.tree_digest(("c", 0.)), a.tree_digest(("c", -0.)))  # repr decides identity
+        self.assertNotEqual(a.tree_digest(("c", 1.)), a.tree_digest(("c", 1)))
+        self.assertNotEqual(a.tree_digest([big, ("x", 1)]), a.tree_digest([("x", 1), big]))
+        self.assertEqual(len(a.equivalence_key(big)), 16)
+        self.assertIs(a.interned_grammar(["+", "-"]), a.interned_grammar(("+", "-")))
+        X = np.ones((5, 1)); a.evaluate_cached(big, X)
+        self.assertTrue(all(len(key[0]) == 16 for key in a._EVALUATION_CACHE))   # no repr text in the keys
+
+    def test_budget_counts_entries_and_workers_get_a_share(self):
+        a.configure_cache_memory(1)                                              # 125,000 elements
+        X = np.ones((10, 1))
+        for i in range(5000): a.evaluate_cached(("+", ("x", 0), ("c", float(i))), X)
+        self.assertLessEqual(a._EVALUATION_CACHE_SIZE[0], a.EVALUATION_CACHE_ELEMENTS)
+        self.assertLessEqual(len(a._EVALUATION_CACHE), a.EVALUATION_CACHE_ELEMENTS // (10 + a.EVALUATION_CACHE_ENTRY_COST) + 1)
+        a.configure_cache_memory(128)
+        with patch("signal.signal"): a._worker_init()
+        self.assertEqual(a.EVALUATION_CACHE_ELEMENTS, int(16_000_000 * a.WORKER_CACHE_SHARE))
+        self.assertFalse(a._EVALUATION_CACHE)
+        with self.assertRaises(ValueError): a.configure_cache_memory(0)
+        self.assertEqual(a.parse_cli(["--cache-memory", "32"])[1].cache_memory, 32.)
+
+
 if __name__ == "__main__":
     unittest.main()

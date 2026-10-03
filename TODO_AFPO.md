@@ -79,6 +79,18 @@ GUI form test in `test_afpo_gui.py`):
   paths in the live view's tooltips; live island labels carry their roles.
   Not built: a full ancestry DAG (both parents at every step); `lineage_id`
   and `parent_ids` leave room for an optional on-disk ledger later.
+- **Cache memory** (2026-10-03): long-lived caches were capped by entry
+  count or array elements but keyed by `repr(tree)` (plus a copy of the
+  operator tuple), so key text grew with tree size: at 63-node trees the
+  evaluation cache held ~90 MB of keys beside its ~130 MB of arrays, and
+  every `--workers` process grew its own full-size caches. Keys are now
+  128-bit blake2b digests (`tree_digest`, `tree_fingerprint` memoized per
+  tree object, `interned_grammar`), the evaluation budget charges a
+  per-entry overhead, scoring workers get 1/8 of the budget, and
+  `--cache-memory MB` (default 128) scales the evaluation, compiled-tree and
+  score caches together. Total memory (PSS) at generation 35, 4 workers,
+  255-node trees: 775 MB before, 665 MB now, 520 MB with --cache-memory 32,
+  with identical results and no measurable slowdown.
 
 Not done: role-specific ALPS reseeding uses global tree size; residual-signature
 descriptors (Phase 3) and everything in Phases 4-5 other than the above.

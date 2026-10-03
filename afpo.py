@@ -425,12 +425,54 @@ def model_description(model, n_features=None, operators=None, adfs=None):
 # audit record.  Memoize that structural part (exact integers, so the total is
 # unchanged); the readout coefficients are priced fresh.  Invalid models raise
 # from model_description() and are never cached.
+# Cache keys of trees: a 128-bit digest of their repr (and ADF signature)
+# instead of the repr itself.  With large trees the repr strings, one per
+# cached entry, outweighed the cached values: at 63-node trees the evaluation
+# cache held ~150 MB of key text beside ~130 MB of arrays.  repr, not the
+# tuple, still decides identity (0.0/-0.0 and 1/1.0 evaluate differently), and
+# blake2b is the same in every process (Python's hash() is randomised per
+# process), so keys merge across cell workers.  A tree's fingerprint is
+# memoized per tree object: trees are immutable tuples shared by every clone,
+# so a large tree is serialized and hashed once, not on every cache lookup.
+# Each memo entry holds its tree, so the id cannot be reused while cached.
+_TREE_FINGERPRINTS={}
+TREE_FINGERPRINT_LIMIT=100_000
+def _is_tree(value):
+    return isinstance(value,tuple) and bool(value) and isinstance(value[0],str)
+def tree_fingerprint(tree):
+    """128-bit digest of repr(tree), memoized per tree object."""
+    hit=_TREE_FINGERPRINTS.get(id(tree))
+    if hit is not None and hit[0] is tree: return hit[1]
+    digest=hashlib.blake2b(repr(tree).encode(),digest_size=16).digest()
+    if len(_TREE_FINGERPRINTS)>=TREE_FINGERPRINT_LIMIT: _TREE_FINGERPRINTS.clear()
+    _TREE_FINGERPRINTS[id(tree)]=(tree,digest)
+    return digest
+def tree_digest(*parts):
+    """128-bit key of trees, lists of trees and any other repr-able parts (ADF signatures, scales)."""
+    digest=hashlib.blake2b(digest_size=16)
+    for part in parts:
+        if _is_tree(part): digest.update(b"t"); digest.update(tree_fingerprint(part))
+        elif isinstance(part,list) and part and all(_is_tree(item) for item in part):
+            digest.update(b"l%d:"%len(part))
+            for item in part: digest.update(tree_fingerprint(item))
+        else: digest.update(b"r"); digest.update(repr(part).encode())
+        digest.update(b"\0")
+    return digest.digest()
+# One shared tuple per distinct grammar, so cache keys reference it instead of
+# each copying the run's operator list (~100 names).
+_GRAMMARS={}
+def interned_grammar(operators):
+    operators=tuple(operators); hit=_GRAMMARS.get(operators)
+    if hit is None:
+        if len(_GRAMMARS)>=1024: _GRAMMARS.clear()
+        hit=_GRAMMARS[operators]=operators
+    return hit
 _DESCRIPTION_BITS_CACHE={}
 def model_description_bits(model, n_features=None, operators=None, adfs=None):
     n_features=model.mdl_feature_count if n_features is None else n_features
     operators=tuple(model.mdl_operators if operators is None else operators)
     adfs=getattr(model,"adfs",{}) if adfs is None else adfs
-    key=(repr(model.trees),n_features,operators,adf_signature(model.trees,adfs))
+    key=(tree_digest(model.trees,adf_signature(model.trees,adfs)),n_features,interned_grammar(operators))
     structural=_DESCRIPTION_BITS_CACHE.get(key)
     if structural is None:
         description=model_description(model,n_features,operators,adfs)
@@ -750,11 +792,15 @@ def _equivalence_key(t):
     return (op,*children)
 def equivalence_key(tree):
     """Hashable identity shared by algebraically equal trees (see above)."""
-    if not EQUIVALENCE_COLLAPSE: return repr(tree)
-    raw=repr(tree); hit=_EQUIVALENCE_CACHE.get(raw)
+    # 128-bit digests (see tree_digest) instead of repr strings: the key and
+    # value text of every cached entry grew with the tree.  Keys are only ever
+    # compared for identity, never ordered or stored.
+    raw=tree_fingerprint(tree)
+    if not EQUIVALENCE_COLLAPSE: return raw
+    hit=_EQUIVALENCE_CACHE.get(raw)
     if hit is None:
         if len(_EQUIVALENCE_CACHE)>=16384: _EQUIVALENCE_CACHE.clear()
-        hit=_EQUIVALENCE_CACHE[raw]=repr(_equivalence_key(tree))
+        hit=_EQUIVALENCE_CACHE[raw]=hashlib.blake2b(repr(_equivalence_key(tree)).encode(),digest_size=16).digest()
     return hit
 def model_equivalence_key(model_or_trees):
     trees=model_or_trees.trees if hasattr(model_or_trees,"trees") else model_or_trees
@@ -907,12 +953,12 @@ _COMPILED_TREES={}
 def _compiled_tree(tree, feature_count):
     """(core, program, constants) of a tree the compiled kernels can run, else None (memoized)."""
     if FIT_BACKEND!="auto": return None
-    key=(repr(tree),feature_count); hit=_COMPILED_TREES.get(key)
+    key=(tree_fingerprint(tree),feature_count); hit=_COMPILED_TREES.get(key)
     if hit is None:
         core=compiled_fitter(); flat=None if core is None else _FlatTree.build(tree)
         program=None if flat is None else _compiled_program(flat,core,feature_count)
         hit=(None,) if program is None else (core,program,np.array([flat.payload[index] for index in flat.constants],float))
-        if len(_COMPILED_TREES)>=20000: _COMPILED_TREES.clear()
+        if len(_COMPILED_TREES)>=cache_limit(20000): _COMPILED_TREES.clear()
         _COMPILED_TREES[key]=hit
     return None if hit[0] is None else hit
 def _guard_changes_output(value, exact):
@@ -923,7 +969,7 @@ def guard_engagement(trees, X, adfs=None):
     """'' when no numeric guard shapes the trees' values on X, else the guard's name."""
     if not GUARD_EXPLOIT_CHECK: return ""
     X=np.asarray(X,float); interface=X.__array_interface__
-    key=(tuple(repr(t) for t in trees),adf_signature(trees,adfs),interface["data"][0],X.shape,X.strides)
+    key=(tree_digest(*trees,adf_signature(trees,adfs)),interface["data"][0],X.shape,X.strides)
     hit=_GUARD_CACHE.get(key)
     if hit is not None: return hit[0]
     reason=""; blocks=_row_blocks(len(X)) if X.ndim==2 else None
@@ -957,6 +1003,26 @@ def guard_engagement(trees, X, adfs=None):
 # results are read-only so no caller can corrupt a shared entry.
 _EVALUATION_CACHE={}; _EVALUATION_CACHE_SIZE=[0]
 EVALUATION_CACHE_ELEMENTS=16_000_000
+# --cache-memory MB sets this budget (8 bytes per element).  Every scoring
+# worker (--workers) builds its own caches, so with the full budget each one
+# grew as large as the main process (4 workers on 63-node trees: ~1 GB in
+# all).  Workers see each model about once (the main process deduplicates
+# before sending), so they get WORKER_CACHE_SHARE of the budget.
+WORKER_CACHE_SHARE = 1/8
+# The entry caps of the compiled-tree and score caches scale with the same
+# setting (CACHE_SCALE = MB/128): their entries grow with the tree size.
+CACHE_SCALE = 1.
+def cache_limit(entries):
+    return max(500,int(entries*CACHE_SCALE))
+def configure_cache_memory(megabytes):
+    global EVALUATION_CACHE_ELEMENTS,CACHE_SCALE
+    megabytes=float(megabytes)
+    if not megabytes>0: raise ValueError("--cache-memory must be positive")
+    EVALUATION_CACHE_ELEMENTS=max(10_000,int(megabytes*1_000_000/8)); CACHE_SCALE=megabytes/128
+# Charged per entry beside its array (key, tuples, array header, dict slot,
+# ~400 bytes), so few-row data cannot fill the budget with entries whose
+# overhead outweighs their values.
+EVALUATION_CACHE_ENTRY_COST=48
 def referenced_adfs(trees, adfs):
     """The ADF definitions the trees call, transitively (name order)."""
     if not adfs: return {}
@@ -1006,15 +1072,15 @@ def evaluate_cached(t, X, adfs=None):
     interface=X.__array_interface__
     # repr, not the tuple: equal-hashing constants such as 0.0/-0.0 or 1/1.0
     # can evaluate differently.
-    key=(repr(t),adf_signature((t,),adfs),interface["data"][0],X.shape,X.strides,interface["typestr"])
+    key=(tree_digest(t,adf_signature((t,),adfs)),interface["data"][0],X.shape,X.strides,interface["typestr"])
     hit=_EVALUATION_CACHE.get(key)
     if hit is not None: return hit[0]
     value=np.asarray(evaluate(t,X,adfs))
     if value.ndim!=1 or len(value)!=len(X): return value
     value.setflags(write=False)
-    _EVALUATION_CACHE[key]=(value,X); _EVALUATION_CACHE_SIZE[0]+=value.size
+    _EVALUATION_CACHE[key]=(value,X); _EVALUATION_CACHE_SIZE[0]+=value.size+EVALUATION_CACHE_ENTRY_COST
     while _EVALUATION_CACHE_SIZE[0]>EVALUATION_CACHE_ELEMENTS and _EVALUATION_CACHE:
-        oldest=next(iter(_EVALUATION_CACHE)); _EVALUATION_CACHE_SIZE[0]-=_EVALUATION_CACHE.pop(oldest)[0].size
+        oldest=next(iter(_EVALUATION_CACHE)); _EVALUATION_CACHE_SIZE[0]-=_EVALUATION_CACHE.pop(oldest)[0].size+EVALUATION_CACHE_ENTRY_COST
     return value
 
 def tree_contains_adf(tree):
@@ -1761,7 +1827,7 @@ class PosteriorParticlePopulation:
         """_likelihood_energy, memoized: the catalog carries over between
         generations, so the same particles were re-predicted every update."""
         if not (isinstance(X,np.ndarray) and isinstance(Y,np.ndarray)): return self._likelihood_energy(model,X,Y,cats)
-        key=(repr(model.trees),repr(model.scales),adf_signature(model.trees,model.adfs),array_digest(X),array_digest(Y),
+        key=(tree_digest(model.trees,model.scales,adf_signature(model.trees,model.adfs)),array_digest(X),array_digest(Y),
              repr(cats),self.likelihood_kind,self.noise_scale,self.student_t_df)
         hit=_LIKELIHOOD_ENERGY_CACHE.get(key)
         if hit is None:
@@ -2075,7 +2141,7 @@ class BayesianEquationGenerator:
 _PARTICLE_SCORE_CACHE={}
 _LIKELIHOOD_ENERGY_CACHE={}
 def assess_particle_cached(particle, X, Y, affine_on, cats):
-    key=(repr(particle.trees),adf_signature(particle.trees,particle.adfs),tuple(particle.mdl_operators),particle.mdl_feature_count,
+    key=(tree_digest(particle.trees,adf_signature(particle.trees,particle.adfs)),interned_grammar(particle.mdl_operators),particle.mdl_feature_count,
          array_digest(X),array_digest(Y),bool(affine_on),repr(cats))
     hit=_PARTICLE_SCORE_CACHE.get(key)
     if hit is None:
@@ -5195,6 +5261,11 @@ def resolve_worker_count(requested, population):
 
 def _worker_init():
     signal.signal(signal.SIGINT,signal.SIG_IGN)
+    # A smaller evaluation cache per scoring worker (see WORKER_CACHE_SHARE);
+    # inherited entries go too, so the budget holds from the first batch.
+    global EVALUATION_CACHE_ELEMENTS,CACHE_SCALE
+    EVALUATION_CACHE_ELEMENTS=max(10_000,int(EVALUATION_CACHE_ELEMENTS*WORKER_CACHE_SHARE)); CACHE_SCALE*=WORKER_CACHE_SHARE
+    _EVALUATION_CACHE.clear(); _EVALUATION_CACHE_SIZE[0]=0; _COMPILED_TREES.clear()
 
 def _worker_assess_batch(models, dataset, indices, fit_affine, epoch, tune=False):
     """Score a batch using read-only arrays inherited by forked workers."""
@@ -5238,11 +5309,11 @@ class ModelEvaluator:
         """Bound the score cache.  A key fixes the tree, grammar, ADFs, rows and
         readout, and scoring is deterministic, so entries stay valid across
         generations; archives and QD cells are no longer rescored each time."""
-        if len(self._score_cache)>self.SCORE_CACHE_LIMIT: self._score_cache.clear()
+        if len(self._score_cache)>cache_limit(self.SCORE_CACHE_LIMIT): self._score_cache.clear()
     def _cache_key(self, model, dataset, indices, fit_affine, tune=False):
         sample=None if indices is None else rows_digest(indices)
         scales=() if fit_affine else tuple((float(a),float(b)) for a,b in model.scales)
-        return (dataset,sample,fit_affine,tune,repr(model.trees),adf_signature(model.trees,model.adfs),scales,tuple(model.mdl_operators),model.mdl_feature_count)
+        return (dataset,sample,fit_affine,tune,tree_digest(model.trees,adf_signature(model.trees,model.adfs)),scales,interned_grammar(model.mdl_operators),model.mdl_feature_count)
     @staticmethod
     def _score_data(model):
         return (list(model.trees),list(model.scales),tuple(model.objectives),model.feasible,model.invalid_reason,model.constraint_count)
@@ -7239,9 +7310,9 @@ def _merge_cache_entries(entries):
         _GUARD_CACHE[key]=value
     for key,value in entries.get("_EVALUATION_CACHE",()):
         if key in _EVALUATION_CACHE: continue
-        _EVALUATION_CACHE[key]=value; _EVALUATION_CACHE_SIZE[0]+=value[0].size
+        _EVALUATION_CACHE[key]=value; _EVALUATION_CACHE_SIZE[0]+=value[0].size+EVALUATION_CACHE_ENTRY_COST
         while _EVALUATION_CACHE_SIZE[0]>EVALUATION_CACHE_ELEMENTS and _EVALUATION_CACHE:
-            oldest=next(iter(_EVALUATION_CACHE)); _EVALUATION_CACHE_SIZE[0]-=_EVALUATION_CACHE.pop(oldest)[0].size
+            oldest=next(iter(_EVALUATION_CACHE)); _EVALUATION_CACHE_SIZE[0]-=_EVALUATION_CACHE.pop(oldest)[0].size+EVALUATION_CACHE_ENTRY_COST
 
 _CELL_JOB=None
 def _evolve_cell_in_child(index):
@@ -7316,6 +7387,7 @@ def resume_main(args):
     SEQUENCE_LAYOUT=maps.get(SEQUENCE_LAYOUT_KEY)
     GUARD_EXPLOIT_CHECK=bool(state.get("numeric_guard_check",False))
     global INTERPOLATION_CHECK,FIT_BACKEND,JUMP_CONSTANT_SCAN
+    configure_cache_memory(getattr(args,"cache_memory",128))
     INTERPOLATION_CHECK=bool(state.get("interpolation_check",False))
     JUMP_CONSTANT_SCAN=bool(state.get("jump_constant_scan",False))
     global SELECTION_PROBE_FILTER
@@ -7482,6 +7554,7 @@ def build_arg_parser():
     ap.add_argument("--qd-parent-choice",choices=QD_PARENT_CHOICES,default="quality_coverage",help="How QD archives pick parent cells beyond the uniform share: success x bounded quality rank x coverage bonus, or legacy success-only (default: quality_coverage)")
     ap.add_argument("--scale-balanced-selection",choices=("on","off"),default="on",help="Selection-only: give every target-magnitude band equal weight and compare asinh-compressed errors in lexicase parent choice; reported loss is unchanged (default: on)")
     ap.add_argument("--cell-workers",type=int,default=0,help="Processes that evolve island/stage cells in parallel; 0=auto (one per cell, up to CPUs-1), 1=serial.  Results are identical either way (default: 0)")
+    ap.add_argument("--cache-memory",type=float,default=128,metavar="MB",help="Budget of the tree-output cache in the main process; each --workers scoring process gets an eighth of it. Lower it if large trees or many workers run out of memory: results are identical, only speed changes (default: 128)")
     ap.add_argument("--fit-backend",choices=("auto","python"),default="auto",help="Compiled kernels: auto uses the Cython constant fitter, jump-constant scan, affine readout and numeric guard check when they build: several times faster, agreeing with Python to round-off.  python always uses the pure-Python code (default: auto)")
     ap.add_argument("--numeric-guard-check",choices=("on","off"),default="on",help="Reject models whose values depend on afpo's numeric safety guards (the +/-1e12 value clamp, sinh/cosh/tan input clips) instead of letting them use a guard as a hidden min/max (default: on)")
     ap.add_argument("--interpolation-check",choices=("on","off"),default="on",help="Add a loss term scoring predictions between nearest-neighbour rows against interpolated targets, so equations that only memorise the training rows (e.g. short-period mod sawtooths) lose (default: on)")
@@ -7683,6 +7756,7 @@ def train_from_setup(args, setup, choose_model=None):
     global SQUASH_SWAP_WEIGHT,SMOOTH_SWAP_WEIGHT,GATE_MUTATION_WEIGHT
     SQUASH_SWAP_WEIGHT=float(getattr(args,"squash_swap_weight",1.)); SMOOTH_SWAP_WEIGHT=float(getattr(args,"smooth_swap_weight",1.)); GATE_MUTATION_WEIGHT=float(getattr(args,"gate_mutation_weight",1.))
     FIT_BACKEND=getattr(args,"fit_backend","auto")
+    configure_cache_memory(getattr(args,"cache_memory",128))
     RESIDUAL_ARCHIVE=getattr(args,"residual_archive","on")=="on"; QD_PARENT_CHOICE=getattr(args,"qd_parent_choice","quality_coverage")
     SCALE_BALANCED_SELECTION=getattr(args,"scale_balanced_selection","on")=="on"
     run_seed=args.seed if args.seed is not None else random.SystemRandom().randrange(2**32)
