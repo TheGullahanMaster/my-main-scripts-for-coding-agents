@@ -928,6 +928,11 @@ def adf_signature(trees, adfs):
     trees never call change every generation and must not change keys."""
     if not adfs: return None
     return tuple((name,repr(item["tree"]),int(item["arity"])) for name,item in referenced_adfs(trees,adfs).items()) or None
+def rows_digest(rows):
+    """128-bit content key of a row-index array.  Raw index bytes as a cache key
+    cost 8 bytes per sampled row in every entry: tens of thousands of score
+    cache entries on a large co-evolution sample held gigabytes of keys."""
+    return hashlib.blake2b(np.ascontiguousarray(rows,dtype=np.int64).tobytes(),digest_size=16).digest()
 _ROW_SUBSETS={}
 def row_subset(X, rows):
     """X[rows], returning the same array object for the same rows of the same
@@ -936,7 +941,7 @@ def row_subset(X, rows):
     if isinstance(rows,slice): return X[rows]
     rows=np.asarray(rows)
     interface=X.__array_interface__
-    key=(interface["data"][0],X.shape,X.strides,interface["typestr"],rows.dtype.str,rows.tobytes())
+    key=(interface["data"][0],X.shape,X.strides,interface["typestr"],rows.dtype.str,rows_digest(rows) if rows.dtype.kind in "iu" else rows.tobytes())
     hit=_ROW_SUBSETS.get(key)
     if hit is not None: return hit[0]
     if len(_ROW_SUBSETS)>=64: _ROW_SUBSETS.clear()
@@ -4282,6 +4287,74 @@ def parse_delimiter(choice):
     standard={"0":",","1":";","2":" ","3":"\t"}
     return standard[choice] if choice in standard else ask("Custom delimiter")
 
+CSV_CHUNK_ROWS=50_000
+def csv_read_options(delimiter):
+    """pandas' C parser for one-character delimiters: several times faster and
+    far leaner than the Python engine, which only multi-character (regex)
+    separators need."""
+    sep=delimiter or ","
+    return {"sep":sep,"engine":"c" if len(sep)==1 else "python"}
+
+class _MixedChunkTypes(Exception): pass
+
+def _sample_csv_rows(path, options, max_rows, seed, as_text):
+    """(kept chunk pieces, kept file row numbers, file row count) of a streamed uniform sample.
+
+    Each row gets a random key and the max_rows smallest keys survive, so only
+    about max_rows rows are ever held.  Typed chunks raise _MixedChunkTypes when
+    a column parses as text in one chunk and as numbers in another."""
+    generator=np.random.default_rng(seed)
+    kept=[]; keys=np.empty(0); rows=np.empty(0,dtype=np.int64); total=0; threshold=np.inf; kinds=None
+    extra={"dtype":str,"keep_default_na":False} if as_text else {}
+    for chunk in pd.read_csv(path,chunksize=CSV_CHUNK_ROWS,**extra,**options):
+        if not as_text:
+            chunk_kinds=["number" if dtype.kind in "iuf" else str(dtype) for dtype in chunk.dtypes]
+            if kinds is None: kinds=chunk_kinds
+            elif chunk_kinds!=kinds: raise _MixedChunkTypes
+        chunk_keys=generator.random(len(chunk)); chunk_rows=np.arange(total,total+len(chunk)); total+=len(chunk)
+        chosen=np.flatnonzero(chunk_keys<threshold)
+        if not len(chosen): continue
+        kept.append(chunk.iloc[chosen]); keys=np.concatenate([keys,chunk_keys[chosen]]); rows=np.concatenate([rows,chunk_rows[chosen]])
+        if len(keys)>max_rows:
+            frame=pd.concat(kept,ignore_index=True)
+            order=np.sort(np.argpartition(keys,max_rows-1)[:max_rows])
+            kept=[frame.iloc[order]]; keys=keys[order]; rows=rows[order]; threshold=float(keys.max())
+    return kept,rows,total
+
+def read_dataset(path, delimiter=",", max_rows=0, seed=0):
+    """Read a CSV; above ``max_rows`` rows keep a seeded uniform sample, in file order.
+
+    The sample is drawn while streaming the file in chunks, so a file far larger
+    than memory is never held whole.  Columns keep the types a full read gives
+    (int and float chunks unify to float as they would); if a column reads as
+    text in some chunks and numbers in others, the file is streamed again as
+    text and the kept rows are parsed together.  ``frame.attrs
+    ["afpo_row_sample"]`` records the file's row count and the kept row numbers."""
+    options=csv_read_options(delimiter)
+    if not max_rows or max_rows<=0: return pd.read_csv(path,**options)
+    try:
+        kept,rows,total=_sample_csv_rows(path,options,max_rows,seed,as_text=False)
+        frame=pd.concat(kept,ignore_index=True) if kept else None
+    except _MixedChunkTypes:
+        kept,rows,total=_sample_csv_rows(path,options,max_rows,seed,as_text=True)
+        text=io.StringIO(); pd.concat(kept,ignore_index=True).to_csv(text,index=False); del kept
+        text.seek(0); frame=pd.read_csv(text)
+    if total<=max_rows: return pd.read_csv(path,**options)
+    frame.attrs["afpo_row_sample"]={"source_rows":int(total),"max_rows":int(max_rows),"seed":int(seed),"rows":rows.tolist()}
+    return frame
+
+def csv_shape(path, delimiter=","):
+    """(row count, column names) without holding the file: the header, then one column streamed."""
+    options=csv_read_options(delimiter)
+    columns=list(pd.read_csv(path,nrows=0,**options).columns)
+    if not columns: return 0,columns
+    rows=sum(len(chunk) for chunk in pd.read_csv(path,usecols=[0],dtype=str,keep_default_na=False,chunksize=CSV_CHUNK_ROWS*4,**options))
+    return rows,columns
+
+def describe_row_sample(frame):
+    sample=frame.attrs.get("afpo_row_sample")
+    return f"; sampled {len(frame):,} of {sample['source_rows']:,} rows (--max-rows, seed {sample['seed']})" if sample else ""
+
 def holdout_split_indices(n_rows, validation_rows, seed):
     """Deterministic disjoint train/validation split used by every run."""
     if not 0 < validation_rows < n_rows: raise ValueError("Validation rows must be between 1 and n_rows - 1")
@@ -4301,7 +4374,12 @@ def dataset_sha256(path):
     return digest.hexdigest()
 
 def write_run_manifest(path, seed, config, df, train_indices, validation_indices, external_validation=None):
-    """Persist enough provenance to reproduce a run's data and split."""
+    """Persist enough provenance to reproduce a run's data and split.
+
+    ``df`` is the loaded frame or just its ``(row_count, columns)``.  Under
+    --max-rows the split indices are rows of the sample; configuration
+    ["row_sample"]["rows"] maps them to file rows."""
+    rows,columns=df if isinstance(df,tuple) else (len(df),list(df.columns))
     stamp=time.strftime("%Y%m%d-%H%M%S")
     run_dir=Path("afpo_runs") / f"{stamp}-seed{seed}"
     suffix=1
@@ -4310,7 +4388,7 @@ def write_run_manifest(path, seed, config, df, train_indices, validation_indices
     run_dir.mkdir(parents=True)
     manifest={
         "format_version":2, "seed":seed, "dataset":{"path":str(Path(path).resolve()), "sha256":dataset_sha256(path),
-        "rows":len(df), "columns":list(df.columns)}, "configuration":config,
+        "rows":rows, "columns":columns}, "configuration":config,
         "split":{"train_indices":train_indices.tolist(), "validation_indices":validation_indices.tolist(),
                  "external_validation":external_validation},
     }
@@ -4344,10 +4422,27 @@ def write_model_card(path, model, feature_names, output_names, constraints, hypo
     target=Path(path).with_name("model_card.json"); target.write_text(json.dumps(card,indent=2,sort_keys=True)+"\n")
     return target
 
-SAFE_CHECKPOINT_FORMAT=15
+# 16 stores numeric arrays as compressed base64 bytes; 15 (JSON number lists) still loads.
+SAFE_CHECKPOINT_FORMAT=16
+READABLE_CHECKPOINT_FORMATS=(15,16)
+
+def _checkpoint_state_for_save(state):
+    """The run state minus X/Y when they are the training arrays themselves.
+
+    A fresh run sets X,Y=Xt,Yt, so saving both wrote the whole dataset twice;
+    loading restores them from Xt/Yt (see checkpoint_arrays)."""
+    if state.get("X") is state.get("Xt") and state.get("Y") is state.get("Yt") and "Xt" in state:
+        return {key:value for key,value in state.items() if key not in ("X","Y")}
+    return state
+
+def checkpoint_arrays(state):
+    """(X, Y, Xt, Yt, Xv, Yv) of a loaded state; X/Y default to the training arrays."""
+    Xt,Yt=state["Xt"],state["Yt"]
+    return state.get("X",Xt),state.get("Y",Yt),Xt,Yt,state["Xv"],state["Yv"]
 
 def save_checkpoint(path, generation, population, bayes, archive, state):
     """Atomically persist all stochastic/evolutionary state as safe JSON."""
+    state=_checkpoint_state_for_save(state)
     population_data=[PosteriorParticlePopulation._model_data(m) for m in population]
     if isinstance(bayes,PerOutputBayesianBanks):
         payload={"format_version":14,"generation":generation,"population":population_data,"bayesian_banks":bayesian_banks_snapshot(bayes),"archive":{"capacity":archive.capacity,"items":[PosteriorParticlePopulation._model_data(m) for m in archive.items]},"next_lineage_id":_NEXT_LINEAGE_ID,"python_rng_state":rng.getstate(),"numpy_rng_state":np.random.get_state(),"state":state}
@@ -4362,10 +4457,14 @@ def save_checkpoint(path, generation, population, bayes, archive, state):
         payload={"format_version":14,"generation":generation,"population":population_data,"bayes":bayes_data,"archive":archive_data,"next_lineage_id":_NEXT_LINEAGE_ID,
                  "python_rng_state":rng.getstate(),"numpy_rng_state":np.random.get_state(),"state":state}
     encoded=_json_checkpoint_value(payload)
-    body=json.dumps(encoded,sort_keys=True,separators=(",",":"),allow_nan=False)
-    wrapper={"format_version":SAFE_CHECKPOINT_FORMAT,"checksum":hashlib.sha256(body.encode()).hexdigest(),"payload":encoded}
+    body=json.dumps(encoded,sort_keys=True,separators=(",",":"),allow_nan=False); del encoded
+    checksum=hashlib.sha256(body.encode()).hexdigest()
     temporary=Path(str(path)+".tmp")
-    temporary.write_text(json.dumps(wrapper,sort_keys=True,separators=(",",":"))+"\n")
+    # Exactly json.dumps(wrapper,sort_keys=True,separators=(",",":")), written
+    # around the body instead of serialising the whole payload a second time.
+    with temporary.open("w") as handle:
+        handle.write(f'{{"checksum":{json.dumps(checksum)},"format_version":{SAFE_CHECKPOINT_FORMAT},"payload":')
+        handle.write(body); handle.write("}\n")
     temporary.replace(path)
 
 def load_checkpoint(path, allow_unsafe_pickle=False):
@@ -4377,7 +4476,7 @@ def load_checkpoint(path, allow_unsafe_pickle=False):
         if not allow_unsafe_pickle: raise ValueError("Refusing legacy pickle checkpoint; rerun with --allow-unsafe-pickle only for a trusted local file")
         with source.open("rb") as handle: payload=pickle.load(handle)
     else:
-        if wrapper.get("format_version")!=SAFE_CHECKPOINT_FORMAT: raise ValueError("Unknown safe checkpoint format")
+        if wrapper.get("format_version") not in READABLE_CHECKPOINT_FORMATS: raise ValueError("Unknown safe checkpoint format")
         body=json.dumps(wrapper["payload"],sort_keys=True,separators=(",",":"),allow_nan=False)
         if hashlib.sha256(body.encode()).hexdigest()!=wrapper.get("checksum"): raise ValueError("Checkpoint checksum does not match")
         payload=_from_json_checkpoint_value(wrapper["payload"])
@@ -4458,10 +4557,21 @@ def column_types(df):
                 break
             print("Enter 0, 1, 2, 5, or 6; optionally append *count (for example 1*3).")
     return types
-def configure(path):
+LARGE_DATASET_ROWS=200_000
+def row_sample_seed(args):
+    """--max-rows samples with --seed when given, else a fixed seed, so a rerun keeps the same rows."""
+    return 0 if getattr(args,"seed",None) is None else int(args.seed)
+
+def report_loaded(df, max_rows=0):
+    print(f"Loaded {len(df):,} rows and {len(df.columns)} columns{describe_row_sample(df)}: {list(df.columns)}")
+    if len(df)>LARGE_DATASET_ROWS and not max_rows:
+        print(f"Large dataset: every generation scores every training row. --max-rows N (e.g. 100000) trains on a "
+              f"uniform sample of N rows and uses far less memory; co-evolution scores a subsample each generation.")
+
+def configure(path, max_rows=0, seed=0):
     delim=parse_delimiter(ask("Delimiter: 0=comma, 1=semicolon, 2=space, 3=tab, 4=custom", "0"))
-    df=pd.read_csv(path,sep=delim,engine="python")
-    print(f"Loaded {len(df):,} rows and {len(df.columns)} columns: {list(df.columns)}")
+    df=read_dataset(path,delim,max_rows,seed)
+    report_loaded(df,max_rows)
     types=column_types(df)
     if not any(t in (5,6) for t in types) or not any(t in (1,2) for t in types): raise ValueError("Select at least one input and one output")
     return df,types,delim
@@ -4469,31 +4579,47 @@ def parse_sequence_group(text):
     name,sep,columns=str(text).partition("=")
     if not sep or not name.strip(): raise ValueError(f"--sequence-group expects NAME=COL1,COL2,...; got {text!r}")
     return name.strip(),[column.strip() for column in columns.split(",") if column.strip()]
+ONE_HOT_WARNING_BYTES=1<<30
 def encode(df, types, fitted_maps=None):
-    features=[]; names=[]; outputs=[]; output_names=[]; categorical=[]; maps={}
+    # Columns are planned first and written straight into one preallocated
+    # matrix: stacking a list of per-feature arrays held every feature twice.
+    plan=[]; names=[]; outputs=[]; output_names=[]; categorical=[]; maps={}
     numeric_fills=dict((fitted_maps or {}).get("__afpo_numeric_fills__",{}))
     for col,t in zip(df.columns,types):
         s=df[col]
         if t==1:
             z=pd.to_numeric(s,errors="coerce").to_numpy(float)
             fill=float(numeric_fills.get(col,np.nanmedian(z[np.isfinite(z)]) if np.isfinite(z).any() else 0.))
-            numeric_fills[col]=fill; z=np.where(np.isfinite(z),z,fill); features.append(z); names.append(col)
+            numeric_fills[col]=fill; plan.append(("numeric",col,z,fill)); names.append(col)
         elif t==2:
             vals=s.fillna("__MISSING__").astype(str)
             classes=(fitted_maps or {}).get(col, sorted(vals.unique())); maps[col]=classes
-            for cl in classes: features.append((vals==cl).to_numpy(float)); names.append(f"{col}={cl}")
+            # Class positions (-1 if unseen): one pass over the rows instead of one per class.
+            plan.append(("one_hot",col,pd.Index(classes).get_indexer(vals),len(classes)))
+            names.extend(f"{col}={cl}" for cl in classes)
+            if len(classes)*len(df)*8>=ONE_HOT_WARNING_BYTES:
+                print(f"Warning: categorical input {col!r} has {len(classes):,} categories; its one-hot columns take "
+                      f"{len(classes)*len(df)*8/2**30:.1f} GB. Ignore it (type 0) if it is an identifier.")
         elif t in (5,6):
             if t==5:
                 z=pd.to_numeric(s,errors="coerce").to_numpy(float); mask=np.isfinite(z); fill=np.nanmedian(z[mask]) if mask.any() else 0.; outputs.append(np.where(mask,z,fill)); categorical.append(None)
             else:
                 vals=s.fillna("__MISSING__").astype(str)
                 classes=(fitted_maps or {}).get(col, sorted(vals.unique())); maps[col]=classes
-                # Unseen validation labels are deliberately treated as a loss,
-                # not silently added as a new output dimension.
-                outputs.append(np.array([classes.index(v) if v in classes else -1 for v in vals],float)); categorical.append(classes)
+                # Unseen validation labels are deliberately treated as a loss
+                # (code -1), not silently added as a new output dimension.
+                outputs.append(pd.Index(classes).get_indexer(vals).astype(float)); categorical.append(classes)
             output_names.append(col)
     maps["__afpo_numeric_fills__"]=numeric_fills
-    X=np.column_stack(features)
+    if not names: raise ValueError("need at least one array to concatenate")
+    X=np.empty((len(df),len(names))); offset=0
+    for item in plan:
+        if item[0]=="numeric":
+            _,_,z,fill=item; X[:,offset]=np.where(np.isfinite(z),z,fill); offset+=1
+        else:
+            _,_,codes,width=item; block=X[:,offset:offset+width]; block.fill(0.)
+            present=codes>=0; block[np.flatnonzero(present),codes[present]]=1.; offset+=width
+    del plan
     layout=(fitted_maps or {}).get(SEQUENCE_LAYOUT_KEY) or build_sequence_layout(names,SEQUENCE_GROUP_REQUEST)
     # Assigned even when None: a layout left over from an earlier run in this
     # process would otherwise add seqsum/seqprod to a run without sequences.
@@ -4541,6 +4667,22 @@ INTERPOLATION_CHECK = True
 INTERPOLATION_CHECK_WEIGHT = 1.
 INTERPOLATION_BAND_SLACK = .05
 _NEIGHBOUR_PROBE_CACHE = {}
+NEAREST_ROW_BLOCK_BYTES = 1<<25
+def nearest_other_rows(standard, rows):
+    """(nearest row, has one) for each of standard[rows], ignoring rows at squared distance <= 1e-18.
+
+    The same per-pair arithmetic as one (len(rows), n, features) difference
+    array, done a block of rows at a time with a running minimum (ties keep
+    the first row, as argmin does), so results are identical while memory
+    stays at NEAREST_ROW_BLOCK_BYTES: the all-at-once array needed 26 GB for
+    64 probes on a million 52-feature rows."""
+    query=standard[rows]; best=np.full(len(rows),np.inf); partner=np.zeros(len(rows),dtype=np.intp)
+    step=max(1,NEAREST_ROW_BLOCK_BYTES//max(1,8*len(rows)*standard.shape[1])); positions=np.arange(len(rows))
+    for start in range(0,len(standard),step):
+        distance=np.sum((query[:,None,:]-standard[None,start:start+step,:])**2,axis=2); distance[distance<=1e-18]=np.inf
+        local=np.argmin(distance,axis=1); value=distance[positions,local]
+        better=value<best; best[better]=value[better]; partner[better]=local[better]+start
+    return partner,np.isfinite(best)
 def neighbour_probes(X):
     """(probe inputs, row indices, neighbour indices) for nearest-neighbour pairs, or None."""
     if not isinstance(X,np.ndarray) or X.ndim!=2 or len(X)<4: return None
@@ -4551,8 +4693,7 @@ def neighbour_probes(X):
     standard=np.divide(values-values.mean(axis=0),scale,out=np.zeros_like(values),where=scale>EPS)
     generator=np.random.default_rng(len(X)+7919)
     rows=generator.choice(len(X),min(INTERPOLATION_PROBES,len(X)),replace=False)
-    distance=np.sum((standard[rows,None,:]-standard[None,:,:])**2,axis=2); distance[distance<=1e-18]=np.inf
-    partner=np.argmin(distance,axis=1); usable=np.isfinite(distance[np.arange(len(rows)),partner])
+    partner,usable=nearest_other_rows(standard,rows)
     rows,partner=rows[usable],partner[usable]
     if not len(rows): return None
     fraction=generator.uniform(.15,.85,len(rows))[:,None]
@@ -4743,7 +4884,7 @@ class ModelEvaluator:
         generations; archives and QD cells are no longer rescored each time."""
         if len(self._score_cache)>self.SCORE_CACHE_LIMIT: self._score_cache.clear()
     def _cache_key(self, model, dataset, indices, fit_affine, tune=False):
-        sample=None if indices is None else np.asarray(indices,dtype=np.int64).tobytes()
+        sample=None if indices is None else rows_digest(indices)
         scales=() if fit_affine else tuple((float(a),float(b)) for a,b in model.scales)
         return (dataset,sample,fit_affine,tune,repr(model.trees),adf_signature(model.trees,model.adfs),scales,tuple(model.mdl_operators),model.mdl_feature_count)
     @staticmethod
@@ -4849,8 +4990,7 @@ def set_selection_probe_data(X, Y, Xv=None, Yv=None, cats=None):
     scale=X.std(axis=0); standard=np.divide(X-X.mean(axis=0),scale,out=np.zeros_like(X),where=scale>EPS)
     generator=np.random.default_rng(len(X)+104729)
     rows=generator.choice(len(X),min(SELECTION_PROBE_ROWS,len(X)),replace=False)
-    distance=np.sum((standard[rows,None,:]-standard[None,:,:])**2,axis=2); distance[distance<=1e-18]=np.inf
-    partner=np.argmin(distance,axis=1); usable=np.isfinite(distance[np.arange(len(rows)),partner])
+    partner,usable=nearest_other_rows(standard,rows)
     rows,partner=rows[usable],partner[usable]
     if not len(rows): return
     fraction=generator.uniform(.15,.85,len(rows))[:,None]
@@ -6608,7 +6748,7 @@ def resume_main(args):
     # Island snapshots, top-up proposals and final ADF refresh all need
     # per-output banks; a single shared generator failed at the first save.
     if not isinstance(bayes,PerOutputBayesianBanks): raise ValueError("Checkpoint predates per-output Bayesian banks and cannot resume; start a new run")
-    X,Y,Xt,Yt,Xv,Yv=(state[k] for k in ("X","Y","Xt","Yt","Xv","Yv"))
+    X,Y,Xt,Yt,Xv,Yv=checkpoint_arrays(state)
     names,out_names,cats,maps=(state[k] for k in ("names","out_names","cats","maps"))
     global SEQUENCE_LAYOUT,EQUIVALENCE_COLLAPSE,RESIDUAL_ARCHIVE,QD_PARENT_CHOICE,SCALE_BALANCED_SELECTION,GUARD_EXPLOIT_CHECK
     SEQUENCE_LAYOUT=maps.get(SEQUENCE_LAYOUT_KEY)
@@ -6760,6 +6900,7 @@ def build_arg_parser():
     ap.add_argument("--allow-unsafe-pickle",action="store_true",help="Allow a trusted legacy pickle checkpoint; pickle files can execute code when loaded")
     ap.add_argument("--migrate-checkpoint",nargs=2,metavar=("SOURCE","DESTINATION"),help="Convert a trusted legacy checkpoint to the safe JSON format (requires --allow-unsafe-pickle)")
     ap.add_argument("--test-csv",help="Final held-out CSV; reported only, never used for selection")
+    ap.add_argument("--max-rows",type=int,default=0,help="Read at most this many rows from each CSV (training, validation and test): a uniform random sample (seeded by --seed, else fixed) kept in file order and drawn while streaming the file, so a large CSV never sits in memory whole and every generation scores fewer rows; the kept file rows are recorded in the run manifest; 0 reads every row (default: 0)")
     ap.add_argument("--selection-loss-tolerance",type=float,default=.01,help="Relative loss tolerance for selecting the shortest-MDL validation-equivalent model (default: 0.01)")
     ap.add_argument("--nsga-normalization",choices=NSGA_NORMALIZATIONS,default="intercept",help="Fixed NSGA-III normalization; legacy is retained only for paired ablations")
     ap.add_argument("--parsimony-quality-tolerance",type=float,default=.01,help="Per-objective relative near-tie band for lower-MDL survivor preference; 0 disables it (default: 0.01)")
@@ -6821,6 +6962,8 @@ def parse_cli(argv=None):
     if not .10 <= args.qd_parent_rate <= .30: ap.error("--qd-parent-rate must be between 0.10 and 0.30")
     if args.evaluation_refresh < 1 or args.stagnation_window < 1: ap.error("evaluation refresh and stagnation window must be positive")
     if args.fit_iterations < 1: ap.error("--fit-iterations must be positive")
+    if args.max_rows < 0: ap.error("--max-rows must be non-negative (0 reads every row)")
+    if 0 < args.max_rows < 10: ap.error("--max-rows needs at least 10 rows to split training and validation data")
     try:
         for item in args.units.split(","):
             if item.strip():
@@ -6880,7 +7023,7 @@ def collect_training_setup(args):
     """Ask the interactive training questions.  The GUI builds the same dict from its form."""
     path=Path(ask("Dataset path"))
     if not path.is_file(): raise FileNotFoundError(path)
-    df,types,delimiter=configure(path)
+    df,types,delimiter=configure(path,getattr(args,"max_rows",0),row_sample_seed(args))
     ops=choose_operator_groups()
     print("Structural objective = MDL model-description bits (uniform enabled grammar; exact constants and affine coefficients included).")
     affine_on=yes(ask("Affine scaling? 1=yes, 0=no","1")); coev=yes(ask("Use co-evolution/minibatches? 1=yes, 0=no","0"))
@@ -6977,7 +7120,10 @@ def train_from_setup(args, setup, choose_model=None):
     run_seed=args.seed if args.seed is not None else random.SystemRandom().randrange(2**32)
     rng.seed(run_seed); np.random.seed(run_seed)
     print(f"Run seed: {run_seed}")
-    path,df,types,delimiter,ops=(setup[key] for key in ("path","df","types","delimiter","ops"))
+    # Dropped from the setup so the frame can be freed once encoded (see below).
+    df=setup.pop("df")
+    path,types,delimiter,ops=(setup[key] for key in ("path","types","delimiter","ops"))
+    max_rows=getattr(args,"max_rows",0); sample_seed=row_sample_seed(args)
     affine_on,coev,dynamic_pressure_on,adf_enabled,nodes,depth=(setup[key] for key in ("affine_on","coev","dynamic_pressure_on","adf_enabled","nodes","depth"))
     island_count,migration_interval,migrants_per_island,val_path=(setup[key] for key in ("island_count","migration_interval","migrants_per_island","val_path"))
     adf_enabled=adf_enabled and args.adf_mode!="off"
@@ -6993,8 +7139,10 @@ def train_from_setup(args, setup, choose_model=None):
     if val_path=="0":
         train_indices=np.arange(len(df)); validation_indices=np.array([],dtype=int); train_df=df; validation_df=None
     elif val_path:
-        validation_df=pd.read_csv(val_path,sep=delimiter,engine="python"); train_df=df; train_indices=np.arange(len(df)); validation_indices=np.arange(len(validation_df))
-        external_validation={"path":str(Path(val_path).resolve()),"sha256":dataset_sha256(val_path),"rows":len(validation_df)}
+        validation_df=read_dataset(val_path,delimiter,max_rows,sample_seed); train_df=df; train_indices=np.arange(len(df)); validation_indices=np.arange(len(validation_df))
+        external_validation={"path":str(Path(val_path).resolve()),"sha256":dataset_sha256(val_path),"rows":len(validation_df),
+                             "row_sample":validation_df.attrs.get("afpo_row_sample")}
+        if validation_df.attrs.get("afpo_row_sample"): print(f"Validation CSV{describe_row_sample(validation_df)}.")
     else:
         pct=setup["validation_percent"]
         if pct is None or pct<=0:
@@ -7028,6 +7176,12 @@ def train_from_setup(args, setup, choose_model=None):
     if validation_df is not None:
         Xv,Yv,names2,out2,cats2,_=encode(validation_df,types,maps)
         if names2!=names or out2!=out_names or cats2!=cats: raise ValueError("Validation CSV columns/types do not match training data")
+    # Everything later needs only these from the frames; dropping them frees
+    # the parsed text and the train/validation row copies (often several
+    # times the encoded matrices) for the whole search.
+    source_columns=list(df.columns); source_rows=len(df); row_sample=df.attrs.get("afpo_row_sample")
+    input_ranges=training_input_ranges(train_df,source_columns,types); export_fixture=train_df.head(16).copy()
+    del df,train_df,validation_df
     set_selection_probe_data(Xt,Yt,Xv,Yv,cats)
     global LOSS_NOISE_FLOOR
     floor_setting=getattr(args,"loss_noise_floor","auto")
@@ -7035,8 +7189,9 @@ def train_from_setup(args, setup, choose_model=None):
     print(f"Loss noise floor: {LOSS_NOISE_FLOOR:.3g} ({'from the precision of the targets' if floor_setting=='auto' else 'set'})")
     Xtest=Ytest=None
     if args.test_csv:
-        test_df=pd.read_csv(args.test_csv,sep=delimiter,engine="python")
-        Xtest,Ytest,test_names,test_outputs,test_cats,_=encode(test_df,types,maps)
+        test_df=read_dataset(args.test_csv,delimiter,max_rows,sample_seed)
+        if test_df.attrs.get("afpo_row_sample"): print(f"Test CSV{describe_row_sample(test_df)}.")
+        Xtest,Ytest,test_names,test_outputs,test_cats,_=encode(test_df,types,maps); del test_df
         if test_names!=names or test_outputs!=out_names or test_cats!=cats: raise ValueError("Test CSV columns/types do not match training data")
     if Xv is not None and len(Xv)<3:
         raise ValueError("Validation needs at least three rows when affine scaling is enabled")
@@ -7068,14 +7223,14 @@ def train_from_setup(args, setup, choose_model=None):
         "equivalence_collapse":EQUIVALENCE_COLLAPSE,"residual_archive":RESIDUAL_ARCHIVE,"qd_parent_choice":QD_PARENT_CHOICE,"scale_balanced_selection":SCALE_BALANCED_SELECTION,
         "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"selection_probe_filter":SELECTION_PROBE_FILTER,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"fit_iterations":CONSTANT_FIT_ITERATIONS,"semantic_max_delta":SEMANTIC_MAX_DELTA,"constant_snapping":CONSTANT_SNAPPING,"snap_tolerance":SNAP_TOLERANCE,"readout":READOUT_MODE,"max_terms":MAX_TERMS,"gene_crossover_rate":GENE_CROSSOVER_RATE,"backprop_mutation_weight":BACKPROP_MUTATION_WEIGHT,"backprop_inverse":BACKPROP_INVERSE,"residual_term_weight":RESIDUAL_TERM_WEIGHT,"loss":LOSS_MODE,"huber_delta":ROBUST_LOSS_DELTA,"forbid_nesting":",".join(sorted(f"{o}>{i}" for o,i in NESTING_RULES)),"units":UNIT_SPEC,"sparse_seeding":SPARSE_SEEDING,"sparse_basis_size":SPARSE_BASIS_SIZE,"squash_swap_weight":SQUASH_SWAP_WEIGHT,"smooth_swap_weight":SMOOTH_SWAP_WEIGHT,"gate_mutation_weight":GATE_MUTATION_WEIGHT,"loss_noise_floor":LOSS_NOISE_FLOOR,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age",
         "test_csv":str(Path(args.test_csv).resolve()) if args.test_csv else None,
-    },df,train_indices,validation_indices,external_validation)
+        "row_sample":row_sample,
+    },(source_rows,source_columns),train_indices,validation_indices,external_validation)
     print(f"Run manifest: {manifest_path}")
     checkpoint_path=manifest_path.parent / "checkpoint_latest.json"
-    input_ranges=training_input_ranges(train_df,list(df.columns),types)
     checkpoint_state={"dataset_path":str(path.resolve()),"types":types,"operators":ops,"affine_on":affine_on,
         "coev":coev,"nodes":nodes,"depth":depth,"X":X,"Y":Y,"Xt":Xt,"Yt":Yt,"Xv":Xv,"Yv":Yv,
-        "names":names,"out_names":out_names,"cats":cats,"maps":maps,"encoding_schema":{"version":1,"fit_scope":"training_rows_only","maps":maps},"source_columns":list(df.columns),
-        "export_fixture":train_df.head(16).copy(),"input_ranges":input_ranges,
+        "names":names,"out_names":out_names,"cats":cats,"maps":maps,"encoding_schema":{"version":1,"fit_scope":"training_rows_only","maps":maps},"source_columns":source_columns,
+        "export_fixture":export_fixture,"input_ranges":input_ranges,
         "run_seed":run_seed,"manifest":str(manifest_path.resolve()),"bayesian_proposal_rate":args.bayesian_proposal_rate,"bayesian_mode":args.bayesian_mode,"crossover_rate":args.crossover_rate,"evaluation_workers":resolve_worker_count(args.workers,args.population),
         "qd_parent_rate":args.qd_parent_rate,"qd_mode":args.qd_mode,"lexicase_cases":args.lexicase_cases,
         "selection_policy":"loss_tolerance_shortest_mdl","selection_loss_tolerance":args.selection_loss_tolerance,
@@ -7170,7 +7325,7 @@ def train_from_setup(args, setup, choose_model=None):
     if Xtest is not None:
         metrics=frozen_metrics(chosen,Xtest,Ytest,cats,constraints,out_names)
         print(f"Final held-out test (not used for selection): loss={metrics['loss']:.6g}, shape={metrics['shape']:.6g} | output losses={output_loss_summary(metrics['losses'],out_names)}")
-    export_model(chosen,names,out_names,cats,maps,list(df.columns),types,train_df,input_ranges)
+    export_model(chosen,names,out_names,cats,maps,source_columns,types,export_fixture,input_ranges)
     write_symbolic_export(chosen,names,out_names,cats,Xt)
     selected_entry=next(entry for entry in evaluation[1] if entry[0] is chosen)
     selection={**selection,"constant_snapping":snapping,"selected_choice":labels[selected_index],"default_selected":selected_index==0,

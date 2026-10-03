@@ -128,8 +128,13 @@ def resolve_path(path, must_exist=True):
     return resolved.resolve()
 
 
-def read_frame(path, delimiter):
-    return pd.read_csv(resolve_path(path), sep=delimiter or ",", engine="python")
+def read_frame(path, delimiter, max_rows=0):
+    return afpo.read_dataset(resolve_path(path), delimiter or ",", max_rows)
+
+
+# Column statistics and type suggestions come from a uniform sample this
+# size: inspecting a multi-gigabyte CSV must not load all of it.
+INSPECT_ROWS = 100_000
 
 
 def _histogram(values, bins=24):
@@ -145,9 +150,10 @@ def _histogram(values, bins=24):
 
 def inspect_dataset(path, delimiter=","):
     """Columns with the CLI's default type suggestions, a histogram each, and a preview."""
-    df = read_frame(path, delimiter)
+    df = read_frame(path, delimiter, INSPECT_ROWS)
     if not len(df.columns):
         raise ValueError("The file has no columns")
+    sample = df.attrs.get("afpo_row_sample")
     usable = [i for i, c in enumerate(df.columns) if df[c].dropna().nunique() > 1]
     suggested_output = usable[-1] if usable else -1
     columns = []
@@ -177,7 +183,8 @@ def inspect_dataset(path, delimiter=","):
             info["top"] = [[str(k), int(v)] for k, v in top.items()]
         columns.append(info)
     preview = df.head(12).astype(object).where(df.head(12).notna(), None).values.tolist()
-    return {"path": str(resolve_path(path)), "rows": int(len(df)), "columns": columns,
+    return {"path": str(resolve_path(path)), "rows": int(sample["source_rows"] if sample else len(df)),
+            "sampled_rows": int(len(df)) if sample else None, "columns": columns,
             "preview": [[None if v is None else str(v) for v in row] for row in preview]}
 
 
@@ -306,10 +313,11 @@ def check_form(form):
     setup = setup_answers(form)
     if setup["island_count"] * setup["stages"]["count"] > args.population // 8:
         raise ValueError("Islands x stages need at least eight models each; raise the population or choose fewer islands/stages")
-    df = read_frame(setup["path"], setup["delimiter"])
-    if len(setup["types"]) != len(df.columns):
-        raise ValueError(f"The column types list has {len(setup['types'])} entries but the file has {len(df.columns)} columns; inspect the dataset again")
-    return {"ok": True, "argv": argv, "operators": len(setup["ops"]), "rows": int(len(df))}
+    rows, columns = afpo.csv_shape(resolve_path(setup["path"]), setup["delimiter"])
+    if len(setup["types"]) != len(columns):
+        raise ValueError(f"The column types list has {len(setup['types'])} entries but the file has {len(columns)} columns; inspect the dataset again")
+    return {"ok": True, "argv": argv, "operators": len(setup["ops"]), "rows": int(rows),
+            "training_rows": int(min(rows, args.max_rows)) if args.max_rows else int(rows)}
 
 
 # ───────────────────────── training child process ─────────────────────────
@@ -465,11 +473,13 @@ def run_spec(spec_path):
                 telemetry.emit("done", checkpoint=str(Path(args.resume).resolve()), best_model=str(Path("best_model.py").resolve()))
                 return 0
             answers = spec["setup"]
-            df = pd.read_csv(answers["path"], sep=answers["delimiter"], engine="python")
-            print(f"Loaded {len(df):,} rows and {len(df.columns)} columns: {list(df.columns)}")
+            df = afpo.read_dataset(answers["path"], answers["delimiter"], args.max_rows, afpo.row_sample_seed(args))
+            afpo.report_loaded(df, args.max_rows)
             if len(answers["types"]) != len(df.columns):
                 raise ValueError("Column types do not match the dataset's columns")
+            # Only the setup holds the frame, so training can free it once encoded.
             setup = {**answers, "path": Path(answers["path"]), "df": df}
+            del df
             print(f"Operators ({len(setup['ops'])}): {', '.join(setup['ops'])}")
             print("Structural objective = MDL model-description bits (uniform enabled grammar; exact constants and affine coefficients included).")
             result = afpo.train_from_setup(args, setup, choose_model=telemetry.choose)
