@@ -202,14 +202,23 @@ class UnitTest(unittest.TestCase):
                      ("sin", ("*", ("c", 2.), ("x", 0))),                  # constant carries 1/m
                      ("gt", ("x", 0), ("c", 1.)),
                      ("sqrt", ("*", ("x", 0), ("x", 0))),
-                     ("+", ("x", 4), ("x", 0))):                           # unlisted column is free
+                     ("+", ("x", 4), ("x", 0)),                            # unlisted column is free
+                     ("exp_decay", ("x", 1), ("x", 3)),                    # exp(-t k): s * 1/s
+                     ("exp_decay", ("x", 3), ("x", 1)),
+                     ("exp_decay", ("x", 1), ("c", .5)),                   # constant carries 1/s
+                     ("+", ("x", 0), ("round2", ("x", 0), ("c", 2.))),     # round2 keeps m
+                     ("+", ("x", 0), ("perceptronReLU2", ("x", 0), ("c", 1.)))):
             self.assertEqual(a.unit_violation(tree), "", tree)
 
     def test_inconsistent_trees_fail(self):
         for tree in (("+", ("x", 0), ("x", 1)),                            # m + s
                      ("exp", ("x", 0)),                                    # exp(m)
                      ("gt", ("x", 0), ("x", 2)),                           # m > m/s
-                     ("pow", ("x", 0), ("x", 1))):                         # m ** s
+                     ("pow", ("x", 0), ("x", 1)),                          # m ** s
+                     ("exp_decay", ("x", 0), ("x", 1)),                    # exp(-m s)
+                     ("exp_decay", ("x", 1), ("x", 1)),                    # exp(-s^2)
+                     ("round2", ("x", 0), ("x", 1)),                       # s decimal places
+                     ("perceptronReLU2", ("x", 0), ("x", 1))):             # m + s
             self.assertNotEqual(a.unit_violation(tree), "", tree)
 
     def test_assess_and_cli(self):

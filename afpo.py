@@ -2652,6 +2652,16 @@ def tree_units(tree):
     if op=="atan2":
         return (zero,"") if same(children) is not None else (None,"atan2 of unlike units")
     if op=="sign": return zero,""
+    if op=="exp_decay":
+        # exp(-x*y): only the product must be dimensionless, so exp_decay(t, k)
+        # with t in s and k in 1/s is fine (as exp(neg(t*k)) already is).
+        if WILDCARD in children or dimensionless(tuple(a+b for a,b in zip(*children))): return zero,""
+        return None,"exp_decay of a dimensional product"
+    if op in ("round2","floor2","ceil2","lshift","rshift"):
+        # x rounded to y places / shifted by y bits keeps x's unit; y is a count.
+        return (children[0],"") if dimensionless(children[1]) else (None,f"{op} count has units")
+    if op=="perceptronReLU2":
+        unit=same(children); return (unit,"") if unit is not None else (None,"perceptronReLU2 of unlike units")
     # Everything else (exp, log, sin, tanh, sigmoid, erf, ...) needs dimensionless arguments.
     if all(dimensionless(unit) for unit in children): return zero,""
     return None,f"{op} of a dimensional argument"
