@@ -5,14 +5,16 @@ Only numpy and pandas are required; matplotlib is optional and only used by
 the exported model.  Start it with ``python afpo.py``.
 Use ``--max-generations N`` for a bounded unattended run (useful in CI).
 
-Speed: with Cython and a C compiler installed, constant fitting and the
-numeric inversion of semantic backpropagation use the compiled kernels in
-afpo_lib/fitcore.pyx (built on first use; every operator except
-seqsum/seqprod is compiled; ``--fit-backend python`` opts out).  Runs with several island/stage cells evolve the cells in
-parallel processes (``--cell-workers``; results are identical to serial).
-Above 8192 rows trees are evaluated in cache-sized row blocks (identical
-values) and the affine readout uses the compiled streaming fit, so many
-``--workers`` no longer starve each other of memory bandwidth.
+Speed: with Cython and a C compiler installed, constant fitting (the
+Levenberg-Marquardt loop and the jump-constant scan), the Huber affine
+readout, the numeric guard check and the numeric inversion of semantic
+backpropagation use the compiled kernels in afpo_lib/fitcore.pyx (built on
+first use; every operator except seqsum/seqprod is compiled; they agree with
+Python to round-off; ``--fit-backend python`` opts out).  Runs with several
+island/stage cells evolve the cells in parallel processes (``--cell-workers``;
+results are identical to serial).  Above 8192 rows trees are evaluated in
+cache-sized row blocks (identical values), so many ``--workers`` no longer
+starve each other of memory bandwidth.
 """
 from __future__ import annotations
 
@@ -7025,7 +7027,7 @@ def build_arg_parser():
     ap.add_argument("--qd-parent-choice",choices=QD_PARENT_CHOICES,default="quality_coverage",help="How QD archives pick parent cells beyond the uniform share: success x bounded quality rank x coverage bonus, or legacy success-only (default: quality_coverage)")
     ap.add_argument("--scale-balanced-selection",choices=("on","off"),default="on",help="Selection-only: give every target-magnitude band equal weight and compare asinh-compressed errors in lexicase parent choice; reported loss is unchanged (default: on)")
     ap.add_argument("--cell-workers",type=int,default=0,help="Processes that evolve island/stage cells in parallel; 0=auto (one per cell, up to CPUs-1), 1=serial.  Results are identical either way (default: 0)")
-    ap.add_argument("--fit-backend",choices=("auto","python"),default="auto",help="Compiled kernels: auto uses the Cython constant fitter (and, above 8192 rows, the compiled affine readout) when they build: several times faster, agreeing with Python to round-off.  python always uses the pure-Python code (default: auto)")
+    ap.add_argument("--fit-backend",choices=("auto","python"),default="auto",help="Compiled kernels: auto uses the Cython constant fitter, jump-constant scan, affine readout and numeric guard check when they build: several times faster, agreeing with Python to round-off.  python always uses the pure-Python code (default: auto)")
     ap.add_argument("--numeric-guard-check",choices=("on","off"),default="on",help="Reject models whose values depend on afpo's numeric safety guards (the +/-1e12 value clamp, sinh/cosh/tan input clips) instead of letting them use a guard as a hidden min/max (default: on)")
     ap.add_argument("--interpolation-check",choices=("on","off"),default="on",help="Add a loss term scoring predictions between nearest-neighbour rows against interpolated targets, so equations that only memorise the training rows (e.g. short-period mod sawtooths) lose (default: on)")
     ap.add_argument("--jump-constant-scan",choices=("on","off"),default="on",help="Before the gradient constant fit, scan data-driven values for constants that only move a jump (mod periods, comparison thresholds, floor scales), which the gradient fit cannot move (default: on)")
