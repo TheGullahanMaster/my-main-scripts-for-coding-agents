@@ -22,6 +22,7 @@ oversubscribe the CPU.
 
 Example:
   python bench_roles.py --jobs 4 --seed-count 3
+  AFPO_MODULE=afpo_og python bench_roles.py --configs plus_simplifier   # the frozen earlier simplifier
 """
 
 import argparse
@@ -35,7 +36,16 @@ from pathlib import Path
 for _blas_threads in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
     os.environ.setdefault(_blas_threads, "1")
 
+import importlib
+import sys
+
 import numpy as np
+
+# AFPO_MODULE=afpo_og (or any module name on the path) benchmarks that copy of
+# afpo instead, e.g. the frozen pre-anchored-simplifier version; spawned
+# workers inherit the variable, so every run uses the same code.
+if os.environ.get("AFPO_MODULE"):
+    sys.modules["afpo"] = importlib.import_module(os.environ["AFPO_MODULE"])
 
 import bench_complex
 import benchmark_afpo as base

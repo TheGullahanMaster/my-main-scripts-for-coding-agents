@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Interactive AFPO/NSGA-II symbolic regression.
 
+FROZEN COPY: afpo.py as of commit a7e0387 (island roles, before the anchored
+simplifier), kept so benchmarks of the earlier simplifier stay reproducible
+(bench_roles.py runs it with AFPO_MODULE=afpo_og).  Do not develop here.
+
 Only numpy and pandas are required; matplotlib is optional and only used by
 the exported model.  Start it with ``python afpo.py``.
 Use ``--max-generations N`` for a bounded unattended run (useful in CI).
@@ -6084,10 +6088,7 @@ def migrate_islands(islands, migrant_count, *, X, nsga_normalization, parsimony_
             evaluator.assess(island.population,"train")
         pool=[model for model in island.population if model.feasible]
         if not pool: pool=island.population
-        leaving=(anchored_emigrants(pool,min(migrant_count,len(pool)),nsga_normalization,parsimony_quality_tolerance)
-                 if (island.role.get("params") or {}).get("anchored") else
-                 select_nsga(pool,min(migrant_count,len(pool)),nsga_normalization,parsimony_quality_tolerance))
-        outgoing.append([model.clone() for model in leaving])
+        outgoing.append([model.clone() for model in select_nsga(pool,min(migrant_count,len(pool)),nsga_normalization,parsimony_quality_tolerance)])
     for index,island in enumerate(islands):
         incoming=outgoing[(index-1)%len(islands)]
         if (island.role.get("params") or {}).get("gather_migrants"):
@@ -6326,25 +6327,7 @@ ROLE_MUTATION_BIAS={
     "explorer":{"subtree":2.,"point":1.5,"constant":.5},
     "refiner":{"constant":3.,"parametrize":2.,"point":1.5,"subtree":.5,"jump":.5,"hoist":.3,"shrink":.3,"bilinear":.5},
 }
-# Anchored simplifier.  Plain Pareto survival with a parsimony near-tie band
-# left the simplifier island holding migrant copies: different structures
-# rarely land within a few percent of each other's loss, so a bigger, better
-# model always kept its slot.  The simplifier therefore solves
-#     min MDL  subject to  loss <= anchor + max(band*|anchor|, noise floor)
-# in one lane of its population, where the anchor is the lowest loss the
-# island holds (it gathers every island's elites, so roughly the run's best):
-# SIMPLIFIER_LANE_SHARE of survivors are the shortest in-band models no
-# larger than the anchor, SIMPLIFIER_PARENT_SHARE of parents come from that
-# lane (and their children may not outgrow the anchor), and the rest of the
-# island is ordinary Pareto survival with the usual size allowance, a supply
-# of strong material.  Emigrants are the shortest models within the final
-# choice's band (SIMPLIFIER_FINAL_BAND, the default --selection-loss-tolerance),
-# else within SIMPLIFIER_BAND.  Selection-only: scores and the final pick are
-# unchanged.
-SIMPLIFIER_BAND = .05
-SIMPLIFIER_FINAL_BAND = .01
-SIMPLIFIER_LANE_SHARE = .5
-SIMPLIFIER_PARENT_SHARE = 2/3
+SIMPLIFIER_PARSIMONY = .05      # near-tie band in which the simplifier keeps the lower-MDL model
 EXPLORER_NOVELTY = .25          # share of an explorer's offspring drawn as fresh random trees
 REFINER_MAX_DELTA = 1.          # refiner's semantic step cap (target standard deviations)
 def preset_role_parameters(role, crossover_rate, bayesian_proposal_rate, nodes, ops):
@@ -6352,7 +6335,8 @@ def preset_role_parameters(role, crossover_rate, bayesian_proposal_rate, nodes, 
     if role=="generalist": return {}
     if role=="simplifier":
         return {"crossover_rate":.5*crossover_rate,"bayesian_proposal_rate":.5*bayesian_proposal_rate,
-                "anchored":True,"neutral_shrink":True,"gather_migrants":True,"mutation_bias":ROLE_MUTATION_BIAS["simplifier"]}
+                "nodes":max(3,int(round(.6*nodes))),"parsimony":SIMPLIFIER_PARSIMONY,"neutral_shrink":True,
+                "gather_migrants":True,"mutation_bias":ROLE_MUTATION_BIAS["simplifier"]}
     if role=="explorer":
         return {"crossover_rate":float(min(.9,1.5*crossover_rate)),"bayesian_proposal_rate":float(min(1.,1.5*bayesian_proposal_rate)),
                 "novelty":EXPLORER_NOVELTY,"semantic_max_delta":float("inf"),"mutation_bias":ROLE_MUTATION_BIAS["explorer"]}
@@ -6376,42 +6360,6 @@ def assign_role_parameters(cells, island_count, crossover_rate, bayesian_proposa
             cell.role={"params":role_parameters(t,crossover_rate,bayesian_proposal_rate,nodes),"stale":0}
         else:
             cell.role={"kind":role,"params":preset_role_parameters(role,crossover_rate,bayesian_proposal_rate,nodes,ops)}
-def anchored_band(models, band):
-    """(anchor, loss limit, in-band models) of the anchored simplifier.
-
-    The anchor is the lowest-loss feasible model (ties: the shorter); the
-    limit adds max(band*|anchor loss|, LOSS_NOISE_FLOOR), so an exact anchor
-    (loss ~0) still leaves room for models that differ only by round-off."""
-    feasible=[m for m in models if m.feasible and np.isfinite(aggregate_loss(m))]
-    if not feasible: return None,None,[]
-    anchor=min(feasible,key=secondary_key); best=aggregate_loss(anchor)
-    limit=best+max(band*abs(best),LOSS_NOISE_FLOOR)
-    return anchor,limit,[m for m in feasible if aggregate_loss(m)<=limit]
-def tree_size_cap(model):
-    """Largest single tree of a model: the per-tree node cap of its simplification lane."""
-    return max(3,max(node_size(tree) for tree in model.trees))
-def anchored_lane(models, band=SIMPLIFIER_BAND):
-    """(lane models shortest first, per-tree node cap): in-band models no bigger than the anchor."""
-    anchor,_,inside=anchored_band(models,band)
-    if anchor is None: return [],None
-    cap=tree_size_cap(anchor)
-    lane=[m for m in inside if tree_size_cap(m)<=cap]
-    return sorted(lane,key=lambda m:(model_complexity(m),aggregate_loss(m),repr(m.trees))),cap
-def anchored_survivors(pool, count, normalization, tolerance):
-    """SIMPLIFIER_LANE_SHARE of the slots to the shortest lane models, the rest by NSGA."""
-    lane,_=anchored_lane(pool)
-    kept=lane[:int(count*SIMPLIFIER_LANE_SHARE)]
-    kept_ids={id(m) for m in kept}
-    rest=[m for m in pool if id(m) not in kept_ids]
-    return kept+select_nsga(rest,min(count-len(kept),len(rest)),normalization,tolerance)
-def anchored_emigrants(pool, count, normalization, tolerance):
-    """Shortest models within the final choice's band, else within the wider lane band; NSGA fills the rest."""
-    _,_,final=anchored_band(pool,SIMPLIFIER_FINAL_BAND)
-    chosen=final or anchored_band(pool,SIMPLIFIER_BAND)[2]
-    chosen=sorted(chosen,key=lambda m:(model_complexity(m),aggregate_loss(m),repr(m.trees)))[:count]
-    chosen_ids={id(m) for m in chosen}
-    rest=[m for m in pool if id(m) not in chosen_ids]
-    return chosen+select_nsga(rest,min(count-len(chosen),len(rest)),normalization,tolerance)
 def describe_island_roles(assignments):
     """'island 2 auto, island 3 simplifier' for the run banner."""
     return ", ".join(f"island {index+2} {role}" for index,role in enumerate(assignments))
@@ -6428,7 +6376,7 @@ def cell_search_settings(cell, crossover_rate, bayesian_proposal_rate, nodes):
 def cell_role_settings(cell):
     """The preset-only settings evolve_generation takes as role_settings (None for defaults)."""
     params=cell.role.get("params") or {}
-    settings={key:params[key] for key in ("ops","parsimony","semantic_max_delta","novelty","neutral_shrink","mutation_bias","anchored") if key in params}
+    settings={key:params[key] for key in ("ops","parsimony","semantic_max_delta","novelty","neutral_shrink","mutation_bias") if key in params}
     return settings or None
 def row_errors(model, X, Y, cats):
     """Scale-free per-row error (mean over outputs) used for responsibilities."""
@@ -6807,16 +6755,6 @@ def evolve_generation(pop, generation, *, X, Xt, Yt, Xv, Yv, cats, constraints, 
     ordinary=lexicase_parents(parent_pool,parent_count-qd_count,Xs,Ys,cats,lexicase_cases,row_weights,SCALE_BALANCED_SELECTION)
     parents=(blend_dual_qd_parents(ordinary,semantic_qd,structural_qd,parent_count,qd_count,qd_controller.uniform_rate,residual_qd)
              if qd_mode=="adaptive_dual" else blend_fixed_semantic_parents(ordinary,semantic_qd,parent_count,qd_count)); children=[]; feedback=[]; credits=[]; injections=[]; discovery_children=[]
-    # Anchored simplifier: most parents come from the in-band lane (a
-    # shortest-of-two draw), and their children may not outgrow the anchor.
-    lane_ids=set(); lane_cap=nodes
-    if role_settings.get("anchored"):
-        lane,cap=anchored_lane(pop)
-        if lane:
-            lane_count=min(len(parents),int(round(len(parents)*SIMPLIFIER_PARENT_SHARE)))
-            lane_parents=[ParentChoice(min(rng.choice(lane),rng.choice(lane),key=lambda m:(model_complexity(m),aggregate_loss(m)))) for _ in range(lane_count)]
-            parents=parents[:len(parents)-lane_count]+lane_parents
-            lane_ids={id(choice) for choice in lane_parents}; lane_cap=min(nodes,cap)
     # Archive parents need the same screen fit as their children for feedback.
     evaluator.assess([parent.model for parent in parents if parent.source!="ordinary"],"train",None if isinstance(sample,slice) else sample)
     # A child identical to its parent is a wasted slot and a wasted tuning
@@ -6844,14 +6782,13 @@ def evolve_generation(pop, generation, *, X, Xt, Yt, Xv, Yv, cats, constraints, 
         elif library.items and rng.random()<library.fragment_rate:
             p=rng.choice(parents); trees=[]; composed=False
             for tree in p.model.trees:
-                candidate=library.compose(tree,variation_ops,lane_cap if id(p) in lane_ids else nodes,depth)
+                candidate=library.compose(tree,variation_ops,nodes,depth)
                 trees.append(candidate if candidate is not None else tree); composed|=candidate is not None
             if not composed and unchanged<unchanged_limit: unchanged+=1; continue
             scales=list(p.model.scales); child_age=p.model.age+1; child_origin="fragment"
             sources=[p.model]
         elif rng.random() < crossover_rate and len(parents)>=2:
-            p,q=rng.sample(parents,2); child_nodes=lane_cap if id(p) in lane_ids else nodes
-            trees=[gene_crossover(a,b,child_nodes,depth,variation_ops) if READOUT_MODE=="multiterm" and affine_on and rng.random()<GENE_CROSSOVER_RATE else semantic_crossover(a,b,Xsb,child_nodes,depth,adf_registry.definitions if adf_registry else None,max_delta=role_delta) for a,b in zip(p.model.trees,q.model.trees)]; scales=list(p.model.scales); child_age=max(p.model.age,q.model.age)+1
+            p,q=rng.sample(parents,2); trees=[gene_crossover(a,b,nodes,depth,variation_ops) if READOUT_MODE=="multiterm" and affine_on and rng.random()<GENE_CROSSOVER_RATE else semantic_crossover(a,b,Xsb,nodes,depth,adf_registry.definitions if adf_registry else None,max_delta=role_delta) for a,b in zip(p.model.trees,q.model.trees)]; scales=list(p.model.scales); child_age=max(p.model.age,q.model.age)+1
             if trees==list(p.model.trees) and unchanged<unchanged_limit: unchanged+=1; continue
             if duplicate(trees): continue
             child=Model(trees,scales,child_age,origin="crossover",parent_ids=(p.model.lineage_id,q.model.lineage_id),mdl_operators=grammar_for_trees(active_ops,trees,adf_registry.definitions if adf_registry else None),mdl_feature_count=X.shape[1],adfs={} if adf_registry is None else dict(adf_registry.definitions),founder_ids=tuple(sorted(set(p.model.founder_ids).union(q.model.founder_ids))),birth_generation=generation+1-child_age)
@@ -6863,7 +6800,7 @@ def evolve_generation(pop, generation, *, X, Xt, Yt, Xv, Yv, cats, constraints, 
             for index,tree in enumerate(p.model.trees):
                 proposal=None if bayesian_mode=="off" else (bayes[index] if isinstance(bayes,PerOutputBayesianBanks) else bayes)
                 if BACKPROP_MUTATION_WEIGHT>0 or RESIDUAL_TERM_WEIGHT>0: set_backprop_context(Xsb,backprop_desired(p.model,index,Ysb,head_outputs),fragment_trees)
-                child_tree,kind,macro=semantic_mutate(tree,Xsb,portfolio,X.shape[1],variation_ops,lane_cap if id(p) in lane_ids else nodes,depth,proposal,adf_registry.definitions if adf_registry else None,library,max_delta=role_delta,neutral_shrink=neutral_shrink)
+                child_tree,kind,macro=semantic_mutate(tree,Xsb,portfolio,X.shape[1],variation_ops,nodes,depth,proposal,adf_registry.definitions if adf_registry else None,library,max_delta=role_delta,neutral_shrink=neutral_shrink)
                 trees.append(child_tree); kinds.append(kind); macro_used|=macro
             if trees==list(p.model.trees) and unchanged<unchanged_limit: unchanged+=1; continue
             scales=list(p.model.scales); child_age=p.model.age+1; child_origin="macro_mutation" if macro_used else "mutation"
@@ -6908,9 +6845,7 @@ def evolve_generation(pop, generation, *, X, Xt, Yt, Xv, Yv, cats, constraints, 
             batch.append(Model(fresh_trees,[(1.,0.)]*len(pop[0].trees),0,origin="novelty_injection",mdl_operators=grammar_for_trees(active_ops,fresh_trees,adf_registry.definitions if adf_registry else None),mdl_feature_count=X.shape[1],adfs={} if adf_registry is None else dict(adf_registry.definitions),birth_generation=generation+1))
         evaluator.assess(batch,"train",None if isinstance(sample,slice) else sample,tune=True)
         survivor_pool=novelty_pool([*survivor_pool,*batch],Xs); attempts+=len(batch)
-    survivors=(anchored_survivors(survivor_pool,min(population_size,len(survivor_pool)),nsga_normalization,effective_tolerance)
-               if role_settings.get("anchored") else
-               select_nsga(survivor_pool,min(population_size,len(survivor_pool)),nsga_normalization,effective_tolerance))
+    survivors=select_nsga(survivor_pool,min(population_size,len(survivor_pool)),nsga_normalization,effective_tolerance)
     # Some datasets admit fewer distinct behaviors than population slots.
     # Keep population capacity even when behavioral deduplication is exhausted.
     distinct=list(survivors)

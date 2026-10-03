@@ -32,9 +32,9 @@ GUI form test in `test_afpo_gui.py`):
   one GUI dropdown per island; the setup key is `roles.assignments`. `auto` is
   the self-organising specialist above (the default, so older setups and
   checkpoints behave exactly as before); the fixed presets
-  (`preset_role_parameters`) are `generalist`, `simplifier` (60% tree size,
-  hoist/shrink/new `prune` moves, 5% parsimony band, accepts smaller trees
-  with unchanged output, gathers every island's migrants), `explorer` (25%
+  (`preset_role_parameters`) are `generalist`, `simplifier` (anchored, see
+  below; hoist/shrink/new `prune` moves, accepts smaller trees with unchanged
+  output, gathers every island's migrants), `explorer` (25%
   fresh random offspring, no semantic step cap, more crossover/proposals),
   `refiner` (constant/point moves, step cap 1 target s.d.), and
   `family:<group>` (new structure from arithmetic + one operator group; MDL
@@ -49,6 +49,19 @@ GUI form test in `test_afpo_gui.py`):
   before tuning `SIMPLIFIER_PARSIMONY`, `EXPLORER_NOVELTY`,
   `REFINER_MAX_DELTA` or `ROLE_MUTATION_BIAS`. Stages with roles are covered
   by tests only.
+- **Anchored simplifier** (2026-10-03, `anchored_band` / `anchored_survivors`
+  / `anchored_emigrants`): the first simplifier (60% size cap, 5% parsimony
+  near-tie band) only held migrant copies: at 50 generations on the coffee
+  data its shortest model within 1% of the best loss was always another
+  island's. Now it solves min MDL s.t. loss <= anchor + max(5% |anchor|,
+  noise floor), anchor = the island's lowest loss: half the survivors are the
+  shortest in-band models no larger than the anchor, 2/3 of parents come from
+  them (their children are capped at the anchor's size), the other half of
+  the island is ordinary Pareto survival with the normal size allowance, and
+  emigrants are the shortest models within 1% (else 5%). Same diagnostic
+  afterwards: 29-32 in-band models (other islands 0-7) and the shortest one
+  within 1% is the simplifier's own child. `afpo_og.py` freezes the earlier
+  version (`AFPO_MODULE=afpo_og python bench_roles.py ...`).
 
 Not done: role-specific ALPS reseeding uses global tree size; residual-signature
 descriptors (Phase 3) and everything in Phases 4-5 other than the above.

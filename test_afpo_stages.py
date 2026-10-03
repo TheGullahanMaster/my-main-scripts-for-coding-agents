@@ -334,7 +334,8 @@ class PresetRoleTests(unittest.TestCase):
         self.assertEqual([a.role_kind(c) for c in cells], ["generalist", "auto", "simplifier", "auto", "family:3"])
         self.assertEqual((cells[1].role["params"]["t"], cells[3].role["params"]["t"]), (0., 1.))   # spread over auto islands only
         simplifier = cells[2].role["params"]
-        self.assertEqual(simplifier["nodes"], 12); self.assertTrue(simplifier["gather_migrants"])
+        self.assertNotIn("nodes", simplifier); self.assertTrue(simplifier["gather_migrants"] and simplifier["anchored"])
+        self.assertTrue(a.cell_role_settings(cells[2])["anchored"])
         self.assertEqual(a.cell_role_settings(cells[4]), {"ops": ["+", "-", "*", "exp"]})
         self.assertIsNone(a.cell_role_settings(cells[1])); self.assertIsNone(a.cell_role_settings(cells[0]))
 
@@ -454,6 +455,52 @@ class PresetRoleTests(unittest.TestCase):
         self.assertEqual(setup["roles"]["assignments"], ["simplifier", "family:3"])
         self.assertTrue(setup["roles"]["enabled"])
         self.assertIn("family:3 = Operators: arithmetic + exponential and logarithmic", log.getvalue())
+
+    def scored(self, tree, loss, bits):
+        m = model(tree, ops=tuple(self.OPS)); m.objectives = (loss, 0., float(bits), 0); return m
+
+    def test_anchored_band_is_noise_floor_aware(self):
+        exact = self.scored(("square", X0), 0., 40)
+        dust = self.scored(("square", ("+", X0, ("c", 1e-9))), a.LOSS_NOISE_FLOOR / 2, 30)
+        worse = self.scored(X0, 1e-3, 10)
+        anchor, limit, inside = a.anchored_band([worse, dust, exact], .05)
+        self.assertIs(anchor, exact)
+        self.assertEqual(limit, a.LOSS_NOISE_FLOOR)                    # 5% of zero would leave no room at all
+        self.assertEqual({id(m) for m in inside}, {id(exact), id(dust)})
+        anchor, limit, inside = a.anchored_band([self.scored(X0, 2., 10), self.scored(X0, 2.09, 9), self.scored(X0, 2.11, 8)], .05)
+        self.assertAlmostEqual(limit, 2.1); self.assertEqual(len(inside), 2)
+
+    def test_anchored_survival_keeps_the_shortest_in_band_models(self):
+        best = self.scored(("+", ("square", X0), ("sin", ("*", X0, ("c", 2.)))), 1., 120)    # 7 nodes
+        close = [self.scored(("+", ("square", X0), ("c", float(i))), 1.02, 60 + i) for i in range(6)]     # in band, shorter
+        bigger = self.scored(("+", ("+", ("square", X0), ("sin", X0)), ("*", X0, ("c", 3.))), 1.01, 200)  # in band, 9 nodes > anchor
+        junk = [self.scored(("c", float(i)), 5. + i, 5) for i in range(10)]                    # short but far out of band
+        pool = [best, *close, bigger, *junk]
+        lane, cap = a.anchored_lane(pool)
+        self.assertEqual(cap, 7); self.assertNotIn(bigger, lane)
+        self.assertEqual(lane[0], close[0]); self.assertEqual(lane[-1], best)
+        survivors = a.anchored_survivors(pool, 8, "intercept", .01)
+        self.assertEqual(len(survivors), 8)
+        self.assertEqual(survivors[:4], close[:4])                     # half the slots: shortest in-band first
+        plain = a.select_nsga(pool, 8, "intercept", .01)
+        self.assertGreater(sum(m in junk for m in plain), sum(m in junk for m in survivors[:4]))
+
+    def test_anchored_emigrants_prefer_the_final_choice_band(self):
+        best = self.scored(("square", X0), 1., 50)
+        near = self.scored(("square", ("+", X0, ("c", 1.))), 1.005, 45)          # within 1%
+        wider = self.scored(X0, 1.04, 10)                                        # within 5% only
+        self.assertEqual(a.anchored_emigrants([best, near, wider], 1, "intercept", .01), [near])
+        self.assertEqual(a.anchored_emigrants([best, wider], 2, "intercept", .01)[0], best)    # 1% band: just the anchor
+        self.assertEqual(a.anchored_emigrants([self.scored(X0, 1., 50), wider], 1, "intercept", .01)[0].objectives[2], 50.)
+
+    def test_anchored_generation_keeps_its_lane_and_size(self):
+        state = self.cells(2)[1]
+        for generation in range(3):
+            advance(state, generation, self.X, self.Y, self.cats, self.OPS, self.ev, role_settings={"anchored": True, "neutral_shrink": True})
+        self.assertEqual(len(state.population), state.population_size)
+        lane, cap = a.anchored_lane(state.population)
+        self.assertTrue(lane)
+        self.assertTrue(all(a.tree_size_cap(m) <= cap for m in lane))
 
     def test_unknown_role_in_setup_is_rejected(self):
         df = pd.DataFrame({"a": np.arange(40.), "y": np.arange(40.)})
