@@ -4667,6 +4667,22 @@ INTERPOLATION_CHECK = True
 INTERPOLATION_CHECK_WEIGHT = 1.
 INTERPOLATION_BAND_SLACK = .05
 _NEIGHBOUR_PROBE_CACHE = {}
+NEAREST_ROW_BLOCK_BYTES = 1<<25
+def nearest_other_rows(standard, rows):
+    """(nearest row, has one) for each of standard[rows], ignoring rows at squared distance <= 1e-18.
+
+    The same per-pair arithmetic as one (len(rows), n, features) difference
+    array, done a block of rows at a time with a running minimum (ties keep
+    the first row, as argmin does), so results are identical while memory
+    stays at NEAREST_ROW_BLOCK_BYTES: the all-at-once array needed 26 GB for
+    64 probes on a million 52-feature rows."""
+    query=standard[rows]; best=np.full(len(rows),np.inf); partner=np.zeros(len(rows),dtype=np.intp)
+    step=max(1,NEAREST_ROW_BLOCK_BYTES//max(1,8*len(rows)*standard.shape[1])); positions=np.arange(len(rows))
+    for start in range(0,len(standard),step):
+        distance=np.sum((query[:,None,:]-standard[None,start:start+step,:])**2,axis=2); distance[distance<=1e-18]=np.inf
+        local=np.argmin(distance,axis=1); value=distance[positions,local]
+        better=value<best; best[better]=value[better]; partner[better]=local[better]+start
+    return partner,np.isfinite(best)
 def neighbour_probes(X):
     """(probe inputs, row indices, neighbour indices) for nearest-neighbour pairs, or None."""
     if not isinstance(X,np.ndarray) or X.ndim!=2 or len(X)<4: return None
@@ -4677,8 +4693,7 @@ def neighbour_probes(X):
     standard=np.divide(values-values.mean(axis=0),scale,out=np.zeros_like(values),where=scale>EPS)
     generator=np.random.default_rng(len(X)+7919)
     rows=generator.choice(len(X),min(INTERPOLATION_PROBES,len(X)),replace=False)
-    distance=np.sum((standard[rows,None,:]-standard[None,:,:])**2,axis=2); distance[distance<=1e-18]=np.inf
-    partner=np.argmin(distance,axis=1); usable=np.isfinite(distance[np.arange(len(rows)),partner])
+    partner,usable=nearest_other_rows(standard,rows)
     rows,partner=rows[usable],partner[usable]
     if not len(rows): return None
     fraction=generator.uniform(.15,.85,len(rows))[:,None]
@@ -4975,8 +4990,7 @@ def set_selection_probe_data(X, Y, Xv=None, Yv=None, cats=None):
     scale=X.std(axis=0); standard=np.divide(X-X.mean(axis=0),scale,out=np.zeros_like(X),where=scale>EPS)
     generator=np.random.default_rng(len(X)+104729)
     rows=generator.choice(len(X),min(SELECTION_PROBE_ROWS,len(X)),replace=False)
-    distance=np.sum((standard[rows,None,:]-standard[None,:,:])**2,axis=2); distance[distance<=1e-18]=np.inf
-    partner=np.argmin(distance,axis=1); usable=np.isfinite(distance[np.arange(len(rows)),partner])
+    partner,usable=nearest_other_rows(standard,rows)
     rows,partner=rows[usable],partner[usable]
     if not len(rows): return
     fraction=generator.uniform(.15,.85,len(rows))[:,None]

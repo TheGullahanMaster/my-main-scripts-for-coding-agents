@@ -88,6 +88,18 @@ class EncodeTests(unittest.TestCase):
         Xv, Yv, *_ = a.encode(pd.DataFrame({"x": [2.], "c": ["new"], "y": [0.], "k": ["unseen"]}), [1, 2, 5, 6], maps)
         np.testing.assert_array_equal(Xv, [[2, 0, 0, 0]]); self.assertEqual(Yv[0, 1], -1)
 
+    def test_blocked_nearest_rows_match_all_pairs(self):
+        rng = np.random.default_rng(0)
+        X = np.round(rng.normal(size=(600, 3)), 1); X[5] = X[6]
+        rows = rng.choice(600, 64, replace=False)
+        distance = np.sum((X[rows, None, :] - X[None, :, :]) ** 2, axis=2); distance[distance <= 1e-18] = np.inf
+        expected = np.argmin(distance, axis=1)
+        for block in (1 << 25, 4096, 8):
+            with patch.object(a, "NEAREST_ROW_BLOCK_BYTES", block):
+                partner, usable = a.nearest_other_rows(X, rows)
+            np.testing.assert_array_equal(partner, expected)
+            np.testing.assert_array_equal(usable, np.isfinite(distance[np.arange(64), expected]))
+
     def test_row_cache_keys_are_compact(self):
         rows = np.arange(100_000)
         self.assertEqual(len(a.rows_digest(rows)), 16)
