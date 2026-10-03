@@ -233,9 +233,21 @@ input, select, textarea { max-width: 100%; }
       <div class="card" id="columnsCard">
         <h2>Columns <span class="grow"></span><span class="hint" id="columnsSummary"></span></h2>
         <div id="columnsEmpty" class="hint">Inspect a dataset to choose inputs and outputs. Defaults follow the terminal version: the last usable column is the output, constant columns are ignored.</div>
-        <div class="scroll hidden" id="columnsWrap">
-          <table id="columnsTable"><thead><tr><th>#</th><th>Column</th><th>Values</th><th>Distribution</th><th>Use as</th></tr></thead><tbody></tbody></table>
+        <div class="row hidden" id="columnsBulk" style="margin-bottom:8px">
+          <button class="btn" data-colsel="all">Select all</button>
+          <button class="btn" data-colsel="none">None</button>
+          <button class="btn" data-colsel="numeric">Numeric</button>
+          <button class="btn" data-colsel="text">Text</button>
+          <button class="btn" data-colsel="invert">Invert</button>
+          <span class="hint" id="colSelCount">0 selected →</span>
+          <select id="colBulkType" style="width:auto"></select>
+          <button class="btn primary" id="colBulkSet" disabled>Set type</button>
+          <button class="btn" id="colUseSuggested" title="Reset every column to the suggested type">Use suggestions</button>
         </div>
+        <div class="scroll hidden" id="columnsWrap">
+          <table id="columnsTable"><thead><tr><th><input type="checkbox" id="colSelAll" title="Select every usable column"></th><th>#</th><th>Column</th><th>Values</th><th>Distribution</th><th>Use as</th></tr></thead><tbody></tbody></table>
+        </div>
+        <div class="hint hidden" id="columnsTip" style="margin-top:8px">Tip: tick several rows (shift+click for a range) and change one of their menus — or use “Set type” — to assign them all at once. Constant columns stay ignored.</div>
         <details class="hidden" id="previewWrap"><summary>Preview first rows</summary><div class="scroll-x"><table id="previewTable"></table></div></details>
       </div>
 
@@ -1094,26 +1106,54 @@ async function inspect() {
     const key = INSPECT.path + '|' + delimiterValue();
     INSPECT.columns.forEach(c => c.type = c.suggested);
     if (savedTypes && savedTypes.key === key && savedTypes.types.length === INSPECT.columns.length) INSPECT.columns.forEach((c, i) => { if (!c.constant) c.type = savedTypes.types[i]; });
+    COL_SEL = new Set(); COL_LAST = null;
     renderColumns();
     $('#datasetInfo').textContent = `${INSPECT.rows.toLocaleString()} rows · ${INSPECT.columns.length} columns · ${INSPECT.path}`;
   } catch (e) { $('#datasetInfo').textContent = ''; toast(e.message, true); }
   finally { $('#inspectBtn').disabled = false; }
 }
+// Batch typing: ticked rows (indices into INSPECT.columns) share type changes. Constant columns
+// cannot be selected and always stay ignored, as in the terminal's type*count.
+let COL_SEL = new Set(), COL_LAST = null;
+const usableColumns = () => INSPECT.columns.filter(c => !c.constant);
+function selectColumns(cols) { COL_SEL = new Set(cols.map(c => c.index)); COL_LAST = null; renderColumns(); }
+function setColumnTypes(indices, type) {
+  for (const i of indices) if (!INSPECT.columns[i].constant) INSPECT.columns[i].type = type;
+  renderColumns();
+}
 function renderColumns() {
   const tb = $('#columnsTable tbody'); tb.innerHTML = '';
   for (const c of INSPECT.columns) {
     const tr = document.createElement('tr');
+    if (COL_SEL.has(c.index)) tr.className = 'selected';
     const values = c.numeric ? `${fmt(c.min)} … ${fmt(c.max)}<div class="hint">${c.unique} unique${c.missing ? ` · ${c.missing} missing` : ''}</div>`
       : `${esc((c.top || []).slice(0, 3).map(t => t[0]).join(', '))}<div class="hint">${c.unique} categories${c.missing ? ` · ${c.missing} missing` : ''}</div>`;
     const select = c.constant ? '<span class="hint">ignored (constant)</span>'
       : `<select data-col="${c.index}">${TYPE_LABELS.map(([v, l]) => `<option value="${v}" ${v === c.type ? 'selected' : ''}>${l}</option>`).join('')}</select>` +
         (c.class_like && c.type === 5 ? '<div class="hint">few integer codes: pick Categorical output if these are classes</div>' : '');
-    tr.innerHTML = `<td class="num">${c.index}</td><td><strong>${esc(c.name)}</strong><div class="hint">${c.numeric ? 'numeric' : 'text'}</div></td><td>${values}</td><td class="hist">${c.hist ? '<canvas></canvas>' : ''}</td><td>${select}</td>`;
+    const tick = c.constant ? '' : `<input type="checkbox" data-colpick="${c.index}" ${COL_SEL.has(c.index) ? 'checked' : ''}>`;
+    tr.innerHTML = `<td>${tick}</td><td class="num">${c.index}</td><td><strong>${esc(c.name)}</strong><div class="hint">${c.numeric ? 'numeric' : 'text'}</div></td><td>${values}</td><td class="hist">${c.hist ? '<canvas></canvas>' : ''}</td><td>${select}</td>`;
     tb.appendChild(tr);
     if (c.hist) sparkHist(tr.querySelector('canvas'), c.hist);
+    const pick = tr.querySelector('[data-colpick]');
+    if (pick) pick.onclick = ev => {
+      if (ev.shiftKey && COL_LAST != null) {
+        const [a, b] = [COL_LAST, c.index].sort((x, y) => x - y);
+        for (let k = a; k <= b; k++) if (!INSPECT.columns[k].constant) COL_SEL.add(k);
+      } else if (COL_SEL.has(c.index)) COL_SEL.delete(c.index); else COL_SEL.add(c.index);
+      COL_LAST = c.index; renderColumns();
+    };
     const sel = tr.querySelector('select');
-    if (sel) sel.onchange = () => { c.type = +sel.value; storeTypes(); summarizeColumns(); renderColumns(); };
+    // Changing the menu of a ticked row applies the type to every ticked row.
+    if (sel) sel.onchange = () => setColumnTypes(COL_SEL.has(c.index) && COL_SEL.size > 1 ? [...COL_SEL] : [c.index], +sel.value);
   }
+  const usable = usableColumns().length;
+  $('#colSelAll').checked = usable > 0 && COL_SEL.size === usable;
+  $('#colSelAll').indeterminate = COL_SEL.size > 0 && COL_SEL.size < usable;
+  $('#colSelCount').textContent = `${COL_SEL.size} selected →`;
+  $('#colBulkSet').disabled = !COL_SEL.size;
+  if (!$('#colBulkType').options.length) $('#colBulkType').innerHTML = TYPE_LABELS.map(([v, l]) => `<option value="${v}">${l}</option>`).join('');
+  ['#columnsBulk', '#columnsTip'].forEach(id => $(id).classList.remove('hidden'));
   $('#columnsEmpty').classList.add('hidden'); $('#columnsWrap').classList.remove('hidden');
   const pt = $('#previewTable');
   pt.innerHTML = `<thead><tr>${INSPECT.columns.map(c => `<th>${esc(c.name)}</th>`).join('')}</tr></thead><tbody>${INSPECT.preview.map(r => `<tr>${r.map(v => `<td>${v === null ? '<span class="muted">∅</span>' : esc(v)}</td>`).join('')}</tr>`).join('')}</tbody>`;
@@ -1127,6 +1167,15 @@ function summarizeColumns() {
   $('#columnsSummary').textContent = `${n([1, 2])} inputs · ${n([5, 6])} outputs · ${n([0])} ignored`;
 }
 $('#inspectBtn').onclick = inspect;
+const COLUMN_PICKS = {
+  all: () => usableColumns(), none: () => [],
+  numeric: () => usableColumns().filter(c => c.numeric), text: () => usableColumns().filter(c => !c.numeric),
+  invert: () => usableColumns().filter(c => !COL_SEL.has(c.index)),
+};
+$$('[data-colsel]').forEach(b => b.onclick = () => selectColumns(COLUMN_PICKS[b.dataset.colsel]()));
+$('#colSelAll').onchange = e => selectColumns(e.target.checked ? usableColumns() : []);
+$('#colBulkSet').onclick = () => setColumnTypes([...COL_SEL], +$('#colBulkType').value);
+$('#colUseSuggested').onclick = () => { INSPECT.columns.forEach(c => c.type = c.suggested); renderColumns(); };
 
 function collectForm() {
   if (!INSPECT) throw new Error('Inspect the dataset first so its columns can be assigned');
