@@ -5,9 +5,10 @@ Only numpy and pandas are required; matplotlib is optional and only used by
 the exported model.  Start it with ``python afpo.py``.
 Use ``--max-generations N`` for a bounded unattended run (useful in CI).
 
-Speed: with Cython and a C compiler installed, constant fitting uses the
-compiled fitter in afpo_lib/fitcore.pyx (built on first use; ``--fit-backend
-python`` opts out).  Runs with several island/stage cells evolve the cells in
+Speed: with Cython and a C compiler installed, constant fitting and the
+numeric inversion of semantic backpropagation use the compiled kernels in
+afpo_lib/fitcore.pyx (built on first use; every operator except
+seqsum/seqprod is compiled; ``--fit-backend python`` opts out).  Runs with several island/stage cells evolve the cells in
 parallel processes (``--cell-workers``; results are identical to serial).
 Above 8192 rows trees are evaluated in cache-sized row blocks (identical
 values) and the affine readout uses the compiled streaming fit, so many
@@ -2306,6 +2307,7 @@ BACKPROP_MIN_VALID = .5            # share of rows whose desired value must be d
 _BACKPROP_CONTEXT = {"X":None,"desired":None,"fragments":()}
 _BACKPROP_LIBRARY_CACHE = {}
 _INVERSE_GRID = np.concatenate([-np.logspace(-6,6,121)[::-1],[0.],np.logspace(-6,6,121)])
+_INVERSE_WIDE, _INVERSE_NARROW = np.linspace(-4,4,161), np.linspace(-.25,.25,51)  # offsets around the current value, in spans
 _LIBRARY_EXCLUDED = {"python_rng","perlin_noise","seqsum","seqprod","cat","x_at_pos_y"}
 
 def set_backprop_context(X=None, desired=None, fragments=()):
@@ -2332,10 +2334,19 @@ def exact_inverse(op, k, desired, args):
     return None
 
 def numeric_inverse(op, k, desired, args):
-    """Per-row solution z of op(..., z at k, ...) = desired nearest the current child value."""
+    """Per-row solution z of op(..., z at k, ...) = desired nearest the current child value.
+
+    With --fit-backend auto the compiled kernel (afpo_lib/fitcore.pyx) runs the
+    same grid, bisection and dip search row by row: about 5x faster, equal to
+    round-off (bit for bit for the exactly compiled operators)."""
+    core=compiled_fitter() if FIT_BACKEND=="auto" else None
+    code=None if core is None else core.OPERATOR_CODES.get(op)
+    if code is not None and len(args)<=3:
+        return core.numeric_inverse(code,k,np.broadcast_to(np.asarray(desired,float),(len(args[k]),)),
+                                    [np.asarray(value,float) for value in args],_INVERSE_WIDE,_INVERSE_NARROW,_INVERSE_GRID)
     current=np.asarray(args[k],float); n=len(current)
     span=np.maximum(np.abs(current),1.)
-    grid=np.concatenate([current[:,None]+span[:,None]*np.linspace(-4,4,161)[None,:],current[:,None]+span[:,None]*np.linspace(-.25,.25,51)[None,:],np.broadcast_to(_INVERSE_GRID,(n,len(_INVERSE_GRID)))],axis=1)
+    grid=np.concatenate([current[:,None]+span[:,None]*_INVERSE_WIDE[None,:],current[:,None]+span[:,None]*_INVERSE_NARROW[None,:],np.broadcast_to(_INVERSE_GRID,(n,len(_INVERSE_GRID)))],axis=1)
     grid.sort(axis=1); G=grid.shape[1]
     def apply(z):
         values=[np.repeat(np.asarray(a,float),z.shape[1]) if i!=k else z.ravel() for i,a in enumerate(args)]

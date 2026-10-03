@@ -609,8 +609,24 @@ class CompiledFitterTests(unittest.TestCase):
 
     def test_unsupported_trees_fall_back_to_python(self):
         tree = ("bitwise_and", ("x", 0), ("c", 3.))
-        self.assertIsNone(a._compiled_program(a._FlatTree(tree), self.core, 1))
+        with patch.dict(self.core.OPERATOR_CODES):
+            del self.core.OPERATOR_CODES["bitwise_and"]
+            self.assertIsNone(a._compiled_program(a._FlatTree(tree), self.core, 1))
         self.assertIsNone(a._compiled_program(a._FlatTree(("+", ("x", 5), ("c", 1.))), self.core, 1))
+
+    def test_every_operator_but_sequence_aggregates_is_compiled(self):
+        self.assertEqual(set(a.OPS)-set(self.core.OPERATOR_CODES), {"seqsum", "seqprod"})
+
+    def test_compiled_numeric_inverse_matches_python(self):
+        rng = np.random.default_rng(3)
+        for op in ("+", "*", "sin", "mod", "if_else", "gcd", "sigmoid", "floor", "pow"):
+            args = [a.clean(rng.normal(0, 2, 64)) for _ in range(a.OPS[op][0])]
+            desired = a.op_eval(op, args)+rng.normal(0, .1, 64)
+            for k in range(len(args)):
+                with patch.object(a, "FIT_BACKEND", "python"): want = a.numeric_inverse(op, k, desired, args)
+                got = a.numeric_inverse(op, k, desired, args)
+                np.testing.assert_array_equal(np.isnan(got), np.isnan(want), err_msg=f"{op} {k}")
+                np.testing.assert_allclose(got[~np.isnan(got)], want[~np.isnan(want)], rtol=1e-10, atol=1e-12, err_msg=f"{op} {k}")
 
 
 class BlockedEvaluationTests(unittest.TestCase):
