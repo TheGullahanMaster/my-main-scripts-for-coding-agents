@@ -91,6 +91,31 @@ GUI form test in `test_afpo_gui.py`):
   score caches together. Total memory (PSS) at generation 35, 4 workers,
   255-node trees: 775 MB before, 665 MB now, 520 MB with --cache-memory 32,
   with identical results and no measurable slowdown.
+- **Role benchmark** (2026-10-03, `bench_roles.py`; 16 cases x 5 seeds,
+  5 islands, population 600, 60 generations, operator groups 1-5 and 7;
+  solved = held-out R^2 >= 0.999; paired against all_auto, bootstrap 95%):
+
+  | config | solved/80 | test R^2 | bits | vs all_auto: gained/lost | bits diff |
+  |---|---|---|---|---|---|
+  | all_auto | 54 | 0.984 | 182 | - | - |
+  | families (2 per case) | 54 | 0.983 | 187 | 4/4 | +5 [-8, +17] |
+  | all_roles (old simplifier) | 53 | 0.978 | 193 | 3/4 | +10 [-1, +22] |
+  | all_roles (anchored) | 53 | 0.981 | 190 | 3/4 | +8 [-1, +17] |
+  | plus_refiner | 52 | 0.960 | 190 | 2/4 | +8 [-4, +20] |
+  | plus_simplifier (anchored) | 52 | 0.959 | 192 | 2/4 | +10 [-1, +23] |
+  | plus_explorer | 51 | 0.961 | 186 | 1/4 | +4 [-8, +16] |
+  | plus_simplifier (old) | 50 | 0.962 | 181 | 1/5 | -1 [-13, +10] |
+
+  No fixed role beats all_auto at this budget; every interval spans zero
+  and the differences are a few hard cases moving both ways (ratio_wrap
+  favours all_auto, log_exp4 and reuse_poly3 favour roles/families). The
+  anchored simplifier recovers the old one's losses (vs old: 2 solves
+  gained, 0 lost) but its chosen models are ~12 bits longer [+2, +22]:
+  likely because it lowers the best validation loss, which tightens the 1%
+  final-choice band. Untested follow-ups: offer the simplifier's shortest
+  near-best models as their own final choice, or bench a looser
+  --selection-loss-tolerance. Raw runs: bench_roles.py output (not kept in
+  the repo).
 
 Not done: role-specific ALPS reseeding uses global tree size; residual-signature
 descriptors (Phase 3) and everything in Phases 4-5 other than the above.
