@@ -1627,7 +1627,13 @@ function renderMath() {
     if (!shown) shown = `<math display="block"><mi${o.name.length > 1 ? ' mathvariant="normal"' : ''}>${esc(o.name)}</mi><mo>=</mo>${form.mathml}</math>`;
     const a = o.agreement;
     const note = mode === 'raw' && a ? `<div class="hint">Matches the model on ${(100 * a.defined).toFixed(1)}% of training rows${a.gap == null ? '' : `, max difference ${fmt(a.gap, 2)} of the output range`}.</div>` : '';
-    return `<div class="math">${d.outputs.length > 1 ? `<div class="name">${esc(o.name)}</div>` : ''}${shown}${note}</div>`;
+    // Classifier: after the last score equation, how the scores become a class.
+    const decision = o.decision ? `<div class="name" style="margin-top:8px">${esc(o.output || o.name)}: predicted class</div>` + o.decision.latex.map((line, i) => {
+      let html = null;
+      if (MATH.katex) { try { html = MATH.katex.renderToString(line, {displayMode: true, throwOnError: true}); } catch (e) { html = null; } }
+      return html || `<div class="mono" style="margin:6px 0">${esc(o.decision.text[i] || line)}</div>`;
+    }).join('') : '';
+    return `<div class="math">${d.outputs.length > 1 ? `<div class="name">${esc(o.name)}</div>` : ''}${shown}${note}${decision}</div>`;
   }).join('') + (mode === 'exact' ? '<div class="hint">Exact: afpo\'s guards as evaluated (the per-node ±1e12 clamp is left out).</div>' : '');
 }
 $$('#mathMode button').forEach(b => b.onclick = () => {
@@ -1638,7 +1644,7 @@ $$('#mathMode button').forEach(b => b.onclick = () => {
 $('#mathCopy').onclick = async () => {
   const d = MATH.data;
   if (!d || !d.available) return;
-  const text = d.outputs.filter(o => o[MATH.mode].latex).map(o => `${o.name_latex} = ${o[MATH.mode].latex}`).join('\n');
+  const text = d.outputs.filter(o => o[MATH.mode].latex).map(o => [`${o.name_latex} = ${o[MATH.mode].latex}`, ...(o.decision ? o.decision.latex : [])].join('\n')).join('\n');
   try { await navigator.clipboard.writeText(text); toast('LaTeX copied'); } catch (e) { toast('Copy failed: ' + e.message, true); }
 };
 function fillOutputSelect(sel, names, keep) {

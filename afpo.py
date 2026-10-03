@@ -5893,10 +5893,35 @@ def _raw_agreement(expression, symbols, X, reference):
     gap=float(np.max(np.abs(values.real[defined]-reference[defined])))/spread if defined.any() else float("nan")
     return float(defined.mean()),gap
 
+def latex_text(value):
+    """\text{...} of a class label, LaTeX specials escaped."""
+    escaped=re.sub(r"([&%$#_{}])",r"\\\1",str(value)).replace("~",r"\textasciitilde{}").replace("^",r"\textasciicircum{}")
+    return r"\text{"+escaped+"}"
+def classification_decision(name, labels, score_names):
+    """How a classifier's score equations become a class: LaTeX lines and plain text.
+
+    Mirrors predict_targets: one head for two classes (the second label when
+    the score rounds to 1, probability sigmoid(s - 1/2)); one score per class
+    for three or more (arg max, softmax probabilities)."""
+    target=latex_symbol_name(name.replace(" ","_"))
+    hat=(lambda t: rf"\hat{{{t}}}") if len(name)==1 else (lambda t: rf"\widehat{{{t}}}")
+    if len(labels)==1:
+        return {"latex":[rf"{hat(target)} = {latex_text(labels[0])}"],"text":[f"{name} is always {labels[0]!r}"]}
+    if len(labels)==2:
+        s=score_names[0]
+        return {"latex":[rf"{hat(target)} = \begin{{cases}} {latex_text(labels[1])} & {s} \ge \tfrac{{1}}{{2}} \\ {latex_text(labels[0])} & \text{{otherwise}} \end{{cases}}",
+                         rf"P\left({target} = {latex_text(labels[1])}\right) = \frac{{1}}{{1 + e^{{-\left({s} - \frac{{1}}{{2}}\right)}}}}"],
+                "text":[f"{name} = {labels[1]!r} if score >= 0.5, else {labels[0]!r}",f"P({name} = {labels[1]!r}) = 1 / (1 + exp(-(score - 0.5)))"]}
+    return {"latex":[rf"{hat(target)} = \operatorname*{{arg\,max}}_{{k}}\; s_{{k}}",
+                     rf"P\left({target} = k\right) = \frac{{e^{{s_{{k}}}}}}{{\sum_{{j}} e^{{s_{{j}}}}}}"],
+            "text":[f"{name} = the class with the highest score",f"P({name} = k) = softmax of the class scores"]}
 def symbolic_model(model, feature_names, output_names, cats, positive=(), X=None):
-    """{output name: {"exact": (expr, latex), "raw": (expr, latex), "agreement": ...}}
-    for regression outputs; None without SymPy.  agreement compares the raw
-    form with the model on X (None without X)."""
+    """{name: {"exact": (expr, latex), "raw": (expr, latex), "agreement": ...}}
+    per equation head; None without SymPy.  agreement compares the raw form
+    with the model on X (None without X).  Regression outputs key by output
+    name; classifier score heads key as "name score" (two classes) or
+    "name[label] score" and also carry "output", "name_latex" (s_y or s_label)
+    and, on the target's last head, "decision" (classification_decision)."""
     try: import sympy as sp
     except ImportError: return None
     symbols=[sp.Symbol(name.replace(" ","_"),real=True,positive=True if index in positive else None) for index,name in enumerate(feature_names)]
@@ -5904,17 +5929,24 @@ def symbolic_model(model, feature_names, output_names, cats, positive=(), X=None
     predictions=None if X is None else predict_model(model,X)
     targets,_=classification_layout(cats); result={}
     for j,heads in enumerate(targets):
-        if cats[j] is not None: continue
-        head=heads[0]; entry={}
-        for mode in ("exact","raw"):
-            # An export must never stop a run: a form SymPy cannot handle is reported, not raised.
-            try:
-                expression=_symbolic_form(model,head,symbols,mode)
-                entry[mode]=(expression,sp.latex(expression,symbol_names=names,ln_notation=True,mul_symbol=r"\,"))
-            except Exception as error:
-                entry[mode]=(None,None); entry.setdefault("errors",{})[mode]=f"{type(error).__name__}: {error}"
-        entry["agreement"]=None if predictions is None or entry["raw"][0] is None else _raw_agreement(entry["raw"][0],symbols,X,predictions[:,head])
-        result[output_names[j]]=entry
+        labels=cats[j]; score_names=[]
+        for k,head in enumerate(heads):
+            entry={}
+            for mode in ("exact","raw"):
+                # An export must never stop a run: a form SymPy cannot handle is reported, not raised.
+                try:
+                    expression=_symbolic_form(model,head,symbols,mode)
+                    entry[mode]=(expression,sp.latex(expression,symbol_names=names,ln_notation=True,mul_symbol=r"\,"))
+                except Exception as error:
+                    entry[mode]=(None,None); entry.setdefault("errors",{})[mode]=f"{type(error).__name__}: {error}"
+            entry["agreement"]=None if predictions is None or entry["raw"][0] is None else _raw_agreement(entry["raw"][0],symbols,X,predictions[:,head])
+            if labels is None: result[output_names[j]]=entry; continue
+            many=len(labels)>2
+            entry["output"]=output_names[j]
+            entry["name_latex"]=f"s_{{{latex_text(labels[k])}}}" if many else f"s_{{{latex_symbol_name(output_names[j].replace(' ','_'))}}}"
+            score_names.append(entry["name_latex"])
+            if k==len(heads)-1: entry["decision"]=classification_decision(output_names[j],labels,score_names)
+            result[f"{output_names[j]}[{labels[k]}] score" if many else f"{output_names[j]} score"]=entry
     return result
 
 def write_symbolic_export(model, feature_names, output_names, cats, X=None, path="best_model_symbolic.txt"):
@@ -5937,6 +5969,9 @@ def write_symbolic_export(model, feature_names, output_names, cats, X=None, path
         if agreement is not None:
             share,gap=agreement
             lines.append(f"raw vs model on training rows: defined on {100*share:.1f}% of rows, max |difference| = {gap:.2g} of the output range")
+        decision=entry.get("decision")
+        if decision:
+            lines+=[f"decision: {text}" for text in decision["text"]]+[f"LaTeX (decision): {latex}" for latex in decision["latex"]]
         lines.append("")
         if entry["raw"][0] is not None: print(f"Symbolic: {name} = {entry['raw'][0]}")
     Path(path).write_text("\n".join(lines))

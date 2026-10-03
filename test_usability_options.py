@@ -230,6 +230,28 @@ class UnitTest(unittest.TestCase):
             a.parse_cli(["--units", "x=m$"])
 
 
+class ClassifierSymbolicTest(unittest.TestCase):
+    def test_classifier_scores_and_decisions_are_rendered(self):
+        X = np.random.default_rng(0).uniform(0, 1, (30, 2))
+        binary = a.Model([("-", ("x", 0), ("x", 1))], [(2., .5)])
+        result = a.symbolic_model(binary, ["a", "b"], ["flag"], [["no", "yes"]], (), X)
+        entry = result["flag score"]
+        self.assertEqual(entry["raw"][1], r"2\,a - 2\,b + \frac{1}{2}")
+        self.assertEqual(entry["name_latex"], r"s_{\mathrm{flag}}")
+        self.assertIn(r"\text{yes} & s_{\mathrm{flag}} \ge \tfrac{1}{2}", entry["decision"]["latex"][0])
+        self.assertIn(r"\widehat{\mathrm{flag}}", entry["decision"]["latex"][0])
+        self.assertEqual(entry["agreement"][0], 1.)
+        multi = a.Model([("x", 0), ("x", 1), ("c", .3)], [(1., 0.)] * 3)
+        result = a.symbolic_model(multi, ["a", "b"], ["kind"], [["cat", "dog", "b_ird"]], (), X)
+        self.assertEqual(list(result), ["kind[cat] score", "kind[dog] score", "kind[b_ird] score"])
+        self.assertEqual(result["kind[b_ird] score"]["name_latex"], r"s_{\text{b\_ird}}")
+        self.assertNotIn("decision", result["kind[cat] score"])
+        self.assertIn("arg", result["kind[b_ird] score"]["decision"]["latex"][0])
+        mixed = a.symbolic_model(a.Model([("x", 0), ("x", 1)], [(1., 0.)] * 2), ["a", "b"], ["y", "c"], [None, ["p", "q"]], (), X)
+        self.assertEqual(list(mixed), ["y", "c score"])                       # regression keys unchanged
+        self.assertNotIn("decision", mixed["y"])
+
+
 class CacheMemoryTest(unittest.TestCase):
     def setUp(self):
         self.budget = a.EVALUATION_CACHE_ELEMENTS

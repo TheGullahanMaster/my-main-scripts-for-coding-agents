@@ -795,8 +795,10 @@ class ModelExplorer:
                          {"latex": entry[mode][1], "text": str(entry[mode][0]),
                           "mathml": afpo.mathml_expression(entry[mode][0], entry[mode][0].free_symbols)} for mode in ("exact", "raw")}
                 agreement = entry["agreement"]
-                outputs.append({"name": name, "name_latex": afpo.latex_symbol_name(name.replace(" ", "_")), **forms, "agreement": None if agreement is None else
-                                {"defined": agreement[0], "gap": None if not math.isfinite(agreement[1]) else agreement[1]}})
+                outputs.append({"name": name, "name_latex": entry.get("name_latex") or afpo.latex_symbol_name(name.replace(" ", "_")), **forms,
+                                "agreement": None if agreement is None else
+                                {"defined": agreement[0], "gap": None if not math.isfinite(agreement[1]) else agreement[1]},
+                                "output": entry.get("output"), "decision": entry.get("decision")})
             payload = {"available": True, "outputs": outputs}
             self.models[int(index)]["latex"] = payload
             return payload
