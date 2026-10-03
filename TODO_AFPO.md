@@ -112,8 +112,8 @@ benchmark_afpo cases unchanged (5 seeds); bench_complex.py (3-8 inputs,
 reused variables) 2/40 exact recoveries either way: still open.  Run time on
 bench_jump about equal (25.7 s -> 24.6 s mean) after batching the scan.
 
-Notes: `afpo_lib/fitcore.pyx` (the Cython fitter) is not in the repository,
-so every run here used the Python fitter; the scan runs before either
+Notes: `afpo_lib/fitcore.pyx` (the Cython fitter) was not in the repository
+then (added 2026-10-03), so every run here used the Python fitter; the scan runs before either
 fitter.  bench_harsh's kink_ifelse jumps at 0.65 but keeps the test row that
 straddles it, so some of its "failures" are that one ambiguous row.
 
