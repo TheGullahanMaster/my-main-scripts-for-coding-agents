@@ -413,8 +413,25 @@ def model_description(model, n_features=None, operators=None, adfs=None):
             "adf_definition_bits":definition_bits,
             "total_bits":sum(item["bits"] for item in trees)+sum(item["bits"] for item in affine)+definition_bits}
 
+# Tree and ADF-definition bits depend only on the trees, the grammar, the
+# feature count and the called ADFs; scoring asks for them for every model it
+# scores and the Bayesian banks for every particle, each time building the full
+# audit record.  Memoize that structural part (exact integers, so the total is
+# unchanged); the readout coefficients are priced fresh.  Invalid models raise
+# from model_description() and are never cached.
+_DESCRIPTION_BITS_CACHE={}
 def model_description_bits(model, n_features=None, operators=None, adfs=None):
-    return float(model_description(model,n_features,operators,adfs)["total_bits"])
+    n_features=model.mdl_feature_count if n_features is None else n_features
+    operators=tuple(model.mdl_operators if operators is None else operators)
+    adfs=getattr(model,"adfs",{}) if adfs is None else adfs
+    key=(repr(model.trees),n_features,operators,adf_signature(model.trees,adfs))
+    structural=_DESCRIPTION_BITS_CACHE.get(key)
+    if structural is None:
+        description=model_description(model,n_features,operators,adfs)
+        if len(_DESCRIPTION_BITS_CACHE)>=50_000: _DESCRIPTION_BITS_CACHE.clear()
+        _DESCRIPTION_BITS_CACHE[key]=description["tree_bits"]+description["adf_definition_bits"]
+        return float(description["total_bits"])
+    return float(structural+sum(exact_float_code(scale)["bits"]+exact_float_code(intercept)["bits"] for scale,intercept in model.scales))
 
 def clean(x: Any) -> np.ndarray:
     # Same result as nan_to_num(nan=0, posinf=CLIP, neginf=-CLIP) then clip
@@ -867,9 +884,18 @@ def _guard_walk(t, X, adfs, arguments=None, position=None):
             pairs=[_guard_walk(q,X,adfs,arguments,position) for q in t[1:]]
             values=[v for v,_ in pairs]; references=[r for _,r in pairs]
             raw=np.asarray(_OP_TABLE[t[0]](values[0],values),float)
-            exact=np.asarray(_UNGUARDED.get(t[0],_OP_TABLE[t[0]])(references[0],references),float)
+            # While every input is still its exact reference and the operator
+            # has no unguarded form, the exact pass would repeat this very
+            # computation; share it (the common case: no guard on the path).
+            if t[0] not in _UNGUARDED and all(v is r for v,r in pairs): exact=None
+            else: exact=np.asarray(_UNGUARDED.get(t[0],_OP_TABLE[t[0]])(references[0],references),float)
     value=clean(raw)
     if np.any(np.abs(value)>=CLIP): raise _GuardEngaged("value_clamp")
+    if exact is None:
+        # Below the clamp, clean() changes only NaNs (to 0): with none, the
+        # guarded value is bitwise the exact one and can stand for it.
+        if np.isnan(raw).any(): exact=raw
+        else: return value,value
     return value,exact
 def _guard_changes_output(value, exact):
     spread=float(np.std(value)) if np.size(value)>1 else 0.
@@ -1684,9 +1710,22 @@ class PosteriorParticlePopulation:
             return float(np.mean(np.where(valid,-np.log(np.maximum(probability[row,np.clip(truth,0,probability.shape[1]-1)],EPS)),-np.log(EPS))))
         return float("inf")
 
+    def _cached_likelihood_energy(self, model, X, Y, cats):
+        """_likelihood_energy, memoized: the catalog carries over between
+        generations, so the same particles were re-predicted every update."""
+        if not (isinstance(X,np.ndarray) and isinstance(Y,np.ndarray)): return self._likelihood_energy(model,X,Y,cats)
+        key=(repr(model.trees),repr(model.scales),adf_signature(model.trees,model.adfs),array_digest(X),array_digest(Y),
+             repr(cats),self.likelihood_kind,self.noise_scale,self.student_t_df)
+        hit=_LIKELIHOOD_ENERGY_CACHE.get(key)
+        if hit is None:
+            hit=self._likelihood_energy(model,X,Y,cats)
+            if len(_LIKELIHOOD_ENERGY_CACHE)>=20000: _LIKELIHOOD_ENERGY_CACHE.clear()
+            _LIKELIHOOD_ENERGY_CACHE[key]=hit
+        return hit
+
     def _energies(self, models, X=None, Y=None, cats=None):
         if X is not None and self.likelihood_kind!="legacy":
-            return np.asarray([self._likelihood_energy(model,X,Y,cats)+self.complexity_prior*model_complexity(model) for model in models])
+            return np.asarray([self._cached_likelihood_energy(model,X,Y,cats)+self.complexity_prior*model_complexity(model) for model in models])
         losses=np.asarray([max(0.0,aggregate_loss(m)) for m in models])
         finite=losses[np.isfinite(losses)]
         scale=max(EPS,float(np.median(finite))) if len(finite) else 1.0
@@ -1987,6 +2026,7 @@ class BayesianEquationGenerator:
 # rescored on all training rows each generation.  Scoring is deterministic in
 # the trees, called ADFs, grammar and data, so reuse it (age is live state).
 _PARTICLE_SCORE_CACHE={}
+_LIKELIHOOD_ENERGY_CACHE={}
 def assess_particle_cached(particle, X, Y, affine_on, cats):
     key=(repr(particle.trees),adf_signature(particle.trees,particle.adfs),tuple(particle.mdl_operators),particle.mdl_feature_count,
          array_digest(X),array_digest(Y),bool(affine_on),repr(cats))
@@ -2707,21 +2747,33 @@ def _fragment_halves(n):
     """Deterministic interleaved row halves for cross-fitting (None when too few rows)."""
     if n<8: return None
     rows=np.arange(n); return rows[0::2],rows[1::2]
-def cross_fitted_reduction(values, residual, halves):
+def constant_baselines(residual, halves):
+    """Held-out loss of the best constant, per cross-fitting direction: the
+    part of cross_fitted_reduction that depends on the residual alone, so one
+    model's fragments can share it."""
+    if halves is None: return None
+    baselines=[]
+    for fit,score in (halves,halves[::-1]):
+        _,level=affine(np.zeros(len(fit)),residual[fit])
+        baselines.append(robust_loss(np.full(len(score),level),residual[score]))
+    return baselines
+def cross_fitted_reduction(values, residual, halves, baselines=None):
     """Held-out residual reduction of an affinely fitted fragment beyond the best constant.
 
     Fit on one half, score on the other, both ways, and average.  A fragment
     that is constant on the rows earns nothing (it can only move the mean,
-    which the model's own affine readout already does)."""
+    which the model's own affine readout already does).  ``baselines``: a
+    list the caller shares across one residual's fragments; it is filled with
+    constant_baselines(residual, halves) on first need."""
     values=np.asarray(values,float)
     if not np.all(np.isfinite(values)) or float(np.std(values))<=1e-12*(1.+float(np.mean(np.abs(values)))): return 0.
     if halves is None: return 0.
+    if baselines is None: baselines=[]
+    if not baselines: baselines.extend(constant_baselines(residual,halves))
     gains=[]
-    for fit,score in (halves,halves[::-1]):
+    for (fit,score),baseline in zip((halves,halves[::-1]),baselines):
         scale,offset=affine(values[fit],residual[fit])
-        _,level=affine(np.zeros(len(fit)),residual[fit])
-        target=residual[score]
-        gains.append(robust_loss(np.full(len(score),level),target)-robust_loss(clean(scale*values[score]+offset),target))
+        gains.append(baseline-robust_loss(clean(scale*values[score]+offset),residual[score]))
     return float(np.mean(gains))
 class FragmentLibrary:
     """Small, checkpointable store of partial symbolic discoveries."""
@@ -2790,7 +2842,7 @@ class FragmentLibrary:
                 if labels is not None or not heads: continue
                 residual=np.asarray(Y[:,output]-prediction[:,output],float)
                 residual_key=(hashlib.blake2b(np.ascontiguousarray(residual).view(np.uint8),digest_size=16).digest(),array_digest(X),adf_signature(model.trees,model.adfs))
-                tree=model.trees[heads[0]]
+                tree=model.trees[heads[0]]; baselines=[]
                 for path in subtree_paths(tree):
                     fragment=subtree_at(tree,path); size=node_size(fragment)
                     if not 2<=size<=12: continue
@@ -2807,7 +2859,7 @@ class FragmentLibrary:
                     # is deterministic, so reuse it (failures included).
                     fit_key=(key,residual_key); reduction=_FRAGMENT_FIT_CACHE.get(fit_key)
                     if reduction is None:
-                        try: reduction=cross_fitted_reduction(evaluate_cached(fragment,X,model.adfs),residual,halves)
+                        try: reduction=cross_fitted_reduction(evaluate_cached(fragment,X,model.adfs),residual,halves,baselines)
                         except (ArithmeticError, IndexError, ValueError): reduction=_FRAGMENT_FIT_FAILED
                         if len(_FRAGMENT_FIT_CACHE)>=100_000: _FRAGMENT_FIT_CACHE.clear()
                         _FRAGMENT_FIT_CACHE[fit_key]=reduction
@@ -3882,8 +3934,25 @@ class QualityDiversityArchive:
         scale=np.std(centred,axis=0,keepdims=True)
         return np.divide(centred,scale,out=np.zeros_like(centred),where=scale>=EPS).reshape(-1)
 
+    # Descriptors are pure functions of a model's trees, readout and called
+    # ADFs (and the archive's fixed probe), but update() needs each one twice
+    # (initialize, then cell) and every cell model is re-binned each
+    # generation, so most were recomputed.  The memo is per archive, bounded,
+    # and never pickled or snapshotted.
+    DESCRIPTOR_CACHE_LIMIT=8192
+    def descriptor_key(self, model): return (repr(model.trees),repr(model.scales),adf_signature(model.trees,model.adfs))
+    def cached_descriptor(self, model):
+        cache=self.__dict__.setdefault("_descriptor_cache",{})
+        key=self.descriptor_key(model); hit=cache.get(key)
+        if hit is None:
+            if len(cache)>=self.DESCRIPTOR_CACHE_LIMIT: cache.clear()
+            hit=np.asarray(self.descriptor(model)); hit.setflags(write=False); cache[key]=hit
+        return hit
+    def __getstate__(self):
+        state=dict(self.__dict__); state.pop("_descriptor_cache",None); return state
+
     def initialize(self, candidates):
-        descriptors=[self.descriptor(model) for model in candidates if model.feasible]
+        descriptors=[self.cached_descriptor(model) for model in candidates if model.feasible]
         if descriptors and not self.initialized:
             self.landmarks=cvt_landmarks(np.asarray(descriptors),self.capacity)
         elif descriptors and len(self.landmarks)<self.capacity:
@@ -3906,7 +3975,7 @@ class QualityDiversityArchive:
 
     def cell(self, model):
         if not self.initialized: raise ValueError("QD landmarks have not been initialized")
-        descriptor=self.descriptor(model)
+        descriptor=self.cached_descriptor(model)
         return int(np.argmin(np.sum((self.landmarks-descriptor)**2,axis=1)))
 
     def update(self, candidates, loss_threshold=None):
@@ -4011,6 +4080,7 @@ class StructuralQualityDiversityArchive(QualityDiversityArchive):
         super().__init__(np.empty((0,self.n_features)),(),seed,capacity,landmarks)
 
     def descriptor(self, model): return structural_descriptor(model,self.n_features)
+    def descriptor_key(self, model): return repr(model.trees)
 
     def snapshot(self):
         data=super().snapshot(); data["n_features"]=self.n_features; return data
@@ -6389,7 +6459,7 @@ def reset_run_caches():
     and data alone.  A fresh process starts empty; benchmarks and tests run
     several configurations in one process, which then reused the previous
     configuration's particle scores, fragment fits and constant readouts."""
-    for cache in (_PARTICLE_SCORE_CACHE,_FRAGMENT_FIT_CACHE,_CONSTANT_AFFINE_CACHE): cache.clear()
+    for cache in (_PARTICLE_SCORE_CACHE,_LIKELIHOOD_ENERGY_CACHE,_FRAGMENT_FIT_CACHE,_CONSTANT_AFFINE_CACHE): cache.clear()
     INVALID_DIAGNOSTICS.clear()
 
 def synchronize_model_ages(models, generation):
