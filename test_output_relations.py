@@ -152,6 +152,17 @@ class OpaqueTests(unittest.TestCase):
 
 class SeparateRunTests(unittest.TestCase):
     """A short real run: one search per output, merged and exported."""
+    # A run sets module-wide options (symbolic export, intervals, ...); later test files expect the defaults.
+    SAVED = ("SYMBOLIC_EXPORT", "CONSTANT_INTERVALS", "CLIP", "EPS")
+
+    def setUp(self):
+        self.saved = {name: getattr(a, name) for name in self.SAVED}
+
+    def tearDown(self):
+        for name, value in self.saved.items(): setattr(a, name, value)
+        a.configure_custom_ops((), [])
+        a.configure_input_relations((), [])
+
 
     def test_end_to_end(self):
         r = np.random.default_rng(0); n = 120

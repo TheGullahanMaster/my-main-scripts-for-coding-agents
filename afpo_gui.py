@@ -837,6 +837,7 @@ class ModelExplorer:
                 "outputs": state["out_names"], "cats": state["cats"], "inputs": inputs, "models": out,
                 "dataset": state.get("dataset_path"), "seed": state.get("run_seed"),
                 "train_rows": len(state["Xt"]), "validation_rows": 0 if state.get("Xv") is None else len(state["Xv"]),
+                "test_rows": 0 if state.get("Xtest") is None else len(state["Xtest"]),
                 "saved_selection": (saved or {}).get("selected_choice"), "manifest": state.get("manifest")}
 
     def _model(self, index):
@@ -853,8 +854,11 @@ class ModelExplorer:
             item = self.models[int(index)]
             validation = (afpo.frozen_metrics(model, state["Xv"], state["Yv"], cats, self.constraints, out_names)
                           if state.get("Xv") is not None else None)
+            test = (afpo.frozen_metrics(model, state["Xtest"], state["Ytest"], cats, self.constraints, out_names)
+                    if state.get("Xtest") is not None else None)
             per_output = [{"name": name, "train_loss": item["train"]["losses"][j],
-                           "validation_loss": None if validation is None else validation["losses"][j]}
+                           "validation_loss": None if validation is None else validation["losses"][j],
+                           "test_loss": None if test is None else test["losses"][j]}
                           for j, name in enumerate(out_names)]
             return {"index": int(index), "label": item["label"], "equations": afpo.equations(model, names, out_names, cats).split("; "),
                     "adfs": afpo.adf_display_definitions(model, names),
@@ -904,7 +908,7 @@ class ModelExplorer:
         """Predicted vs. actual (regression) or a confusion matrix (classification)."""
         with self.lock:
             model, state = self._model(index), self.state
-            X, Y = (state["Xv"], state["Yv"]) if split == "validation" and state.get("Xv") is not None else (state["Xt"], state["Yt"])
+            X, Y, split = self._split(split)
             prediction = afpo.predict_targets(model, X, state["cats"])
             rows = np.arange(len(X))
             if len(rows) > MAX_FIT_POINTS:
@@ -926,7 +930,16 @@ class ModelExplorer:
                             matrix[t, g] += 1
                     outputs.append({"name": name, "kind": "classification", "labels": labels, "matrix": matrix,
                                     "accuracy": float(np.mean(truth == guess))})
-            return {"split": "validation" if X is state.get("Xv") else "train", "rows": len(X), "outputs": outputs}
+            return {"split": split, "rows": len(X), "outputs": outputs}
+
+    def _split(self, split):
+        """(X, Y, name) of the training, validation or test rows; an unavailable split falls back to training."""
+        state = self.state
+        if split == "validation" and state.get("Xv") is not None:
+            return state["Xv"], state["Yv"], "validation"
+        if split == "test" and state.get("Xtest") is not None:
+            return state["Xtest"], state["Ytest"], "test"
+        return state["Xt"], state["Yt"], "train"
 
     def _encode(self, rows):
         state = self.state
@@ -1015,26 +1028,32 @@ class ModelExplorer:
                                       if dist is not None and dist.shape[1] == len(labels) else {})}
         return outputs
 
-    def _training_points(self, columns):
+    def _point_sets(self, columns):
+        """Validation and test rows (when the run had them) in _training_points' form, keyed by split."""
+        return {split: self._training_points(columns, split) for split in ("validation", "test")
+                if self.state.get("Xv" if split == "validation" else "Xtest") is not None}
+
+    def _training_points(self, columns, split="train"):
         """A sample of training rows: the explored inputs (category index for text inputs) and the targets."""
         state = self.state
-        rows = np.arange(len(state["Xt"]))
+        X, Y, _ = self._split(split)
+        rows = np.arange(len(X))
         if len(rows) > MAX_FIT_POINTS:
             rows = np.random.default_rng(1).choice(rows, MAX_FIT_POINTS, replace=False)
         coords = {}
         for column in columns:
             kind = state["types"][state["source_columns"].index(column)]
             if kind == 1 and column in state["names"]:
-                coords[column] = state["Xt"][rows, state["names"].index(column)]
+                coords[column] = X[rows, state["names"].index(column)]
             elif kind == 2:
                 classes = state["maps"].get(column, [])
                 onehot = [state["names"].index(f"{column}={cl}") for cl in classes if f"{column}={cl}" in state["names"]]
                 if len(onehot) != len(classes):
                     return None
-                coords[column] = np.argmax(state["Xt"][np.ix_(rows, onehot)], axis=1)
+                coords[column] = np.argmax(X[np.ix_(rows, onehot)], axis=1)
             else:
                 return None        # sequence-derived inputs have no single raw column
-        return {"coords": coords, "targets": {name: state["Yt"][rows, j] for j, name in enumerate(state["out_names"])}}
+        return {"coords": coords, "targets": {name: Y[rows, j] for j, name in enumerate(state["out_names"])}}
 
     def sweep(self, index, column, base=None, lo=None, hi=None, points=160):
         """1D: one input varied, every other input frozen (typical values unless overridden)."""
@@ -1044,7 +1063,7 @@ class ModelExplorer:
             base = self._base(base)
             return {"column": column, "kind": kind, "x": xs, "base": base,
                     "outputs": self._surface(model, [{**base, column: x} for x in xs]),
-                    "data": self._training_points([column])}
+                    "data": self._training_points([column]), "data_sets": self._point_sets([column])}
 
     def grid(self, index, x, y, base=None, x_lo=None, x_hi=None, y_lo=None, y_hi=None, points=60):
         """2D/3D: two inputs over a grid, the rest frozen.  Values are row-major: z[yi][xi]."""
@@ -1065,7 +1084,7 @@ class ModelExplorer:
                     item["predicted"] = np.asarray(item["predicted"]).reshape(shape)
                     item["prob"] = {label: np.asarray(v, float).reshape(shape) for label, v in item["prob"].items()}
             return {"x": {"column": x, "kind": x_kind, "values": xs}, "y": {"column": y, "kind": y_kind, "values": ys},
-                    "base": base, "outputs": outputs, "data": self._training_points([x, y])}
+                    "base": base, "outputs": outputs, "data": self._training_points([x, y]), "data_sets": self._point_sets([x, y])}
 
     def predict_csv(self, index, path, delimiter=","):
         with self.lock:

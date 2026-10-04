@@ -88,8 +88,16 @@ class EvaluationTests(unittest.TestCase):
 
 
 class RunTests(unittest.TestCase):
+    # A run sets module-wide options (symbolic export, intervals, ...); later test files expect the defaults.
+    SAVED = ("SYMBOLIC_EXPORT", "CONSTANT_INTERVALS", "CLIP", "EPS")
+
+    def setUp(self):
+        self.saved = {name: getattr(a, name) for name in self.SAVED}
+
     def tearDown(self):
-        a.configure_custom_ops((), NAMES)
+        for name, value in self.saved.items(): setattr(a, name, value)
+        a.configure_custom_ops((), [])
+        a.configure_input_relations((), [])
 
     def test_a_run_uses_and_exports_custom_operators(self):
         r = np.random.default_rng(1); n = 120

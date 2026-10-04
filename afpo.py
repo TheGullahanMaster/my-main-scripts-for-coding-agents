@@ -8469,7 +8469,7 @@ def train_separate_outputs(args, setup, df, frames, run_seed, metadata, choose_m
         elif validation_df is None: validation_o=None
         else: validation_o=df_o.iloc[validation_indices]
         args_o=argparse.Namespace(**vars(args)); args_o.test_csv=None; args_o.seed=run_seed
-        setup_o={**setup,"df":df_o,"types":types_o,"metadata":_metadata_for_output(metadata,out_names,column),
+        setup_o={**setup,"df":df_o,"_test_frame":augment(test_df,"test"),"types":types_o,"metadata":_metadata_for_output(metadata,out_names,column),
                  "_frames":(train_indices,validation_indices,train_o,validation_o,external_validation),"_limits":limits,
                  "_subrun":{"output":column,"index":number-1,"count":len(plan),"reads":list(sources)}}
         result=train_from_setup(args_o,setup_o,choose_model)
@@ -8551,7 +8551,8 @@ def train_separate_outputs(args, setup, df, frames, run_seed, metadata, choose_m
             "manifest":str(summary_path.resolve()),"model_card":str(summary_path.resolve()),
             "generation":max(results[column]["generation"] for column,_ in plan),
             "selected":"; ".join(f"{column}: {results[column]['selected']}" for column,_ in plan),
-            "equation":equations(merged,names,out_names_all,cats),"outputs":{column:results[column]["equation"] for column,_ in plan}}
+            "equation":equations(merged,names,out_names_all,cats),"outputs":{column:results[column]["equation"] for column,_ in plan},
+            "metrics":{split:{"loss":item["loss"],"shape":item["shape"],"losses":dict(zip(out_names_all,item["losses"]))} for split,item in report.items() if split!="train"}}
 
 def split_frames(df, types, setup, run_seed, delimiter, max_rows=0, sample_seed=None):
     """(train_indices, validation_indices, train_df, validation_df, external_validation) for a run's setup."""
@@ -8691,9 +8692,11 @@ def train_from_setup(args, setup, choose_model=None):
     LOSS_NOISE_FLOOR=estimate_loss_noise_floor(Yt,cats,Yv) if floor_setting=="auto" else float(floor_setting)
     print(f"Loss noise floor: {LOSS_NOISE_FLOOR:.3g} ({'from the precision of the targets' if floor_setting=='auto' else 'set'})")
     Xtest=Ytest=None
-    if args.test_csv:
+    test_df=setup.get("_test_frame")
+    if test_df is None and args.test_csv:
         test_df=read_dataset(args.test_csv,delimiter,max_rows,sample_seed)
         if test_df.attrs.get("afpo_row_sample"): print(f"Test CSV{describe_row_sample(test_df)}.")
+    if test_df is not None:
         Xtest,Ytest,test_names,test_outputs,test_cats,_=encode(test_df,types,maps); del test_df
         if test_names!=base_names or test_outputs!=out_names or test_cats!=cats: raise ValueError("Test CSV columns/types do not match training data")
         Xtest=custom_feature_columns(Xtest,derived)
@@ -8734,7 +8737,7 @@ def train_from_setup(args, setup, choose_model=None):
     print(f"Run manifest: {manifest_path}")
     checkpoint_path=manifest_path.parent / "checkpoint_latest.json"
     checkpoint_state={"dataset_path":str(path.resolve()),"types":types,"operators":ops,"affine_on":affine_on,
-        "coev":coev,"nodes":nodes,"depth":depth,"X":X,"Y":Y,"Xt":Xt,"Yt":Yt,"Xv":Xv,"Yv":Yv,
+        "coev":coev,"nodes":nodes,"depth":depth,"X":X,"Y":Y,"Xt":Xt,"Yt":Yt,"Xv":Xv,"Yv":Yv,"Xtest":Xtest,"Ytest":Ytest,
         "names":names,"out_names":out_names,"cats":cats,"maps":maps,"encoding_schema":{"version":1,"fit_scope":"training_rows_only","maps":maps},"source_columns":source_columns,
         "export_fixture":export_fixture,"input_ranges":input_ranges,
         "run_seed":run_seed,"manifest":str(manifest_path.resolve()),"bayesian_proposal_rate":args.bayesian_proposal_rate,"bayesian_mode":args.bayesian_mode,"crossover_rate":args.crossover_rate,"evaluation_workers":resolve_worker_count(args.workers,args.population),
@@ -8832,13 +8835,14 @@ def train_from_setup(args, setup, choose_model=None):
     if chosen.history: print("History:\n  "+"\n  ".join(describe_history(chosen.history)))
     intervals=constant_intervals(chosen,Xt,Yt,cats) if CONSTANT_INTERVALS=="on" else None
     print_constant_intervals(intervals)
+    held_out={}
     if Xv is not None:
-        metrics=frozen_metrics(chosen,Xv,Yv,cats,constraints,out_names)
+        metrics=held_out["validation"]=frozen_metrics(chosen,Xv,Yv,cats,constraints,out_names)
         print(f"Validation (used for selection): loss={metrics['loss']:.6g}, shape={metrics['shape']:.6g} | output losses={output_loss_summary(metrics['losses'],out_names)}")
         summary=classification_summary(chosen,Xv,Yv,cats,out_names)
         if summary: print(f"Validation classes: {summary}")
     if Xtest is not None:
-        metrics=frozen_metrics(chosen,Xtest,Ytest,cats,constraints,out_names)
+        metrics=held_out["test"]=frozen_metrics(chosen,Xtest,Ytest,cats,constraints,out_names)
         print(f"Final held-out test (not used for selection): loss={metrics['loss']:.6g}, shape={metrics['shape']:.6g} | output losses={output_loss_summary(metrics['losses'],out_names)}")
         summary=classification_summary(chosen,Xtest,Ytest,cats,out_names)
         if summary: print(f"Test classes: {summary}")
@@ -8859,7 +8863,8 @@ def train_from_setup(args, setup, choose_model=None):
     evaluator.close()
     print(f"Model card: {card}")
     result={"checkpoint":str(checkpoint_path.resolve()),"manifest":str(manifest_path.resolve()),"model_card":str(Path(card).resolve()),
-            "generation":gen,"selected":labels[selected_index],"equation":equations(chosen,names,out_names,cats)}
+            "generation":gen,"selected":labels[selected_index],"equation":equations(chosen,names,out_names,cats),
+            "metrics":{split:{"loss":item["loss"],"shape":item["shape"],"losses":dict(zip(out_names,item["losses"]))} for split,item in held_out.items()}}
     if subrun:
         result.update(model=chosen,names=list(names),maps=maps,cats=cats,out_names=list(out_names),types=list(types),selected_metrics=selected_entry[2],
                       derived=dict(CUSTOM_FEATURES))
