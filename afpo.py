@@ -7938,7 +7938,8 @@ def resume_main(args):
     print(f"Resumed generation {generation} from {checkpoint_path} (seed {state['run_seed']}); {topology}; model scoring uses {'serial evaluation' if workers==1 else f'{workers} worker processes'}.")
     started=time.time(); stop=GracefulStop().__enter__(); interrupted=False
     try:
-        while (not args.max_generations or generation < args.max_generations) and not stop.requested and not stop_rule_reached(args,started,islands):
+        stop_validation={"X":Xv,"Y":Yv,"cats":cats,"constraints":constraints,"out_names":out_names}
+        while (not args.max_generations or generation < args.max_generations) and not stop.requested and not stop_rule_reached(args,started,islands,stop_validation):
             def step(island):
                 def progress(gen,elite,sample):
                     if len(islands)>1 and gen%10==0: print(cell_label(island,island_config["count"],stage_count),flush=True)
@@ -7998,16 +7999,60 @@ def parse_nesting_rules(text):
         rules.add((outer.strip(),inner.strip()))
     return frozenset(rules)
 
-def stop_rule_reached(args, started, islands):
-    """--max-time (seconds of search) and --stop-at-loss (best training loss) end the search like Ctrl-C."""
+def parse_stop_targets(value):
+    """--stop-at-loss: one number for the mean loss, or 'NAME=VALUE,...' per output (None when off)."""
+    if value is None or value=="": return None
+    if isinstance(value,(int,float)): return float(value)
+    text=str(value).strip()
+    if "=" not in text: return float(text)
+    targets={}
+    for item in text.split(","):
+        if not item.strip(): continue
+        name,_,number=item.rpartition("=")
+        if not name.strip(): raise ValueError(f"Malformed --stop-at-loss item {item!r}")
+        targets[name.strip()]=float(number)
+    return targets
+
+_STOP_VALIDATION={}
+def stop_rule_reached(args, started, islands, validation=None):
+    """--max-time (seconds of search) and --stop-at-loss end the search like Ctrl-C.
+
+    The loss is the validation loss of the islands' best models when there is
+    validation data (validation = dict(X, Y, cats, constraints, out_names)),
+    else their training loss.  Per-output targets ('HH=0.01,MM=0.05') must all
+    be met; names that are not outputs of this search are ignored, so in a
+    separate-output run each output's search stops at its own limit."""
     limit=getattr(args,"max_time",0.) or 0.
     if limit and time.time()-started>=limit:
         print(f"Stopping: --max-time {limit:g}s reached."); return True
-    target=getattr(args,"stop_at_loss",None)
-    if target is not None:
-        best=min((aggregate_loss(island.best_models.model) for island in islands if island.best_models.model is not None),default=float("inf"))
-        if best<=target:
-            print(f"Stopping: best training loss {best:.6g} reached --stop-at-loss {target:g}."); return True
+    target=parse_stop_targets(getattr(args,"stop_at_loss",None))
+    if target is None: return False
+    models=[island.best_models.model for island in islands if island.best_models.model is not None]
+    if not models: return False
+    names=list(validation["out_names"]) if validation else []
+    held_out=bool(validation) and validation.get("X") is not None
+    def losses(model):
+        if not held_out: return tuple(model_losses(model)),aggregate_loss(model)
+        key=(id(validation["X"]),repr(model.trees),tuple(model.scales))
+        if key not in _STOP_VALIDATION:
+            if len(_STOP_VALIDATION)>256: _STOP_VALIDATION.clear()
+            try:
+                metrics=frozen_metrics(model,validation["X"],validation["Y"],validation["cats"],validation["constraints"],validation["out_names"])
+                _STOP_VALIDATION[key]=(tuple(metrics["losses"]),metrics["loss"])
+            except (ArithmeticError, IndexError, RecursionError, ValueError): _STOP_VALIDATION[key]=((float("inf"),)*len(names),float("inf"))
+        return _STOP_VALIDATION[key]
+    kind="validation" if held_out else "training"
+    scored=[losses(model) for model in models]
+    if isinstance(target,dict):
+        wanted={names.index(name):value for name,value in target.items() if name in names}
+        if not wanted: return False
+        for per_output,_ in scored:
+            if all(per_output[j]<=value for j,value in wanted.items()):
+                print(f"Stopping: best {kind} loss reached --stop-at-loss for "+", ".join(f"{names[j]} ({per_output[j]:.6g} <= {value:g})" for j,value in wanted.items())+"."); return True
+        return False
+    best=min(total for _,total in scored)
+    if best<=target:
+        print(f"Stopping: best {kind} loss {best:.6g} reached --stop-at-loss {target:g}."); return True
     return False
 
 def build_arg_parser():
@@ -8067,7 +8112,7 @@ def build_arg_parser():
     ap.add_argument("--input-relations",action="append",default=[],metavar="A,B[;C,D]",help="Input columns that belong together, e.g. HH1,MM1;HH2,MM2 (repeatable). Inside a relation columns combine freely; with other inputs only as complete subexpressions that read every column of the relation, so HH2-HH1 is rejected but (60*HH2+MM2)-(60*HH1+MM1) is not (default: none)")
     ap.add_argument("--units",default="",metavar="COLUMN=UNIT,...",help="Units of input columns for dimensional analysis, e.g. x=m,t=s,F=kg*m/s^2 (exponents with ^, fractions in parentheses like m^(1/2)); trees that add, compare or exponentiate unlike units are rejected; constants and unlisted columns are unit-free wildcards (default: none)")
     ap.add_argument("--max-time",type=float,default=0.,help="Stop the search after this many seconds and go to the final choice; 0 = no limit (default: 0)")
-    ap.add_argument("--stop-at-loss",type=float,default=None,help="Stop the search once the best training loss (the loss printed during the run) is at or below this value (default: off)")
+    ap.add_argument("--stop-at-loss",default=None,metavar="LOSS|NAME=LOSS,...",help="Stop the search once the best model's loss is at or below this value: its validation loss when there is validation data, else its training loss. NAME=LOSS,... sets one limit per output instead (all must be met); in separate-output runs each output's search stops at its own limit and the next output starts (default: off)")
     ap.add_argument("--sparse-seeding",choices=("on","off"),default="off",help="Seed the initial population with sparse linear fits over a modest basis (inputs, unary operators of inputs, pairwise products and ratios, hinges), found by orthogonal matching pursuit (default: off)")
     ap.add_argument("--sparse-basis-size",type=int,default=300,help="Most basis terms the sparse seeding searches (default: 300)")
     ap.add_argument("--jump-mutation-weight",type=float,default=1.,help="Initial portfolio weight of the jump mutation, which wraps a subtree in mod(s,c), floordiv(s,c) or if_else(gt(x,c),s,s') as one move; adapted like the other mutation kinds; 0 disables it (default: 1)")
@@ -8722,7 +8767,8 @@ def train_from_setup(args, setup, choose_model=None):
     print(f"Searching indefinitely with {args.bayesian_proposal_rate:.0%} Bayesian proposals, {topology}, and {'serial evaluation' if workers==1 else f'{workers} worker processes'}; press Ctrl-C to choose and save a model.")
     stop=GracefulStop().__enter__(); interrupted=False
     try:
-        while (not args.max_generations or gen<args.max_generations) and not stop.requested and not stop_rule_reached(args,start,islands):
+        stop_validation={"X":Xv,"Y":Yv,"cats":cats,"constraints":constraints,"out_names":out_names}
+        while (not args.max_generations or gen<args.max_generations) and not stop.requested and not stop_rule_reached(args,start,islands,stop_validation):
             def step(island):
                 def progress(generation,elite,sample):
                     if cell_count>1 and generation%10==0: print(cell_label(island,island_count,stages["count"]),flush=True)

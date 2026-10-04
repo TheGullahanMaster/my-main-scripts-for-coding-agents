@@ -180,3 +180,37 @@ class SeparateRunTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StopRuleTests(unittest.TestCase):
+    """--stop-at-loss prefers validation loss and takes per-output limits."""
+
+    def island(self, model):
+        from types import SimpleNamespace
+        return SimpleNamespace(best_models=SimpleNamespace(model=model))
+
+    def model(self, offset):
+        m = a.Model([("x", 0)], [(1., offset)], mdl_operators=("+",), mdl_feature_count=1)
+        m.objectives = (0., 0., 3., 0)          # perfect on training
+        return m
+
+    def test_validation_loss_decides(self):
+        from types import SimpleNamespace
+        Xv = np.linspace(0, 1, 30)[:, None]
+        context = {"X": Xv, "Y": Xv.copy(), "cats": [None], "constraints": None, "out_names": ["y"]}
+        args = SimpleNamespace(max_time=0., stop_at_loss=1e-6)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertFalse(a.stop_rule_reached(args, 0., [self.island(self.model(5.))], context))      # training says stop
+            self.assertTrue(a.stop_rule_reached(args, 0., [self.island(self.model(0.))], context))
+            self.assertTrue(a.stop_rule_reached(args, 0., [self.island(self.model(5.))], {**context, "X": None}))
+
+    def test_per_output_limits(self):
+        self.assertEqual(a.parse_stop_targets("HH=0.01, MM=0.5"), {"HH": .01, "MM": .5})
+        self.assertEqual(a.parse_stop_targets("0.1"), .1)
+        from types import SimpleNamespace
+        args = SimpleNamespace(max_time=0., stop_at_loss="other=1, y=1e-6")
+        context = {"X": None, "Y": None, "cats": [None], "constraints": None, "out_names": ["y"]}
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue(a.stop_rule_reached(args, 0., [self.island(self.model(0.))], context))
+            args.stop_at_loss = "other=1"                # no output of this search is named: no loss stop
+            self.assertFalse(a.stop_rule_reached(args, 0., [self.island(self.model(0.))], context))
