@@ -44,7 +44,7 @@ MAX_GENERATE_ROWS = 5_000_000
 GENERATE_CHUNK = 50_000
 # Options with their own place in the form (or not meaningful from the GUI).
 FORM_HANDLED = {"resume", "migrate_checkpoint", "allow_unsafe_pickle", "gui", "port", "test_csv",
-                "constraint_metadata", "sequence_group", "max_generations", "population", "seed", "workers", "adf_mode", "help"}
+                "constraint_metadata", "sequence_group", "input_relations", "output_relations", "max_generations", "population", "seed", "workers", "adf_mode", "help"}
 
 
 # ───────────────────────── helpers ─────────────────────────
@@ -244,6 +244,10 @@ def build_argv(form):
     for line in str(data.get("sequence_groups") or "").splitlines():
         if line.strip():
             argv += ["--sequence-group", line.strip()]
+    for field, flag in (("input_relations", "--input-relations"), ("output_relations", "--output-relations")):
+        for line in str(data.get(field) or "").splitlines():
+            if line.strip():
+                argv += [flag, line.strip()]
     return argv
 
 
@@ -340,6 +344,7 @@ class Telemetry:
         self.last_snapshot = 0.
         self.validation_cache = {}
         self.announced = False
+        self.announced_outputs = None
 
     def emit(self, kind, **data):
         self.stream.write(json.dumps(clean({"kind": kind, "time": time.time(), **data}), allow_nan=False) + "\n")
@@ -371,10 +376,15 @@ class Telemetry:
     def hook(self, **kw):
         # Cells evolved in parallel processes arrive as fresh objects each
         # generation, so key on the stable (island, stage) label when given.
+        names, out_names, cats = kw["names"], kw["out_names"], kw["cats"]
+        # Separate-output runs search one output after another: each search
+        # announces itself afresh, and the live view follows the current one.
+        if self.announced and list(out_names) != self.announced_outputs:
+            self.announced = False; self.islands = {}; self.latest = {}; self.validation_cache = {}
         island = self.islands.setdefault(kw.get("cell") or id(kw["archive"]), len(self.islands))
         self.latest[island] = kw
-        names, out_names, cats = kw["names"], kw["out_names"], kw["cats"]
         if not self.announced:
+            self.announced_outputs = list(out_names)
             self.announced = True
             self.emit("config", names=names, outputs=out_names, cats=cats, islands=self.island_count, stages=self.stage_count,
                       train_rows=len(kw["Xt"]), validation_rows=0 if kw["Xv"] is None else len(kw["Xv"]))
@@ -610,6 +620,8 @@ class TrainingSession:
                 self.snapshot = event
                 self.snapshot_seq += 1
             elif kind == "config":
+                if self.config is not None:          # the next output's search of a separate-output run
+                    self.history = []; self.snapshot = None
                 self.config = event
             elif kind == "choose":
                 self.choose = event

@@ -446,6 +446,32 @@ so these are **audit-then-extend**, not new builds.
   seeds), accuracy 0.974 -> 0.951. Plain accuracy drops because the decision
   rule no longer favours the majority; use `off` when plain accuracy under the
   training prior is the goal.
+- [x] Separate per-output searches (`--output-mode separate|joint`, default
+  separate, 2026-10-04). With several output columns each column (a
+  categorical column with all its classes) runs its own full search — own
+  population, islands, Pareto front, MDL, node limit, caches, stopping rules
+  and final choice — one after another; the choices are merged into one
+  exported model, and `separate_outputs.json` (next to the per-output run
+  directories) records them. Before, one model carried a tree per output:
+  every mutation changed all trees at once, MDL was one sum and selection one
+  mean loss. Benchmark (3 unrelated numeric outputs, pop 100, 40 generations,
+  node limit 15, 6 seeds): hard-output test R² 0.927 -> 0.970 (5/6 seeds);
+  easy and middle outputs exact on every seed (joint missed one); ~8% more
+  time. Resuming one per-output checkpoint continues only that output.
+- [x] Output relations (`--output-relations "HH -> MM; year -> month -> day"`):
+  a dependency graph; each output reads its ancestors' *predicted* values
+  (never true ones) as extra inputs, ancestors are searched first. The merged
+  export inlines those predictions (a class as a comparison indicator of the
+  class scores) and marks the inlined subtrees opaque (`Model.opaque`), so
+  the structural rules still check the merged model but treat each inlined
+  equation as the staged leaf it replaced. Reported complexity is local (what
+  selection used) plus expanded (after inlining).
+- [x] Input relations (`--input-relations "HH1,MM1;HH2,MM2"`): provenance
+  groups; ungrouped inputs are singleton groups. Inside a group columns mix
+  freely; across groups only complete subexpressions (reading every column of
+  their group) combine. Enforced in random trees, mutation and crossover
+  retries, offspring redraws, constant tuning and scoring.
+  GUI: output mode in Advanced options; relation fields in the Data section.
 
 ## Phase 4 — Later (after Phases 1–3 produce telemetry)
 

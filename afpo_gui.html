@@ -315,6 +315,8 @@ input, select, textarea { max-width: 100%; }
           <div class="field"><label>Constraint metadata JSON file <span class="hint">optional</span></label><div data-path="metadata" data-kind="json"></div></div>
           <div class="field"><label>…or inline constraint metadata JSON</label><textarea id="metadataText" placeholder="{}"></textarea></div>
           <div class="field"><label>Sequence groups <span class="hint">one per line: NAME=COL1,COL2,…</span></label><textarea id="sequenceGroups"></textarea></div>
+          <div class="field"><label>Input relations <span class="hint">one per line: COL1,COL2 — related inputs combine with others only as complete subexpressions</span></label><textarea id="inputRelations" placeholder="HH1,MM1&#10;HH2,MM2"></textarea></div>
+          <div class="field"><label>Output relations <span class="hint">one per line: A -> B -> C — later outputs read earlier outputs' predictions (output mode separate)</span></label><textarea id="outputRelations" placeholder="HH -> MM"></textarea></div>
         </details>
       </div>
 
@@ -1154,7 +1156,7 @@ function renderAdvanced() {
   }
   box.addEventListener('change', saveForm);
 }
-const FORM_IDS = ['population', 'maxGenerations', 'seed', 'workers', 'nodes', 'depth', 'islands', 'migrationInterval', 'migrants', 'stageMode', 'stages', 'stageInterval', 'stageQuantile', 'stageAgeGap', 'stageSchedule', 'roleInterval', 'valPercent', 'metadataText', 'sequenceGroups', 'adfMode', 'delimiterCustom', 'resumeMax', 'resumeWorkers'];
+const FORM_IDS = ['population', 'maxGenerations', 'seed', 'workers', 'nodes', 'depth', 'islands', 'migrationInterval', 'migrants', 'stageMode', 'stages', 'stageInterval', 'stageQuantile', 'stageAgeGap', 'stageSchedule', 'roleInterval', 'valPercent', 'metadataText', 'sequenceGroups', 'inputRelations', 'outputRelations', 'adfMode', 'delimiterCustom', 'resumeMax', 'resumeWorkers'];
 const CHECK_IDS = ['affine', 'coev', 'pressure', 'adf', 'roles'];
 function saveForm() {
   const v = {};
@@ -1283,7 +1285,8 @@ function collectForm() {
     mode: 'train',
     data: {path: INSPECT.path, delimiter: delimiterValue(), types: INSPECT.columns.map(c => c.type), validation_mode: valmode,
       validation_percent: +$('#valPercent').value, validation_path: pathInputs.validation.value.trim(), test_path: pathInputs.test.value.trim(),
-      metadata_path: pathInputs.metadata.value.trim(), metadata_text: $('#metadataText').value.trim(), sequence_groups: $('#sequenceGroups').value},
+      metadata_path: pathInputs.metadata.value.trim(), metadata_text: $('#metadataText').value.trim(), sequence_groups: $('#sequenceGroups').value,
+      input_relations: $('#inputRelations').value, output_relations: $('#outputRelations').value},
     operators: operatorForm(),
     search: {nodes: +$('#nodes').value, depth: +$('#depth').value, affine: $('#affine').checked, coev: $('#coev').checked,
       dynamic_pressure: $('#pressure').checked, adf: $('#adf').checked, islands: +$('#islands').value,

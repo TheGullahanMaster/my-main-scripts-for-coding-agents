@@ -69,6 +69,16 @@ class GuiTests(unittest.TestCase):
             gui.check_form(bad)
         self.assertTrue(gui.check_form(form(self.csv))["ok"])
 
+    def test_relation_fields_become_flags(self):
+        related = form(self.csv)
+        related["data"]["input_relations"] = "a,b\n"
+        related["data"]["output_relations"] = "y -> y2\n\n"
+        argv = gui.build_argv(related)
+        self.assertIn(["--input-relations", "a,b"], [argv[i:i + 2] for i in range(len(argv))])
+        self.assertIn(["--output-relations", "y -> y2"], [argv[i:i + 2] for i in range(len(argv))])
+        self.assertIn("output_mode", {item["dest"] for item in gui.options()["advanced"]})
+        self.assertNotIn("input_relations", {item["dest"] for item in gui.options()["advanced"]})
+
     def test_stage_and_role_fields_reach_the_setup(self):
         staged = form(self.csv, islands=2, migration_interval=5, migrants=1, stage_mode="both", stages=2,
                       stage_interval=4, stage_quantile=.4, stage_age_gap=6, stage_schedule="linear", roles=True, role_interval=7)
