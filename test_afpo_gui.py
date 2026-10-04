@@ -137,6 +137,16 @@ class GuiTests(unittest.TestCase):
         self.assertEqual(status["state"], "finished", status["error"])
         self.assertTrue(Path(status["done"]["manifest"]).is_file())
 
+        # The Models tab opens the merged model, every output, not just the first search.
+        explorer = gui.ModelExplorer()
+        summary = explorer.load(status["done"]["checkpoint"])
+        self.assertEqual(summary["outputs"], ["y", "y2"])
+        self.assertEqual(len(summary["models"]), 1)
+        self.assertEqual(len(explorer.detail(0)["equations"]), 2)
+        self.assertEqual({row["name"] for row in explorer.detail(0)["per_output"]}, {"y", "y2"})
+        with self.assertRaisesRegex(ValueError, "browsing and export only"):
+            gui.afpo.resume_main(gui.afpo.parse_cli(["--resume", status["done"]["checkpoint"]])[1])
+
     def test_train_choose_then_explore(self):
         session = gui.TrainingSession()
         session.start(form(self.csv))

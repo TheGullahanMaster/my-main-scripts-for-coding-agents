@@ -457,7 +457,10 @@ so these are **audit-then-extend**, not new builds.
   mean loss. Benchmark (3 unrelated numeric outputs, pop 100, 40 generations,
   node limit 15, 6 seeds): hard-output test R² 0.927 -> 0.970 (5/6 seeds);
   easy and middle outputs exact on every seed (joint missed one); ~8% more
-  time. Resuming one per-output checkpoint continues only that output.
+  time. Resuming one per-output checkpoint continues only that output. The
+  merged model also gets a browse-only `checkpoint_latest.json` beside
+  `separate_outputs.json`; the run reports it, so the GUI's Models tab shows
+  every output (it showed only the first search before); resuming it is refused.
 - [x] Output relations (`--output-relations "HH -> MM; year -> month -> day"`):
   a dependency graph; each output reads its ancestors' *predicted* values
   (never true ones) as extra inputs, ancestors are searched first. The merged

@@ -1816,7 +1816,8 @@ class PosteriorParticlePopulation:
         return {"trees":model.trees,"scales":model.scales,"age":model.age,"objectives":model.objectives,
                 "lineage_id":model.lineage_id,"origin":model.origin,"parent_ids":model.parent_ids,
                 "feasible":model.feasible,"invalid_reason":model.invalid_reason,"constraint_count":model.constraint_count,
-                "mdl_operators":model.mdl_operators,"mdl_feature_count":model.mdl_feature_count,"adfs":checkpoint_adfs(model),"founder_ids":model.founder_ids,"birth_generation":model.birth_generation,"history":list(model.history)}
+                "mdl_operators":model.mdl_operators,"mdl_feature_count":model.mdl_feature_count,"adfs":checkpoint_adfs(model),"founder_ids":model.founder_ids,"birth_generation":model.birth_generation,"history":list(model.history),
+                **({"opaque":model.opaque} if model.opaque else {})}
 
     def snapshot(self):
         return {"capacity":self.capacity,"complexity_prior":self.complexity_prior,"ess_ratio":self.ess_ratio,
@@ -7928,13 +7929,16 @@ def evolve_cells(cells, step, workers, evaluator=None, shared=None):
 def resume_main(args):
     reset_run_caches()
     generation,pop,bayes,archive,state=load_checkpoint(args.resume,args.allow_unsafe_pickle)
+    part=state.get("separate_output")
+    if part and part.get("merged"):
+        raise ValueError("This checkpoint holds the merged model of a separate-output run, for browsing and export only; "
+                         "resume one output's own checkpoint ("+", ".join(part.get("checkpoints",[]))+") or rerun the full setup")
     # Island snapshots, top-up proposals and final ADF refresh all need
     # per-output banks; a single shared generator failed at the first save.
     if not isinstance(bayes,PerOutputBayesianBanks): raise ValueError("Checkpoint predates per-output Bayesian banks and cannot resume; start a new run")
     X,Y,Xt,Yt,Xv,Yv=checkpoint_arrays(state)
     names,out_names,cats,maps=(state[k] for k in ("names","out_names","cats","maps"))
     set_numeric_limits(state.get("clip",DEFAULT_CLIP),state.get("eps",DEFAULT_EPS))
-    part=state.get("separate_output")
     if part:
         print(f"This checkpoint is output {part['output']!r} ({part['index']+1} of {part['count']}) of a separate-output run: resuming continues "
               "only this output's search and does not rebuild the merged model; rerun the full setup for that.")
@@ -8619,8 +8623,24 @@ def train_separate_outputs(args, setup, df, frames, run_seed, metadata, choose_m
                     "manifest":results[column]["manifest"],"checkpoint":results[column]["checkpoint"],"model_card":results[column]["model_card"]} for column,sources in plan],
         "metrics":report}),indent=2,default=lambda value:value.item() if hasattr(value,"item") else str(value))+"\n")
     print(f"Separate-output summary: {summary_path}")
+    # Each output's checkpoint holds only its own search: the merged model gets
+    # one of its own, over the whole table, so browsing it (the GUI's Models
+    # tab) shows every output. It is for browsing and export; resume_main refuses it.
+    merged_checkpoint=summary_path.parent / "checkpoint_latest.json"
+    merged_state={"dataset_path":str(Path(setup["path"]).resolve()),"types":types,"affine_on":setup["affine_on"],
+        "Xt":Xt,"Yt":Yt,"Xv":Xv,"Yv":Yv,"Xtest":Xtest,"Ytest":Ytest,"names":list(names),"out_names":list(out_names_all),"cats":cats,"maps":maps,
+        "source_columns":columns,"export_fixture":train_df.head(16).copy(),"input_ranges":training_input_ranges(train_df,columns,types),
+        "run_seed":run_seed,"manifest":str(summary_path.resolve()),"profile":args.profile,"constraint_metadata":metadata,
+        "selection_loss_tolerance":args.selection_loss_tolerance,"nsga_normalization":args.nsga_normalization,
+        "parsimony_quality_tolerance":args.parsimony_quality_tolerance,"custom_ops":list(CUSTOM_OP_SPECS),"custom_feature_base":CUSTOM_FEATURE_BASE,
+        "clip":CLIP,"eps":EPS,"selection":{"selected_choice":"merged per-output choices"},
+        "separate_output":{"merged":True,"outputs":[column for column,_ in plan],"checkpoints":[results[column]["checkpoint"] for column,_ in plan]}}
+    archive=ParetoArchive(1,args.nsga_normalization,args.parsimony_quality_tolerance); archive.items=[merged]
+    save_checkpoint(merged_checkpoint,max(results[column]["generation"] for column,_ in plan),[],
+                    BayesianEquationGenerator(list(merged.mdl_operators),len(names)),archive,merged_state)
+    print(f"Merged model checkpoint (for browsing): {merged_checkpoint}")
     print("Saved best_model.py")
-    return {"checkpoint":results[plan[0][0]]["checkpoint"],"checkpoints":[results[column]["checkpoint"] for column,_ in plan],
+    return {"checkpoint":str(merged_checkpoint.resolve()),"checkpoints":[results[column]["checkpoint"] for column,_ in plan],
             "manifest":str(summary_path.resolve()),"model_card":str(summary_path.resolve()),
             "generation":max(results[column]["generation"] for column,_ in plan),
             "selected":"; ".join(f"{column}: {results[column]['selected']}" for column,_ in plan),
