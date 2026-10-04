@@ -3029,6 +3029,12 @@ def custom_feature_columns(X, derived):
     X=np.asarray(X,float)
     return np.column_stack([X]+[clean(evaluate(body,X)) for _,body in derived])
 
+def append_custom_features(X):
+    """Base-encoded X (as encode() returns it) with this run's derived custom features appended."""
+    X=np.asarray(X,float)
+    if not CUSTOM_FEATURES or CUSTOM_FEATURE_BASE is None or X.ndim!=2 or X.shape[1]!=CUSTOM_FEATURE_BASE: return X
+    return custom_feature_columns(X,list(CUSTOM_FEATURES.items()))
+
 def inline_custom_features(model, feature_names):
     """A copy whose derived-feature leaves are replaced by their bodies (for export)."""
     if not CUSTOM_FEATURES: return model

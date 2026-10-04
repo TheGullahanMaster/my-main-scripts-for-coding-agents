@@ -276,3 +276,40 @@ class GuiTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _slow(seconds):
+    time.sleep(seconds)
+    return seconds
+
+
+def _fail():
+    raise ValueError("boom")
+
+
+class IsolatedJobTests(unittest.TestCase):
+    """Heavy symbolic work runs in a killable child, never under the explorer lock."""
+
+    def test_result_timeout_error_and_cancel(self):
+        job = gui.IsolatedJob()
+        self.assertEqual(job.run(_slow, (0.01,), 10), 0.01)
+        with self.assertRaises(TimeoutError):
+            job.run(_slow, (30,), 0.3)
+        with self.assertRaisesRegex(RuntimeError, "boom"):
+            job.run(_fail, (), 10)
+        import threading
+        outcome = {}
+        waiter = threading.Thread(target=lambda: outcome.setdefault("first", self._capture(job, 30)))
+        waiter.start(); time.sleep(0.3)
+        started = time.time()
+        self.assertEqual(job.run(_slow, (0.01,), 10), 0.01)           # the newer request kills the older one
+        waiter.join(5)
+        self.assertIsInstance(outcome.get("first"), InterruptedError)
+        self.assertLess(time.time() - started, 5)
+
+    @staticmethod
+    def _capture(job, seconds):
+        try:
+            return job.run(_slow, (seconds,), 60)
+        except Exception as error:
+            return error

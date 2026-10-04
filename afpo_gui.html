@@ -1612,33 +1612,52 @@ async function loadMath(index) {
   $('#mathBody').innerHTML = '<div class="hint">Converting…</div>';
   try {
     const [data, katex] = await Promise.all([api('/api/models/latex', {index}), loadKatex()]);
-    if (M.index !== index) return;
+    if (M.index !== index || data.cancelled) return;
     MATH.data = data; MATH.katex = katex; renderMath();
   } catch (e) { if (M.index === index) $('#mathBody').innerHTML = `<div class="hint">${esc(e.message)}</div>`; }
+}
+// KaTeX lays a formula out synchronously on the page's only thread: a huge
+// equation froze every tab until it finished.  Outputs render one per tick,
+// and a formula over MATH_LIMIT characters shows its exact text with a
+// button to render it on request.
+const MATH_LIMIT = 6000;
+let mathTicket = 0;
+function mathHtml(o, mode, force) {
+  const form = o[mode], tex = `${o.name_latex} = ${form.latex}`;
+  if (!form.latex) return `<div class="hint">${esc(o.name)}: could not convert (${esc(form.error)})</div>`;
+  if (!force && tex.length > MATH_LIMIT)
+    return `<div class="mono" style="white-space:pre-wrap;word-break:break-all;max-height:16em;overflow:auto">${esc(o.name)} = ${esc(form.text || form.latex)}</div>
+      <button class="btn" style="margin-top:6px" data-render-math="1">Render (${tex.length.toLocaleString()} characters; may take a while)</button>`;
+  let shown;
+  if (MATH.katex) {
+    try { shown = MATH.katex.renderToString(tex, {displayMode: true, throwOnError: true}); } catch (e) { shown = null; }
+  }
+  if (!shown) shown = `<math display="block"><mi${o.name.length > 1 ? ' mathvariant="normal"' : ''}>${esc(o.name)}</mi><mo>=</mo>${form.mathml}</math>`;
+  const a = o.agreement;
+  const note = mode === 'raw' && a ? `<div class="hint">Matches the model on ${(100 * a.defined).toFixed(1)}% of training rows${a.gap == null ? '' : `, max difference ${fmt(a.gap, 2)} of the output range`}.</div>` : '';
+  // Classifier: after the last score equation, how the scores become a class.
+  const decision = o.decision ? `<div class="name" style="margin-top:8px">${esc(o.output || o.name)}: predicted class</div>` + o.decision.latex.map((line, i) => {
+    let html = null;
+    if (MATH.katex && (force || line.length <= MATH_LIMIT)) { try { html = MATH.katex.renderToString(line, {displayMode: true, throwOnError: true}); } catch (e) { html = null; } }
+    return html || `<div class="mono" style="margin:6px 0">${esc(o.decision.text[i] || line)}</div>`;
+  }).join('') : '';
+  return shown + note + decision;
 }
 function renderMath() {
   const d = MATH.data, body = $('#mathBody');
   if (!d) return;
   if (!d.available) { body.innerHTML = `<div class="hint">${esc(d.reason)}</div>`; return; }
-  const mode = MATH.mode;
-  body.innerHTML = d.outputs.map(o => {
-    const form = o[mode], tex = `${o.name_latex} = ${form.latex}`;
-    if (!form.latex) return `<div class="math"><div class="hint">${esc(o.name)}: could not convert (${esc(form.error)})</div></div>`;
-    let shown;
-    if (MATH.katex) {
-      try { shown = MATH.katex.renderToString(tex, {displayMode: true, throwOnError: true}); } catch (e) { shown = null; }
-    }
-    if (!shown) shown = `<math display="block"><mi${o.name.length > 1 ? ' mathvariant="normal"' : ''}>${esc(o.name)}</mi><mo>=</mo>${form.mathml}</math>`;
-    const a = o.agreement;
-    const note = mode === 'raw' && a ? `<div class="hint">Matches the model on ${(100 * a.defined).toFixed(1)}% of training rows${a.gap == null ? '' : `, max difference ${fmt(a.gap, 2)} of the output range`}.</div>` : '';
-    // Classifier: after the last score equation, how the scores become a class.
-    const decision = o.decision ? `<div class="name" style="margin-top:8px">${esc(o.output || o.name)}: predicted class</div>` + o.decision.latex.map((line, i) => {
-      let html = null;
-      if (MATH.katex) { try { html = MATH.katex.renderToString(line, {displayMode: true, throwOnError: true}); } catch (e) { html = null; } }
-      return html || `<div class="mono" style="margin:6px 0">${esc(o.decision.text[i] || line)}</div>`;
-    }).join('') : '';
-    return `<div class="math">${d.outputs.length > 1 ? `<div class="name">${esc(o.name)}</div>` : ''}${shown}${note}${decision}</div>`;
-  }).join('') + (mode === 'exact' ? '<div class="hint">Exact: afpo\'s guards as evaluated (the per-node ±1e12 clamp is left out).</div>' : '');
+  const mode = MATH.mode, ticket = ++mathTicket;
+  body.innerHTML = d.outputs.map((o, i) => `<div class="math">${d.outputs.length > 1 ? `<div class="name">${esc(o.name)}</div>` : ''}<div data-math-slot="${i}"><div class="hint">Rendering…</div></div></div>`).join('')
+    + (mode === 'exact' ? '<div class="hint">Exact: afpo\'s guards as evaluated (the per-node value clamp is left out).</div>' : '');
+  d.outputs.forEach((o, i) => setTimeout(() => {
+    if (ticket !== mathTicket) return;          // a newer render (other model or mode) took over
+    const slot = body.querySelector(`[data-math-slot="${i}"]`);
+    if (!slot) return;
+    slot.innerHTML = mathHtml(o, mode, false);
+    const button = slot.querySelector('[data-render-math]');
+    if (button) button.onclick = () => { button.textContent = 'Rendering…'; setTimeout(() => { if (ticket === mathTicket) slot.innerHTML = mathHtml(o, mode, true); }, 30); };
+  }, 20 * i));
 }
 $$('#mathMode button').forEach(b => b.onclick = () => {
   MATH.mode = b.dataset.mode;

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import multiprocessing
 import contextlib
 import io
 import json
@@ -679,6 +680,75 @@ class TrainingSession:
 
 
 # ───────────────────────── model explorer ─────────────────────────
+SYMBOLIC_TIMEOUT = 120.      # seconds a rendered-equation conversion may take
+
+
+def _latex_payload(model, names, out_names, cats, positive, Xt):
+    """The rendered-equation view of a model, as plain JSON-ready data (runs in a child process)."""
+    result = afpo.symbolic_model(model, names, out_names, cats, positive, Xt)
+    if result is None:
+        return {"available": False, "reason": "Install sympy to see the rendered equation."}
+    outputs = []
+    for name, entry in result.items():
+        forms = {mode: {"latex": None, "error": entry.get("errors", {}).get(mode)} if entry[mode][0] is None else
+                 {"latex": entry[mode][1], "text": str(entry[mode][0]),
+                  "mathml": afpo.mathml_expression(entry[mode][0], entry[mode][0].free_symbols)} for mode in ("exact", "raw")}
+        agreement = entry["agreement"]
+        outputs.append({"name": name, "name_latex": entry.get("name_latex") or afpo.latex_symbol_name(name.replace(" ", "_")), **forms,
+                        "agreement": None if agreement is None else
+                        {"defined": agreement[0], "gap": None if not math.isfinite(agreement[1]) else agreement[1]},
+                        "output": entry.get("output"), "decision": entry.get("decision")})
+    return {"available": True, "outputs": outputs}
+
+
+class IsolatedJob:
+    """Run one CPU-heavy pure-Python call in a forked child, so it neither holds
+    the GIL against the server's other threads nor outlives a newer request:
+    starting a job (or cancel()) kills the one before it."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.proc = None
+
+    def cancel(self):
+        with self.lock:
+            proc, self.proc = self.proc, None
+        if proc is not None and proc.is_alive():
+            proc.kill()
+
+    def run(self, function, args, timeout):
+        if "fork" not in multiprocessing.get_all_start_methods():
+            return function(*args)              # no fork: run in this (request) thread
+        context = multiprocessing.get_context("fork")
+        reader, writer = context.Pipe(duplex=False)
+
+        def target():
+            try:
+                writer.send(("ok", function(*args)))
+            except BaseException as error:  # report, never hang the waiting request
+                writer.send(("error", f"{type(error).__name__}: {error}"))
+
+        self.cancel()
+        proc = context.Process(target=target, daemon=True)
+        with self.lock:
+            proc.start(); self.proc = proc
+        writer.close()
+        try:
+            if not reader.poll(timeout):
+                proc.kill()
+                raise TimeoutError(f"gave up after {timeout:g} s")
+            status, value = reader.recv()
+        except EOFError:
+            raise InterruptedError("cancelled by a newer request") from None
+        finally:
+            reader.close(); proc.join(1)
+            with self.lock:
+                if self.proc is proc: self.proc = None
+        if status == "error":
+            raise RuntimeError(value)
+        return value
+
+
 class ModelExplorer:
     """Loads a checkpoint in the GUI process to browse, plot, predict with and export its models."""
 
@@ -689,6 +759,7 @@ class ModelExplorer:
         self.path = None
         self.files = {}
         self.job = None
+        self.symbolic = IsolatedJob()
 
     def _require(self):
         if self.state is None:
@@ -700,6 +771,12 @@ class ModelExplorer:
             generation, pop, bayes, archive, state = afpo.load_checkpoint(path, allow_unsafe_pickle=False)
             maps = state["maps"]
             afpo.SEQUENCE_LAYOUT = maps.get(afpo.SEQUENCE_LAYOUT_KEY)
+            self.symbolic.cancel()
+            # Settings the models were searched with: numeric limits and user operators (names, bodies).
+            afpo.set_numeric_limits(state.get("clip", afpo.DEFAULT_CLIP), state.get("eps", afpo.DEFAULT_EPS))
+            base = state.get("custom_feature_base")
+            afpo.configure_custom_ops(state.get("custom_ops", ()), list(state["names"]) if base is None else list(state["names"])[:base],
+                                      state.get("source_columns", ()), state.get("types", ()))
             tolerance = state.get("parsimony_quality_tolerance", 0.)
             simplifier_keys = set()
             if state.get("island_states"):
@@ -790,33 +867,31 @@ class ModelExplorer:
                     "history": [dict(record) for record in model.history], "history_text": afpo.describe_history(model.history)}
 
     def latex(self, index):
-        """Exact and raw equation forms of a model for the rendered-equation view (needs sympy)."""
+        """Exact and raw equation forms of a model for the rendered-equation view (needs sympy).
+
+        SymPy simplification of a large equation can take minutes of pure
+        Python: it runs in a child process (IsolatedJob) outside the explorer
+        lock, so browsing data, plotting and sampling stay responsive, and a
+        newer request (another model) cancels it."""
         with self.lock:
             model, state = self._model(index), self.state
-            cached = self.models[int(index)].get("latex")
-            if cached is not None:
-                return cached
+            item = self.models[int(index)]
+            if item.get("latex") is not None:
+                return item["latex"]
             names, out_names, cats, Xt = state["names"], state["out_names"], state["cats"], state["Xt"]
             positive = tuple(i for i in range(Xt.shape[1]) if len(Xt) and np.all(Xt[:, i] > 0))
-            try:
-                result = afpo.symbolic_model(model, names, out_names, cats, positive, Xt)
-            except Exception as error:  # an unsupported operator must not break the model view
-                return {"available": False, "reason": f"Symbolic conversion failed: {error}"}
-            if result is None:
-                return {"available": False, "reason": "Install sympy to see the rendered equation."}
-            outputs = []
-            for name, entry in result.items():
-                forms = {mode: {"latex": None, "error": entry.get("errors", {}).get(mode)} if entry[mode][0] is None else
-                         {"latex": entry[mode][1], "text": str(entry[mode][0]),
-                          "mathml": afpo.mathml_expression(entry[mode][0], entry[mode][0].free_symbols)} for mode in ("exact", "raw")}
-                agreement = entry["agreement"]
-                outputs.append({"name": name, "name_latex": entry.get("name_latex") or afpo.latex_symbol_name(name.replace(" ", "_")), **forms,
-                                "agreement": None if agreement is None else
-                                {"defined": agreement[0], "gap": None if not math.isfinite(agreement[1]) else agreement[1]},
-                                "output": entry.get("output"), "decision": entry.get("decision")})
-            payload = {"available": True, "outputs": outputs}
-            self.models[int(index)]["latex"] = payload
-            return payload
+        try:
+            payload = self.symbolic.run(_latex_payload, (model, names, out_names, cats, positive, Xt), SYMBOLIC_TIMEOUT)
+        except InterruptedError:
+            return {"available": False, "cancelled": True, "reason": "Cancelled: another model was selected."}
+        except TimeoutError as error:
+            return {"available": False, "reason": f"The equation is too large to render ({error}); the text form above is exact."}
+        except Exception as error:  # an unsupported operator must not break the model view
+            return {"available": False, "reason": f"Symbolic conversion failed: {error}"}
+        with self.lock:
+            if self.state is state and int(index) < len(self.models) and self.models[int(index)] is item:
+                item["latex"] = payload
+        return payload
 
     def _inputs_used(self, model):
         """Source input columns the model reads (a text column counts if any of its categories is used)."""
@@ -860,7 +935,7 @@ class ModelExplorer:
         for column, kind in zip(state["source_columns"], state["types"]):
             if kind == 1:
                 frame[column] = pd.to_numeric(frame[column], errors="coerce")
-        return afpo.encode(frame, state["types"], state["maps"])[0]
+        return afpo.append_custom_features(afpo.encode(frame, state["types"], state["maps"])[0])
 
     def _typical_row(self):
         state = self.state
@@ -1012,7 +1087,7 @@ class ModelExplorer:
             if all(name in frame.columns for name in state["out_names"]):
                 Xe, Ye, *_ = afpo.encode(frame[state["source_columns"]] if all(c in frame.columns for c in state["source_columns"]) else
                                          frame.reindex(columns=state["source_columns"]), state["types"], state["maps"])
-                metrics = afpo.frozen_metrics(model, Xe, Ye, state["cats"], self.constraints, state["out_names"])
+                metrics = afpo.frozen_metrics(model, afpo.append_custom_features(Xe), Ye, state["cats"], self.constraints, state["out_names"])
             preview = result.head(25).astype(object).where(result.head(25).notna(), None)
             return {"path": str(destination.resolve()), "rows": int(len(result)), "columns": [str(c) for c in result.columns],
                     "preview": [[None if v is None else str(v) for v in row] for row in preview.values.tolist()], "metrics": metrics}
@@ -1075,7 +1150,7 @@ def _encode_frame(state, frame):
     for column, kind in zip(state["source_columns"], state["types"]):
         if kind == 1:
             frame[column] = pd.to_numeric(frame[column], errors="coerce")
-    return afpo.encode(frame, state["types"], state["maps"])[0]
+    return afpo.append_custom_features(afpo.encode(frame, state["types"], state["maps"])[0])
 
 
 def generation_plan(state, spec):
