@@ -1478,8 +1478,9 @@ function renderChoose(choose) {
   const card = $('#chooseCard');
   if (!choose) { card.classList.add('hidden'); return; }
   if (!card.classList.contains('hidden') && card.dataset.time === String(choose.time)) return;
-  card.dataset.time = choose.time; card.classList.remove('hidden');
-  $('#chooseHint').textContent = `The search has ended. Scores below are on ${choose.source} data; option 1 is what the terminal saves by default.`;
+  card.dataset.time = choose.time; card.classList.remove('hidden'); T.choice = 0;
+  const which = choose.outputs && choose.outputs.length ? ` for ${choose.outputs.join(', ')}` : '';
+  $('#chooseHint').textContent = `The search${which} has ended. Scores below are on ${choose.source} data; option 1 is what the terminal saves by default.`;
   const list = $('#chooseList'); list.innerHTML = '';
   choose.options.forEach((o, i) => {
     const div = document.createElement('div'); div.className = 'option' + (i === T.choice ? ' sel' : '');

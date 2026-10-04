@@ -117,6 +117,26 @@ class GuiTests(unittest.TestCase):
                     "to": {"island": 3, "stage": 0, "role": "simplifier"}, "how": "gathered"})
         self.assertEqual(gui.afpo.history_path(history), ["island 2 (explorer)", "island 4 (simplifier)"])
 
+    def test_separate_outputs_ask_for_each_choice(self):
+        """Regression: the second output's choice was hidden behind the first pick, and the run hung in 'saving'."""
+        two = Path(self.tmp.name) / "two.csv"
+        frame = pd.read_csv(self.csv); frame["y2"] = frame["a"] - frame["b"]; frame.to_csv(two, index=False)
+        spec = form(two); spec["data"]["types"] = [1, 1, 1, 5, 5]; spec["data"]["output_relations"] = "y -> y2"
+        spec["run"]["max_generations"] = 2
+        session = gui.TrainingSession()
+        session.start(spec)
+        for output in ("y", "y2"):
+            status = wait_for(session, {"choosing", "failed", "finished"})
+            self.assertEqual(status["state"], "choosing", "\n".join(status["console"][-30:]))
+            self.assertEqual(status["choose"]["outputs"], [output])
+            session.pick(0)
+            if output == "y":     # the next search runs (not "saving") until it asks again
+                status = wait_for(session, {"running", "choosing", "failed", "finished"})
+                self.assertNotEqual(status["state"], "failed", status["error"])
+        status = wait_for(session, {"finished", "failed"})
+        self.assertEqual(status["state"], "finished", status["error"])
+        self.assertTrue(Path(status["done"]["manifest"]).is_file())
+
     def test_train_choose_then_explore(self):
         session = gui.TrainingSession()
         session.start(form(self.csv))
