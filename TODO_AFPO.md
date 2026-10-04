@@ -424,6 +424,28 @@ so these are **audit-then-extend**, not new builds.
   quality rank (best cell at most e^2 the worst's weight, ties share a rank) x
   coverage bonus for rarely tried cells; the protected uniform share is kept.
   `--qd-parent-choice legacy` restores success-only weighting.
+- [x] Class balancing for categorical outputs (`--class-balance on|off`,
+  default on, 2026-10-04; checkpoints from before it resume with it off).
+  Every class of a categorical output gets equal total weight
+  (`class_balance_weights`, mean 1) in: the scored log loss; the shape
+  objective, which becomes the balanced error rate; the classifier readout fit
+  (`fit_classifier_affine`, so offsets no longer encode the class prior);
+  classifier constant tuning, which also runs on `class_balanced_rows` (input
+  coverage alone could leave a rare class with no rows); the Bayesian
+  bernoulli/categorical likelihoods; and lexicase case order. Also with it on:
+  the holdout split is stratified by class (a rare class always keeps a
+  training row, so its label is never unseen), and the residual archive gets
+  one error group per class, probed on class-balanced rows. Off reproduces the
+  previous search bit for bit. Independent of the flag: `--sparse-seeding`
+  now seeds classifier heads from one-vs-rest indicator fits; validation, test,
+  the posterior check and the exported `best_model.py --test-csv` report
+  balanced accuracy beside accuracy.
+  Benchmark (synthetic, 600 rows, pop 120, 40 generations, 4000-row test set):
+  binary 94/6 — balanced accuracy 0.928 -> 0.967 (5/5 seeds), accuracy
+  0.981 -> 0.973; 3-class 80/13/7 — balanced accuracy 0.909 -> 0.938 (8/10
+  seeds), accuracy 0.974 -> 0.951. Plain accuracy drops because the decision
+  rule no longer favours the majority; use `off` when plain accuracy under the
+  training prior is the goal.
 
 ## Phase 4 — Later (after Phases 1–3 produce telemetry)
 

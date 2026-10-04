@@ -1596,7 +1596,9 @@ def _classifier_log_loss(raw, truth, class_count):
     scores=np.column_stack([a*raw[:,k]+b for k,(a,b) in enumerate(scales)])
     probabilities=binary_probabilities(scores[:,0]) if raw.shape[1]==1 else stable_softmax(scores)
     truth=np.asarray(np.rint(truth),int); valid=(truth>=0)&(truth<probabilities.shape[1])
-    return float(np.mean(-np.log(np.maximum(probabilities[np.arange(len(truth))[valid],truth[valid]],EPS)))) if np.any(valid) else 0.
+    if not np.any(valid): return 0.
+    losses=-np.log(np.maximum(probabilities[np.arange(len(truth))[valid],truth[valid]],EPS))
+    return float(np.average(losses,weights=class_balance_weights(truth,class_count)[valid]))
 
 def _tune_classifier_heads(trees, heads, X, truth, class_count, adfs):
     """Tune each class head's constants against its 0/1 indicator (least squares surrogate),
@@ -1622,7 +1624,10 @@ def tune_model_constants(model, X, Y, affine_on, cats):
     Xs,Ys=row_subset(X,rows),row_subset(Y,rows); trees=list(model.trees); changed=False
     for j,heads in enumerate(targets):
         if cats[j] is not None:
-            if len(cats[j])>=2 and affine_on and _tune_classifier_heads(trees,heads,Xs,Ys[:,j],len(cats[j]),model.adfs): changed=True
+            if len(cats[j])>=2 and affine_on:
+                # Input coverage alone can leave a rare class with no rows at all.
+                class_rows=class_balanced_rows(X,Y[:,j],len(cats[j]),CONSTANT_FIT_ROWS) if CLASS_BALANCE else rows
+                if _tune_classifier_heads(trees,heads,row_subset(X,class_rows),row_subset(Y,class_rows)[:,j],len(cats[j]),model.adfs): changed=True
             continue
         for head in heads:
             original=trees[head]
@@ -1817,10 +1822,10 @@ class PosteriorParticlePopulation:
         if self.likelihood_kind=="bernoulli":
             probability=binary_probabilities(raw[:,0])[:,1]
             truth=np.asarray(np.rint(Y[:,0]),int); valid=(truth>=0)&(truth<=1)
-            return float(np.mean(np.where(valid,-np.log(np.where(truth==1,probability,1-probability)+EPS),-np.log(EPS))))
+            return float(np.average(np.where(valid,-np.log(np.where(truth==1,probability,1-probability)+EPS),-np.log(EPS)),weights=class_balance_weights(truth,2)))
         if self.likelihood_kind=="categorical":
             probability=stable_softmax(raw); truth=np.asarray(np.rint(Y[:,0]),int); valid=(truth>=0)&(truth<probability.shape[1]); row=np.arange(len(truth))
-            return float(np.mean(np.where(valid,-np.log(np.maximum(probability[row,np.clip(truth,0,probability.shape[1]-1)],EPS)),-np.log(EPS))))
+            return float(np.average(np.where(valid,-np.log(np.maximum(probability[row,np.clip(truth,0,probability.shape[1]-1)],EPS)),-np.log(EPS)),weights=class_balance_weights(truth,probability.shape[1])))
         return float("inf")
 
     def _cached_likelihood_energy(self, model, X, Y, cats):
@@ -1962,7 +1967,7 @@ class PosteriorParticlePopulation:
             }
         categorical=[index for index, labels in enumerate(cats) if labels is not None]
         if categorical:
-            correct=total=0; log_losses=[]; confidences=[]; briers=[]
+            correct=total=0; log_losses=[]; confidences=[]; briers=[]; recalls=[]
             for index in categorical:
                 class_count=len(cats[index])
                 truth=np.asarray(np.rint(Y[:,index]),dtype=int)
@@ -1978,6 +1983,7 @@ class PosteriorParticlePopulation:
                 probabilities=np.tensordot(weights,np.asarray(particle_probabilities),axes=(0,0))
                 chosen=np.argmax(probabilities,axis=1)
                 correct+=int(np.sum(chosen[valid]==truth[valid])); total+=int(np.sum(valid))
+                recalls.extend(float(np.mean(chosen[valid&(truth==label)]==label)) for label in np.unique(truth[valid]))
                 row=np.arange(len(truth))[valid]
                 log_losses.extend(-np.log(np.maximum(probabilities[row,truth[valid]],EPS)))
                 confidences.extend(np.max(probabilities[valid],axis=1))
@@ -1985,6 +1991,7 @@ class PosteriorParticlePopulation:
             if total:
                 result["classification"]={
                     "accuracy":correct/total,
+                    "balanced_accuracy":float(np.mean(recalls)),
                     "log_loss":float(np.mean(log_losses)),
                     "mean_confidence":float(np.mean(confidences)),"brier_score":float(np.mean(briers)),
                     "observations":total,
@@ -2106,7 +2113,7 @@ class BayesianEquationGenerator:
                              f"95% band={numeric['coverage_95']:.0%}")
             if "classification" in predictive:
                 classification=predictive["classification"]
-                parts.append(f"class accuracy={classification['accuracy']:.1%}, log loss={classification['log_loss']:.4g}, "
+                parts.append(f"class accuracy={classification['accuracy']:.1%} (balanced {classification.get('balanced_accuracy',classification['accuracy']):.1%}), log loss={classification['log_loss']:.4g}, "
                              f"confidence={classification['mean_confidence']:.1%}")
             check=f", {predictive['source']} PPC " + "; ".join(parts) if parts else ", PPC=no valid held-out targets"
         return (f"Adaptive Bayesian proposals: entropy={self.entropy:.2f}, exploration={self.exploration:.0%}, injection={self.particles.injection_rate:.0%}, "
@@ -3263,16 +3270,54 @@ def binary_probabilities(scores):
     positive=1./(1.+np.exp(-np.clip(np.asarray(scores,float)-.5,-50,50)))
     return np.column_stack((1.-positive,positive))
 
+# --class-balance (default on): every class of a categorical output carries the
+# same total weight in its log loss, its error rate (the shape objective
+# becomes the balanced error rate), the classifier readout fit, classifier
+# constant tuning, the Bayesian likelihood and lexicase case order.
+# Unweighted, a 95/5 target is 95% "accurate" with a constant head, and every
+# one of those signals preferred dropping the rare class to fitting it.  The
+# weights come from the rows being scored, so validation is balanced too.
+CLASS_BALANCE = True
+def class_balance_weights(truth, class_count):
+    """Row weights giving every present class the same total weight, with mean 1
+    over the valid rows; rows with an unknown label (-1) keep weight 1."""
+    truth=np.asarray(np.rint(truth),int); weights=np.ones(len(truth))
+    if not CLASS_BALANCE: return weights
+    valid=(truth>=0)&(truth<class_count)
+    if not np.any(valid): return weights
+    counts=np.bincount(truth[valid],minlength=class_count).astype(float)
+    weights[valid]=np.count_nonzero(valid)/(np.count_nonzero(counts)*counts[truth[valid]])
+    return weights
+_BALANCED_ROWS={}
+def class_balanced_rows(X, truth, class_count, maximum):
+    """Deterministic training rows with every present class equally represented:
+    a large class keeps its maximin input-coverage probe, a small one repeats its
+    rows (duplication is how an unweighted least-squares fit sees a class weight)."""
+    truth=np.asarray(np.rint(truth),int)
+    key=(int(maximum),int(class_count),array_digest(np.asarray(X)),rows_digest(truth))
+    cached=_BALANCED_ROWS.get(key)
+    if cached is not None: return cached
+    groups=[np.flatnonzero(truth==label) for label in range(class_count)]
+    groups=[group for group in groups if len(group)]
+    if not groups: return stratified_probe_indices(X,maximum) if len(X)>maximum else slice(None)
+    quota=max(1,min(max(len(group) for group in groups),int(maximum)//len(groups)))
+    parts=[group[stratified_probe_indices(X[group],quota)] if len(group)>quota else np.resize(group,quota) for group in groups]
+    rows=np.sort(np.concatenate(parts))
+    if len(_BALANCED_ROWS)>=64: _BALANCED_ROWS.clear()
+    _BALANCED_ROWS[key]=rows
+    return rows
+
 CLASSIFIER_RIDGE=1e-3
 def fit_classifier_affine(raw, truth, class_count):
     """Fit per-head (scale, offset) minimizing ridge-penalized log loss by damped Newton.
 
     raw has one column per head; binary targets use one head whose log-odds are
-    score-0.5, so the returned offset already includes that +0.5 shift."""
+    score-0.5, so the returned offset already includes that +0.5 shift.  Rows
+    carry class_balance_weights, so the offsets do not encode the class prior."""
     raw=np.asarray(raw,float); n,heads=raw.shape
     truth=np.asarray(np.rint(truth),int); valid=(truth>=0)&(truth<class_count)
     if not np.any(valid): return [(1.,0.)]*heads
-    raw=raw[valid]; truth=truth[valid]; n=len(truth)
+    raw=raw[valid]; truth=truth[valid]; n=len(truth); row_weights=class_balance_weights(truth,class_count)
     centre=raw.mean(axis=0); spread=raw.std(axis=0); live=spread>=EPS*np.maximum(1.,np.abs(centre))
     spread=np.where(live,spread,1.)
     u=(raw-centre)/spread
@@ -3286,14 +3331,15 @@ def fit_classifier_affine(raw, truth, class_count):
         logits=np.einsum("nkd,kd->nk",features,t.reshape(class_count,2))
         logits-=logits.max(axis=1,keepdims=True)
         log_probabilities=logits-np.log(np.exp(logits).sum(axis=1,keepdims=True))
-        return float(-np.mean(log_probabilities[np.arange(n),truth])+.5*CLASSIFIER_RIDGE*t@t),np.exp(log_probabilities)
+        return float(-np.mean(row_weights*log_probabilities[np.arange(n),truth])+.5*CLASSIFIER_RIDGE*t@t),np.exp(log_probabilities)
     value,probabilities=objective(theta)
     for _ in range(30):
-        weighted=(probabilities-one_hot)[:,:,None]*features
+        weighted=((probabilities-one_hot)*row_weights[:,None])[:,:,None]*features
         gradient=weighted.reshape(n,-1).mean(axis=0)+CLASSIFIER_RIDGE*theta
-        # Softmax Hessian block (k,l) = sum_n (p_k[k=l] - p_k p_l) f_k f_l^T.
-        weighted_features=(probabilities[:,:,None]*features).reshape(n,-1)
-        hessian=(same_class*((flat*np.repeat(probabilities,2,axis=1)).T@flat)-weighted_features.T@weighted_features)/n+ridge
+        # Softmax Hessian block (k,l) = sum_n w_n (p_k[k=l] - p_k p_l) f_k f_l^T.
+        # g.T@g on one buffer (numpy's symmetric product), so unit weights reproduce the unweighted fit bit for bit.
+        weighted_features=(probabilities[:,:,None]*features).reshape(n,-1)*np.sqrt(row_weights)[:,None]
+        hessian=(same_class*((flat*np.repeat(probabilities*row_weights[:,None],2,axis=1)).T@flat)-weighted_features.T@weighted_features)/n+ridge
         try: step=np.linalg.solve(hessian,gradient)
         except np.linalg.LinAlgError: step=gradient
         rate=1.
@@ -4401,12 +4447,18 @@ class StructuralQualityDiversityArchive(QualityDiversityArchive):
 RESIDUAL_ARCHIVE = True       # --residual-archive
 RESIDUAL_TARGET_BINS = 3      # low / middle / high target values, per numeric output
 RESIDUAL_REGION_BINS = 4      # quartiles of the probe inputs' first principal component
-def residual_regions(probe_X, probe_Y, cats):
+def residual_regions(probe_X, probe_Y, cats, class_groups=True):
     """Fixed row groups for residual signatures: target-magnitude bins per
-    numeric output and input-region bins, each a list of row-index arrays."""
+    numeric output, one group per class of a categorical output (class_groups;
+    a model that only misses class A and one that only misses class B are
+    complementary), and input-region bins, each a list of row-index arrays."""
     X=np.asarray(probe_X,float); groups=[]
     for j,labels in enumerate(cats):
-        if labels is not None: continue
+        if labels is not None:
+            if class_groups and len(labels)>=2:
+                truth=np.rint(np.asarray(probe_Y[:,j],float))
+                groups.append([np.flatnonzero(truth==label) for label in range(len(labels))])
+            continue
         y=np.asarray(probe_Y[:,j],float)
         edges=np.quantile(y,np.linspace(0,1,RESIDUAL_TARGET_BINS+1)[1:-1]) if len(y) else []
         bins=np.searchsorted(edges,y,side="left")
@@ -4430,10 +4482,10 @@ class ResidualQualityDiversityArchive(QualityDiversityArchive):
     so it describes the error's location, not its size; each cell still keeps
     its lowest-loss model."""
     policy="residual_signature_cvt"
-    def __init__(self, probe, probe_targets, cats, seed, capacity=64, landmarks=None):
+    def __init__(self, probe, probe_targets, cats, seed, capacity=64, landmarks=None, class_groups=True):
         super().__init__(probe,cats,seed,capacity,landmarks)
-        self.probe_targets=np.asarray(probe_targets,float)
-        self.groups=residual_regions(self.probe,self.probe_targets,self.cats)
+        self.probe_targets=np.asarray(probe_targets,float); self.class_groups=bool(class_groups)
+        self.groups=residual_regions(self.probe,self.probe_targets,self.cats,self.class_groups)
 
     def descriptor(self, model):
         prediction=np.asarray(predict_targets(model,self.probe,self.cats),float)
@@ -4449,11 +4501,12 @@ class ResidualQualityDiversityArchive(QualityDiversityArchive):
         return np.concatenate(parts) if parts else np.zeros(1)
 
     def snapshot(self):
-        data=super().snapshot(); data["probe_targets"]=self.probe_targets; return data
+        data=super().snapshot(); data["probe_targets"]=self.probe_targets; data["class_groups"]=self.class_groups; return data
 
     @classmethod
     def from_snapshot(cls, data):
-        result=cls(data["probe"],data["probe_targets"],data["cats"],data["seed"],data["capacity"],data.get("landmarks"))
+        # Archives saved before class groups keep their descriptor length (and landmarks).
+        result=cls(data["probe"],data["probe_targets"],data["cats"],data["seed"],data["capacity"],data.get("landmarks"),data.get("class_groups",False))
         result.cells={int(key):Model(**model) for key,model in data.get("cells",{}).items()}
         result.updates=int(data.get("updates",0)); result.replacements=int(data.get("replacements",0)); result.last_loss_threshold=data.get("last_loss_threshold")
         result.cell_trials={int(key):float(value) for key,value in data.get("cell_trials",{}).items()}
@@ -4615,9 +4668,13 @@ def lexicase_parents(pop, count, X, Y, cats, max_cases=0, case_weights=None, sca
         # Informed down-sampling prioritizes cases where the population still
         # disagrees most, preserving selection pressure under large datasets.
         cases=np.argsort(np.median(errors,axis=0))[-max_cases:].tolist()
-    weights=None
-    if case_weights is not None:
-        weights=np.maximum(np.tile(np.asarray(case_weights,float),Y.shape[1])[cases],EPS)
+    per_case=None if case_weights is None else np.tile(np.asarray(case_weights,float),Y.shape[1])
+    if CLASS_BALANCE and any(labels is not None for labels in cats):
+        # A rare class's rows are few cases, so uniform order almost never
+        # examines them first; equal class weight puts them first as often.
+        balance=np.concatenate([np.ones(len(Y)) if labels is None else class_balance_weights(Y[:,j],len(labels)) for j,labels in enumerate(cats)])
+        if not np.all(balance==1.): per_case=balance if per_case is None else per_case*balance
+    weights=None if per_case is None else np.maximum(per_case[cases],EPS)
     selected=[]
     for _ in range(count):
         pool=np.arange(len(pop))
@@ -4729,11 +4786,30 @@ def describe_row_sample(frame):
     sample=frame.attrs.get("afpo_row_sample")
     return f"; sampled {len(frame):,} of {sample['source_rows']:,} rows (--max-rows, seed {sample['seed']})" if sample else ""
 
-def holdout_split_indices(n_rows, validation_rows, seed):
-    """Deterministic disjoint train/validation split used by every run."""
+def holdout_split_indices(n_rows, validation_rows, seed, strata=None):
+    """Deterministic disjoint train/validation split used by every run.
+
+    strata (one label per row, e.g. the class of a categorical output) gives
+    each stratum its proportional share of the validation rows, and always
+    leaves it at least one training row: a plain random split can put every
+    row of a rare class in validation, where its label was never seen."""
     if not 0 < validation_rows < n_rows: raise ValueError("Validation rows must be between 1 and n_rows - 1")
     indices=np.random.default_rng(seed).permutation(n_rows)
-    return indices[:-validation_rows],indices[-validation_rows:]
+    if strata is None: return indices[:-validation_rows],indices[-validation_rows:]
+    _,codes=np.unique(np.asarray(strata,dtype=str),return_inverse=True)
+    counts=np.bincount(codes); share=validation_rows*counts/n_rows; room=counts-1
+    quota=np.minimum(np.floor(share).astype(int),room)
+    # Largest remainder first, then any stratum with room left.
+    for stratum in [*np.argsort(-(share-quota),kind="stable"),*np.argsort(-room,kind="stable")]:
+        if quota.sum()>=validation_rows: break
+        if quota[stratum]<room[stratum]: quota[stratum]+=1
+    if quota.sum()<validation_rows: return indices[:-validation_rows],indices[-validation_rows:]
+    # The last members of each stratum in permutation order become validation.
+    ordered=codes[indices]; rank=np.empty(n_rows,dtype=int)
+    for stratum in range(len(counts)):
+        members=np.flatnonzero(ordered==stratum); rank[members]=np.arange(len(members))[::-1]
+    holdout=rank<quota[ordered]
+    return indices[~holdout],indices[holdout]
 
 def kfold_split_indices(n_rows, folds, seed):
     """Deterministic disjoint K-fold partitions for external CV orchestration."""
@@ -5216,14 +5292,16 @@ def assess(m, X, Y, affine_on, cats, fit_affine=True, constraints=None, output_n
             scores=np.column_stack([clean(scales[head][0]*raw[:,head]+scales[head][1]) for head in heads]); probabilities=stable_softmax(scores)
             truth=np.asarray(np.rint(Y[:,j]),dtype=int); valid=(truth>=0)&(truth<len(cats[j])); row=np.arange(len(truth))
             cross_entropy=np.where(valid,-np.log(np.maximum(probabilities[row,np.clip(truth,0,len(cats[j])-1)],EPS)),-np.log(EPS))
-            labels=np.argmax(probabilities,axis=1); losses.append(float(np.mean(cross_entropy))); shapes.append(float(np.mean(labels!=truth))); decoded.append(labels)
+            balance=class_balance_weights(truth,len(cats[j]))
+            labels=np.argmax(probabilities,axis=1); losses.append(float(np.average(cross_entropy,weights=balance))); shapes.append(float(np.average(labels!=truth,weights=balance))); decoded.append(labels)
         else:
-            labels=binary_labels(p,len(cats[j])); error_rate=float(np.mean(labels!=Y[:,j]))
+            balance=class_balance_weights(Y[:,j],len(cats[j]))
+            labels=binary_labels(p,len(cats[j])); error_rate=float(np.average(labels!=Y[:,j],weights=balance))
             if len(cats[j])==2:
                 # Log loss rewards moving the decision score toward the right side of 0.5, which a 0/1 error cannot.
                 truth=np.asarray(np.rint(Y[:,j]),dtype=int); positive=binary_probabilities(p)[:,1]
                 chosen=np.where(truth==1,positive,np.where(truth==0,1.-positive,0.))
-                losses.append(float(np.mean(-np.log(np.maximum(chosen,EPS)))))
+                losses.append(float(np.average(-np.log(np.maximum(chosen,EPS)),weights=balance)))
             else: losses.append(error_rate)
             shapes.append(error_rate)
             decoded.append(labels)
@@ -5382,6 +5460,19 @@ def frozen_metrics(m, X, Y, cats, constraints=None, output_names=()):
     quality=objectives[:2*Y.shape[1]]
     return {"loss":aggregate_loss(quality+(0.,0.)),"shape":float(np.mean(quality[1::2])),
             "losses":tuple(quality[::2]),"shapes":tuple(quality[1::2])}
+
+def classification_summary(m, X, Y, cats, output_names):
+    """'name: accuracy=..., balanced accuracy=...' for each categorical output, or ''."""
+    if cats is None or all(labels is None for labels in cats): return ""
+    try: prediction=predict_targets(m,X,cats)
+    except (ArithmeticError, IndexError, RecursionError, ValueError): return ""
+    parts=[]
+    for j,labels in enumerate(cats):
+        if labels is None: continue
+        truth=np.asarray(np.rint(Y[:,j]),int); hits=np.asarray(np.rint(prediction[:,j]),int)==truth
+        recalls=[float(np.mean(hits[truth==label])) for label in np.unique(truth)]
+        parts.append(f"{output_names[j]}: accuracy={np.mean(hits):.1%}, balanced accuracy={np.mean(recalls):.1%}")
+    return "; ".join(parts)
 
 def _selection_metrics(model, objectives, cats):
     """Extract final-selection metrics without treating age as model quality."""
@@ -6182,10 +6273,12 @@ def evaluate_csv(path, tolerances):
         actual=frame[output]
         if MODEL['cats'][index] is not None:
             if actual.isna().any(): raise ValueError('Ground truth has missing values for '+output)
-            matches=predicted[output].astype(str).to_numpy()==actual.astype(str).to_numpy()
+            labels=actual.astype(str).to_numpy(); matches=predicted[output].astype(str).to_numpy()==labels
             accuracy=100.*float(matches.mean())
-            report[output]={{'type':'categorical','rows':len(frame),'accuracy':accuracy}}
-            print(f'{{output}}: categorical accuracy={{accuracy:.6g}}% ({{int(matches.sum())}}/{{len(frame)}} exact matches)')
+            # Mean per-class recall: a model that never predicts a rare class cannot hide behind the majority.
+            balanced=100.*float(np.mean([matches[labels==label].mean() for label in np.unique(labels)]))
+            report[output]={{'type':'categorical','rows':len(frame),'accuracy':accuracy,'balanced_accuracy':balanced}}
+            print(f'{{output}}: categorical accuracy={{accuracy:.6g}}%, balanced accuracy={{balanced:.6g}}% ({{int(matches.sum())}}/{{len(frame)}} exact matches)')
             continue
         truth=pd.to_numeric(actual,errors='coerce').to_numpy(float)
         if not np.isfinite(truth).all(): raise ValueError('Ground truth must be finite numeric values for '+output)
@@ -6919,20 +7012,34 @@ def sparse_fits(B, y, max_terms=4, branches=6):
     return sorted(results.values(),key=lambda item:item[0])
 
 def sparse_seed_models(X, Y, cats, ops, max_nodes, max_depth, count, head_count):
-    """Up to `count` seed models whose regression heads are sparse fits of their outputs."""
+    """Up to `count` seed models whose heads are sparse fits of their outputs; a
+    classifier head fits its class indicator (one-vs-rest) on class-balanced
+    rows, and the classifier readout calibrates it."""
     targets,_=classification_layout(cats)
     rows=stratified_probe_indices(X,1000) if len(X)>1000 else slice(None)
     Xs=X[rows]; trees_by_head={}; best_r2=None
     basis,B=sparse_basis(Xs,ops)
-    for j,heads in enumerate(targets):
-        if cats[j] is not None: continue
-        y=np.asarray(Y[rows,j],float); options=[]
+    def options_for(basis, B, y, track=True):
+        nonlocal best_r2
+        options=[]
         for _,support,coefficients,_,r2 in sparse_fits(B,y,max_terms=min(MAX_TERMS,4)):
             joined=join_terms([(coefficients[index],basis[index]) for index in support],ops)
             if joined is None: continue
             tree=simplify_tree(joined)
             if node_size(tree)<=max_nodes and node_depth(tree)<=max_depth and tree not in options:
-                options.append(tree); best_r2=r2 if best_r2 is None else max(best_r2,r2)
+                options.append(tree)
+                if track: best_r2=r2 if best_r2 is None else max(best_r2,r2)  # regression fit quality only
+        return options
+    for j,heads in enumerate(targets):
+        if cats[j] is not None:
+            if len(cats[j])<2: continue
+            class_rows=class_balanced_rows(X,Y[:,j],len(cats[j]),1000) if CLASS_BALANCE else rows
+            class_basis,class_B=sparse_basis(X[class_rows],ops); truth=np.rint(np.asarray(Y[class_rows,j],float))
+            for position,head in enumerate(heads):
+                options=options_for(class_basis,class_B,(truth==(1 if len(heads)==1 else position)).astype(float),track=False)
+                if options: trees_by_head[head]=options
+            continue
+        options=options_for(basis,B,np.asarray(Y[rows,j],float))
         if options: trees_by_head[heads[0]]=options
     SPARSE_SEED_STATS.update(basis=len(basis))
     if not trees_by_head: return []
@@ -6962,6 +7069,10 @@ def new_island_runtime(population_size, *, X, Xt, cats, ops, nodes, depth, head_
                       mdl_operators=tuple(ops),mdl_feature_count=X.shape[1],adfs=dict(adf_registry.definitions))
                 for _ in range(population_size-len(seeds))]
     probe_indices=stratified_probe_indices(Xt,256)
+    # Per-class residual groups need rows of every class; input coverage alone can miss a rare one.
+    classified=[j for j,labels in enumerate(cats) if labels is not None and len(labels)>=2]
+    residual_probe=(class_balanced_rows(Xt,np.asarray(Yt)[:,classified[0]],len(cats[classified[0]]),256)
+                    if CLASS_BALANCE and classified and Yt is not None else probe_indices)
     qd_controller=QDOutcomeController(rate=float(np.clip(qd_parent_rate,.10,.30)))
     library=FragmentLibrary(); library.admit_discoveries(interaction_discovery)
     return IslandRuntime(
@@ -6974,7 +7085,7 @@ def new_island_runtime(population_size, *, X, Xt, cats, ops, nodes, depth, head_
         DynamicPressureController(dynamic_pressure_on,parsimony_quality_tolerance,qd_controller.uniform_rate,stagnation_window),
         library,adf_registry,EvaluationBudget(evaluation_budget,evaluation_refresh),
         island_index=(island_index if cell is None else cell[0]),stage=(0 if cell is None else cell[1]),
-        residual_qd=(ResidualQualityDiversityArchive(Xt[probe_indices],np.asarray(Yt)[probe_indices],cats,run_seed ^ 0x5245 ^ island_index)
+        residual_qd=(ResidualQualityDiversityArchive(Xt[residual_probe],np.asarray(Yt)[residual_probe],cats,run_seed ^ 0x5245 ^ island_index,class_groups=CLASS_BALANCE)
                      if RESIDUAL_ARCHIVE and Yt is not None else None),
     )
 
@@ -7438,7 +7549,7 @@ def resume_main(args):
     if not isinstance(bayes,PerOutputBayesianBanks): raise ValueError("Checkpoint predates per-output Bayesian banks and cannot resume; start a new run")
     X,Y,Xt,Yt,Xv,Yv=checkpoint_arrays(state)
     names,out_names,cats,maps=(state[k] for k in ("names","out_names","cats","maps"))
-    global SEQUENCE_LAYOUT,EQUIVALENCE_COLLAPSE,RESIDUAL_ARCHIVE,QD_PARENT_CHOICE,SCALE_BALANCED_SELECTION,GUARD_EXPLOIT_CHECK
+    global SEQUENCE_LAYOUT,EQUIVALENCE_COLLAPSE,RESIDUAL_ARCHIVE,QD_PARENT_CHOICE,SCALE_BALANCED_SELECTION,CLASS_BALANCE,GUARD_EXPLOIT_CHECK
     SEQUENCE_LAYOUT=maps.get(SEQUENCE_LAYOUT_KEY)
     GUARD_EXPLOIT_CHECK=bool(state.get("numeric_guard_check",False))
     global INTERPOLATION_CHECK,FIT_BACKEND,JUMP_CONSTANT_SCAN
@@ -7470,6 +7581,7 @@ def resume_main(args):
     # Settings that postdate a checkpoint resume with the behaviour it was searched with.
     RESIDUAL_ARCHIVE=bool(state.get("residual_archive",False)); QD_PARENT_CHOICE=state.get("qd_parent_choice","legacy")
     SCALE_BALANCED_SELECTION=bool(state.get("scale_balanced_selection",False))
+    CLASS_BALANCE=bool(state.get("class_balance",False))
     # Checkpoints from before equivalence keys searched without them; keep that.
     EQUIVALENCE_COLLAPSE=bool(state.get("equivalence_collapse",False)); EQUIVALENCE_STATS["children_redrawn"]=0
     ops,nodes,depth,affine_on,coev=(state[k] for k in ("operators","nodes","depth","affine_on","coev"))
@@ -7607,6 +7719,7 @@ def build_arg_parser():
     ap.add_argument("--equivalence-collapse",choices=("on","off"),default="on",help="Treat algebraically equal equations (x+y vs y+x, x+x vs 2*x, x*x vs square(x)) as one candidate in offspring, deduplication and archives (default: on)")
     ap.add_argument("--residual-archive",choices=("on","off"),default="on",help="Keep a third QD archive keyed by where each model errs (target-size bins and input regions), so complementary partial models survive (default: on)")
     ap.add_argument("--qd-parent-choice",choices=QD_PARENT_CHOICES,default="quality_coverage",help="How QD archives pick parent cells beyond the uniform share: success x bounded quality rank x coverage bonus, or legacy success-only (default: quality_coverage)")
+    ap.add_argument("--class-balance",choices=("on","off"),default="on",help="Give every class of a categorical output equal weight: class-weighted log loss, balanced error rate as its shape objective, class-weighted readout fit and constant tuning, class-balanced lexicase case order, per-class residual-archive groups, and a train/validation split stratified by class (default: on)")
     ap.add_argument("--scale-balanced-selection",choices=("on","off"),default="on",help="Selection-only: give every target-magnitude band equal weight and compare asinh-compressed errors in lexicase parent choice; reported loss is unchanged (default: on)")
     ap.add_argument("--cell-workers",type=int,default=0,help="Processes that evolve island/stage cells in parallel; 0=auto (one per cell, up to CPUs-1), 1=serial.  Results are identical either way (default: 0)")
     ap.add_argument("--cache-memory",type=float,default=128,metavar="MB",help="Budget of the tree-output cache in the main process; each --workers scoring process gets an eighth of it. Lower it if large trees or many workers run out of memory: results are identical, only speed changes (default: 128)")
@@ -7784,7 +7897,7 @@ def train_from_setup(args, setup, choose_model=None):
     ``choose_model(labels, choices, evaluation)`` returns the index of the model
     to save; the default asks at the terminal."""
     reset_run_caches()
-    global EQUIVALENCE_COLLAPSE,RESIDUAL_ARCHIVE,QD_PARENT_CHOICE,SCALE_BALANCED_SELECTION,GUARD_EXPLOIT_CHECK
+    global EQUIVALENCE_COLLAPSE,RESIDUAL_ARCHIVE,QD_PARENT_CHOICE,SCALE_BALANCED_SELECTION,CLASS_BALANCE,GUARD_EXPLOIT_CHECK
     EQUIVALENCE_COLLAPSE=getattr(args,"equivalence_collapse","on")=="on"; EQUIVALENCE_STATS["children_redrawn"]=0
     GUARD_EXPLOIT_CHECK=getattr(args,"numeric_guard_check","on")=="on"
     global INTERPOLATION_CHECK,FIT_BACKEND,JUMP_CONSTANT_SCAN
@@ -7814,6 +7927,7 @@ def train_from_setup(args, setup, choose_model=None):
     configure_cache_memory(getattr(args,"cache_memory",128))
     RESIDUAL_ARCHIVE=getattr(args,"residual_archive","on")=="on"; QD_PARENT_CHOICE=getattr(args,"qd_parent_choice","quality_coverage")
     SCALE_BALANCED_SELECTION=getattr(args,"scale_balanced_selection","on")=="on"
+    CLASS_BALANCE=getattr(args,"class_balance","on")=="on"
     run_seed=args.seed if args.seed is not None else random.SystemRandom().randrange(2**32)
     rng.seed(run_seed); np.random.seed(run_seed)
     print(f"Run seed: {run_seed}")
@@ -7854,7 +7968,12 @@ def train_from_setup(args, setup, choose_model=None):
             else:
                 if val_rows != requested:
                     print(f"Using {val_rows} validation rows (minimum for reliable affine-scaled scoring).")
-                train_indices,validation_indices=holdout_split_indices(len(df),val_rows,run_seed)
+                strata=None
+                for col in [col for col,t in zip(df.columns,types) if t==6] if CLASS_BALANCE else ():
+                    labels=df[col].fillna("__MISSING__").astype(str)
+                    strata=labels if strata is None else strata+"\x1f"+labels
+                strata=None if strata is None else strata.to_numpy()
+                train_indices,validation_indices=holdout_split_indices(len(df),val_rows,run_seed,strata)
                 train_df=df.iloc[train_indices]; validation_df=df.iloc[validation_indices]
     global SEQUENCE_GROUP_REQUEST
     SEQUENCE_GROUP_REQUEST=tuple(parse_sequence_group(item) for item in args.sequence_group)
@@ -7918,7 +8037,7 @@ def train_from_setup(args, setup, choose_model=None):
         "islands":{"count":island_count,"population_total":args.population,"migration_interval":migration_interval,"migrants_per_island":migrants_per_island,"topology":"ring","state":"independent population, Bayesian banks, archive, QD, fragment library, pressure, ADF, and budget",
                    "stages":{key:stages[key] for key in ("mode","count","interval","age_gap","schedule","threshold_quantile")},
                    "roles":{key:roles[key] for key in ("enabled","interval","mix","retire_after","assignments")}},
-        "equivalence_collapse":EQUIVALENCE_COLLAPSE,"residual_archive":RESIDUAL_ARCHIVE,"qd_parent_choice":QD_PARENT_CHOICE,"scale_balanced_selection":SCALE_BALANCED_SELECTION,
+        "equivalence_collapse":EQUIVALENCE_COLLAPSE,"residual_archive":RESIDUAL_ARCHIVE,"qd_parent_choice":QD_PARENT_CHOICE,"scale_balanced_selection":SCALE_BALANCED_SELECTION,"class_balance":CLASS_BALANCE,
         "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"selection_probe_filter":SELECTION_PROBE_FILTER,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"fit_iterations":CONSTANT_FIT_ITERATIONS,"semantic_max_delta":SEMANTIC_MAX_DELTA,"constant_snapping":CONSTANT_SNAPPING,"snap_tolerance":SNAP_TOLERANCE,"readout":READOUT_MODE,"max_terms":MAX_TERMS,"gene_crossover_rate":GENE_CROSSOVER_RATE,"backprop_mutation_weight":BACKPROP_MUTATION_WEIGHT,"backprop_inverse":BACKPROP_INVERSE,"residual_term_weight":RESIDUAL_TERM_WEIGHT,"loss":LOSS_MODE,"huber_delta":ROBUST_LOSS_DELTA,"forbid_nesting":",".join(sorted(f"{o}>{i}" for o,i in NESTING_RULES)),"units":UNIT_SPEC,"sparse_seeding":SPARSE_SEEDING,"sparse_basis_size":SPARSE_BASIS_SIZE,"squash_swap_weight":SQUASH_SWAP_WEIGHT,"smooth_swap_weight":SMOOTH_SWAP_WEIGHT,"gate_mutation_weight":GATE_MUTATION_WEIGHT,"loss_noise_floor":LOSS_NOISE_FLOOR,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age",
         "test_csv":str(Path(args.test_csv).resolve()) if args.test_csv else None,
         "row_sample":row_sample,
@@ -7935,7 +8054,7 @@ def train_from_setup(args, setup, choose_model=None):
         "nsga_normalization":args.nsga_normalization,"parsimony_quality_tolerance":args.parsimony_quality_tolerance,"dynamic_pressure_enabled":dynamic_pressure_on,"adf_registry":ADFRegistry(adf_enabled,allow_nested=args.adf_mode=="nested").snapshot(),
         "profile":args.profile,"constraint_metadata":metadata,"constraints":constraints.describe(),"bayesian_particles":args.bayesian_particles,"interaction_discovery":interaction_discovery,
         "island_config":{"count":island_count,"migration_interval":migration_interval,"migrants_per_island":migrants_per_island,"topology":"ring","migration_events":0,"stages":stages,"roles":roles},
-        "equivalence_collapse":EQUIVALENCE_COLLAPSE,"residual_archive":RESIDUAL_ARCHIVE,"qd_parent_choice":QD_PARENT_CHOICE,"scale_balanced_selection":SCALE_BALANCED_SELECTION,
+        "equivalence_collapse":EQUIVALENCE_COLLAPSE,"residual_archive":RESIDUAL_ARCHIVE,"qd_parent_choice":QD_PARENT_CHOICE,"scale_balanced_selection":SCALE_BALANCED_SELECTION,"class_balance":CLASS_BALANCE,
         "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"selection_probe_filter":SELECTION_PROBE_FILTER,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"fit_iterations":CONSTANT_FIT_ITERATIONS,"semantic_max_delta":SEMANTIC_MAX_DELTA,"constant_snapping":CONSTANT_SNAPPING,"snap_tolerance":SNAP_TOLERANCE,"readout":READOUT_MODE,"max_terms":MAX_TERMS,"gene_crossover_rate":GENE_CROSSOVER_RATE,"backprop_mutation_weight":BACKPROP_MUTATION_WEIGHT,"backprop_inverse":BACKPROP_INVERSE,"residual_term_weight":RESIDUAL_TERM_WEIGHT,"loss":LOSS_MODE,"huber_delta":ROBUST_LOSS_DELTA,"forbid_nesting":",".join(sorted(f"{o}>{i}" for o,i in NESTING_RULES)),"units":UNIT_SPEC,"sparse_seeding":SPARSE_SEEDING,"sparse_basis_size":SPARSE_BASIS_SIZE,"squash_swap_weight":SQUASH_SWAP_WEIGHT,"smooth_swap_weight":SMOOTH_SWAP_WEIGHT,"gate_mutation_weight":GATE_MUTATION_WEIGHT,"loss_noise_floor":LOSS_NOISE_FLOOR,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age"}
     head_count=sum(len(heads) for heads in classification_layout(cats)[0])
     population_sizes=cell_population_sizes(args.population,cell_count)
@@ -8026,9 +8145,13 @@ def train_from_setup(args, setup, choose_model=None):
     if Xv is not None:
         metrics=frozen_metrics(chosen,Xv,Yv,cats,constraints,out_names)
         print(f"Validation (used for selection): loss={metrics['loss']:.6g}, shape={metrics['shape']:.6g} | output losses={output_loss_summary(metrics['losses'],out_names)}")
+        summary=classification_summary(chosen,Xv,Yv,cats,out_names)
+        if summary: print(f"Validation classes: {summary}")
     if Xtest is not None:
         metrics=frozen_metrics(chosen,Xtest,Ytest,cats,constraints,out_names)
         print(f"Final held-out test (not used for selection): loss={metrics['loss']:.6g}, shape={metrics['shape']:.6g} | output losses={output_loss_summary(metrics['losses'],out_names)}")
+        summary=classification_summary(chosen,Xtest,Ytest,cats,out_names)
+        if summary: print(f"Test classes: {summary}")
     export_model(chosen,names,out_names,cats,maps,source_columns,types,export_fixture,input_ranges)
     write_symbolic_export(chosen,names,out_names,cats,Xt)
     selected_entry=next(entry for entry in evaluation[1] if entry[0] is chosen)
