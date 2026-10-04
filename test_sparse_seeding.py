@@ -44,9 +44,15 @@ class FitTest(unittest.TestCase):
         self.assertLess(a.aggregate_loss(models[0]), 1e-12)
         self.assertGreater(a.SPARSE_SEED_STATS["best_r2"], 1 - 1e-10)
 
-    def test_classifier_outputs_are_skipped(self):
+    def test_classifier_heads_fit_their_class_indicator(self):
         Y = np.column_stack([(X[:, 0] > 1).astype(float)])
-        self.assertEqual(a.sparse_seed_models(X, Y, [["no", "yes"]], OPS, 21, 6, 5, 1), [])
+        seeds = a.sparse_seed_models(X, Y, [["no", "yes"]], OPS, 21, 6, 5, 1)
+        self.assertTrue(seeds)
+        self.assertIn(("x", 0), list(a.walk_tree(seeds[0].trees[0])))
+
+    def test_single_class_outputs_are_skipped(self):
+        Y = np.zeros((len(X), 1))
+        self.assertEqual(a.sparse_seed_models(X, Y, [["only"]], OPS, 21, 6, 5, 1), [])
 
     def test_cli(self):
         args = a.parse_cli(["--sparse-seeding", "on", "--sparse-basis-size", "50"])[1]

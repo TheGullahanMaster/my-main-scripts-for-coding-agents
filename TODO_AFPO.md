@@ -424,6 +424,83 @@ so these are **audit-then-extend**, not new builds.
   quality rank (best cell at most e^2 the worst's weight, ties share a rank) x
   coverage bonus for rarely tried cells; the protected uniform share is kept.
   `--qd-parent-choice legacy` restores success-only weighting.
+- [x] Class balancing for categorical outputs (`--class-balance on|off`,
+  default on, 2026-10-04; checkpoints from before it resume with it off).
+  Every class of a categorical output gets equal total weight
+  (`class_balance_weights`, mean 1) in: the scored log loss; the shape
+  objective, which becomes the balanced error rate; the classifier readout fit
+  (`fit_classifier_affine`, so offsets no longer encode the class prior);
+  classifier constant tuning, which also runs on `class_balanced_rows` (input
+  coverage alone could leave a rare class with no rows); the Bayesian
+  bernoulli/categorical likelihoods; and lexicase case order. Also with it on:
+  the holdout split is stratified by class (a rare class always keeps a
+  training row, so its label is never unseen), and the residual archive gets
+  one error group per class, probed on class-balanced rows. Off reproduces the
+  previous search bit for bit. Independent of the flag: `--sparse-seeding`
+  now seeds classifier heads from one-vs-rest indicator fits; validation, test,
+  the posterior check and the exported `best_model.py --test-csv` report
+  balanced accuracy beside accuracy.
+  Benchmark (synthetic, 600 rows, pop 120, 40 generations, 4000-row test set):
+  binary 94/6 — balanced accuracy 0.928 -> 0.967 (5/5 seeds), accuracy
+  0.981 -> 0.973; 3-class 80/13/7 — balanced accuracy 0.909 -> 0.938 (8/10
+  seeds), accuracy 0.974 -> 0.951. Plain accuracy drops because the decision
+  rule no longer favours the majority; use `off` when plain accuracy under the
+  training prior is the goal.
+- [x] Separate per-output searches (`--output-mode separate|joint`, default
+  separate, 2026-10-04). With several output columns each column (a
+  categorical column with all its classes) runs its own full search — own
+  population, islands, Pareto front, MDL, node limit, caches, stopping rules
+  and final choice — one after another; the choices are merged into one
+  exported model, and `separate_outputs.json` (next to the per-output run
+  directories) records them. Before, one model carried a tree per output:
+  every mutation changed all trees at once, MDL was one sum and selection one
+  mean loss. Benchmark (3 unrelated numeric outputs, pop 100, 40 generations,
+  node limit 15, 6 seeds): hard-output test R² 0.927 -> 0.970 (5/6 seeds);
+  easy and middle outputs exact on every seed (joint missed one); ~8% more
+  time. Resuming one per-output checkpoint continues only that output.
+- [x] Output relations (`--output-relations "HH -> MM; year -> month -> day"`):
+  a dependency graph; each output reads its ancestors' *predicted* values
+  (never true ones) as extra inputs, ancestors are searched first. The merged
+  export inlines those predictions (a class as a comparison indicator of the
+  class scores) and marks the inlined subtrees opaque (`Model.opaque`), so
+  the structural rules still check the merged model but treat each inlined
+  equation as the staged leaf it replaced. Reported complexity is local (what
+  selection used) plus expanded (after inlining).
+- [x] Input relations (`--input-relations "HH1,MM1;HH2,MM2"`): provenance
+  groups; ungrouped inputs are singleton groups. Inside a group columns mix
+  freely; across groups only complete subexpressions (reading every column of
+  their group) combine. Enforced in random trees, mutation and crossover
+  retries, offspring redraws, constant tuning and scoring.
+  GUI: output mode in Advanced options; relation fields in the Data section.
+- [x] Custom operators (`--custom-op "NAME = EXPR"`, 2026-10-04): partly
+  known operators built from AFPO's own operators. `v0, v1, ...` are
+  parameters the search fills in (every `v0` the same argument), `v#` an
+  optional slot whose operation disappears when left out (`bar + v#*kpop`
+  becomes `bar + kpop`), column names and numbers are fixed, earlier custom
+  operators can be reused (`name(a, b)` or bare `name`). Operators with
+  parameters are permanent ADFs (one per optional-slot combination, shown by
+  their own name, not charged as definitions); parameterless forms (`E =
+  m*c**2`, or `foo()` with every `v#` left out) are derived input features
+  that the export inlines. Staged inputs in separate-output runs now carry
+  the original column name.
+- [x] `--clamp auto` (default): value clamp and divisor/log guard follow the
+  data (CLIP = max(1e12, 1e6*B^2), EPS = min(1e-12, 1e-6*b^2)); data within
+  [1e-3, 1e3] keeps 1e12/1e-12. E = m*c^2 with c ≈ 3e8: `default` stalls on a
+  linear fudge, `auto` finds m*c*c exactly. Saved in checkpoints, passed to
+  the compiled fitter, embedded in the export.
+- [x] `--stop-at-loss` uses validation loss when there is validation data
+  and accepts `NAME=LOSS,...` per output (each separate-output search stops
+  at its own limit).
+- [x] GUI: rendered equations run in a killable child process outside the
+  explorer lock and long formulas render on request (no more frozen tabs);
+  test rows kept in checkpoints, test loss shown when a run finishes, in the
+  model details and as a Test fit split; validation/test row overlays in
+  1D/2D/3D; 1D x axis follows the requested range (narrow range zooms in);
+  wheel/pinch zoom, drag pan and double-click reset on 1D/2D; custom
+  resolution; animation of frozen inputs (several at once, live or
+  pregenerated — a pregenerated loop keeps 3D rotatable); equation editing
+  (each head as text, applied as a new scored candidate, optional constant
+  re-fit).
 
 ## Phase 4 — Later (after Phases 1–3 produce telemetry)
 

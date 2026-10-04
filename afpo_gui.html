@@ -10,7 +10,7 @@
   --bg: #f4f3f0; --surface: #fcfcfb; --surface-2: #f0efec; --border: #dddcd7;
   --text: #0b0b0b; --text-2: #52514e; --muted: #8a8983; --grid: #e7e6e2;
   --accent: #2a78d6; --accent-ink: #ffffff; --danger: #c93c3b; --good: #008300; --warn: #b87a00;
-  --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a;
+  --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s4: #7c4dce;
   --seq: #cde2fb,#9ec5f4,#6da7ec,#3987e5,#256abf,#184f95,#0d366b;
   --other: #b9b8b2;
 }
@@ -20,7 +20,7 @@
     --bg: #121211; --surface: #1a1a19; --surface-2: #242422; --border: #34342f;
     --text: #ffffff; --text-2: #c3c2b7; --muted: #8f8e86; --grid: #2c2c29;
     --accent: #3987e5; --accent-ink: #ffffff; --danger: #e66767; --good: #3fae3f; --warn: #d9a13a;
-    --s1: #3987e5; --s2: #d95926; --s3: #199e70;
+    --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #9c78e6;
     --seq: #0d366b,#104281,#1c5cab,#2a78d6,#5598e7,#86b6ef,#cde2fb;
     --other: #5c5b56;
   }
@@ -30,7 +30,7 @@
   --bg: #121211; --surface: #1a1a19; --surface-2: #242422; --border: #34342f;
   --text: #ffffff; --text-2: #c3c2b7; --muted: #8f8e86; --grid: #2c2c29;
   --accent: #3987e5; --accent-ink: #ffffff; --danger: #e66767; --good: #3fae3f; --warn: #d9a13a;
-  --s1: #3987e5; --s2: #d95926; --s3: #199e70;
+  --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #9c78e6;
   --seq: #0d366b,#104281,#1c5cab,#2a78d6,#5598e7,#86b6ef,#cde2fb;
   --other: #5c5b56;
 }
@@ -191,6 +191,14 @@ input, select, textarea { max-width: 100%; }
 .frozen .field { margin-bottom: 6px; }
 .frozen .field > label { display: flex; justify-content: space-between; gap: 6px; font-weight: 500; }
 .frozen .unused { color: var(--muted); font-weight: 400; font-size: 11px; }
+.frozen .frow { display: flex; gap: 6px; align-items: center; }
+.frozen .frow > input, .frozen .frow > select { flex: 1; min-width: 0; }
+button.play { border: 1px solid var(--border); background: var(--surface-2); color: var(--text); border-radius: 6px; width: 30px; height: 30px; cursor: pointer; flex: none; font-size: 12px; }
+button.play.on { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+.anim { display: flex; gap: 4px; margin-top: 4px; }
+.anim input { flex: 1; min-width: 0; }
+.anim-bar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin: 6px 0 2px; }
+#exChart { touch-action: none; }
 .chart.h480 { height: 480px; }
 .chart canvas.grab { cursor: grab; touch-action: none; } .chart canvas.grab:active { cursor: grabbing; }
 .colorbar { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 8px; align-items: center; font-size: 12px; color: var(--text-2); margin-top: 8px; font-variant-numeric: tabular-nums; }
@@ -315,6 +323,9 @@ input, select, textarea { max-width: 100%; }
           <div class="field"><label>Constraint metadata JSON file <span class="hint">optional</span></label><div data-path="metadata" data-kind="json"></div></div>
           <div class="field"><label>…or inline constraint metadata JSON</label><textarea id="metadataText" placeholder="{}"></textarea></div>
           <div class="field"><label>Sequence groups <span class="hint">one per line: NAME=COL1,COL2,…</span></label><textarea id="sequenceGroups"></textarea></div>
+          <div class="field"><label>Input relations <span class="hint">one per line: COL1,COL2 — related inputs combine with others only as complete subexpressions</span></label><textarea id="inputRelations" placeholder="HH1,MM1&#10;HH2,MM2"></textarea></div>
+          <div class="field"><label>Custom operators <span class="hint">one per line: NAME = EXPR with v0, v1 (search fills in), v# (optional), column names, numbers — e.g. fq = amount / v0, E = m*c**2</span></label><textarea id="customOps" placeholder="fq = amount / v0&#10;foo = bar + v#*kpop"></textarea></div>
+          <div class="field"><label>Output relations <span class="hint">one per line: A -> B -> C — later outputs read earlier outputs' predictions (output mode separate)</span></label><textarea id="outputRelations" placeholder="HH -> MM"></textarea></div>
         </details>
       </div>
 
@@ -452,8 +463,15 @@ input, select, textarea { max-width: 100%; }
 
     <div id="detailView" class="hidden">
       <div class="card">
-        <h2>Selected model <span class="grow"></span><button class="btn" id="exportBtn">Export as best_model.py</button></h2>
+        <h2>Selected model <span class="grow"></span><button class="btn" id="editBtn">Edit equation</button><button class="btn" id="exportBtn">Export as best_model.py</button></h2>
         <div id="detailEq"></div>
+        <div id="editBox" class="hidden" style="margin-top:8px">
+          <div id="editHeads"></div>
+          <div class="row" style="margin-top:6px"><label class="check" title="Re-fit the numeric constants (and the output scale and offset) of the edited structure to the training rows"><input type="checkbox" id="editRefit"> Re-fit constants after editing</label>
+            <span class="grow"></span><button class="btn" id="editCancel">Cancel</button><button class="btn primary" id="editApply">Apply as a new candidate</button></div>
+          <div class="hint">Change constants, drop terms, add operators: the edited equation becomes a new candidate, scored on the same rows, and every view below follows it. Syntax: + - * / ** % // and comparisons; any operator by name, e.g. sin(x), max(a, b); input names that are not plain identifiers go in `back quotes`.</div>
+          <div id="editError" class="notice err hidden" style="margin-top:6px"></div>
+        </div>
         <details id="mathBox" open style="margin-top:8px"><summary>Rendered equation</summary>
           <div class="row" style="margin:6px 0">
             <span class="seg" id="mathMode"><button data-mode="raw" class="active" title="Protections removed, constants as fractions or 6 significant digits">Readable</button><button data-mode="exact" title="afpo's protected operators and full-precision constants: reproduces the model's predictions">Exact</button></span>
@@ -480,12 +498,21 @@ input, select, textarea { max-width: 100%; }
               <div class="row range" id="exXRange"><input type="number" step="any" id="exXlo" placeholder="from"><input type="number" step="any" id="exXhi" placeholder="to"></div></div>
             <div class="field exY"><label>Input on the y axis</label><select id="exY"></select>
               <div class="row range" id="exYRange"><input type="number" step="any" id="exYlo" placeholder="from"><input type="number" step="any" id="exYhi" placeholder="to"></div></div>
-            <div class="field"><label>Resolution</label><select id="exRes"><option value="0">Coarse</option><option value="1" selected>Medium</option><option value="2">Fine</option></select></div>
+            <div class="field"><label>Resolution</label><div class="row" style="flex-wrap:nowrap"><select id="exRes"><option value="0">Coarse</option><option value="1" selected>Medium</option><option value="2">Fine</option><option value="custom">Custom…</option></select>
+              <input type="number" id="exResCustom" min="2" step="1" class="hidden" title="Points along each axis" placeholder="points"></div></div>
             <label class="check"><input type="checkbox" id="exData" checked> Show training rows</label>
+            <label class="check" id="exValBox"><input type="checkbox" id="exVal"> Show validation rows</label>
+            <label class="check" id="exTestBox"><input type="checkbox" id="exTest"> Show test rows</label>
             <div class="frozen">
               <div class="row" style="justify-content:space-between;margin-bottom:6px"><strong>Other inputs held at</strong><button class="link" id="exReset">reset to typical</button></div>
               <div id="exFrozen"></div>
-              <div class="hint">Blank ranges use the training range plus 5%. Typical = training median, or the most common category.</div>
+              <div class="anim-bar" id="exAnimBar">
+                <label class="check" title="Compute the whole loop first, then play it as an animation: smooth, and the 3D view can be rotated and zoomed while it plays (1D/2D zoom and pan wait until it stops)"><input type="checkbox" id="exPregen"> Pregenerate frames</label>
+                <label class="hint">Frame <select id="exAnimSpeed" style="width:auto"><option value="120">120 ms</option><option value="250" selected>250 ms</option><option value="500">500 ms</option><option value="1000">1 s</option></select></label>
+                <button class="btn hidden" id="exAnimStop">Stop all</button>
+              </div>
+              <div class="hint" id="exAnimHint"></div>
+              <div class="hint">▶ animates an input over a range in a loop (several can play together). Blank ranges use the training range plus 5%. Typical = training median, or the most common category. Wheel or pinch on a 1D/2D plot zooms, drag pans, double-click resets.</div>
             </div>
           </div>
           <div>
@@ -501,7 +528,7 @@ input, select, textarea { max-width: 100%; }
       <div class="grid2">
         <div class="card">
           <h2>Fit <span class="grow"></span>
-            <select id="fitSplit" style="width:auto"><option value="validation">Validation</option><option value="train">Training</option></select>
+            <select id="fitSplit" style="width:auto"><option value="validation">Validation</option><option value="train">Training</option><option value="test">Test</option></select>
             <select id="fitOutput" style="width:auto"></select>
           </h2>
           <div id="fitBody"></div>
@@ -692,7 +719,7 @@ class Chart {
     const pw = w - m.l - m.r, ph = h - m.t - m.b;
     const sx = v => m.l + ((X.log ? Math.log10(v) : v) - xd[0]) / (xd[1] - xd[0]) * pw;
     const sy = v => m.t + ph - ((Y.log ? Math.log10(v) : v) - yd[0]) / (yd[1] - yd[0]) * ph;
-    this.sx = sx; this.sy = sy; this.m = m; this.pw = pw; this.ph = ph;
+    this.sx = sx; this.sy = sy; this.m = m; this.pw = pw; this.ph = ph; this.xd = X.log ? null : xd; this.yd = Y.log ? null : yd;
     ctx.strokeStyle = grid; ctx.lineWidth = 1; ctx.fillStyle = muted;
     ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
     const yt = Y.labels ? Y.labels.map((label, i) => ({v: i, label})) : this.ticks(yd, Y.log, ph);
@@ -940,12 +967,12 @@ class Surface3D {
       const py = spec.yspan[1] > spec.yspan[0] ? (pt.y - spec.yspan[0]) / (spec.yspan[1] - spec.yspan[0]) * 2 - 1 : 0;
       const pz = zn(pt.z);
       if (Math.abs(px) > 1.001 || Math.abs(py) > 1.001 || Math.abs(pz) > 1.6 || !isFinite(pz)) continue;
-      const P = this.project(px, py, pz); items.push({d: P[2], point: P});
+      const P = this.project(px, py, pz); items.push({d: P[2], point: P, color: pt.color});
     }
     items.sort((a, b) => b.d - a.d);
     const s2c = css('--s2');
     for (const it of items) {
-      if (it.point) { ctx.beginPath(); ctx.arc(it.point[0], it.point[1], 2.6, 0, Math.PI * 2); ctx.fillStyle = s2c; ctx.fill(); ctx.lineWidth = 1.2; ctx.strokeStyle = surface; ctx.stroke(); continue; }
+      if (it.point) { ctx.beginPath(); ctx.arc(it.point[0], it.point[1], 2.6, 0, Math.PI * 2); ctx.fillStyle = it.color ? css(it.color) : s2c; ctx.fill(); ctx.lineWidth = 1.2; ctx.strokeStyle = surface; ctx.stroke(); continue; }
       const col = `rgb(${it.rgb[0] | 0},${it.rgb[1] | 0},${it.rgb[2] | 0})`;
       ctx.beginPath(); ctx.moveTo(it.P[0][0], it.P[0][1]); for (let k = 1; k < 4; k++) ctx.lineTo(it.P[k][0], it.P[k][1]); ctx.closePath();
       ctx.fillStyle = col; ctx.fill(); ctx.strokeStyle = col; ctx.lineWidth = .7; ctx.stroke();
@@ -1154,7 +1181,7 @@ function renderAdvanced() {
   }
   box.addEventListener('change', saveForm);
 }
-const FORM_IDS = ['population', 'maxGenerations', 'seed', 'workers', 'nodes', 'depth', 'islands', 'migrationInterval', 'migrants', 'stageMode', 'stages', 'stageInterval', 'stageQuantile', 'stageAgeGap', 'stageSchedule', 'roleInterval', 'valPercent', 'metadataText', 'sequenceGroups', 'adfMode', 'delimiterCustom', 'resumeMax', 'resumeWorkers'];
+const FORM_IDS = ['population', 'maxGenerations', 'seed', 'workers', 'nodes', 'depth', 'islands', 'migrationInterval', 'migrants', 'stageMode', 'stages', 'stageInterval', 'stageQuantile', 'stageAgeGap', 'stageSchedule', 'roleInterval', 'valPercent', 'metadataText', 'sequenceGroups', 'inputRelations', 'outputRelations', 'customOps', 'adfMode', 'delimiterCustom', 'resumeMax', 'resumeWorkers'];
 const CHECK_IDS = ['affine', 'coev', 'pressure', 'adf', 'roles'];
 function saveForm() {
   const v = {};
@@ -1283,7 +1310,8 @@ function collectForm() {
     mode: 'train',
     data: {path: INSPECT.path, delimiter: delimiterValue(), types: INSPECT.columns.map(c => c.type), validation_mode: valmode,
       validation_percent: +$('#valPercent').value, validation_path: pathInputs.validation.value.trim(), test_path: pathInputs.test.value.trim(),
-      metadata_path: pathInputs.metadata.value.trim(), metadata_text: $('#metadataText').value.trim(), sequence_groups: $('#sequenceGroups').value},
+      metadata_path: pathInputs.metadata.value.trim(), metadata_text: $('#metadataText').value.trim(), sequence_groups: $('#sequenceGroups').value,
+      input_relations: $('#inputRelations').value, output_relations: $('#outputRelations').value, custom_ops: $('#customOps').value},
     operators: operatorForm(),
     search: {nodes: +$('#nodes').value, depth: +$('#depth').value, affine: $('#affine').checked, coev: $('#coev').checked,
       dynamic_pressure: $('#pressure').checked, adf: $('#adf').checked, islands: +$('#islands').value,
@@ -1366,7 +1394,8 @@ function applyStatus(s) {
     notice = `<div class="notice"><strong>Finished${d.generation != null ? ' at generation ' + d.generation : ''}.</strong> ${d.selected ? 'Saved: ' + esc(d.selected) + '. ' : ''}
       <div class="kv" style="margin-top:6px">${d.checkpoint ? `<span class="k">Checkpoint</span><span class="mono">${esc(d.checkpoint)}</span>` : ''}
       ${d.model_card ? `<span class="k">Model card</span><span class="mono">${esc(d.model_card)}</span>` : ''}
-      ${d.best_model ? `<span class="k">Exported</span><span class="mono">${esc(d.best_model)}</span>` : ''}</div>
+      ${d.best_model ? `<span class="k">Exported</span><span class="mono">${esc(d.best_model)}</span>` : ''}
+      ${Object.entries(d.metrics || {}).map(([split, m]) => `<span class="k">${split === 'test' ? 'Test loss (not used for selection)' : 'Validation loss'}</span><span>${fmt(m.loss)}${Object.keys(m.losses || {}).length > 1 ? ' · ' + Object.entries(m.losses).map(([n, v]) => `${esc(n)} ${fmt(v)}`).join(' · ') : ''}</span>`).join('')}</div>
       <div class="row" style="margin-top:8px"><button class="btn primary" id="exploreBtn">Explore these models</button></div></div>`;
   }
   $('#trainNotice').innerHTML = notice;
@@ -1526,7 +1555,7 @@ function renderCandidates() {
 }
 $('#candLog').onchange = renderCandidates;
 async function selectModel(index) {
-  M.index = index; renderCandidates();
+  M.index = index; renderCandidates(); $('#editBox').classList.add('hidden');
   try {
     const d = M.detail = await api('/api/models/detail', {index});
     $('#detailView').classList.remove('hidden');
@@ -1539,11 +1568,13 @@ async function selectModel(index) {
       <span class="k">Size</span><span>${fmt(d.metrics.mdl_bits, 4)} MDL bits · ${d.nodes} nodes</span><span class="k">Age · origin</span><span>${d.age} · ${esc(d.origin || 'seed')}</span>
       <span class="k">Inputs used</span><span>${esc(d.features_used.join(', ') || 'none (constant)')}</span>
       <span class="k">Constants</span><span class="mono">${esc(d.constants.map(c => '[' + c.map(v => fmt(v, 6)).join(', ') + ']').join(' '))}</span>`;
-    $('#detailOutputs').innerHTML = `<thead><tr><th>Output</th><th class="num">Training loss</th><th class="num">Validation loss</th></tr></thead><tbody>${d.per_output.map(o => `<tr><td>${esc(o.name)}</td><td class="num">${fmt(o.train_loss)}</td><td class="num">${fmt(o.validation_loss)}</td></tr>`).join('')}</tbody>`;
+    const hasTest = d.per_output.some(o => o.test_loss != null);
+    $('#detailOutputs').innerHTML = `<thead><tr><th>Output</th><th class="num">Training loss</th><th class="num">Validation loss</th>${hasTest ? '<th class="num">Test loss</th>' : ''}</tr></thead><tbody>${d.per_output.map(o => `<tr><td>${esc(o.name)}</td><td class="num">${fmt(o.train_loss)}</td><td class="num">${fmt(o.validation_loss)}</td>${hasTest ? `<td class="num">${fmt(o.test_loss)}</td>` : ''}</tr>`).join('')}</tbody>`;
     const url = URL.createObjectURL(new Blob([d.svg], {type: 'image/svg+xml'}));
     $('#treeBox').innerHTML = `<img alt="Expression tree" src="${url}">`;
     renderLineage(d.history || []);
     defaultAxes(); syncAxisControls();
+    if (EX.pregen) { EX.pregen.playing = false; EX.pregen.stale = true; }    // frames belong to the previous model
     loadMath(index);
     await Promise.all([loadFit(), loadExplore(), loadGenDefaults()]);
   } catch (e) { toast(e.message, true); }
@@ -1608,33 +1639,52 @@ async function loadMath(index) {
   $('#mathBody').innerHTML = '<div class="hint">Converting…</div>';
   try {
     const [data, katex] = await Promise.all([api('/api/models/latex', {index}), loadKatex()]);
-    if (M.index !== index) return;
+    if (M.index !== index || data.cancelled) return;
     MATH.data = data; MATH.katex = katex; renderMath();
   } catch (e) { if (M.index === index) $('#mathBody').innerHTML = `<div class="hint">${esc(e.message)}</div>`; }
+}
+// KaTeX lays a formula out synchronously on the page's only thread: a huge
+// equation froze every tab until it finished.  Outputs render one per tick,
+// and a formula over MATH_LIMIT characters shows its exact text with a
+// button to render it on request.
+const MATH_LIMIT = 6000;
+let mathTicket = 0;
+function mathHtml(o, mode, force) {
+  const form = o[mode], tex = `${o.name_latex} = ${form.latex}`;
+  if (!form.latex) return `<div class="hint">${esc(o.name)}: could not convert (${esc(form.error)})</div>`;
+  if (!force && tex.length > MATH_LIMIT)
+    return `<div class="mono" style="white-space:pre-wrap;word-break:break-all;max-height:16em;overflow:auto">${esc(o.name)} = ${esc(form.text || form.latex)}</div>
+      <button class="btn" style="margin-top:6px" data-render-math="1">Render (${tex.length.toLocaleString()} characters; may take a while)</button>`;
+  let shown;
+  if (MATH.katex) {
+    try { shown = MATH.katex.renderToString(tex, {displayMode: true, throwOnError: true}); } catch (e) { shown = null; }
+  }
+  if (!shown) shown = `<math display="block"><mi${o.name.length > 1 ? ' mathvariant="normal"' : ''}>${esc(o.name)}</mi><mo>=</mo>${form.mathml}</math>`;
+  const a = o.agreement;
+  const note = mode === 'raw' && a ? `<div class="hint">Matches the model on ${(100 * a.defined).toFixed(1)}% of training rows${a.gap == null ? '' : `, max difference ${fmt(a.gap, 2)} of the output range`}.</div>` : '';
+  // Classifier: after the last score equation, how the scores become a class.
+  const decision = o.decision ? `<div class="name" style="margin-top:8px">${esc(o.output || o.name)}: predicted class</div>` + o.decision.latex.map((line, i) => {
+    let html = null;
+    if (MATH.katex && (force || line.length <= MATH_LIMIT)) { try { html = MATH.katex.renderToString(line, {displayMode: true, throwOnError: true}); } catch (e) { html = null; } }
+    return html || `<div class="mono" style="margin:6px 0">${esc(o.decision.text[i] || line)}</div>`;
+  }).join('') : '';
+  return shown + note + decision;
 }
 function renderMath() {
   const d = MATH.data, body = $('#mathBody');
   if (!d) return;
   if (!d.available) { body.innerHTML = `<div class="hint">${esc(d.reason)}</div>`; return; }
-  const mode = MATH.mode;
-  body.innerHTML = d.outputs.map(o => {
-    const form = o[mode], tex = `${o.name_latex} = ${form.latex}`;
-    if (!form.latex) return `<div class="math"><div class="hint">${esc(o.name)}: could not convert (${esc(form.error)})</div></div>`;
-    let shown;
-    if (MATH.katex) {
-      try { shown = MATH.katex.renderToString(tex, {displayMode: true, throwOnError: true}); } catch (e) { shown = null; }
-    }
-    if (!shown) shown = `<math display="block"><mi${o.name.length > 1 ? ' mathvariant="normal"' : ''}>${esc(o.name)}</mi><mo>=</mo>${form.mathml}</math>`;
-    const a = o.agreement;
-    const note = mode === 'raw' && a ? `<div class="hint">Matches the model on ${(100 * a.defined).toFixed(1)}% of training rows${a.gap == null ? '' : `, max difference ${fmt(a.gap, 2)} of the output range`}.</div>` : '';
-    // Classifier: after the last score equation, how the scores become a class.
-    const decision = o.decision ? `<div class="name" style="margin-top:8px">${esc(o.output || o.name)}: predicted class</div>` + o.decision.latex.map((line, i) => {
-      let html = null;
-      if (MATH.katex) { try { html = MATH.katex.renderToString(line, {displayMode: true, throwOnError: true}); } catch (e) { html = null; } }
-      return html || `<div class="mono" style="margin:6px 0">${esc(o.decision.text[i] || line)}</div>`;
-    }).join('') : '';
-    return `<div class="math">${d.outputs.length > 1 ? `<div class="name">${esc(o.name)}</div>` : ''}${shown}${note}${decision}</div>`;
-  }).join('') + (mode === 'exact' ? '<div class="hint">Exact: afpo\'s guards as evaluated (the per-node ±1e12 clamp is left out).</div>' : '');
+  const mode = MATH.mode, ticket = ++mathTicket;
+  body.innerHTML = d.outputs.map((o, i) => `<div class="math">${d.outputs.length > 1 ? `<div class="name">${esc(o.name)}</div>` : ''}<div data-math-slot="${i}"><div class="hint">Rendering…</div></div></div>`).join('')
+    + (mode === 'exact' ? '<div class="hint">Exact: afpo\'s guards as evaluated (the per-node value clamp is left out).</div>' : '');
+  d.outputs.forEach((o, i) => setTimeout(() => {
+    if (ticket !== mathTicket) return;          // a newer render (other model or mode) took over
+    const slot = body.querySelector(`[data-math-slot="${i}"]`);
+    if (!slot) return;
+    slot.innerHTML = mathHtml(o, mode, false);
+    const button = slot.querySelector('[data-render-math]');
+    if (button) button.onclick = () => { button.textContent = 'Rendering…'; setTimeout(() => { if (ticket === mathTicket) slot.innerHTML = mathHtml(o, mode, true); }, 30); };
+  }, 20 * i));
 }
 $$('#mathMode button').forEach(b => b.onclick = () => {
   MATH.mode = b.dataset.mode;
@@ -1656,7 +1706,9 @@ function fillOutputSelect(sel, names, keep) {
 async function loadFit() {
   if (M.index == null) return;
   const s = M.summary;
-  if (s.validation_rows === 0) { $('#fitSplit').value = 'train'; $('#fitSplit').disabled = true; } else $('#fitSplit').disabled = false;
+  const avail = {validation: s.validation_rows > 0, test: s.test_rows > 0, train: true};
+  $$('#fitSplit option').forEach(o => { o.disabled = !avail[o.value]; o.textContent = {validation: 'Validation', train: 'Training', test: 'Test'}[o.value] + (avail[o.value] ? '' : ' (none)'); });
+  if (!avail[$('#fitSplit').value]) $('#fitSplit').value = 'train';
   const f = await api('/api/models/fit', {index: M.index, split: $('#fitSplit').value});
   fillOutputSelect($('#fitOutput'), f.outputs.map(o => o.name), true);
   const o = f.outputs.find(x => x.name === $('#fitOutput').value) || f.outputs[0];
@@ -1689,7 +1741,7 @@ async function loadFit() {
 $('#fitSplit').onchange = () => loadFit().catch(e => toast(e.message, true));
 $('#fitOutput').onchange = () => loadFit().catch(e => toast(e.message, true));
 // ───────────── explore: 1D curve, 2D map, 3D surface ─────────────
-const EX = {mode: '1d', frozen: {}, seq: 0, timer: null, userAxes: false};
+const EX = {mode: '1d', frozen: {}, seq: 0, timer: null, userAxes: false, anim: {}, animTimer: null, animRun: 0, pregen: null, view: null};
 const exChart = new Chart($('#exChart')), ex3d = new Surface3D($('#ex3d'));
 const EX_RES = {'1d': [80, 200, 500], '2d': [30, 70, 120], '3d': [18, 34, 54]};
 const SEP = '\u0001';
@@ -1698,6 +1750,10 @@ function setupExplore() {
   const s = M.summary;
   EX.userAxes = false;
   EX.frozen = typicalFrozen();
+  clearTimeout(EX.animTimer); EX.animRun++; EX.anim = {}; EX.pregen = null; syncAnimBar();
+  $('#exValBox').classList.toggle('hidden', !s.validation_rows); $('#exTestBox').classList.toggle('hidden', !s.test_rows);
+  if (!s.validation_rows) $('#exVal').checked = false;
+  if (!s.test_rows) $('#exTest').checked = false;
   const outs = [];
   s.outputs.forEach((name, j) => {
     const labels = s.cats[j];
@@ -1732,21 +1788,31 @@ function syncAxisControls() {
   }
   renderFrozen();
 }
+// Frozen inputs; a numeric one can be animated (▶) over a range in a loop.
 function renderFrozen() {
   const axes = new Set([$('#exX').value, ...(EX.mode !== '1d' ? [$('#exY').value] : [])]);
   const used = new Set(M.detail ? M.detail.inputs_used || [] : []);
   const rest = M.summary.inputs.filter(i => !axes.has(i.name));
+  for (const name of Object.keys(EX.anim)) if (axes.has(name)) delete EX.anim[name];   // an axis cannot also be animated
   const box = $('#exFrozen');
-  if (!rest.length) { box.innerHTML = '<div class="hint">Every input is on an axis.</div>'; return; }
+  if (!rest.length) { box.innerHTML = '<div class="hint">Every input is on an axis.</div>'; syncAnimBar(); return; }
   box.innerHTML = rest.map(i => {
     const tag = M.detail && !used.has(i.name) ? '<span class="unused">not used by this model</span>' : (i.kind === 'numeric' && i.range ? `<span class="unused">${fmt(i.range[0])} … ${fmt(i.range[1])}</span>` : '');
-    const v = EX.frozen[i.name] ?? '';
-    const control = i.kind === 'numeric'
-      ? `<input type="number" step="any" data-frozen="${esc(i.name)}" value="${esc(v)}" placeholder="${esc(fmt(i.typical, 6))}">`
-      : `<select data-frozen="${esc(i.name)}">${i.classes.map(c => `<option ${String(c) === String(v) ? 'selected' : ''}>${esc(c)}</option>`).join('')}</select>`;
-    return `<div class="field"><label>${esc(i.name)} ${tag}</label>${control}</div>`;
+    const v = EX.frozen[i.name] ?? '', n = esc(i.name), a = EX.anim[i.name];
+    if (i.kind !== 'numeric')
+      return `<div class="field"><label>${n} ${tag}</label><select data-frozen="${n}">${i.classes.map(c => `<option ${String(c) === String(v) ? 'selected' : ''}>${esc(c)}</option>`).join('')}</select></div>`;
+    const r = i.range || [0, 1];
+    return `<div class="field"><label>${n} ${tag}</label><div class="frow">
+        <input type="number" step="any" data-frozen="${n}" value="${esc(v)}" placeholder="${esc(fmt(i.typical, 6))}">
+        <button class="play ${a && a.playing ? 'on' : ''}" data-play="${n}" title="Animate ${n} over a range in a loop">${a && a.playing ? '❚❚' : '▶'}</button></div>
+      ${a ? `<div class="anim"><input type="number" step="any" data-anim="${n}" data-k="lo" value="${esc(a.lo)}" placeholder="from ${esc(fmt(r[0]))}" title="From">
+        <input type="number" step="any" data-anim="${n}" data-k="hi" value="${esc(a.hi)}" placeholder="to ${esc(fmt(r[1]))}" title="To">
+        <input type="number" step="1" min="2" data-anim="${n}" data-k="steps" value="${esc(a.steps)}" title="Steps per loop"></div>` : ''}</div>`;
   }).join('');
-  $$('[data-frozen]', box).forEach(el => el.addEventListener('input', () => { EX.frozen[el.dataset.frozen] = el.value; scheduleExplore(); }));
+  $$('[data-frozen]', box).forEach(el => el.addEventListener('input', () => { EX.frozen[el.dataset.frozen] = el.value; animInvalidate(); scheduleExplore(); }));
+  $$('[data-play]', box).forEach(b => b.onclick = () => toggleAnim(b.dataset.play));
+  $$('[data-anim]', box).forEach(el => el.addEventListener('input', () => { EX.anim[el.dataset.anim][el.dataset.k] = el.value; animInvalidate(); }));
+  syncAnimBar();
 }
 function scheduleExplore() { clearTimeout(EX.timer); EX.timer = setTimeout(() => loadExplore().catch(e => toast(e.message, true)), 220); }
 function exPick(item, key) {
@@ -1762,74 +1828,270 @@ function exTargets(data, key) {
   const labels = M.summary.cats[M.summary.outputs.indexOf(name)];
   return t.map(v => v === labels.indexOf(cls) ? 1 : 0);
 }
-function exBase() {
+function exBase(frozen = EX.frozen) {
   const base = {};
-  for (const [k, v] of Object.entries(EX.frozen)) if (v !== '' && v !== null && v !== undefined) base[k] = inputInfo(k) && inputInfo(k).kind === 'numeric' ? +v : v;
+  for (const [k, v] of Object.entries(frozen)) if (v !== '' && v !== null && v !== undefined) base[k] = inputInfo(k) && inputInfo(k).kind === 'numeric' ? +v : v;
   return base;
+}
+function exPoints(mode) {
+  if ($('#exRes').value !== 'custom') return EX_RES[mode][+$('#exRes').value];
+  const n = Math.round(+$('#exResCustom').value || EX_RES[mode][1]);
+  return Math.max(mode === '1d' ? 2 : 5, Math.min(mode === '1d' ? 1000 : 150, n));
+}
+// Row overlays: which point sets exist and are ticked, with their colours per view.
+const EX_SETS = [
+  {split: 'train', box: '#exData', label: 'Training rows', c1: '--other', c2: '--s2'},
+  {split: 'validation', box: '#exVal', label: 'Validation rows', c1: '--s3', c2: '--s3'},
+  {split: 'test', box: '#exTest', label: 'Test rows', c1: '--s4', c2: '--s4'},
+];
+function exSets(r, key) {
+  return EX_SETS.filter(s => $(s.box).checked).map(s => {
+    const data = s.split === 'train' ? r.data : (r.data_sets || {})[s.split];
+    const targets = exTargets(data, key);
+    return data && targets ? {...s, data, targets} : null;
+  }).filter(Boolean);
+}
+// The parameters of one view: everything a fetch depends on.
+function exParams(frozen = EX.frozen) {
+  const mode = EX.mode, key = $('#exOutput').value;
+  return {mode, key, outName: key.split(SEP)[0], isProb: key.includes(SEP),
+    outLabel: $('#exOutput').selectedOptions[0] ? $('#exOutput').selectedOptions[0].textContent : key.split(SEP)[0],
+    points: exPoints(mode), xName: $('#exX').value, yName: $('#exY').value, base: exBase(frozen),
+    xlo: $('#exXlo').value, xhi: $('#exXhi').value, ylo: $('#exYlo').value, yhi: $('#exYhi').value};
+}
+function exProblem(p) {
+  const s = M.summary;
+  if (!s.inputs.length) return 'This model has no inputs to vary';
+  if (p.mode === '1d') return null;
+  if (s.inputs.length < 2) return 'A 2D or 3D view needs a model with at least two inputs';
+  if (p.yName === p.xName) return 'Choose two different inputs';
+  return null;
+}
+function fetchExplore(p) {
+  if (p.mode === '1d') return api('/api/models/sweep', {index: M.index, column: p.xName, base: p.base, lo: p.xlo, hi: p.xhi, points: p.points});
+  return api('/api/models/grid', {index: M.index, x: p.xName, y: p.yName, base: p.base, x_lo: p.xlo, x_hi: p.xhi, y_lo: p.ylo, y_hi: p.yhi, points: p.points});
 }
 async function loadExplore() {
   if (M.index == null || !M.summary) return;
-  const s = M.summary;
-  if (!s.inputs.length) { exChart.set({layers: [], empty: 'This model has no inputs to vary'}); return; }
-  const seq = ++EX.seq, mode = EX.mode, key = $('#exOutput').value, outName = key.split(SEP)[0], isProb = key.includes(SEP);
-  const outLabel = $('#exOutput').selectedOptions[0] ? $('#exOutput').selectedOptions[0].textContent : outName;
-  const points = EX_RES[mode][+$('#exRes').value], xName = $('#exX').value, showData = $('#exData').checked;
+  if (EX.pregen && EX.pregen.playing) return;          // a pregenerated loop owns the view
+  const p = exParams(), seq = ++EX.seq;
+  $('#exWrap2d').classList.toggle('hidden', p.mode === '3d'); $('#exWrap3d').classList.toggle('hidden', p.mode !== '3d');
+  const problem = exProblem(p);
+  if (problem) { exChart.set({layers: [], empty: problem}); ex3d.set(null); $('#exColorbar').classList.add('hidden'); return; }
+  const r = await fetchExplore(p);
+  if (seq !== EX.seq) return;
+  renderExplore(r, p);
+}
+function renderExplore(r, p) {
+  const {mode, key, outName, isProb, outLabel, xName, yName} = p;
   $('#exWrap2d').classList.toggle('hidden', mode === '3d'); $('#exWrap3d').classList.toggle('hidden', mode !== '3d');
+  const sets = exSets(r, key);
+  EX.view = {mode, categorical: false};
   if (mode === '1d') {
-    const r = await api('/api/models/sweep', {index: M.index, column: xName, base: exBase(), lo: $('#exXlo').value, hi: $('#exXhi').value, points});
-    if (seq !== EX.seq) return;
     const ys = exPick(r.outputs[outName], key), cat = r.kind === 'categorical';
     const line = r.x.map((x, i) => ({x: cat ? i : x, y: ys[i], label: x}));
-    const layers = [];
-    const targets = exTargets(r.data, key);
-    const dataOk = showData && r.data && targets;
-    if (dataOk) layers.push({type: 'points', data: r.data.coords[xName].map((x, i) => ({x: cat ? x + (Math.random() - .5) * .3 : x, y: targets[i], data: true, raw: x})), color: '--other', alpha: .6, r: 2.5});
+    // The requested range is the x axis: rows outside it are left out, so a narrow range zooms in.
+    const lo = cat ? -.5 : r.x[0], hi = cat ? r.x.length - .5 : r.x[r.x.length - 1];
+    const layers = sets.map(s => ({type: 'points', color: s.c1, alpha: .6, r: 2.5,
+      data: s.data.coords[xName].map((x, i) => ({x: cat ? x + (Math.random() - .5) * .3 : x, y: s.targets[i], data: s.label, raw: x})).filter(d => cat || (d.x >= lo && d.x <= hi))}));
     layers.push(cat ? {type: 'points', data: line, color: '--s1', r: 6, ring: true} : {type: 'line', data: line, color: '--s1', hover: true});
-    $('#exLegend').innerHTML = `<span><i class="sw ${cat ? '' : 'line'}" style="background:var(--s1)"></i>Model</span>` + (dataOk ? `<span><i class="sw" style="background:var(--other)"></i>Training rows (their other inputs vary)</span>` : '');
+    $('#exLegend').innerHTML = `<span><i class="sw ${cat ? '' : 'line'}" style="background:var(--s1)"></i>Model</span>` + sets.map(s => `<span><i class="sw" style="background:var(${s.c1})"></i>${s.label} (their other inputs vary)</span>`).join('');
     $('#exColorbar').classList.add('hidden');
+    EX.view = {mode, categorical: cat, xCat: cat, yCat: true};
     exChart.set({
-      x: {title: xName, labels: cat ? r.x.map(String) : null, domain: cat ? [-.5, r.x.length - .5] : null},
+      x: {title: xName, labels: cat ? r.x.map(String) : null, domain: [lo, hi]},
       y: {title: outLabel, domain: isProb ? [-.02, 1.02] : null}, layers, crosshair: !cat,
-      tooltip: d => d.data ? `training row<br>${esc(xName)} = ${esc(cat ? r.x[d.raw] : fmt(d.x, 6))}<br>${esc(outLabel)} = ${fmt(d.y, 6)}` : `${esc(xName)} = ${esc(cat ? d.label : fmt(d.label, 6))}<br>${esc(outLabel)} = <strong>${fmt(d.y, 6)}</strong>`,
+      tooltip: d => d.data ? `${esc(d.data.toLowerCase().replace(/s$/, ''))}<br>${esc(xName)} = ${esc(cat ? r.x[d.raw] : fmt(d.x, 6))}<br>${esc(outLabel)} = ${fmt(d.y, 6)}` : `${esc(xName)} = ${esc(cat ? d.label : fmt(d.label, 6))}<br>${esc(outLabel)} = <strong>${fmt(d.y, 6)}</strong>`,
     });
     $('#exHint').textContent = 'The curve varies one input; every other input stays at the values on the left.';
     return;
   }
-  const yName = $('#exY').value;
-  if (s.inputs.length < 2) { exChart.set({layers: [], empty: 'A 2D or 3D view needs a model with at least two inputs'}); $('#exColorbar').classList.add('hidden'); return; }
-  if (yName === xName) { exChart.set({layers: [], empty: 'Choose two different inputs'}); ex3d.set(null); $('#exColorbar').classList.add('hidden'); return; }
-  const r = await api('/api/models/grid', {index: M.index, x: xName, y: yName, base: exBase(), x_lo: $('#exXlo').value, x_hi: $('#exXhi').value, y_lo: $('#exYlo').value, y_hi: $('#exYhi').value, points});
-  if (seq !== EX.seq) return;
   const z = exPick(r.outputs[outName], key);
   const flat = z.flat().filter(v => v !== null && isFinite(v));
   let lo = isProb ? 0 : Math.min(...flat), hi = isProb ? 1 : Math.max(...flat);
   if (!flat.length) { lo = 0; hi = 1; }
   const xc = r.x.kind === 'categorical', yc = r.y.kind === 'categorical';
   const xs = xc ? r.x.values.map((_, i) => i) : r.x.values, ys = yc ? r.y.values.map((_, i) => i) : r.y.values;
-  const targets = exTargets(r.data, key);
-  const pts = showData && r.data && targets ? r.data.coords[xName].map((x, i) => ({x, y: r.data.coords[yName][i], z: targets[i]})) : [];
   const ramp = rampStops().map((c, i, a) => `rgb(${c.join(',')}) ${Math.round(100 * i / (a.length - 1))}%`).join(', ');
   $('#exColorbar').classList.remove('hidden');
   $('#exColorbar').innerHTML = `<span class="title">${esc(outLabel)}${isProb ? '' : ' (colour scale spans this view)'}</span><span>${fmt(lo)}</span><div class="ramp" style="background:linear-gradient(90deg, ${ramp})"></div><span>${fmt(hi)}</span>`;
   const valueTip = d => `${esc(xName)} = ${esc(xc ? r.x.values[d.x] : fmt(d.x, 6))}<br>${esc(yName)} = ${esc(yc ? r.y.values[d.y] : fmt(d.y, 6))}<br>${esc(outLabel)} = <strong>${fmt(d.z, 6)}</strong>`;
+  EX.view = {mode, xCat: xc, yCat: yc};
   if (mode === '2d') {
-    const ex = cellEdges(xs), ey = cellEdges(ys);
+    const ex = cellEdges(xs), ey = cellEdges(ys), inside = d => d.x >= ex[0] && d.x <= ex[ex.length - 1] && d.y >= ey[0] && d.y <= ey[ey.length - 1];
     const layers = [{type: 'heat', data: [], grid: {xs, ys, z, lo, hi}}];
-    if (pts.length) layers.push({type: 'points', data: pts.map(p => ({...p, x: xc ? p.x + (Math.random() - .5) * .3 : p.x, y: yc ? p.y + (Math.random() - .5) * .3 : p.y, data: true, rx: p.x, ry: p.y})), color: '--s2', r: 2.6, ring: true});
-    $('#exLegend').innerHTML = pts.length ? `<span><i class="sw" style="background:var(--s2)"></i>Training rows (where the data is)</span>` : '';
+    for (const s of sets) layers.push({type: 'points', color: s.c2, r: 2.6, ring: true,
+      data: s.data.coords[xName].map((x, i) => ({x: xc ? x + (Math.random() - .5) * .3 : x, y: yc ? s.data.coords[yName][i] + (Math.random() - .5) * .3 : s.data.coords[yName][i], z: s.targets[i], data: s.label, rx: x, ry: s.data.coords[yName][i]})).filter(inside)});
+    $('#exLegend').innerHTML = sets.map(s => `<span><i class="sw" style="background:var(${s.c2})"></i>${s.label} (where the data is)</span>`).join('');
     exChart.set({
       x: {title: xName, labels: xc ? r.x.values.map(String) : null, domain: [ex[0], ex[ex.length - 1]]},
       y: {title: yName, labels: yc ? r.y.values.map(String) : null, domain: [ey[0], ey[ey.length - 1]]}, layers,
-      tooltip: d => d.data ? `training row<br>${esc(xName)} = ${esc(xc ? r.x.values[d.rx] : fmt(d.rx, 6))}<br>${esc(yName)} = ${esc(yc ? r.y.values[d.ry] : fmt(d.ry, 6))}<br>actual ${esc(outLabel)} = ${fmt(d.z, 6)}` : valueTip(d),
+      tooltip: d => d.data ? `${esc(d.data.toLowerCase().replace(/s$/, ''))}<br>${esc(xName)} = ${esc(xc ? r.x.values[d.rx] : fmt(d.rx, 6))}<br>${esc(yName)} = ${esc(yc ? r.y.values[d.ry] : fmt(d.ry, 6))}<br>actual ${esc(outLabel)} = ${fmt(d.z, 6)}` : valueTip(d),
     });
-    $('#exHint').textContent = 'Colour is the model output over two inputs; the rest stay at the values on the left. Areas far from the training rows are extrapolation.';
+    $('#exHint').textContent = 'Colour is the model output over two inputs; the rest stay at the values on the left. Areas far from the data rows are extrapolation.';
     return;
   }
-  $('#exLegend').innerHTML = pts.length ? `<span><i class="sw" style="background:var(--s2)"></i>Training rows at their actual value</span>` : '';
+  const pts = sets.flatMap(s => s.data.coords[xName].map((x, i) => ({x, y: s.data.coords[yName][i], z: s.targets[i], color: s.c2})));
+  $('#exLegend').innerHTML = sets.map(s => `<span><i class="sw" style="background:var(${s.c2})"></i>${s.label} at their actual value</span>`).join('');
   ex3d.set({xs, ys, z, lo, hi, xlabel: xName, ylabel: yName, zlabel: outLabel, xlabels: xc ? r.x.values.map(String) : null, ylabels: yc ? r.y.values.map(String) : null,
     xspan: [xs[0], xs[xs.length - 1]], yspan: [ys[0], ys[ys.length - 1]], points: pts, tooltip: valueTip});
-  $('#exHint').textContent = 'Drag to rotate (down to look from below) · scroll or pinch to zoom · tap for a value · double-click or double-tap to reset. Training rows outside the plotted ranges are hidden.';
+  $('#exHint').textContent = 'Drag to rotate (down to look from below) · scroll or pinch to zoom · tap for a value · double-click or double-tap to reset. Rows outside the plotted ranges are hidden.';
 }
+// ── zoom and pan on the 1D/2D plot: the range inputs follow, and the view is recomputed ──
+function exRange(axis) {
+  const [loId, hiId] = axis === 'x' ? ['#exXlo', '#exXhi'] : ['#exYlo', '#exYhi'];
+  const d = axis === 'x' ? exChart.xd : exChart.yd;
+  return d ? {loId, hiId, lo: d[0], hi: d[1]} : null;
+}
+function exSetRange(axis, lo, hi) {
+  if (!(isFinite(lo) && isFinite(hi) && hi > lo)) return;
+  const r = exRange(axis); if (!r) return;
+  const digits = v => +v.toPrecision(8);
+  $(r.loId).value = digits(lo); $(r.hiId).value = digits(hi);
+}
+function exAxes() {
+  // Axes that zoom: numeric x in 1D; numeric x and y in 2D.
+  const v = EX.view || {};
+  if (v.mode === '1d') return v.xCat ? [] : ['x'];
+  if (v.mode === '2d') return [...(v.xCat ? [] : ['x']), ...(v.yCat ? [] : ['y'])];
+  return [];
+}
+function exBlocked() {
+  if (EX.pregen && EX.pregen.playing && EX.mode !== '3d') { $('#exAnimHint').textContent = 'Zoom and pan wait until the pregenerated animation stops.'; return true; }
+  return false;
+}
+function exZoom(factor, px, py) {
+  const axes = exAxes(); if (!axes.length || exBlocked()) return;
+  for (const axis of axes) {
+    const r = exRange(axis); if (!r) continue;
+    const frac = axis === 'x' ? (px - exChart.m.l) / exChart.pw : 1 - (py - exChart.m.t) / exChart.ph;
+    const anchor = r.lo + Math.min(1, Math.max(0, frac)) * (r.hi - r.lo);
+    exSetRange(axis, anchor - (anchor - r.lo) * factor, anchor + (r.hi - anchor) * factor);
+  }
+  animInvalidate(); scheduleExplore();
+}
+function exPan(dx, dy) {
+  const axes = exAxes(); if (!axes.length || exBlocked()) return;
+  for (const axis of axes) {
+    const r = exRange(axis); if (!r) continue;
+    const shift = axis === 'x' ? -dx / exChart.pw * (r.hi - r.lo) : dy / exChart.ph * (r.hi - r.lo);
+    exSetRange(axis, r.lo + shift, r.hi + shift);
+  }
+  animInvalidate(); scheduleExplore();
+}
+(function bindExploreGestures() {
+  const c = $('#exChart'), pointers = new Map();
+  let pinch = null, last = null;
+  const local = e => { const b = c.getBoundingClientRect(); return [e.clientX - b.left, e.clientY - b.top]; };
+  c.addEventListener('wheel', e => {
+    if (!exAxes().length) return;
+    e.preventDefault(); const [x, y] = local(e);
+    exZoom(Math.exp(Math.max(-1, Math.min(1, e.deltaY * .0015))), x, y);
+  }, {passive: false});
+  c.addEventListener('pointerdown', e => { pointers.set(e.pointerId, local(e)); c.setPointerCapture(e.pointerId); last = local(e); pinch = null; });
+  c.addEventListener('pointermove', e => {
+    if (!pointers.has(e.pointerId)) return;
+    pointers.set(e.pointerId, local(e));
+    if (pointers.size === 2) {
+      const [a, b] = [...pointers.values()], dist = Math.hypot(a[0] - b[0], a[1] - b[1]), mid = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
+      if (pinch && dist > 0) exZoom(pinch.dist / dist, mid[0], mid[1]);
+      pinch = {dist}; return;
+    }
+    if (pointers.size === 1 && last) {
+      const p = local(e), dx = p[0] - last[0], dy = p[1] - last[1];
+      if (Math.abs(dx) + Math.abs(dy) >= 2) { exPan(dx, dy); last = p; }
+    }
+  });
+  const up = e => { pointers.delete(e.pointerId); if (pointers.size < 2) pinch = null; if (!pointers.size) last = null; };
+  c.addEventListener('pointerup', up); c.addEventListener('pointercancel', up);
+  c.addEventListener('dblclick', () => {
+    if (!exAxes().length || exBlocked()) return;
+    for (const axis of exAxes()) { const r = exRange(axis); if (r) { $(r.loId).value = ''; $(r.hiId).value = ''; } }
+    animInvalidate(); scheduleExplore();
+  });
+})();
+// ── animation: inputs stepped over a range in a loop, live or pregenerated ──
+function animValues(name) {
+  const a = EX.anim[name], info = inputInfo(name), r = (info && info.range) || [0, 1];
+  const pad = .05 * (r[1] - r[0] || 1);
+  const lo = a.lo === '' ? r[0] - pad : +a.lo, hi = a.hi === '' ? r[1] + pad : +a.hi, steps = Math.max(2, Math.min(400, Math.round(+a.steps || 24)));
+  return Array.from({length: steps}, (_, i) => lo + (hi - lo) * i / (steps - 1));
+}
+function animPlaying() { return Object.entries(EX.anim).filter(([, a]) => a.playing).map(([name]) => name); }
+function animFrozenAt(frame) {
+  const frozen = {...EX.frozen};
+  for (const name of animPlaying()) { const values = animValues(name); frozen[name] = values[frame % values.length]; }
+  return frozen;
+}
+function animFrameCount() { return Math.max(1, ...animPlaying().map(name => animValues(name).length)); }
+function toggleAnim(name) {
+  if (!EX.anim[name]) EX.anim[name] = {lo: '', hi: '', steps: 24, playing: false};
+  EX.anim[name].playing = !EX.anim[name].playing;
+  animInvalidate(); renderFrozen();
+  if (animPlaying().length) animStart(); else animStop(false);
+}
+function syncAnimBar() {
+  const any = animPlaying().length > 0;
+  $('#exAnimStop').classList.toggle('hidden', !any);
+  if (!any) $('#exAnimHint').textContent = '';
+}
+function animInvalidate() { if (EX.pregen) { EX.pregen.stale = true; } }
+function animStop(clear = true) {
+  clearTimeout(EX.animTimer); EX.animTimer = null; EX.animRun++;
+  if (EX.pregen) EX.pregen.playing = false;
+  if (clear) for (const a of Object.values(EX.anim)) a.playing = false;
+  renderFrozen(); syncAnimBar(); scheduleExplore();
+}
+async function animStart() {
+  clearTimeout(EX.animTimer);
+  const run = ++EX.animRun, delay = () => +$('#exAnimSpeed').value;
+  const p0 = exParams(), problem = exProblem(p0);
+  if (problem) { toast(problem, true); return; }
+  if ($('#exPregen').checked) {
+    // Compute every frame first, then play them back (3D stays rotatable).
+    const n = animFrameCount(), frames = [];
+    EX.pregen = {frames, playing: false, stale: false};
+    for (let f = 0; f < n; f++) {
+      if (run !== EX.animRun) return;
+      $('#exAnimHint').textContent = `Generating frame ${f + 1} of ${n}…`;
+      const p = exParams(animFrozenAt(f));
+      try { frames.push({r: await fetchExplore(p), p, frozen: animFrozenAt(f)}); } catch (e) { toast(e.message, true); return; }
+    }
+    if (run !== EX.animRun) return;
+    EX.pregen.playing = true;
+    let f = 0;
+    const play = () => {
+      if (run !== EX.animRun || !EX.pregen || !EX.pregen.playing) return;
+      if (EX.pregen.stale) { $('#exAnimHint').textContent = 'Settings changed: press ▶ again to regenerate the frames.'; EX.pregen.playing = false; animStop(); return; }
+      const frame = frames[f % frames.length];
+      renderExplore(frame.r, frame.p); animShowValues(frame.frozen);
+      $('#exAnimHint').textContent = `Playing ${frames.length} pregenerated frames.`;
+      f++; EX.animTimer = setTimeout(play, delay());
+    };
+    play(); return;
+  }
+  EX.pregen = null;
+  let f = 0;
+  const step = async () => {
+    if (run !== EX.animRun || !animPlaying().length) return;
+    const frozen = animFrozenAt(f), p = exParams(frozen);
+    const started = performance.now();
+    try { const r = await fetchExplore(p); if (run !== EX.animRun) return; renderExplore(r, p); animShowValues(frozen); }
+    catch (e) { toast(e.message, true); animStop(); return; }
+    $('#exAnimHint').textContent = `Live: frame ${f % animFrameCount() + 1} of ${animFrameCount()} (tick “Pregenerate frames” for a smoother loop).`;
+    f++;
+    EX.animTimer = setTimeout(step, Math.max(0, delay() - (performance.now() - started)));
+  };
+  step();
+}
+function animShowValues(frozen) {
+  for (const name of animPlaying()) {
+    const el = $(`#exFrozen [data-frozen="${CSS.escape(name)}"]`);
+    if (el) el.value = +(+frozen[name]).toPrecision(6);
+  }
+}
+$('#exAnimStop').onclick = () => animStop();
+$('#exPregen').onchange = () => { if (animPlaying().length) { animInvalidate(); animStart(); } };
 $$('#exMode button').forEach(b => b.onclick = () => {
   EX.mode = b.dataset.mode;
   $$('#exMode button').forEach(x => x.classList.toggle('active', x === b));
@@ -1837,13 +2099,19 @@ $$('#exMode button').forEach(b => b.onclick = () => {
     const other = M.summary && M.summary.inputs.find(i => i.name !== $('#exX').value);
     if (other) $('#exY').value = other.name;
   }
-  syncAxisControls(); scheduleExplore();
+  animInvalidate(); syncAxisControls(); scheduleExplore();
 });
-$('#exX').onchange = () => { EX.userAxes = true; ['#exXlo', '#exXhi'].forEach(id => $(id).value = ''); syncAxisControls(); scheduleExplore(); };
-$('#exY').onchange = () => { EX.userAxes = true; ['#exYlo', '#exYhi'].forEach(id => $(id).value = ''); syncAxisControls(); scheduleExplore(); };
-['#exXlo', '#exXhi', '#exYlo', '#exYhi'].forEach(id => $(id).addEventListener('input', scheduleExplore));
-['#exOutput', '#exRes', '#exData'].forEach(id => $(id).onchange = scheduleExplore);
-$('#exReset').onclick = () => { EX.frozen = typicalFrozen(); renderFrozen(); scheduleExplore(); };
+$('#exX').onchange = () => { EX.userAxes = true; ['#exXlo', '#exXhi'].forEach(id => $(id).value = ''); animInvalidate(); syncAxisControls(); scheduleExplore(); };
+$('#exY').onchange = () => { EX.userAxes = true; ['#exYlo', '#exYhi'].forEach(id => $(id).value = ''); animInvalidate(); syncAxisControls(); scheduleExplore(); };
+['#exXlo', '#exXhi', '#exYlo', '#exYhi', '#exResCustom'].forEach(id => $(id).addEventListener('input', () => { animInvalidate(); scheduleExplore(); }));
+['#exOutput', '#exData', '#exVal', '#exTest'].forEach(id => $(id).onchange = () => { animInvalidate(); scheduleExplore(); });
+$('#exRes').onchange = () => {
+  const custom = $('#exRes').value === 'custom';
+  $('#exResCustom').classList.toggle('hidden', !custom);
+  if (custom && !$('#exResCustom').value) $('#exResCustom').value = EX_RES[EX.mode][1];
+  animInvalidate(); scheduleExplore();
+};
+$('#exReset').onclick = () => { EX.frozen = typicalFrozen(); animInvalidate(); renderFrozen(); scheduleExplore(); };
 function typicalFrozen() {
   return Object.fromEntries(M.summary.inputs.map(i => [i.name, typeof i.typical === 'number' ? +i.typical.toPrecision(6) : (i.typical ?? '')]));
 }
@@ -1886,6 +2154,31 @@ $('#batchBtn').onclick = async () => {
       <div class="scroll-x"><table><thead><tr>${r.columns.map(c => `<th>${esc(c)}</th>`).join('')}</tr></thead><tbody>${r.preview.map(row => `<tr>${row.map(v => `<td>${v === null ? '' : esc(v)}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`;
   } catch (e) { toast(e.message, true); }
   finally { $('#batchBtn').disabled = false; }
+};
+// ───────────── edit the selected equation ─────────────
+$('#editBtn').onclick = async () => {
+  if (M.index == null) return;
+  try {
+    const r = await api('/api/models/edit_text', {index: M.index});
+    $('#editHeads').innerHTML = r.heads.map((h, i) => `<div class="field"><label>${esc(h.label)} =</label>
+      <textarea class="mono" data-edit-head="${i}" rows="${Math.min(8, 1 + Math.ceil(h.text.length / 90))}" spellcheck="false">${esc(h.text)}</textarea></div>`).join('');
+    $('#editError').classList.add('hidden');
+    $('#editBox').classList.remove('hidden');
+  } catch (e) { toast(e.message, true); }
+};
+$('#editCancel').onclick = () => $('#editBox').classList.add('hidden');
+$('#editApply').onclick = async () => {
+  if (M.index == null) return;
+  const texts = $$('#editHeads [data-edit-head]').map(t => t.value);
+  $('#editApply').disabled = true;
+  try {
+    const r = await api('/api/models/edit', {index: M.index, texts, refit: $('#editRefit').checked});
+    M.summary = r.summary; renderCandidates();
+    $('#editBox').classList.add('hidden');
+    await selectModel(r.index);
+    toast('Edited model added as candidate #' + (r.index + 1));
+  } catch (e) { $('#editError').textContent = e.message; $('#editError').classList.remove('hidden'); }
+  finally { $('#editApply').disabled = false; }
 };
 $('#exportBtn').onclick = async () => {
   if (M.index == null) return;

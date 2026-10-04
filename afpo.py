@@ -395,8 +395,9 @@ def model_description(model, n_features=None, operators=None, adfs=None):
             name=tree[0]
             if name in visiting: raise ValueError(f"Cyclic ADF definition {name!r}")
             if name not in used:
-                item=adfs.get(name)
+                item=adf_definition(name,adfs)
                 if item is None: raise ValueError(f"Missing ADF definition {name!r}")
+                adfs.setdefault(name,item)
                 visiting.add(name); visit(item["tree"]); visiting.remove(name); used.append(name)
         for child in tree[1:]: visit(child)
     for tree in model.trees: visit(tree)
@@ -404,6 +405,7 @@ def model_description(model, n_features=None, operators=None, adfs=None):
     trees=[tree_description(tree,n_features,operators,adfs) for tree in model.trees]
     definitions=[]
     for name in used:
+        if name in CUSTOM_OPS: continue          # a user operator is grammar the user supplied, not a mined definition
         item=adfs.get(name)
         if item is None: raise ValueError(f"Missing ADF definition {name!r}")
         definition=tree_description(item["tree"],n_features,operators,adfs,int(item["arity"]))
@@ -878,7 +880,7 @@ def _evaluate(t, X, adfs=None, arguments=None, position=None):
         if arguments is None or not isinstance(t[1],int) or not 0<=t[1]<len(arguments): raise ValueError("Invalid ADF argument")
         return arguments[t[1]]
     if t[0].startswith("adf_"):
-        item=(adfs or {}).get(t[0])
+        item=adf_definition(t[0],adfs)
         if item is None or len(t)-1 != int(item["arity"]): raise ValueError(f"Unknown or malformed ADF {t[0]!r}")
         values=[_evaluate(q,X,adfs,arguments,position) for q in t[1:]]
         return _evaluate(item["tree"],X,adfs,values,position)
@@ -923,7 +925,7 @@ def _guard_walk(t, X, adfs, arguments=None, position=None):
     if t[0] in ("x","c"):
         value=evaluate(t,X,adfs,None,position); return value,value
     if t[0].startswith("adf_"):
-        item=(adfs or {}).get(t[0])
+        item=adf_definition(t[0],adfs)
         if item is None or len(t)-1!=int(item["arity"]): raise ValueError(f"Unknown or malformed ADF {t[0]!r}")
         pairs=[_guard_walk(q,X,adfs,arguments,position) for q in t[1:]]
         return _guard_walk(item["tree"],X,adfs,pairs,position)
@@ -1343,6 +1345,38 @@ class _FlatTree:
 # round-off, not bit for bit: compiled sums and libm differ in the last bit.
 FIT_BACKEND = "auto"
 _FITCORE = []
+# --clamp auto (default): the value clamp CLIP and the divisor/log guard EPS
+# follow the data.  Every operator result is clamped to +/-CLIP and a model
+# that reaches it is rejected (the numeric-guard check), so data whose values
+# or intermediate products pass 1e12 -- E = m*c**2 with c = 3e8 already has
+# c**2 = 9e16 -- had every right answer rejected and the search stalled; data
+# below 1e-12 had its divisors treated as zero.  With the largest absolute
+# input or target value B and the smallest nonzero one b, auto uses
+# CLIP = max(1e12, 1e6*B**2) and EPS = min(1e-12, 1e-6*b**2), within
+# 1e+/-150 so a product of two clamped values stays finite.  Data within
+# [1e-3, 1e3] keeps the old 1e12 / 1e-12 exactly.  `default` pins them; a
+# number sets CLIP (EPS stays automatic).  The export embeds the values.
+DEFAULT_CLIP, DEFAULT_EPS = CLIP, EPS
+def automatic_limits(*arrays):
+    """(CLIP, EPS) for data with these values (see --clamp)."""
+    values=np.concatenate([np.abs(np.asarray(array,float)).ravel() for array in arrays if array is not None and np.size(array)] or [np.zeros(0)])
+    values=values[np.isfinite(values)]
+    if not len(values): return DEFAULT_CLIP,DEFAULT_EPS
+    big=float(values.max()); nonzero=values[values>0]; small=float(nonzero.min()) if len(nonzero) else 1.
+    clip=DEFAULT_CLIP if big<=1e3 else float(min(1e150,max(DEFAULT_CLIP,1e6*big*big)))
+    eps=DEFAULT_EPS if small>=1e-3 else float(max(1e-150,min(DEFAULT_EPS,1e-6*small*small)))
+    return clip,eps
+def set_numeric_limits(clip, eps):
+    global CLIP,EPS
+    CLIP,EPS=float(clip),float(eps)
+def resolve_numeric_limits(setting, *arrays):
+    """(CLIP, EPS) for a --clamp setting."""
+    if setting in (None,"auto"): return automatic_limits(*arrays)
+    if setting=="default": return DEFAULT_CLIP,DEFAULT_EPS
+    clip=float(setting)
+    if not clip>0: raise ValueError("--clamp must be auto, default or a positive number")
+    return clip,automatic_limits(*arrays)[1]
+
 def compiled_fitter():
     """The compiled fitter module, or None when Cython or a compiler is unavailable."""
     if not _FITCORE:
@@ -1355,7 +1389,12 @@ def compiled_fitter():
         except Exception as error:
             print(f"Compiled constant fitter unavailable ({type(error).__name__}: {error}); using the Python fitter.",file=sys.stderr)
             _FITCORE.append(None)
-    return _FITCORE[0]
+    core=_FITCORE[0]
+    if core is not None:
+        # The kernel keeps its own copy of the limits; a build without the setter can only use the defaults.
+        if hasattr(core,"set_limits"): core.set_limits(CLIP,EPS)
+        elif (CLIP,EPS)!=(DEFAULT_CLIP,DEFAULT_EPS): return None
+    return core
 def _compiled_program(flat, core, feature_count):
     """(code, arg, kid) arrays of a flat tree, or None when it needs the Python fitter."""
     codes=core.OPERATOR_CODES; nodes=len(flat.kind)
@@ -1596,7 +1635,9 @@ def _classifier_log_loss(raw, truth, class_count):
     scores=np.column_stack([a*raw[:,k]+b for k,(a,b) in enumerate(scales)])
     probabilities=binary_probabilities(scores[:,0]) if raw.shape[1]==1 else stable_softmax(scores)
     truth=np.asarray(np.rint(truth),int); valid=(truth>=0)&(truth<probabilities.shape[1])
-    return float(np.mean(-np.log(np.maximum(probabilities[np.arange(len(truth))[valid],truth[valid]],EPS)))) if np.any(valid) else 0.
+    if not np.any(valid): return 0.
+    losses=-np.log(np.maximum(probabilities[np.arange(len(truth))[valid],truth[valid]],EPS))
+    return float(np.average(losses,weights=class_balance_weights(truth,class_count)[valid]))
 
 def _tune_classifier_heads(trees, heads, X, truth, class_count, adfs):
     """Tune each class head's constants against its 0/1 indicator (least squares surrogate),
@@ -1622,7 +1663,10 @@ def tune_model_constants(model, X, Y, affine_on, cats):
     Xs,Ys=row_subset(X,rows),row_subset(Y,rows); trees=list(model.trees); changed=False
     for j,heads in enumerate(targets):
         if cats[j] is not None:
-            if len(cats[j])>=2 and affine_on and _tune_classifier_heads(trees,heads,Xs,Ys[:,j],len(cats[j]),model.adfs): changed=True
+            if len(cats[j])>=2 and affine_on:
+                # Input coverage alone can leave a rare class with no rows at all.
+                class_rows=class_balanced_rows(X,Y[:,j],len(cats[j]),CONSTANT_FIT_ROWS) if CLASS_BALANCE else rows
+                if _tune_classifier_heads(trees,heads,row_subset(X,class_rows),row_subset(Y,class_rows)[:,j],len(cats[j]),model.adfs): changed=True
             continue
         for head in heads:
             original=trees[head]
@@ -1634,6 +1678,8 @@ def tune_model_constants(model, X, Y, affine_on, cats):
             # scale and the term coefficients share one degree of freedom, and
             # leaving it to Levenberg-Marquardt lets them drift apart.
             if multiterm and tree is not original: tree=multiterm_refit(tree,Xs,Ys[:,j],model.adfs,grammar)
+            # Pruning a term can leave part of an input relation exposed; keep the rule-abiding original.
+            if tree is not original and RELATION_OF_FEATURE and relation_violation(tree) and not relation_violation(original): continue
             if tree is not original: trees[head]=tree; changed=True
     if changed: model.trees=trees
     return changed
@@ -1817,10 +1863,10 @@ class PosteriorParticlePopulation:
         if self.likelihood_kind=="bernoulli":
             probability=binary_probabilities(raw[:,0])[:,1]
             truth=np.asarray(np.rint(Y[:,0]),int); valid=(truth>=0)&(truth<=1)
-            return float(np.mean(np.where(valid,-np.log(np.where(truth==1,probability,1-probability)+EPS),-np.log(EPS))))
+            return float(np.average(np.where(valid,-np.log(np.where(truth==1,probability,1-probability)+EPS),-np.log(EPS)),weights=class_balance_weights(truth,2)))
         if self.likelihood_kind=="categorical":
             probability=stable_softmax(raw); truth=np.asarray(np.rint(Y[:,0]),int); valid=(truth>=0)&(truth<probability.shape[1]); row=np.arange(len(truth))
-            return float(np.mean(np.where(valid,-np.log(np.maximum(probability[row,np.clip(truth,0,probability.shape[1]-1)],EPS)),-np.log(EPS))))
+            return float(np.average(np.where(valid,-np.log(np.maximum(probability[row,np.clip(truth,0,probability.shape[1]-1)],EPS)),-np.log(EPS)),weights=class_balance_weights(truth,probability.shape[1])))
         return float("inf")
 
     def _cached_likelihood_energy(self, model, X, Y, cats):
@@ -1962,7 +2008,7 @@ class PosteriorParticlePopulation:
             }
         categorical=[index for index, labels in enumerate(cats) if labels is not None]
         if categorical:
-            correct=total=0; log_losses=[]; confidences=[]; briers=[]
+            correct=total=0; log_losses=[]; confidences=[]; briers=[]; recalls=[]
             for index in categorical:
                 class_count=len(cats[index])
                 truth=np.asarray(np.rint(Y[:,index]),dtype=int)
@@ -1978,6 +2024,7 @@ class PosteriorParticlePopulation:
                 probabilities=np.tensordot(weights,np.asarray(particle_probabilities),axes=(0,0))
                 chosen=np.argmax(probabilities,axis=1)
                 correct+=int(np.sum(chosen[valid]==truth[valid])); total+=int(np.sum(valid))
+                recalls.extend(float(np.mean(chosen[valid&(truth==label)]==label)) for label in np.unique(truth[valid]))
                 row=np.arange(len(truth))[valid]
                 log_losses.extend(-np.log(np.maximum(probabilities[row,truth[valid]],EPS)))
                 confidences.extend(np.max(probabilities[valid],axis=1))
@@ -1985,6 +2032,7 @@ class PosteriorParticlePopulation:
             if total:
                 result["classification"]={
                     "accuracy":correct/total,
+                    "balanced_accuracy":float(np.mean(recalls)),
                     "log_loss":float(np.mean(log_losses)),
                     "mean_confidence":float(np.mean(confidences)),"brier_score":float(np.mean(briers)),
                     "observations":total,
@@ -2106,7 +2154,7 @@ class BayesianEquationGenerator:
                              f"95% band={numeric['coverage_95']:.0%}")
             if "classification" in predictive:
                 classification=predictive["classification"]
-                parts.append(f"class accuracy={classification['accuracy']:.1%}, log loss={classification['log_loss']:.4g}, "
+                parts.append(f"class accuracy={classification['accuracy']:.1%} (balanced {classification.get('balanced_accuracy',classification['accuracy']):.1%}), log loss={classification['log_loss']:.4g}, "
                              f"confidence={classification['mean_confidence']:.1%}")
             check=f", {predictive['source']} PPC " + "; ".join(parts) if parts else ", PPC=no valid held-out targets"
         return (f"Adaptive Bayesian proposals: entropy={self.entropy:.2f}, exploration={self.exploration:.0%}, injection={self.particles.injection_rate:.0%}, "
@@ -2232,7 +2280,7 @@ def choose_operator(options):
     options=list(options)
     return options[0] if len(options)==1 else rng.choices(options,weights=[operator_prior(op) for op in options])[0]
 def operator_arity(op, adfs=None):
-    return int((adfs or {}).get(op,{}).get("arity",OPS.get(op,(-1,))[0]))
+    return int((adf_definition(op,adfs) or {}).get("arity",OPS.get(op,(-1,))[0]))
 
 def random_tree(n_features, ops, max_nodes, max_depth, depth=0, proposal=None, adfs=None):
     if proposal is not None and depth==0: proposal.begin_equation()
@@ -2283,13 +2331,13 @@ def bayesian_injection_trees(bayes, n_outputs, n_features, ops, max_nodes, max_d
                 for local,head in enumerate(heads):
                     trees[head]=mutate(particle.trees[local],n_features,ops,max_nodes,max_depth,proposal=bank,adfs=adfs); scales[head]=particle.scales[local]
             else:
-                for head in heads: trees[head]=random_tree(n_features,ops,max_nodes,max_depth,proposal=bank,adfs=adfs)
+                for head in heads: trees[head]=admissible_random_tree(n_features,ops,max_nodes,max_depth,proposal=bank,adfs=adfs)
         return (trees,scales,sources) if return_sources else (trees,scales)
     particle=bayes.sample_particle()
     if particle_mode!="grammar" and particle is not None and len(particle.trees)==n_outputs and rng.random()<.65:
         trees=[mutate(tree,n_features,ops,max_nodes,max_depth,proposal=bayes,adfs=adfs) for tree in particle.trees]
         return (trees,list(particle.scales),[particle]) if return_sources else (trees,list(particle.scales))
-    trees=[random_tree(n_features,ops,max_nodes,max_depth,proposal=bayes,adfs=adfs) for _ in range(n_outputs)]
+    trees=[admissible_random_tree(n_features,ops,max_nodes,max_depth,proposal=bayes,adfs=adfs) for _ in range(n_outputs)]
     scales=[(1.,0.)]*n_outputs
     return (trees,scales,[]) if return_sources else (trees,scales)
 
@@ -2625,14 +2673,15 @@ def residual_term_mutate(t, ops, max_nodes, max_depth, adfs=None):
 # any model that still contains one is infeasible.
 NESTING_RULES = frozenset()
 
-def nesting_violation(tree, enclosing=frozenset()):
-    """The first forbidden outer>inner pair in the tree, or ''."""
-    if not NESTING_RULES or tree[0] in ("x","c","arg"): return ""
+def nesting_violation(tree, enclosing=frozenset(), opaque=frozenset()):
+    """The first forbidden outer>inner pair in the tree, or ''.  Subtrees in
+    opaque are leaves (see Model.opaque): they are not looked into."""
+    if not NESTING_RULES or tree[0] in ("x","c","arg") or (opaque and tree in opaque): return ""
     for outer in enclosing:
         if (outer,tree[0]) in NESTING_RULES: return f"{outer}>{tree[0]}"
     inner=enclosing|{tree[0]}
     for child in tree[1:]:
-        found=nesting_violation(child,inner)
+        found=nesting_violation(child,inner,opaque)
         if found: return found
     return ""
 
@@ -2689,13 +2738,13 @@ def configure_units(spec, feature_names):
     UNIT_FEATURES={feature_names.index(name):tuple(unit.get(base,0.) for base in UNIT_BASES) for name,unit in parsed.items()}
     return parsed
 
-def tree_units(tree):
+def tree_units(tree, opaque=frozenset()):
     """(unit or WILDCARD, violation text or '')."""
     if tree[0]=="x": return UNIT_FEATURES.get(tree[1],WILDCARD),""
-    if tree[0] in ("c","arg"): return WILDCARD,""
+    if tree[0] in ("c","arg") or (opaque and tree in opaque): return WILDCARD,""
     children=[]
     for child in tree[1:]:
-        unit,violation=tree_units(child)
+        unit,violation=tree_units(child,opaque)
         if violation: return None,violation
         children.append(unit)
     op=tree[0]; zero=tuple(0. for _ in UNIT_BASES)
@@ -2747,15 +2796,341 @@ def tree_units(tree):
     if all(dimensionless(unit) for unit in children): return zero,""
     return None,f"{op} of a dimensional argument"
 
-def unit_violation(tree):
+def unit_violation(tree, opaque=frozenset()):
     if not UNIT_FEATURES or tree[0] in ("x","c","arg"): return ""
-    return tree_units(tree)[1]
+    return tree_units(tree,opaque)[1]
+
+# --input-relations "HH1,MM1;HH2,MM2": input columns that belong together.
+# Inside a relation its columns combine freely; across relations (and with
+# inputs in no relation, each its own one-column relation) only *complete*
+# subexpressions combine, ones that read every column of their relation.  So
+# (60*HH2+MM2)-(60*HH1+MM1) is allowed but HH2-HH1 or HH1*MM2 is not: the
+# relation is a module whose result may meet other modules' results, while
+# its variables never meet outside variables directly.  A categorical input
+# is one column (any of its one-hot features reads it).  Trees that break the
+# rule are infeasible, and offspring that break it are redrawn.
+INPUT_RELATIONS = ()           # tuple of column-name tuples, as given
+RELATION_SPEC = ""
+RELATION_OF_FEATURE = {}       # feature index -> (relation index, column name)
+RELATION_COLUMNS = {}          # relation index -> frozenset of its column names
+
+def parse_relations(spec):
+    """'a,b;c,d' (or a list of such strings) -> (('a','b'),('c','d'))."""
+    items=[spec] if isinstance(spec,str) else list(spec or ())
+    relations=[]
+    for item in items:
+        for part in str(item).split(";"):
+            columns=tuple(dict.fromkeys(column.strip() for column in part.split(",") if column.strip()))
+            if not columns: continue
+            if len(columns)<2: raise ValueError(f"A relation needs at least two columns: {part.strip()!r}")
+            relations.append(columns)
+    seen={}
+    for index,columns in enumerate(relations):
+        for column in columns:
+            if column in seen: raise ValueError(f"Column {column!r} is in two relations")
+            seen[column]=index
+    return tuple(relations)
+
+def format_relations(relations): return ";".join(",".join(columns) for columns in relations)
+
+def configure_input_relations(spec, feature_names, source_columns=(), types=()):
+    """Map every feature of a related input column to its relation."""
+    global INPUT_RELATIONS,RELATION_SPEC,RELATION_OF_FEATURE,RELATION_COLUMNS
+    relations=parse_relations(spec)
+    INPUT_RELATIONS=relations; RELATION_SPEC=format_relations(relations); RELATION_OF_FEATURE={}; RELATION_COLUMNS={}
+    if not relations: return
+    kinds=dict(zip(source_columns,types))
+    for index,columns in enumerate(relations):
+        RELATION_COLUMNS[index]=frozenset(columns)
+        for column in columns:
+            kind=kinds.get(column)
+            if kind is None and source_columns: raise ValueError(f"Input relation names unknown column {column!r}")
+            if kind is not None and kind not in (1,2): raise ValueError(f"Input relation column {column!r} is not an input")
+            features=[position for position,name in enumerate(feature_names) if name==column or (kind!=1 and name.startswith(f"{column}="))]
+            if not features: raise ValueError(f"Input relation column {column!r} has no encoded feature")
+            for position in features: RELATION_OF_FEATURE[position]=(index,column)
+
+def _relation_summary(tree, opaque=frozenset()):
+    """({relation: columns read}, violation) of a subtree; unrelated inputs are complete one-column relations."""
+    if tree[0]=="x":
+        found=RELATION_OF_FEATURE.get(tree[1])
+        return ({("feature",tree[1]):frozenset()} if found is None else {found[0]:frozenset((found[1],))}),""
+    if tree[0] in ("c","arg"): return {},""
+    # An opaque subtree stands for the staged feature it replaced: a complete one-column relation.
+    if opaque and tree in opaque: return {("opaque",tree):frozenset()},""
+    children=[]
+    for child in tree[1:]:
+        summary,violation=_relation_summary(child,opaque)
+        if violation: return None,violation
+        children.append(summary)
+    merged={}
+    for summary in children:
+        for relation,columns in summary.items(): merged[relation]=merged.get(relation,frozenset())|columns
+    if len(merged)>1:
+        for summary in children:
+            if len(summary)!=1: continue
+            (relation,columns),=summary.items()
+            if relation in RELATION_COLUMNS and not columns>=RELATION_COLUMNS[relation]:
+                return None,f"{tree[0]} mixes part of relation {','.join(INPUT_RELATIONS[relation])} with other inputs"
+    return merged,""
+
+def relation_violation(tree, opaque=frozenset()):
+    if not RELATION_OF_FEATURE or tree[0] in ("x","c","arg"): return ""
+    return _relation_summary(tree,opaque)[1]
+
+def structural_violation(tree, opaque=frozenset()):
+    """The first --forbid-nesting, --units or --input-relations violation of a tree, or ''."""
+    return nesting_violation(tree,opaque=opaque) or unit_violation(tree,opaque) or relation_violation(tree,opaque)
+
+# --custom-op "name = expression": operators the user already knows part of.
+# The expression uses AFPO's own operators only (+ - * / ** %, //, unary -,
+# comparisons and any OPS function such as sin(x) or pow(x, y)), numbers,
+# input column names (`back quotes` for names that are not identifiers), and
+# parameters the search fills in:
+#   v0, v1, ...  required; every v0 gets the same argument, every v1 another;
+#   v#           optional; each occurrence is its own slot, and when the
+#                search leaves it out the operation it took part in goes too
+#                (v#*kpop becomes kpop, bar + v#*kpop becomes bar + kpop);
+#   name         an earlier custom operator: name(a, b) passes arguments,
+#                a bare name brings its parameters along as new ones.
+# "fq = amount / v0" is fq(u) = amount/u; "E = m*c**2" (no parameters) and
+# every variant whose parameters are all left out become derived input
+# features named after the operator.  An operator with parameters becomes a
+# permanent ADF (adf_<name>, shown as name(...)), one per combination of its
+# optional slots; its body's numbers and columns are fixed, the arguments are
+# ordinary subtrees whose constants are fitted.  The export inlines derived
+# features and carries the ADF bodies, so best_model.py reads CSV columns only.
+CUSTOM_OP_SPECS = ()          # the --custom-op strings, as given
+CUSTOM_OPS = {}               # adf name -> {"tree","arity","display","spec"}
+CUSTOM_FEATURES = {}          # derived feature name -> body over the base features
+CUSTOM_FEATURE_BASE = None    # feature count before the derived features
+_BINARY_AST_OPS = {"Add":"+","Sub":"-","Mult":"*","Div":"/","Mod":"mod","FloorDiv":"floordiv","Pow":"pow"}
+_COMPARE_AST_OPS = {"Gt":"gt","Lt":"lt","GtE":"gte","LtE":"lte","Eq":"eq","NotEq":"ne"}
+_POWER_SHORTCUTS = {2.:"square",3.:"cube",.5:"sqrt",-1.:"inv"}
+
+def adf_definition(name, adfs=None):
+    """A model's ADF definition, or the user operator of that name."""
+    return (adfs or {}).get(name) or CUSTOM_OPS.get(name)
+
+def _custom_parse(spec, columns, earlier):
+    """(name, required count, optional count, tree) of one spec; parameters are ("arg", i) / ("opt", k)."""
+    import ast
+    if "=" not in spec: raise ValueError(f"Custom operator needs 'name = expression': {spec!r}")
+    name,body=spec.split("=",1); name=name.strip()
+    if not name.isidentifier() or name.startswith("v") and name[1:].isdigit(): raise ValueError(f"Invalid custom operator name {name!r}")
+    if name in OPS or name in earlier: raise ValueError(f"Custom operator {name!r} clashes with an existing operator")
+    quoted={}
+    def unquote(match):
+        key=f"__col{len(quoted)}"; quoted[key]=match.group(1); return key
+    body=re.sub(r"`([^`]+)`",unquote,body)
+    optional=0
+    def mark(_):
+        nonlocal optional
+        optional+=1; return f"__opt{optional-1}"
+    body=re.sub(r"v#",mark,body)
+    try: parsed=ast.parse(body.strip(),mode="eval").body
+    except SyntaxError as error: raise ValueError(f"Custom operator {name!r}: {error.msg}") from None
+    required=sorted({int(node.id[1:]) for node in ast.walk(parsed) if isinstance(node,ast.Name) and re.fullmatch(r"v\d+",node.id)})
+    slot={number:index for index,number in enumerate(required)}
+    extra=[len(required),optional]       # next free required / optional parameter
+    def bring(definition, arguments=None):
+        """Inline an earlier operator; its own free parameters become this one's."""
+        _,count,options,tree=definition
+        mapping=list(arguments) if arguments is not None else []
+        while len(mapping)<count: mapping.append(("arg",extra[0])); extra[0]+=1
+        renamed={k:extra[1]+k for k in range(options)}; extra[1]+=options
+        def substitute(node):
+            if node[0]=="arg": return mapping[node[1]]
+            if node[0]=="opt": return ("opt",renamed[node[1]])
+            if node[0] in ("x","c"): return node
+            return tuple([node[0]]+[substitute(child) for child in node[1:]])
+        return substitute(tree)
+    def convert(node):
+        if isinstance(node,ast.Constant) and isinstance(node.value,(int,float)) and not isinstance(node.value,bool): return ("c",float(node.value))
+        if isinstance(node,ast.Name):
+            ident=node.id
+            if ident.startswith("__opt"): return ("opt",int(ident[5:]))
+            if re.fullmatch(r"v\d+",ident): return ("arg",slot[int(ident[1:])])
+            column=quoted.get(ident,ident)
+            if column in columns: return ("x",columns[column])
+            if ident in earlier: return bring(earlier[ident])
+            raise ValueError(f"Custom operator {name!r}: unknown name {column!r} (not a numeric input column, parameter or earlier operator)")
+        if isinstance(node,ast.UnaryOp):
+            inner=convert(node.operand)
+            if isinstance(node.op,ast.USub): return ("c",-inner[1]) if inner[0]=="c" else ("neg",inner)
+            if isinstance(node.op,ast.UAdd): return inner
+        if isinstance(node,ast.BinOp) and type(node.op).__name__ in _BINARY_AST_OPS:
+            left,right=convert(node.left),convert(node.right); op=_BINARY_AST_OPS[type(node.op).__name__]
+            if op=="pow" and right[0]=="c" and right[1] in _POWER_SHORTCUTS: return (_POWER_SHORTCUTS[right[1]],left)
+            return (op,left,right)
+        if isinstance(node,ast.Compare) and len(node.ops)==1 and type(node.ops[0]).__name__ in _COMPARE_AST_OPS:
+            return (_COMPARE_AST_OPS[type(node.ops[0]).__name__],convert(node.left),convert(node.comparators[0]))
+        if isinstance(node,ast.Call) and isinstance(node.func,ast.Name) and not node.keywords:
+            function=node.func.id; arguments=[convert(argument) for argument in node.args]
+            if function in earlier:
+                if len(arguments)!=earlier[function][1]: raise ValueError(f"Custom operator {name!r}: {function} takes {earlier[function][1]} argument(s)")
+                return bring(earlier[function],arguments)
+            if function not in OPS: raise ValueError(f"Custom operator {name!r}: unknown function {function!r}")
+            if OPS[function][0]!=len(arguments): raise ValueError(f"Custom operator {name!r}: {function} takes {OPS[function][0]} argument(s)")
+            return tuple([function]+arguments)
+        raise ValueError(f"Custom operator {name!r}: unsupported expression {ast.unparse(node)!r}")
+    tree=convert(parsed)
+    return name,extra[0],extra[1],tree
+
+def _prune_optional(tree, present):
+    """Drop the absent optional slots and the operations they took part in (None if nothing is left)."""
+    if tree[0]=="opt": return ("opt",tree[1]) if tree[1] in present else None
+    if tree[0] in ("x","c","arg"): return tree
+    children=[_prune_optional(child,present) for child in tree[1:]]
+    kept=[child for child in children if child is not None]
+    if len(kept)==len(children): return tuple([tree[0]]+children)
+    if not kept: return None
+    if len(kept)==1: return kept[0]
+    raise ValueError(f"An optional parameter inside {tree[0]}(...) with more than two operands has no clear meaning when left out")
+
+def configure_custom_ops(specs, feature_names, source_columns=(), types=()):
+    """Parse --custom-op specs over the base features; returns the derived feature (name, body) pairs.
+
+    Sets CUSTOM_OPS (operators with parameters) and CUSTOM_FEATURES."""
+    global CUSTOM_OP_SPECS,CUSTOM_OPS,CUSTOM_FEATURES,CUSTOM_FEATURE_BASE
+    specs=tuple(str(spec).strip() for item in ([specs] if isinstance(specs,str) else list(specs or ())) for spec in str(item).split(";") if str(spec).strip())
+    CUSTOM_OP_SPECS=specs; CUSTOM_OPS={}; CUSTOM_FEATURES={}; CUSTOM_FEATURE_BASE=len(feature_names) if specs else None
+    if not specs: return []
+    kinds=dict(zip(source_columns,types))
+    columns={name:index for index,name in enumerate(feature_names) if kinds.get(name,1)==1 and "=" not in name}
+    earlier={}; derived=[]
+    for spec in specs:
+        name,required,optional,tree=_custom_parse(spec,columns,earlier)
+        if optional>4: raise ValueError(f"Custom operator {name!r}: at most four optional (v#) slots")
+        earlier[name]=(name,required,optional,tree)
+        for mask in range(2**optional):
+            present=[k for k in range(optional) if mask>>k&1]
+            body=_prune_optional(tree,set(present))
+            if body is None: raise ValueError(f"Custom operator {name!r} is empty without its optional parameters")
+            position={k:required+i for i,k in enumerate(present)}
+            def place(node):
+                if node[0]=="opt": return ("arg",position[node[1]])
+                if node[0] in ("x","c","arg"): return node
+                return tuple([node[0]]+[place(child) for child in node[1:]])
+            body=place(body); arity=required+len(present)
+            full=mask==2**optional-1
+            if arity==0:
+                label=name if full else f"{name}()"
+                if label in feature_names or label in CUSTOM_FEATURES: raise ValueError(f"Custom operator {name!r} clashes with column {label!r}")
+                CUSTOM_FEATURES[label]=body; derived.append((label,body))
+            else:
+                internal=f"adf_{name}" if full else f"adf_{name}__{''.join('1' if mask>>k&1 else '0' for k in range(optional))}"
+                CUSTOM_OPS[internal]={"tree":body,"arity":arity,"display":name,"spec":spec}
+    return derived
+
+def custom_feature_columns(X, derived):
+    """X with the derived custom features appended."""
+    if not derived: return X
+    X=np.asarray(X,float)
+    return np.column_stack([X]+[clean(evaluate(body,X)) for _,body in derived])
+
+def append_custom_features(X):
+    """Base-encoded X (as encode() returns it) with this run's derived custom features appended."""
+    X=np.asarray(X,float)
+    if not CUSTOM_FEATURES or CUSTOM_FEATURE_BASE is None or X.ndim!=2 or X.shape[1]!=CUSTOM_FEATURE_BASE: return X
+    return custom_feature_columns(X,list(CUSTOM_FEATURES.items()))
+
+def inline_custom_features(model, feature_names):
+    """A copy whose derived-feature leaves are replaced by their bodies (for export)."""
+    if not CUSTOM_FEATURES: return model
+    bodies={index:CUSTOM_FEATURES[name] for index,name in enumerate(feature_names) if name in CUSTOM_FEATURES}
+    def substitute(tree):
+        if tree[0]=="x": return bodies.get(tree[1],tree)
+        if tree[0] in ("c","arg"): return tree
+        return tuple([tree[0]]+[substitute(child) for child in tree[1:]])
+    result=model.clone(); result.trees=[substitute(tree) for tree in model.trees]
+    result.adfs={**{name:{"tree":item["tree"],"arity":item["arity"]} for name,item in CUSTOM_OPS.items()},**model.adfs}
+    return result
+
+def register_custom_ops(registry):
+    """Give an ADF registry the permanent user operators."""
+    for name,item in CUSTOM_OPS.items():
+        if name not in registry.definitions:
+            registry.definitions[name]={"tree":item["tree"],"arity":item["arity"],"dependencies":[],"supporting_founders":[],"activated_generation":None,
+                                        "retired_generation":None,"elite_uses":0,"validation":[]}
+
+# Editable equations (GUI): a tree as text in the --custom-op syntax and back.
+# Infix for + - * / ** % // and comparisons, function calls for every other
+# operator, `back quotes` for feature names that are not identifiers, user
+# operators by their own name and mined ADFs by theirs, and constants written
+# exactly (repr), so text -> tree -> text loses nothing.
+_INFIX_TEXT = {"+":"+","-":"-","*":"*","/":"/","pow":"**","mod":"%","floordiv":"//","gt":">","lt":"<","gte":">=","lte":"<=","eq":"==","ne":"!="}
+_TEXT_RESERVED = set(OPS)|{"True","False","None","and","or","not","if","else","lambda","in","is"}
+
+def _text_name(name):
+    return name if name.isidentifier() and name not in _TEXT_RESERVED and not re.fullmatch(r"v\d+",name) else f"`{name}`"
+
+def tree_text(tree, feature_names):
+    """A tree in the editable equation syntax (see parse_equation)."""
+    if tree[0]=="x": return _text_name(feature_names[tree[1]])
+    if tree[0]=="c": return repr(float(tree[1]))
+    if tree[0]=="arg": raise ValueError("ADF arguments only appear inside definitions")
+    args=[tree_text(child,feature_names) for child in tree[1:]]
+    if tree[0] in _INFIX_TEXT and len(args)==2: return f"({args[0]} {_INFIX_TEXT[tree[0]]} {args[1]})"
+    if tree[0]=="neg": return f"(-{args[0]})"
+    name=CUSTOM_OPS[tree[0]]["display"] if tree[0] in CUSTOM_OPS else tree[0]
+    return f"{name}({', '.join(args)})"
+
+def readout_text(tree, scale, feature_names):
+    """One head with its affine readout, as the user edits it."""
+    a,b=scale; body=tree_text(tree,feature_names)
+    if a==1. and b==0.: return body
+    return f"{repr(float(a))} * {body}"+("" if b==0. else f" + {repr(float(b))}")
+
+def parse_equation(text, feature_names, adfs=None):
+    """Parse an edited equation into a tree over the model's features."""
+    import ast
+    quoted={}
+    def unquote(match):
+        key=f"__q{len(quoted)}"; quoted[key]=match.group(1); return key
+    source=re.sub(r"`([^`]+)`",unquote,str(text).strip())
+    if not source: raise ValueError("The equation is empty")
+    try: parsed=ast.parse(source,mode="eval").body
+    except SyntaxError as error: raise ValueError(f"Cannot parse the equation: {error.msg}") from None
+    features={name:index for index,name in enumerate(feature_names)}
+    adfs=adfs or {}
+    by_display={}
+    for internal,item in CUSTOM_OPS.items(): by_display.setdefault(item["display"],{})[int(item["arity"])]=internal
+    def convert(node):
+        if isinstance(node,ast.Constant) and isinstance(node.value,(int,float)) and not isinstance(node.value,bool): return ("c",float(node.value))
+        if isinstance(node,ast.Name):
+            name=quoted.get(node.id,node.id)
+            if name in features: return ("x",features[name])
+            raise ValueError(f"Unknown input {name!r} (names that are not identifiers go in `back quotes`)")
+        if isinstance(node,ast.UnaryOp):
+            inner=convert(node.operand)
+            if isinstance(node.op,ast.USub): return ("c",-inner[1]) if inner[0]=="c" else ("neg",inner)
+            if isinstance(node.op,ast.UAdd): return inner
+        if isinstance(node,ast.BinOp) and type(node.op).__name__ in _BINARY_AST_OPS:
+            return (_BINARY_AST_OPS[type(node.op).__name__],convert(node.left),convert(node.right))
+        if isinstance(node,ast.Compare) and len(node.ops)==1 and type(node.ops[0]).__name__ in _COMPARE_AST_OPS:
+            return (_COMPARE_AST_OPS[type(node.ops[0]).__name__],convert(node.left),convert(node.comparators[0]))
+        if isinstance(node,ast.Call) and isinstance(node.func,ast.Name) and not node.keywords:
+            name=node.func.id; arguments=[convert(argument) for argument in node.args]
+            if name in by_display:
+                internal=by_display[name].get(len(arguments))
+                if internal is None: raise ValueError(f"{name} takes {' or '.join(map(str,sorted(by_display[name])))} argument(s)")
+                return tuple([internal]+arguments)
+            if name in adfs:
+                if len(arguments)!=int(adfs[name]["arity"]): raise ValueError(f"{name} takes {adfs[name]['arity']} argument(s)")
+                return tuple([name]+arguments)
+            if name in OPS:
+                if OPS[name][0]!=len(arguments): raise ValueError(f"{name} takes {OPS[name][0]} argument(s)")
+                return tuple([name]+arguments)
+            raise ValueError(f"Unknown function {name!r}")
+        raise ValueError(f"Unsupported expression {ast.unparse(node)!r}")
+    return convert(parsed)
 
 def admissible_random_tree(n_features, ops, max_nodes, max_depth, attempts=25, **kwargs):
-    """A random tree that passes --forbid-nesting and --units, when one turns up within a few draws."""
+    """A random tree that passes --forbid-nesting, --units and --input-relations, when one turns up within a few draws."""
     tree=random_tree(n_features,ops,max_nodes,max_depth,**kwargs)
     for _ in range(attempts):
-        if not (nesting_violation(tree) or unit_violation(tree)): break
+        if not structural_violation(tree): break
         tree=random_tree(n_features,ops,max_nodes,max_depth,**kwargs)
     return tree
 
@@ -3139,6 +3514,7 @@ def semantic_mutate(tree, X, portfolio, n_features, ops, max_nodes, max_depth, p
     except ValueError: return tree,None,False
     for _ in range(6):
         child,kind=portfolio.apply(tree,n_features,ops,max_nodes,max_depth,proposal,adfs)
+        if RELATION_OF_FEATURE and relation_violation(child): continue
         try: delta=semantic_distance(baseline,evaluate_cached(child,X,adfs))
         except ValueError: continue
         if min_delta < delta <= max_delta: return child,kind,False
@@ -3148,6 +3524,7 @@ def semantic_mutate(tree, X, portfolio, n_features, ops, max_nodes, max_depth, p
     if library is not None and rng.random()<library.macro_rate:
         for _ in range(3):
             child,kind=portfolio.apply(tree,n_features,ops,max_nodes,max_depth,proposal,adfs)
+            if RELATION_OF_FEATURE and relation_violation(child): continue
             try: delta=semantic_distance(baseline,evaluate_cached(child,X,adfs))
             except ValueError: continue
             if delta>max_delta and np.isfinite(delta):
@@ -3184,6 +3561,7 @@ def crossover(left, right, max_nodes, max_depth):
         donor=subtree_at(right,right_path)
         if node_type(subtree_at(left,left_path)) != node_type(donor): continue
         child=simplify_tree(replace_subtree(left,left_path,donor))
+        if RELATION_OF_FEATURE and relation_violation(child): continue
         if node_size(child)<=max_nodes and node_depth(child)<=max_depth and child!=left: return child
     return left
 
@@ -3207,7 +3585,8 @@ def expr(t, names, argument_names=None):
     args=[expr(q,names,argument_names) for q in t[1:]]
     if t[0] in {"+", "-", "*", "/", "pow", "max", "min"}:
         return f"({args[0]} {t[0]} {args[1]})"
-    return f"{t[0]}({', '.join(args)})"
+    name=CUSTOM_OPS[t[0]]["display"] if t[0] in CUSTOM_OPS else t[0]
+    return f"{name}({', '.join(args)})"
 
 def referenced_adf_names(model):
     """Return direct/transitive ADFs in definition-before-use order."""
@@ -3218,7 +3597,7 @@ def referenced_adf_names(model):
             name=tree[0]
             if name in visiting: raise ValueError(f"Cyclic ADF definition {name!r}")
             if name not in visited:
-                item=model.adfs.get(name)
+                item=adf_definition(name,model.adfs)
                 if item is None: raise ValueError(f"Missing ADF definition {name!r}")
                 visiting.add(name); visit(item["tree"]); visiting.remove(name)
                 visited.add(name); ordered.append(name)
@@ -3230,6 +3609,7 @@ def adf_display_definitions(model, feature_names):
     """Readable definitions for the ADFs actually used by one model."""
     result=[]
     for name in referenced_adf_names(model):
+        if name in CUSTOM_OPS: continue          # shown by its --custom-op spec instead
         item=model.adfs[name]; arity=int(item["arity"]); arguments=[f"u{index}" for index in range(arity)]
         dependencies=[]
         def collect(tree):
@@ -3263,16 +3643,54 @@ def binary_probabilities(scores):
     positive=1./(1.+np.exp(-np.clip(np.asarray(scores,float)-.5,-50,50)))
     return np.column_stack((1.-positive,positive))
 
+# --class-balance (default on): every class of a categorical output carries the
+# same total weight in its log loss, its error rate (the shape objective
+# becomes the balanced error rate), the classifier readout fit, classifier
+# constant tuning, the Bayesian likelihood and lexicase case order.
+# Unweighted, a 95/5 target is 95% "accurate" with a constant head, and every
+# one of those signals preferred dropping the rare class to fitting it.  The
+# weights come from the rows being scored, so validation is balanced too.
+CLASS_BALANCE = True
+def class_balance_weights(truth, class_count):
+    """Row weights giving every present class the same total weight, with mean 1
+    over the valid rows; rows with an unknown label (-1) keep weight 1."""
+    truth=np.asarray(np.rint(truth),int); weights=np.ones(len(truth))
+    if not CLASS_BALANCE: return weights
+    valid=(truth>=0)&(truth<class_count)
+    if not np.any(valid): return weights
+    counts=np.bincount(truth[valid],minlength=class_count).astype(float)
+    weights[valid]=np.count_nonzero(valid)/(np.count_nonzero(counts)*counts[truth[valid]])
+    return weights
+_BALANCED_ROWS={}
+def class_balanced_rows(X, truth, class_count, maximum):
+    """Deterministic training rows with every present class equally represented:
+    a large class keeps its maximin input-coverage probe, a small one repeats its
+    rows (duplication is how an unweighted least-squares fit sees a class weight)."""
+    truth=np.asarray(np.rint(truth),int)
+    key=(int(maximum),int(class_count),array_digest(np.asarray(X)),rows_digest(truth))
+    cached=_BALANCED_ROWS.get(key)
+    if cached is not None: return cached
+    groups=[np.flatnonzero(truth==label) for label in range(class_count)]
+    groups=[group for group in groups if len(group)]
+    if not groups: return stratified_probe_indices(X,maximum) if len(X)>maximum else slice(None)
+    quota=max(1,min(max(len(group) for group in groups),int(maximum)//len(groups)))
+    parts=[group[stratified_probe_indices(X[group],quota)] if len(group)>quota else np.resize(group,quota) for group in groups]
+    rows=np.sort(np.concatenate(parts))
+    if len(_BALANCED_ROWS)>=64: _BALANCED_ROWS.clear()
+    _BALANCED_ROWS[key]=rows
+    return rows
+
 CLASSIFIER_RIDGE=1e-3
 def fit_classifier_affine(raw, truth, class_count):
     """Fit per-head (scale, offset) minimizing ridge-penalized log loss by damped Newton.
 
     raw has one column per head; binary targets use one head whose log-odds are
-    score-0.5, so the returned offset already includes that +0.5 shift."""
+    score-0.5, so the returned offset already includes that +0.5 shift.  Rows
+    carry class_balance_weights, so the offsets do not encode the class prior."""
     raw=np.asarray(raw,float); n,heads=raw.shape
     truth=np.asarray(np.rint(truth),int); valid=(truth>=0)&(truth<class_count)
     if not np.any(valid): return [(1.,0.)]*heads
-    raw=raw[valid]; truth=truth[valid]; n=len(truth)
+    raw=raw[valid]; truth=truth[valid]; n=len(truth); row_weights=class_balance_weights(truth,class_count)
     centre=raw.mean(axis=0); spread=raw.std(axis=0); live=spread>=EPS*np.maximum(1.,np.abs(centre))
     spread=np.where(live,spread,1.)
     u=(raw-centre)/spread
@@ -3286,14 +3704,15 @@ def fit_classifier_affine(raw, truth, class_count):
         logits=np.einsum("nkd,kd->nk",features,t.reshape(class_count,2))
         logits-=logits.max(axis=1,keepdims=True)
         log_probabilities=logits-np.log(np.exp(logits).sum(axis=1,keepdims=True))
-        return float(-np.mean(log_probabilities[np.arange(n),truth])+.5*CLASSIFIER_RIDGE*t@t),np.exp(log_probabilities)
+        return float(-np.mean(row_weights*log_probabilities[np.arange(n),truth])+.5*CLASSIFIER_RIDGE*t@t),np.exp(log_probabilities)
     value,probabilities=objective(theta)
     for _ in range(30):
-        weighted=(probabilities-one_hot)[:,:,None]*features
+        weighted=((probabilities-one_hot)*row_weights[:,None])[:,:,None]*features
         gradient=weighted.reshape(n,-1).mean(axis=0)+CLASSIFIER_RIDGE*theta
-        # Softmax Hessian block (k,l) = sum_n (p_k[k=l] - p_k p_l) f_k f_l^T.
-        weighted_features=(probabilities[:,:,None]*features).reshape(n,-1)
-        hessian=(same_class*((flat*np.repeat(probabilities,2,axis=1)).T@flat)-weighted_features.T@weighted_features)/n+ridge
+        # Softmax Hessian block (k,l) = sum_n w_n (p_k[k=l] - p_k p_l) f_k f_l^T.
+        # g.T@g on one buffer (numpy's symmetric product), so unit weights reproduce the unweighted fit bit for bit.
+        weighted_features=(probabilities[:,:,None]*features).reshape(n,-1)*np.sqrt(row_weights)[:,None]
+        hessian=(same_class*((flat*np.repeat(probabilities*row_weights[:,None],2,axis=1)).T@flat)-weighted_features.T@weighted_features)/n+ridge
         try: step=np.linalg.solve(hessian,gradient)
         except np.linalg.LinAlgError: step=gradient
         rate=1.
@@ -3584,6 +4003,10 @@ class Model:
     adfs:dict=field(default_factory=dict)
     founder_ids:tuple=field(default_factory=tuple)
     birth_generation:int|None=None
+    # Subtrees the structural rules treat as leaves: in a merged separate-output
+    # model, each inlined earlier-stage equation, which was validated in its own
+    # search and stands for the staged feature its reader was validated with.
+    opaque:tuple=field(default_factory=tuple,compare=False)
     # Main-line history (see HISTORY_LIMIT): observational only, never read
     # by the search.  Records are never mutated in place, so clones share them.
     history:tuple=field(default_factory=tuple,compare=False)
@@ -3591,7 +4014,7 @@ class Model:
         if not self.founder_ids: self.founder_ids=(self.lineage_id,)
         else: self.founder_ids=tuple(sorted(set(self.founder_ids)))
         if not isinstance(self.history,tuple): self.history=tuple(self.history or ())
-    def clone(self): return Model(trees=list(self.trees),scales=list(self.scales),age=self.age,objectives=tuple(self.objectives),lineage_id=self.lineage_id,origin=self.origin,parent_ids=tuple(self.parent_ids),feasible=self.feasible,invalid_reason=self.invalid_reason,constraint_count=self.constraint_count,mdl_operators=tuple(self.mdl_operators),mdl_feature_count=self.mdl_feature_count,adfs=dict(self.adfs),founder_ids=tuple(self.founder_ids),birth_generation=self.birth_generation,history=self.history)
+    def clone(self): return Model(trees=list(self.trees),scales=list(self.scales),age=self.age,objectives=tuple(self.objectives),lineage_id=self.lineage_id,origin=self.origin,parent_ids=tuple(self.parent_ids),feasible=self.feasible,invalid_reason=self.invalid_reason,constraint_count=self.constraint_count,mdl_operators=tuple(self.mdl_operators),mdl_feature_count=self.mdl_feature_count,adfs=dict(self.adfs),founder_ids=tuple(self.founder_ids),birth_generation=self.birth_generation,history=self.history,opaque=self.opaque)
 
 # Main-line model history.  Every model carries a short timeline of its main
 # line of descent: where it was born (generation, island, stage, role, how),
@@ -4401,12 +4824,18 @@ class StructuralQualityDiversityArchive(QualityDiversityArchive):
 RESIDUAL_ARCHIVE = True       # --residual-archive
 RESIDUAL_TARGET_BINS = 3      # low / middle / high target values, per numeric output
 RESIDUAL_REGION_BINS = 4      # quartiles of the probe inputs' first principal component
-def residual_regions(probe_X, probe_Y, cats):
+def residual_regions(probe_X, probe_Y, cats, class_groups=True):
     """Fixed row groups for residual signatures: target-magnitude bins per
-    numeric output and input-region bins, each a list of row-index arrays."""
+    numeric output, one group per class of a categorical output (class_groups;
+    a model that only misses class A and one that only misses class B are
+    complementary), and input-region bins, each a list of row-index arrays."""
     X=np.asarray(probe_X,float); groups=[]
     for j,labels in enumerate(cats):
-        if labels is not None: continue
+        if labels is not None:
+            if class_groups and len(labels)>=2:
+                truth=np.rint(np.asarray(probe_Y[:,j],float))
+                groups.append([np.flatnonzero(truth==label) for label in range(len(labels))])
+            continue
         y=np.asarray(probe_Y[:,j],float)
         edges=np.quantile(y,np.linspace(0,1,RESIDUAL_TARGET_BINS+1)[1:-1]) if len(y) else []
         bins=np.searchsorted(edges,y,side="left")
@@ -4430,10 +4859,10 @@ class ResidualQualityDiversityArchive(QualityDiversityArchive):
     so it describes the error's location, not its size; each cell still keeps
     its lowest-loss model."""
     policy="residual_signature_cvt"
-    def __init__(self, probe, probe_targets, cats, seed, capacity=64, landmarks=None):
+    def __init__(self, probe, probe_targets, cats, seed, capacity=64, landmarks=None, class_groups=True):
         super().__init__(probe,cats,seed,capacity,landmarks)
-        self.probe_targets=np.asarray(probe_targets,float)
-        self.groups=residual_regions(self.probe,self.probe_targets,self.cats)
+        self.probe_targets=np.asarray(probe_targets,float); self.class_groups=bool(class_groups)
+        self.groups=residual_regions(self.probe,self.probe_targets,self.cats,self.class_groups)
 
     def descriptor(self, model):
         prediction=np.asarray(predict_targets(model,self.probe,self.cats),float)
@@ -4449,11 +4878,12 @@ class ResidualQualityDiversityArchive(QualityDiversityArchive):
         return np.concatenate(parts) if parts else np.zeros(1)
 
     def snapshot(self):
-        data=super().snapshot(); data["probe_targets"]=self.probe_targets; return data
+        data=super().snapshot(); data["probe_targets"]=self.probe_targets; data["class_groups"]=self.class_groups; return data
 
     @classmethod
     def from_snapshot(cls, data):
-        result=cls(data["probe"],data["probe_targets"],data["cats"],data["seed"],data["capacity"],data.get("landmarks"))
+        # Archives saved before class groups keep their descriptor length (and landmarks).
+        result=cls(data["probe"],data["probe_targets"],data["cats"],data["seed"],data["capacity"],data.get("landmarks"),data.get("class_groups",False))
         result.cells={int(key):Model(**model) for key,model in data.get("cells",{}).items()}
         result.updates=int(data.get("updates",0)); result.replacements=int(data.get("replacements",0)); result.last_loss_threshold=data.get("last_loss_threshold")
         result.cell_trials={int(key):float(value) for key,value in data.get("cell_trials",{}).items()}
@@ -4615,9 +5045,13 @@ def lexicase_parents(pop, count, X, Y, cats, max_cases=0, case_weights=None, sca
         # Informed down-sampling prioritizes cases where the population still
         # disagrees most, preserving selection pressure under large datasets.
         cases=np.argsort(np.median(errors,axis=0))[-max_cases:].tolist()
-    weights=None
-    if case_weights is not None:
-        weights=np.maximum(np.tile(np.asarray(case_weights,float),Y.shape[1])[cases],EPS)
+    per_case=None if case_weights is None else np.tile(np.asarray(case_weights,float),Y.shape[1])
+    if CLASS_BALANCE and any(labels is not None for labels in cats):
+        # A rare class's rows are few cases, so uniform order almost never
+        # examines them first; equal class weight puts them first as often.
+        balance=np.concatenate([np.ones(len(Y)) if labels is None else class_balance_weights(Y[:,j],len(labels)) for j,labels in enumerate(cats)])
+        if not np.all(balance==1.): per_case=balance if per_case is None else per_case*balance
+    weights=None if per_case is None else np.maximum(per_case[cases],EPS)
     selected=[]
     for _ in range(count):
         pool=np.arange(len(pop))
@@ -4729,11 +5163,30 @@ def describe_row_sample(frame):
     sample=frame.attrs.get("afpo_row_sample")
     return f"; sampled {len(frame):,} of {sample['source_rows']:,} rows (--max-rows, seed {sample['seed']})" if sample else ""
 
-def holdout_split_indices(n_rows, validation_rows, seed):
-    """Deterministic disjoint train/validation split used by every run."""
+def holdout_split_indices(n_rows, validation_rows, seed, strata=None):
+    """Deterministic disjoint train/validation split used by every run.
+
+    strata (one label per row, e.g. the class of a categorical output) gives
+    each stratum its proportional share of the validation rows, and always
+    leaves it at least one training row: a plain random split can put every
+    row of a rare class in validation, where its label was never seen."""
     if not 0 < validation_rows < n_rows: raise ValueError("Validation rows must be between 1 and n_rows - 1")
     indices=np.random.default_rng(seed).permutation(n_rows)
-    return indices[:-validation_rows],indices[-validation_rows:]
+    if strata is None: return indices[:-validation_rows],indices[-validation_rows:]
+    _,codes=np.unique(np.asarray(strata,dtype=str),return_inverse=True)
+    counts=np.bincount(codes); share=validation_rows*counts/n_rows; room=counts-1
+    quota=np.minimum(np.floor(share).astype(int),room)
+    # Largest remainder first, then any stratum with room left.
+    for stratum in [*np.argsort(-(share-quota),kind="stable"),*np.argsort(-room,kind="stable")]:
+        if quota.sum()>=validation_rows: break
+        if quota[stratum]<room[stratum]: quota[stratum]+=1
+    if quota.sum()<validation_rows: return indices[:-validation_rows],indices[-validation_rows:]
+    # The last members of each stratum in permutation order become validation.
+    ordered=codes[indices]; rank=np.empty(n_rows,dtype=int)
+    for stratum in range(len(counts)):
+        members=np.flatnonzero(ordered==stratum); rank[members]=np.arange(len(members))[::-1]
+    holdout=rank<quota[ordered]
+    return indices[~holdout],indices[holdout]
 
 def kfold_split_indices(n_rows, folds, seed):
     """Deterministic disjoint K-fold partitions for external CV orchestration."""
@@ -5148,7 +5601,7 @@ def assess(m, X, Y, affine_on, cats, fit_affine=True, constraints=None, output_n
         if t[0]=="x": return "" if isinstance(t[1],int) and t[1]>=0 else "invalid_feature"
         if t[0]=="c": return "" if np.isfinite(t[1]) else "nonfinite_constant"
         if t[0]=="arg": return "invalid_adf_argument"
-        arity=(adfs or m.adfs).get(t[0],{}).get("arity") if t[0].startswith("adf_") else OPS.get(t[0],(-1,))[0]
+        arity=(adf_definition(t[0],adfs or m.adfs) or {}).get("arity") if t[0].startswith("adf_") else OPS.get(t[0],(-1,))[0]
         if arity is None: return f"unknown_operator:{t[0]}"
         if len(t)-1 != arity: return f"arity:{t[0]}"
         position=GUARDED_DIVISOR_OPS.get(t[0])
@@ -5157,9 +5610,11 @@ def assess(m, X, Y, affine_on, cats, fit_affine=True, constraints=None, output_n
             child_reason=valid(child)
             if child_reason: return child_reason
         return ""
-    reason=""
+    reason=""; opaque=frozenset(m.opaque)
     for tree in m.trees:
-        reason=valid(tree) or (f"nesting:{nesting_violation(tree)}" if NESTING_RULES and nesting_violation(tree) else "") or (f"units:{unit_violation(tree)}" if UNIT_FEATURES and unit_violation(tree) else "")
+        violation=structural_violation(tree,opaque) if NESTING_RULES or UNIT_FEATURES or RELATION_OF_FEATURE else ""
+        kind="nesting" if NESTING_RULES and nesting_violation(tree,opaque=opaque) else "units" if UNIT_FEATURES and unit_violation(tree,opaque) else "relations"
+        reason=valid(tree) or (f"{kind}:{violation}" if violation else "")
         if reason: break
     if reason:
         m.feasible=False; m.invalid_reason=reason; INVALID_DIAGNOSTICS[reason]=INVALID_DIAGNOSTICS.get(reason,0)+1
@@ -5216,14 +5671,16 @@ def assess(m, X, Y, affine_on, cats, fit_affine=True, constraints=None, output_n
             scores=np.column_stack([clean(scales[head][0]*raw[:,head]+scales[head][1]) for head in heads]); probabilities=stable_softmax(scores)
             truth=np.asarray(np.rint(Y[:,j]),dtype=int); valid=(truth>=0)&(truth<len(cats[j])); row=np.arange(len(truth))
             cross_entropy=np.where(valid,-np.log(np.maximum(probabilities[row,np.clip(truth,0,len(cats[j])-1)],EPS)),-np.log(EPS))
-            labels=np.argmax(probabilities,axis=1); losses.append(float(np.mean(cross_entropy))); shapes.append(float(np.mean(labels!=truth))); decoded.append(labels)
+            balance=class_balance_weights(truth,len(cats[j]))
+            labels=np.argmax(probabilities,axis=1); losses.append(float(np.average(cross_entropy,weights=balance))); shapes.append(float(np.average(labels!=truth,weights=balance))); decoded.append(labels)
         else:
-            labels=binary_labels(p,len(cats[j])); error_rate=float(np.mean(labels!=Y[:,j]))
+            balance=class_balance_weights(Y[:,j],len(cats[j]))
+            labels=binary_labels(p,len(cats[j])); error_rate=float(np.average(labels!=Y[:,j],weights=balance))
             if len(cats[j])==2:
                 # Log loss rewards moving the decision score toward the right side of 0.5, which a 0/1 error cannot.
                 truth=np.asarray(np.rint(Y[:,j]),dtype=int); positive=binary_probabilities(p)[:,1]
                 chosen=np.where(truth==1,positive,np.where(truth==0,1.-positive,0.))
-                losses.append(float(np.mean(-np.log(np.maximum(chosen,EPS)))))
+                losses.append(float(np.average(-np.log(np.maximum(chosen,EPS)),weights=balance)))
             else: losses.append(error_rate)
             shapes.append(error_rate)
             decoded.append(labels)
@@ -5382,6 +5839,19 @@ def frozen_metrics(m, X, Y, cats, constraints=None, output_names=()):
     quality=objectives[:2*Y.shape[1]]
     return {"loss":aggregate_loss(quality+(0.,0.)),"shape":float(np.mean(quality[1::2])),
             "losses":tuple(quality[::2]),"shapes":tuple(quality[1::2])}
+
+def classification_summary(m, X, Y, cats, output_names):
+    """'name: accuracy=..., balanced accuracy=...' for each categorical output, or ''."""
+    if cats is None or all(labels is None for labels in cats): return ""
+    try: prediction=predict_targets(m,X,cats)
+    except (ArithmeticError, IndexError, RecursionError, ValueError): return ""
+    parts=[]
+    for j,labels in enumerate(cats):
+        if labels is None: continue
+        truth=np.asarray(np.rint(Y[:,j]),int); hits=np.asarray(np.rint(prediction[:,j]),int)==truth
+        recalls=[float(np.mean(hits[truth==label])) for label in np.unique(truth)]
+        parts.append(f"{output_names[j]}: accuracy={np.mean(hits):.1%}, balanced accuracy={np.mean(recalls):.1%}")
+    return "; ".join(parts)
 
 def _selection_metrics(model, objectives, cats):
     """Extract final-selection metrics without treating age as model quality."""
@@ -5674,10 +6144,13 @@ def snap_final_candidates(models, Xt, Yt, Xv, Yv, affine_on, cats, constraints=N
 
 def used_feature_indices(model):
     """Return encoded feature indices referenced by any output tree."""
-    used=set()
+    used=set(); seen=set()
     def visit(tree):
         if tree[0]=="x": used.add(int(tree[1])); return
-        if tree[0]=="c": return
+        if tree[0] in ("c","arg"): return
+        if tree[0].startswith("adf_") and tree[0] not in seen:
+            seen.add(tree[0]); item=adf_definition(tree[0],model.adfs)
+            if item is not None: visit(item["tree"])
         for child in tree[1:]: visit(child)
     for tree in model.trees: visit(tree)
     return tuple(sorted(used))
@@ -6051,7 +6524,8 @@ def export_model(m, feature_names, output_names, cats, maps, source_columns, typ
         offset+=width
     if any(index<0 or index>=len(feature_names) for index in used_indices): raise ValueError("Model references an unavailable feature")
     ranges=training_input_ranges(fixture_df,source_columns,types) if input_ranges is None and fixture_df is not None else (input_ranges or {})
-    payload=repr({"trees":m.trees,"scales":m.scales,"adfs":m.adfs,"features":feature_names,"outputs":output_names,"cats":cats,"maps":maps,"source_columns":source_columns,"types":types,"input_ranges":ranges,
+    adfs={**{name:{"tree":item["tree"],"arity":item["arity"]} for name,item in CUSTOM_OPS.items() if name in referenced_adf_names(m)},**m.adfs}
+    payload=repr({"trees":m.trees,"scales":m.scales,"adfs":adfs,"features":feature_names,"outputs":output_names,"cats":cats,"maps":maps,"source_columns":source_columns,"types":types,"input_ranges":ranges,
                   "contract":{"version":3,"input_columns":input_columns,"feature_indices":sorted(used_indices),"feature_count":len(feature_names),"fixture":"best_model_fixture.csv","expected":"best_model_fixture_predictions.csv"}})
     # Keep exports genuinely standalone: embed exactly the guarded evaluator
     # used during search, rather than importing this training script.
@@ -6065,7 +6539,7 @@ import numpy as np
 import pandas as pd
 MODEL = {payload}
 CONTRACT = MODEL['contract']
-EPS=1e-12; CLIP=1e12
+EPS={EPS!r}; CLIP={CLIP!r}
 def clean(x): return np.clip(np.nan_to_num(x,nan=0.,posinf=CLIP,neginf=-CLIP),-CLIP,CLIP)
 {operator_source}
 {sequence_source}
@@ -6182,10 +6656,12 @@ def evaluate_csv(path, tolerances):
         actual=frame[output]
         if MODEL['cats'][index] is not None:
             if actual.isna().any(): raise ValueError('Ground truth has missing values for '+output)
-            matches=predicted[output].astype(str).to_numpy()==actual.astype(str).to_numpy()
+            labels=actual.astype(str).to_numpy(); matches=predicted[output].astype(str).to_numpy()==labels
             accuracy=100.*float(matches.mean())
-            report[output]={{'type':'categorical','rows':len(frame),'accuracy':accuracy}}
-            print(f'{{output}}: categorical accuracy={{accuracy:.6g}}% ({{int(matches.sum())}}/{{len(frame)}} exact matches)')
+            # Mean per-class recall: a model that never predicts a rare class cannot hide behind the majority.
+            balanced=100.*float(np.mean([matches[labels==label].mean() for label in np.unique(labels)]))
+            report[output]={{'type':'categorical','rows':len(frame),'accuracy':accuracy,'balanced_accuracy':balanced}}
+            print(f'{{output}}: categorical accuracy={{accuracy:.6g}}%, balanced accuracy={{balanced:.6g}}% ({{int(matches.sum())}}/{{len(frame)}} exact matches)')
             continue
         truth=pd.to_numeric(actual,errors='coerce').to_numpy(float)
         if not np.isfinite(truth).all(): raise ValueError('Ground truth must be finite numeric values for '+output)
@@ -6489,7 +6965,7 @@ def fresh_stage_models(count, cell, generation, *, n_features, ops, nodes, depth
     head_count=len(cell.population[0].trees) if cell.population else 1
     models=[]
     for _ in range(max(0,count)):
-        trees=[random_tree(n_features,active_ops,nodes,depth,adfs=definitions) for _ in range(head_count)]
+        trees=[admissible_random_tree(n_features,active_ops,nodes,depth,adfs=definitions) for _ in range(head_count)]
         models.append(Model(trees,[(1.,0.)]*head_count,0,origin="stage_seed",mdl_operators=grammar_for_trees(active_ops,trees,definitions),
                             mdl_feature_count=n_features,adfs=dict(definitions),birth_generation=generation))
     return models
@@ -6919,20 +7395,34 @@ def sparse_fits(B, y, max_terms=4, branches=6):
     return sorted(results.values(),key=lambda item:item[0])
 
 def sparse_seed_models(X, Y, cats, ops, max_nodes, max_depth, count, head_count):
-    """Up to `count` seed models whose regression heads are sparse fits of their outputs."""
+    """Up to `count` seed models whose heads are sparse fits of their outputs; a
+    classifier head fits its class indicator (one-vs-rest) on class-balanced
+    rows, and the classifier readout calibrates it."""
     targets,_=classification_layout(cats)
     rows=stratified_probe_indices(X,1000) if len(X)>1000 else slice(None)
     Xs=X[rows]; trees_by_head={}; best_r2=None
     basis,B=sparse_basis(Xs,ops)
-    for j,heads in enumerate(targets):
-        if cats[j] is not None: continue
-        y=np.asarray(Y[rows,j],float); options=[]
+    def options_for(basis, B, y, track=True):
+        nonlocal best_r2
+        options=[]
         for _,support,coefficients,_,r2 in sparse_fits(B,y,max_terms=min(MAX_TERMS,4)):
             joined=join_terms([(coefficients[index],basis[index]) for index in support],ops)
             if joined is None: continue
             tree=simplify_tree(joined)
-            if node_size(tree)<=max_nodes and node_depth(tree)<=max_depth and tree not in options:
-                options.append(tree); best_r2=r2 if best_r2 is None else max(best_r2,r2)
+            if node_size(tree)<=max_nodes and node_depth(tree)<=max_depth and tree not in options and not structural_violation(tree):
+                options.append(tree)
+                if track: best_r2=r2 if best_r2 is None else max(best_r2,r2)  # regression fit quality only
+        return options
+    for j,heads in enumerate(targets):
+        if cats[j] is not None:
+            if len(cats[j])<2: continue
+            class_rows=class_balanced_rows(X,Y[:,j],len(cats[j]),1000) if CLASS_BALANCE else rows
+            class_basis,class_B=sparse_basis(X[class_rows],ops); truth=np.rint(np.asarray(Y[class_rows,j],float))
+            for position,head in enumerate(heads):
+                options=options_for(class_basis,class_B,(truth==(1 if len(heads)==1 else position)).astype(float),track=False)
+                if options: trees_by_head[head]=options
+            continue
+        options=options_for(basis,B,np.asarray(Y[rows,j],float))
         if options: trees_by_head[heads[0]]=options
     SPARSE_SEED_STATS.update(basis=len(basis))
     if not trees_by_head: return []
@@ -6953,7 +7443,7 @@ def new_island_runtime(population_size, *, X, Xt, cats, ops, nodes, depth, head_
     island_index seeds the cell's archives; cell=(island, stage) labels it
     (defaults to (island_index, 0) for stage-free runs).  Yt enables the
     residual-signature QD repertoire (when RESIDUAL_ARCHIVE is on)."""
-    adf_registry=ADFRegistry(adf_enabled,allow_nested=adf_mode=="nested")
+    adf_registry=ADFRegistry(adf_enabled,allow_nested=adf_mode=="nested"); register_custom_ops(adf_registry)
     seeds=direct_feature_baselines(X,None,cats,ops,True)[:population_size//4]
     if SPARSE_SEEDING=="on" and Yt is not None and (cell is None or cell[1]==0):
         seeds+=sparse_seed_models(Xt,Yt,cats,ops,nodes,depth,max(1,int(SPARSE_SEED_SHARE*population_size)),head_count)
@@ -6962,6 +7452,10 @@ def new_island_runtime(population_size, *, X, Xt, cats, ops, nodes, depth, head_
                       mdl_operators=tuple(ops),mdl_feature_count=X.shape[1],adfs=dict(adf_registry.definitions))
                 for _ in range(population_size-len(seeds))]
     probe_indices=stratified_probe_indices(Xt,256)
+    # Per-class residual groups need rows of every class; input coverage alone can miss a rare one.
+    classified=[j for j,labels in enumerate(cats) if labels is not None and len(labels)>=2]
+    residual_probe=(class_balanced_rows(Xt,np.asarray(Yt)[:,classified[0]],len(cats[classified[0]]),256)
+                    if CLASS_BALANCE and classified and Yt is not None else probe_indices)
     qd_controller=QDOutcomeController(rate=float(np.clip(qd_parent_rate,.10,.30)))
     library=FragmentLibrary(); library.admit_discoveries(interaction_discovery)
     return IslandRuntime(
@@ -6974,7 +7468,7 @@ def new_island_runtime(population_size, *, X, Xt, cats, ops, nodes, depth, head_
         DynamicPressureController(dynamic_pressure_on,parsimony_quality_tolerance,qd_controller.uniform_rate,stagnation_window),
         library,adf_registry,EvaluationBudget(evaluation_budget,evaluation_refresh),
         island_index=(island_index if cell is None else cell[0]),stage=(0 if cell is None else cell[1]),
-        residual_qd=(ResidualQualityDiversityArchive(Xt[probe_indices],np.asarray(Yt)[probe_indices],cats,run_seed ^ 0x5245 ^ island_index)
+        residual_qd=(ResidualQualityDiversityArchive(Xt[residual_probe],np.asarray(Yt)[residual_probe],cats,run_seed ^ 0x5245 ^ island_index,class_groups=CLASS_BALANCE)
                      if RESIDUAL_ARCHIVE and Yt is not None else None),
     )
 
@@ -7173,7 +7667,7 @@ def evolve_generation(pop, generation, *, X, Xt, Yt, Xv, Yv, cats, constraints, 
     seen={model_equivalence_key(model) for model in pop}
     def duplicate(trees):
         nonlocal unchanged
-        if (NESTING_RULES or UNIT_FEATURES) and unchanged<unchanged_limit and any(nesting_violation(tree) or unit_violation(tree) for tree in trees):
+        if (NESTING_RULES or UNIT_FEATURES or RELATION_OF_FEATURE) and unchanged<unchanged_limit and any(structural_violation(tree) for tree in trees):
             unchanged+=1; return True
         key=model_equivalence_key(trees)
         if EQUIVALENCE_COLLAPSE and key in seen and unchanged<unchanged_limit:
@@ -7184,7 +7678,7 @@ def evolve_generation(pop, generation, *, X, Xt, Yt, Xv, Yv, cats, constraints, 
     while len(children)<population_size:
         sources=[]
         if novelty_rate and rng.random()<novelty_rate:
-            trees=[random_tree(X.shape[1],variation_ops,nodes,depth,adfs=adf_registry.definitions if adf_registry else None) for _ in range(len(pop[0].trees))]; scales=[(1.,0.)]*len(trees); child_age=0; child_origin="novelty_injection"
+            trees=[admissible_random_tree(X.shape[1],variation_ops,nodes,depth,adfs=adf_registry.definitions if adf_registry else None) for _ in range(len(pop[0].trees))]; scales=[(1.,0.)]*len(trees); child_age=0; child_origin="novelty_injection"
         elif bayesian_mode!="off" and rng.random() < bayesian_proposal_rate:
             trees,scales,sources=bayesian_injection_trees(bayes,len(pop[0].trees),X.shape[1],variation_ops,nodes,depth,"grammar" if bayesian_mode=="grammar" else bayesian_mode,adf_registry.definitions if adf_registry else None,return_sources=True)
             child_age=max((model.age+1 for model in sources),default=0); child_origin="bayesian_injection"
@@ -7257,7 +7751,7 @@ def evolve_generation(pop, generation, *, X, Xt, Yt, Xv, Yv, cats, constraints, 
     while len(survivor_pool)<population_size and attempts<population_size*8:
         batch=[]
         for _ in range(min(population_size-len(survivor_pool),population_size*8-attempts)):
-            fresh_trees=[random_tree(X.shape[1],variation_ops,nodes,depth,proposal=None if bayesian_mode=="off" else (bayes[index] if isinstance(bayes,PerOutputBayesianBanks) else bayes),adfs=adf_registry.definitions if adf_registry else None) for index in range(len(pop[0].trees))]
+            fresh_trees=[admissible_random_tree(X.shape[1],variation_ops,nodes,depth,proposal=None if bayesian_mode=="off" else (bayes[index] if isinstance(bayes,PerOutputBayesianBanks) else bayes),adfs=adf_registry.definitions if adf_registry else None) for index in range(len(pop[0].trees))]
             batch.append(Model(fresh_trees,[(1.,0.)]*len(pop[0].trees),0,origin="novelty_injection",mdl_operators=grammar_for_trees(active_ops,fresh_trees,adf_registry.definitions if adf_registry else None),mdl_feature_count=X.shape[1],adfs={} if adf_registry is None else dict(adf_registry.definitions),birth_generation=generation+1))
         evaluator.assess(batch,"train",None if isinstance(sample,slice) else sample,tune=True)
         for model in batch: history_born(model,generation,place)
@@ -7438,7 +7932,12 @@ def resume_main(args):
     if not isinstance(bayes,PerOutputBayesianBanks): raise ValueError("Checkpoint predates per-output Bayesian banks and cannot resume; start a new run")
     X,Y,Xt,Yt,Xv,Yv=checkpoint_arrays(state)
     names,out_names,cats,maps=(state[k] for k in ("names","out_names","cats","maps"))
-    global SEQUENCE_LAYOUT,EQUIVALENCE_COLLAPSE,RESIDUAL_ARCHIVE,QD_PARENT_CHOICE,SCALE_BALANCED_SELECTION,GUARD_EXPLOIT_CHECK
+    set_numeric_limits(state.get("clip",DEFAULT_CLIP),state.get("eps",DEFAULT_EPS))
+    part=state.get("separate_output")
+    if part:
+        print(f"This checkpoint is output {part['output']!r} ({part['index']+1} of {part['count']}) of a separate-output run: resuming continues "
+              "only this output's search and does not rebuild the merged model; rerun the full setup for that.")
+    global SEQUENCE_LAYOUT,EQUIVALENCE_COLLAPSE,RESIDUAL_ARCHIVE,QD_PARENT_CHOICE,SCALE_BALANCED_SELECTION,CLASS_BALANCE,GUARD_EXPLOIT_CHECK
     SEQUENCE_LAYOUT=maps.get(SEQUENCE_LAYOUT_KEY)
     GUARD_EXPLOIT_CHECK=bool(state.get("numeric_guard_check",False))
     global INTERPOLATION_CHECK,FIT_BACKEND,JUMP_CONSTANT_SCAN
@@ -7458,6 +7957,9 @@ def resume_main(args):
     SYMBOLIC_EXPORT=getattr(args,"symbolic_export","on")
     LOSS_MODE=state.get("loss","huber"); ROBUST_LOSS_DELTA=float(state.get("huber_delta",1.5))
     configure_units(state.get("units",""),list(names))
+    configure_input_relations(state.get("input_relations",""),list(names),state.get("source_columns",()),state.get("types",()))
+    base=state.get("custom_feature_base")
+    configure_custom_ops(state.get("custom_ops",()),list(names) if base is None else list(names)[:base],state.get("source_columns",()),state.get("types",()))
     RESIDUAL_TERM_WEIGHT=float(state.get("residual_term_weight",0.)); NESTING_RULES=parse_nesting_rules(state.get("forbid_nesting",""))
     BACKPROP_MUTATION_WEIGHT=float(state.get("backprop_mutation_weight",0.)); BACKPROP_INVERSE=state.get("backprop_inverse","generic")
     READOUT_MODE=state.get("readout","affine"); MAX_TERMS=int(state.get("max_terms",4)); GENE_CROSSOVER_RATE=float(state.get("gene_crossover_rate",0.))
@@ -7470,6 +7972,7 @@ def resume_main(args):
     # Settings that postdate a checkpoint resume with the behaviour it was searched with.
     RESIDUAL_ARCHIVE=bool(state.get("residual_archive",False)); QD_PARENT_CHOICE=state.get("qd_parent_choice","legacy")
     SCALE_BALANCED_SELECTION=bool(state.get("scale_balanced_selection",False))
+    CLASS_BALANCE=bool(state.get("class_balance",False))
     # Checkpoints from before equivalence keys searched without them; keep that.
     EQUIVALENCE_COLLAPSE=bool(state.get("equivalence_collapse",False)); EQUIVALENCE_STATS["children_redrawn"]=0
     ops,nodes,depth,affine_on,coev=(state[k] for k in ("operators","nodes","depth","affine_on","coev"))
@@ -7513,7 +8016,8 @@ def resume_main(args):
     print(f"Resumed generation {generation} from {checkpoint_path} (seed {state['run_seed']}); {topology}; model scoring uses {'serial evaluation' if workers==1 else f'{workers} worker processes'}.")
     started=time.time(); stop=GracefulStop().__enter__(); interrupted=False
     try:
-        while (not args.max_generations or generation < args.max_generations) and not stop.requested and not stop_rule_reached(args,started,islands):
+        stop_validation={"X":Xv,"Y":Yv,"cats":cats,"constraints":constraints,"out_names":out_names}
+        while (not args.max_generations or generation < args.max_generations) and not stop.requested and not stop_rule_reached(args,started,islands,stop_validation):
             def step(island):
                 def progress(gen,elite,sample):
                     if len(islands)>1 and gen%10==0: print(cell_label(island,island_config["count"],stage_count),flush=True)
@@ -7555,7 +8059,12 @@ def resume_main(args):
     if warning: print(f"WARNING: {warning}"); state["selection"]["warning"]=warning
     print(f"{selection['source'].title()} selection scores: mean loss={selection['metrics']['loss']:.6g}, mean shape={selection['metrics']['shape']:.6g}, MDL bits={selection['metrics']['mdl_bits']:.6g}")
     if chosen.history: print("History:\n  "+"\n  ".join(describe_history(chosen.history)))
-    export_model(chosen,names,out_names,cats,maps,state["source_columns"],state["types"],state.get("export_fixture"),state.get("input_ranges")); evaluator.close()
+    if part and part.get("reads"):
+        # Its inputs include other outputs' predicted values, which no CSV holds.
+        print(f"Not exporting best_model.py: {part['output']!r} reads predicted {', '.join(part['reads'])}; only the full separate-output run exports it.")
+        evaluator.close(); return
+    if part: print(f"Exporting best_model.py for {part['output']!r} alone.")
+    export_model(inline_custom_features(chosen,names),names if CUSTOM_FEATURE_BASE is None else names[:CUSTOM_FEATURE_BASE],out_names,cats,maps,state["source_columns"],state["types"],state.get("export_fixture"),state.get("input_ranges")); evaluator.close()
     write_symbolic_export(chosen,names,out_names,cats,Xt)
 
 def parse_nesting_rules(text):
@@ -7568,16 +8077,60 @@ def parse_nesting_rules(text):
         rules.add((outer.strip(),inner.strip()))
     return frozenset(rules)
 
-def stop_rule_reached(args, started, islands):
-    """--max-time (seconds of search) and --stop-at-loss (best training loss) end the search like Ctrl-C."""
+def parse_stop_targets(value):
+    """--stop-at-loss: one number for the mean loss, or 'NAME=VALUE,...' per output (None when off)."""
+    if value is None or value=="": return None
+    if isinstance(value,(int,float)): return float(value)
+    text=str(value).strip()
+    if "=" not in text: return float(text)
+    targets={}
+    for item in text.split(","):
+        if not item.strip(): continue
+        name,_,number=item.rpartition("=")
+        if not name.strip(): raise ValueError(f"Malformed --stop-at-loss item {item!r}")
+        targets[name.strip()]=float(number)
+    return targets
+
+_STOP_VALIDATION={}
+def stop_rule_reached(args, started, islands, validation=None):
+    """--max-time (seconds of search) and --stop-at-loss end the search like Ctrl-C.
+
+    The loss is the validation loss of the islands' best models when there is
+    validation data (validation = dict(X, Y, cats, constraints, out_names)),
+    else their training loss.  Per-output targets ('HH=0.01,MM=0.05') must all
+    be met; names that are not outputs of this search are ignored, so in a
+    separate-output run each output's search stops at its own limit."""
     limit=getattr(args,"max_time",0.) or 0.
     if limit and time.time()-started>=limit:
         print(f"Stopping: --max-time {limit:g}s reached."); return True
-    target=getattr(args,"stop_at_loss",None)
-    if target is not None:
-        best=min((aggregate_loss(island.best_models.model) for island in islands if island.best_models.model is not None),default=float("inf"))
-        if best<=target:
-            print(f"Stopping: best training loss {best:.6g} reached --stop-at-loss {target:g}."); return True
+    target=parse_stop_targets(getattr(args,"stop_at_loss",None))
+    if target is None: return False
+    models=[island.best_models.model for island in islands if island.best_models.model is not None]
+    if not models: return False
+    names=list(validation["out_names"]) if validation else []
+    held_out=bool(validation) and validation.get("X") is not None
+    def losses(model):
+        if not held_out: return tuple(model_losses(model)),aggregate_loss(model)
+        key=(id(validation["X"]),repr(model.trees),tuple(model.scales))
+        if key not in _STOP_VALIDATION:
+            if len(_STOP_VALIDATION)>256: _STOP_VALIDATION.clear()
+            try:
+                metrics=frozen_metrics(model,validation["X"],validation["Y"],validation["cats"],validation["constraints"],validation["out_names"])
+                _STOP_VALIDATION[key]=(tuple(metrics["losses"]),metrics["loss"])
+            except (ArithmeticError, IndexError, RecursionError, ValueError): _STOP_VALIDATION[key]=((float("inf"),)*len(names),float("inf"))
+        return _STOP_VALIDATION[key]
+    kind="validation" if held_out else "training"
+    scored=[losses(model) for model in models]
+    if isinstance(target,dict):
+        wanted={names.index(name):value for name,value in target.items() if name in names}
+        if not wanted: return False
+        for per_output,_ in scored:
+            if all(per_output[j]<=value for j,value in wanted.items()):
+                print(f"Stopping: best {kind} loss reached --stop-at-loss for "+", ".join(f"{names[j]} ({per_output[j]:.6g} <= {value:g})" for j,value in wanted.items())+"."); return True
+        return False
+    best=min(total for _,total in scored)
+    if best<=target:
+        print(f"Stopping: best {kind} loss {best:.6g} reached --stop-at-loss {target:g}."); return True
     return False
 
 def build_arg_parser():
@@ -7607,6 +8160,7 @@ def build_arg_parser():
     ap.add_argument("--equivalence-collapse",choices=("on","off"),default="on",help="Treat algebraically equal equations (x+y vs y+x, x+x vs 2*x, x*x vs square(x)) as one candidate in offspring, deduplication and archives (default: on)")
     ap.add_argument("--residual-archive",choices=("on","off"),default="on",help="Keep a third QD archive keyed by where each model errs (target-size bins and input regions), so complementary partial models survive (default: on)")
     ap.add_argument("--qd-parent-choice",choices=QD_PARENT_CHOICES,default="quality_coverage",help="How QD archives pick parent cells beyond the uniform share: success x bounded quality rank x coverage bonus, or legacy success-only (default: quality_coverage)")
+    ap.add_argument("--class-balance",choices=("on","off"),default="on",help="Give every class of a categorical output equal weight: class-weighted log loss, balanced error rate as its shape objective, class-weighted readout fit and constant tuning, class-balanced lexicase case order, per-class residual-archive groups, and a train/validation split stratified by class (default: on)")
     ap.add_argument("--scale-balanced-selection",choices=("on","off"),default="on",help="Selection-only: give every target-magnitude band equal weight and compare asinh-compressed errors in lexicase parent choice; reported loss is unchanged (default: on)")
     ap.add_argument("--cell-workers",type=int,default=0,help="Processes that evolve island/stage cells in parallel; 0=auto (one per cell, up to CPUs-1), 1=serial.  Results are identical either way (default: 0)")
     ap.add_argument("--cache-memory",type=float,default=128,metavar="MB",help="Budget of the tree-output cache in the main process; each --workers scoring process gets an eighth of it. Lower it if large trees or many workers run out of memory: results are identical, only speed changes (default: 128)")
@@ -7629,9 +8183,14 @@ def build_arg_parser():
     ap.add_argument("--loss",choices=("huber","squared","relative"),default="huber",help="Regression loss: huber (MAD-scaled, robust to outliers), squared (plain least squares) or relative (Huber on the error relative to |y|, for targets spanning orders of magnitude) (default: huber)")
     ap.add_argument("--huber-delta",type=float,default=1.5,help="Huber threshold in robust target-scale units for --loss huber and relative (default: 1.5)")
     ap.add_argument("--constant-intervals",choices=("on","off"),default="on",help="Print and record approximate 95%% intervals for the chosen model's constants from the linearised covariance (default: on)")
+    ap.add_argument("--output-mode",choices=OUTPUT_MODES,default="separate",help="With several output columns: separate gives each column (a categorical column with all its classes) its own search, Pareto front, MDL and node limit, run one after another and merged into one exported model; joint searches one model holding every output (default: separate)")
+    ap.add_argument("--output-relations",action="append",default=[],metavar="'A -> B[; C -> D]'",help="Staged prediction (separate mode) as a dependency graph, e.g. 'HH -> MM' or 'lat -> lon; year -> month -> day' ('a, b -> c' feeds both into c; repeatable). Each output may read the predicted (never the true) values of all its ancestors as extra inputs, ancestors are searched first, and the export inlines them (default: none)")
+    ap.add_argument("--clamp",default="auto",metavar="auto|default|VALUE",help="Value clamp for every operator result (models that reach it are rejected): auto scales it and the divisor/log guard to the data's magnitudes, so data beyond 1e3 (E=m*c**2 with c=3e8) is not clamped at 1e12 and data below 1e-3 keeps its small divisors; default pins 1e12 and 1e-12; a number sets the clamp (default: auto)")
+    ap.add_argument("--custom-op",action="append",default=[],metavar="'NAME = EXPR'",help="A partly known operator built from AFPO's operators (repeatable; ';' separates several): v0, v1, ... are parameters the search fills in (every v0 the same), v# an optional one whose operation disappears when left out, column names and numbers are fixed. E.g. 'fq = amount / v0', 'E = m*c**2', 'foo = bar + v#*kpop' (default: none)")
+    ap.add_argument("--input-relations",action="append",default=[],metavar="A,B[;C,D]",help="Input columns that belong together, e.g. HH1,MM1;HH2,MM2 (repeatable). Inside a relation columns combine freely; with other inputs only as complete subexpressions that read every column of the relation, so HH2-HH1 is rejected but (60*HH2+MM2)-(60*HH1+MM1) is not (default: none)")
     ap.add_argument("--units",default="",metavar="COLUMN=UNIT,...",help="Units of input columns for dimensional analysis, e.g. x=m,t=s,F=kg*m/s^2 (exponents with ^, fractions in parentheses like m^(1/2)); trees that add, compare or exponentiate unlike units are rejected; constants and unlisted columns are unit-free wildcards (default: none)")
     ap.add_argument("--max-time",type=float,default=0.,help="Stop the search after this many seconds and go to the final choice; 0 = no limit (default: 0)")
-    ap.add_argument("--stop-at-loss",type=float,default=None,help="Stop the search once the best training loss (the loss printed during the run) is at or below this value (default: off)")
+    ap.add_argument("--stop-at-loss",default=None,metavar="LOSS|NAME=LOSS,...",help="Stop the search once the best model's loss is at or below this value: its validation loss when there is validation data, else its training loss. NAME=LOSS,... sets one limit per output instead (all must be met); in separate-output runs each output's search stops at its own limit and the next output starts (default: off)")
     ap.add_argument("--sparse-seeding",choices=("on","off"),default="off",help="Seed the initial population with sparse linear fits over a modest basis (inputs, unary operators of inputs, pairwise products and ratios, hinges), found by orthogonal matching pursuit (default: off)")
     ap.add_argument("--sparse-basis-size",type=int,default=300,help="Most basis terms the sparse seeding searches (default: 300)")
     ap.add_argument("--jump-mutation-weight",type=float,default=1.,help="Initial portfolio weight of the jump mutation, which wraps a subtree in mod(s,c), floordiv(s,c) or if_else(gt(x,c),s,s') as one move; adapted like the other mutation kinds; 0 disables it (default: 1)")
@@ -7716,6 +8275,13 @@ def collect_training_setup(args):
     path=Path(ask("Dataset path"))
     if not path.is_file(): raise FileNotFoundError(path)
     df,types,delimiter=configure(path,getattr(args,"max_rows",0),row_sample_seed(args))
+    inputs=[column for column,kind in zip(df.columns,types) if kind in (1,2)]; outputs=[column for column,kind in zip(df.columns,types) if kind in (5,6)]
+    if len(inputs)>=2 and not getattr(args,"input_relations",None):
+        answer=ask(f"Input relations among {', '.join(map(str,inputs))} (e.g. A,B;C,D; blank=none)","")
+        if answer: parse_relations(answer); args.input_relations=[answer]
+    if len(outputs)>=2 and getattr(args,"output_mode","separate")=="separate" and not getattr(args,"output_relations",None):
+        answer=ask(f"Output relations among {', '.join(map(str,outputs))} (e.g. A -> B; blank=none: each output is searched on its own)","")
+        if answer: separate_output_plan(list(df.columns),types,parse_output_relations(answer)); args.output_relations=[answer]
     ops=choose_operator_groups()
     print("Structural objective = MDL model-description bits (uniform enabled grammar; exact constants and affine coefficients included).")
     affine_on=yes(ask("Affine scaling? 1=yes, 0=no","1")); coev=yes(ask("Use co-evolution/minibatches? 1=yes, 0=no","0"))
@@ -7778,13 +8344,328 @@ def choose_model_interactively(labels, choices, evaluation):
         try: return max(0,min(len(choices)-1,int(answer)-1))
         except ValueError: print(f"Enter a number from 1 to {len(choices)}.")
 
+# --output-mode separate (default): with several output columns, each column
+# gets its own search -- its own population, Pareto front, MDL count, node
+# limit and final choice -- one after another, and the chosen equations are
+# merged into one exported model.  In one joint search every model carries a
+# tree per output, every mutation and crossover changes all of them at once,
+# MDL is one sum over the trees and selection compares mean loss, so outputs
+# fought for fitness and --nodes had to be large enough for all of them at
+# once.  A categorical column keeps its class heads together in one search.
+# `joint` restores the single search.  --max-generations and --max-time
+# apply to each output's search.
+#
+# --output-relations "HH,MM": staged prediction.  Within a relation the
+# columns are searched in the order given, and each later column gets the
+# earlier columns' *predicted* values (never their true values, which are
+# unknown at prediction time) as extra input features: a numeric output as
+# one column, a categorical one as one-hot columns of its predicted class.
+# In the merged model those features are replaced by the earlier equations
+# themselves (a class indicator by comparisons of the class scores), so the
+# exported model reads only the original inputs.
+OUTPUT_MODES=("separate","joint")
+
+def parse_output_relations(spec):
+    """Dependency edges [(source, target)] of --output-relations, in the order written.
+
+    'year -> month -> day; lat -> lon' is a graph: each '->' feeds every
+    column of the stage before it into every column of the stage after it
+    ('a, b -> c' feeds both a and b into c).  A part without '->' is a chain
+    in the order listed ('HH,MM' is 'HH -> MM')."""
+    items=[spec] if isinstance(spec,str) else list(spec or ())
+    edges=[]
+    for item in items:
+        for part in str(item).split(";"):
+            if not part.strip(): continue
+            if "->" in part:
+                stages=[[column.strip() for column in stage.split(",") if column.strip()] for stage in part.split("->")]
+                if len(stages)<2 or not all(stages): raise ValueError(f"Malformed output relation {part.strip()!r}")
+            else:
+                stages=[[column.strip()] for column in part.split(",") if column.strip()]
+                if len(stages)<2: raise ValueError(f"An output relation needs at least two columns: {part.strip()!r}")
+            for before,after in zip(stages,stages[1:]):
+                edges+=[(source,target) for target in after for source in before if (source,target) not in edges]
+    for source,target in edges:
+        if source==target: raise ValueError(f"Output {source!r} cannot read its own prediction")
+    return edges
+
+def format_output_relations(edges): return "; ".join(f"{source} -> {target}" for source,target in edges)
+
+def separate_output_plan(columns, types, edges):
+    """[(output column, ancestors it may read)] in search order.
+
+    Every output reads the predictions of all its ancestors in the relation
+    graph (day reads month and year in 'year -> month -> day'), so ancestors
+    are searched first: related outputs in the order they first appear, then
+    the unrelated ones in column order.  A cycle is an error."""
+    outputs=[column for column,kind in zip(columns,types) if kind in (5,6)]
+    for column in dict.fromkeys(column for edge in edges for column in edge):
+        if column not in outputs: raise ValueError(f"Output relation names {column!r}, which is not an output column")
+    parents={}
+    for source,target in edges: parents.setdefault(target,[]).append(source)
+    related=list(dict.fromkeys(column for edge in edges for column in edge))
+    order=[]; state={}
+    def visit(column, path=()):
+        if state.get(column)=="done": return
+        if column in path: raise ValueError("Output relations form a cycle: "+" -> ".join([*path[path.index(column):],column]))
+        for parent in parents.get(column,()): visit(parent,(*path,column))
+        state[column]="done"; order.append(column)
+    for column in related: visit(column)
+    def ancestors(column, seen=None):
+        seen=set() if seen is None else seen
+        for parent in parents.get(column,()):
+            if parent not in seen: seen.add(parent); ancestors(parent,seen)
+        return seen
+    plan=[(column,tuple(other for other in order if other in ancestors(column))) for column in order]
+    return plan+[(column,()) for column in outputs if column not in order]
+
+def _predicted_values(result, frame):
+    """A sub-run's chosen model applied to a frame: floats, or predicted class labels."""
+    X=encode(frame,result["types"],result["maps"])[0]
+    values=predict_targets(result["model"],X,result["cats"])[:,0]
+    labels=result["cats"][0]
+    return values.astype(float) if labels is None else np.array([str(labels[int(value)]) for value in values],dtype=object)
+
+def _affine_tree(tree, a, b):
+    if a!=1.: tree=("*",("c",float(a)),tree)
+    return ("+",tree,("c",float(b))) if b!=0. else tree
+
+def _class_indicator(scores, k):
+    """1 where class k wins the argmax (ties go to the lower index, as np.argmax does), else 0."""
+    factors=[("gt" if j<k else "gte",scores[k],scores[j]) for j in range(len(scores)) if j!=k]
+    if not factors: return ("c",1.)
+    tree=factors[0]
+    for factor in factors[1:]: tree=("*",tree,factor)
+    return tree
+
+def _rename_adfs(tree, renames):
+    if tree[0] in ("x","c","arg"): return tree
+    return tuple([renames.get(tree[0],tree[0])]+[_rename_adfs(child,renames) for child in tree[1:]])
+
+def merge_separate_models(plan, results, staged, feature_names, out_names, cats):
+    """One Model over the original features from the per-output choices.
+
+    staged maps a source output to the name of its predicted-value feature;
+    every read of such a feature becomes the source's own equation."""
+    index={name:position for position,name in enumerate(feature_names)}
+    targets,_=classification_layout(cats)
+    merged_trees={}; merged_scales={}; adfs={}; operators=[]; opaque=[]
+    for column,_ in plan:
+        result=results[column]; model=result["model"]; tag=out_names.index(column)
+        # Each search numbers its own ADFs from zero; keep the merged names apart.
+        renames={name:f"adf_o{tag}_{name[4:]}" for name in model.adfs if name not in CUSTOM_OPS}
+        for name,item in model.adfs.items():
+            if name in CUSTOM_OPS: continue      # one shared definition, in this feature space (below)
+            renamed=dict(item); renamed["tree"]=_rename_adfs(item["tree"],renames)
+            if "dependencies" in item: renamed["dependencies"]=[renames.get(dependency,dependency) for dependency in item["dependencies"]]
+            adfs[renames[name]]=renamed
+        def staged_tree(name):
+            for source,staged_name in staged.items():
+                if source not in merged_trees: continue
+                source_cats=results[source]["cats"][0]; trees,scales=merged_trees[source],merged_scales[source]
+                if source_cats is None:
+                    if name==staged_name: return _affine_tree(trees[0],*scales[0])
+                    continue
+                if not name.startswith(f"{staged_name}="): continue
+                k=[str(label) for label in source_cats].index(name[len(staged_name)+1:])
+                if len(trees)>1: return _class_indicator([_affine_tree(tree,*scale) for tree,scale in zip(trees,scales)],k)
+                if len(source_cats)<2: return ("c",1.)
+                score=_affine_tree(trees[0],*scales[0])
+                # binary_labels: class 1 exactly when the score is above 0.5.
+                return ("gt",score,("c",.5)) if k==1 else ("lte",score,("c",.5))
+            raise ValueError(f"Output {column!r} reads unknown feature {name!r}")
+        def substitute(tree):
+            if tree[0]=="x":
+                name=result["names"][tree[1]]
+                if name in index: return ("x",index[name])
+                derived=result.get("derived") or {}
+                # A derived --custom-op feature was a leaf in its search: inline its body, opaque likewise.
+                inlined=substitute(derived[name]) if name in derived else staged_tree(name)
+                opaque.append(inlined); return inlined
+            if tree[0] in ("c","arg"): return tree
+            return tuple([renames.get(tree[0],tree[0])]+[substitute(child) for child in tree[1:]])
+        merged_trees[column]=[substitute(tree) for tree in model.trees]
+        merged_scales[column]=list(model.scales)
+        operators+=[op for op in model.mdl_operators if op not in operators]
+    adfs.update({name:{"tree":item["tree"],"arity":item["arity"]} for name,item in CUSTOM_OPS.items()})
+    trees=[None]*sum(len(heads) for heads in targets); scales=[None]*len(trees)
+    for j,column in enumerate(out_names):
+        for head,tree,scale in zip(targets[j],merged_trees[column],merged_scales[column]): trees[head]=tree; scales[head]=scale
+    # Inlined class indicators may use comparisons the searches' grammars lacked.
+    extra=sorted({node[0] for tree in trees for node in walk_tree(tree)
+                  if node[0] not in ("x","c","arg") and not node[0].startswith("adf_") and node[0] not in operators})
+    return Model(trees,scales,origin="separate_outputs",mdl_operators=tuple(operators+extra),mdl_feature_count=len(feature_names),adfs=adfs,
+                 opaque=tuple(dict.fromkeys(opaque)))
+
+def _metadata_for_output(metadata, out_names, column):
+    """The constraint metadata of one output, keyed by its name."""
+    outputs=(metadata or {}).get("outputs",metadata or {})
+    if not isinstance(outputs,dict): return {}
+    kept={column:spec for key,spec in outputs.items()
+          if key==column or (isinstance(key,str) and key.isdigit() and int(key)<len(out_names) and out_names[int(key)]==column)}
+    return {"outputs":kept} if kept else {}
+
+def train_separate_outputs(args, setup, df, frames, run_seed, metadata, choose_model=None):
+    """One search per output column (see OUTPUT_MODES), then one merged, exported model."""
+    types=list(setup["types"]); columns=list(df.columns)
+    train_indices,validation_indices,train_df,validation_df,external_validation=frames
+    edges=parse_output_relations(getattr(args,"output_relations",None) or ())
+    plan=separate_output_plan(columns,types,edges)
+    out_names=[column for column,kind in zip(columns,types) if kind in (5,6)]
+    test_df=None
+    if args.test_csv:
+        test_df=read_dataset(args.test_csv,setup["delimiter"],getattr(args,"max_rows",0),row_sample_seed(args))
+        if test_df.attrs.get("afpo_row_sample"): print(f"Test CSV{describe_row_sample(test_df)}.")
+    base_X,base_Y,_,_,base_cats,_=encode(train_df,types)
+    limits=resolve_numeric_limits(getattr(args,"clamp","auto"),base_X,base_Y[:,[j for j,labels in enumerate(base_cats) if labels is None]])
+    print(f"Separate output searches ({len(plan)}): "+"; ".join(f"{column}"+(f" (reads predicted {', '.join(sources)})" if sources else "") for column,sources in plan))
+    # Predicted columns of finished outputs on every frame: the full table (the
+    # internal split takes its rows from it), an external validation file, the test file.
+    predicted={}; staged={}; results={}
+    internal_split=train_df is not df
+    for number,(column,sources) in enumerate(plan,start=1):
+        kind=types[columns.index(column)]
+        print(f"\n=== Output {number}/{len(plan)}: {column} ({'categorical' if kind==6 else 'numeric'}"+(f"; reads predicted {', '.join(sources)}" if sources else "")+") ===")
+        # An earlier output this one reads becomes an input column of the same
+        # name holding its predictions (never its true values).
+        types_o=[(1 if results[name]["cats"][0] is None else 2) if name in sources else kind_ if kind_ not in (5,6) or name==column else 0
+                 for name,kind_ in zip(columns,types)]
+        def augment(frame, part):
+            if frame is None: return None
+            frame=frame.copy()
+            for source in sources: frame[source]=predicted[source][part]
+            return frame
+        df_o=augment(df,"df")
+        train_o=df_o.iloc[train_indices] if internal_split else df_o
+        if external_validation: validation_o=augment(validation_df,"validation")
+        elif validation_df is None: validation_o=None
+        else: validation_o=df_o.iloc[validation_indices]
+        args_o=argparse.Namespace(**vars(args)); args_o.test_csv=None; args_o.seed=run_seed
+        setup_o={**setup,"df":df_o,"_test_frame":augment(test_df,"test"),"types":types_o,"metadata":_metadata_for_output(metadata,out_names,column),
+                 "_frames":(train_indices,validation_indices,train_o,validation_o,external_validation),"_limits":limits,
+                 "_subrun":{"output":column,"index":number-1,"count":len(plan),"reads":list(sources)}}
+        result=train_from_setup(args_o,setup_o,choose_model)
+        result["frames"]=(train_o,validation_o); results[column]=result
+        if any(column in reads for _,reads in plan):
+            staged[column]=column
+            predicted[column]={"df":_predicted_values(result,df_o)}
+            if external_validation: predicted[column]["validation"]=_predicted_values(result,validation_o)
+            if test_df is not None: predicted[column]["test"]=_predicted_values(result,augment(test_df,"test"))
+    print(f"\n=== Merging {len(plan)} output searches ===")
+    # The merged model lives in the original feature space of the whole table.
+    set_numeric_limits(*limits)
+    Xt,Yt,names,out_names_all,cats,maps=encode(train_df,types)
+    configure_custom_ops(getattr(args,"custom_op",None) or (),list(names),columns,types)
+    Xv=Yv=None
+    if validation_df is not None: Xv,Yv=encode(validation_df,types,maps)[:2]
+    Xtest=Ytest=None
+    if test_df is not None:
+        Xtest,Ytest,test_names,test_outputs,test_cats,_=encode(test_df,types,maps)
+        if test_names!=names or test_outputs!=out_names_all or test_cats!=cats: raise ValueError("Test CSV columns/types do not match training data")
+    merged=merge_separate_models(plan,results,staged,names,out_names_all,cats)
+    constraints=compile_constraints(args.profile,metadata)
+    # Every rule still applies to the merged trees, in the whole table's feature
+    # space; only the inlined earlier equations are opaque (Model.opaque).
+    configure_units(getattr(args,"units",""),list(names))
+    configure_input_relations(getattr(args,"input_relations",None) or (),list(names),columns,types)
+    assess(merged,Xt,Yt,setup["affine_on"],cats,fit_affine=False,constraints=constraints,output_names=out_names_all)
+    if not merged.feasible: print(f"WARNING: the merged model is infeasible ({merged.invalid_reason})")
+    # The inlined model must predict exactly what the searches chose.
+    check_X=Xv if Xv is not None else Xt
+    check=predict_targets(merged,check_X,cats); mismatches=[]
+    for j,column in enumerate(out_names_all):
+        sub=results[column]; frame=sub["frames"][1] if Xv is not None else sub["frames"][0]
+        expected=predict_targets(sub["model"],encode(frame,sub["types"],sub["maps"])[0],sub["cats"])[:,0]
+        same=np.isclose(check[:,j],expected,rtol=1e-9,atol=1e-9) if cats[j] is None else check[:,j]==expected
+        if not np.all(same): mismatches.append(f"{column} ({int(np.sum(~same))} rows)")
+    if mismatches: print(f"WARNING: the merged model differs from the per-output choices on {', '.join(mismatches)}")
+    report={"train":frozen_metrics(merged,Xt,Yt,cats,constraints,out_names_all)}
+    if Xv is not None: report["validation"]=frozen_metrics(merged,Xv,Yv,cats,constraints,out_names_all)
+    if Xtest is not None: report["test"]=frozen_metrics(merged,Xtest,Ytest,cats,constraints,out_names_all)
+    # Local complexity (what selection used: a staged feature is one leaf)
+    # beside the expanded complexity of the inlined export, for information.
+    targets,_=classification_layout(cats); complexity={}
+    for j,column in enumerate(out_names_all):
+        local=results[column]["model"]; heads=targets[j]
+        expanded=Model([merged.trees[head] for head in heads],[merged.scales[head] for head in heads],mdl_operators=merged.mdl_operators,mdl_feature_count=len(names),adfs=merged.adfs)
+        complexity[column]={"local_mdl_bits":model_description_bits(local),"local_nodes":int(sum(node_size(tree) for tree in local.trees)),
+                            "expanded_mdl_bits":model_description_bits(expanded),"expanded_nodes":int(sum(node_size(tree) for tree in expanded.trees))}
+    for column,sources in plan:
+        item=complexity[column]
+        print(f"{column}: {results[column]['equation']}"+(f"   [{', '.join(staged[source] for source in sources)} = predicted {', '.join(sources)}]" if sources else ""))
+        print(f"  complexity: {item['local_mdl_bits']:.0f} bits, {item['local_nodes']} nodes"
+              +(f" (expanded with inlined predictions: {item['expanded_mdl_bits']:.0f} bits, {item['expanded_nodes']} nodes)" if sources else ""))
+    print(f"Merged model: {equations(merged,names,out_names_all,cats)}")
+    if Xv is not None:
+        print(f"Validation: loss={report['validation']['loss']:.6g}, shape={report['validation']['shape']:.6g} | output losses={output_loss_summary(report['validation']['losses'],out_names_all)}")
+        summary=classification_summary(merged,Xv,Yv,cats,out_names_all)
+        if summary: print(f"Validation classes: {summary}")
+    if Xtest is not None:
+        print(f"Final held-out test (not used for selection): loss={report['test']['loss']:.6g}, shape={report['test']['shape']:.6g} | output losses={output_loss_summary(report['test']['losses'],out_names_all)}")
+        summary=classification_summary(merged,Xtest,Ytest,cats,out_names_all)
+        if summary: print(f"Test classes: {summary}")
+    export_model(merged,names,out_names_all,cats,maps,columns,types,train_df.head(16).copy(),training_input_ranges(train_df,columns,types))
+    write_symbolic_export(merged,names,out_names_all,cats,Xt)
+    run_dir=Path(results[plan[0][0]]["manifest"]).parent
+    summary_path=run_dir.with_name(run_dir.name+"-outputs") / "separate_outputs.json"
+    summary_path.parent.mkdir(parents=True,exist_ok=True)
+    summary_path.write_text(json.dumps(({
+        "schema_version":1,"output_mode":"separate","seed":run_seed,"output_relations":format_output_relations(edges),
+        "input_relations":format_relations(parse_relations(getattr(args,"input_relations",None) or ())),"merged_equation":equations(merged,names,out_names_all,cats),
+        "merge_check":"exact" if not mismatches else mismatches,
+        "outputs":[{"output":column,"reads_predicted":list(sources),"staged_feature":staged.get(column),"equation":results[column]["equation"],
+                    "complexity":complexity[column],"selected":results[column]["selected"],"generations":results[column]["generation"],"selected_metrics":results[column]["selected_metrics"],
+                    "manifest":results[column]["manifest"],"checkpoint":results[column]["checkpoint"],"model_card":results[column]["model_card"]} for column,sources in plan],
+        "metrics":report}),indent=2,default=lambda value:value.item() if hasattr(value,"item") else str(value))+"\n")
+    print(f"Separate-output summary: {summary_path}")
+    print("Saved best_model.py")
+    return {"checkpoint":results[plan[0][0]]["checkpoint"],"checkpoints":[results[column]["checkpoint"] for column,_ in plan],
+            "manifest":str(summary_path.resolve()),"model_card":str(summary_path.resolve()),
+            "generation":max(results[column]["generation"] for column,_ in plan),
+            "selected":"; ".join(f"{column}: {results[column]['selected']}" for column,_ in plan),
+            "equation":equations(merged,names,out_names_all,cats),"outputs":{column:results[column]["equation"] for column,_ in plan},
+            "metrics":{split:{"loss":item["loss"],"shape":item["shape"],"losses":dict(zip(out_names_all,item["losses"]))} for split,item in report.items() if split!="train"}}
+
+def split_frames(df, types, setup, run_seed, delimiter, max_rows=0, sample_seed=None):
+    """(train_indices, validation_indices, train_df, validation_df, external_validation) for a run's setup."""
+    val_path=setup["val_path"]
+    external_validation=None
+    if val_path=="0":
+        train_indices=np.arange(len(df)); validation_indices=np.array([],dtype=int); train_df=df; validation_df=None
+    elif val_path:
+        validation_df=read_dataset(val_path,delimiter,max_rows,sample_seed); train_df=df; train_indices=np.arange(len(df)); validation_indices=np.arange(len(validation_df))
+        external_validation={"path":str(Path(val_path).resolve()),"sha256":dataset_sha256(val_path),"rows":len(validation_df),
+                             "row_sample":validation_df.attrs.get("afpo_row_sample")}
+        if validation_df.attrs.get("afpo_row_sample"): print(f"Validation CSV{describe_row_sample(validation_df)}.")
+    else:
+        pct=setup["validation_percent"]
+        if pct is None or pct<=0:
+            train_indices=np.arange(len(df)); validation_indices=np.array([],dtype=int); train_df=df; validation_df=None
+        else:
+            requested=max(1,math.ceil(len(df)*pct/100))
+            val_rows=max(5,requested)
+            if len(df)-val_rows < 4:
+                print("Validation disabled: this dataset cannot retain both 5 holdout rows and 4 training rows.")
+                train_indices=np.arange(len(df)); validation_indices=np.array([],dtype=int); train_df=df; validation_df=None
+            else:
+                if val_rows != requested:
+                    print(f"Using {val_rows} validation rows (minimum for reliable affine-scaled scoring).")
+                strata=None
+                for col in [col for col,t in zip(df.columns,types) if t==6] if CLASS_BALANCE else ():
+                    labels=df[col].fillna("__MISSING__").astype(str)
+                    strata=labels if strata is None else strata+"\x1f"+labels
+                strata=None if strata is None else strata.to_numpy()
+                train_indices,validation_indices=holdout_split_indices(len(df),val_rows,run_seed,strata)
+                train_df=df.iloc[train_indices]; validation_df=df.iloc[validation_indices]
+    return train_indices,validation_indices,train_df,validation_df,external_validation
+
 def train_from_setup(args, setup, choose_model=None):
     """Run a fresh search from collected setup answers; returns where its outputs went.
 
     ``choose_model(labels, choices, evaluation)`` returns the index of the model
     to save; the default asks at the terminal."""
     reset_run_caches()
-    global EQUIVALENCE_COLLAPSE,RESIDUAL_ARCHIVE,QD_PARENT_CHOICE,SCALE_BALANCED_SELECTION,GUARD_EXPLOIT_CHECK
+    global EQUIVALENCE_COLLAPSE,RESIDUAL_ARCHIVE,QD_PARENT_CHOICE,SCALE_BALANCED_SELECTION,CLASS_BALANCE,GUARD_EXPLOIT_CHECK
     EQUIVALENCE_COLLAPSE=getattr(args,"equivalence_collapse","on")=="on"; EQUIVALENCE_STATS["children_redrawn"]=0
     GUARD_EXPLOIT_CHECK=getattr(args,"numeric_guard_check","on")=="on"
     global INTERPOLATION_CHECK,FIT_BACKEND,JUMP_CONSTANT_SCAN
@@ -7814,6 +8695,7 @@ def train_from_setup(args, setup, choose_model=None):
     configure_cache_memory(getattr(args,"cache_memory",128))
     RESIDUAL_ARCHIVE=getattr(args,"residual_archive","on")=="on"; QD_PARENT_CHOICE=getattr(args,"qd_parent_choice","quality_coverage")
     SCALE_BALANCED_SELECTION=getattr(args,"scale_balanced_selection","on")=="on"
+    CLASS_BALANCE=getattr(args,"class_balance","on")=="on"
     run_seed=args.seed if args.seed is not None else random.SystemRandom().randrange(2**32)
     rng.seed(run_seed); np.random.seed(run_seed)
     print(f"Run seed: {run_seed}")
@@ -7833,29 +8715,13 @@ def train_from_setup(args, setup, choose_model=None):
     perceptron_enabled=any(operator.startswith("perceptron") for operator in ops)
     metadata=setup.get("metadata")
     if metadata is None: metadata=json.loads(Path(args.constraint_metadata).read_text()) if args.constraint_metadata else {}
-    external_validation=None
-    if val_path=="0":
-        train_indices=np.arange(len(df)); validation_indices=np.array([],dtype=int); train_df=df; validation_df=None
-    elif val_path:
-        validation_df=read_dataset(val_path,delimiter,max_rows,sample_seed); train_df=df; train_indices=np.arange(len(df)); validation_indices=np.arange(len(validation_df))
-        external_validation={"path":str(Path(val_path).resolve()),"sha256":dataset_sha256(val_path),"rows":len(validation_df),
-                             "row_sample":validation_df.attrs.get("afpo_row_sample")}
-        if validation_df.attrs.get("afpo_row_sample"): print(f"Validation CSV{describe_row_sample(validation_df)}.")
-    else:
-        pct=setup["validation_percent"]
-        if pct is None or pct<=0:
-            train_indices=np.arange(len(df)); validation_indices=np.array([],dtype=int); train_df=df; validation_df=None
-        else:
-            requested=max(1,math.ceil(len(df)*pct/100))
-            val_rows=max(5,requested)
-            if len(df)-val_rows < 4:
-                print("Validation disabled: this dataset cannot retain both 5 holdout rows and 4 training rows.")
-                train_indices=np.arange(len(df)); validation_indices=np.array([],dtype=int); train_df=df; validation_df=None
-            else:
-                if val_rows != requested:
-                    print(f"Using {val_rows} validation rows (minimum for reliable affine-scaled scoring).")
-                train_indices,validation_indices=holdout_split_indices(len(df),val_rows,run_seed)
-                train_df=df.iloc[train_indices]; validation_df=df.iloc[validation_indices]
+    frames=setup.get("_frames") or split_frames(df,types,setup,run_seed,delimiter,max_rows,sample_seed)
+    train_indices,validation_indices,train_df,validation_df,external_validation=frames
+    output_columns=[col for col,t in zip(df.columns,types) if t in (5,6)]
+    if not setup.get("_subrun") and len(output_columns)>1 and getattr(args,"output_mode","separate")=="separate":
+        return train_separate_outputs(args,setup,df,frames,run_seed,metadata,choose_model)
+    if not setup.get("_subrun") and parse_output_relations(getattr(args,"output_relations",None) or ()):
+        print("Output relations need --output-mode separate and at least two outputs; ignoring them.")
     global SEQUENCE_GROUP_REQUEST
     SEQUENCE_GROUP_REQUEST=tuple(parse_sequence_group(item) for item in args.sequence_group)
     # Fit every fill value and category vocabulary on training rows only.
@@ -7874,6 +8740,18 @@ def train_from_setup(args, setup, choose_model=None):
     if validation_df is not None:
         Xv,Yv,names2,out2,cats2,_=encode(validation_df,types,maps)
         if names2!=names or out2!=out_names or cats2!=cats: raise ValueError("Validation CSV columns/types do not match training data")
+    numeric_targets=[j for j,labels in enumerate(cats) if labels is None]
+    set_numeric_limits(*(setup.get("_limits") or resolve_numeric_limits(getattr(args,"clamp","auto"),Xt,Yt[:,numeric_targets])))
+    if (CLIP,EPS)!=(DEFAULT_CLIP,DEFAULT_EPS): print(f"Numeric limits: values clamp at +/-{CLIP:.3g}, divisor/log guard {EPS:.3g} (--clamp {getattr(args,'clamp','auto')}).")
+    base_names=list(names)
+    derived=configure_custom_ops(getattr(args,"custom_op",None) or (),base_names,list(df.columns),types)
+    if derived:
+        Xt=custom_feature_columns(Xt,derived); X=Xt
+        if Xv is not None: Xv=custom_feature_columns(Xv,derived)
+        names=base_names+[label for label,_ in derived]
+    if CUSTOM_OPS: ops=list(dict.fromkeys([*ops,*CUSTOM_OPS]))
+    if CUSTOM_OP_SPECS:
+        print("Custom operators: "+"; ".join(CUSTOM_OP_SPECS)+(f" | derived features: {', '.join(label for label,_ in derived)}" if derived else ""))
     # Everything later needs only these from the frames; dropping them frees
     # the parsed text and the train/validation row copies (often several
     # times the encoded matrices) for the whole search.
@@ -7886,17 +8764,22 @@ def train_from_setup(args, setup, choose_model=None):
     LOSS_NOISE_FLOOR=estimate_loss_noise_floor(Yt,cats,Yv) if floor_setting=="auto" else float(floor_setting)
     print(f"Loss noise floor: {LOSS_NOISE_FLOOR:.3g} ({'from the precision of the targets' if floor_setting=='auto' else 'set'})")
     Xtest=Ytest=None
-    if args.test_csv:
+    test_df=setup.get("_test_frame")
+    if test_df is None and args.test_csv:
         test_df=read_dataset(args.test_csv,delimiter,max_rows,sample_seed)
         if test_df.attrs.get("afpo_row_sample"): print(f"Test CSV{describe_row_sample(test_df)}.")
+    if test_df is not None:
         Xtest,Ytest,test_names,test_outputs,test_cats,_=encode(test_df,types,maps); del test_df
-        if test_names!=names or test_outputs!=out_names or test_cats!=cats: raise ValueError("Test CSV columns/types do not match training data")
+        if test_names!=base_names or test_outputs!=out_names or test_cats!=cats: raise ValueError("Test CSV columns/types do not match training data")
+        Xtest=custom_feature_columns(Xtest,derived)
     if Xv is not None and len(Xv)<3:
         raise ValueError("Validation needs at least three rows when affine scaling is enabled")
     if len(Xt)<4 and Xv is not None: raise ValueError("Need at least four training rows after validation split")
     if coev and len(Xt)<=512: print(f"Co-evolution subsamples only above 512 training rows; with {len(Xt)} rows every generation scores all rows.")
     configure_units(getattr(args,"units",""),list(names))
     if UNIT_FEATURES: print(f"Dimensional analysis on {len(UNIT_FEATURES)} column(s) over base units {', '.join(UNIT_BASES)}.")
+    configure_input_relations(getattr(args,"input_relations",None) or (),list(names),source_columns,types)
+    if INPUT_RELATIONS: print(f"Input relations: {'; '.join('('+', '.join(columns)+')' for columns in INPUT_RELATIONS)}; their columns combine with outside inputs only as complete subexpressions.")
     hypotheses=discover_hypotheses(Xt,Yt,names,out_names)
     interaction_discovery=discover_interaction_fragments(Xt,Yt,names,out_names,ops,Xv,Yv)
     if interaction_discovery["status"]=="ok":
@@ -7918,15 +8801,15 @@ def train_from_setup(args, setup, choose_model=None):
         "islands":{"count":island_count,"population_total":args.population,"migration_interval":migration_interval,"migrants_per_island":migrants_per_island,"topology":"ring","state":"independent population, Bayesian banks, archive, QD, fragment library, pressure, ADF, and budget",
                    "stages":{key:stages[key] for key in ("mode","count","interval","age_gap","schedule","threshold_quantile")},
                    "roles":{key:roles[key] for key in ("enabled","interval","mix","retire_after","assignments")}},
-        "equivalence_collapse":EQUIVALENCE_COLLAPSE,"residual_archive":RESIDUAL_ARCHIVE,"qd_parent_choice":QD_PARENT_CHOICE,"scale_balanced_selection":SCALE_BALANCED_SELECTION,
-        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"selection_probe_filter":SELECTION_PROBE_FILTER,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"fit_iterations":CONSTANT_FIT_ITERATIONS,"semantic_max_delta":SEMANTIC_MAX_DELTA,"constant_snapping":CONSTANT_SNAPPING,"snap_tolerance":SNAP_TOLERANCE,"readout":READOUT_MODE,"max_terms":MAX_TERMS,"gene_crossover_rate":GENE_CROSSOVER_RATE,"backprop_mutation_weight":BACKPROP_MUTATION_WEIGHT,"backprop_inverse":BACKPROP_INVERSE,"residual_term_weight":RESIDUAL_TERM_WEIGHT,"loss":LOSS_MODE,"huber_delta":ROBUST_LOSS_DELTA,"forbid_nesting":",".join(sorted(f"{o}>{i}" for o,i in NESTING_RULES)),"units":UNIT_SPEC,"sparse_seeding":SPARSE_SEEDING,"sparse_basis_size":SPARSE_BASIS_SIZE,"squash_swap_weight":SQUASH_SWAP_WEIGHT,"smooth_swap_weight":SMOOTH_SWAP_WEIGHT,"gate_mutation_weight":GATE_MUTATION_WEIGHT,"loss_noise_floor":LOSS_NOISE_FLOOR,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age",
+        "equivalence_collapse":EQUIVALENCE_COLLAPSE,"residual_archive":RESIDUAL_ARCHIVE,"qd_parent_choice":QD_PARENT_CHOICE,"scale_balanced_selection":SCALE_BALANCED_SELECTION,"class_balance":CLASS_BALANCE,
+        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"selection_probe_filter":SELECTION_PROBE_FILTER,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"fit_iterations":CONSTANT_FIT_ITERATIONS,"semantic_max_delta":SEMANTIC_MAX_DELTA,"constant_snapping":CONSTANT_SNAPPING,"snap_tolerance":SNAP_TOLERANCE,"readout":READOUT_MODE,"max_terms":MAX_TERMS,"gene_crossover_rate":GENE_CROSSOVER_RATE,"backprop_mutation_weight":BACKPROP_MUTATION_WEIGHT,"backprop_inverse":BACKPROP_INVERSE,"residual_term_weight":RESIDUAL_TERM_WEIGHT,"loss":LOSS_MODE,"huber_delta":ROBUST_LOSS_DELTA,"forbid_nesting":",".join(sorted(f"{o}>{i}" for o,i in NESTING_RULES)),"units":UNIT_SPEC,"input_relations":RELATION_SPEC,"custom_ops":list(CUSTOM_OP_SPECS),"custom_feature_base":CUSTOM_FEATURE_BASE,"clip":CLIP,"eps":EPS,"sparse_seeding":SPARSE_SEEDING,"sparse_basis_size":SPARSE_BASIS_SIZE,"squash_swap_weight":SQUASH_SWAP_WEIGHT,"smooth_swap_weight":SMOOTH_SWAP_WEIGHT,"gate_mutation_weight":GATE_MUTATION_WEIGHT,"loss_noise_floor":LOSS_NOISE_FLOOR,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age",
         "test_csv":str(Path(args.test_csv).resolve()) if args.test_csv else None,
         "row_sample":row_sample,
     },(source_rows,source_columns),train_indices,validation_indices,external_validation)
     print(f"Run manifest: {manifest_path}")
     checkpoint_path=manifest_path.parent / "checkpoint_latest.json"
     checkpoint_state={"dataset_path":str(path.resolve()),"types":types,"operators":ops,"affine_on":affine_on,
-        "coev":coev,"nodes":nodes,"depth":depth,"X":X,"Y":Y,"Xt":Xt,"Yt":Yt,"Xv":Xv,"Yv":Yv,
+        "coev":coev,"nodes":nodes,"depth":depth,"X":X,"Y":Y,"Xt":Xt,"Yt":Yt,"Xv":Xv,"Yv":Yv,"Xtest":Xtest,"Ytest":Ytest,
         "names":names,"out_names":out_names,"cats":cats,"maps":maps,"encoding_schema":{"version":1,"fit_scope":"training_rows_only","maps":maps},"source_columns":source_columns,
         "export_fixture":export_fixture,"input_ranges":input_ranges,
         "run_seed":run_seed,"manifest":str(manifest_path.resolve()),"bayesian_proposal_rate":args.bayesian_proposal_rate,"bayesian_mode":args.bayesian_mode,"crossover_rate":args.crossover_rate,"evaluation_workers":resolve_worker_count(args.workers,args.population),
@@ -7935,8 +8818,8 @@ def train_from_setup(args, setup, choose_model=None):
         "nsga_normalization":args.nsga_normalization,"parsimony_quality_tolerance":args.parsimony_quality_tolerance,"dynamic_pressure_enabled":dynamic_pressure_on,"adf_registry":ADFRegistry(adf_enabled,allow_nested=args.adf_mode=="nested").snapshot(),
         "profile":args.profile,"constraint_metadata":metadata,"constraints":constraints.describe(),"bayesian_particles":args.bayesian_particles,"interaction_discovery":interaction_discovery,
         "island_config":{"count":island_count,"migration_interval":migration_interval,"migrants_per_island":migrants_per_island,"topology":"ring","migration_events":0,"stages":stages,"roles":roles},
-        "equivalence_collapse":EQUIVALENCE_COLLAPSE,"residual_archive":RESIDUAL_ARCHIVE,"qd_parent_choice":QD_PARENT_CHOICE,"scale_balanced_selection":SCALE_BALANCED_SELECTION,
-        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"selection_probe_filter":SELECTION_PROBE_FILTER,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"fit_iterations":CONSTANT_FIT_ITERATIONS,"semantic_max_delta":SEMANTIC_MAX_DELTA,"constant_snapping":CONSTANT_SNAPPING,"snap_tolerance":SNAP_TOLERANCE,"readout":READOUT_MODE,"max_terms":MAX_TERMS,"gene_crossover_rate":GENE_CROSSOVER_RATE,"backprop_mutation_weight":BACKPROP_MUTATION_WEIGHT,"backprop_inverse":BACKPROP_INVERSE,"residual_term_weight":RESIDUAL_TERM_WEIGHT,"loss":LOSS_MODE,"huber_delta":ROBUST_LOSS_DELTA,"forbid_nesting":",".join(sorted(f"{o}>{i}" for o,i in NESTING_RULES)),"units":UNIT_SPEC,"sparse_seeding":SPARSE_SEEDING,"sparse_basis_size":SPARSE_BASIS_SIZE,"squash_swap_weight":SQUASH_SWAP_WEIGHT,"smooth_swap_weight":SMOOTH_SWAP_WEIGHT,"gate_mutation_weight":GATE_MUTATION_WEIGHT,"loss_noise_floor":LOSS_NOISE_FLOOR,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age"}
+        "equivalence_collapse":EQUIVALENCE_COLLAPSE,"residual_archive":RESIDUAL_ARCHIVE,"qd_parent_choice":QD_PARENT_CHOICE,"scale_balanced_selection":SCALE_BALANCED_SELECTION,"class_balance":CLASS_BALANCE,
+        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"selection_probe_filter":SELECTION_PROBE_FILTER,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"fit_iterations":CONSTANT_FIT_ITERATIONS,"semantic_max_delta":SEMANTIC_MAX_DELTA,"constant_snapping":CONSTANT_SNAPPING,"snap_tolerance":SNAP_TOLERANCE,"readout":READOUT_MODE,"max_terms":MAX_TERMS,"gene_crossover_rate":GENE_CROSSOVER_RATE,"backprop_mutation_weight":BACKPROP_MUTATION_WEIGHT,"backprop_inverse":BACKPROP_INVERSE,"residual_term_weight":RESIDUAL_TERM_WEIGHT,"loss":LOSS_MODE,"huber_delta":ROBUST_LOSS_DELTA,"forbid_nesting":",".join(sorted(f"{o}>{i}" for o,i in NESTING_RULES)),"units":UNIT_SPEC,"input_relations":RELATION_SPEC,"custom_ops":list(CUSTOM_OP_SPECS),"custom_feature_base":CUSTOM_FEATURE_BASE,"clip":CLIP,"eps":EPS,"sparse_seeding":SPARSE_SEEDING,"sparse_basis_size":SPARSE_BASIS_SIZE,"squash_swap_weight":SQUASH_SWAP_WEIGHT,"smooth_swap_weight":SMOOTH_SWAP_WEIGHT,"gate_mutation_weight":GATE_MUTATION_WEIGHT,"loss_noise_floor":LOSS_NOISE_FLOOR,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age"}
     head_count=sum(len(heads) for heads in classification_layout(cats)[0])
     population_sizes=cell_population_sizes(args.population,cell_count)
     islands=[new_island_runtime(size,X=X,Xt=Xt,cats=cats,ops=ops,nodes=nodes,depth=depth,head_count=head_count,
@@ -7965,7 +8848,8 @@ def train_from_setup(args, setup, choose_model=None):
     print(f"Searching indefinitely with {args.bayesian_proposal_rate:.0%} Bayesian proposals, {topology}, and {'serial evaluation' if workers==1 else f'{workers} worker processes'}; press Ctrl-C to choose and save a model.")
     stop=GracefulStop().__enter__(); interrupted=False
     try:
-        while (not args.max_generations or gen<args.max_generations) and not stop.requested and not stop_rule_reached(args,start,islands):
+        stop_validation={"X":Xv,"Y":Yv,"cats":cats,"constraints":constraints,"out_names":out_names}
+        while (not args.max_generations or gen<args.max_generations) and not stop.requested and not stop_rule_reached(args,start,islands,stop_validation):
             def step(island):
                 def progress(generation,elite,sample):
                     if cell_count>1 and generation%10==0: print(cell_label(island,island_count,stages["count"]),flush=True)
@@ -8023,18 +8907,26 @@ def train_from_setup(args, setup, choose_model=None):
     if chosen.history: print("History:\n  "+"\n  ".join(describe_history(chosen.history)))
     intervals=constant_intervals(chosen,Xt,Yt,cats) if CONSTANT_INTERVALS=="on" else None
     print_constant_intervals(intervals)
+    held_out={}
     if Xv is not None:
-        metrics=frozen_metrics(chosen,Xv,Yv,cats,constraints,out_names)
+        metrics=held_out["validation"]=frozen_metrics(chosen,Xv,Yv,cats,constraints,out_names)
         print(f"Validation (used for selection): loss={metrics['loss']:.6g}, shape={metrics['shape']:.6g} | output losses={output_loss_summary(metrics['losses'],out_names)}")
+        summary=classification_summary(chosen,Xv,Yv,cats,out_names)
+        if summary: print(f"Validation classes: {summary}")
     if Xtest is not None:
-        metrics=frozen_metrics(chosen,Xtest,Ytest,cats,constraints,out_names)
+        metrics=held_out["test"]=frozen_metrics(chosen,Xtest,Ytest,cats,constraints,out_names)
         print(f"Final held-out test (not used for selection): loss={metrics['loss']:.6g}, shape={metrics['shape']:.6g} | output losses={output_loss_summary(metrics['losses'],out_names)}")
-    export_model(chosen,names,out_names,cats,maps,source_columns,types,export_fixture,input_ranges)
-    write_symbolic_export(chosen,names,out_names,cats,Xt)
+        summary=classification_summary(chosen,Xtest,Ytest,cats,out_names)
+        if summary: print(f"Test classes: {summary}")
+    subrun=setup.get("_subrun")
+    if not subrun:
+        export_model(inline_custom_features(chosen,names),names if CUSTOM_FEATURE_BASE is None else names[:CUSTOM_FEATURE_BASE],out_names,cats,maps,source_columns,types,export_fixture,input_ranges)
+        write_symbolic_export(chosen,names,out_names,cats,Xt)
     selected_entry=next(entry for entry in evaluation[1] if entry[0] is chosen)
     selection={**selection,"constant_snapping":snapping,"selected_choice":labels[selected_index],"default_selected":selected_index==0,
                "selected_metrics":selected_entry[2],"selected_objectives":tuple(selected_entry[1].objectives)}
     checkpoint_state["selection"]=selection
+    if subrun: checkpoint_state["separate_output"]=dict(subrun)
     snapshot_islands(checkpoint_state,islands,checkpoint_state["island_config"])
     save_checkpoint(checkpoint_path,gen,islands[0].population,islands[0].bayes,islands[0].archive,checkpoint_state)
     record_selection_manifest(manifest_path,selection)
@@ -8042,9 +8934,15 @@ def train_from_setup(args, setup, choose_model=None):
                                                                                          "residual":None if island.residual_qd is None else island.residual_qd.diagnostics()} for island in islands]},survival={"nsga_normalization":args.nsga_normalization,"parsimony_quality_tolerance":args.parsimony_quality_tolerance,"islands":checkpoint_state["island_config"]},adf_diagnostics=[island.adf_registry.diagnostics() for island in islands if island.adf_registry.enabled] or None,evaluation={"budgets":[island.budget.snapshot() for island in islands],"evaluator":evaluator.diagnostics()},interaction_discovery=interaction_discovery,island_diagnostics={"config":checkpoint_state["island_config"],"bayesian_posteriors":[[bank.particles.last_predictive for bank in island.bayes.banks] for island in islands]})
     evaluator.close()
     print(f"Model card: {card}")
+    result={"checkpoint":str(checkpoint_path.resolve()),"manifest":str(manifest_path.resolve()),"model_card":str(Path(card).resolve()),
+            "generation":gen,"selected":labels[selected_index],"equation":equations(chosen,names,out_names,cats),
+            "metrics":{split:{"loss":item["loss"],"shape":item["shape"],"losses":dict(zip(out_names,item["losses"]))} for split,item in held_out.items()}}
+    if subrun:
+        result.update(model=chosen,names=list(names),maps=maps,cats=cats,out_names=list(out_names),types=list(types),selected_metrics=selected_entry[2],
+                      derived=dict(CUSTOM_FEATURES))
+        return result
     print("Saved best_model.py")
-    return {"checkpoint":str(checkpoint_path.resolve()),"manifest":str(manifest_path.resolve()),"model_card":str(Path(card).resolve()),
-            "generation":gen,"selected":labels[selected_index],"equation":equations(chosen,names,out_names,cats)}
+    return result
 
 if __name__=="__main__":
     try: main()

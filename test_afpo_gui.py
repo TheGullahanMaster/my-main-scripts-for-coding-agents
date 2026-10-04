@@ -69,6 +69,18 @@ class GuiTests(unittest.TestCase):
             gui.check_form(bad)
         self.assertTrue(gui.check_form(form(self.csv))["ok"])
 
+    def test_relation_fields_become_flags(self):
+        related = form(self.csv)
+        related["data"]["input_relations"] = "a,b\n"
+        related["data"]["output_relations"] = "y -> y2\n\n"
+        related["data"]["custom_ops"] = "fq = a / v0\n"
+        argv = gui.build_argv(related)
+        self.assertIn(["--input-relations", "a,b"], [argv[i:i + 2] for i in range(len(argv))])
+        self.assertIn(["--output-relations", "y -> y2"], [argv[i:i + 2] for i in range(len(argv))])
+        self.assertIn(["--custom-op", "fq = a / v0"], [argv[i:i + 2] for i in range(len(argv))])
+        self.assertIn("output_mode", {item["dest"] for item in gui.options()["advanced"]})
+        self.assertNotIn("input_relations", {item["dest"] for item in gui.options()["advanced"]})
+
     def test_stage_and_role_fields_reach_the_setup(self):
         staged = form(self.csv, islands=2, migration_interval=5, migrants=1, stage_mode="both", stages=2,
                       stage_interval=4, stage_quantile=.4, stage_age_gap=6, stage_schedule="linear", roles=True, role_interval=7)
@@ -154,6 +166,18 @@ class GuiTests(unittest.TestCase):
         self.assertEqual(values.shape, (7, 7))
         self.assertAlmostEqual(values[6, 0], explorer.predict(index, {"a": -1, "b": 2, "c": .3})["outputs"]["y"], places=9)
         self.assertEqual(set(grid["data"]["coords"]), {"a", "b"})
+        self.assertEqual(set(grid["data_sets"]), {"validation"})           # no test CSV in this run
+        # Editing: the text round-trips, and an edit becomes a new, scored candidate.
+        heads = explorer.edit_text(index)["heads"]
+        self.assertEqual(len(heads), 1)
+        same = explorer.edit(index, [heads[0]["text"]])
+        np.testing.assert_allclose(explorer.sweep(same["index"], "a")["outputs"]["y"]["values"], sweep["outputs"]["y"]["values"])
+        shifted = explorer.edit(index, [f"({heads[0]['text']}) + 1"])
+        np.testing.assert_allclose(np.asarray(explorer.sweep(shifted["index"], "a")["outputs"]["y"]["values"]),
+                                   np.asarray(sweep["outputs"]["y"]["values"]) + 1)
+        self.assertTrue(shifted["summary"]["models"][shifted["index"]]["label"].startswith("Edited"))
+        with self.assertRaisesRegex(ValueError, "Unknown input"):
+            explorer.edit(index, ["a + nope"])
         with self.assertRaises(ValueError):
             explorer.grid(index, "a", "a")
         with self.assertRaises(ValueError):
@@ -264,3 +288,40 @@ class GuiTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _slow(seconds):
+    time.sleep(seconds)
+    return seconds
+
+
+def _fail():
+    raise ValueError("boom")
+
+
+class IsolatedJobTests(unittest.TestCase):
+    """Heavy symbolic work runs in a killable child, never under the explorer lock."""
+
+    def test_result_timeout_error_and_cancel(self):
+        job = gui.IsolatedJob()
+        self.assertEqual(job.run(_slow, (0.01,), 10), 0.01)
+        with self.assertRaises(TimeoutError):
+            job.run(_slow, (30,), 0.3)
+        with self.assertRaisesRegex(RuntimeError, "boom"):
+            job.run(_fail, (), 10)
+        import threading
+        outcome = {}
+        waiter = threading.Thread(target=lambda: outcome.setdefault("first", self._capture(job, 30)))
+        waiter.start(); time.sleep(0.3)
+        started = time.time()
+        self.assertEqual(job.run(_slow, (0.01,), 10), 0.01)           # the newer request kills the older one
+        waiter.join(5)
+        self.assertIsInstance(outcome.get("first"), InterruptedError)
+        self.assertLess(time.time() - started, 5)
+
+    @staticmethod
+    def _capture(job, seconds):
+        try:
+            return job.run(_slow, (seconds,), 60)
+        except Exception as error:
+            return error

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import multiprocessing
 import contextlib
 import io
 import json
@@ -44,7 +45,7 @@ MAX_GENERATE_ROWS = 5_000_000
 GENERATE_CHUNK = 50_000
 # Options with their own place in the form (or not meaningful from the GUI).
 FORM_HANDLED = {"resume", "migrate_checkpoint", "allow_unsafe_pickle", "gui", "port", "test_csv",
-                "constraint_metadata", "sequence_group", "max_generations", "population", "seed", "workers", "adf_mode", "help"}
+                "constraint_metadata", "sequence_group", "input_relations", "output_relations", "custom_op", "max_generations", "population", "seed", "workers", "adf_mode", "help"}
 
 
 # ───────────────────────── helpers ─────────────────────────
@@ -244,6 +245,10 @@ def build_argv(form):
     for line in str(data.get("sequence_groups") or "").splitlines():
         if line.strip():
             argv += ["--sequence-group", line.strip()]
+    for field, flag in (("input_relations", "--input-relations"), ("output_relations", "--output-relations"), ("custom_ops", "--custom-op")):
+        for line in str(data.get(field) or "").splitlines():
+            if line.strip():
+                argv += [flag, line.strip()]
     return argv
 
 
@@ -340,6 +345,7 @@ class Telemetry:
         self.last_snapshot = 0.
         self.validation_cache = {}
         self.announced = False
+        self.announced_outputs = None
 
     def emit(self, kind, **data):
         self.stream.write(json.dumps(clean({"kind": kind, "time": time.time(), **data}), allow_nan=False) + "\n")
@@ -371,10 +377,15 @@ class Telemetry:
     def hook(self, **kw):
         # Cells evolved in parallel processes arrive as fresh objects each
         # generation, so key on the stable (island, stage) label when given.
+        names, out_names, cats = kw["names"], kw["out_names"], kw["cats"]
+        # Separate-output runs search one output after another: each search
+        # announces itself afresh, and the live view follows the current one.
+        if self.announced and list(out_names) != self.announced_outputs:
+            self.announced = False; self.islands = {}; self.latest = {}; self.validation_cache = {}
         island = self.islands.setdefault(kw.get("cell") or id(kw["archive"]), len(self.islands))
         self.latest[island] = kw
-        names, out_names, cats = kw["names"], kw["out_names"], kw["cats"]
         if not self.announced:
+            self.announced_outputs = list(out_names)
             self.announced = True
             self.emit("config", names=names, outputs=out_names, cats=cats, islands=self.island_count, stages=self.stage_count,
                       train_rows=len(kw["Xt"]), validation_rows=0 if kw["Xv"] is None else len(kw["Xv"]))
@@ -610,6 +621,8 @@ class TrainingSession:
                 self.snapshot = event
                 self.snapshot_seq += 1
             elif kind == "config":
+                if self.config is not None:          # the next output's search of a separate-output run
+                    self.history = []; self.snapshot = None
                 self.config = event
             elif kind == "choose":
                 self.choose = event
@@ -667,6 +680,75 @@ class TrainingSession:
 
 
 # ───────────────────────── model explorer ─────────────────────────
+SYMBOLIC_TIMEOUT = 120.      # seconds a rendered-equation conversion may take
+
+
+def _latex_payload(model, names, out_names, cats, positive, Xt):
+    """The rendered-equation view of a model, as plain JSON-ready data (runs in a child process)."""
+    result = afpo.symbolic_model(model, names, out_names, cats, positive, Xt)
+    if result is None:
+        return {"available": False, "reason": "Install sympy to see the rendered equation."}
+    outputs = []
+    for name, entry in result.items():
+        forms = {mode: {"latex": None, "error": entry.get("errors", {}).get(mode)} if entry[mode][0] is None else
+                 {"latex": entry[mode][1], "text": str(entry[mode][0]),
+                  "mathml": afpo.mathml_expression(entry[mode][0], entry[mode][0].free_symbols)} for mode in ("exact", "raw")}
+        agreement = entry["agreement"]
+        outputs.append({"name": name, "name_latex": entry.get("name_latex") or afpo.latex_symbol_name(name.replace(" ", "_")), **forms,
+                        "agreement": None if agreement is None else
+                        {"defined": agreement[0], "gap": None if not math.isfinite(agreement[1]) else agreement[1]},
+                        "output": entry.get("output"), "decision": entry.get("decision")})
+    return {"available": True, "outputs": outputs}
+
+
+class IsolatedJob:
+    """Run one CPU-heavy pure-Python call in a forked child, so it neither holds
+    the GIL against the server's other threads nor outlives a newer request:
+    starting a job (or cancel()) kills the one before it."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.proc = None
+
+    def cancel(self):
+        with self.lock:
+            proc, self.proc = self.proc, None
+        if proc is not None and proc.is_alive():
+            proc.kill()
+
+    def run(self, function, args, timeout):
+        if "fork" not in multiprocessing.get_all_start_methods():
+            return function(*args)              # no fork: run in this (request) thread
+        context = multiprocessing.get_context("fork")
+        reader, writer = context.Pipe(duplex=False)
+
+        def target():
+            try:
+                writer.send(("ok", function(*args)))
+            except BaseException as error:  # report, never hang the waiting request
+                writer.send(("error", f"{type(error).__name__}: {error}"))
+
+        self.cancel()
+        proc = context.Process(target=target, daemon=True)
+        with self.lock:
+            proc.start(); self.proc = proc
+        writer.close()
+        try:
+            if not reader.poll(timeout):
+                proc.kill()
+                raise TimeoutError(f"gave up after {timeout:g} s")
+            status, value = reader.recv()
+        except EOFError:
+            raise InterruptedError("cancelled by a newer request") from None
+        finally:
+            reader.close(); proc.join(1)
+            with self.lock:
+                if self.proc is proc: self.proc = None
+        if status == "error":
+            raise RuntimeError(value)
+        return value
+
+
 class ModelExplorer:
     """Loads a checkpoint in the GUI process to browse, plot, predict with and export its models."""
 
@@ -677,6 +759,7 @@ class ModelExplorer:
         self.path = None
         self.files = {}
         self.job = None
+        self.symbolic = IsolatedJob()
 
     def _require(self):
         if self.state is None:
@@ -688,6 +771,12 @@ class ModelExplorer:
             generation, pop, bayes, archive, state = afpo.load_checkpoint(path, allow_unsafe_pickle=False)
             maps = state["maps"]
             afpo.SEQUENCE_LAYOUT = maps.get(afpo.SEQUENCE_LAYOUT_KEY)
+            self.symbolic.cancel()
+            # Settings the models were searched with: numeric limits and user operators (names, bodies).
+            afpo.set_numeric_limits(state.get("clip", afpo.DEFAULT_CLIP), state.get("eps", afpo.DEFAULT_EPS))
+            base = state.get("custom_feature_base")
+            afpo.configure_custom_ops(state.get("custom_ops", ()), list(state["names"]) if base is None else list(state["names"])[:base],
+                                      state.get("source_columns", ()), state.get("types", ()))
             tolerance = state.get("parsimony_quality_tolerance", 0.)
             simplifier_keys = set()
             if state.get("island_states"):
@@ -748,6 +837,7 @@ class ModelExplorer:
                 "outputs": state["out_names"], "cats": state["cats"], "inputs": inputs, "models": out,
                 "dataset": state.get("dataset_path"), "seed": state.get("run_seed"),
                 "train_rows": len(state["Xt"]), "validation_rows": 0 if state.get("Xv") is None else len(state["Xv"]),
+                "test_rows": 0 if state.get("Xtest") is None else len(state["Xtest"]),
                 "saved_selection": (saved or {}).get("selected_choice"), "manifest": state.get("manifest")}
 
     def _model(self, index):
@@ -764,8 +854,11 @@ class ModelExplorer:
             item = self.models[int(index)]
             validation = (afpo.frozen_metrics(model, state["Xv"], state["Yv"], cats, self.constraints, out_names)
                           if state.get("Xv") is not None else None)
+            test = (afpo.frozen_metrics(model, state["Xtest"], state["Ytest"], cats, self.constraints, out_names)
+                    if state.get("Xtest") is not None else None)
             per_output = [{"name": name, "train_loss": item["train"]["losses"][j],
-                           "validation_loss": None if validation is None else validation["losses"][j]}
+                           "validation_loss": None if validation is None else validation["losses"][j],
+                           "test_loss": None if test is None else test["losses"][j]}
                           for j, name in enumerate(out_names)]
             return {"index": int(index), "label": item["label"], "equations": afpo.equations(model, names, out_names, cats).split("; "),
                     "adfs": afpo.adf_display_definitions(model, names),
@@ -778,33 +871,78 @@ class ModelExplorer:
                     "history": [dict(record) for record in model.history], "history_text": afpo.describe_history(model.history)}
 
     def latex(self, index):
-        """Exact and raw equation forms of a model for the rendered-equation view (needs sympy)."""
+        """Exact and raw equation forms of a model for the rendered-equation view (needs sympy).
+
+        SymPy simplification of a large equation can take minutes of pure
+        Python: it runs in a child process (IsolatedJob) outside the explorer
+        lock, so browsing data, plotting and sampling stay responsive, and a
+        newer request (another model) cancels it."""
         with self.lock:
             model, state = self._model(index), self.state
-            cached = self.models[int(index)].get("latex")
-            if cached is not None:
-                return cached
+            item = self.models[int(index)]
+            if item.get("latex") is not None:
+                return item["latex"]
             names, out_names, cats, Xt = state["names"], state["out_names"], state["cats"], state["Xt"]
             positive = tuple(i for i in range(Xt.shape[1]) if len(Xt) and np.all(Xt[:, i] > 0))
-            try:
-                result = afpo.symbolic_model(model, names, out_names, cats, positive, Xt)
-            except Exception as error:  # an unsupported operator must not break the model view
-                return {"available": False, "reason": f"Symbolic conversion failed: {error}"}
-            if result is None:
-                return {"available": False, "reason": "Install sympy to see the rendered equation."}
-            outputs = []
-            for name, entry in result.items():
-                forms = {mode: {"latex": None, "error": entry.get("errors", {}).get(mode)} if entry[mode][0] is None else
-                         {"latex": entry[mode][1], "text": str(entry[mode][0]),
-                          "mathml": afpo.mathml_expression(entry[mode][0], entry[mode][0].free_symbols)} for mode in ("exact", "raw")}
-                agreement = entry["agreement"]
-                outputs.append({"name": name, "name_latex": entry.get("name_latex") or afpo.latex_symbol_name(name.replace(" ", "_")), **forms,
-                                "agreement": None if agreement is None else
-                                {"defined": agreement[0], "gap": None if not math.isfinite(agreement[1]) else agreement[1]},
-                                "output": entry.get("output"), "decision": entry.get("decision")})
-            payload = {"available": True, "outputs": outputs}
-            self.models[int(index)]["latex"] = payload
-            return payload
+        try:
+            payload = self.symbolic.run(_latex_payload, (model, names, out_names, cats, positive, Xt), SYMBOLIC_TIMEOUT)
+        except InterruptedError:
+            return {"available": False, "cancelled": True, "reason": "Cancelled: another model was selected."}
+        except TimeoutError as error:
+            return {"available": False, "reason": f"The equation is too large to render ({error}); the text form above is exact."}
+        except Exception as error:  # an unsupported operator must not break the model view
+            return {"available": False, "reason": f"Symbolic conversion failed: {error}"}
+        with self.lock:
+            if self.state is state and int(index) < len(self.models) and self.models[int(index)] is item:
+                item["latex"] = payload
+        return payload
+
+    def _head_labels(self):
+        state = self.state
+        labels = []
+        for name, classes in zip(state["out_names"], state["cats"]):
+            labels.extend([f"{name}[{c!r}] score" for c in classes] if classes is not None and len(classes) > 2 else [name])
+        return labels
+
+    def edit_text(self, index):
+        """Each equation head with its readout, in the editable syntax (afpo.parse_equation)."""
+        with self.lock:
+            model, state = self._model(index), self.state
+            return {"heads": [{"label": label, "text": afpo.readout_text(tree, scale, state["names"])}
+                              for label, tree, scale in zip(self._head_labels(), model.trees, model.scales)]}
+
+    def edit(self, index, texts, refit=False):
+        """A new candidate from edited equations (optionally with its constants re-fitted); returns its index."""
+        with self.lock:
+            original, state = self._model(index), self.state
+            names, out_names, cats = state["names"], state["out_names"], state["cats"]
+            if len(texts) != len(original.trees):
+                raise ValueError(f"Expected {len(original.trees)} equation(s)")
+            trees = []
+            for label, text in zip(self._head_labels(), texts):
+                try:
+                    trees.append(afpo.parse_equation(text, names, original.adfs))
+                except ValueError as error:
+                    raise ValueError(f"{label}: {error}") from None
+            used = {node[0] for tree in trees for node in afpo.walk_tree(tree) if node[0] not in ("x", "c", "arg")}
+            model = afpo.Model(trees, [(1., 0.)] * len(trees), origin="edited", mdl_operators=tuple(dict.fromkeys([*original.mdl_operators, *sorted(used)])),
+                               mdl_feature_count=original.mdl_feature_count or len(names), adfs=dict(original.adfs), history=original.history)
+            Xt, Yt = state["Xt"], state["Yt"]
+            if refit:
+                afpo.tune_model_constants(model, Xt, Yt, state.get("affine_on", True), cats)
+                afpo.assess(model, Xt, Yt, state.get("affine_on", True), cats, fit_affine=True, constraints=self.constraints, output_names=out_names)
+            else:
+                afpo.assess(model, Xt, Yt, False, cats, fit_affine=False, constraints=self.constraints, output_names=out_names)
+            if not model.feasible:
+                raise ValueError(f"The edited model cannot be scored ({model.invalid_reason})")
+            entries = afpo.selection_evaluation([model], state.get("Xv"), state.get("Yv"), cats, self.constraints, out_names)[1]
+            if not entries:
+                raise ValueError("The edited model gives non-finite results")
+            _, _, metrics = entries[0]
+            train = afpo.frozen_metrics(model, Xt, Yt, cats, self.constraints, out_names)
+            self.models.append({"model": model, "metrics": metrics, "train": train,
+                                "label": f"Edited (from #{int(index) + 1})" + (", refitted" if refit else ""), "frontier": False})
+            return {"index": len(self.models) - 1, "summary": self.summary(state.get("selection") or {})}
 
     def _inputs_used(self, model):
         """Source input columns the model reads (a text column counts if any of its categories is used)."""
@@ -817,7 +955,7 @@ class ModelExplorer:
         """Predicted vs. actual (regression) or a confusion matrix (classification)."""
         with self.lock:
             model, state = self._model(index), self.state
-            X, Y = (state["Xv"], state["Yv"]) if split == "validation" and state.get("Xv") is not None else (state["Xt"], state["Yt"])
+            X, Y, split = self._split(split)
             prediction = afpo.predict_targets(model, X, state["cats"])
             rows = np.arange(len(X))
             if len(rows) > MAX_FIT_POINTS:
@@ -839,7 +977,16 @@ class ModelExplorer:
                             matrix[t, g] += 1
                     outputs.append({"name": name, "kind": "classification", "labels": labels, "matrix": matrix,
                                     "accuracy": float(np.mean(truth == guess))})
-            return {"split": "validation" if X is state.get("Xv") else "train", "rows": len(X), "outputs": outputs}
+            return {"split": split, "rows": len(X), "outputs": outputs}
+
+    def _split(self, split):
+        """(X, Y, name) of the training, validation or test rows; an unavailable split falls back to training."""
+        state = self.state
+        if split == "validation" and state.get("Xv") is not None:
+            return state["Xv"], state["Yv"], "validation"
+        if split == "test" and state.get("Xtest") is not None:
+            return state["Xtest"], state["Ytest"], "test"
+        return state["Xt"], state["Yt"], "train"
 
     def _encode(self, rows):
         state = self.state
@@ -848,7 +995,7 @@ class ModelExplorer:
         for column, kind in zip(state["source_columns"], state["types"]):
             if kind == 1:
                 frame[column] = pd.to_numeric(frame[column], errors="coerce")
-        return afpo.encode(frame, state["types"], state["maps"])[0]
+        return afpo.append_custom_features(afpo.encode(frame, state["types"], state["maps"])[0])
 
     def _typical_row(self):
         state = self.state
@@ -928,26 +1075,32 @@ class ModelExplorer:
                                       if dist is not None and dist.shape[1] == len(labels) else {})}
         return outputs
 
-    def _training_points(self, columns):
+    def _point_sets(self, columns):
+        """Validation and test rows (when the run had them) in _training_points' form, keyed by split."""
+        return {split: self._training_points(columns, split) for split in ("validation", "test")
+                if self.state.get("Xv" if split == "validation" else "Xtest") is not None}
+
+    def _training_points(self, columns, split="train"):
         """A sample of training rows: the explored inputs (category index for text inputs) and the targets."""
         state = self.state
-        rows = np.arange(len(state["Xt"]))
+        X, Y, _ = self._split(split)
+        rows = np.arange(len(X))
         if len(rows) > MAX_FIT_POINTS:
             rows = np.random.default_rng(1).choice(rows, MAX_FIT_POINTS, replace=False)
         coords = {}
         for column in columns:
             kind = state["types"][state["source_columns"].index(column)]
             if kind == 1 and column in state["names"]:
-                coords[column] = state["Xt"][rows, state["names"].index(column)]
+                coords[column] = X[rows, state["names"].index(column)]
             elif kind == 2:
                 classes = state["maps"].get(column, [])
                 onehot = [state["names"].index(f"{column}={cl}") for cl in classes if f"{column}={cl}" in state["names"]]
                 if len(onehot) != len(classes):
                     return None
-                coords[column] = np.argmax(state["Xt"][np.ix_(rows, onehot)], axis=1)
+                coords[column] = np.argmax(X[np.ix_(rows, onehot)], axis=1)
             else:
                 return None        # sequence-derived inputs have no single raw column
-        return {"coords": coords, "targets": {name: state["Yt"][rows, j] for j, name in enumerate(state["out_names"])}}
+        return {"coords": coords, "targets": {name: Y[rows, j] for j, name in enumerate(state["out_names"])}}
 
     def sweep(self, index, column, base=None, lo=None, hi=None, points=160):
         """1D: one input varied, every other input frozen (typical values unless overridden)."""
@@ -957,7 +1110,7 @@ class ModelExplorer:
             base = self._base(base)
             return {"column": column, "kind": kind, "x": xs, "base": base,
                     "outputs": self._surface(model, [{**base, column: x} for x in xs]),
-                    "data": self._training_points([column])}
+                    "data": self._training_points([column]), "data_sets": self._point_sets([column])}
 
     def grid(self, index, x, y, base=None, x_lo=None, x_hi=None, y_lo=None, y_hi=None, points=60):
         """2D/3D: two inputs over a grid, the rest frozen.  Values are row-major: z[yi][xi]."""
@@ -978,7 +1131,7 @@ class ModelExplorer:
                     item["predicted"] = np.asarray(item["predicted"]).reshape(shape)
                     item["prob"] = {label: np.asarray(v, float).reshape(shape) for label, v in item["prob"].items()}
             return {"x": {"column": x, "kind": x_kind, "values": xs}, "y": {"column": y, "kind": y_kind, "values": ys},
-                    "base": base, "outputs": outputs, "data": self._training_points([x, y])}
+                    "base": base, "outputs": outputs, "data": self._training_points([x, y]), "data_sets": self._point_sets([x, y])}
 
     def predict_csv(self, index, path, delimiter=","):
         with self.lock:
@@ -1000,7 +1153,7 @@ class ModelExplorer:
             if all(name in frame.columns for name in state["out_names"]):
                 Xe, Ye, *_ = afpo.encode(frame[state["source_columns"]] if all(c in frame.columns for c in state["source_columns"]) else
                                          frame.reindex(columns=state["source_columns"]), state["types"], state["maps"])
-                metrics = afpo.frozen_metrics(model, Xe, Ye, state["cats"], self.constraints, state["out_names"])
+                metrics = afpo.frozen_metrics(model, afpo.append_custom_features(Xe), Ye, state["cats"], self.constraints, state["out_names"])
             preview = result.head(25).astype(object).where(result.head(25).notna(), None)
             return {"path": str(destination.resolve()), "rows": int(len(result)), "columns": [str(c) for c in result.columns],
                     "preview": [[None if v is None else str(v) for v in row] for row in preview.values.tolist()], "metrics": metrics}
@@ -1050,8 +1203,9 @@ class ModelExplorer:
     def export(self, index):
         with self.lock:
             model, state = self._model(index), self.state
-            afpo.export_model(model, state["names"], state["out_names"], state["cats"], state["maps"], state["source_columns"],
-                              state["types"], state.get("export_fixture"), state.get("input_ranges"))
+            names = state["names"] if afpo.CUSTOM_FEATURE_BASE is None else state["names"][:afpo.CUSTOM_FEATURE_BASE]
+            afpo.export_model(afpo.inline_custom_features(model, state["names"]), names, state["out_names"], state["cats"], state["maps"],
+                              state["source_columns"], state["types"], state.get("export_fixture"), state.get("input_ranges"))
             written = [p for p in ("best_model.py", "model_tree.svg", "best_model_fixture.csv", "best_model_fixture_predictions.csv") if Path(p).exists()]
             return {"written": [str(Path(p).resolve()) for p in written],
                     "equation": afpo.equations(model, state["names"], state["out_names"], state["cats"])}
@@ -1063,7 +1217,7 @@ def _encode_frame(state, frame):
     for column, kind in zip(state["source_columns"], state["types"]):
         if kind == 1:
             frame[column] = pd.to_numeric(frame[column], errors="coerce")
-    return afpo.encode(frame, state["types"], state["maps"])[0]
+    return afpo.append_custom_features(afpo.encode(frame, state["types"], state["maps"])[0])
 
 
 def generation_plan(state, spec):
@@ -1304,6 +1458,8 @@ def run_gui(host="127.0.0.1", port=DEFAULT_PORT, open_browser=True):
         "/api/models/load": lambda b: explorer.load(b["path"]),
         "/api/models/detail": lambda b: explorer.detail(b["index"]),
         "/api/models/latex": lambda b: explorer.latex(b["index"]),
+        "/api/models/edit_text": lambda b: explorer.edit_text(b["index"]),
+        "/api/models/edit": lambda b: explorer.edit(b["index"], b.get("texts") or [], bool(b.get("refit"))),
         "/api/models/fit": lambda b: explorer.fit(b["index"], b.get("split", "train")),
         "/api/models/predict": lambda b: explorer.predict(b["index"], b.get("row") or {}),
         "/api/models/sweep": lambda b: explorer.sweep(b["index"], b["column"], b.get("base"), b.get("lo"), b.get("hi"), b.get("points", 160)),

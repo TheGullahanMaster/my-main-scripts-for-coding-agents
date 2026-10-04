@@ -34,6 +34,12 @@ from libc.stdlib cimport malloc, free
 
 cdef double EPS = 1e-12
 cdef double CLIP = 1e12
+
+def set_limits(double clip, double eps):
+    """afpo's --clamp: the value clamp and the divisor/log guard used by every kernel below."""
+    global CLIP, EPS
+    CLIP = clip
+    EPS = eps
 cdef double NAN_VALUE = float("nan")
 cdef double PI = 3.141592653589793
 cdef double LOGE2 = 0.693147180559945309417232121458176568
