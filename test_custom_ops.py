@@ -1,0 +1,117 @@
+"""--custom-op: partly known operators with v0/v1 parameters, optional v# slots and fixed columns.
+
+Run with: python -B -m unittest -v test_custom_ops
+"""
+import contextlib
+import io
+import tempfile
+import unittest
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+import afpo as a
+
+NAMES = ["amount", "seconds", "m", "c", "bar", "kpop"]
+X = lambda i: ("x", i)
+ARG = lambda i: ("arg", i)
+
+
+def configure(*specs):
+    return a.configure_custom_ops(list(specs), NAMES, NAMES, [1] * len(NAMES))
+
+
+class ParseTests(unittest.TestCase):
+    def tearDown(self):
+        a.configure_custom_ops((), NAMES)
+
+    def test_columns_and_parameters(self):
+        configure("fq = amount / v0", "speed = v0/seconds")
+        self.assertEqual(a.CUSTOM_OPS["adf_fq"]["tree"], ("/", X(0), ARG(0)))
+        self.assertEqual(a.CUSTOM_OPS["adf_speed"]["tree"], ("/", ARG(0), X(1)))
+
+    def test_shared_parameters(self):
+        configure("foobar = (v0-v1)/(v0+v1)")
+        item = a.CUSTOM_OPS["adf_foobar"]
+        self.assertEqual(item["arity"], 2)
+        self.assertEqual(item["tree"], ("/", ("-", ARG(0), ARG(1)), ("+", ARG(0), ARG(1))))
+
+    def test_no_parameters_is_a_derived_feature(self):
+        derived = configure("E = m*c**2")
+        self.assertEqual(derived, [("E", ("*", X(2), ("square", X(3))))])
+        self.assertEqual(a.CUSTOM_OPS, {})
+
+    def test_optional_slot_drops_its_operation(self):
+        derived = configure("foo = bar + v#*kpop")
+        self.assertEqual(a.CUSTOM_OPS["adf_foo"]["tree"], ("+", X(4), ("*", ARG(0), X(5))))
+        self.assertEqual(derived, [("foo()", ("+", X(4), X(5)))])
+
+    def test_earlier_operators_are_reused(self):
+        configure("foobar = (v0-v1)/(v0+v1)", "maybefoobar = v#*foobar", "twice = foobar(v0, 2) * 2")
+        self.assertEqual(a.CUSTOM_OPS["adf_maybefoobar"]["arity"], 3)          # foobar's two parameters come along
+        self.assertEqual(a.CUSTOM_OPS["adf_maybefoobar__0"]["tree"], a.CUSTOM_OPS["adf_foobar"]["tree"])
+        self.assertEqual(a.CUSTOM_OPS["adf_twice"]["tree"],
+                         ("*", ("/", ("-", ARG(0), ("c", 2.)), ("+", ARG(0), ("c", 2.))), ("c", 2.)))
+
+    def test_bad_specs(self):
+        for spec in ("nonsense", "f = nope + v0", "sin = v0", "f = sin(v0, v1)", "f = v0 if v1 else 2"):
+            with self.subTest(spec=spec), self.assertRaises(ValueError):
+                configure(spec)
+
+
+class EvaluationTests(unittest.TestCase):
+    Xd = np.random.default_rng(0).uniform(1, 3, (30, 6))
+
+    def tearDown(self):
+        a.configure_custom_ops((), NAMES)
+
+    def test_operator_evaluates_and_displays_by_name(self):
+        configure("fq = amount / v0")
+        tree = ("adf_fq", ("c", 2.))
+        np.testing.assert_allclose(a.evaluate(tree, self.Xd), self.Xd[:, 0] / 2)
+        self.assertEqual(a.expr(tree, NAMES), "fq(2)")
+        self.assertEqual(a.operator_arity("adf_fq"), 1)
+
+    def test_user_operator_bodies_are_not_charged_as_definitions(self):
+        configure("fq = amount / v0")
+        m = a.Model([("adf_fq", ("c", 2.))], [(1., 0.)], mdl_operators=("+", "adf_fq"), mdl_feature_count=6)
+        self.assertEqual(a.model_description(m)["adf_definition_bits"], 0)
+        self.assertEqual(a.used_feature_indices(m), (0,))       # the body's column counts for the export contract
+
+    def test_export_inlines_derived_features(self):
+        derived = configure("E = m*c**2")
+        names = NAMES + [label for label, _ in derived]
+        m = a.Model([("+", X(6), X(0))], [(1., 0.)])
+        inlined = a.inline_custom_features(m, names)
+        np.testing.assert_allclose(a.predict_model(inlined, self.Xd)[:, 0], self.Xd[:, 2] * self.Xd[:, 3] ** 2 + self.Xd[:, 0])
+
+
+class RunTests(unittest.TestCase):
+    def tearDown(self):
+        a.configure_custom_ops((), NAMES)
+
+    def test_a_run_uses_and_exports_custom_operators(self):
+        r = np.random.default_rng(1); n = 120
+        frame = pd.DataFrame({"m": r.uniform(1, 3, n), "c": r.uniform(1, 3, n), "z": r.uniform(1, 3, n)})
+        frame["E"] = frame.m * frame.c ** 2 + frame.z
+        with tempfile.TemporaryDirectory() as directory, contextlib.chdir(directory):
+            frame.to_csv("data.csv", index=False)
+            setup = {"df": frame, "path": Path("data.csv"), "types": [1, 1, 1, 5], "delimiter": ",", "ops": ["+", "-", "*"],
+                     "affine_on": True, "coev": False, "dynamic_pressure_on": True, "adf_enabled": False, "nodes": 9, "depth": 4,
+                     "island_count": 1, "migration_interval": 0, "migrants_per_island": 0, "val_path": "", "validation_percent": 20,
+                     "metadata": {}, "stages": None, "roles": None}
+            args = a.parse_cli(["--population", "24", "--max-generations", "3", "--seed", "1", "--workers", "1",
+                                "--custom-op", "mc2 = m*c**2", "--custom-op", "plus = z + v0",
+                                "--symbolic-export", "off", "--constant-intervals", "off"])[1]
+            with contextlib.redirect_stdout(io.StringIO()):
+                a.train_from_setup(args, setup, choose_model=lambda labels, choices, evaluation: 0)
+            exported = Path("best_model.py").read_text()
+            self.assertNotIn("'mc2'", exported.split("'contract'")[1].split("'feature_count'")[0])
+            spec = __import__("importlib.util").util.spec_from_file_location("exported", "best_model.py")
+            module = __import__("importlib.util").util.module_from_spec(spec); spec.loader.exec_module(module)
+            self.assertEqual(len(module.predict_frame(frame)), n)
+
+
+if __name__ == "__main__":
+    unittest.main()

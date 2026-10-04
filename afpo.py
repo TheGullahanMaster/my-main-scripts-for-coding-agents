@@ -395,8 +395,9 @@ def model_description(model, n_features=None, operators=None, adfs=None):
             name=tree[0]
             if name in visiting: raise ValueError(f"Cyclic ADF definition {name!r}")
             if name not in used:
-                item=adfs.get(name)
+                item=adf_definition(name,adfs)
                 if item is None: raise ValueError(f"Missing ADF definition {name!r}")
+                adfs.setdefault(name,item)
                 visiting.add(name); visit(item["tree"]); visiting.remove(name); used.append(name)
         for child in tree[1:]: visit(child)
     for tree in model.trees: visit(tree)
@@ -404,6 +405,7 @@ def model_description(model, n_features=None, operators=None, adfs=None):
     trees=[tree_description(tree,n_features,operators,adfs) for tree in model.trees]
     definitions=[]
     for name in used:
+        if name in CUSTOM_OPS: continue          # a user operator is grammar the user supplied, not a mined definition
         item=adfs.get(name)
         if item is None: raise ValueError(f"Missing ADF definition {name!r}")
         definition=tree_description(item["tree"],n_features,operators,adfs,int(item["arity"]))
@@ -878,7 +880,7 @@ def _evaluate(t, X, adfs=None, arguments=None, position=None):
         if arguments is None or not isinstance(t[1],int) or not 0<=t[1]<len(arguments): raise ValueError("Invalid ADF argument")
         return arguments[t[1]]
     if t[0].startswith("adf_"):
-        item=(adfs or {}).get(t[0])
+        item=adf_definition(t[0],adfs)
         if item is None or len(t)-1 != int(item["arity"]): raise ValueError(f"Unknown or malformed ADF {t[0]!r}")
         values=[_evaluate(q,X,adfs,arguments,position) for q in t[1:]]
         return _evaluate(item["tree"],X,adfs,values,position)
@@ -923,7 +925,7 @@ def _guard_walk(t, X, adfs, arguments=None, position=None):
     if t[0] in ("x","c"):
         value=evaluate(t,X,adfs,None,position); return value,value
     if t[0].startswith("adf_"):
-        item=(adfs or {}).get(t[0])
+        item=adf_definition(t[0],adfs)
         if item is None or len(t)-1!=int(item["arity"]): raise ValueError(f"Unknown or malformed ADF {t[0]!r}")
         pairs=[_guard_walk(q,X,adfs,arguments,position) for q in t[1:]]
         return _guard_walk(item["tree"],X,adfs,pairs,position)
@@ -2241,7 +2243,7 @@ def choose_operator(options):
     options=list(options)
     return options[0] if len(options)==1 else rng.choices(options,weights=[operator_prior(op) for op in options])[0]
 def operator_arity(op, adfs=None):
-    return int((adfs or {}).get(op,{}).get("arity",OPS.get(op,(-1,))[0]))
+    return int((adf_definition(op,adfs) or {}).get("arity",OPS.get(op,(-1,))[0]))
 
 def random_tree(n_features, ops, max_nodes, max_depth, depth=0, proposal=None, adfs=None):
     if proposal is not None and depth==0: proposal.begin_equation()
@@ -2843,6 +2845,172 @@ def structural_violation(tree, opaque=frozenset()):
     """The first --forbid-nesting, --units or --input-relations violation of a tree, or ''."""
     return nesting_violation(tree,opaque=opaque) or unit_violation(tree,opaque) or relation_violation(tree,opaque)
 
+# --custom-op "name = expression": operators the user already knows part of.
+# The expression uses AFPO's own operators only (+ - * / ** %, //, unary -,
+# comparisons and any OPS function such as sin(x) or pow(x, y)), numbers,
+# input column names (`back quotes` for names that are not identifiers), and
+# parameters the search fills in:
+#   v0, v1, ...  required; every v0 gets the same argument, every v1 another;
+#   v#           optional; each occurrence is its own slot, and when the
+#                search leaves it out the operation it took part in goes too
+#                (v#*kpop becomes kpop, bar + v#*kpop becomes bar + kpop);
+#   name         an earlier custom operator: name(a, b) passes arguments,
+#                a bare name brings its parameters along as new ones.
+# "fq = amount / v0" is fq(u) = amount/u; "E = m*c**2" (no parameters) and
+# every variant whose parameters are all left out become derived input
+# features named after the operator.  An operator with parameters becomes a
+# permanent ADF (adf_<name>, shown as name(...)), one per combination of its
+# optional slots; its body's numbers and columns are fixed, the arguments are
+# ordinary subtrees whose constants are fitted.  The export inlines derived
+# features and carries the ADF bodies, so best_model.py reads CSV columns only.
+CUSTOM_OP_SPECS = ()          # the --custom-op strings, as given
+CUSTOM_OPS = {}               # adf name -> {"tree","arity","display","spec"}
+CUSTOM_FEATURES = {}          # derived feature name -> body over the base features
+CUSTOM_FEATURE_BASE = None    # feature count before the derived features
+_BINARY_AST_OPS = {"Add":"+","Sub":"-","Mult":"*","Div":"/","Mod":"mod","FloorDiv":"floordiv","Pow":"pow"}
+_COMPARE_AST_OPS = {"Gt":"gt","Lt":"lt","GtE":"gte","LtE":"lte","Eq":"eq","NotEq":"ne"}
+_POWER_SHORTCUTS = {2.:"square",3.:"cube",.5:"sqrt",-1.:"inv"}
+
+def adf_definition(name, adfs=None):
+    """A model's ADF definition, or the user operator of that name."""
+    return (adfs or {}).get(name) or CUSTOM_OPS.get(name)
+
+def _custom_parse(spec, columns, earlier):
+    """(name, required count, optional count, tree) of one spec; parameters are ("arg", i) / ("opt", k)."""
+    import ast
+    if "=" not in spec: raise ValueError(f"Custom operator needs 'name = expression': {spec!r}")
+    name,body=spec.split("=",1); name=name.strip()
+    if not name.isidentifier() or name.startswith("v") and name[1:].isdigit(): raise ValueError(f"Invalid custom operator name {name!r}")
+    if name in OPS or name in earlier: raise ValueError(f"Custom operator {name!r} clashes with an existing operator")
+    quoted={}
+    def unquote(match):
+        key=f"__col{len(quoted)}"; quoted[key]=match.group(1); return key
+    body=re.sub(r"`([^`]+)`",unquote,body)
+    optional=0
+    def mark(_):
+        nonlocal optional
+        optional+=1; return f"__opt{optional-1}"
+    body=re.sub(r"v#",mark,body)
+    try: parsed=ast.parse(body.strip(),mode="eval").body
+    except SyntaxError as error: raise ValueError(f"Custom operator {name!r}: {error.msg}") from None
+    required=sorted({int(node.id[1:]) for node in ast.walk(parsed) if isinstance(node,ast.Name) and re.fullmatch(r"v\d+",node.id)})
+    slot={number:index for index,number in enumerate(required)}
+    extra=[len(required),optional]       # next free required / optional parameter
+    def bring(definition, arguments=None):
+        """Inline an earlier operator; its own free parameters become this one's."""
+        _,count,options,tree=definition
+        mapping=list(arguments) if arguments is not None else []
+        while len(mapping)<count: mapping.append(("arg",extra[0])); extra[0]+=1
+        renamed={k:extra[1]+k for k in range(options)}; extra[1]+=options
+        def substitute(node):
+            if node[0]=="arg": return mapping[node[1]]
+            if node[0]=="opt": return ("opt",renamed[node[1]])
+            if node[0] in ("x","c"): return node
+            return tuple([node[0]]+[substitute(child) for child in node[1:]])
+        return substitute(tree)
+    def convert(node):
+        if isinstance(node,ast.Constant) and isinstance(node.value,(int,float)) and not isinstance(node.value,bool): return ("c",float(node.value))
+        if isinstance(node,ast.Name):
+            ident=node.id
+            if ident.startswith("__opt"): return ("opt",int(ident[5:]))
+            if re.fullmatch(r"v\d+",ident): return ("arg",slot[int(ident[1:])])
+            column=quoted.get(ident,ident)
+            if column in columns: return ("x",columns[column])
+            if ident in earlier: return bring(earlier[ident])
+            raise ValueError(f"Custom operator {name!r}: unknown name {column!r} (not a numeric input column, parameter or earlier operator)")
+        if isinstance(node,ast.UnaryOp):
+            inner=convert(node.operand)
+            if isinstance(node.op,ast.USub): return ("c",-inner[1]) if inner[0]=="c" else ("neg",inner)
+            if isinstance(node.op,ast.UAdd): return inner
+        if isinstance(node,ast.BinOp) and type(node.op).__name__ in _BINARY_AST_OPS:
+            left,right=convert(node.left),convert(node.right); op=_BINARY_AST_OPS[type(node.op).__name__]
+            if op=="pow" and right[0]=="c" and right[1] in _POWER_SHORTCUTS: return (_POWER_SHORTCUTS[right[1]],left)
+            return (op,left,right)
+        if isinstance(node,ast.Compare) and len(node.ops)==1 and type(node.ops[0]).__name__ in _COMPARE_AST_OPS:
+            return (_COMPARE_AST_OPS[type(node.ops[0]).__name__],convert(node.left),convert(node.comparators[0]))
+        if isinstance(node,ast.Call) and isinstance(node.func,ast.Name) and not node.keywords:
+            function=node.func.id; arguments=[convert(argument) for argument in node.args]
+            if function in earlier:
+                if len(arguments)!=earlier[function][1]: raise ValueError(f"Custom operator {name!r}: {function} takes {earlier[function][1]} argument(s)")
+                return bring(earlier[function],arguments)
+            if function not in OPS: raise ValueError(f"Custom operator {name!r}: unknown function {function!r}")
+            if OPS[function][0]!=len(arguments): raise ValueError(f"Custom operator {name!r}: {function} takes {OPS[function][0]} argument(s)")
+            return tuple([function]+arguments)
+        raise ValueError(f"Custom operator {name!r}: unsupported expression {ast.unparse(node)!r}")
+    tree=convert(parsed)
+    return name,extra[0],extra[1],tree
+
+def _prune_optional(tree, present):
+    """Drop the absent optional slots and the operations they took part in (None if nothing is left)."""
+    if tree[0]=="opt": return ("opt",tree[1]) if tree[1] in present else None
+    if tree[0] in ("x","c","arg"): return tree
+    children=[_prune_optional(child,present) for child in tree[1:]]
+    kept=[child for child in children if child is not None]
+    if len(kept)==len(children): return tuple([tree[0]]+children)
+    if not kept: return None
+    if len(kept)==1: return kept[0]
+    raise ValueError(f"An optional parameter inside {tree[0]}(...) with more than two operands has no clear meaning when left out")
+
+def configure_custom_ops(specs, feature_names, source_columns=(), types=()):
+    """Parse --custom-op specs over the base features; returns the derived feature (name, body) pairs.
+
+    Sets CUSTOM_OPS (operators with parameters) and CUSTOM_FEATURES."""
+    global CUSTOM_OP_SPECS,CUSTOM_OPS,CUSTOM_FEATURES,CUSTOM_FEATURE_BASE
+    specs=tuple(str(spec).strip() for item in ([specs] if isinstance(specs,str) else list(specs or ())) for spec in str(item).split(";") if str(spec).strip())
+    CUSTOM_OP_SPECS=specs; CUSTOM_OPS={}; CUSTOM_FEATURES={}; CUSTOM_FEATURE_BASE=len(feature_names) if specs else None
+    if not specs: return []
+    kinds=dict(zip(source_columns,types))
+    columns={name:index for index,name in enumerate(feature_names) if kinds.get(name,1)==1 and "=" not in name}
+    earlier={}; derived=[]
+    for spec in specs:
+        name,required,optional,tree=_custom_parse(spec,columns,earlier)
+        if optional>4: raise ValueError(f"Custom operator {name!r}: at most four optional (v#) slots")
+        earlier[name]=(name,required,optional,tree)
+        for mask in range(2**optional):
+            present=[k for k in range(optional) if mask>>k&1]
+            body=_prune_optional(tree,set(present))
+            if body is None: raise ValueError(f"Custom operator {name!r} is empty without its optional parameters")
+            position={k:required+i for i,k in enumerate(present)}
+            def place(node):
+                if node[0]=="opt": return ("arg",position[node[1]])
+                if node[0] in ("x","c","arg"): return node
+                return tuple([node[0]]+[place(child) for child in node[1:]])
+            body=place(body); arity=required+len(present)
+            full=mask==2**optional-1
+            if arity==0:
+                label=name if full else f"{name}()"
+                if label in feature_names or label in CUSTOM_FEATURES: raise ValueError(f"Custom operator {name!r} clashes with column {label!r}")
+                CUSTOM_FEATURES[label]=body; derived.append((label,body))
+            else:
+                internal=f"adf_{name}" if full else f"adf_{name}__{''.join('1' if mask>>k&1 else '0' for k in range(optional))}"
+                CUSTOM_OPS[internal]={"tree":body,"arity":arity,"display":name,"spec":spec}
+    return derived
+
+def custom_feature_columns(X, derived):
+    """X with the derived custom features appended."""
+    if not derived: return X
+    X=np.asarray(X,float)
+    return np.column_stack([X]+[clean(evaluate(body,X)) for _,body in derived])
+
+def inline_custom_features(model, feature_names):
+    """A copy whose derived-feature leaves are replaced by their bodies (for export)."""
+    if not CUSTOM_FEATURES: return model
+    bodies={index:CUSTOM_FEATURES[name] for index,name in enumerate(feature_names) if name in CUSTOM_FEATURES}
+    def substitute(tree):
+        if tree[0]=="x": return bodies.get(tree[1],tree)
+        if tree[0] in ("c","arg"): return tree
+        return tuple([tree[0]]+[substitute(child) for child in tree[1:]])
+    result=model.clone(); result.trees=[substitute(tree) for tree in model.trees]
+    result.adfs={**{name:{"tree":item["tree"],"arity":item["arity"]} for name,item in CUSTOM_OPS.items()},**model.adfs}
+    return result
+
+def register_custom_ops(registry):
+    """Give an ADF registry the permanent user operators."""
+    for name,item in CUSTOM_OPS.items():
+        if name not in registry.definitions:
+            registry.definitions[name]={"tree":item["tree"],"arity":item["arity"],"dependencies":[],"supporting_founders":[],"activated_generation":None,
+                                        "retired_generation":None,"elite_uses":0,"validation":[]}
+
 def admissible_random_tree(n_features, ops, max_nodes, max_depth, attempts=25, **kwargs):
     """A random tree that passes --forbid-nesting, --units and --input-relations, when one turns up within a few draws."""
     tree=random_tree(n_features,ops,max_nodes,max_depth,**kwargs)
@@ -3302,7 +3470,8 @@ def expr(t, names, argument_names=None):
     args=[expr(q,names,argument_names) for q in t[1:]]
     if t[0] in {"+", "-", "*", "/", "pow", "max", "min"}:
         return f"({args[0]} {t[0]} {args[1]})"
-    return f"{t[0]}({', '.join(args)})"
+    name=CUSTOM_OPS[t[0]]["display"] if t[0] in CUSTOM_OPS else t[0]
+    return f"{name}({', '.join(args)})"
 
 def referenced_adf_names(model):
     """Return direct/transitive ADFs in definition-before-use order."""
@@ -3313,7 +3482,7 @@ def referenced_adf_names(model):
             name=tree[0]
             if name in visiting: raise ValueError(f"Cyclic ADF definition {name!r}")
             if name not in visited:
-                item=model.adfs.get(name)
+                item=adf_definition(name,model.adfs)
                 if item is None: raise ValueError(f"Missing ADF definition {name!r}")
                 visiting.add(name); visit(item["tree"]); visiting.remove(name)
                 visited.add(name); ordered.append(name)
@@ -3325,6 +3494,7 @@ def adf_display_definitions(model, feature_names):
     """Readable definitions for the ADFs actually used by one model."""
     result=[]
     for name in referenced_adf_names(model):
+        if name in CUSTOM_OPS: continue          # shown by its --custom-op spec instead
         item=model.adfs[name]; arity=int(item["arity"]); arguments=[f"u{index}" for index in range(arity)]
         dependencies=[]
         def collect(tree):
@@ -5316,7 +5486,7 @@ def assess(m, X, Y, affine_on, cats, fit_affine=True, constraints=None, output_n
         if t[0]=="x": return "" if isinstance(t[1],int) and t[1]>=0 else "invalid_feature"
         if t[0]=="c": return "" if np.isfinite(t[1]) else "nonfinite_constant"
         if t[0]=="arg": return "invalid_adf_argument"
-        arity=(adfs or m.adfs).get(t[0],{}).get("arity") if t[0].startswith("adf_") else OPS.get(t[0],(-1,))[0]
+        arity=(adf_definition(t[0],adfs or m.adfs) or {}).get("arity") if t[0].startswith("adf_") else OPS.get(t[0],(-1,))[0]
         if arity is None: return f"unknown_operator:{t[0]}"
         if len(t)-1 != arity: return f"arity:{t[0]}"
         position=GUARDED_DIVISOR_OPS.get(t[0])
@@ -5859,10 +6029,13 @@ def snap_final_candidates(models, Xt, Yt, Xv, Yv, affine_on, cats, constraints=N
 
 def used_feature_indices(model):
     """Return encoded feature indices referenced by any output tree."""
-    used=set()
+    used=set(); seen=set()
     def visit(tree):
         if tree[0]=="x": used.add(int(tree[1])); return
-        if tree[0]=="c": return
+        if tree[0] in ("c","arg"): return
+        if tree[0].startswith("adf_") and tree[0] not in seen:
+            seen.add(tree[0]); item=adf_definition(tree[0],model.adfs)
+            if item is not None: visit(item["tree"])
         for child in tree[1:]: visit(child)
     for tree in model.trees: visit(tree)
     return tuple(sorted(used))
@@ -6236,7 +6409,8 @@ def export_model(m, feature_names, output_names, cats, maps, source_columns, typ
         offset+=width
     if any(index<0 or index>=len(feature_names) for index in used_indices): raise ValueError("Model references an unavailable feature")
     ranges=training_input_ranges(fixture_df,source_columns,types) if input_ranges is None and fixture_df is not None else (input_ranges or {})
-    payload=repr({"trees":m.trees,"scales":m.scales,"adfs":m.adfs,"features":feature_names,"outputs":output_names,"cats":cats,"maps":maps,"source_columns":source_columns,"types":types,"input_ranges":ranges,
+    adfs={**{name:{"tree":item["tree"],"arity":item["arity"]} for name,item in CUSTOM_OPS.items() if name in referenced_adf_names(m)},**m.adfs}
+    payload=repr({"trees":m.trees,"scales":m.scales,"adfs":adfs,"features":feature_names,"outputs":output_names,"cats":cats,"maps":maps,"source_columns":source_columns,"types":types,"input_ranges":ranges,
                   "contract":{"version":3,"input_columns":input_columns,"feature_indices":sorted(used_indices),"feature_count":len(feature_names),"fixture":"best_model_fixture.csv","expected":"best_model_fixture_predictions.csv"}})
     # Keep exports genuinely standalone: embed exactly the guarded evaluator
     # used during search, rather than importing this training script.
@@ -7154,7 +7328,7 @@ def new_island_runtime(population_size, *, X, Xt, cats, ops, nodes, depth, head_
     island_index seeds the cell's archives; cell=(island, stage) labels it
     (defaults to (island_index, 0) for stage-free runs).  Yt enables the
     residual-signature QD repertoire (when RESIDUAL_ARCHIVE is on)."""
-    adf_registry=ADFRegistry(adf_enabled,allow_nested=adf_mode=="nested")
+    adf_registry=ADFRegistry(adf_enabled,allow_nested=adf_mode=="nested"); register_custom_ops(adf_registry)
     seeds=direct_feature_baselines(X,None,cats,ops,True)[:population_size//4]
     if SPARSE_SEEDING=="on" and Yt is not None and (cell is None or cell[1]==0):
         seeds+=sparse_seed_models(Xt,Yt,cats,ops,nodes,depth,max(1,int(SPARSE_SEED_SHARE*population_size)),head_count)
@@ -7668,6 +7842,8 @@ def resume_main(args):
     LOSS_MODE=state.get("loss","huber"); ROBUST_LOSS_DELTA=float(state.get("huber_delta",1.5))
     configure_units(state.get("units",""),list(names))
     configure_input_relations(state.get("input_relations",""),list(names),state.get("source_columns",()),state.get("types",()))
+    base=state.get("custom_feature_base")
+    configure_custom_ops(state.get("custom_ops",()),list(names) if base is None else list(names)[:base],state.get("source_columns",()),state.get("types",()))
     RESIDUAL_TERM_WEIGHT=float(state.get("residual_term_weight",0.)); NESTING_RULES=parse_nesting_rules(state.get("forbid_nesting",""))
     BACKPROP_MUTATION_WEIGHT=float(state.get("backprop_mutation_weight",0.)); BACKPROP_INVERSE=state.get("backprop_inverse","generic")
     READOUT_MODE=state.get("readout","affine"); MAX_TERMS=int(state.get("max_terms",4)); GENE_CROSSOVER_RATE=float(state.get("gene_crossover_rate",0.))
@@ -7771,7 +7947,7 @@ def resume_main(args):
         print(f"Not exporting best_model.py: {part['output']!r} reads predicted {', '.join(part['reads'])}; only the full separate-output run exports it.")
         evaluator.close(); return
     if part: print(f"Exporting best_model.py for {part['output']!r} alone.")
-    export_model(chosen,names,out_names,cats,maps,state["source_columns"],state["types"],state.get("export_fixture"),state.get("input_ranges")); evaluator.close()
+    export_model(inline_custom_features(chosen,names),names if CUSTOM_FEATURE_BASE is None else names[:CUSTOM_FEATURE_BASE],out_names,cats,maps,state["source_columns"],state["types"],state.get("export_fixture"),state.get("input_ranges")); evaluator.close()
     write_symbolic_export(chosen,names,out_names,cats,Xt)
 
 def parse_nesting_rules(text):
@@ -7848,6 +8024,7 @@ def build_arg_parser():
     ap.add_argument("--constant-intervals",choices=("on","off"),default="on",help="Print and record approximate 95%% intervals for the chosen model's constants from the linearised covariance (default: on)")
     ap.add_argument("--output-mode",choices=OUTPUT_MODES,default="separate",help="With several output columns: separate gives each column (a categorical column with all its classes) its own search, Pareto front, MDL and node limit, run one after another and merged into one exported model; joint searches one model holding every output (default: separate)")
     ap.add_argument("--output-relations",action="append",default=[],metavar="'A -> B[; C -> D]'",help="Staged prediction (separate mode) as a dependency graph, e.g. 'HH -> MM' or 'lat -> lon; year -> month -> day' ('a, b -> c' feeds both into c; repeatable). Each output may read the predicted (never the true) values of all its ancestors as extra inputs, ancestors are searched first, and the export inlines them (default: none)")
+    ap.add_argument("--custom-op",action="append",default=[],metavar="'NAME = EXPR'",help="A partly known operator built from AFPO's operators (repeatable; ';' separates several): v0, v1, ... are parameters the search fills in (every v0 the same), v# an optional one whose operation disappears when left out, column names and numbers are fixed. E.g. 'fq = amount / v0', 'E = m*c**2', 'foo = bar + v#*kpop' (default: none)")
     ap.add_argument("--input-relations",action="append",default=[],metavar="A,B[;C,D]",help="Input columns that belong together, e.g. HH1,MM1;HH2,MM2 (repeatable). Inside a relation columns combine freely; with other inputs only as complete subexpressions that read every column of the relation, so HH2-HH1 is rejected but (60*HH2+MM2)-(60*HH1+MM1) is not (default: none)")
     ap.add_argument("--units",default="",metavar="COLUMN=UNIT,...",help="Units of input columns for dimensional analysis, e.g. x=m,t=s,F=kg*m/s^2 (exponents with ^, fractions in parentheses like m^(1/2)); trees that add, compare or exponentiate unlike units are rejected; constants and unlisted columns are unit-free wildcards (default: none)")
     ap.add_argument("--max-time",type=float,default=0.,help="Stop the search after this many seconds and go to the final choice; 0 = no limit (default: 0)")
@@ -8080,11 +8257,6 @@ def separate_output_plan(columns, types, edges):
     plan=[(column,tuple(other for other in order if other in ancestors(column))) for column in order]
     return plan+[(column,()) for column in outputs if column not in order]
 
-def _staged_name(column, taken):
-    name=f"{column}_pred"
-    while name in taken: name+="_"
-    return name
-
 def _predicted_values(result, frame):
     """A sub-run's chosen model applied to a frame: floats, or predicted class labels."""
     X=encode(frame,result["types"],result["maps"])[0]
@@ -8119,8 +8291,9 @@ def merge_separate_models(plan, results, staged, feature_names, out_names, cats)
     for column,_ in plan:
         result=results[column]; model=result["model"]; tag=out_names.index(column)
         # Each search numbers its own ADFs from zero; keep the merged names apart.
-        renames={name:f"adf_o{tag}_{name[4:]}" for name in model.adfs}
+        renames={name:f"adf_o{tag}_{name[4:]}" for name in model.adfs if name not in CUSTOM_OPS}
         for name,item in model.adfs.items():
+            if name in CUSTOM_OPS: continue      # one shared definition, in this feature space (below)
             renamed=dict(item); renamed["tree"]=_rename_adfs(item["tree"],renames)
             if "dependencies" in item: renamed["dependencies"]=[renames.get(dependency,dependency) for dependency in item["dependencies"]]
             adfs[renames[name]]=renamed
@@ -8143,12 +8316,16 @@ def merge_separate_models(plan, results, staged, feature_names, out_names, cats)
             if tree[0]=="x":
                 name=result["names"][tree[1]]
                 if name in index: return ("x",index[name])
-                inlined=staged_tree(name); opaque.append(inlined); return inlined
+                derived=result.get("derived") or {}
+                # A derived --custom-op feature was a leaf in its search: inline its body, opaque likewise.
+                inlined=substitute(derived[name]) if name in derived else staged_tree(name)
+                opaque.append(inlined); return inlined
             if tree[0] in ("c","arg"): return tree
             return tuple([renames.get(tree[0],tree[0])]+[substitute(child) for child in tree[1:]])
         merged_trees[column]=[substitute(tree) for tree in model.trees]
         merged_scales[column]=list(model.scales)
         operators+=[op for op in model.mdl_operators if op not in operators]
+    adfs.update({name:{"tree":item["tree"],"arity":item["arity"]} for name,item in CUSTOM_OPS.items()})
     trees=[None]*sum(len(heads) for heads in targets); scales=[None]*len(trees)
     for j,column in enumerate(out_names):
         for head,tree,scale in zip(targets[j],merged_trees[column],merged_scales[column]): trees[head]=tree; scales[head]=scale
@@ -8185,13 +8362,15 @@ def train_separate_outputs(args, setup, df, frames, run_seed, metadata, choose_m
     for number,(column,sources) in enumerate(plan,start=1):
         kind=types[columns.index(column)]
         print(f"\n=== Output {number}/{len(plan)}: {column} ({'categorical' if kind==6 else 'numeric'}"+(f"; reads predicted {', '.join(sources)}" if sources else "")+") ===")
-        types_o=[kind_ if kind_ not in (5,6) or name==column else 0 for name,kind_ in zip(columns,types)]
+        # An earlier output this one reads becomes an input column of the same
+        # name holding its predictions (never its true values).
+        types_o=[(1 if results[name]["cats"][0] is None else 2) if name in sources else kind_ if kind_ not in (5,6) or name==column else 0
+                 for name,kind_ in zip(columns,types)]
         def augment(frame, part):
             if frame is None: return None
             frame=frame.copy()
-            for source in sources: frame[staged[source]]=predicted[source][part]
+            for source in sources: frame[source]=predicted[source][part]
             return frame
-        for source in sources: types_o.append(1 if results[source]["cats"][0] is None else 2)
         df_o=augment(df,"df")
         train_o=df_o.iloc[train_indices] if internal_split else df_o
         if external_validation: validation_o=augment(validation_df,"validation")
@@ -8204,14 +8383,14 @@ def train_separate_outputs(args, setup, df, frames, run_seed, metadata, choose_m
         result=train_from_setup(args_o,setup_o,choose_model)
         result["frames"]=(train_o,validation_o); results[column]=result
         if any(column in reads for _,reads in plan):
-            taken=set(columns)|set(staged.values())
-            staged[column]=_staged_name(column,taken)
+            staged[column]=column
             predicted[column]={"df":_predicted_values(result,df_o)}
             if external_validation: predicted[column]["validation"]=_predicted_values(result,validation_o)
             if test_df is not None: predicted[column]["test"]=_predicted_values(result,augment(test_df,"test"))
     print(f"\n=== Merging {len(plan)} output searches ===")
     # The merged model lives in the original feature space of the whole table.
     Xt,Yt,names,out_names_all,cats,maps=encode(train_df,types)
+    configure_custom_ops(getattr(args,"custom_op",None) or (),list(names),columns,types)
     Xv=Yv=None
     if validation_df is not None: Xv,Yv=encode(validation_df,types,maps)[:2]
     Xtest=Ytest=None
@@ -8265,14 +8444,14 @@ def train_separate_outputs(args, setup, df, frames, run_seed, metadata, choose_m
     run_dir=Path(results[plan[0][0]]["manifest"]).parent
     summary_path=run_dir.with_name(run_dir.name+"-outputs") / "separate_outputs.json"
     summary_path.parent.mkdir(parents=True,exist_ok=True)
-    summary_path.write_text(json.dumps(_json_checkpoint_value({
+    summary_path.write_text(json.dumps(({
         "schema_version":1,"output_mode":"separate","seed":run_seed,"output_relations":format_output_relations(edges),
         "input_relations":format_relations(parse_relations(getattr(args,"input_relations",None) or ())),"merged_equation":equations(merged,names,out_names_all,cats),
         "merge_check":"exact" if not mismatches else mismatches,
         "outputs":[{"output":column,"reads_predicted":list(sources),"staged_feature":staged.get(column),"equation":results[column]["equation"],
                     "complexity":complexity[column],"selected":results[column]["selected"],"generations":results[column]["generation"],"selected_metrics":results[column]["selected_metrics"],
                     "manifest":results[column]["manifest"],"checkpoint":results[column]["checkpoint"],"model_card":results[column]["model_card"]} for column,sources in plan],
-        "metrics":report}),indent=2,default=str))
+        "metrics":report}),indent=2,default=lambda value:value.item() if hasattr(value,"item") else str(value))+"\n")
     print(f"Separate-output summary: {summary_path}")
     print("Saved best_model.py")
     return {"checkpoint":results[plan[0][0]]["checkpoint"],"checkpoints":[results[column]["checkpoint"] for column,_ in plan],
@@ -8395,6 +8574,15 @@ def train_from_setup(args, setup, choose_model=None):
     if validation_df is not None:
         Xv,Yv,names2,out2,cats2,_=encode(validation_df,types,maps)
         if names2!=names or out2!=out_names or cats2!=cats: raise ValueError("Validation CSV columns/types do not match training data")
+    base_names=list(names)
+    derived=configure_custom_ops(getattr(args,"custom_op",None) or (),base_names,list(df.columns),types)
+    if derived:
+        Xt=custom_feature_columns(Xt,derived); X=Xt
+        if Xv is not None: Xv=custom_feature_columns(Xv,derived)
+        names=base_names+[label for label,_ in derived]
+    if CUSTOM_OPS: ops=list(dict.fromkeys([*ops,*CUSTOM_OPS]))
+    if CUSTOM_OP_SPECS:
+        print("Custom operators: "+"; ".join(CUSTOM_OP_SPECS)+(f" | derived features: {', '.join(label for label,_ in derived)}" if derived else ""))
     # Everything later needs only these from the frames; dropping them frees
     # the parsed text and the train/validation row copies (often several
     # times the encoded matrices) for the whole search.
@@ -8411,7 +8599,8 @@ def train_from_setup(args, setup, choose_model=None):
         test_df=read_dataset(args.test_csv,delimiter,max_rows,sample_seed)
         if test_df.attrs.get("afpo_row_sample"): print(f"Test CSV{describe_row_sample(test_df)}.")
         Xtest,Ytest,test_names,test_outputs,test_cats,_=encode(test_df,types,maps); del test_df
-        if test_names!=names or test_outputs!=out_names or test_cats!=cats: raise ValueError("Test CSV columns/types do not match training data")
+        if test_names!=base_names or test_outputs!=out_names or test_cats!=cats: raise ValueError("Test CSV columns/types do not match training data")
+        Xtest=custom_feature_columns(Xtest,derived)
     if Xv is not None and len(Xv)<3:
         raise ValueError("Validation needs at least three rows when affine scaling is enabled")
     if len(Xt)<4 and Xv is not None: raise ValueError("Need at least four training rows after validation split")
@@ -8442,7 +8631,7 @@ def train_from_setup(args, setup, choose_model=None):
                    "stages":{key:stages[key] for key in ("mode","count","interval","age_gap","schedule","threshold_quantile")},
                    "roles":{key:roles[key] for key in ("enabled","interval","mix","retire_after","assignments")}},
         "equivalence_collapse":EQUIVALENCE_COLLAPSE,"residual_archive":RESIDUAL_ARCHIVE,"qd_parent_choice":QD_PARENT_CHOICE,"scale_balanced_selection":SCALE_BALANCED_SELECTION,"class_balance":CLASS_BALANCE,
-        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"selection_probe_filter":SELECTION_PROBE_FILTER,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"fit_iterations":CONSTANT_FIT_ITERATIONS,"semantic_max_delta":SEMANTIC_MAX_DELTA,"constant_snapping":CONSTANT_SNAPPING,"snap_tolerance":SNAP_TOLERANCE,"readout":READOUT_MODE,"max_terms":MAX_TERMS,"gene_crossover_rate":GENE_CROSSOVER_RATE,"backprop_mutation_weight":BACKPROP_MUTATION_WEIGHT,"backprop_inverse":BACKPROP_INVERSE,"residual_term_weight":RESIDUAL_TERM_WEIGHT,"loss":LOSS_MODE,"huber_delta":ROBUST_LOSS_DELTA,"forbid_nesting":",".join(sorted(f"{o}>{i}" for o,i in NESTING_RULES)),"units":UNIT_SPEC,"input_relations":RELATION_SPEC,"sparse_seeding":SPARSE_SEEDING,"sparse_basis_size":SPARSE_BASIS_SIZE,"squash_swap_weight":SQUASH_SWAP_WEIGHT,"smooth_swap_weight":SMOOTH_SWAP_WEIGHT,"gate_mutation_weight":GATE_MUTATION_WEIGHT,"loss_noise_floor":LOSS_NOISE_FLOOR,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age",
+        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"selection_probe_filter":SELECTION_PROBE_FILTER,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"fit_iterations":CONSTANT_FIT_ITERATIONS,"semantic_max_delta":SEMANTIC_MAX_DELTA,"constant_snapping":CONSTANT_SNAPPING,"snap_tolerance":SNAP_TOLERANCE,"readout":READOUT_MODE,"max_terms":MAX_TERMS,"gene_crossover_rate":GENE_CROSSOVER_RATE,"backprop_mutation_weight":BACKPROP_MUTATION_WEIGHT,"backprop_inverse":BACKPROP_INVERSE,"residual_term_weight":RESIDUAL_TERM_WEIGHT,"loss":LOSS_MODE,"huber_delta":ROBUST_LOSS_DELTA,"forbid_nesting":",".join(sorted(f"{o}>{i}" for o,i in NESTING_RULES)),"units":UNIT_SPEC,"input_relations":RELATION_SPEC,"custom_ops":list(CUSTOM_OP_SPECS),"custom_feature_base":CUSTOM_FEATURE_BASE,"sparse_seeding":SPARSE_SEEDING,"sparse_basis_size":SPARSE_BASIS_SIZE,"squash_swap_weight":SQUASH_SWAP_WEIGHT,"smooth_swap_weight":SMOOTH_SWAP_WEIGHT,"gate_mutation_weight":GATE_MUTATION_WEIGHT,"loss_noise_floor":LOSS_NOISE_FLOOR,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age",
         "test_csv":str(Path(args.test_csv).resolve()) if args.test_csv else None,
         "row_sample":row_sample,
     },(source_rows,source_columns),train_indices,validation_indices,external_validation)
@@ -8459,7 +8648,7 @@ def train_from_setup(args, setup, choose_model=None):
         "profile":args.profile,"constraint_metadata":metadata,"constraints":constraints.describe(),"bayesian_particles":args.bayesian_particles,"interaction_discovery":interaction_discovery,
         "island_config":{"count":island_count,"migration_interval":migration_interval,"migrants_per_island":migrants_per_island,"topology":"ring","migration_events":0,"stages":stages,"roles":roles},
         "equivalence_collapse":EQUIVALENCE_COLLAPSE,"residual_archive":RESIDUAL_ARCHIVE,"qd_parent_choice":QD_PARENT_CHOICE,"scale_balanced_selection":SCALE_BALANCED_SELECTION,"class_balance":CLASS_BALANCE,
-        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"selection_probe_filter":SELECTION_PROBE_FILTER,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"fit_iterations":CONSTANT_FIT_ITERATIONS,"semantic_max_delta":SEMANTIC_MAX_DELTA,"constant_snapping":CONSTANT_SNAPPING,"snap_tolerance":SNAP_TOLERANCE,"readout":READOUT_MODE,"max_terms":MAX_TERMS,"gene_crossover_rate":GENE_CROSSOVER_RATE,"backprop_mutation_weight":BACKPROP_MUTATION_WEIGHT,"backprop_inverse":BACKPROP_INVERSE,"residual_term_weight":RESIDUAL_TERM_WEIGHT,"loss":LOSS_MODE,"huber_delta":ROBUST_LOSS_DELTA,"forbid_nesting":",".join(sorted(f"{o}>{i}" for o,i in NESTING_RULES)),"units":UNIT_SPEC,"input_relations":RELATION_SPEC,"sparse_seeding":SPARSE_SEEDING,"sparse_basis_size":SPARSE_BASIS_SIZE,"squash_swap_weight":SQUASH_SWAP_WEIGHT,"smooth_swap_weight":SMOOTH_SWAP_WEIGHT,"gate_mutation_weight":GATE_MUTATION_WEIGHT,"loss_noise_floor":LOSS_NOISE_FLOOR,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age"}
+        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"selection_probe_filter":SELECTION_PROBE_FILTER,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"fit_iterations":CONSTANT_FIT_ITERATIONS,"semantic_max_delta":SEMANTIC_MAX_DELTA,"constant_snapping":CONSTANT_SNAPPING,"snap_tolerance":SNAP_TOLERANCE,"readout":READOUT_MODE,"max_terms":MAX_TERMS,"gene_crossover_rate":GENE_CROSSOVER_RATE,"backprop_mutation_weight":BACKPROP_MUTATION_WEIGHT,"backprop_inverse":BACKPROP_INVERSE,"residual_term_weight":RESIDUAL_TERM_WEIGHT,"loss":LOSS_MODE,"huber_delta":ROBUST_LOSS_DELTA,"forbid_nesting":",".join(sorted(f"{o}>{i}" for o,i in NESTING_RULES)),"units":UNIT_SPEC,"input_relations":RELATION_SPEC,"custom_ops":list(CUSTOM_OP_SPECS),"custom_feature_base":CUSTOM_FEATURE_BASE,"sparse_seeding":SPARSE_SEEDING,"sparse_basis_size":SPARSE_BASIS_SIZE,"squash_swap_weight":SQUASH_SWAP_WEIGHT,"smooth_swap_weight":SMOOTH_SWAP_WEIGHT,"gate_mutation_weight":GATE_MUTATION_WEIGHT,"loss_noise_floor":LOSS_NOISE_FLOOR,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age"}
     head_count=sum(len(heads) for heads in classification_layout(cats)[0])
     population_sizes=cell_population_sizes(args.population,cell_count)
     islands=[new_island_runtime(size,X=X,Xt=Xt,cats=cats,ops=ops,nodes=nodes,depth=depth,head_count=head_count,
@@ -8558,7 +8747,7 @@ def train_from_setup(args, setup, choose_model=None):
         if summary: print(f"Test classes: {summary}")
     subrun=setup.get("_subrun")
     if not subrun:
-        export_model(chosen,names,out_names,cats,maps,source_columns,types,export_fixture,input_ranges)
+        export_model(inline_custom_features(chosen,names),names if CUSTOM_FEATURE_BASE is None else names[:CUSTOM_FEATURE_BASE],out_names,cats,maps,source_columns,types,export_fixture,input_ranges)
         write_symbolic_export(chosen,names,out_names,cats,Xt)
     selected_entry=next(entry for entry in evaluation[1] if entry[0] is chosen)
     selection={**selection,"constant_snapping":snapping,"selected_choice":labels[selected_index],"default_selected":selected_index==0,
@@ -8575,7 +8764,8 @@ def train_from_setup(args, setup, choose_model=None):
     result={"checkpoint":str(checkpoint_path.resolve()),"manifest":str(manifest_path.resolve()),"model_card":str(Path(card).resolve()),
             "generation":gen,"selected":labels[selected_index],"equation":equations(chosen,names,out_names,cats)}
     if subrun:
-        result.update(model=chosen,names=list(names),maps=maps,cats=cats,out_names=list(out_names),types=list(types),selected_metrics=selected_entry[2])
+        result.update(model=chosen,names=list(names),maps=maps,cats=cats,out_names=list(out_names),types=list(types),selected_metrics=selected_entry[2],
+                      derived=dict(CUSTOM_FEATURES))
         return result
     print("Saved best_model.py")
     return result

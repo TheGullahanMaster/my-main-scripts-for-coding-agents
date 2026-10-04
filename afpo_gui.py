@@ -44,7 +44,7 @@ MAX_GENERATE_ROWS = 5_000_000
 GENERATE_CHUNK = 50_000
 # Options with their own place in the form (or not meaningful from the GUI).
 FORM_HANDLED = {"resume", "migrate_checkpoint", "allow_unsafe_pickle", "gui", "port", "test_csv",
-                "constraint_metadata", "sequence_group", "input_relations", "output_relations", "max_generations", "population", "seed", "workers", "adf_mode", "help"}
+                "constraint_metadata", "sequence_group", "input_relations", "output_relations", "custom_op", "max_generations", "population", "seed", "workers", "adf_mode", "help"}
 
 
 # ───────────────────────── helpers ─────────────────────────
@@ -244,7 +244,7 @@ def build_argv(form):
     for line in str(data.get("sequence_groups") or "").splitlines():
         if line.strip():
             argv += ["--sequence-group", line.strip()]
-    for field, flag in (("input_relations", "--input-relations"), ("output_relations", "--output-relations")):
+    for field, flag in (("input_relations", "--input-relations"), ("output_relations", "--output-relations"), ("custom_ops", "--custom-op")):
         for line in str(data.get(field) or "").splitlines():
             if line.strip():
                 argv += [flag, line.strip()]

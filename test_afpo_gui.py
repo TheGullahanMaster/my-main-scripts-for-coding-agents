@@ -73,9 +73,11 @@ class GuiTests(unittest.TestCase):
         related = form(self.csv)
         related["data"]["input_relations"] = "a,b\n"
         related["data"]["output_relations"] = "y -> y2\n\n"
+        related["data"]["custom_ops"] = "fq = a / v0\n"
         argv = gui.build_argv(related)
         self.assertIn(["--input-relations", "a,b"], [argv[i:i + 2] for i in range(len(argv))])
         self.assertIn(["--output-relations", "y -> y2"], [argv[i:i + 2] for i in range(len(argv))])
+        self.assertIn(["--custom-op", "fq = a / v0"], [argv[i:i + 2] for i in range(len(argv))])
         self.assertIn("output_mode", {item["dest"] for item in gui.options()["advanced"]})
         self.assertNotIn("input_relations", {item["dest"] for item in gui.options()["advanced"]})
 

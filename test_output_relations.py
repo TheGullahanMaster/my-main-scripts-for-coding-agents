@@ -174,6 +174,8 @@ class SeparateRunTests(unittest.TestCase):
             self.assertNotIn("differs from the per-output choices", text)
             self.assertTrue(Path("best_model.py").exists())
             self.assertTrue(Path(outcome["manifest"]).exists())
+            summary = __import__("json").loads(Path(outcome["manifest"]).read_text())
+            self.assertEqual(summary["outputs"][0]["staged_feature"], "p")       # q reads predicted p under p's own name
 
 
 if __name__ == "__main__":
