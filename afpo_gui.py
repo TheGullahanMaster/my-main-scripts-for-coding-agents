@@ -204,7 +204,9 @@ def options():
     defaults = {a.dest: a.default for a in parser._actions if a.option_strings}
     groups = [{"id": gid, "name": name, "ops": list(ops), "default": gid in afpo.DEFAULT_GROUP_IDS}
               for gid, (name, ops) in afpo.OPERATOR_GROUPS.items()]
-    return {"groups": groups, "advanced": advanced, "defaults": defaults, "profiles": list(afpo.PROFILES),
+    roles = [{"id": role, "name": label.split(":", 1)[0], "description": label.split(":", 1)[1].strip()}
+             for role, label in afpo.ISLAND_ROLES.items()]
+    return {"groups": groups, "roles": roles, "advanced": advanced, "defaults": defaults, "profiles": list(afpo.PROFILES),
             "adf_modes": ["off", "flat", "nested"], "cwd": os.getcwd(),
             "op_cost": {op: afpo.OP_COMPLEXITY_BONUS.get(op, 2) for op in afpo.OPS}}
 
@@ -284,11 +286,15 @@ def setup_answers(form):
         except ValueError as exc:
             raise ValueError(f"Constraint metadata is not valid JSON: {exc}")
     islands = max(1, int(search.get("islands") or 1))
+    ops = selected_operators(form)
+    roles_on = bool(search.get("roles")) and islands > 1
+    # One dropdown per island after the first; island 1 stays the generalist.
+    assignments = afpo.validate_island_roles(search.get("island_roles") or [], islands, ops) if roles_on else []
     stage_mode = search.get("stage_mode") or "off"
     stages = afpo.stage_config(stage_mode, count=int(search.get("stages") or 3), interval=int(search.get("stage_interval") or 5),
                                age_gap=int(search.get("stage_age_gap") or 10), schedule=search.get("stage_schedule") or "polynomial",
                                threshold_quantile=float(search.get("stage_quantile") or .5))
-    return {"path": str(path), "delimiter": data.get("delimiter") or ",", "types": types, "ops": selected_operators(form),
+    return {"path": str(path), "delimiter": data.get("delimiter") or ",", "types": types, "ops": ops,
             "affine_on": bool(search.get("affine", True)), "coev": bool(search.get("coev", False)),
             "dynamic_pressure_on": bool(search.get("dynamic_pressure", True)), "adf_enabled": bool(search.get("adf", False)),
             "nodes": max(3, int(search.get("nodes") or 31)), "depth": max(1, int(search.get("depth") or 6)),
@@ -296,7 +302,7 @@ def setup_answers(form):
             "migration_interval": max(1, int(search.get("migration_interval") or 25)) if islands > 1 else 0,
             "migrants_per_island": max(1, int(search.get("migrants") or 2)) if islands > 1 else 0,
             "stages": stages,
-            "roles": afpo.role_config(bool(search.get("roles")) and islands > 1, interval=int(search.get("role_interval") or 10)),
+            "roles": afpo.role_config(roles_on, interval=int(search.get("role_interval") or 10), assignments=assignments),
             "val_path": val_path, "validation_percent": float(data.get("validation_percent") or 0) if mode == "percent" else None,
             "metadata": metadata}
 
@@ -324,9 +330,11 @@ def check_form(form):
 class Telemetry:
     """Turns afpo.PROGRESS_HOOK calls into JSON lines the GUI server tails."""
 
-    def __init__(self, stream, island_count, stage_count=1):
+    def __init__(self, stream, island_count, stage_count=1, roles=None):
         self.stream, self.island_count = stream, max(1, int(island_count))
         self.stage_count = max(1, int(stage_count))
+        # Role per island (island 1 the generalist) when island roles are on.
+        self.roles = ["generalist", *roles] if roles else None
         self.islands = {}          # cell label (or id(archive)) -> index
         self.latest = {}           # index -> latest hook kwargs
         self.last_snapshot = 0.
@@ -356,6 +364,8 @@ class Telemetry:
         parts = [f"island {island + 1}"] if self.island_count > 1 else []
         if self.stage_count > 1:
             parts.append(f"stage {stage + 1}")
+        if self.roles and island < len(self.roles):
+            parts.append(f"({self.roles[island]})")
         return " ".join(parts) or f"island {index + 1}"
 
     def hook(self, **kw):
@@ -391,6 +401,7 @@ class Telemetry:
                  "nodes": int(sum(afpo.node_size(t) for t in model.trees))}
         if equation:
             point["equation"] = afpo.equations(model, names, out_names, cats)
+            point["path"] = afpo.history_path(model.history)
         return point
 
     def snapshot(self, generation):
@@ -404,7 +415,7 @@ class Telemetry:
                 point = self._point(model, names, out_names, cats, equation=True)
                 if point:
                     point["island"] = index
-                    if self.stage_count > 1:
+                    if self.stage_count > 1 or self.roles:
                         point["cell"] = self.cell_name(index)
                     archive.append(point)
             for model in kw["population"]:
@@ -412,7 +423,7 @@ class Telemetry:
                 point = self._point(model, names, out_names, cats)
                 if point and len(population) < MAX_POPULATION_POINTS:
                     point["island"] = index
-                    if self.stage_count > 1:
+                    if self.stage_count > 1 or self.roles:
                         point["cell"] = self.cell_name(index)
                     population.append(point)
             candidate = kw["best_so_far"]
@@ -463,7 +474,9 @@ def run_spec(spec_path):
     spec = json.loads(Path(spec_path).read_text())
     with open(spec["events"], "a", encoding="utf-8") as stream:
         setup_spec = spec.get("setup") or {}
-        telemetry = Telemetry(stream, setup_spec.get("island_count", 1), (setup_spec.get("stages") or {}).get("count", 1))
+        roles = setup_spec.get("roles") or {}
+        telemetry = Telemetry(stream, setup_spec.get("island_count", 1), (setup_spec.get("stages") or {}).get("count", 1),
+                              (roles.get("assignments") or ["auto"] * (setup_spec.get("island_count", 1) - 1)) if roles.get("enabled") else None)
         telemetry.emit("started", pid=os.getpid(), mode=spec["mode"], argv=spec["argv"])
         try:
             args = afpo.parse_cli(spec["argv"])[1]
@@ -676,8 +689,10 @@ class ModelExplorer:
             maps = state["maps"]
             afpo.SEQUENCE_LAYOUT = maps.get(afpo.SEQUENCE_LAYOUT_KEY)
             tolerance = state.get("parsimony_quality_tolerance", 0.)
+            simplifier_keys = set()
             if state.get("island_states"):
                 islands = [afpo.island_from_snapshot(item, len(state["Xt"]), tolerance) for item in state["island_states"]]
+                simplifier_keys = afpo.simplifier_identities(islands)
                 pool = [m for island in islands for m in [*island.archive.items, island.best_models.model] if m is not None]
                 populations = [m for island in islands for m in island.population]
             else:
@@ -691,7 +706,8 @@ class ModelExplorer:
             loss_tolerance = state.get("selection_loss_tolerance", .01)
             candidates = afpo.unique_models([*pool, *populations])
             evaluation = afpo.selection_evaluation(candidates, Xv, Yv, cats, constraints, out_names)
-            labels, choices, selection = afpo.model_options([e[0] for e in evaluation[1]], cats=cats, loss_tolerance=loss_tolerance, evaluation=evaluation)
+            labels, choices, selection = afpo.model_options([e[0] for e in evaluation[1]], cats=cats, loss_tolerance=loss_tolerance, evaluation=evaluation,
+                                                           simplifier_keys=simplifier_keys)
             recommended = {id(model): label for label, model in zip(labels, choices)}
             pool_ids = {afpo.selection_identity(m) for m in pool}
             frontier_ids = {id(e[0]) for e in afpo.selection_frontier(evaluation[1])}
@@ -758,7 +774,8 @@ class ModelExplorer:
                     "per_output": per_output, "svg": afpo.tree_map_svg(model, names, out_names, cats),
                     "nodes": int(sum(afpo.node_size(t) for t in model.trees)), "age": int(model.age), "origin": model.origin,
                     "features_used": [names[i] for i in afpo.used_feature_indices(model) if i < len(names)],
-                    "inputs_used": self._inputs_used(model)}
+                    "inputs_used": self._inputs_used(model),
+                    "history": [dict(record) for record in model.history], "history_text": afpo.describe_history(model.history)}
 
     def latex(self, index):
         """Exact and raw equation forms of a model for the rendered-equation view (needs sympy)."""
@@ -781,8 +798,10 @@ class ModelExplorer:
                          {"latex": entry[mode][1], "text": str(entry[mode][0]),
                           "mathml": afpo.mathml_expression(entry[mode][0], entry[mode][0].free_symbols)} for mode in ("exact", "raw")}
                 agreement = entry["agreement"]
-                outputs.append({"name": name, "name_latex": afpo.latex_symbol_name(name.replace(" ", "_")), **forms, "agreement": None if agreement is None else
-                                {"defined": agreement[0], "gap": None if not math.isfinite(agreement[1]) else agreement[1]}})
+                outputs.append({"name": name, "name_latex": entry.get("name_latex") or afpo.latex_symbol_name(name.replace(" ", "_")), **forms,
+                                "agreement": None if agreement is None else
+                                {"defined": agreement[0], "gap": None if not math.isfinite(agreement[1]) else agreement[1]},
+                                "output": entry.get("output"), "decision": entry.get("decision")})
             payload = {"available": True, "outputs": outputs}
             self.models[int(index)]["latex"] = payload
             return payload

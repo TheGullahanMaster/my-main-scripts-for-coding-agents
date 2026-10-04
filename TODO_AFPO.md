@@ -27,6 +27,98 @@ GUI form test in `test_afpo_gui.py`):
   `novelty_pool`, `unique_models` and `ParetoArchive`; `--equivalence-collapse
   off` restores syntactic identity; checkpoints from before it resume with it off.
 - **Benchmark**: `benchmark_afpo.py` (Phase 6 harness).
+- **Per-island roles** (2026-10-03): with roles on, every island after the
+  first gets its own role, chosen in the terminal setup (comma list) or with
+  one GUI dropdown per island; the setup key is `roles.assignments`. `auto` is
+  the self-organising specialist above (the default, so older setups and
+  checkpoints behave exactly as before); the fixed presets
+  (`preset_role_parameters`) are `generalist`, `simplifier` (anchored, see
+  below; hoist/shrink/new `prune` moves, accepts smaller trees with unchanged
+  output, gathers every island's migrants), `explorer` (25%
+  fresh random offspring, no semantic step cap, more crossover/proposals),
+  `refiner` (constant/point moves, step cap 1 target s.d.), and
+  `family:<group>` (new structure from arithmetic + one operator group; MDL
+  still priced on the run's whole grammar). Fixed roles are never reweighted
+  or retired; their held-out contribution is still logged. Only a first
+  look so far (coffee cooling, Newton's law, 4 islands, population 120, 60
+  generations, groups 1-9, 4 seeds): all-auto reached the noise floor 4/4
+  (mean 136 MDL bits, 2 readable exponentials); auto + simplifier +
+  family:3 reached it 4/4 but with rbf/sigmoid-tail forms (mean 183 bits);
+  auto + auto + simplifier reached it 2/4 (mean 166 bits). So no preset is a
+  default; benchmark them (`benchmark_afpo.py` takes `roles.assignments`)
+  before tuning `SIMPLIFIER_PARSIMONY`, `EXPLORER_NOVELTY`,
+  `REFINER_MAX_DELTA` or `ROLE_MUTATION_BIAS`. Stages with roles are covered
+  by tests only.
+- **Anchored simplifier** (2026-10-03, `anchored_band` / `anchored_survivors`
+  / `anchored_emigrants`): the first simplifier (60% size cap, 5% parsimony
+  near-tie band) only held migrant copies: at 50 generations on the coffee
+  data its shortest model within 1% of the best loss was always another
+  island's. Now it solves min MDL s.t. loss <= anchor + max(5% |anchor|,
+  noise floor), anchor = the island's lowest loss: half the survivors are the
+  shortest in-band models no larger than the anchor, 2/3 of parents come from
+  them (their children are capped at the anchor's size), the other half of
+  the island is ordinary Pareto survival with the normal size allowance, and
+  emigrants are the shortest models within 1% (else 5%). Same diagnostic
+  afterwards: 29-32 in-band models (other islands 0-7) and the shortest one
+  within 1% is the simplifier's own child. `afpo_og.py` freezes the earlier
+  version (`AFPO_MODULE=afpo_og python bench_roles.py ...`).
+- **Main-line model history** (2026-10-03, `history_*`, `describe_history`):
+  every model carries a timeline of its main line of descent: born
+  (generation, island, stage, role, how), variation runs on one island
+  (collapsed: span, count, move kinds, MDL bits and loss at start and end),
+  crossovers (partner lineage id and where the partner was last made),
+  migrations (ring / gathered by a simplifier / anchored emigrant), stage
+  promotions and final constant snapping. Children inherit the main parent's
+  timeline; runs never merge across an island, stage, role, crossover or
+  migration; past 64 records the oldest block of variation/crossover records
+  is merged, keeping landmarks. Observational only (not in equality,
+  equivalence keys, MDL, selection or RNG): seeded runs are bit-identical to
+  before. Checkpoints store each distinct record once (`history_records`),
+  +7% size on a 5-island coffee run. Shown in the CLI after the final choice,
+  in the model card, as a timeline in the GUI's Models tab, and as island
+  paths in the live view's tooltips; live island labels carry their roles.
+  Not built: a full ancestry DAG (both parents at every step); `lineage_id`
+  and `parent_ids` leave room for an optional on-disk ledger later.
+- **Cache memory** (2026-10-03): long-lived caches were capped by entry
+  count or array elements but keyed by `repr(tree)` (plus a copy of the
+  operator tuple), so key text grew with tree size: at 63-node trees the
+  evaluation cache held ~90 MB of keys beside its ~130 MB of arrays, and
+  every `--workers` process grew its own full-size caches. Keys are now
+  128-bit blake2b digests (`tree_digest`, `tree_fingerprint` memoized per
+  tree object, `interned_grammar`), the evaluation budget charges a
+  per-entry overhead, scoring workers get 1/8 of the budget, and
+  `--cache-memory MB` (default 128) scales the evaluation, compiled-tree and
+  score caches together. Total memory (PSS) at generation 35, 4 workers,
+  255-node trees: 775 MB before, 665 MB now, 520 MB with --cache-memory 32,
+  with identical results and no measurable slowdown.
+- **Role benchmark** (2026-10-03, `bench_roles.py`; 16 cases x 5 seeds,
+  5 islands, population 600, 60 generations, operator groups 1-5 and 7;
+  solved = held-out R^2 >= 0.999; paired against all_auto, bootstrap 95%):
+
+  | config | solved/80 | test R^2 | bits | vs all_auto: gained/lost | bits diff |
+  |---|---|---|---|---|---|
+  | all_auto | 54 | 0.984 | 182 | - | - |
+  | families (2 per case) | 54 | 0.983 | 187 | 4/4 | +5 [-8, +17] |
+  | all_roles (old simplifier) | 53 | 0.978 | 193 | 3/4 | +10 [-1, +22] |
+  | all_roles (anchored) | 53 | 0.981 | 190 | 3/4 | +8 [-1, +17] |
+  | plus_refiner | 52 | 0.960 | 190 | 2/4 | +8 [-4, +20] |
+  | plus_simplifier (anchored) | 52 | 0.959 | 192 | 2/4 | +10 [-1, +23] |
+  | plus_explorer | 51 | 0.961 | 186 | 1/4 | +4 [-8, +16] |
+  | plus_simplifier (old) | 50 | 0.962 | 181 | 1/5 | -1 [-13, +10] |
+
+  No fixed role beats all_auto at this budget; every interval spans zero
+  and the differences are a few hard cases moving both ways (ratio_wrap
+  favours all_auto, log_exp4 and reuse_poly3 favour roles/families). The
+  anchored simplifier recovers the old one's losses (vs old: 2 solves
+  gained, 0 lost) but its chosen models are ~12 bits longer [+2, +22]:
+  likely because it lowers the best validation loss, which tightens the 1%
+  final-choice band. Follow-up done: the final menu (terminal and GUI
+  Models tab) now offers "Shortest within 5% of the best loss (simplifier
+  island)" (`simplifier_choice`); on the coffee data (seed 1) it surfaced
+  the exact Newton law at 111 bits where Best Score picked a 182-bit
+  ceil2 hack 1.5% better on validation. Untested: a looser
+  --selection-loss-tolerance in the benchmark. Raw runs: bench_roles.py output (not kept in
+  the repo).
 
 Not done: role-specific ALPS reseeding uses global tree size; residual-signature
 descriptors (Phase 3) and everything in Phases 4-5 other than the above.
