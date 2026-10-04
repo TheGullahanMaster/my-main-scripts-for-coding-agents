@@ -1345,6 +1345,38 @@ class _FlatTree:
 # round-off, not bit for bit: compiled sums and libm differ in the last bit.
 FIT_BACKEND = "auto"
 _FITCORE = []
+# --clamp auto (default): the value clamp CLIP and the divisor/log guard EPS
+# follow the data.  Every operator result is clamped to +/-CLIP and a model
+# that reaches it is rejected (the numeric-guard check), so data whose values
+# or intermediate products pass 1e12 -- E = m*c**2 with c = 3e8 already has
+# c**2 = 9e16 -- had every right answer rejected and the search stalled; data
+# below 1e-12 had its divisors treated as zero.  With the largest absolute
+# input or target value B and the smallest nonzero one b, auto uses
+# CLIP = max(1e12, 1e6*B**2) and EPS = min(1e-12, 1e-6*b**2), within
+# 1e+/-150 so a product of two clamped values stays finite.  Data within
+# [1e-3, 1e3] keeps the old 1e12 / 1e-12 exactly.  `default` pins them; a
+# number sets CLIP (EPS stays automatic).  The export embeds the values.
+DEFAULT_CLIP, DEFAULT_EPS = CLIP, EPS
+def automatic_limits(*arrays):
+    """(CLIP, EPS) for data with these values (see --clamp)."""
+    values=np.concatenate([np.abs(np.asarray(array,float)).ravel() for array in arrays if array is not None and np.size(array)] or [np.zeros(0)])
+    values=values[np.isfinite(values)]
+    if not len(values): return DEFAULT_CLIP,DEFAULT_EPS
+    big=float(values.max()); nonzero=values[values>0]; small=float(nonzero.min()) if len(nonzero) else 1.
+    clip=DEFAULT_CLIP if big<=1e3 else float(min(1e150,max(DEFAULT_CLIP,1e6*big*big)))
+    eps=DEFAULT_EPS if small>=1e-3 else float(max(1e-150,min(DEFAULT_EPS,1e-6*small*small)))
+    return clip,eps
+def set_numeric_limits(clip, eps):
+    global CLIP,EPS
+    CLIP,EPS=float(clip),float(eps)
+def resolve_numeric_limits(setting, *arrays):
+    """(CLIP, EPS) for a --clamp setting."""
+    if setting in (None,"auto"): return automatic_limits(*arrays)
+    if setting=="default": return DEFAULT_CLIP,DEFAULT_EPS
+    clip=float(setting)
+    if not clip>0: raise ValueError("--clamp must be auto, default or a positive number")
+    return clip,automatic_limits(*arrays)[1]
+
 def compiled_fitter():
     """The compiled fitter module, or None when Cython or a compiler is unavailable."""
     if not _FITCORE:
@@ -1357,7 +1389,12 @@ def compiled_fitter():
         except Exception as error:
             print(f"Compiled constant fitter unavailable ({type(error).__name__}: {error}); using the Python fitter.",file=sys.stderr)
             _FITCORE.append(None)
-    return _FITCORE[0]
+    core=_FITCORE[0]
+    if core is not None:
+        # The kernel keeps its own copy of the limits; a build without the setter can only use the defaults.
+        if hasattr(core,"set_limits"): core.set_limits(CLIP,EPS)
+        elif (CLIP,EPS)!=(DEFAULT_CLIP,DEFAULT_EPS): return None
+    return core
 def _compiled_program(flat, core, feature_count):
     """(code, arg, kid) arrays of a flat tree, or None when it needs the Python fitter."""
     codes=core.OPERATOR_CODES; nodes=len(flat.kind)
@@ -6424,7 +6461,7 @@ import numpy as np
 import pandas as pd
 MODEL = {payload}
 CONTRACT = MODEL['contract']
-EPS=1e-12; CLIP=1e12
+EPS={EPS!r}; CLIP={CLIP!r}
 def clean(x): return np.clip(np.nan_to_num(x,nan=0.,posinf=CLIP,neginf=-CLIP),-CLIP,CLIP)
 {operator_source}
 {sequence_source}
@@ -7817,6 +7854,7 @@ def resume_main(args):
     if not isinstance(bayes,PerOutputBayesianBanks): raise ValueError("Checkpoint predates per-output Bayesian banks and cannot resume; start a new run")
     X,Y,Xt,Yt,Xv,Yv=checkpoint_arrays(state)
     names,out_names,cats,maps=(state[k] for k in ("names","out_names","cats","maps"))
+    set_numeric_limits(state.get("clip",DEFAULT_CLIP),state.get("eps",DEFAULT_EPS))
     part=state.get("separate_output")
     if part:
         print(f"This checkpoint is output {part['output']!r} ({part['index']+1} of {part['count']}) of a separate-output run: resuming continues "
@@ -8024,6 +8062,7 @@ def build_arg_parser():
     ap.add_argument("--constant-intervals",choices=("on","off"),default="on",help="Print and record approximate 95%% intervals for the chosen model's constants from the linearised covariance (default: on)")
     ap.add_argument("--output-mode",choices=OUTPUT_MODES,default="separate",help="With several output columns: separate gives each column (a categorical column with all its classes) its own search, Pareto front, MDL and node limit, run one after another and merged into one exported model; joint searches one model holding every output (default: separate)")
     ap.add_argument("--output-relations",action="append",default=[],metavar="'A -> B[; C -> D]'",help="Staged prediction (separate mode) as a dependency graph, e.g. 'HH -> MM' or 'lat -> lon; year -> month -> day' ('a, b -> c' feeds both into c; repeatable). Each output may read the predicted (never the true) values of all its ancestors as extra inputs, ancestors are searched first, and the export inlines them (default: none)")
+    ap.add_argument("--clamp",default="auto",metavar="auto|default|VALUE",help="Value clamp for every operator result (models that reach it are rejected): auto scales it and the divisor/log guard to the data's magnitudes, so data beyond 1e3 (E=m*c**2 with c=3e8) is not clamped at 1e12 and data below 1e-3 keeps its small divisors; default pins 1e12 and 1e-12; a number sets the clamp (default: auto)")
     ap.add_argument("--custom-op",action="append",default=[],metavar="'NAME = EXPR'",help="A partly known operator built from AFPO's operators (repeatable; ';' separates several): v0, v1, ... are parameters the search fills in (every v0 the same), v# an optional one whose operation disappears when left out, column names and numbers are fixed. E.g. 'fq = amount / v0', 'E = m*c**2', 'foo = bar + v#*kpop' (default: none)")
     ap.add_argument("--input-relations",action="append",default=[],metavar="A,B[;C,D]",help="Input columns that belong together, e.g. HH1,MM1;HH2,MM2 (repeatable). Inside a relation columns combine freely; with other inputs only as complete subexpressions that read every column of the relation, so HH2-HH1 is rejected but (60*HH2+MM2)-(60*HH1+MM1) is not (default: none)")
     ap.add_argument("--units",default="",metavar="COLUMN=UNIT,...",help="Units of input columns for dimensional analysis, e.g. x=m,t=s,F=kg*m/s^2 (exponents with ^, fractions in parentheses like m^(1/2)); trees that add, compare or exponentiate unlike units are rejected; constants and unlisted columns are unit-free wildcards (default: none)")
@@ -8354,6 +8393,8 @@ def train_separate_outputs(args, setup, df, frames, run_seed, metadata, choose_m
     if args.test_csv:
         test_df=read_dataset(args.test_csv,setup["delimiter"],getattr(args,"max_rows",0),row_sample_seed(args))
         if test_df.attrs.get("afpo_row_sample"): print(f"Test CSV{describe_row_sample(test_df)}.")
+    base_X,base_Y,_,_,base_cats,_=encode(train_df,types)
+    limits=resolve_numeric_limits(getattr(args,"clamp","auto"),base_X,base_Y[:,[j for j,labels in enumerate(base_cats) if labels is None]])
     print(f"Separate output searches ({len(plan)}): "+"; ".join(f"{column}"+(f" (reads predicted {', '.join(sources)})" if sources else "") for column,sources in plan))
     # Predicted columns of finished outputs on every frame: the full table (the
     # internal split takes its rows from it), an external validation file, the test file.
@@ -8378,7 +8419,7 @@ def train_separate_outputs(args, setup, df, frames, run_seed, metadata, choose_m
         else: validation_o=df_o.iloc[validation_indices]
         args_o=argparse.Namespace(**vars(args)); args_o.test_csv=None; args_o.seed=run_seed
         setup_o={**setup,"df":df_o,"types":types_o,"metadata":_metadata_for_output(metadata,out_names,column),
-                 "_frames":(train_indices,validation_indices,train_o,validation_o,external_validation),
+                 "_frames":(train_indices,validation_indices,train_o,validation_o,external_validation),"_limits":limits,
                  "_subrun":{"output":column,"index":number-1,"count":len(plan),"reads":list(sources)}}
         result=train_from_setup(args_o,setup_o,choose_model)
         result["frames"]=(train_o,validation_o); results[column]=result
@@ -8389,6 +8430,7 @@ def train_separate_outputs(args, setup, df, frames, run_seed, metadata, choose_m
             if test_df is not None: predicted[column]["test"]=_predicted_values(result,augment(test_df,"test"))
     print(f"\n=== Merging {len(plan)} output searches ===")
     # The merged model lives in the original feature space of the whole table.
+    set_numeric_limits(*limits)
     Xt,Yt,names,out_names_all,cats,maps=encode(train_df,types)
     configure_custom_ops(getattr(args,"custom_op",None) or (),list(names),columns,types)
     Xv=Yv=None
@@ -8574,6 +8616,9 @@ def train_from_setup(args, setup, choose_model=None):
     if validation_df is not None:
         Xv,Yv,names2,out2,cats2,_=encode(validation_df,types,maps)
         if names2!=names or out2!=out_names or cats2!=cats: raise ValueError("Validation CSV columns/types do not match training data")
+    numeric_targets=[j for j,labels in enumerate(cats) if labels is None]
+    set_numeric_limits(*(setup.get("_limits") or resolve_numeric_limits(getattr(args,"clamp","auto"),Xt,Yt[:,numeric_targets])))
+    if (CLIP,EPS)!=(DEFAULT_CLIP,DEFAULT_EPS): print(f"Numeric limits: values clamp at +/-{CLIP:.3g}, divisor/log guard {EPS:.3g} (--clamp {getattr(args,'clamp','auto')}).")
     base_names=list(names)
     derived=configure_custom_ops(getattr(args,"custom_op",None) or (),base_names,list(df.columns),types)
     if derived:
@@ -8631,7 +8676,7 @@ def train_from_setup(args, setup, choose_model=None):
                    "stages":{key:stages[key] for key in ("mode","count","interval","age_gap","schedule","threshold_quantile")},
                    "roles":{key:roles[key] for key in ("enabled","interval","mix","retire_after","assignments")}},
         "equivalence_collapse":EQUIVALENCE_COLLAPSE,"residual_archive":RESIDUAL_ARCHIVE,"qd_parent_choice":QD_PARENT_CHOICE,"scale_balanced_selection":SCALE_BALANCED_SELECTION,"class_balance":CLASS_BALANCE,
-        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"selection_probe_filter":SELECTION_PROBE_FILTER,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"fit_iterations":CONSTANT_FIT_ITERATIONS,"semantic_max_delta":SEMANTIC_MAX_DELTA,"constant_snapping":CONSTANT_SNAPPING,"snap_tolerance":SNAP_TOLERANCE,"readout":READOUT_MODE,"max_terms":MAX_TERMS,"gene_crossover_rate":GENE_CROSSOVER_RATE,"backprop_mutation_weight":BACKPROP_MUTATION_WEIGHT,"backprop_inverse":BACKPROP_INVERSE,"residual_term_weight":RESIDUAL_TERM_WEIGHT,"loss":LOSS_MODE,"huber_delta":ROBUST_LOSS_DELTA,"forbid_nesting":",".join(sorted(f"{o}>{i}" for o,i in NESTING_RULES)),"units":UNIT_SPEC,"input_relations":RELATION_SPEC,"custom_ops":list(CUSTOM_OP_SPECS),"custom_feature_base":CUSTOM_FEATURE_BASE,"sparse_seeding":SPARSE_SEEDING,"sparse_basis_size":SPARSE_BASIS_SIZE,"squash_swap_weight":SQUASH_SWAP_WEIGHT,"smooth_swap_weight":SMOOTH_SWAP_WEIGHT,"gate_mutation_weight":GATE_MUTATION_WEIGHT,"loss_noise_floor":LOSS_NOISE_FLOOR,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age",
+        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"selection_probe_filter":SELECTION_PROBE_FILTER,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"fit_iterations":CONSTANT_FIT_ITERATIONS,"semantic_max_delta":SEMANTIC_MAX_DELTA,"constant_snapping":CONSTANT_SNAPPING,"snap_tolerance":SNAP_TOLERANCE,"readout":READOUT_MODE,"max_terms":MAX_TERMS,"gene_crossover_rate":GENE_CROSSOVER_RATE,"backprop_mutation_weight":BACKPROP_MUTATION_WEIGHT,"backprop_inverse":BACKPROP_INVERSE,"residual_term_weight":RESIDUAL_TERM_WEIGHT,"loss":LOSS_MODE,"huber_delta":ROBUST_LOSS_DELTA,"forbid_nesting":",".join(sorted(f"{o}>{i}" for o,i in NESTING_RULES)),"units":UNIT_SPEC,"input_relations":RELATION_SPEC,"custom_ops":list(CUSTOM_OP_SPECS),"custom_feature_base":CUSTOM_FEATURE_BASE,"clip":CLIP,"eps":EPS,"sparse_seeding":SPARSE_SEEDING,"sparse_basis_size":SPARSE_BASIS_SIZE,"squash_swap_weight":SQUASH_SWAP_WEIGHT,"smooth_swap_weight":SMOOTH_SWAP_WEIGHT,"gate_mutation_weight":GATE_MUTATION_WEIGHT,"loss_noise_floor":LOSS_NOISE_FLOOR,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age",
         "test_csv":str(Path(args.test_csv).resolve()) if args.test_csv else None,
         "row_sample":row_sample,
     },(source_rows,source_columns),train_indices,validation_indices,external_validation)
@@ -8648,7 +8693,7 @@ def train_from_setup(args, setup, choose_model=None):
         "profile":args.profile,"constraint_metadata":metadata,"constraints":constraints.describe(),"bayesian_particles":args.bayesian_particles,"interaction_discovery":interaction_discovery,
         "island_config":{"count":island_count,"migration_interval":migration_interval,"migrants_per_island":migrants_per_island,"topology":"ring","migration_events":0,"stages":stages,"roles":roles},
         "equivalence_collapse":EQUIVALENCE_COLLAPSE,"residual_archive":RESIDUAL_ARCHIVE,"qd_parent_choice":QD_PARENT_CHOICE,"scale_balanced_selection":SCALE_BALANCED_SELECTION,"class_balance":CLASS_BALANCE,
-        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"selection_probe_filter":SELECTION_PROBE_FILTER,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"fit_iterations":CONSTANT_FIT_ITERATIONS,"semantic_max_delta":SEMANTIC_MAX_DELTA,"constant_snapping":CONSTANT_SNAPPING,"snap_tolerance":SNAP_TOLERANCE,"readout":READOUT_MODE,"max_terms":MAX_TERMS,"gene_crossover_rate":GENE_CROSSOVER_RATE,"backprop_mutation_weight":BACKPROP_MUTATION_WEIGHT,"backprop_inverse":BACKPROP_INVERSE,"residual_term_weight":RESIDUAL_TERM_WEIGHT,"loss":LOSS_MODE,"huber_delta":ROBUST_LOSS_DELTA,"forbid_nesting":",".join(sorted(f"{o}>{i}" for o,i in NESTING_RULES)),"units":UNIT_SPEC,"input_relations":RELATION_SPEC,"custom_ops":list(CUSTOM_OP_SPECS),"custom_feature_base":CUSTOM_FEATURE_BASE,"sparse_seeding":SPARSE_SEEDING,"sparse_basis_size":SPARSE_BASIS_SIZE,"squash_swap_weight":SQUASH_SWAP_WEIGHT,"smooth_swap_weight":SMOOTH_SWAP_WEIGHT,"gate_mutation_weight":GATE_MUTATION_WEIGHT,"loss_noise_floor":LOSS_NOISE_FLOOR,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age"}
+        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"selection_probe_filter":SELECTION_PROBE_FILTER,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"fit_iterations":CONSTANT_FIT_ITERATIONS,"semantic_max_delta":SEMANTIC_MAX_DELTA,"constant_snapping":CONSTANT_SNAPPING,"snap_tolerance":SNAP_TOLERANCE,"readout":READOUT_MODE,"max_terms":MAX_TERMS,"gene_crossover_rate":GENE_CROSSOVER_RATE,"backprop_mutation_weight":BACKPROP_MUTATION_WEIGHT,"backprop_inverse":BACKPROP_INVERSE,"residual_term_weight":RESIDUAL_TERM_WEIGHT,"loss":LOSS_MODE,"huber_delta":ROBUST_LOSS_DELTA,"forbid_nesting":",".join(sorted(f"{o}>{i}" for o,i in NESTING_RULES)),"units":UNIT_SPEC,"input_relations":RELATION_SPEC,"custom_ops":list(CUSTOM_OP_SPECS),"custom_feature_base":CUSTOM_FEATURE_BASE,"clip":CLIP,"eps":EPS,"sparse_seeding":SPARSE_SEEDING,"sparse_basis_size":SPARSE_BASIS_SIZE,"squash_swap_weight":SQUASH_SWAP_WEIGHT,"smooth_swap_weight":SMOOTH_SWAP_WEIGHT,"gate_mutation_weight":GATE_MUTATION_WEIGHT,"loss_noise_floor":LOSS_NOISE_FLOOR,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age"}
     head_count=sum(len(heads) for heads in classification_layout(cats)[0])
     population_sizes=cell_population_sizes(args.population,cell_count)
     islands=[new_island_runtime(size,X=X,Xt=Xt,cats=cats,ops=ops,nodes=nodes,depth=depth,head_count=head_count,

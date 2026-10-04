@@ -115,3 +115,26 @@ class RunTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NumericLimitTests(unittest.TestCase):
+    def tearDown(self):
+        a.set_numeric_limits(a.DEFAULT_CLIP, a.DEFAULT_EPS)
+
+    def test_ordinary_data_keeps_the_defaults(self):
+        self.assertEqual(a.automatic_limits(np.array([[0.01, 500.], [-3., 2.]])), (1e12, 1e-12))
+
+    def test_large_and_small_data_move_the_limits(self):
+        clip, eps = a.automatic_limits(np.array([3e8, 1.]))
+        self.assertGreater(clip, (3e8) ** 2)
+        clip, eps = a.automatic_limits(np.array([1e-9, 1.]))
+        self.assertLess(eps, 1e-18)
+        self.assertEqual(a.resolve_numeric_limits("default", np.array([3e8])), (1e12, 1e-12))
+        self.assertEqual(a.resolve_numeric_limits("1e20", np.array([1.]))[0], 1e20)
+
+    def test_clamp_and_guard_follow_the_limits(self):
+        x = np.array([3e8])
+        self.assertEqual(float(a.op_eval("square", [x])[0]), 1e12)       # default clamp
+        a.set_numeric_limits(1e40, 1e-30)
+        self.assertEqual(float(a.op_eval("square", [x])[0]), 9e16)
+        self.assertEqual(float(a.op_eval("/", [np.array([1e-20]), np.array([1e-20])])[0]), 1.)
