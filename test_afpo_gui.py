@@ -166,6 +166,18 @@ class GuiTests(unittest.TestCase):
         self.assertEqual(values.shape, (7, 7))
         self.assertAlmostEqual(values[6, 0], explorer.predict(index, {"a": -1, "b": 2, "c": .3})["outputs"]["y"], places=9)
         self.assertEqual(set(grid["data"]["coords"]), {"a", "b"})
+        self.assertEqual(set(grid["data_sets"]), {"validation"})           # no test CSV in this run
+        # Editing: the text round-trips, and an edit becomes a new, scored candidate.
+        heads = explorer.edit_text(index)["heads"]
+        self.assertEqual(len(heads), 1)
+        same = explorer.edit(index, [heads[0]["text"]])
+        np.testing.assert_allclose(explorer.sweep(same["index"], "a")["outputs"]["y"]["values"], sweep["outputs"]["y"]["values"])
+        shifted = explorer.edit(index, [f"({heads[0]['text']}) + 1"])
+        np.testing.assert_allclose(np.asarray(explorer.sweep(shifted["index"], "a")["outputs"]["y"]["values"]),
+                                   np.asarray(sweep["outputs"]["y"]["values"]) + 1)
+        self.assertTrue(shifted["summary"]["models"][shifted["index"]]["label"].startswith("Edited"))
+        with self.assertRaisesRegex(ValueError, "Unknown input"):
+            explorer.edit(index, ["a + nope"])
         with self.assertRaises(ValueError):
             explorer.grid(index, "a", "a")
         with self.assertRaises(ValueError):

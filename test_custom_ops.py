@@ -146,3 +146,24 @@ class NumericLimitTests(unittest.TestCase):
         a.set_numeric_limits(1e40, 1e-30)
         self.assertEqual(float(a.op_eval("square", [x])[0]), 9e16)
         self.assertEqual(float(a.op_eval("/", [np.array([1e-20]), np.array([1e-20])])[0]), 1.)
+
+
+class EquationTextTests(unittest.TestCase):
+    """The GUI's editable equation text round-trips exactly."""
+    names = ["a", "b c", "x=1"]
+
+    def tearDown(self):
+        a.configure_custom_ops((), NAMES)
+
+    def test_round_trip(self):
+        for tree in [("+", ("*", ("c", 2.5), X(0)), ("sin", X(1))), ("pow", ("neg", X(2)), ("c", .1 + .2)),
+                     ("gt", X(0), ("c", -1e-7)), ("max", X(0), ("mod", X(1), ("c", 3.))), ("floordiv", X(0), ("c", 7.))]:
+            with self.subTest(tree=tree):
+                self.assertEqual(a.parse_equation(a.tree_text(tree, self.names), self.names), tree)
+
+    def test_readout_and_custom_operators(self):
+        configure("fq = amount / v0")
+        text = a.readout_text(("adf_fq", ("c", 2.)), (3., -1.), NAMES)
+        self.assertEqual(text, "3.0 * fq(2.0) + -1.0")
+        self.assertEqual(a.parse_equation(text, NAMES), ("+", ("*", ("c", 3.), ("adf_fq", ("c", 2.))), ("c", -1.)))
+        with self.assertRaises(ValueError): a.parse_equation("fq(1, 2)", NAMES)

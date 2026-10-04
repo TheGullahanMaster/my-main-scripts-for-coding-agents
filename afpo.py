@@ -3054,6 +3054,78 @@ def register_custom_ops(registry):
             registry.definitions[name]={"tree":item["tree"],"arity":item["arity"],"dependencies":[],"supporting_founders":[],"activated_generation":None,
                                         "retired_generation":None,"elite_uses":0,"validation":[]}
 
+# Editable equations (GUI): a tree as text in the --custom-op syntax and back.
+# Infix for + - * / ** % // and comparisons, function calls for every other
+# operator, `back quotes` for feature names that are not identifiers, user
+# operators by their own name and mined ADFs by theirs, and constants written
+# exactly (repr), so text -> tree -> text loses nothing.
+_INFIX_TEXT = {"+":"+","-":"-","*":"*","/":"/","pow":"**","mod":"%","floordiv":"//","gt":">","lt":"<","gte":">=","lte":"<=","eq":"==","ne":"!="}
+_TEXT_RESERVED = set(OPS)|{"True","False","None","and","or","not","if","else","lambda","in","is"}
+
+def _text_name(name):
+    return name if name.isidentifier() and name not in _TEXT_RESERVED and not re.fullmatch(r"v\d+",name) else f"`{name}`"
+
+def tree_text(tree, feature_names):
+    """A tree in the editable equation syntax (see parse_equation)."""
+    if tree[0]=="x": return _text_name(feature_names[tree[1]])
+    if tree[0]=="c": return repr(float(tree[1]))
+    if tree[0]=="arg": raise ValueError("ADF arguments only appear inside definitions")
+    args=[tree_text(child,feature_names) for child in tree[1:]]
+    if tree[0] in _INFIX_TEXT and len(args)==2: return f"({args[0]} {_INFIX_TEXT[tree[0]]} {args[1]})"
+    if tree[0]=="neg": return f"(-{args[0]})"
+    name=CUSTOM_OPS[tree[0]]["display"] if tree[0] in CUSTOM_OPS else tree[0]
+    return f"{name}({', '.join(args)})"
+
+def readout_text(tree, scale, feature_names):
+    """One head with its affine readout, as the user edits it."""
+    a,b=scale; body=tree_text(tree,feature_names)
+    if a==1. and b==0.: return body
+    return f"{repr(float(a))} * {body}"+("" if b==0. else f" + {repr(float(b))}")
+
+def parse_equation(text, feature_names, adfs=None):
+    """Parse an edited equation into a tree over the model's features."""
+    import ast
+    quoted={}
+    def unquote(match):
+        key=f"__q{len(quoted)}"; quoted[key]=match.group(1); return key
+    source=re.sub(r"`([^`]+)`",unquote,str(text).strip())
+    if not source: raise ValueError("The equation is empty")
+    try: parsed=ast.parse(source,mode="eval").body
+    except SyntaxError as error: raise ValueError(f"Cannot parse the equation: {error.msg}") from None
+    features={name:index for index,name in enumerate(feature_names)}
+    adfs=adfs or {}
+    by_display={}
+    for internal,item in CUSTOM_OPS.items(): by_display.setdefault(item["display"],{})[int(item["arity"])]=internal
+    def convert(node):
+        if isinstance(node,ast.Constant) and isinstance(node.value,(int,float)) and not isinstance(node.value,bool): return ("c",float(node.value))
+        if isinstance(node,ast.Name):
+            name=quoted.get(node.id,node.id)
+            if name in features: return ("x",features[name])
+            raise ValueError(f"Unknown input {name!r} (names that are not identifiers go in `back quotes`)")
+        if isinstance(node,ast.UnaryOp):
+            inner=convert(node.operand)
+            if isinstance(node.op,ast.USub): return ("c",-inner[1]) if inner[0]=="c" else ("neg",inner)
+            if isinstance(node.op,ast.UAdd): return inner
+        if isinstance(node,ast.BinOp) and type(node.op).__name__ in _BINARY_AST_OPS:
+            return (_BINARY_AST_OPS[type(node.op).__name__],convert(node.left),convert(node.right))
+        if isinstance(node,ast.Compare) and len(node.ops)==1 and type(node.ops[0]).__name__ in _COMPARE_AST_OPS:
+            return (_COMPARE_AST_OPS[type(node.ops[0]).__name__],convert(node.left),convert(node.comparators[0]))
+        if isinstance(node,ast.Call) and isinstance(node.func,ast.Name) and not node.keywords:
+            name=node.func.id; arguments=[convert(argument) for argument in node.args]
+            if name in by_display:
+                internal=by_display[name].get(len(arguments))
+                if internal is None: raise ValueError(f"{name} takes {' or '.join(map(str,sorted(by_display[name])))} argument(s)")
+                return tuple([internal]+arguments)
+            if name in adfs:
+                if len(arguments)!=int(adfs[name]["arity"]): raise ValueError(f"{name} takes {adfs[name]['arity']} argument(s)")
+                return tuple([name]+arguments)
+            if name in OPS:
+                if OPS[name][0]!=len(arguments): raise ValueError(f"{name} takes {OPS[name][0]} argument(s)")
+                return tuple([name]+arguments)
+            raise ValueError(f"Unknown function {name!r}")
+        raise ValueError(f"Unsupported expression {ast.unparse(node)!r}")
+    return convert(parsed)
+
 def admissible_random_tree(n_features, ops, max_nodes, max_depth, attempts=25, **kwargs):
     """A random tree that passes --forbid-nesting, --units and --input-relations, when one turns up within a few draws."""
     tree=random_tree(n_features,ops,max_nodes,max_depth,**kwargs)

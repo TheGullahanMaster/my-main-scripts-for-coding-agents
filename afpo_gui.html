@@ -463,8 +463,15 @@ button.play.on { background: var(--accent); color: var(--accent-ink); border-col
 
     <div id="detailView" class="hidden">
       <div class="card">
-        <h2>Selected model <span class="grow"></span><button class="btn" id="exportBtn">Export as best_model.py</button></h2>
+        <h2>Selected model <span class="grow"></span><button class="btn" id="editBtn">Edit equation</button><button class="btn" id="exportBtn">Export as best_model.py</button></h2>
         <div id="detailEq"></div>
+        <div id="editBox" class="hidden" style="margin-top:8px">
+          <div id="editHeads"></div>
+          <div class="row" style="margin-top:6px"><label class="check" title="Re-fit the numeric constants (and the output scale and offset) of the edited structure to the training rows"><input type="checkbox" id="editRefit"> Re-fit constants after editing</label>
+            <span class="grow"></span><button class="btn" id="editCancel">Cancel</button><button class="btn primary" id="editApply">Apply as a new candidate</button></div>
+          <div class="hint">Change constants, drop terms, add operators: the edited equation becomes a new candidate, scored on the same rows, and every view below follows it. Syntax: + - * / ** % // and comparisons; any operator by name, e.g. sin(x), max(a, b); input names that are not plain identifiers go in `back quotes`.</div>
+          <div id="editError" class="notice err hidden" style="margin-top:6px"></div>
+        </div>
         <details id="mathBox" open style="margin-top:8px"><summary>Rendered equation</summary>
           <div class="row" style="margin:6px 0">
             <span class="seg" id="mathMode"><button data-mode="raw" class="active" title="Protections removed, constants as fractions or 6 significant digits">Readable</button><button data-mode="exact" title="afpo's protected operators and full-precision constants: reproduces the model's predictions">Exact</button></span>
@@ -1548,7 +1555,7 @@ function renderCandidates() {
 }
 $('#candLog').onchange = renderCandidates;
 async function selectModel(index) {
-  M.index = index; renderCandidates();
+  M.index = index; renderCandidates(); $('#editBox').classList.add('hidden');
   try {
     const d = M.detail = await api('/api/models/detail', {index});
     $('#detailView').classList.remove('hidden');
@@ -2147,6 +2154,31 @@ $('#batchBtn').onclick = async () => {
       <div class="scroll-x"><table><thead><tr>${r.columns.map(c => `<th>${esc(c)}</th>`).join('')}</tr></thead><tbody>${r.preview.map(row => `<tr>${row.map(v => `<td>${v === null ? '' : esc(v)}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`;
   } catch (e) { toast(e.message, true); }
   finally { $('#batchBtn').disabled = false; }
+};
+// ───────────── edit the selected equation ─────────────
+$('#editBtn').onclick = async () => {
+  if (M.index == null) return;
+  try {
+    const r = await api('/api/models/edit_text', {index: M.index});
+    $('#editHeads').innerHTML = r.heads.map((h, i) => `<div class="field"><label>${esc(h.label)} =</label>
+      <textarea class="mono" data-edit-head="${i}" rows="${Math.min(8, 1 + Math.ceil(h.text.length / 90))}" spellcheck="false">${esc(h.text)}</textarea></div>`).join('');
+    $('#editError').classList.add('hidden');
+    $('#editBox').classList.remove('hidden');
+  } catch (e) { toast(e.message, true); }
+};
+$('#editCancel').onclick = () => $('#editBox').classList.add('hidden');
+$('#editApply').onclick = async () => {
+  if (M.index == null) return;
+  const texts = $$('#editHeads [data-edit-head]').map(t => t.value);
+  $('#editApply').disabled = true;
+  try {
+    const r = await api('/api/models/edit', {index: M.index, texts, refit: $('#editRefit').checked});
+    M.summary = r.summary; renderCandidates();
+    $('#editBox').classList.add('hidden');
+    await selectModel(r.index);
+    toast('Edited model added as candidate #' + (r.index + 1));
+  } catch (e) { $('#editError').textContent = e.message; $('#editError').classList.remove('hidden'); }
+  finally { $('#editApply').disabled = false; }
 };
 $('#exportBtn').onclick = async () => {
   if (M.index == null) return;

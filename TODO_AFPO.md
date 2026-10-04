@@ -472,6 +472,35 @@ so these are **audit-then-extend**, not new builds.
   their group) combine. Enforced in random trees, mutation and crossover
   retries, offspring redraws, constant tuning and scoring.
   GUI: output mode in Advanced options; relation fields in the Data section.
+- [x] Custom operators (`--custom-op "NAME = EXPR"`, 2026-10-04): partly
+  known operators built from AFPO's own operators. `v0, v1, ...` are
+  parameters the search fills in (every `v0` the same argument), `v#` an
+  optional slot whose operation disappears when left out (`bar + v#*kpop`
+  becomes `bar + kpop`), column names and numbers are fixed, earlier custom
+  operators can be reused (`name(a, b)` or bare `name`). Operators with
+  parameters are permanent ADFs (one per optional-slot combination, shown by
+  their own name, not charged as definitions); parameterless forms (`E =
+  m*c**2`, or `foo()` with every `v#` left out) are derived input features
+  that the export inlines. Staged inputs in separate-output runs now carry
+  the original column name.
+- [x] `--clamp auto` (default): value clamp and divisor/log guard follow the
+  data (CLIP = max(1e12, 1e6*B^2), EPS = min(1e-12, 1e-6*b^2)); data within
+  [1e-3, 1e3] keeps 1e12/1e-12. E = m*c^2 with c ≈ 3e8: `default` stalls on a
+  linear fudge, `auto` finds m*c*c exactly. Saved in checkpoints, passed to
+  the compiled fitter, embedded in the export.
+- [x] `--stop-at-loss` uses validation loss when there is validation data
+  and accepts `NAME=LOSS,...` per output (each separate-output search stops
+  at its own limit).
+- [x] GUI: rendered equations run in a killable child process outside the
+  explorer lock and long formulas render on request (no more frozen tabs);
+  test rows kept in checkpoints, test loss shown when a run finishes, in the
+  model details and as a Test fit split; validation/test row overlays in
+  1D/2D/3D; 1D x axis follows the requested range (narrow range zooms in);
+  wheel/pinch zoom, drag pan and double-click reset on 1D/2D; custom
+  resolution; animation of frozen inputs (several at once, live or
+  pregenerated — a pregenerated loop keeps 3D rotatable); equation editing
+  (each head as text, applied as a new scored candidate, optional constant
+  re-fit).
 
 ## Phase 4 — Later (after Phases 1–3 produce telemetry)
 

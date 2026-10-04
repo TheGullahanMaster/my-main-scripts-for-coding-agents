@@ -897,6 +897,53 @@ class ModelExplorer:
                 item["latex"] = payload
         return payload
 
+    def _head_labels(self):
+        state = self.state
+        labels = []
+        for name, classes in zip(state["out_names"], state["cats"]):
+            labels.extend([f"{name}[{c!r}] score" for c in classes] if classes is not None and len(classes) > 2 else [name])
+        return labels
+
+    def edit_text(self, index):
+        """Each equation head with its readout, in the editable syntax (afpo.parse_equation)."""
+        with self.lock:
+            model, state = self._model(index), self.state
+            return {"heads": [{"label": label, "text": afpo.readout_text(tree, scale, state["names"])}
+                              for label, tree, scale in zip(self._head_labels(), model.trees, model.scales)]}
+
+    def edit(self, index, texts, refit=False):
+        """A new candidate from edited equations (optionally with its constants re-fitted); returns its index."""
+        with self.lock:
+            original, state = self._model(index), self.state
+            names, out_names, cats = state["names"], state["out_names"], state["cats"]
+            if len(texts) != len(original.trees):
+                raise ValueError(f"Expected {len(original.trees)} equation(s)")
+            trees = []
+            for label, text in zip(self._head_labels(), texts):
+                try:
+                    trees.append(afpo.parse_equation(text, names, original.adfs))
+                except ValueError as error:
+                    raise ValueError(f"{label}: {error}") from None
+            used = {node[0] for tree in trees for node in afpo.walk_tree(tree) if node[0] not in ("x", "c", "arg")}
+            model = afpo.Model(trees, [(1., 0.)] * len(trees), origin="edited", mdl_operators=tuple(dict.fromkeys([*original.mdl_operators, *sorted(used)])),
+                               mdl_feature_count=original.mdl_feature_count or len(names), adfs=dict(original.adfs), history=original.history)
+            Xt, Yt = state["Xt"], state["Yt"]
+            if refit:
+                afpo.tune_model_constants(model, Xt, Yt, state.get("affine_on", True), cats)
+                afpo.assess(model, Xt, Yt, state.get("affine_on", True), cats, fit_affine=True, constraints=self.constraints, output_names=out_names)
+            else:
+                afpo.assess(model, Xt, Yt, False, cats, fit_affine=False, constraints=self.constraints, output_names=out_names)
+            if not model.feasible:
+                raise ValueError(f"The edited model cannot be scored ({model.invalid_reason})")
+            entries = afpo.selection_evaluation([model], state.get("Xv"), state.get("Yv"), cats, self.constraints, out_names)[1]
+            if not entries:
+                raise ValueError("The edited model gives non-finite results")
+            _, _, metrics = entries[0]
+            train = afpo.frozen_metrics(model, Xt, Yt, cats, self.constraints, out_names)
+            self.models.append({"model": model, "metrics": metrics, "train": train,
+                                "label": f"Edited (from #{int(index) + 1})" + (", refitted" if refit else ""), "frontier": False})
+            return {"index": len(self.models) - 1, "summary": self.summary(state.get("selection") or {})}
+
     def _inputs_used(self, model):
         """Source input columns the model reads (a text column counts if any of its categories is used)."""
         state = self.state
@@ -1156,8 +1203,9 @@ class ModelExplorer:
     def export(self, index):
         with self.lock:
             model, state = self._model(index), self.state
-            afpo.export_model(model, state["names"], state["out_names"], state["cats"], state["maps"], state["source_columns"],
-                              state["types"], state.get("export_fixture"), state.get("input_ranges"))
+            names = state["names"] if afpo.CUSTOM_FEATURE_BASE is None else state["names"][:afpo.CUSTOM_FEATURE_BASE]
+            afpo.export_model(afpo.inline_custom_features(model, state["names"]), names, state["out_names"], state["cats"], state["maps"],
+                              state["source_columns"], state["types"], state.get("export_fixture"), state.get("input_ranges"))
             written = [p for p in ("best_model.py", "model_tree.svg", "best_model_fixture.csv", "best_model_fixture_predictions.csv") if Path(p).exists()]
             return {"written": [str(Path(p).resolve()) for p in written],
                     "equation": afpo.equations(model, state["names"], state["out_names"], state["cats"])}
@@ -1410,6 +1458,8 @@ def run_gui(host="127.0.0.1", port=DEFAULT_PORT, open_browser=True):
         "/api/models/load": lambda b: explorer.load(b["path"]),
         "/api/models/detail": lambda b: explorer.detail(b["index"]),
         "/api/models/latex": lambda b: explorer.latex(b["index"]),
+        "/api/models/edit_text": lambda b: explorer.edit_text(b["index"]),
+        "/api/models/edit": lambda b: explorer.edit(b["index"], b.get("texts") or [], bool(b.get("refit"))),
         "/api/models/fit": lambda b: explorer.fit(b["index"], b.get("split", "train")),
         "/api/models/predict": lambda b: explorer.predict(b["index"], b.get("row") or {}),
         "/api/models/sweep": lambda b: explorer.sweep(b["index"], b["column"], b.get("base"), b.get("lo"), b.get("hi"), b.get("points", 160)),
