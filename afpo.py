@@ -4384,7 +4384,8 @@ def normalize_objectives(models, mode="intercept"):
     extreme=np.asarray([translated[np.argmin(np.max(translated/weight,axis=1))] for weight in weights])
     fallback=np.maximum(translated.max(axis=0),EPS)
     try:
-        intercepts=1./np.linalg.solve(extreme,np.ones(dimensions))
+        # A singular or degenerate system falls back below; its divide-by-zero is expected, not news.
+        with np.errstate(divide="ignore",invalid="ignore"): intercepts=1./np.linalg.solve(extreme,np.ones(dimensions))
         if not np.all(np.isfinite(intercepts)) or np.any(intercepts<=EPS): raise np.linalg.LinAlgError
     except np.linalg.LinAlgError:
         intercepts=fallback

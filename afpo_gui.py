@@ -469,7 +469,7 @@ class Telemetry:
             metrics = next((e[2] for e in entries if e[0] is model), {})
             items.append({"label": label, "metrics": metrics, "train_loss": afpo.aggregate_loss(model),
                           "equation": afpo.equations(model, names, out_names, cats) if names else repr(model.trees)})
-        self.emit("choose", source=source, options=items)
+        self.emit("choose", source=source, options=items, outputs=list(out_names or []))
         line = sys.stdin.readline()
         try:
             index = int(line.strip() or 0)
@@ -623,9 +623,12 @@ class TrainingSession:
             elif kind == "config":
                 if self.config is not None:          # the next output's search of a separate-output run
                     self.history = []; self.snapshot = None
+                    # The previous output's choice is settled; this search runs (and can be stopped) afresh.
+                    self.choose = None; self.chosen = None; self.stop_requests = 0
                 self.config = event
             elif kind == "choose":
-                self.choose = event
+                # A separate-output run asks once per output: every prompt waits for its own pick.
+                self.choose = event; self.chosen = None
             elif kind == "done":
                 self.done = event
             elif kind == "error":
