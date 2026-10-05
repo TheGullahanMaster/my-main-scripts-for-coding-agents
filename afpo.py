@@ -3681,6 +3681,67 @@ def class_balanced_rows(X, truth, class_count, maximum):
     _BALANCED_ROWS[key]=rows
     return rows
 
+# --output-balance (default off): the numeric counterpart of --class-balance.
+# Each numeric output's training range is cut into OUTPUT_BALANCE_BINS
+# equal-width bins and the training rows are resampled, once, before the
+# search, so every occupied bin holds the same number of rows: rows of a
+# crowded bin are thinned, rows of a sparse one repeated.  Everything
+# downstream (loss, readout and constant fits, co-evolution minibatches,
+# probes, lexicase) then sees the whole output range evenly instead of the
+# dataset's own distribution, where a target that is zero on most rows is
+# fitted by a constant long before the other values count.  Validation rows are
+# resampled the same way (training bin edges), so model choice follows the same
+# weighting; the test file is left as it is.  With --output-mode separate each
+# output's search resamples for its own column.
+OUTPUT_BALANCE = False
+OUTPUT_BALANCE_BINS = 10
+def output_balance_edges(y, bins=None):
+    """Inner edges of the equal-width bins over y's finite range; None for a constant column."""
+    y=np.asarray(y,float); finite=y[np.isfinite(y)]
+    if not len(finite): return None
+    low,high=float(finite.min()),float(finite.max())
+    if not high>low: return None
+    return np.linspace(low,high,(OUTPUT_BALANCE_BINS if bins is None else int(bins))+1)[1:-1]
+def output_bin_index(y, edges):
+    """Bin of every value; values outside the fitted range fall in the end bins."""
+    return np.searchsorted(edges,np.nan_to_num(np.asarray(y,float),nan=0.),side="right")
+def output_balance_weights(Y, cats, edges):
+    """Row weights (mean 1) giving every occupied value bin of every numeric
+    output the same total weight; None when no output has a range to balance."""
+    weights=None
+    for j,labels in enumerate(cats):
+        if labels is not None or edges[j] is None: continue
+        bin_index=output_bin_index(Y[:,j],edges[j]); counts=np.bincount(bin_index).astype(float)
+        part=len(Y)/(np.count_nonzero(counts)*counts[bin_index])
+        weights=part if weights is None else weights+part
+    return None if weights is None else weights*len(weights)/float(weights.sum())
+def output_balanced_rows(weights, seed):
+    """len(weights) row indices, in row order, each row repeated in proportion
+    to its weight (systematic resampling: a row's copies are within one of its
+    weight).  Its own generator, so the run's RNG streams are untouched."""
+    n=len(weights); cumulative=np.cumsum(weights)
+    points=(np.random.default_rng(seed).random()+np.arange(n))*cumulative[-1]/n
+    return np.minimum(np.searchsorted(cumulative,points,side="right"),n-1)
+def apply_output_balance(Xt, Yt, Xv, Yv, cats, out_names, seed):
+    """Resample the training (and validation) rows for --output-balance; unchanged when nothing applies."""
+    edges=[None if labels is not None else output_balance_edges(Yt[:,j]) for j,labels in enumerate(cats)]
+    weights=output_balance_weights(Yt,cats,edges)
+    if weights is None:
+        print("Output balance: no numeric output with a value range; rows are unchanged.")
+        return Xt,Yt,Xv,Yv
+    rows=output_balanced_rows(weights,seed ^ 0x4F42)
+    copies=np.bincount(rows,minlength=len(Yt))
+    balanced=[f"{name} ({len(np.unique(output_bin_index(Yt[:,j],edges[j])))} of {len(edges[j])+1} bins occupied)"
+              for j,name in enumerate(out_names) if edges[j] is not None]
+    print(f"Output balance: resampled {len(Yt):,} training rows evenly over the value range of {', '.join(balanced)}; "
+          f"{int(np.count_nonzero(copies)):,} distinct rows kept, the most repeated one {int(copies.max()):,}x.")
+    Xt,Yt=Xt[rows],Yt[rows]
+    if Xv is not None:
+        validation_weights=output_balance_weights(Yv,cats,edges)
+        if validation_weights is not None:
+            rows=output_balanced_rows(validation_weights,seed ^ 0x4F56); Xv,Yv=Xv[rows],Yv[rows]
+    return Xt,Yt,Xv,Yv
+
 CLASSIFIER_RIDGE=1e-3
 def fit_classifier_affine(raw, truth, class_count):
     """Fit per-head (scale, offset) minimizing ridge-penalized log loss by damped Newton.
@@ -8166,6 +8227,8 @@ def build_arg_parser():
     ap.add_argument("--residual-archive",choices=("on","off"),default="on",help="Keep a third QD archive keyed by where each model errs (target-size bins and input regions), so complementary partial models survive (default: on)")
     ap.add_argument("--qd-parent-choice",choices=QD_PARENT_CHOICES,default="quality_coverage",help="How QD archives pick parent cells beyond the uniform share: success x bounded quality rank x coverage bonus, or legacy success-only (default: quality_coverage)")
     ap.add_argument("--class-balance",choices=("on","off"),default="on",help="Give every class of a categorical output equal weight: class-weighted log loss, balanced error rate as its shape objective, class-weighted readout fit and constant tuning, class-balanced lexicase case order, per-class residual-archive groups, and a train/validation split stratified by class (default: on)")
+    ap.add_argument("--output-balance",choices=("on","off"),default="off",help="Sample numeric outputs uniformly over their value range instead of following the dataset's own distribution (the numeric counterpart of --class-balance): each numeric output's range is cut into --output-balance-bins equal-width bins and the training and validation rows are resampled once so every occupied bin holds the same number of rows, crowded values thinned and rare ones repeated.  Use it when most rows share one value (e.g. zero) and the rest would otherwise be fitted late or never; with --output-mode separate each output is balanced on its own column.  Losses printed during the run are then on the resampled rows; the test CSV is never resampled.  A single extreme value owns a bin, so it is repeated heavily (default: off)")
+    ap.add_argument("--output-balance-bins",type=int,default=10,help="Equal-width value bins per numeric output for --output-balance (default: 10)")
     ap.add_argument("--scale-balanced-selection",choices=("on","off"),default="on",help="Selection-only: give every target-magnitude band equal weight and compare asinh-compressed errors in lexicase parent choice; reported loss is unchanged (default: on)")
     ap.add_argument("--cell-workers",type=int,default=0,help="Processes that evolve island/stage cells in parallel; 0=auto (one per cell, up to CPUs-1), 1=serial.  Results are identical either way (default: 0)")
     ap.add_argument("--cache-memory",type=float,default=128,metavar="MB",help="Budget of the tree-output cache in the main process; each --workers scoring process gets an eighth of it. Lower it if large trees or many workers run out of memory: results are identical, only speed changes (default: 128)")
@@ -8218,6 +8281,7 @@ def parse_cli(argv=None):
     if not .10 <= args.qd_parent_rate <= .30: ap.error("--qd-parent-rate must be between 0.10 and 0.30")
     if args.evaluation_refresh < 1 or args.stagnation_window < 1: ap.error("evaluation refresh and stagnation window must be positive")
     if args.fit_iterations < 1: ap.error("--fit-iterations must be positive")
+    if args.output_balance_bins < 2: ap.error("--output-balance-bins must be at least 2")
     if args.max_rows < 0: ap.error("--max-rows must be non-negative (0 reads every row)")
     if 0 < args.max_rows < 10: ap.error("--max-rows needs at least 10 rows to split training and validation data")
     try:
@@ -8675,6 +8739,12 @@ def split_frames(df, types, setup, run_seed, delimiter, max_rows=0, sample_seed=
                 for col in [col for col,t in zip(df.columns,types) if t==6] if CLASS_BALANCE else ():
                     labels=df[col].fillna("__MISSING__").astype(str)
                     strata=labels if strata is None else strata+"\x1f"+labels
+                # A sparse value bin likewise keeps rows on both sides of the split.
+                for col in [col for col,t in zip(df.columns,types) if t==5] if OUTPUT_BALANCE else ():
+                    values=pd.to_numeric(df[col],errors="coerce").to_numpy(float); edges=output_balance_edges(values)
+                    if edges is None: continue
+                    labels=pd.Series(output_bin_index(values,edges).astype(str),index=df.index)
+                    strata=labels if strata is None else strata+"\x1f"+labels
                 strata=None if strata is None else strata.to_numpy()
                 train_indices,validation_indices=holdout_split_indices(len(df),val_rows,run_seed,strata)
                 train_df=df.iloc[train_indices]; validation_df=df.iloc[validation_indices]
@@ -8717,6 +8787,8 @@ def train_from_setup(args, setup, choose_model=None):
     RESIDUAL_ARCHIVE=getattr(args,"residual_archive","on")=="on"; QD_PARENT_CHOICE=getattr(args,"qd_parent_choice","quality_coverage")
     SCALE_BALANCED_SELECTION=getattr(args,"scale_balanced_selection","on")=="on"
     CLASS_BALANCE=getattr(args,"class_balance","on")=="on"
+    global OUTPUT_BALANCE,OUTPUT_BALANCE_BINS
+    OUTPUT_BALANCE=getattr(args,"output_balance","off")=="on"; OUTPUT_BALANCE_BINS=int(getattr(args,"output_balance_bins",10))
     run_seed=args.seed if args.seed is not None else random.SystemRandom().randrange(2**32)
     rng.seed(run_seed); np.random.seed(run_seed)
     print(f"Run seed: {run_seed}")
@@ -8761,6 +8833,8 @@ def train_from_setup(args, setup, choose_model=None):
     if validation_df is not None:
         Xv,Yv,names2,out2,cats2,_=encode(validation_df,types,maps)
         if names2!=names or out2!=out_names or cats2!=cats: raise ValueError("Validation CSV columns/types do not match training data")
+    if OUTPUT_BALANCE:
+        Xt,Yt,Xv,Yv=apply_output_balance(Xt,Yt,Xv,Yv,cats,out_names,run_seed); X,Y=Xt,Yt
     numeric_targets=[j for j,labels in enumerate(cats) if labels is None]
     set_numeric_limits(*(setup.get("_limits") or resolve_numeric_limits(getattr(args,"clamp","auto"),Xt,Yt[:,numeric_targets])))
     if (CLIP,EPS)!=(DEFAULT_CLIP,DEFAULT_EPS): print(f"Numeric limits: values clamp at +/-{CLIP:.3g}, divisor/log guard {EPS:.3g} (--clamp {getattr(args,'clamp','auto')}).")
@@ -8822,7 +8896,7 @@ def train_from_setup(args, setup, choose_model=None):
         "islands":{"count":island_count,"population_total":args.population,"migration_interval":migration_interval,"migrants_per_island":migrants_per_island,"topology":"ring","state":"independent population, Bayesian banks, archive, QD, fragment library, pressure, ADF, and budget",
                    "stages":{key:stages[key] for key in ("mode","count","interval","age_gap","schedule","threshold_quantile")},
                    "roles":{key:roles[key] for key in ("enabled","interval","mix","retire_after","assignments")}},
-        "equivalence_collapse":EQUIVALENCE_COLLAPSE,"residual_archive":RESIDUAL_ARCHIVE,"qd_parent_choice":QD_PARENT_CHOICE,"scale_balanced_selection":SCALE_BALANCED_SELECTION,"class_balance":CLASS_BALANCE,
+        "equivalence_collapse":EQUIVALENCE_COLLAPSE,"residual_archive":RESIDUAL_ARCHIVE,"qd_parent_choice":QD_PARENT_CHOICE,"scale_balanced_selection":SCALE_BALANCED_SELECTION,"class_balance":CLASS_BALANCE,"output_balance":OUTPUT_BALANCE,"output_balance_bins":OUTPUT_BALANCE_BINS,
         "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"selection_probe_filter":SELECTION_PROBE_FILTER,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"fit_iterations":CONSTANT_FIT_ITERATIONS,"semantic_max_delta":SEMANTIC_MAX_DELTA,"constant_snapping":CONSTANT_SNAPPING,"snap_tolerance":SNAP_TOLERANCE,"readout":READOUT_MODE,"max_terms":MAX_TERMS,"gene_crossover_rate":GENE_CROSSOVER_RATE,"backprop_mutation_weight":BACKPROP_MUTATION_WEIGHT,"backprop_inverse":BACKPROP_INVERSE,"residual_term_weight":RESIDUAL_TERM_WEIGHT,"loss":LOSS_MODE,"huber_delta":ROBUST_LOSS_DELTA,"forbid_nesting":",".join(sorted(f"{o}>{i}" for o,i in NESTING_RULES)),"units":UNIT_SPEC,"input_relations":RELATION_SPEC,"custom_ops":list(CUSTOM_OP_SPECS),"custom_feature_base":CUSTOM_FEATURE_BASE,"clip":CLIP,"eps":EPS,"sparse_seeding":SPARSE_SEEDING,"sparse_basis_size":SPARSE_BASIS_SIZE,"squash_swap_weight":SQUASH_SWAP_WEIGHT,"smooth_swap_weight":SMOOTH_SWAP_WEIGHT,"gate_mutation_weight":GATE_MUTATION_WEIGHT,"loss_noise_floor":LOSS_NOISE_FLOOR,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age",
         "test_csv":str(Path(args.test_csv).resolve()) if args.test_csv else None,
         "row_sample":row_sample,
@@ -8839,7 +8913,7 @@ def train_from_setup(args, setup, choose_model=None):
         "nsga_normalization":args.nsga_normalization,"parsimony_quality_tolerance":args.parsimony_quality_tolerance,"dynamic_pressure_enabled":dynamic_pressure_on,"adf_registry":ADFRegistry(adf_enabled,allow_nested=args.adf_mode=="nested").snapshot(),
         "profile":args.profile,"constraint_metadata":metadata,"constraints":constraints.describe(),"bayesian_particles":args.bayesian_particles,"interaction_discovery":interaction_discovery,
         "island_config":{"count":island_count,"migration_interval":migration_interval,"migrants_per_island":migrants_per_island,"topology":"ring","migration_events":0,"stages":stages,"roles":roles},
-        "equivalence_collapse":EQUIVALENCE_COLLAPSE,"residual_archive":RESIDUAL_ARCHIVE,"qd_parent_choice":QD_PARENT_CHOICE,"scale_balanced_selection":SCALE_BALANCED_SELECTION,"class_balance":CLASS_BALANCE,
+        "equivalence_collapse":EQUIVALENCE_COLLAPSE,"residual_archive":RESIDUAL_ARCHIVE,"qd_parent_choice":QD_PARENT_CHOICE,"scale_balanced_selection":SCALE_BALANCED_SELECTION,"class_balance":CLASS_BALANCE,"output_balance":OUTPUT_BALANCE,"output_balance_bins":OUTPUT_BALANCE_BINS,
         "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"selection_probe_filter":SELECTION_PROBE_FILTER,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"fit_iterations":CONSTANT_FIT_ITERATIONS,"semantic_max_delta":SEMANTIC_MAX_DELTA,"constant_snapping":CONSTANT_SNAPPING,"snap_tolerance":SNAP_TOLERANCE,"readout":READOUT_MODE,"max_terms":MAX_TERMS,"gene_crossover_rate":GENE_CROSSOVER_RATE,"backprop_mutation_weight":BACKPROP_MUTATION_WEIGHT,"backprop_inverse":BACKPROP_INVERSE,"residual_term_weight":RESIDUAL_TERM_WEIGHT,"loss":LOSS_MODE,"huber_delta":ROBUST_LOSS_DELTA,"forbid_nesting":",".join(sorted(f"{o}>{i}" for o,i in NESTING_RULES)),"units":UNIT_SPEC,"input_relations":RELATION_SPEC,"custom_ops":list(CUSTOM_OP_SPECS),"custom_feature_base":CUSTOM_FEATURE_BASE,"clip":CLIP,"eps":EPS,"sparse_seeding":SPARSE_SEEDING,"sparse_basis_size":SPARSE_BASIS_SIZE,"squash_swap_weight":SQUASH_SWAP_WEIGHT,"smooth_swap_weight":SMOOTH_SWAP_WEIGHT,"gate_mutation_weight":GATE_MUTATION_WEIGHT,"loss_noise_floor":LOSS_NOISE_FLOOR,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age"}
     head_count=sum(len(heads) for heads in classification_layout(cats)[0])
     population_sizes=cell_population_sizes(args.population,cell_count)
