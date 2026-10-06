@@ -1600,7 +1600,7 @@ function renderLineage(history) {
   const box = $('#lineageView');
   if (!history.length) { box.innerHTML = '<span class="hint">No history recorded (models from runs before histories existed).</span>'; return; }
   box.innerHTML = history.map(r => {
-    const span = r.start != null ? (r.end != null && r.end !== r.start ? `gen ${r.start}–${r.end}` : `gen ${r.start}`) : r.generation != null ? `gen ${r.generation}` : r.event === 'snapped' ? 'final' : 'gen ?';
+    const span = r.start != null ? (r.end != null && r.end !== r.start ? `gen ${r.start}–${r.end}` : `gen ${r.start}`) : r.generation != null ? `gen ${r.generation}` : (r.event === 'snapped' || r.event === 'simplified') ? 'final' : 'gen ?';
     let place = lineagePlace(r), what = '';
     if (r.event === 'born') what = `born as ${esc(r.how || 'seed')}`;
     else if (r.event === 'variation') {
@@ -1615,6 +1615,10 @@ function renderLineage(history) {
     } else if (r.event === 'snapped') {
       const values = (r.values || []).slice(0, 6).map(([a, b]) => `${fmt(a, 6)} → ${fmt(b, 6)}`).join(', ');
       what = `snapped ${r.constants} constant${r.constants === 1 ? '' : 's'}${values ? ` <span class="hint">${esc(values)}</span>` : ''}${r.changed ? ' and simplified' : ''}`;
+      place = {text: '', color: '--border'};
+    } else if (r.event === 'simplified') {
+      const [before, after] = r.nodes || [];
+      what = `simplified from ${esc(before)} to ${esc(after)} nodes`;
       place = {text: '', color: '--border'};
     } else what = esc(JSON.stringify(r));
     return `<span class="gen">${span}</span><span class="place" style="--role: var(${place.color})">${esc(place.text)}</span><span class="what">${what} ${lineageChange(r)}</span>`;

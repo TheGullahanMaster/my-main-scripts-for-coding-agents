@@ -2530,6 +2530,16 @@ BILINEAR_MUTATION_WEIGHT = 0.
 # Initial weight of jump_mutate; the portfolio adapts it like the others.
 # It only acts when mod/floordiv or if_else+gt are in the grammar.
 JUMP_MUTATION_WEIGHT = 1.
+# Trimming in every population, not only on a simplifier island.
+# --prune-mutation-weight: initial portfolio weight of the prune mutation
+# (collapse one inner node anywhere in the tree); 0 leaves it to simplifier roles.
+# --neutral-shrink: also accept a mutation whose output is unchanged when the
+# tree got smaller (an exact simplification), instead of redrawing it as a no-op.
+# Both off by default: on bench_complex (2026-10-06, 6 seeds x 8 targets, equal
+# generations) together they trimmed the chosen model by about one node of 26
+# and solved 13 vs 12 of 48 at population 25 but 13 vs 17 of 48 at 100.
+PRUNE_MUTATION_WEIGHT = 0.
+NEUTRAL_SHRINK = False
 # Initial weights of squash_swap_mutate, smooth_swap_mutate and gate_mutate.
 # Each acts only when its operators (sigmoid/tanh/erf, relu/softplus/abs/sign)
 # are in the grammar.
@@ -3221,10 +3231,12 @@ class MutationPortfolio:
     def __init__(self):
         self.weights={"subtree":1.,"point":1.,"constant":1.,"hoist":.7,"shrink":.7,"parametrize":1.,"bilinear":BILINEAR_MUTATION_WEIGHT,"jump":JUMP_MUTATION_WEIGHT,
                       "squash":SQUASH_SWAP_WEIGHT,"smooth":SMOOTH_SWAP_WEIGHT,"gate":GATE_MUTATION_WEIGHT,"backprop":BACKPROP_MUTATION_WEIGHT,"residual_term":RESIDUAL_TERM_WEIGHT}
+        # At weight 0 prune stays out of the table, so a simplifier role's bias still finds it at weight 1.
+        if PRUNE_MUTATION_WEIGHT>0: self.weights["prune"]=PRUNE_MUTATION_WEIGHT
         self.tries={k:0 for k in self.weights}; self.wins={k:0 for k in self.weights}
     # Island-role multipliers on the adaptive weights, set before each
     # generation by the island's role (never checkpointed: the role is).
-    # A kind only a role uses (prune) starts at weight 1 times its bias.
+    # A kind missing from the table (prune at weight 0) starts at weight 1 times its bias.
     bias=None
     def choose(self):
         if not self.bias: return rng.choices(list(self.weights),weights=list(self.weights.values()))[0]
@@ -3534,7 +3546,7 @@ def semantic_distance(baseline, candidate):
     return float(np.sqrt(np.mean((difference/scale)**2)))
 
 def semantic_mutate(tree, X, portfolio, n_features, ops, max_nodes, max_depth, proposal=None, adfs=None, library=None, min_delta=1e-8, max_delta=None, neutral_shrink=False):
-    """neutral_shrink (simplifier islands) also accepts a smaller child with
+    """neutral_shrink (--neutral-shrink, and always on simplifier islands) also accepts a smaller child with
     unchanged output: exactly the rewrite a simplifier is looking for."""
     if max_delta is None: max_delta=SEMANTIC_MAX_DELTA
     # A returned kind of None means "no move was applied": the unchanged
@@ -4121,7 +4133,7 @@ class Model:
 # observational: no equivalence key, MDL, selection, deduplication or random
 # draw reads it.
 HISTORY_LIMIT = 64
-HISTORY_LANDMARKS = frozenset(("born","migrated","promoted","snapped"))
+HISTORY_LANDMARKS = frozenset(("born","migrated","promoted","snapped","simplified"))
 def history_place(cell=None, role=None):
     """{"island", "stage", "role"} of a cell (island/stage numbers are 0-based)."""
     if cell is None: return {"island":0,"stage":0,"role":role}
@@ -4243,6 +4255,9 @@ def describe_history(history):
             detail=f" ({values})" if values else ""
             simplified=" and simplified" if record.get("changed") else ""
             lines.append(f"final: snapped {record.get('constants')} constant(s){detail}{simplified}{change}")
+        elif event=="simplified":
+            before,after=record.get("nodes",[None,None])
+            lines.append(f"final: simplified from {before} to {after} nodes{change}")
         else: lines.append(str(record))
     return lines
 def history_path(history):
@@ -4584,11 +4599,13 @@ class DynamicPressureController:
         banks=bayes.banks if isinstance(bayes,PerOutputBayesianBanks) else [bayes]
         for bank in banks: bank.pressure_exploration=self.exploration_boost()
         qd_controller.uniform_rate=self.uniform_rate()
-    def snapshot(self): return {key:getattr(self,key) for key in ("enabled","base_parsimony","base_uniform","window","level","last_quality_generation","last_check_generation","last_qd_activity")}
+    size_limit=None    # --dynamic-size-limit: this population's current per-tree node limit (None until first used)
+    def snapshot(self): return {key:getattr(self,key) for key in ("enabled","base_parsimony","base_uniform","window","level","last_quality_generation","last_check_generation","last_qd_activity","size_limit")}
     @classmethod
     def from_snapshot(cls, data):
         result=cls(data.get("enabled",False),data.get("base_parsimony",.01),data.get("base_uniform",.25),data.get("window",100))
         for key in ("level","last_quality_generation","last_check_generation"): setattr(result,key,int(data.get(key,0)))
+        if data.get("size_limit") is not None: result.size_limit=int(data["size_limit"])
         result.last_qd_activity=tuple(tuple(item) for item in data.get("last_qd_activity",((0,0),(0,0)))); return result
     def stats(self):
         return f"Dynamic pressure={'on' if self.enabled else 'off'}; level={self.level}; parsimony={self.effective_parsimony():.0%}; Bayesian boost={self.exploration_boost():.0%}; QD uniform={self.uniform_rate():.0%}; novelty={self.novelty_rate():.0%}"
@@ -5163,14 +5180,20 @@ def _median_1d(values):
     part=np.partition(values,(half-1,half,-1) if n%2==0 else (half,-1))
     if part[-1]!=part[-1]: return np.nan
     return (0.+part[half-1]+part[half])/2. if n%2==0 else part[half]+0.    # 0.+: mean() never returns -0.0
-def lexicase_parents(pop, count, X, Y, cats, max_cases=0, case_weights=None, scale_balanced=False):
+def size_frequency_penalties(models, scaling):
+    """exp(scaling * share of the models with the same total size), one per model."""
+    sizes=[sum(node_size(tree) for tree in model.trees) for model in models]
+    counts={}
+    for size in sizes: counts[size]=counts.get(size,0)+1
+    return np.exp(scaling*np.array([counts[size] for size in sizes],float)/max(1,len(sizes)))
+def lexicase_parents(pop, count, X, Y, cats, max_cases=0, case_weights=None, scale_balanced=False, penalties=None):
     """Epsilon-lexicase parents.  case_weights (one per row of X, selection
     only) make heavily weighted rows tend to be examined first, which is how a
     self-organised island role steers its parents; None keeps uniform order."""
     predictions=[predict_targets(m,X,cats) for m in pop]; errors=np.empty((len(pop),len(X)*Y.shape[1]))
     for i,pred in enumerate(predictions):
         parts=[selection_errors(pred[:,j],Y[:,j],cats[j],scale_balanced) for j in range(Y.shape[1])]
-        errors[i]=np.concatenate(parts)
+        errors[i]=np.concatenate(parts) if penalties is None else np.concatenate(parts)*penalties[i]
     if scale_balanced:
         balance=scale_balanced_row_weights(Y,cats)
         if balance is not None: case_weights=balance if case_weights is None else np.asarray(case_weights,float)*balance
@@ -6293,6 +6316,98 @@ def snap_final_candidates(models, Xt, Yt, Xv, Yv, affine_on, cats, constraints=N
     # Replace every copy, or an unsnapped twin would still compete for "Lowest Loss".
     return [replacements.get(selection_identity(model),model) if model is not None else None for model in models],summary
 
+# --final-simplification: before the final choice, try to shorten the
+# strongest candidates.  One node at a time is collapsed into one of its
+# children (or, below the root, a constant), the constants are refitted, and
+# the shorter model is kept while its training and validation loss stay within
+# the final choice's tolerance of the ORIGINAL model's (so steps do not
+# accumulate).  The search keeps redundant structure around a good equation
+# (in-search size pressure did not remove it: 2026-10-06 benchmarks); this
+# removes what the data cannot tell apart.  The shortened models are added to
+# the candidates; the originals stay, so "Lowest Loss" is unchanged.
+FINAL_SIMPLIFICATION = "on"
+# 4 candidates x 200 refits chose the same equation as 8 x 600 in 45 of 48
+# bench_complex runs (mean 24.8 vs 24.6 nodes; 25.5 without the pass) at a
+# sixth of the worst-case work.
+FINAL_SIMPLIFICATION_LIMIT = 4       # lowest-loss candidates tried
+FINAL_SIMPLIFICATION_TRIALS = 200    # refits per candidate at most
+def _tree_reductions(tree):
+    """Distinct smaller trees one collapse away, smallest first."""
+    found={}
+    for path in subtree_paths(tree):
+        node=subtree_at(tree,path)
+        if node[0] in ("x","c","arg"): continue
+        for option in [*node[1:],*([("c",1.)] if path else [])]:
+            candidate=simplify_tree(replace_subtree(tree,path,option))
+            if node_size(candidate)<node_size(tree): found.setdefault(repr(candidate),candidate)
+    return sorted(found.values(),key=node_size)
+
+def _simplification_options(current, budget):
+    """Up to `budget` (head, tree) collapses of a model, biggest cut first."""
+    options=sorted(((node_size(candidate),head,candidate) for head,tree in enumerate(current.trees) for candidate in _tree_reductions(tree)),key=lambda item:item[:2])
+    return [(head,candidate) for _,head,candidate in options[:max(0,budget)]]
+
+def simplify_final_candidates(models, Xt, Yt, Xv, Yv, affine_on, cats, tolerance, constraints=None, output_names=(), limit=None, evaluator=None):
+    """``models`` plus shortened copies of the lowest-loss candidates, and a summary.
+
+    Each round offers every candidate's collapses, biggest cut first, and
+    takes the first that holds; a candidate stops when none does or after
+    FINAL_SIMPLIFICATION_TRIALS refits.  With scoring processes (an evaluator
+    holding Xt, Yt) a round's refits run in parallel; the choice is the same."""
+    limit=FINAL_SIMPLIFICATION_LIMIT if limit is None else limit
+    summary={"mode":FINAL_SIMPLIFICATION,"tolerance":tolerance,"models_tried":0,"models_simplified":0,"nodes_removed":0}
+    if FINAL_SIMPLIFICATION!="on": return list(models),summary
+    unique={}
+    for model in models:
+        if model is not None and model.feasible and np.all(np.isfinite(model.scales)): unique.setdefault(selection_identity(model),model)
+    size=lambda m:sum(node_size(tree) for tree in m.trees)
+    def violations_of(m): return tuple(m.objectives[2*len(cats):2*len(cats)+m.constraint_count])
+    states=[]
+    for model in sorted(unique.values(),key=lambda m:(aggregate_loss(m),model_complexity(m)))[:limit]:
+        summary["models_tried"]+=1
+        base,train,validation,violations=_snap_scores(model,Xt,Yt,Xv,Yv,affine_on,cats,constraints,output_names)
+        if not base.feasible or not np.isfinite(train): continue
+        states.append(SimpleNamespace(model=model,base=base,current=base,train=train,violations=violations,budget=FINAL_SIMPLIFICATION_TRIALS,
+                                      train_bound=train+max(LOSS_NOISE_FLOOR,tolerance*abs(train)),validation_bound=validation+max(LOSS_NOISE_FLOOR,tolerance*abs(validation))))
+    def holds(state, trial):
+        """A scored trial keeps the original's quality (the validation check runs only when training passes)."""
+        if not (trial.feasible and aggregate_loss(trial)<=state.train_bound and size(trial)<size(state.current)
+                and all(a<=b+1e-12 for a,b in zip(violations_of(trial),state.violations))): return False
+        return Xv is None or frozen_metrics(trial,Xv,Yv,cats,constraints,output_names)["loss"]<=state.validation_bound
+    def build(state, head, candidate):
+        trial=state.current.clone(); trial.trees[head]=candidate; return trial
+    held=getattr(evaluator,"datasets",{}).get("train",(None,None))
+    parallel=getattr(evaluator,"executor",None) is not None and held[0] is Xt and held[1] is Yt and evaluator.affine_on==affine_on
+    active=list(states)
+    while active:
+        offers=[(state,[build(state,head,candidate) for head,candidate in _simplification_options(state.current,state.budget)]) for state in active]
+        if parallel:
+            # Search diagnostics (rows scored, cache hits) stay those of the search, as in the serial path.
+            counters=(evaluator.cache_hits,evaluator.cache_misses,evaluator.row_model_evaluations)
+            evaluator.assess([trial for _,trials in offers for trial in trials],"train",tune=True)
+            evaluator.cache_hits,evaluator.cache_misses,evaluator.row_model_evaluations=counters
+        active=[]
+        for state,trials in offers:
+            for position,trial in enumerate(trials):
+                if not parallel:
+                    try: tune_model_constants(trial,Xt,Yt,affine_on,cats); assess(trial,Xt,Yt,affine_on,cats,fit_affine=True,constraints=constraints,output_names=output_names)
+                    except (ArithmeticError, IndexError, ValueError): continue
+                if holds(state,trial):
+                    state.current=trial; state.budget-=position+1; active.append(state); break
+            # No collapse held (or the refit budget ran out): this candidate is done.
+    added=[]
+    for state in states:
+        removed=size(state.base)-size(state.current)
+        if removed<=0: continue
+        shorter=state.current; shorter.origin=getattr(state.model,"origin","")
+        shorter.history=history_append(state.model.history,{"event":"simplified","nodes":[size(state.base),size(shorter)],
+            "bits":[_history_score(state.model)[0],_history_score(shorter)[0]],"loss":[_history_number(state.train),_history_number(aggregate_loss(shorter))]})
+        added.append(shorter); summary["models_simplified"]+=1; summary["nodes_removed"]+=removed
+    return [*models,*added],summary
+def report_simplification(summary):
+    if summary["mode"]=="on" and summary["models_tried"]:
+        print(f"Final simplification: {summary['nodes_removed']} node(s) removed from {summary['models_simplified']} of {summary['models_tried']} lowest-loss candidates (within {summary['tolerance']:.2%} of their loss).")
+
 def used_feature_indices(model):
     """Return encoded feature indices referenced by any output tree."""
     used=set(); seen=set()
@@ -7319,6 +7434,15 @@ SIMPLIFIER_LANE_SHARE = .5
 SIMPLIFIER_PARENT_SHARE = 2/3
 EXPLORER_NOVELTY = .25          # share of an explorer's offspring drawn as fresh random trees
 REFINER_MAX_DELTA = 1.          # refiner's semantic step cap (target standard deviations)
+# The same lane for populations that are not a simplifier island (a single
+# population, the generalist, other roles), off by default:
+# --simplifier-lane gives that share of the survivor slots to the shortest
+# models within --simplifier-lane-band of the population's best loss, and
+# --simplifier-lane-parents draws that share of the parents from them (their
+# children may not outgrow the best model).  The rest is ordinary survival.
+LANE_SURVIVOR_SHARE = 0.
+LANE_PARENT_SHARE = 0.
+LANE_BAND = SIMPLIFIER_BAND
 def preset_role_parameters(role, crossover_rate, bayesian_proposal_rate, nodes, ops):
     """Search settings of a fixed (non-auto) island role."""
     if role=="generalist": return {}
@@ -7369,10 +7493,10 @@ def anchored_lane(models, band=SIMPLIFIER_BAND):
     cap=tree_size_cap(anchor)
     lane=[m for m in inside if tree_size_cap(m)<=cap]
     return sorted(lane,key=lambda m:(model_complexity(m),aggregate_loss(m),trees_text(m.trees))),cap
-def anchored_survivors(pool, count, normalization, tolerance):
-    """SIMPLIFIER_LANE_SHARE of the slots to the shortest lane models, the rest by NSGA."""
-    lane,_=anchored_lane(pool)
-    kept=lane[:int(count*SIMPLIFIER_LANE_SHARE)]
+def anchored_survivors(pool, count, normalization, tolerance, share=SIMPLIFIER_LANE_SHARE, band=SIMPLIFIER_BAND):
+    """`share` of the slots to the shortest lane models, the rest by NSGA."""
+    lane,_=anchored_lane(pool,band)
+    kept=lane[:int(count*share)]
     kept_ids={id(m) for m in kept}
     rest=[m for m in pool if id(m) not in kept_ids]
     return kept+select_nsga(rest,min(count-len(kept),len(rest)),normalization,tolerance)
@@ -7710,6 +7834,56 @@ def refresh_persistent_scores(archive, best_models, semantic_qd, structural_qd, 
             cell=repertoire.cell(model); incumbent=repertoire.cells.get(cell)
             if incumbent is None or secondary_key(model)<secondary_key(incumbent): repertoire.cells[cell]=model
 
+# Three optional size controls for any population (all off by default).
+# --dynamic-size-limit N: the per-tree node limit starts at N and rises only
+#   when a bigger child beats the best within-limit model by more than the
+#   parsimony band (Silva & Costa's dynamic limit): size has to be earned.
+# --semantic-simplification: in every new child, a subtree whose output on the
+#   behaviour rows is constant, equals an input, or equals a smaller subtree
+#   of the same tree is replaced by that (equivalences the algebra cannot
+#   prove, such as abs(x) for positive x).
+# --adaptive-parsimony S: parent selection multiplies a model's errors by
+#   exp(S * share of the population with its size) (PySR's frequency-based
+#   parsimony), so sizes the population piles up on are picked less.
+DYNAMIC_SIZE_LIMIT = 0
+SEMANTIC_SIMPLIFICATION = False
+ADAPTIVE_PARSIMONY = 0.
+def _output_signature(values):
+    """Identity of an output vector up to ~9 significant digits; None unless finite."""
+    if not np.all(np.isfinite(values)): return None
+    scale=float(np.max(np.abs(values)))
+    if scale==0.: return (0.,b"")
+    return (float(f"{scale:.9e}"),np.round(values/scale,9).tobytes())
+def semantic_simplify_tree(tree, X):
+    """Replace subtrees by a constant, an input or a smaller subtree of the
+    same tree with the same output on X (bottom-up, one operator evaluation
+    per node).  Trees with ADF calls, sequence or stateful operators are
+    returned unchanged."""
+    if SEQUENCE_LAYOUT is not None or not isinstance(X,np.ndarray) or X.ndim!=2: return tree
+    if any(node[0]=="arg" or node[0].startswith("adf_") or node[0] in _LIBRARY_EXCLUDED or node[0] in CUSTOM_OPS for node in walk_tree(tree)): return tree
+    known={}
+    for index in range(X.shape[1]):
+        signature=_output_signature(X[:,index])
+        if signature is not None: known.setdefault(signature,("x",index))
+    def visit(node):
+        if node[0]=="x": return node,X[:,node[1]]
+        if node[0]=="c": return node,np.full(len(X),node[1])
+        children=[visit(child) for child in node[1:]]
+        rebuilt=node if all(new is old for (new,_),old in zip(children,node[1:])) else (node[0],*[new for new,_ in children])
+        values=_op_eval_unguarded_state(node[0],[value for _,value in children])
+        signature=_output_signature(values)
+        if signature is None: return rebuilt,values
+        low,high=float(np.min(values)),float(np.max(values))
+        if high-low<=1e-12*max(1.,abs(high),abs(low)): return ("c",float(values[0])),values
+        hit=known.get(signature)
+        if hit is not None and node_size(hit)<node_size(rebuilt): return hit,values
+        if hit is None or node_size(rebuilt)<node_size(hit): known[signature]=rebuilt
+        return rebuilt,values
+    try:
+        with np.errstate(all="ignore"): result,_=visit(tree)
+    except (ArithmeticError, IndexError, ValueError, TypeError): return tree
+    return tree if result is tree else simplify_tree(result)
+
 # Offspring creation.  A generation's children are made in up to
 # CREATION_BATCHES batches, each from its own seed (drawn from the run's
 # stream) and each seeing only the generation's parents and proposal state,
@@ -7721,7 +7895,7 @@ def refresh_persistent_scores(archive, best_models, semantic_qd, structural_qd, 
 # 15 processes left a third wave of two); the count is fixed, never derived
 # from --workers, because it shapes the random streams.
 CREATION_BATCHES=128
-_CREATION_SETTINGS=("READOUT_MODE","GENE_CROSSOVER_RATE","BACKPROP_MUTATION_WEIGHT","RESIDUAL_TERM_WEIGHT","BACKPROP_INVERSE","SEMANTIC_MAX_DELTA","EQUIVALENCE_COLLAPSE","NESTING_RULES")
+_CREATION_SETTINGS=("SEMANTIC_SIMPLIFICATION","READOUT_MODE","GENE_CROSSOVER_RATE","BACKPROP_MUTATION_WEIGHT","RESIDUAL_TERM_WEIGHT","BACKPROP_INVERSE","SEMANTIC_MAX_DELTA","EQUIVALENCE_COLLAPSE","NESTING_RULES")
 def creation_batch_sizes(count):
     size=max(1,math.ceil(count/CREATION_BATCHES))
     return [min(size,count-start) for start in range(0,count,size)]
@@ -7754,6 +7928,7 @@ def _create_children(count, c):
         if EQUIVALENCE_COLLAPSE and key in seen and unchanged<unchanged_limit:
             unchanged+=1; redrawn+=1; return True
         seen.add(key); return False
+    def tidy(trees): return [semantic_simplify_tree(tree,c.Xsb) for tree in trees] if SEMANTIC_SIMPLIFICATION else trees
     def build(trees, scales, age, origin, sources):
         return Model(trees,scales,age,lineage_id=-1,origin=origin,parent_ids=tuple(model.lineage_id for model in sources),
                      mdl_operators=grammar_for_trees(c.active_ops,trees,definitions),mdl_feature_count=n_features,adfs={} if definitions is None else dict(definitions),
@@ -7763,10 +7938,12 @@ def _create_children(count, c):
         parent=None
         if c.novelty_rate and rng.random()<c.novelty_rate:
             trees=[admissible_random_tree(n_features,variation_ops,nodes,depth,adfs=definitions) for _ in range(head_count)]; scales=[(1.,0.)]*len(trees)
+            trees=tidy(trees)
             if duplicate(trees): continue
             records.append((build(trees,scales,0,"novelty_injection",[]),None,["novelty_injection"],None,())); continue
         if c.bayesian_mode!="off" and rng.random()<c.bayesian_proposal_rate:
             trees,scales,sources=bayesian_injection_trees(bayes,head_count,n_features,variation_ops,nodes,depth,"grammar" if c.bayesian_mode=="grammar" else c.bayesian_mode,definitions,return_sources=True)
+            trees=tidy(trees)
             if duplicate(trees): continue
             records.append((build(trees,scales,max((model.age+1 for model in sources),default=0),"bayesian_injection",sources),sources[0] if sources else None,["bayesian"],None,())); continue
         if library.items and rng.random()<library.fragment_rate:
@@ -7775,12 +7952,14 @@ def _create_children(count, c):
                 candidate=library.compose(tree,variation_ops,c.lane_cap if index>=c.lane_start else nodes,depth)
                 trees.append(candidate if candidate is not None else tree); composed|=candidate is not None
             if not composed and unchanged<unchanged_limit: unchanged+=1; continue
+            trees=tidy(trees)
             if duplicate(trees): continue
             records.append((build(trees,list(p.scales),p.age+1,"fragment",[p]),index,["fragment"],None,())); continue
         if rng.random()<c.crossover_rate and len(parents)>=2:
             first,second=rng.sample(range(len(parents)),2); p,q=parents[first],parents[second]; child_nodes=c.lane_cap if first>=c.lane_start else nodes
             trees=[gene_crossover(a,b,child_nodes,depth,variation_ops) if READOUT_MODE=="multiterm" and c.affine_on and rng.random()<GENE_CROSSOVER_RATE else semantic_crossover(a,b,c.Xsb,child_nodes,depth,definitions,max_delta=c.role_delta) for a,b in zip(p.trees,q.trees)]
             if trees==list(p.trees) and unchanged<unchanged_limit: unchanged+=1; continue
+            trees=tidy(trees)
             if duplicate(trees): continue
             records.append((build(trees,list(p.scales),max(p.age,q.age)+1,"crossover",[p,q]),first,None,second,(first,second))); continue
         index=rng.randrange(len(parents)); p=parents[index]
@@ -7792,6 +7971,7 @@ def _create_children(count, c):
             child_tree,kind,macro=semantic_mutate(tree,c.Xsb,portfolio,n_features,variation_ops,c.lane_cap if index>=c.lane_start else nodes,depth,proposal,definitions,library,max_delta=c.role_delta,neutral_shrink=c.neutral_shrink)
             trees.append(child_tree); kinds.append(kind); macro_used|=macro
         if trees==list(p.trees) and unchanged<unchanged_limit: unchanged+=1; continue
+        trees=tidy(trees)
         if duplicate(trees): continue
         records.append((build(trees,list(p.scales),p.age+1,"macro_mutation" if macro_used else "mutation",[p]),index,kinds+(["macro"] if macro_used else []),None,() if macro_used else (index,)))
     return records,redrawn
@@ -7916,7 +8096,7 @@ def evolve_generation(pop, generation, *, X, Xt, Yt, Xv, Yv, cats, constraints, 
     random share of offspring), "neutral_shrink" and "mutation_bias"."""
     role_settings=role_settings or {}; place=place or history_place()
     portfolio.bias=role_settings.get("mutation_bias")
-    role_delta=role_settings.get("semantic_max_delta"); neutral_shrink=bool(role_settings.get("neutral_shrink"))
+    role_delta=role_settings.get("semantic_max_delta"); neutral_shrink=NEUTRAL_SHRINK or bool(role_settings.get("neutral_shrink"))
     population_size=len(pop) if population_size is None else population_size
     if population_size<1 or not pop: raise ValueError("Evolution requires a nonempty population")
     particle_models=[particle for bank in (bayes.banks if isinstance(bayes,PerOutputBayesianBanks) else [bayes]) for particle in [*bank.particles.catalog,*bank.particles.particles]]
@@ -7989,19 +8169,28 @@ def evolve_generation(pop, generation, *, X, Xt, Yt, Xv, Yv, cats, constraints, 
     parent_pool=novelty_pool(pop,Xs)
     parent_count=max(1,population_size//2); qd_count=dual_qd_parent_count(parent_count,qd_controller,semantic_qd,structural_qd,residual_qd)
     row_weights=None if case_weights is None else (np.asarray(case_weights) if isinstance(sample,slice) else np.asarray(case_weights)[sample])
-    ordinary=lexicase_parents(parent_pool,parent_count-qd_count,Xs,Ys,cats,lexicase_cases,row_weights,SCALE_BALANCED_SELECTION)
+    ordinary=lexicase_parents(parent_pool,parent_count-qd_count,Xs,Ys,cats,lexicase_cases,row_weights,SCALE_BALANCED_SELECTION,
+                              size_frequency_penalties(parent_pool,ADAPTIVE_PARSIMONY) if ADAPTIVE_PARSIMONY>0 else None)
     parents=(blend_dual_qd_parents(ordinary,semantic_qd,structural_qd,parent_count,qd_count,qd_controller.uniform_rate,residual_qd)
              if qd_mode=="adaptive_dual" else blend_fixed_semantic_parents(ordinary,semantic_qd,parent_count,qd_count)); children=[]; feedback=[]; credits=[]; injections=[]; discovery_children=[]
     # Anchored simplifier: most parents come from the in-band lane (a
     # shortest-of-two draw), and their children may not outgrow the anchor.
-    lane_ids=set(); lane_cap=nodes
-    if role_settings.get("anchored"):
-        lane,cap=anchored_lane(pop)
+    # Dynamic size limit: children may be created a little over the limit
+    # (grow_nodes), and one is kept only if it earns the size (below).
+    size_limit=None; grow_nodes=nodes
+    if DYNAMIC_SIZE_LIMIT>0:
+        if pressure.size_limit is None: pressure.size_limit=DYNAMIC_SIZE_LIMIT
+        size_limit=max(3,min(nodes,pressure.size_limit)); grow_nodes=min(nodes,size_limit+max(2,size_limit//4))
+    lane_ids=set(); lane_cap=grow_nodes
+    anchored=bool(role_settings.get("anchored"))
+    lane_parent_share,lane_survivor_share,lane_band=(SIMPLIFIER_PARENT_SHARE,SIMPLIFIER_LANE_SHARE,SIMPLIFIER_BAND) if anchored else (LANE_PARENT_SHARE,LANE_SURVIVOR_SHARE,LANE_BAND)
+    if lane_parent_share>0:
+        lane,cap=anchored_lane(pop,lane_band)
         if lane:
-            lane_count=min(len(parents),int(round(len(parents)*SIMPLIFIER_PARENT_SHARE)))
+            lane_count=min(len(parents),int(round(len(parents)*lane_parent_share)))
             lane_parents=[ParentChoice(min(rng.choice(lane),rng.choice(lane),key=lambda m:(model_complexity(m),aggregate_loss(m)))) for _ in range(lane_count)]
             parents=parents[:len(parents)-lane_count]+lane_parents
-            lane_ids={id(choice) for choice in lane_parents}; lane_cap=min(nodes,cap)
+            lane_ids={id(choice) for choice in lane_parents}; lane_cap=min(grow_nodes,cap)
     # Archive parents need the same screen fit as their children for feedback.
     evaluator.assess([parent.model for parent in parents if parent.source!="ordinary"],"train",None if isinstance(sample,slice) else sample)
     # Offspring are created in independently seeded batches (see
@@ -8010,7 +8199,7 @@ def evolve_generation(pop, generation, *, X, Xt, Yt, Xv, Yv, cats, constraints, 
     definitions=adf_registry.definitions if adf_registry else None
     creation=SimpleNamespace(
         parents=[choice.model for choice in parents],lane_start=len(parents)-len(lane_ids),lane_cap=lane_cap,bayes=bayes,library=library,portfolio=portfolio,
-        definitions=definitions,active_ops=active_ops,variation_ops=variation_ops,nodes=nodes,depth=depth,n_features=X.shape[1],head_count=len(pop[0].trees),
+        definitions=definitions,active_ops=active_ops,variation_ops=variation_ops,nodes=grow_nodes,depth=depth,n_features=X.shape[1],head_count=len(pop[0].trees),
         generation=generation,novelty_rate=max(pressure.novelty_rate(),float(role_settings.get("novelty",0.))),bayesian_mode=bayesian_mode,
         bayesian_proposal_rate=bayesian_proposal_rate,crossover_rate=crossover_rate,affine_on=affine_on,role_delta=role_delta,neutral_shrink=neutral_shrink,
         seen={model_equivalence_key(model) for model in pop},sample=None if isinstance(sample,slice) else sample,Xsb=Xsb,
@@ -8058,6 +8247,17 @@ def evolve_generation(pop, generation, *, X, Xt, Yt, Xv, Yv, cats, constraints, 
         for kind in kinds:
             if kind is not None: portfolio.record(kind,variation_improved(child,parent))
     stable_children=[model.clone() for model in children]; evaluator.assess(stable_children,"train")
+    if size_limit is not None:
+        # A child over the limit stays only if it beats the best within-limit
+        # model by more than the parsimony band; the limit then rises to it.
+        reference=min((aggregate_loss(model) for model in stable_pop if model.feasible and tree_size_cap(model)<=size_limit),default=float("inf"))
+        margin=max(effective_tolerance*abs(reference),LOSS_NOISE_FLOOR) if np.isfinite(reference) else 0.
+        earned=[tree_size_cap(stable)<=size_limit or (stable.feasible and aggregate_loss(stable)<reference-margin) for stable in stable_children]
+        size_limit=max([size_limit,*(tree_size_cap(stable) for stable,kept in zip(stable_children,earned) if kept)])
+        pressure.size_limit=max(pressure.size_limit,size_limit)
+        children=[child for child,kept in zip(children,earned) if kept]; stable_children=[stable for stable,kept in zip(stable_children,earned) if kept]
+        pop=[model for model in pop if tree_size_cap(model)<=size_limit] or pop
+        stable_pop=[model for model in stable_pop if tree_size_cap(model)<=size_limit] or stable_pop
     if best_models.update(stable_children):
         # Offspring are where new bests appear; the earlier signal only
         # rescored already-seen survivors, so the macro lane never saw one.
@@ -8080,13 +8280,13 @@ def evolve_generation(pop, generation, *, X, Xt, Yt, Xv, Yv, cats, constraints, 
     while len(survivor_pool)<population_size and attempts<population_size*8:
         batch=[]
         for _ in range(min(population_size-len(survivor_pool),population_size*8-attempts)):
-            fresh_trees=[admissible_random_tree(X.shape[1],variation_ops,nodes,depth,proposal=None if bayesian_mode=="off" else (bayes[index] if isinstance(bayes,PerOutputBayesianBanks) else bayes),adfs=adf_registry.definitions if adf_registry else None) for index in range(len(pop[0].trees))]
+            fresh_trees=[admissible_random_tree(X.shape[1],variation_ops,nodes if size_limit is None else size_limit,depth,proposal=None if bayesian_mode=="off" else (bayes[index] if isinstance(bayes,PerOutputBayesianBanks) else bayes),adfs=adf_registry.definitions if adf_registry else None) for index in range(len(pop[0].trees))]
             batch.append(Model(fresh_trees,[(1.,0.)]*len(pop[0].trees),0,origin="novelty_injection",mdl_operators=grammar_for_trees(active_ops,fresh_trees,adf_registry.definitions if adf_registry else None),mdl_feature_count=X.shape[1],adfs={} if adf_registry is None else dict(adf_registry.definitions),birth_generation=generation+1))
         evaluator.assess(batch,"train",None if isinstance(sample,slice) else sample,tune=True)
         for model in batch: history_born(model,generation,place)
         survivor_pool=novelty_pool([*survivor_pool,*batch],Xs); attempts+=len(batch)
-    survivors=(anchored_survivors(survivor_pool,min(population_size,len(survivor_pool)),nsga_normalization,effective_tolerance)
-               if role_settings.get("anchored") else
+    survivors=(anchored_survivors(survivor_pool,min(population_size,len(survivor_pool)),nsga_normalization,effective_tolerance,lane_survivor_share,lane_band)
+               if lane_survivor_share>0 else
                select_nsga(survivor_pool,min(population_size,len(survivor_pool)),nsga_normalization,effective_tolerance))
     # Some datasets admit fewer distinct behaviors than population slots.
     # Keep population capacity even when behavioral deduplication is exhausted.
@@ -8278,11 +8478,18 @@ def resume_main(args):
     JUMP_CONSTANT_SCAN=bool(state.get("jump_constant_scan",False))
     global SELECTION_PROBE_FILTER
     SELECTION_PROBE_FILTER=bool(state.get("selection_probe_filter",False))
-    global JUMP_MUTATION_WEIGHT
+    global JUMP_MUTATION_WEIGHT,PRUNE_MUTATION_WEIGHT,NEUTRAL_SHRINK
     JUMP_MUTATION_WEIGHT=float(state.get("jump_mutation_weight",0.))
+    PRUNE_MUTATION_WEIGHT=float(state.get("prune_mutation_weight",0.)); NEUTRAL_SHRINK=bool(state.get("neutral_shrink",False))
+    global DYNAMIC_SIZE_LIMIT,SEMANTIC_SIMPLIFICATION,ADAPTIVE_PARSIMONY
+    DYNAMIC_SIZE_LIMIT=int(state.get("dynamic_size_limit",0)); SEMANTIC_SIMPLIFICATION=bool(state.get("semantic_simplification",False)); ADAPTIVE_PARSIMONY=float(state.get("adaptive_parsimony",0.))
+    global LANE_SURVIVOR_SHARE,LANE_PARENT_SHARE,LANE_BAND
+    LANE_SURVIVOR_SHARE=float(state.get("simplifier_lane",0.)); LANE_PARENT_SHARE=float(state.get("simplifier_lane_parents",0.)); LANE_BAND=float(state.get("simplifier_lane_band",SIMPLIFIER_BAND))
     global CONSTANT_FIT_ITERATIONS,SEMANTIC_MAX_DELTA,CONSTANT_SNAPPING,SNAP_TOLERANCE
     CONSTANT_FIT_ITERATIONS=int(state.get("fit_iterations",12)); SEMANTIC_MAX_DELTA=float(state.get("semantic_max_delta",5.))
     CONSTANT_SNAPPING=state.get("constant_snapping","off"); SNAP_TOLERANCE=float(state.get("snap_tolerance",1e-6))
+    global FINAL_SIMPLIFICATION
+    FINAL_SIMPLIFICATION=state.get("final_simplification","off")
     global READOUT_MODE,MAX_TERMS,GENE_CROSSOVER_RATE
     global BACKPROP_MUTATION_WEIGHT,BACKPROP_INVERSE
     global RESIDUAL_TERM_WEIGHT,NESTING_RULES,SYMBOLIC_EXPORT,LOSS_MODE,ROBUST_LOSS_DELTA
@@ -8380,10 +8587,11 @@ def resume_main(args):
         refresh_persistent_scores(island.archive,island.best_models,island.semantic_qd,island.structural_qd,evaluator,island.residual_qd)
         evaluator.assess(island.population,"train"); island.best_models.update(island.population); island.archive.update(island.population,Xt)
     f=[model for island in islands for model in [*island.archive.items,*island.population,island.best_models.model] if model is not None]
+    f,simplification=simplify_final_candidates(f,Xt,Yt,Xv,Yv,affine_on,cats,loss_tolerance,constraints,out_names,evaluator=evaluator); report_simplification(simplification)
     f,snapping=snap_final_candidates(f,Xt,Yt,Xv,Yv,affine_on,cats,constraints,out_names); report_snapping(snapping)
     chosen,selection=select_best_model(f,Xv,Yv,cats,loss_tolerance,constraints,out_names) if Xv is not None else select_best_model(f,loss_tolerance=loss_tolerance)
     state["selection"]={**selection,"selected_choice":"default","default_selected":True,
-                        "selected_metrics":selection["metrics"],"selected_objectives":selection["objectives"],"constant_snapping":snapping}
+                        "selected_metrics":selection["metrics"],"selected_objectives":selection["objectives"],"constant_snapping":snapping,"final_simplification":simplification}
     snapshot_islands(state,islands,island_config)
     save_checkpoint(checkpoint_path,generation,islands[0].population,islands[0].bayes,islands[0].archive,state)
     print(f"Resume complete at generation {generation}. {selection['source'].title()} loss-tolerance shortest-MDL model selected: {equations(chosen,names,out_names,cats)}")
@@ -8505,6 +8713,7 @@ def build_arg_parser():
     ap.add_argument("--fit-iterations",type=int,default=12,help="Levenberg-Marquardt iterations per constant fit; the 2026-10-02 audit found 15%% of fits stop at 12 while still improving (default: 12)")
     ap.add_argument("--semantic-max-delta",type=float,default=5.,help="Largest output change (in target standard deviations) a mutation or crossover may make before the constant fit; inf disables the cap (default: 5)")
     ap.add_argument("--constant-snapping",choices=("off","final"),default="final",help="final: before the final choice, round fitted constants of the strongest candidates to simpler values (integers, p/q, pi, e, sqrt2, ln2, powers of ten, short decimals) when training and validation loss and the numeric guard are preserved (default: final)")
+    ap.add_argument("--final-simplification",choices=("on","off"),default="on",help="Before the final choice, shorten the lowest-loss candidates: collapse one node at a time into one of its children or a constant, refit the constants, and keep the shorter equation while its training and validation loss stay within --selection-loss-tolerance of the original's; the originals stay available (default: on)")
     ap.add_argument("--snap-tolerance",type=float,default=1e-6,help="Relative loss increase a snapped constant may cause on training and on validation data, never below the loss noise floor (default: 1e-6)")
     ap.add_argument("--readout",choices=("affine","multiterm"),default="multiterm",help="Output readout: affine fits a*tree+b; multiterm (multigene GP) gives each top-level +/- term of a regression tree its own least-squares coefficient, pruning negligible and collinear terms (default: multiterm)")
     ap.add_argument("--max-terms",type=int,default=4,help="Most top-level terms a multiterm tree keeps (default: 4)")
@@ -8527,6 +8736,14 @@ def build_arg_parser():
     ap.add_argument("--stop-at-loss",default=None,metavar="LOSS|NAME=LOSS,...",help="Stop the search once the best model's loss is at or below this value: its validation loss when there is validation data, else its training loss. NAME=LOSS,... sets one limit per output instead (all must be met); in separate-output runs each output's search stops at its own limit and the next output starts (default: off)")
     ap.add_argument("--sparse-seeding",choices=("on","off"),default="off",help="Seed the initial population with sparse linear fits over a modest basis (inputs, unary operators of inputs, pairwise products and ratios, hinges), found by orthogonal matching pursuit (default: off)")
     ap.add_argument("--sparse-basis-size",type=int,default=300,help="Most basis terms the sparse seeding searches (default: 300)")
+    ap.add_argument("--prune-mutation-weight",type=float,default=0.,help="Initial portfolio weight of the prune mutation, which collapses one inner node anywhere in the tree into one of its children or a constant, so the tree gets smaller; adapted like the other mutation kinds; 0 leaves it to simplifier island roles (default: 0)")
+    ap.add_argument("--dynamic-size-limit",type=int,default=0,metavar="NODES",help="Start the per-tree node limit at NODES and raise it only when a bigger child beats the best within-limit model by more than the parsimony band, so size has to be earned by accuracy; the maximum stays the run's node limit; 0 disables it (default: 0)")
+    ap.add_argument("--semantic-simplification",choices=("on","off"),default="off",help="In every new child, replace a subtree whose output on the training rows is constant, equals an input column, or equals a smaller subtree of the same tree by that simpler form (default: off)")
+    ap.add_argument("--adaptive-parsimony",type=float,default=0.,metavar="SCALING",help="Frequency-based parsimony in parent selection: a model's errors are multiplied by exp(SCALING x the share of the population with its size), so over-represented sizes are selected less; PySR uses 20; 0 disables it (default: 0)")
+    ap.add_argument("--simplifier-lane",type=float,default=0.,help="Share of survivor slots (0..0.5) given to the shortest models within --simplifier-lane-band of the population's best loss, in populations that are not a simplifier island: keeps slightly worse but shorter equations alive so they can be refined; 0 disables it (default: 0)")
+    ap.add_argument("--simplifier-lane-parents",type=float,default=0.,help="Share of parents (0..0.9) drawn from that lane, whose children may not outgrow the best model; 0 disables it (default: 0)")
+    ap.add_argument("--simplifier-lane-band",type=float,default=.05,help="Relative loss band of the simplifier lane (default: 0.05)")
+    ap.add_argument("--neutral-shrink",choices=("on","off"),default="off",help="Accept a mutation that leaves the tree's output unchanged when the tree got smaller (an exact simplification) instead of redrawing it as a no-op; simplifier islands always do (default: off)")
     ap.add_argument("--jump-mutation-weight",type=float,default=1.,help="Initial portfolio weight of the jump mutation, which wraps a subtree in mod(s,c), floordiv(s,c) or if_else(gt(x,c),s,s') as one move; adapted like the other mutation kinds; 0 disables it (default: 1)")
     ap.add_argument("--loss-noise-floor",default="auto",help="Loss differences below this count as ties (the shorter model wins). 'auto' derives it from the targets' written precision: about 3e-12 for 7-digit CSV values, down to 1e-18 for full doubles, never above the old fixed 1e-9 (default: auto)")
     ap.add_argument("--squash-swap-weight",type=float,default=1.,help="Initial portfolio weight of the squash swap, which replaces one sigmoid/tanh/erf with another rewritten to the same level, range and slope (sigmoid(z) -> 0.5+0.5*erf(0.443z)); 0 disables it (default: 1)")
@@ -8561,6 +8778,12 @@ def parse_cli(argv=None):
     if not args.huber_delta > 0: ap.error("--huber-delta must be positive")
     if args.max_time < 0: ap.error("--max-time must be non-negative")
     if args.residual_term_weight < 0: ap.error("--residual-term-weight must be non-negative")
+    if args.prune_mutation_weight < 0: ap.error("--prune-mutation-weight must be non-negative")
+    if args.dynamic_size_limit < 0: ap.error("--dynamic-size-limit must be non-negative")
+    if args.adaptive_parsimony < 0: ap.error("--adaptive-parsimony must be non-negative")
+    if not 0 <= args.simplifier_lane <= .5: ap.error("--simplifier-lane must be between 0 and 0.5")
+    if not 0 <= args.simplifier_lane_parents <= .9: ap.error("--simplifier-lane-parents must be between 0 and 0.9")
+    if not args.simplifier_lane_band >= 0: ap.error("--simplifier-lane-band must be non-negative")
     if args.backprop_mutation_weight < 0: ap.error("--backprop-mutation-weight must be non-negative")
     if args.sparse_basis_size < 1: ap.error("--sparse-basis-size must be positive")
     if args.max_terms < 2: ap.error("--max-terms must be at least 2")
@@ -9030,11 +9253,18 @@ def train_from_setup(args, setup, choose_model=None):
     JUMP_CONSTANT_SCAN=getattr(args,"jump_constant_scan","on")=="on"
     global SELECTION_PROBE_FILTER
     SELECTION_PROBE_FILTER=getattr(args,"selection_probe_filter","on")=="on"
-    global JUMP_MUTATION_WEIGHT
+    global JUMP_MUTATION_WEIGHT,PRUNE_MUTATION_WEIGHT,NEUTRAL_SHRINK
     JUMP_MUTATION_WEIGHT=float(getattr(args,"jump_mutation_weight",1.))
+    PRUNE_MUTATION_WEIGHT=float(getattr(args,"prune_mutation_weight",0.)); NEUTRAL_SHRINK=getattr(args,"neutral_shrink","off")=="on"
+    global DYNAMIC_SIZE_LIMIT,SEMANTIC_SIMPLIFICATION,ADAPTIVE_PARSIMONY
+    DYNAMIC_SIZE_LIMIT=int(getattr(args,"dynamic_size_limit",0)); SEMANTIC_SIMPLIFICATION=getattr(args,"semantic_simplification","off")=="on"; ADAPTIVE_PARSIMONY=float(getattr(args,"adaptive_parsimony",0.))
+    global LANE_SURVIVOR_SHARE,LANE_PARENT_SHARE,LANE_BAND
+    LANE_SURVIVOR_SHARE=float(getattr(args,"simplifier_lane",0.)); LANE_PARENT_SHARE=float(getattr(args,"simplifier_lane_parents",0.)); LANE_BAND=float(getattr(args,"simplifier_lane_band",SIMPLIFIER_BAND))
     global CONSTANT_FIT_ITERATIONS,SEMANTIC_MAX_DELTA,CONSTANT_SNAPPING,SNAP_TOLERANCE
     CONSTANT_FIT_ITERATIONS=int(getattr(args,"fit_iterations",12)); SEMANTIC_MAX_DELTA=float(getattr(args,"semantic_max_delta",5.))
     CONSTANT_SNAPPING=getattr(args,"constant_snapping","final"); SNAP_TOLERANCE=float(getattr(args,"snap_tolerance",1e-6))
+    global FINAL_SIMPLIFICATION
+    FINAL_SIMPLIFICATION=getattr(args,"final_simplification","on")
     global READOUT_MODE,MAX_TERMS,GENE_CROSSOVER_RATE
     global SPARSE_SEEDING,SPARSE_BASIS_SIZE
     SPARSE_SEEDING=getattr(args,"sparse_seeding","off"); SPARSE_BASIS_SIZE=int(getattr(args,"sparse_basis_size",300)); SPARSE_SEED_STATS.update(seeds=0,best_r2=None,basis=0)
@@ -9163,7 +9393,7 @@ def train_from_setup(args, setup, choose_model=None):
                    "stages":{key:stages[key] for key in ("mode","count","interval","age_gap","schedule","threshold_quantile")},
                    "roles":{key:roles[key] for key in ("enabled","interval","mix","retire_after","assignments")}},
         "equivalence_collapse":EQUIVALENCE_COLLAPSE,"residual_archive":RESIDUAL_ARCHIVE,"qd_parent_choice":QD_PARENT_CHOICE,"scale_balanced_selection":SCALE_BALANCED_SELECTION,"class_balance":CLASS_BALANCE,"output_balance":OUTPUT_BALANCE,"output_balance_bins":OUTPUT_BALANCE_BINS,
-        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"selection_probe_filter":SELECTION_PROBE_FILTER,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"fit_iterations":CONSTANT_FIT_ITERATIONS,"semantic_max_delta":SEMANTIC_MAX_DELTA,"constant_snapping":CONSTANT_SNAPPING,"snap_tolerance":SNAP_TOLERANCE,"readout":READOUT_MODE,"max_terms":MAX_TERMS,"gene_crossover_rate":GENE_CROSSOVER_RATE,"backprop_mutation_weight":BACKPROP_MUTATION_WEIGHT,"backprop_inverse":BACKPROP_INVERSE,"residual_term_weight":RESIDUAL_TERM_WEIGHT,"loss":LOSS_MODE,"huber_delta":ROBUST_LOSS_DELTA,"forbid_nesting":",".join(sorted(f"{o}>{i}" for o,i in NESTING_RULES)),"units":UNIT_SPEC,"input_relations":RELATION_SPEC,"custom_ops":list(CUSTOM_OP_SPECS),"custom_feature_base":CUSTOM_FEATURE_BASE,"clip":CLIP,"eps":EPS,"sparse_seeding":SPARSE_SEEDING,"sparse_basis_size":SPARSE_BASIS_SIZE,"squash_swap_weight":SQUASH_SWAP_WEIGHT,"smooth_swap_weight":SMOOTH_SWAP_WEIGHT,"gate_mutation_weight":GATE_MUTATION_WEIGHT,"loss_noise_floor":LOSS_NOISE_FLOOR,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age",
+        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"selection_probe_filter":SELECTION_PROBE_FILTER,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"final_simplification":FINAL_SIMPLIFICATION,"dynamic_size_limit":DYNAMIC_SIZE_LIMIT,"semantic_simplification":SEMANTIC_SIMPLIFICATION,"adaptive_parsimony":ADAPTIVE_PARSIMONY,"prune_mutation_weight":PRUNE_MUTATION_WEIGHT,"neutral_shrink":NEUTRAL_SHRINK,"simplifier_lane":LANE_SURVIVOR_SHARE,"simplifier_lane_parents":LANE_PARENT_SHARE,"simplifier_lane_band":LANE_BAND,"fit_iterations":CONSTANT_FIT_ITERATIONS,"semantic_max_delta":SEMANTIC_MAX_DELTA,"constant_snapping":CONSTANT_SNAPPING,"snap_tolerance":SNAP_TOLERANCE,"readout":READOUT_MODE,"max_terms":MAX_TERMS,"gene_crossover_rate":GENE_CROSSOVER_RATE,"backprop_mutation_weight":BACKPROP_MUTATION_WEIGHT,"backprop_inverse":BACKPROP_INVERSE,"residual_term_weight":RESIDUAL_TERM_WEIGHT,"loss":LOSS_MODE,"huber_delta":ROBUST_LOSS_DELTA,"forbid_nesting":",".join(sorted(f"{o}>{i}" for o,i in NESTING_RULES)),"units":UNIT_SPEC,"input_relations":RELATION_SPEC,"custom_ops":list(CUSTOM_OP_SPECS),"custom_feature_base":CUSTOM_FEATURE_BASE,"clip":CLIP,"eps":EPS,"sparse_seeding":SPARSE_SEEDING,"sparse_basis_size":SPARSE_BASIS_SIZE,"squash_swap_weight":SQUASH_SWAP_WEIGHT,"smooth_swap_weight":SMOOTH_SWAP_WEIGHT,"gate_mutation_weight":GATE_MUTATION_WEIGHT,"loss_noise_floor":LOSS_NOISE_FLOOR,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age",
         "test_csv":str(Path(args.test_csv).resolve()) if args.test_csv else None,
         "row_sample":row_sample,
     },(source_rows,source_columns),train_indices,validation_indices,external_validation)
@@ -9180,7 +9410,7 @@ def train_from_setup(args, setup, choose_model=None):
         "profile":args.profile,"constraint_metadata":metadata,"constraints":constraints.describe(),"bayesian_particles":args.bayesian_particles,"interaction_discovery":interaction_discovery,
         "island_config":{"count":island_count,"migration_interval":migration_interval,"migrants_per_island":migrants_per_island,"topology":"ring","migration_events":0,"stages":stages,"roles":roles},
         "equivalence_collapse":EQUIVALENCE_COLLAPSE,"residual_archive":RESIDUAL_ARCHIVE,"qd_parent_choice":QD_PARENT_CHOICE,"scale_balanced_selection":SCALE_BALANCED_SELECTION,"class_balance":CLASS_BALANCE,"output_balance":OUTPUT_BALANCE,"output_balance_bins":OUTPUT_BALANCE_BINS,
-        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"selection_probe_filter":SELECTION_PROBE_FILTER,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"fit_iterations":CONSTANT_FIT_ITERATIONS,"semantic_max_delta":SEMANTIC_MAX_DELTA,"constant_snapping":CONSTANT_SNAPPING,"snap_tolerance":SNAP_TOLERANCE,"readout":READOUT_MODE,"max_terms":MAX_TERMS,"gene_crossover_rate":GENE_CROSSOVER_RATE,"backprop_mutation_weight":BACKPROP_MUTATION_WEIGHT,"backprop_inverse":BACKPROP_INVERSE,"residual_term_weight":RESIDUAL_TERM_WEIGHT,"loss":LOSS_MODE,"huber_delta":ROBUST_LOSS_DELTA,"forbid_nesting":",".join(sorted(f"{o}>{i}" for o,i in NESTING_RULES)),"units":UNIT_SPEC,"input_relations":RELATION_SPEC,"custom_ops":list(CUSTOM_OP_SPECS),"custom_feature_base":CUSTOM_FEATURE_BASE,"clip":CLIP,"eps":EPS,"sparse_seeding":SPARSE_SEEDING,"sparse_basis_size":SPARSE_BASIS_SIZE,"squash_swap_weight":SQUASH_SWAP_WEIGHT,"smooth_swap_weight":SMOOTH_SWAP_WEIGHT,"gate_mutation_weight":GATE_MUTATION_WEIGHT,"loss_noise_floor":LOSS_NOISE_FLOOR,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age"}
+        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"selection_probe_filter":SELECTION_PROBE_FILTER,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"final_simplification":FINAL_SIMPLIFICATION,"dynamic_size_limit":DYNAMIC_SIZE_LIMIT,"semantic_simplification":SEMANTIC_SIMPLIFICATION,"adaptive_parsimony":ADAPTIVE_PARSIMONY,"prune_mutation_weight":PRUNE_MUTATION_WEIGHT,"neutral_shrink":NEUTRAL_SHRINK,"simplifier_lane":LANE_SURVIVOR_SHARE,"simplifier_lane_parents":LANE_PARENT_SHARE,"simplifier_lane_band":LANE_BAND,"fit_iterations":CONSTANT_FIT_ITERATIONS,"semantic_max_delta":SEMANTIC_MAX_DELTA,"constant_snapping":CONSTANT_SNAPPING,"snap_tolerance":SNAP_TOLERANCE,"readout":READOUT_MODE,"max_terms":MAX_TERMS,"gene_crossover_rate":GENE_CROSSOVER_RATE,"backprop_mutation_weight":BACKPROP_MUTATION_WEIGHT,"backprop_inverse":BACKPROP_INVERSE,"residual_term_weight":RESIDUAL_TERM_WEIGHT,"loss":LOSS_MODE,"huber_delta":ROBUST_LOSS_DELTA,"forbid_nesting":",".join(sorted(f"{o}>{i}" for o,i in NESTING_RULES)),"units":UNIT_SPEC,"input_relations":RELATION_SPEC,"custom_ops":list(CUSTOM_OP_SPECS),"custom_feature_base":CUSTOM_FEATURE_BASE,"clip":CLIP,"eps":EPS,"sparse_seeding":SPARSE_SEEDING,"sparse_basis_size":SPARSE_BASIS_SIZE,"squash_swap_weight":SQUASH_SWAP_WEIGHT,"smooth_swap_weight":SMOOTH_SWAP_WEIGHT,"gate_mutation_weight":GATE_MUTATION_WEIGHT,"loss_noise_floor":LOSS_NOISE_FLOOR,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age"}
     head_count=sum(len(heads) for heads in classification_layout(cats)[0])
     population_sizes=cell_population_sizes(args.population,cell_count)
     islands=[new_island_runtime(size,X=X,Xt=Xt,cats=cats,ops=ops,nodes=nodes,depth=depth,head_count=head_count,
@@ -9250,6 +9480,8 @@ def train_from_setup(args, setup, choose_model=None):
         island.best_models.update(island.population); island.archive.update(island.population,Xt)
     f=[model for island in islands for model in [*island.archive.items,*island.population,island.best_models.model] if model is not None]
     from_simplifier=[role_kind(island)=="simplifier" for island in islands for model in [*island.archive.items,*island.population,island.best_models.model] if model is not None]
+    # Shortened copies are appended (beyond from_simplifier, which zip ignores); snapping then sees their refitted constants.
+    f,simplification=simplify_final_candidates(f,Xt,Yt,Xv,Yv,affine_on,cats,args.selection_loss_tolerance,constraints,out_names,evaluator=evaluator); report_simplification(simplification)
     f,snapping=snap_final_candidates(f,Xt,Yt,Xv,Yv,affine_on,cats,constraints,out_names); report_snapping(snapping)
     # Snapping swaps in snapped copies position by position, so identify the
     # simplifier's candidates after it.
@@ -9284,7 +9516,7 @@ def train_from_setup(args, setup, choose_model=None):
         export_model(inline_custom_features(chosen,names),names if CUSTOM_FEATURE_BASE is None else names[:CUSTOM_FEATURE_BASE],out_names,cats,maps,source_columns,types,export_fixture,input_ranges)
         write_symbolic_export(chosen,names,out_names,cats,Xt)
     selected_entry=next(entry for entry in evaluation[1] if entry[0] is chosen)
-    selection={**selection,"constant_snapping":snapping,"selected_choice":labels[selected_index],"default_selected":selected_index==0,
+    selection={**selection,"constant_snapping":snapping,"final_simplification":simplification,"selected_choice":labels[selected_index],"default_selected":selected_index==0,
                "selected_metrics":selected_entry[2],"selected_objectives":tuple(selected_entry[1].objectives)}
     checkpoint_state["selection"]=selection
     if subrun: checkpoint_state["separate_output"]=dict(subrun)
