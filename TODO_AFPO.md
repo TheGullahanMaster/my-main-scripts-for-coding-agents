@@ -446,6 +446,21 @@ so these are **audit-then-extend**, not new builds.
   seeds), accuracy 0.974 -> 0.951. Plain accuracy drops because the decision
   rule no longer favours the majority; use `off` when plain accuracy under the
   training prior is the goal.
+- [x] Uniform sampling over numeric output values (`--output-balance on|off`,
+  default off, `--output-balance-bins N`, default 10, 2026-10-05): the numeric
+  counterpart of `--class-balance`. Each numeric output's training range is cut
+  into equal-width bins and the training rows are resampled once, before the
+  search (`apply_output_balance`, systematic resampling, same row count), so
+  every occupied bin holds the same number of rows; validation rows are
+  resampled with the training edges, the test CSV never. Also with it on: the
+  holdout split is stratified by value bin. With `--output-mode separate` each
+  output's search resamples for its own column; in a joint search the weights
+  are averaged over the numeric outputs. Losses printed by a search are on the
+  resampled rows; the merged model's report of a separate run is on the
+  original rows. `--max-rows` still samples the file uniformly before this.
+  Smoke check only (2000 rows, 5% non-zero target, co-evolution, pop 80, 25
+  generations, 3 seeds): on found the exact law on 2 seeds, off on 1 (another
+  off seed fitted it with a bloated form) -- not a benchmark.
 - [x] Separate per-output searches (`--output-mode separate|joint`, default
   separate, 2026-10-04). With several output columns each column (a
   categorical column with all its classes) runs its own full search — own

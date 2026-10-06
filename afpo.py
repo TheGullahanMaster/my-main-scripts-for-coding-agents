@@ -12,7 +12,9 @@ backpropagation use the compiled kernels in afpo_lib/fitcore.pyx (built on
 first use; every operator except seqsum/seqprod is compiled; they agree with
 Python to round-off; ``--fit-backend python`` opts out).  Runs with several
 island/stage cells evolve the cells in parallel processes (``--cell-workers``;
-results are identical to serial).  Above 8192 rows trees are evaluated in
+results are identical to serial).  With ``--workers``, the scoring processes
+also create the offspring, in independently seeded batches (same results as
+serial).  Above 8192 rows trees are evaluated in
 cache-sized row blocks (identical values), so many ``--workers`` no longer
 starve each other of memory bandwidth.
 
@@ -45,6 +47,7 @@ import threading
 import time
 import warnings
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from pathlib import Path
 from typing import Any
 
@@ -449,6 +452,19 @@ def tree_fingerprint(tree):
     if len(_TREE_FINGERPRINTS)>=TREE_FINGERPRINT_LIMIT: _TREE_FINGERPRINTS.clear()
     _TREE_FINGERPRINTS[id(tree)]=(tree,digest)
     return digest
+_TREE_TEXTS={}
+def trees_text(trees):
+    """repr(trees) for a list of trees, from one memoized repr per tree object."""
+    if type(trees) is not list: return repr(trees)
+    parts=[]
+    for tree in trees:
+        hit=_TREE_TEXTS.get(id(tree))
+        if hit is None or hit[0] is not tree:
+            if type(tree) is not tuple: return repr(trees)
+            if len(_TREE_TEXTS)>=TREE_FINGERPRINT_LIMIT: _TREE_TEXTS.clear()
+            hit=_TREE_TEXTS[id(tree)]=(tree,repr(tree))
+        parts.append(hit[1])
+    return "["+", ".join(parts)+"]"
 def tree_digest(*parts):
     """128-bit key of trees, lists of trees and any other repr-able parts (ADF signatures, scales)."""
     digest=hashlib.blake2b(digest_size=16)
@@ -1074,7 +1090,8 @@ def evaluate_cached(t, X, adfs=None):
     interface=X.__array_interface__
     # repr, not the tuple: equal-hashing constants such as 0.0/-0.0 or 1/1.0
     # can evaluate differently.
-    key=(tree_digest(t,adf_signature((t,),adfs)),interface["data"][0],X.shape,X.strides,interface["typestr"])
+    signature=adf_signature((t,),adfs) if adfs else None
+    key=(tree_fingerprint(t) if signature is None else tree_digest(t,signature),interface["data"][0],X.shape,X.strides,interface["typestr"])
     hit=_EVALUATION_CACHE.get(key)
     if hit is not None: return hit[0]
     value=np.asarray(evaluate(t,X,adfs))
@@ -1913,10 +1930,10 @@ class PosteriorParticlePopulation:
     def update(self, candidates, X=None, Y=None, cats=None, diverse=()):
         """Reweight useful structures while reserving capacity for distinct families."""
         unique={}
-        diversity_keys={(repr(model.trees),tuple(model.scales)) for model in diverse}
+        diversity_keys={(trees_text(model.trees),tuple(model.scales)) for model in diverse}
         for model in [*(self.catalog or self.particles),*candidates,*diverse]:
             if not model.feasible or not np.all(np.isfinite(model.objectives)): continue
-            key=(repr(model.trees),tuple(model.scales))
+            key=(trees_text(model.trees),tuple(model.scales))
             if key not in unique or secondary_key(model) < secondary_key(unique[key]): unique[key]=model
         ranked=sorted(unique.values(),key=secondary_key)
         # A pure quality trim makes the particle catalog an echo of one local
@@ -1925,7 +1942,7 @@ class PosteriorParticlePopulation:
         reserve=min(max(1,self.capacity//4),len(ranked))
         chosen=[]; signatures=set()
         for model in ranked:
-            key=(repr(model.trees),tuple(model.scales))
+            key=(trees_text(model.trees),tuple(model.scales))
             signature=tuple(sorted({node[0] for tree in model.trees for node in walk_tree(tree)}))
             if key in diversity_keys and signature not in signatures:
                 chosen.append(model); signatures.add(signature)
@@ -1953,7 +1970,7 @@ class PosteriorParticlePopulation:
         resampled=self.last_ess <= self.ess_ratio*len(self.particles)+1e-6
         if resampled: self._resample()
         self.post_resample_ess=self._ess(self.weights)
-        self.unique_particles=len({repr(model.trees) for model in self.particles})
+        self.unique_particles=len({trees_text(model.trees) for model in self.particles})
         self.history.append({"pre_resample_ess":self.last_ess,"post_resample_ess":self.post_resample_ess,
                              "unique_particles":self.unique_particles,"temperature":self.inverse_temperature,
                              "log_evidence_proxy":self.log_evidence,"particles":len(self.particles),"resampled":resampled})
@@ -2059,8 +2076,8 @@ class PosteriorParticlePopulation:
             if candidate.feasible:
                 candidate.origin="catalogue_rejuvenation"; candidates.append(candidate)
         self.update(candidates,X,Y,cats)
-        admitted={(repr(model.trees),tuple(model.scales)) for model in self.catalog}
-        self.rejuvenation_accepts+=sum((repr(model.trees),tuple(model.scales)) in admitted for model in candidates)
+        admitted={(trees_text(model.trees),tuple(model.scales)) for model in self.catalog}
+        self.rejuvenation_accepts+=sum((trees_text(model.trees),tuple(model.scales)) in admitted for model in candidates)
 class BayesianEquationGenerator:
     """Smoothed posterior over useful operators/features for new equations.
 
@@ -2283,6 +2300,17 @@ def choose_operator(options):
 def operator_arity(op, adfs=None):
     return int((adf_definition(op,adfs) or {}).get("arity",OPS.get(op,(-1,))[0]))
 
+_FITTING_OPERATORS={}
+def _fitting_operators(ops, max_nodes, adfs=None):
+    """The operators of ops whose arity fits in max_nodes.  Without ADFs or
+    custom operators the answer depends only on (ops, max_nodes), and
+    random_tree asked it afresh for every node it grew."""
+    if adfs or CUSTOM_OPS: return [candidate for candidate in ops if 0<operator_arity(candidate,adfs)<max_nodes]
+    key=(tuple(ops),max_nodes); hit=_FITTING_OPERATORS.get(key)
+    if hit is None:
+        if len(_FITTING_OPERATORS)>=4096: _FITTING_OPERATORS.clear()
+        hit=_FITTING_OPERATORS[key]=tuple(candidate for candidate in ops if 0<operator_arity(candidate)<max_nodes)
+    return list(hit)
 def random_tree(n_features, ops, max_nodes, max_depth, depth=0, proposal=None, adfs=None):
     if proposal is not None and depth==0: proposal.begin_equation()
     stop=proposal.stop_probability(depth) if proposal else .28
@@ -2291,7 +2319,7 @@ def random_tree(n_features, ops, max_nodes, max_depth, depth=0, proposal=None, a
     # A Bayesian proposal can be one promotion ahead of a particle's local
     # catalog.  Never turn that transient mismatch into a zero-argument ADF
     # node: use only operators whose arity is known by this tree's catalog.
-    available=[candidate for candidate in ops if 0<operator_arity(candidate,adfs)<max_nodes]
+    available=_fitting_operators(ops,max_nodes,adfs)
     if not available:
         return ("x",proposal.feature() if proposal else rng.randrange(n_features)) if rng.random()<.65 else ("c",proposal.constant() if proposal else rng.uniform(-3,3))
     op=proposal.operator() if proposal else choose_operator(available)
@@ -4256,7 +4284,7 @@ def aggregate_loss(model_or_objectives):
 def secondary_key(model):
     """Deterministic non-fitness key for duplicate handling and diagnostics."""
     # Losses that differ only by round-off are ties, so the shorter model wins.
-    return (_noise_rounded(aggregate_loss(model)),_noise_rounded(_mean(model_shapes(model))),model_complexity(model),repr(model.trees))
+    return (_noise_rounded(aggregate_loss(model)),_noise_rounded(_mean(model_shapes(model))),model_complexity(model),trees_text(model.trees))
 # Loss/shape differences below this (afpo's scaled units) are rounding noise,
 # not fit: a CSV holding ~7 significant digits leaves an exact model at a loss
 # of ~1e-11, and a bigger model with spare constants can "beat" it by 1e-12.
@@ -4323,9 +4351,30 @@ def behaviour_rows(X, Y=None):
         _BEHAVIOUR_INDICES[len(X)]=rows
     return row_subset(X,rows) if Y is None else (row_subset(X,rows),row_subset(Y,rows))
 
+_SEMANTIC_KEYS={}
 def semantic_key(model, X, decimals=8):
     """Stable behavioral identity on the active evaluation sample (a fixed subset of it on large data)."""
-    return np.round(predict_model(model,behaviour_rows(X)),decimals).tobytes()
+    rows=behaviour_rows(X)
+    if not isinstance(rows,np.ndarray): return np.round(predict_model(model,rows),decimals).tobytes()
+    # A pure function of the trees, readout, called ADFs and the rows, and
+    # every survivor is keyed again in each generation it lives through.
+    key=_semantic_memo_key(model,rows,decimals)
+    hit=_SEMANTIC_KEYS.get(key)
+    if hit is None:
+        if len(_SEMANTIC_KEYS)>=cache_limit(8192): _SEMANTIC_KEYS.clear()
+        hit=_SEMANTIC_KEYS[key]=(np.round(predict_model(model,rows),decimals).tobytes(),rows)    # holding rows pins the address
+    return hit[0]
+def _semantic_memo_key(model, rows, decimals=8):
+    interface=rows.__array_interface__
+    return (trees_text(model.trees),repr(model.scales),adf_signature(model.trees,model.adfs),decimals,interface["data"][0],rows.shape,rows.strides,interface["typestr"])
+def prime_semantic_key(model, X, value):
+    """Record a semantic_key computed elsewhere (the process that scored the model)."""
+    rows=behaviour_rows(X)
+    if not isinstance(rows,np.ndarray): return
+    key=_semantic_memo_key(model,rows)
+    if key not in _SEMANTIC_KEYS:
+        if len(_SEMANTIC_KEYS)>=cache_limit(8192): _SEMANTIC_KEYS.clear()
+        _SEMANTIC_KEYS[key]=(value,rows)
 def novelty_pool(models, X):
     """One best representative per equivalence (algebraic) and behavioral identity."""
     structural={}
@@ -4390,9 +4439,12 @@ def _fronts_vectorized(pop, objectives):
     in the current front is visited, so the next front is ordered by
     (position of that last dominator, model index)."""
     values=np.asarray(objectives,dtype=float); feasible=np.fromiter((bool(model.feasible) for model in pop),bool,len(pop))
+    # One objective at a time: the same booleans as comparing the n x n x d
+    # broadcast, without building it (5x faster at 1600 models).
+    weak=np.ones((len(pop),len(pop)),bool); strict=np.zeros((len(pop),len(pop)),bool)
     with np.errstate(invalid="ignore"):
-        weak=np.all(values[:,None,:]<=values[None,:,:],axis=2)
-        strict=np.any(values[:,None,:]<values[None,:,:],axis=2)
+        for column in values.T:
+            weak&=column[:,None]<=column[None,:]; strict|=column[:,None]<column[None,:]
     same=feasible[:,None]==feasible[None,:]
     dominates_matrix=np.where(same,weak&strict,feasible[:,None])
     count=dominates_matrix.sum(axis=0)
@@ -4608,7 +4660,7 @@ class ParetoArchive:
         self.capacity=capacity; self.normalization=normalization; self.parsimony_quality_tolerance=parsimony_quality_tolerance
         self.items=[]; self.semantic_keys=set(); self.last_change=0; self.generation=0; self.history=[]
     def update(self, candidates, X=None):
-        self.generation+=1; before={repr(m.trees) for m in self.items}
+        self.generation+=1; before={trees_text(m.trees) for m in self.items}
         by_tree={}
         for model in [*self.items,*candidates]:
             key=model_equivalence_key(model)
@@ -4633,7 +4685,7 @@ class ParetoArchive:
         self.semantic_keys=set()
         if X is not None:
             for m in self.items: self.semantic_keys.add(semantic_key(m,X))
-        if {repr(m.trees) for m in self.items} != before: self.last_change=self.generation
+        if {trees_text(m.trees) for m in self.items} != before: self.last_change=self.generation
         vals=np.array([m.objectives[:-1] for m in self.items],float)
         # A bounded, comparable convergence proxy (not an exact hypervolume).
         proxy=float(np.mean(1/(1+np.maximum(vals,0)))) if len(vals) else 0.
@@ -4730,7 +4782,7 @@ class QualityDiversityArchive:
     # generation, so most were recomputed.  The memo is per archive, bounded,
     # and never pickled or snapshotted.
     DESCRIPTOR_CACHE_LIMIT=8192
-    def descriptor_key(self, model): return (repr(model.trees),repr(model.scales),adf_signature(model.trees,model.adfs))
+    def descriptor_key(self, model): return (trees_text(model.trees),repr(model.scales),adf_signature(model.trees,model.adfs))
     def cached_descriptor(self, model):
         cache=self.__dict__.setdefault("_descriptor_cache",{})
         key=self.descriptor_key(model); hit=cache.get(key)
@@ -4738,6 +4790,18 @@ class QualityDiversityArchive:
             if len(cache)>=self.DESCRIPTOR_CACHE_LIMIT: cache.clear()
             hit=np.asarray(self.descriptor(model)); hit.setflags(write=False); cache[key]=hit
         return hit
+    def prime_descriptor(self, model, descriptor):
+        """Record a descriptor computed elsewhere (the process that scored the model)."""
+        cache=self.__dict__.setdefault("_descriptor_cache",{}); key=self.descriptor_key(model)
+        if key not in cache:
+            if len(cache)>=self.DESCRIPTOR_CACHE_LIMIT: cache.clear()
+            descriptor=np.asarray(descriptor); descriptor.setflags(write=False); cache[key]=descriptor
+    def descriptor_only(self):
+        """A copy that can compute descriptors but holds no cells, landmarks or memo (small to send)."""
+        light=object.__new__(type(self))
+        light.__dict__.update({name:value for name,value in self.__dict__.items() if name not in ("cells","cell_trials","cell_successes","landmarks","_descriptor_cache")})
+        light.cells={}; light.cell_trials={}; light.cell_successes={}; light.landmarks=None
+        return light
     def __getstate__(self):
         state=dict(self.__dict__); state.pop("_descriptor_cache",None); return state
 
@@ -4870,7 +4934,7 @@ class StructuralQualityDiversityArchive(QualityDiversityArchive):
         super().__init__(np.empty((0,self.n_features)),(),seed,capacity,landmarks)
 
     def descriptor(self, model): return structural_descriptor(model,self.n_features)
-    def descriptor_key(self, model): return repr(model.trees)
+    def descriptor_key(self, model): return trees_text(model.trees)
 
     def snapshot(self):
         data=super().snapshot(); data["n_features"]=self.n_features; return data
@@ -5092,6 +5156,13 @@ def selection_errors(prediction, y, labels, scale_balanced=False):
     if not scale_balanced: return np.abs(prediction-y)
     unit=max(.05*target_scale(y),EPS)
     return np.abs(np.arcsinh(prediction/unit)-np.arcsinh(y/unit))
+def _median_1d(values):
+    """np.median of a 1-D float array: the same partition, mean and NaN rule
+    without its dispatch overhead (4x faster on the lexicase pools)."""
+    n=len(values); half=n//2
+    part=np.partition(values,(half-1,half,-1) if n%2==0 else (half,-1))
+    if part[-1]!=part[-1]: return np.nan
+    return (0.+part[half-1]+part[half])/2. if n%2==0 else part[half]+0.    # 0.+: mean() never returns -0.0
 def lexicase_parents(pop, count, X, Y, cats, max_cases=0, case_weights=None, scale_balanced=False):
     """Epsilon-lexicase parents.  case_weights (one per row of X, selection
     only) make heavily weighted rows tend to be examined first, which is how a
@@ -5121,7 +5192,7 @@ def lexicase_parents(pop, count, X, Y, cats, max_cases=0, case_weights=None, sca
         # Exponential race: sorting E/w gives a weight-proportional random order.
         order=_lazy_shuffle(cases) if weights is None else (cases[k] for k in np.argsort(np.random.exponential(size=len(cases))/weights))
         for case in order:
-            values=errors[pool,case]; epsilon=np.median(np.abs(values-np.median(values)))
+            values=errors[pool,case]; epsilon=_median_1d(np.abs(values-_median_1d(values)))
             pool=pool[values<=values.min()+epsilon+EPS]
             if len(pool)<=1: break
         selected.append(pop[int(rng.choice(pool))])
@@ -5804,6 +5875,17 @@ def _copy_scored_model(target, scored):
     if not target.feasible:
         INVALID_DIAGNOSTICS[target.invalid_reason]=INVALID_DIAGNOSTICS.get(target.invalid_reason,0)+1
 
+class _Prescored:
+    """Scores that arrived with their models (offspring created and scored in
+    one worker task), for assess() to collect by score-cache key."""
+    def __init__(self): self.sent={}; self.scores=[]
+    def add(self, key, data):
+        if key in self.sent: return
+        score=SimpleNamespace(); score.trees,score.scales,score.objectives,score.feasible,score.invalid_reason,score.constraint_count=data
+        self.sent[key]=(self,len(self.scores)); self.scores.append(score)
+    def result(self): return self.scores
+    def futures(self): return []
+
 class ModelEvaluator:
     """Parent-owned serial/process evaluator with deterministic result order."""
     def __init__(self, workers, datasets, affine_on, cats, constraints, output_names):
@@ -5843,7 +5925,7 @@ class ModelEvaluator:
         model.trees=list(model.trees)
         model.scales=list(model.scales)
         model.objectives=(*model.objectives[:-1],model.age)
-    def assess(self, models, dataset="train", indices=None, fit_affine=True, tune=False):
+    def assess(self, models, dataset="train", indices=None, fit_affine=True, tune=False, prefetched=None):
         """Score models; ``tune`` first refits their inner constants (training only)."""
         if not models: return
         self.epoch+=1
@@ -5867,12 +5949,18 @@ class ModelEvaluator:
                 if tune: tune_model_constants(model,X,Y,self.affine_on,self.cats)
                 assess(model,X,Y,self.affine_on,self.cats,fit_affine,self.constraints,self.output_names)
         else:
-            chunks=[list(models[index:index+max(1,math.ceil(len(models)/(self.workers*2)))]) for index in range(0,len(models),max(1,math.ceil(len(models)/(self.workers*2))))]
+            # Models that arrived already scored are collected; the rest go out now.
+            sent=prefetched.sent if prefetched is not None else {}    # keyed like the score cache: rows, readout and tuning included
+            started=[sent.get(key) for _,key in pending]
+            rest=[model for model,ticket in zip(models,started) if ticket is None]
+            size=max(1,math.ceil(len(rest)/(self.workers*2)))
+            chunks=[list(rest[index:index+size]) for index in range(0,len(rest),size)]
             futures=[self.executor.submit(_worker_assess_batch,chunk,dataset,indices,fit_affine,self.epoch,tune) for chunk in chunks]
             try:
-                scored=[model for future in futures for model in future.result()]
+                remaining=iter([model for future in futures for model in future.result()])
+                scored=[next(remaining) if ticket is None else ticket[0].result()[ticket[1]] for ticket in started]
             except KeyboardInterrupt:
-                for future in futures: future.cancel()
+                for future in [*futures,*(prefetched.futures() if prefetched is not None else ())]: future.cancel()
                 self.close()
                 raise
             for target,result in zip(models,scored): _copy_scored_model(target,result)
@@ -5925,7 +6013,7 @@ def _selection_metrics(model, objectives, cats):
 
 def selection_identity(model):
     """Different fitted coefficients or ADF definitions are different predictors."""
-    return repr(model.trees),tuple(model.scales),adf_signature(model.trees,model.adfs),tuple(model.mdl_operators),model.mdl_feature_count
+    return trees_text(model.trees),tuple(model.scales),adf_signature(model.trees,model.adfs),tuple(model.mdl_operators),model.mdl_feature_count
 
 # The validation rows of a gridded or integer dataset sit on the same lattice
 # as the training rows, so an equation that only memorises lattice points
@@ -5995,7 +6083,7 @@ def selection_evaluation(models, X=None, Y=None, cats=None, constraints=None, ou
 
 def selection_frontier(entries):
     """Loss/MDL nondominance; shape breaks ties instead of excusing prediction error."""
-    ordered=sorted(entries,key=lambda e:(e[2]["mdl_bits"],e[2]["loss"],e[2]["shape"],model_age(e[0]),repr(e[0].trees)))
+    ordered=sorted(entries,key=lambda e:(e[2]["mdl_bits"],e[2]["loss"],e[2]["shape"],model_age(e[0]),trees_text(e[0].trees)))
     frontier=[]; best_loss=float("inf")
     for entry in ordered:
         if entry[2]["loss"] < best_loss:
@@ -6041,7 +6129,7 @@ def _select_best(evaluation, loss_tolerance):
     best_loss=min(item["loss"] for item in metrics)
     allowed_loss=best_loss+max(loss_tolerance*abs(best_loss),LOSS_NOISE_FLOOR)
     eligible=[i for i,item in enumerate(metrics) if item["loss"]<=allowed_loss]
-    index=min(eligible,key=lambda i:(metrics[i]["mdl_bits"],metrics[i]["shape"],metrics[i]["loss"],repr(candidates[i].trees)))
+    index=min(eligible,key=lambda i:(metrics[i]["mdl_bits"],metrics[i]["shape"],metrics[i]["loss"],trees_text(candidates[i].trees)))
     return candidates[index],{"source":source,"objectives":vectors[index],"metrics":metrics[index],
         "policy":"loss_tolerance_shortest_mdl","loss_tolerance":loss_tolerance,"best_loss":best_loss,
         "allowed_loss":allowed_loss,"eligible_candidates":len(eligible),"between_row_excluded":excluded}
@@ -7280,7 +7368,7 @@ def anchored_lane(models, band=SIMPLIFIER_BAND):
     if anchor is None: return [],None
     cap=tree_size_cap(anchor)
     lane=[m for m in inside if tree_size_cap(m)<=cap]
-    return sorted(lane,key=lambda m:(model_complexity(m),aggregate_loss(m),repr(m.trees))),cap
+    return sorted(lane,key=lambda m:(model_complexity(m),aggregate_loss(m),trees_text(m.trees))),cap
 def anchored_survivors(pool, count, normalization, tolerance):
     """SIMPLIFIER_LANE_SHARE of the slots to the shortest lane models, the rest by NSGA."""
     lane,_=anchored_lane(pool)
@@ -7292,7 +7380,7 @@ def anchored_emigrants(pool, count, normalization, tolerance):
     """Shortest models within the final choice's band, else within the wider lane band; NSGA fills the rest."""
     _,_,final=anchored_band(pool,SIMPLIFIER_FINAL_BAND)
     chosen=final or anchored_band(pool,SIMPLIFIER_BAND)[2]
-    chosen=sorted(chosen,key=lambda m:(model_complexity(m),aggregate_loss(m),repr(m.trees)))[:count]
+    chosen=sorted(chosen,key=lambda m:(model_complexity(m),aggregate_loss(m),trees_text(m.trees)))[:count]
     chosen_ids={id(m) for m in chosen}
     rest=[m for m in pool if id(m) not in chosen_ids]
     return chosen+select_nsga(rest,min(count-len(chosen),len(rest)),normalization,tolerance)
@@ -7622,6 +7710,200 @@ def refresh_persistent_scores(archive, best_models, semantic_qd, structural_qd, 
             cell=repertoire.cell(model); incumbent=repertoire.cells.get(cell)
             if incumbent is None or secondary_key(model)<secondary_key(incumbent): repertoire.cells[cell]=model
 
+# Offspring creation.  A generation's children are made in up to
+# CREATION_BATCHES batches, each from its own seed (drawn from the run's
+# stream) and each seeing only the generation's parents and proposal state,
+# never another batch's children.  A batch is therefore a pure function of
+# (seed, generation state): the scoring processes create and score batches in
+# parallel, a serial run makes the same batches one after another, and both
+# give the same population.
+# Many small batches keep the scoring processes evenly loaded (32 batches on
+# 15 processes left a third wave of two); the count is fixed, never derived
+# from --workers, because it shapes the random streams.
+CREATION_BATCHES=128
+_CREATION_SETTINGS=("READOUT_MODE","GENE_CROSSOVER_RATE","BACKPROP_MUTATION_WEIGHT","RESIDUAL_TERM_WEIGHT","BACKPROP_INVERSE","SEMANTIC_MAX_DELTA","EQUIVALENCE_COLLAPSE","NESTING_RULES")
+def creation_batch_sizes(count):
+    size=max(1,math.ceil(count/CREATION_BATCHES))
+    return [min(size,count-start) for start in range(0,count,size)]
+
+def _proposal_banks(bayes): return bayes.banks if isinstance(bayes,PerOutputBayesianBanks) else [bayes]
+
+def _create_children(count, c):
+    """Make `count` offspring from the creation state c (see evolve_generation).
+
+    Returns ([(child, parent, move, partner, credit)], redrawn).  parent is an
+    index into c.parents, the Bayesian catalogue entry a child was drawn from,
+    or None; partner (crossover) is an index; credit lists the parent indices
+    the QD controller credits.  Children carry lineage id -1: the caller
+    numbers them.  Only diagnostic counters of c change."""
+    bayes,library,portfolio,parents=c.bayes,c.library,c.portfolio,c.parents
+    n_features,head_count,nodes,depth,definitions,variation_ops=c.n_features,c.head_count,c.nodes,c.depth,c.definitions,c.variation_ops
+    # A Thompson draw left by an earlier equation would tie this batch to whatever ran before it.
+    for bank in _proposal_banks(bayes): bank.op_draw=None; bank.feature_draw=None
+    # A child identical to its parent is a wasted slot and a wasted tuning
+    # pass; redraw it, with a bound so tiny grammars cannot loop forever.
+    unchanged=0; unchanged_limit=4*count; redrawn=0
+    # Equivalent offspring (y+x beside x+y) would only be deduplicated after
+    # paying for tuning and scoring; redraw them under the same bound instead.
+    seen=set(c.seen)
+    def duplicate(trees):
+        nonlocal unchanged,redrawn
+        if (NESTING_RULES or UNIT_FEATURES or RELATION_OF_FEATURE) and unchanged<unchanged_limit and any(structural_violation(tree) for tree in trees):
+            unchanged+=1; return True
+        key=model_equivalence_key(trees)
+        if EQUIVALENCE_COLLAPSE and key in seen and unchanged<unchanged_limit:
+            unchanged+=1; redrawn+=1; return True
+        seen.add(key); return False
+    def build(trees, scales, age, origin, sources):
+        return Model(trees,scales,age,lineage_id=-1,origin=origin,parent_ids=tuple(model.lineage_id for model in sources),
+                     mdl_operators=grammar_for_trees(c.active_ops,trees,definitions),mdl_feature_count=n_features,adfs={} if definitions is None else dict(definitions),
+                     founder_ids=tuple(sorted({founder for model in sources for founder in model.founder_ids})),birth_generation=c.generation+1-age)
+    records=[]
+    while len(records)<count:
+        parent=None
+        if c.novelty_rate and rng.random()<c.novelty_rate:
+            trees=[admissible_random_tree(n_features,variation_ops,nodes,depth,adfs=definitions) for _ in range(head_count)]; scales=[(1.,0.)]*len(trees)
+            if duplicate(trees): continue
+            records.append((build(trees,scales,0,"novelty_injection",[]),None,["novelty_injection"],None,())); continue
+        if c.bayesian_mode!="off" and rng.random()<c.bayesian_proposal_rate:
+            trees,scales,sources=bayesian_injection_trees(bayes,head_count,n_features,variation_ops,nodes,depth,"grammar" if c.bayesian_mode=="grammar" else c.bayesian_mode,definitions,return_sources=True)
+            if duplicate(trees): continue
+            records.append((build(trees,scales,max((model.age+1 for model in sources),default=0),"bayesian_injection",sources),sources[0] if sources else None,["bayesian"],None,())); continue
+        if library.items and rng.random()<library.fragment_rate:
+            index=rng.randrange(len(parents)); p=parents[index]; trees=[]; composed=False
+            for tree in p.trees:
+                candidate=library.compose(tree,variation_ops,c.lane_cap if index>=c.lane_start else nodes,depth)
+                trees.append(candidate if candidate is not None else tree); composed|=candidate is not None
+            if not composed and unchanged<unchanged_limit: unchanged+=1; continue
+            if duplicate(trees): continue
+            records.append((build(trees,list(p.scales),p.age+1,"fragment",[p]),index,["fragment"],None,())); continue
+        if rng.random()<c.crossover_rate and len(parents)>=2:
+            first,second=rng.sample(range(len(parents)),2); p,q=parents[first],parents[second]; child_nodes=c.lane_cap if first>=c.lane_start else nodes
+            trees=[gene_crossover(a,b,child_nodes,depth,variation_ops) if READOUT_MODE=="multiterm" and c.affine_on and rng.random()<GENE_CROSSOVER_RATE else semantic_crossover(a,b,c.Xsb,child_nodes,depth,definitions,max_delta=c.role_delta) for a,b in zip(p.trees,q.trees)]
+            if trees==list(p.trees) and unchanged<unchanged_limit: unchanged+=1; continue
+            if duplicate(trees): continue
+            records.append((build(trees,list(p.scales),max(p.age,q.age)+1,"crossover",[p,q]),first,None,second,(first,second))); continue
+        index=rng.randrange(len(parents)); p=parents[index]
+        if c.bayesian_mode!="off": bayes.begin_equation()
+        trees=[]; kinds=[]; macro_used=False
+        for head,tree in enumerate(p.trees):
+            proposal=None if c.bayesian_mode=="off" else (bayes[head] if isinstance(bayes,PerOutputBayesianBanks) else bayes)
+            if BACKPROP_MUTATION_WEIGHT>0 or RESIDUAL_TERM_WEIGHT>0: set_backprop_context(c.Xsb,backprop_desired(p,head,c.Ysb,c.head_outputs),c.fragment_trees)
+            child_tree,kind,macro=semantic_mutate(tree,c.Xsb,portfolio,n_features,variation_ops,c.lane_cap if index>=c.lane_start else nodes,depth,proposal,definitions,library,max_delta=c.role_delta,neutral_shrink=c.neutral_shrink)
+            trees.append(child_tree); kinds.append(kind); macro_used|=macro
+        if trees==list(p.trees) and unchanged<unchanged_limit: unchanged+=1; continue
+        if duplicate(trees): continue
+        records.append((build(trees,list(p.scales),p.age+1,"macro_mutation" if macro_used else "mutation",[p]),index,kinds+(["macro"] if macro_used else []),None,() if macro_used else (index,)))
+    return records,redrawn
+
+def _creation_batch(count, seed, c):
+    """_create_children on its own seeded streams, leaving the caller's streams
+    and the proposal banks' draws as they were."""
+    banks=_proposal_banks(c.bayes)
+    saved=(rng.getstate(),np.random.get_state(),[(bank.op_draw,bank.feature_draw) for bank in banks])
+    try:
+        rng.seed(seed); np.random.seed(seed&0xffffffff)
+        return _create_children(count,c)
+    finally:
+        rng.setstate(saved[0]); np.random.set_state(saved[1])
+        for bank,(op_draw,feature_draw) in zip(banks,saved[2]): bank.op_draw=op_draw; bank.feature_draw=feature_draw
+
+def _library_counts(library):
+    return ((library.fragment_attempts,library.scaffold_attempts,library.macro_attempts,library.rejections),
+            {key:(item["uses"],item["rejections"]) for key,item in library.items.items()})
+def _library_count_changes(before, library):
+    totals,items=_library_counts(library)
+    return (tuple(now-then for now,then in zip(totals,before[0])),
+            {key:(uses-before[1][key][0],rejections-before[1][key][1]) for key,(uses,rejections) in items.items() if (uses,rejections)!=before[1][key]})
+def _add_library_counts(library, changes):
+    totals,items=changes
+    library.fragment_attempts+=totals[0]; library.scaffold_attempts+=totals[1]; library.macro_attempts+=totals[2]; library.rejections+=totals[3]
+    for key,(uses,rejections) in items.items():
+        library.items[key]["uses"]+=uses; library.items[key]["rejections"]+=rejections
+
+_WORKER_CREATION=[None,None]   # (token, creation state) of the generation this scoring process last created for
+def _worker_create_batch(token, payload, count, seed):
+    """Scoring process: create one batch and score it as assess(tune=True) would."""
+    if _WORKER_CREATION[0]!=token:
+        c=pickle.loads(payload)
+        if c.settings["EQUIVALENCE_COLLAPSE"]!=EQUIVALENCE_COLLAPSE: _EQUIVALENCE_CACHE.clear()
+        globals().update(c.settings)
+        c.parents=[Model(list(trees),list(scales),age,lineage_id=lineage_id,adfs=adfs,founder_ids=founder_ids) for trees,scales,age,lineage_id,founder_ids,adfs in c.parents]
+        # Archives probing the same rows share one array, so each tree is evaluated on them once.
+        for index,archive in enumerate(c.archives):
+            for earlier in c.archives[:index]:
+                if archive.probe.shape==earlier.probe.shape and np.array_equal(archive.probe,earlier.probe): archive.probe=earlier.probe; break
+        Xt,Yt=_WORKER_EVALUATION_CONTEXT["datasets"]["train"]; sample=slice(None) if c.sample is None else c.sample
+        Xs,Ys=row_subset(Xt,sample),row_subset(Yt,sample); c.Xsb=behaviour_rows(Xs)
+        if BACKPROP_MUTATION_WEIGHT>0 or RESIDUAL_TERM_WEIGHT>0:
+            _,c.Ysb=behaviour_rows(Xs,Ys); c.head_outputs=regression_head_outputs(_WORKER_EVALUATION_CONTEXT["cats"])
+            c.fragment_trees=[item["tree"] for item in c.library.items.values()]
+        _WORKER_CREATION[:]=[token,c]
+    c=_WORKER_CREATION[1]; counts=_library_counts(c.library)
+    records,redrawn=_creation_batch(count,seed,c)
+    scores=[]; derived=[]
+    for record in records:
+        child=record[0]; untuned=(child.trees,child.scales,child.objectives,child.feasible,child.invalid_reason,child.constraint_count)
+        child.trees=list(child.trees); child.scales=list(child.scales)
+        _worker_assess_batch([child],"train",c.sample,True,0,True)
+        scores.append(ModelEvaluator._score_data(child)); derived.append(_scored_child_derived(child,c))
+        child.trees,child.scales,child.objectives,child.feasible,child.invalid_reason,child.constraint_count=untuned
+    return records,redrawn,scores,_library_count_changes(counts,c.library),derived
+
+def _scored_child_derived(child, c):
+    """What the main process would next compute from a scored child, while
+    this process still holds its evaluated trees: (behaviour key, one QD
+    descriptor per archive).  Entries are None where the main process
+    should compute (and report any error) itself."""
+    try: behaviour=np.round(predict_model(child,c.Xsb),8).tobytes()
+    except Exception: behaviour=None
+    descriptors=[]
+    for archive in c.archives:
+        try: descriptors.append(np.asarray(archive.descriptor(child)) if child.feasible else None)
+        except Exception: descriptors.append(None)
+    return behaviour,descriptors
+def prime_scored_child(child, derived, Xs, archives):
+    behaviour,descriptors=derived
+    if behaviour is not None: prime_semantic_key(child,Xs,behaviour)
+    for archive,descriptor in zip(archives,descriptors):
+        if descriptor is not None: archive.prime_descriptor(child,descriptor)
+
+def create_offspring(count, creation, evaluator, Xt, Yt, cats):
+    """The generation's creation batches, in order, as (records, scores,
+    derived): scores (ModelEvaluator._score_data) and derived
+    (_scored_child_derived), one per record, when the scoring processes made
+    the batch, else None.  Adds the batches' counters."""
+    sizes=creation_batch_sizes(count); seeds=[rng.getrandbits(64) for _ in sizes]
+    executor=getattr(evaluator,"executor",None)
+    held=getattr(evaluator,"datasets",{}).get("train",(None,None))
+    # The scoring processes hold the evaluator's training arrays and readout
+    # settings; anything else (a test's stand-in evaluator) is created here.
+    if executor is None or held[0] is not Xt or held[1] is not Yt or evaluator.affine_on!=creation.affine_on or evaluator.cats is not cats:
+        batches=[]
+        for size,seed in zip(sizes,seeds):
+            records,redrawn=_creation_batch(size,seed,creation); EQUIVALENCE_STATS["children_redrawn"]+=redrawn
+            batches.append((records,None,None))
+        return batches
+    state=SimpleNamespace(**vars(creation)); state.Xsb=state.Ysb=state.head_outputs=state.fragment_trees=None
+    state.parents=[(model.trees,model.scales,model.age,model.lineage_id,model.founder_ids,model.adfs) for model in creation.parents]
+    state.settings={name:globals()[name] for name in _CREATION_SETTINGS}
+    # QD descriptors are taken of the full-data rescoring, which equals this
+    # scoring only when the generation is not screened on a row sample.
+    state.archives=[archive.descriptor_only() for archive in creation.archives] if creation.sample is None else []
+    payload=pickle.dumps(state,protocol=pickle.HIGHEST_PROTOCOL)
+    evaluator.epoch+=1; token=(os.getpid(),id(evaluator),evaluator.epoch)
+    futures=[executor.submit(_worker_create_batch,token,payload,size,seed) for size,seed in zip(sizes,seeds)]
+    try: results=[future.result() for future in futures]
+    except KeyboardInterrupt:
+        for future in futures: future.cancel()
+        evaluator.close()
+        raise
+    batches=[]
+    for records,redrawn,scores,changes,derived in results:
+        EQUIVALENCE_STATS["children_redrawn"]+=redrawn; _add_library_counts(creation.library,changes)
+        batches.append((records,scores,derived))
+    return batches
+
 def evolve_generation(pop, generation, *, X, Xt, Yt, Xv, Yv, cats, constraints, out_names, ops, nodes, depth, affine_on, coev,
                       bayes, archive, semantic_qd, structural_qd, qd_controller, best_models, pressure, cases, portfolio, library, evaluator,
                       bayesian_proposal_rate, crossover_rate, qd_mode, lexicase_cases, nsga_normalization, progress=None, bayesian_mode="adaptive", adf_registry=None, budget=None, population_size=None, case_weights=None, residual_qd=None, role_settings=None, place=None):
@@ -7722,67 +8004,51 @@ def evolve_generation(pop, generation, *, X, Xt, Yt, Xv, Yv, cats, constraints, 
             lane_ids={id(choice) for choice in lane_parents}; lane_cap=min(nodes,cap)
     # Archive parents need the same screen fit as their children for feedback.
     evaluator.assess([parent.model for parent in parents if parent.source!="ordinary"],"train",None if isinstance(sample,slice) else sample)
-    # A child identical to its parent is a wasted slot and a wasted tuning
-    # pass; redraw it, with a bound so tiny grammars cannot loop forever.
-    unchanged=0; unchanged_limit=4*population_size
-    # Equivalent offspring (y+x beside x+y) would only be deduplicated after
-    # paying for tuning and scoring; redraw them under the same bound instead.
-    seen={model_equivalence_key(model) for model in pop}
-    def duplicate(trees):
-        nonlocal unchanged
-        if (NESTING_RULES or UNIT_FEATURES or RELATION_OF_FEATURE) and unchanged<unchanged_limit and any(structural_violation(tree) for tree in trees):
-            unchanged+=1; return True
-        key=model_equivalence_key(trees)
-        if EQUIVALENCE_COLLAPSE and key in seen and unchanged<unchanged_limit:
-            unchanged+=1; EQUIVALENCE_STATS["children_redrawn"]+=1; return True
-        seen.add(key); return False
-    novelty_rate=max(pressure.novelty_rate(),float(role_settings.get("novelty",0.)))
+    # Offspring are created in independently seeded batches (see
+    # _create_children), in the scoring processes when there are any: the
+    # batches, their seeds and so the results do not depend on --workers.
+    definitions=adf_registry.definitions if adf_registry else None
+    creation=SimpleNamespace(
+        parents=[choice.model for choice in parents],lane_start=len(parents)-len(lane_ids),lane_cap=lane_cap,bayes=bayes,library=library,portfolio=portfolio,
+        definitions=definitions,active_ops=active_ops,variation_ops=variation_ops,nodes=nodes,depth=depth,n_features=X.shape[1],head_count=len(pop[0].trees),
+        generation=generation,novelty_rate=max(pressure.novelty_rate(),float(role_settings.get("novelty",0.))),bayesian_mode=bayesian_mode,
+        bayesian_proposal_rate=bayesian_proposal_rate,crossover_rate=crossover_rate,affine_on=affine_on,role_delta=role_delta,neutral_shrink=neutral_shrink,
+        seen={model_equivalence_key(model) for model in pop},sample=None if isinstance(sample,slice) else sample,Xsb=Xsb,
+        Ysb=Ysb if BACKPROP_MUTATION_WEIGHT>0 or RESIDUAL_TERM_WEIGHT>0 else None,head_outputs=head_outputs if BACKPROP_MUTATION_WEIGHT>0 or RESIDUAL_TERM_WEIGHT>0 else None,
+        fragment_trees=fragment_trees if BACKPROP_MUTATION_WEIGHT>0 or RESIDUAL_TERM_WEIGHT>0 else None,
+        archives=[semantic_qd,*([structural_qd,*([residual_qd] if residual_qd is not None else [])] if qd_mode=="adaptive_dual" else [])])
     made=[]   # (child, main parent or None, kinds, crossover partner or None) for the history
-    while len(children)<population_size:
-        sources=[]
-        if novelty_rate and rng.random()<novelty_rate:
-            trees=[admissible_random_tree(X.shape[1],variation_ops,nodes,depth,adfs=adf_registry.definitions if adf_registry else None) for _ in range(len(pop[0].trees))]; scales=[(1.,0.)]*len(trees); child_age=0; child_origin="novelty_injection"
-        elif bayesian_mode!="off" and rng.random() < bayesian_proposal_rate:
-            trees,scales,sources=bayesian_injection_trees(bayes,len(pop[0].trees),X.shape[1],variation_ops,nodes,depth,"grammar" if bayesian_mode=="grammar" else bayesian_mode,adf_registry.definitions if adf_registry else None,return_sources=True)
-            child_age=max((model.age+1 for model in sources),default=0); child_origin="bayesian_injection"
-        elif library.items and rng.random()<library.fragment_rate:
-            p=rng.choice(parents); trees=[]; composed=False
-            for tree in p.model.trees:
-                candidate=library.compose(tree,variation_ops,lane_cap if id(p) in lane_ids else nodes,depth)
-                trees.append(candidate if candidate is not None else tree); composed|=candidate is not None
-            if not composed and unchanged<unchanged_limit: unchanged+=1; continue
-            scales=list(p.model.scales); child_age=p.model.age+1; child_origin="fragment"
-            sources=[p.model]
-        elif rng.random() < crossover_rate and len(parents)>=2:
-            p,q=rng.sample(parents,2); child_nodes=lane_cap if id(p) in lane_ids else nodes
-            trees=[gene_crossover(a,b,child_nodes,depth,variation_ops) if READOUT_MODE=="multiterm" and affine_on and rng.random()<GENE_CROSSOVER_RATE else semantic_crossover(a,b,Xsb,child_nodes,depth,adf_registry.definitions if adf_registry else None,max_delta=role_delta) for a,b in zip(p.model.trees,q.model.trees)]; scales=list(p.model.scales); child_age=max(p.model.age,q.model.age)+1
-            if trees==list(p.model.trees) and unchanged<unchanged_limit: unchanged+=1; continue
-            if duplicate(trees): continue
-            child=Model(trees,scales,child_age,origin="crossover",parent_ids=(p.model.lineage_id,q.model.lineage_id),mdl_operators=grammar_for_trees(active_ops,trees,adf_registry.definitions if adf_registry else None),mdl_feature_count=X.shape[1],adfs={} if adf_registry is None else dict(adf_registry.definitions),founder_ids=tuple(sorted(set(p.model.founder_ids).union(q.model.founder_ids))),birth_generation=generation+1-child_age)
-            children.append(child); credits.append((child,(p,q))); made.append((child,p.model,None,q.model)); continue
-        else:
-            p=rng.choice(parents)
-            if bayesian_mode!="off": bayes.begin_equation()
-            trees=[]; kinds=[]; macro_used=False
-            for index,tree in enumerate(p.model.trees):
-                proposal=None if bayesian_mode=="off" else (bayes[index] if isinstance(bayes,PerOutputBayesianBanks) else bayes)
-                if BACKPROP_MUTATION_WEIGHT>0 or RESIDUAL_TERM_WEIGHT>0: set_backprop_context(Xsb,backprop_desired(p.model,index,Ysb,head_outputs),fragment_trees)
-                child_tree,kind,macro=semantic_mutate(tree,Xsb,portfolio,X.shape[1],variation_ops,lane_cap if id(p) in lane_ids else nodes,depth,proposal,adf_registry.definitions if adf_registry else None,library,max_delta=role_delta,neutral_shrink=neutral_shrink)
-                trees.append(child_tree); kinds.append(kind); macro_used|=macro
-            if trees==list(p.model.trees) and unchanged<unchanged_limit: unchanged+=1; continue
-            scales=list(p.model.scales); child_age=p.model.age+1; child_origin="macro_mutation" if macro_used else "mutation"
-            sources=[p.model]
-        if duplicate(trees): continue
-        child=Model(trees,scales,child_age,origin=child_origin,parent_ids=tuple(model.lineage_id for model in sources),mdl_operators=grammar_for_trees(active_ops,trees,adf_registry.definitions if adf_registry else None),mdl_feature_count=X.shape[1],adfs={} if adf_registry is None else dict(adf_registry.definitions),founder_ids=tuple(sorted({founder for model in sources for founder in model.founder_ids})),birth_generation=generation+1-child_age)
+    prescored=_Prescored(); derived_by_child=[]
+    def adopt(record, score=None, derived=None):
+        child,parent,move,partner,credit=record
+        child.lineage_id=next_lineage_id()
+        if not child.parent_ids: child.founder_ids=(child.lineage_id,)
         children.append(child)
-        move=kinds+(["macro"] if macro_used else []) if child_origin in ("mutation","macro_mutation") else [{"fragment":"fragment","bayesian_injection":"bayesian"}.get(child_origin,child_origin)]
-        made.append((child,sources[0] if sources else None,move,None))
+        made.append((child,parents[parent].model if isinstance(parent,int) else parent,move,None if partner is None else parents[partner].model))
+        if credit: credits.append((child,tuple(parents[index] for index in credit)))
+        if child.origin=="mutation": feedback.append((child,parents[parent].model,move))
         if child.origin=="bayesian_injection": injections.append(child)
         if child.origin in {"fragment","macro_mutation"}: discovery_children.append(child)
-        if child.origin=="mutation": feedback.append((child,p.model,kinds)); credits.append((child,(p,)))
+        if score is not None: prescored.add(evaluator._cache_key(child,"train",creation.sample,True,True),score)
+        if derived is not None: derived_by_child.append((child,derived))
+    seen=set(creation.seen)
+    for records,scores,derived in create_offspring(population_size,creation,evaluator,Xt,Yt,cats):
+        for index,record in enumerate(records):
+            # Batches cannot see each other's children: keep the first of equivalent ones.
+            key=model_equivalence_key(record[0])
+            if EQUIVALENCE_COLLAPSE and key in seen: EQUIVALENCE_STATS["children_redrawn"]+=1; continue
+            seen.add(key); adopt(record,None if scores is None else scores[index],None if derived is None else derived[index])
+    while len(children)<population_size:
+        creation.seen=seen
+        records,redrawn=_creation_batch(population_size-len(children),rng.getrandbits(64),creation); EQUIVALENCE_STATS["children_redrawn"]+=redrawn
+        for record in records: seen.add(model_equivalence_key(record[0])); adopt(record)
     # A correct structure with untuned constants otherwise scores like a wrong
     # one and is lost; fit every offspring's inner constants before scoring.
-    evaluator.assess(children,"train",None if isinstance(sample,slice) else sample,tune=True)
+    evaluator.assess(children,"train",None if isinstance(sample,slice) else sample,tune=True,prefetched=prescored)
+    # The scoring processes also computed each child's behaviour key and QD
+    # descriptors (the same functions on the same rows); record them so
+    # deduplication and the archives below do not evaluate every child again.
+    for child,derived in derived_by_child: prime_scored_child(child,derived,Xs,creation.archives)
     for child,parent,kinds,partner in made:
         if partner is not None: history_crossed(child,parent,partner,generation,place)
         elif parent is not None: history_varied(child,parent,generation,place,kinds)
@@ -8177,7 +8443,7 @@ def stop_rule_reached(args, started, islands, validation=None):
     held_out=bool(validation) and validation.get("X") is not None
     def losses(model):
         if not held_out: return tuple(model_losses(model)),aggregate_loss(model)
-        key=(id(validation["X"]),repr(model.trees),tuple(model.scales))
+        key=(id(validation["X"]),trees_text(model.trees),tuple(model.scales))
         if key not in _STOP_VALIDATION:
             if len(_STOP_VALIDATION)>256: _STOP_VALIDATION.clear()
             try:
