@@ -509,6 +509,25 @@ so these are **audit-then-extend**, not new builds.
 - [x] `--stop-at-loss` uses validation loss when there is validation data
   and accepts `NAME=LOSS,...` per output (each separate-output search stops
   at its own limit).
+- [x] Two-stage search (2026-10-07): `--stop-at-loss-fraction F` sets how
+  many islands' best models must reach `--stop-at-loss` before it acts (0 =
+  any one, 1 = all, in between a fraction rounded up). `--stop-at-loss-action
+  compress` then starts a compression stage instead of stopping: every island
+  whose best model meets the target (then, or later) is anchored and from
+  then on searches for the shortest models whose training loss stays under a
+  fixed ceiling (`--compress-ceiling target`, the default: the target itself,
+  or `--compress-band` over the anchor if that is looser; `anchor`: within
+  `--compress-band` of the anchor's loss). 75% of survivors are the shortest
+  in-band models no larger than the anchor, 90% of parents come from them,
+  mutation is biased toward pruning and crossover/Bayesian proposals are
+  halved; the other quarter is ordinary Pareto survival, so a model that
+  loses accuracy just falls out of the lane. Islands that have not met the
+  target keep searching for loss. The stage runs until Ctrl-C, `--max-time`,
+  `--max-generations` or `--compress-patience N` (no island found a shorter
+  in-band model for N generations); its state is in each island's checkpoint,
+  and the final menu offers "Shortest meeting --stop-at-loss" (or "Shortest
+  within B% of the best loss" with `anchor`) second, after Best Score.
+  Tests: `test_afpo_compression.py`.
 - [x] GUI: rendered equations run in a killable child process outside the
   explorer lock and long formulas render on request (no more frozen tabs);
   test rows kept in checkpoints, test loss shown when a run finishes, in the
