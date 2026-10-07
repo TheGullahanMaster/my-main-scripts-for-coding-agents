@@ -204,6 +204,21 @@ button.play.on { background: var(--accent); color: var(--accent-ink); border-col
 .colorbar { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 8px; align-items: center; font-size: 12px; color: var(--text-2); margin-top: 8px; font-variant-numeric: tabular-nums; }
 .colorbar .ramp { height: 10px; border-radius: 3px; }
 .colorbar .title { grid-column: 1 / -1; color: var(--text-2); font-size: 12px; }
+
+/* CSV Editor grid: scrolls both ways inside its box; the row numbers stay in view. */
+.ed-wrap { overflow: auto; max-height: 62vh; border: 1px solid var(--border); border-radius: 8px; -webkit-overflow-scrolling: touch; }
+table.ed { width: max-content; min-width: 100%; }
+table.ed th { z-index: 2; white-space: nowrap; padding: 4px 6px; }
+table.ed td { padding: 2px 4px; vertical-align: middle; }
+table.ed td.rn, table.ed th.rn { position: sticky; left: 0; background: var(--surface); z-index: 1; white-space: nowrap; color: var(--muted); font-variant-numeric: tabular-nums; overflow-wrap: normal; }
+table.ed th.rn { z-index: 3; }
+table.ed input[type=text], table.ed input[type=number], table.ed select { min-width: 96px; width: 100%; padding: 6px 8px; }
+table.ed tr.newrow td { opacity: .65; }
+table.ed .colbtn { border: 0; background: none; color: var(--text); font: inherit; font-weight: 600; cursor: pointer; padding: 2px 0; text-align: left; }
+table.ed .colbtn .hint { display: block; font-weight: 400; }
+table.ed .imgcell { display: flex; align-items: center; gap: 6px; min-width: 150px; }
+table.ed .imgcell img { width: 36px; height: 36px; object-fit: cover; border-radius: 4px; border: 1px solid var(--border); }
+@media (max-width: 600px) { table.ed input[type=text], table.ed input[type=number], table.ed select { font-size: 16px; min-width: 110px; } }
 </style>
 </head>
 <body>
@@ -223,11 +238,30 @@ button.play.on { background: var(--accent); color: var(--accent-ink); border-col
 <main>
 <!-- ───────────── SETUP ───────────── -->
 <section class="tab active" id="tab-setup">
+  <div class="card hidden" id="editorCard">
+    <h2>CSV Editor <span class="grow"></span><span class="hint" id="edStatus" style="text-transform:none;letter-spacing:0"></span></h2>
+    <div class="row" style="margin-bottom:8px">
+      <button class="btn" id="edAddCol">+ Column</button>
+      <button class="btn" id="edAddRow">+ Row</button>
+      <button class="btn" id="edDelRows" disabled>Delete ticked rows</button>
+      <label class="hint nowrap">Go to row <input type="number" id="edGoto" min="1" style="width:84px"></label>
+      <button class="btn" id="edNew">New table</button>
+      <span class="grow"></span>
+      <input type="text" id="edName" class="mono" placeholder="my_data.csv" spellcheck="false" style="max-width:260px" title="A name saves next to the scripts; a full path saves there">
+      <button class="btn" id="edSave">Save</button>
+      <button class="btn primary" id="edUse">Save &amp; use for training</button>
+    </div>
+    <div id="edWarn"></div>
+    <div class="ed-wrap" id="edWrap"><table class="ed" id="edTable"><thead></thead><tbody></tbody></table></div>
+    <div class="hint" id="edHint" style="margin-top:6px">Tap a column name to rename it, change its type or delete it. Typing in the last, faded row adds a row. More rows load as you scroll.</div>
+  </div>
   <div class="grid2">
     <div>
       <div class="card">
         <h2>Dataset</h2>
-        <div class="field">
+        <div class="seg" id="dataSource" style="margin-bottom:10px"><button type="button" data-source="csv" class="active">Existing CSV</button><button type="button" data-source="manual">Manual entry</button></div>
+        <div class="hint hidden" id="sourceManualHint" style="margin-bottom:10px">Build the table in the CSV Editor above, then press <strong>Save &amp; use for training</strong>: the saved file appears here and its columns below.</div>
+        <div class="field" id="sourceCsvField">
           <label>CSV file <span class="hint">paste a full path, browse this machine, or upload through your browser</span></label>
           <div data-path="dataset" data-kind="csv"></div>
         </div>
@@ -242,6 +276,7 @@ button.play.on { background: var(--accent); color: var(--accent-ink); border-col
               <input type="text" id="delimiterCustom" class="hidden" placeholder="e.g. |" style="max-width:90px">
             </div>
           </div>
+          <button class="btn" id="editCsvBtn" title="Open this file in the CSV Editor">Edit in CSV Editor</button>
           <button class="btn primary" id="inspectBtn">Inspect columns</button>
         </div>
         <div id="datasetInfo" class="hint"></div>
@@ -586,6 +621,21 @@ button.play.on { background: var(--accent); color: var(--accent-ink); border-col
     <div style="padding:10px 14px" class="row"><button class="btn" id="browserUp">Up</button><input type="text" id="browserPath" class="grow"><button class="btn" id="browserGo">Go</button></div>
     <div class="list" id="browserList"></div>
     <footer><span class="hint" id="browserHint"></span></footer>
+  </div>
+</div>
+<div class="modal-bg" id="edColModal">
+  <div class="modal" style="width:min(460px,94vw)">
+    <header><strong id="edColTitle">Column</strong><span class="spacer"></span><button class="btn" id="edColCancel">Close</button></header>
+    <div style="padding:12px 14px">
+      <div class="field"><label>Name</label><input type="text" id="edColName" spellcheck="false"></div>
+      <div class="field"><label>Type</label><select id="edColKind"></select><div class="hint" id="edColKindHint" style="margin-top:4px"></div></div>
+      <div class="field hidden" id="edColGridField">
+        <label>Slice every image into a grid <span class="hint">rows × columns, up to 10 × 10</span></label>
+        <div class="row"><input type="number" id="edColGridR" min="1" max="10" value="1" style="max-width:84px"><span>×</span><input type="number" id="edColGridC" min="1" max="10" value="1" style="max-width:84px"></div>
+        <div class="hint" id="edColGridHint" style="margin-top:4px"></div>
+      </div>
+    </div>
+    <footer><button class="btn danger" id="edColDelete">Delete</button><button class="btn" id="edColLeft">← Move</button><button class="btn" id="edColRight">Move →</button><span style="flex:1"></span><button class="btn primary" id="edColSave">Save</button></footer>
   </div>
 </div>
 <div id="toast"></div>
@@ -1240,7 +1290,7 @@ let COL_SEL = new Set(), COL_LAST = null;
 const usableColumns = () => INSPECT.columns.filter(c => !c.constant);
 function selectColumns(cols) { COL_SEL = new Set(cols.map(c => c.index)); COL_LAST = null; renderColumns(); }
 function setColumnTypes(indices, type) {
-  for (const i of indices) if (!INSPECT.columns[i].constant) INSPECT.columns[i].type = type;
+  for (const i of indices) if (!INSPECT.columns[i].constant && !(INSPECT.columns[i].input_only && type >= 5)) INSPECT.columns[i].type = type;
   renderColumns();
 }
 function renderColumns() {
@@ -1250,8 +1300,8 @@ function renderColumns() {
     if (COL_SEL.has(c.index)) tr.className = 'selected';
     const values = c.numeric ? `${fmt(c.min)} … ${fmt(c.max)}<div class="hint">${c.unique} unique${c.missing ? ` · ${c.missing} missing` : ''}</div>`
       : `${esc((c.top || []).slice(0, 3).map(t => t[0]).join(', '))}<div class="hint">${c.unique} categories${c.missing ? ` · ${c.missing} missing` : ''}</div>`;
-    const select = c.constant ? '<span class="hint">ignored (constant)</span>'
-      : `<select data-col="${c.index}">${TYPE_LABELS.map(([v, l]) => `<option value="${v}" ${v === c.type ? 'selected' : ''}>${l}</option>`).join('')}</select>` +
+    const select = c.constant ? `<span class="hint">ignored (${c.reserved ? 'CSV Editor data' : 'constant'})</span>`
+      : `<select data-col="${c.index}">${TYPE_LABELS.filter(([v]) => !(c.input_only && v >= 5)).map(([v, l]) => `<option value="${v}" ${v === c.type ? 'selected' : ''}>${l}</option>`).join('')}</select>` +
         (c.class_like && c.type === 5 ? '<div class="hint">few integer codes: pick Categorical output if these are classes</div>' : '');
     const tick = c.constant ? '' : `<input type="checkbox" data-colpick="${c.index}" ${COL_SEL.has(c.index) ? 'checked' : ''}>`;
     tr.innerHTML = `<td>${tick}</td><td class="num">${c.index}</td><td><strong>${esc(c.name)}</strong><div class="hint">${c.numeric ? 'numeric' : 'text'}</div></td><td>${values}</td><td class="hist">${c.hist ? '<canvas></canvas>' : ''}</td><td>${select}</td>`;
@@ -1289,6 +1339,298 @@ function summarizeColumns() {
   $('#columnsSummary').textContent = `${n([1, 2])} inputs · ${n([5, 6])} outputs · ${n([0])} ignored`;
 }
 $('#inspectBtn').onclick = inspect;
+
+// ───────────── CSV Editor ─────────────
+// The table lives in the server (afpo_lib/csv_editor.py); the page holds only the rows it shows,
+// ED.start … ED.start + ED.rows.length, and trades pages with the server as the box is scrolled.
+const ED = {meta: null, start: 0, rows: [], sel: new Set(), busy: false, col: null};
+const ED_PAGE = 100, ED_KEEP = 400;
+const EDK = {BOOL: 0, INT: 1, FLOAT: 2, CAT: 3, TEXT: 4, CHARS: 5, IMAGE: 6};
+const ED_KIND_HINTS = [
+  'True or False; saved as 1 and 0.',
+  'Whole numbers: anything entered is rounded to the nearest integer.',
+  'Any number, kept as typed.',
+  'One of a list of categories; add new ones from the cell\'s menu.',
+  'Each distinct string is saved as one number. As an output, a prediction shows the nearest stored string, with ~ marks for how far off it is (none, ~, ~~, ~~~).',
+  'Saved as one column per character position, up to the longest entry of the column.',
+  'Upload a picture per row; it is saved as three numbers (per grid cell). Images can only be inputs.',
+];
+function edApply(j) {
+  ED.meta = {columns: j.columns, total: j.total, path: j.path, dirty: j.dirty, kinds: j.kinds, home: j.home, max_grid: j.max_grid, warnings: j.warnings || []};
+  if (j.rows) { ED.start = j.start; ED.rows = j.rows; }
+  const m = ED.meta;
+  $('#edStatus').textContent = `${m.total.toLocaleString()} row${m.total === 1 ? '' : 's'} · ${m.columns.length} column${m.columns.length === 1 ? '' : 's'} · ${m.path ? m.path.split('/').pop() : 'not saved yet'}${m.dirty ? ' · unsaved changes' : ''}`;
+  $('#edWarn').innerHTML = m.warnings.map(w => `<div class="notice warn" style="margin-bottom:8px">${esc(w)}</div>`).join('');
+  $('#edGoto').max = Math.max(1, m.total);
+}
+async function edCall(body) {
+  const j = await api('/api/editor', body);
+  edApply(j);
+  return j;
+}
+async function edLoad(start, extra = {}) {
+  await edCall({op: 'view', ...extra, start: Math.max(0, start), count: ED_PAGE});
+  edRender();
+}
+function edCell(c, ci, v) {
+  const at = `data-col="${ci}"`;
+  if (c.kind === EDK.BOOL) return `<select ${at}><option value=""></option><option value="1" ${v === 1 ? 'selected' : ''}>True</option><option value="0" ${v === 0 ? 'selected' : ''}>False</option></select>`;
+  if (c.kind === EDK.INT || c.kind === EDK.FLOAT) return `<input type="number" inputmode="decimal" step="${c.kind === EDK.INT ? 1 : 'any'}" ${at} value="${v ?? ''}">`;
+  // Too many categories for a menu (see CATEGORY_MENU_LIMIT): type the value instead.
+  if (c.kind === EDK.CAT && c.many) return `<input type="text" ${at} value="${esc(v ?? '')}" spellcheck="false" title="${c.many.toLocaleString()} categories: type the value">`;
+  if (c.kind === EDK.CAT) {
+    const options = [...new Set([...(c.categories || []), ...(v == null ? [] : [v])])];
+    return `<select ${at}><option value=""></option>${options.map(o => `<option ${o === v ? 'selected' : ''}>${esc(o)}</option>`).join('')}<option value="__new_category__">+ New category…</option></select>`;
+  }
+  if (c.kind === EDK.IMAGE) {
+    return `<div class="imgcell">${v ? `<img loading="lazy" alt="" src="/api/editor/thumb?path=${encodeURIComponent(v.path)}">` : ''}<button class="btn" type="button" data-imgbtn="${ci}">${v ? 'Replace' : 'Upload…'}</button>${v ? `<button class="link" type="button" data-imgclear="${ci}" title="Remove this image">×</button>` : ''}<input type="file" class="hidden" accept="image/*" data-imgfile="${ci}"></div>`;
+  }
+  return `<input type="text" ${at} value="${esc(v ?? '')}" spellcheck="false">`;
+}
+function edRowHTML(i) {
+  const fresh = i >= ED.meta.total, row = fresh ? [] : ED.rows[i - ED.start];
+  return `<tr data-row="${i}" class="${fresh ? 'newrow' : ''}"><td class="rn">${fresh ? '<span title="Type here to add a row">＋</span>' : `<label class="check" style="margin:0"><input type="checkbox" data-pick ${ED.sel.has(i) ? 'checked' : ''}>${i + 1}</label>`}</td>${ED.meta.columns.map((c, ci) => `<td>${edCell(c, ci, row[ci] ?? null)}</td>`).join('')}</tr>`;
+}
+function edRender() {
+  const m = ED.meta, table = $('#edTable');
+  if (!m.columns.length) {
+    table.tHead.innerHTML = ''; table.tBodies[0].innerHTML = '<tr><td class="hint" style="padding:18px">No columns yet. Press <strong>+ Column</strong> to add the first one.</td></tr>';
+    return;
+  }
+  table.tHead.innerHTML = `<tr><th class="rn">#</th>${m.columns.map((c, ci) => `<th><button class="colbtn" type="button" data-colbtn="${ci}">${esc(c.name)}<span class="hint">${esc(m.kinds[c.kind])}${c.kind === EDK.IMAGE && c.encoded > 3 ? ` · ${c.grid[0]}×${c.grid[1]}` : ''}${c.many ? ` · ${c.many.toLocaleString()} values` : ''}</span></button></th>`).join('')}</tr>`;
+  let html = '';
+  for (let i = ED.start; i < ED.start + ED.rows.length; i++) html += edRowHTML(i);
+  if (ED.start + ED.rows.length >= m.total) html += edRowHTML(m.total);
+  table.tBodies[0].innerHTML = html;
+  $('#edDelRows').disabled = !ED.sel.size;
+}
+// Endless scroll: fetch the next (or previous) page near an edge and drop rows from the far side.
+$('#edWrap').addEventListener('scroll', async () => {
+  const box = $('#edWrap'), body = $('#edTable').tBodies[0];
+  if (ED.busy || !ED.meta || !ED.meta.columns.length) return;
+  const end = ED.start + ED.rows.length;
+  try {
+    if (box.scrollTop + box.clientHeight > box.scrollHeight - 300 && end < ED.meta.total) {
+      ED.busy = true;
+      const j = await api('/api/editor', {op: 'view', start: end, count: ED_PAGE});
+      ED.rows.push(...j.rows); ED.meta.total = j.total;
+      body.insertAdjacentHTML('beforeend', j.rows.map((_, k) => edRowHTML(end + k)).join('') + (end + j.rows.length >= j.total ? edRowHTML(j.total) : ''));
+      if (ED.rows.length > ED_KEEP) {
+        let removed = 0;
+        for (let k = 0; k < ED_PAGE; k++) { removed += body.rows[0].offsetHeight; body.rows[0].remove(); }
+        ED.rows.splice(0, ED_PAGE); ED.start += ED_PAGE; box.scrollTop -= removed;
+      }
+    } else if (box.scrollTop < 200 && ED.start > 0) {
+      ED.busy = true;
+      const from = Math.max(0, ED.start - ED_PAGE), j = await api('/api/editor', {op: 'view', start: from, count: ED.start - from});
+      const before = box.scrollHeight;
+      ED.rows.unshift(...j.rows); ED.start = from;
+      body.insertAdjacentHTML('afterbegin', j.rows.map((_, k) => edRowHTML(from + k)).join(''));
+      box.scrollTop += box.scrollHeight - before;
+      if (ED.rows.length > ED_KEEP) {
+        const keep = ED.rows.length - ED_PAGE;
+        while (body.rows.length > keep) body.rows[body.rows.length - 1].remove();
+        ED.rows.length = keep;
+      }
+    }
+  } catch (e) { toast(e.message, true); }
+  finally { ED.busy = false; }
+});
+// The faded last row becomes a real one in place the moment it is first edited (focus stays put,
+// and a second cell typed before the server answers lands in the same row); a new faded row follows.
+function edPromote(tr) {
+  if (!tr.classList.contains('newrow')) return;
+  const row = +tr.dataset.row;
+  ED.rows.push(ED.meta.columns.map(() => null)); ED.meta.total = row + 1;
+  tr.classList.remove('newrow');
+  tr.cells[0].innerHTML = `<label class="check" style="margin:0"><input type="checkbox" data-pick>${row + 1}</label>`;
+  tr.insertAdjacentHTML('afterend', edRowHTML(ED.meta.total));
+}
+async function edSetCell(tr, ci, value) {
+  const row = +tr.dataset.row;
+  edPromote(tr);
+  try {
+    const j = await edCall({op: 'set_cell', row, col: ci, value});
+    if (row >= ED.start && row < ED.start + ED.rows.length) ED.rows[row - ED.start] = j.changed.values;
+    // Show what was stored (a rounded integer, a new category, an image) without touching other cells.
+    const column = ED.meta.columns[ci], stored = j.changed.values[ci];
+    const control = tr.cells[ci + 1].querySelector('[data-col]');
+    if (column.kind === EDK.CAT && column.many) {
+      // The column just outgrew its menu: redraw once so every cell becomes a text box.
+      if ($(`#edTable select[data-col="${ci}"]`)) edRender();
+      else if (document.activeElement !== control) control.value = stored ?? '';
+      return;
+    }
+    if (column.kind === EDK.IMAGE || column.kind === EDK.CAT || !control) tr.cells[ci + 1].innerHTML = edCell(column, ci, stored);
+    // A category added here joins the menu of every other row on screen.
+    if (column.kind === EDK.CAT) $$(`#edTable select[data-col="${ci}"]`).forEach(other => {
+      if (other.options.length !== column.categories.length + 2) other.closest('td').innerHTML = edCell(column, ci, other.value === '' ? null : other.value);
+    });
+    else if (document.activeElement !== control) control.value = stored ?? '';
+    else if (column.kind === EDK.INT && stored != null && String(stored) !== control.value) control.value = stored;
+  } catch (e) { toast(e.message, true); edLoad(ED.start).catch(() => {}); }
+}
+$('#edTable').addEventListener('change', async ev => {
+  const t = ev.target, tr = t.closest('tr[data-row]');
+  if (!tr) return;
+  if (t.matches('[data-pick]')) {
+    const row = +tr.dataset.row;
+    t.checked ? ED.sel.add(row) : ED.sel.delete(row);
+    $('#edDelRows').disabled = !ED.sel.size;
+    return;
+  }
+  if (t.matches('[data-imgfile]')) {
+    const file = t.files[0], ci = +t.dataset.imgfile, row = +tr.dataset.row;
+    if (!file) return;
+    edPromote(tr);
+    const button = tr.querySelector(`[data-imgbtn="${ci}"]`);
+    button.disabled = true; button.textContent = 'Encoding…';
+    try {
+      const r = await fetch(`/api/editor/image?name=${encodeURIComponent(file.name)}&row=${row}&col=${ci}`, {method: 'POST', body: file});
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || r.statusText);
+      edApply(j);
+      if (row >= ED.start && row < ED.start + ED.rows.length) ED.rows[row - ED.start] = j.changed.values;
+      tr.cells[ci + 1].innerHTML = edCell(ED.meta.columns[ci], ci, j.changed.values[ci]);
+    } catch (e) { toast(e.message, true); edLoad(ED.start).catch(() => {}); }
+    return;
+  }
+  if (!t.matches('[data-col]')) return;
+  const ci = +t.dataset.col, column = ED.meta.columns[ci];
+  let value = t.value;
+  if (column.kind === EDK.CAT && value === '__new_category__') {
+    value = (prompt(`New category for ${column.name}`) || '').trim();
+    if (!value) { t.value = ''; return; }
+  }
+  edSetCell(tr, ci, value === '' ? null : value);
+});
+$('#edTable').addEventListener('click', ev => {
+  const t = ev.target.closest('[data-imgbtn],[data-imgclear],[data-colbtn]');
+  if (!t) return;
+  if (t.dataset.colbtn != null) return edOpenColumn(+t.dataset.colbtn);
+  const tr = t.closest('tr[data-row]');
+  if (t.dataset.imgbtn != null) tr.querySelector(`[data-imgfile="${t.dataset.imgbtn}"]`).click();
+  else edSetCell(tr, +t.dataset.imgclear, null);
+});
+// Column dialog (new column when ED.col is null).
+function edGridHint() {
+  const r = Math.max(1, Math.min(10, +$('#edColGridR').value || 1)), c = Math.max(1, Math.min(10, +$('#edColGridC').value || 1)), n = 3 * r * c;
+  $('#edColGridHint').textContent = `${r} × ${c} → ${n} input columns per image${n >= 100 ? '. That is a LOT of data for the search.' : ''}${100 % r || 100 % c ? ' Patches overlap slightly where 100 pixels do not divide evenly.' : ''}`;
+}
+function edKindChanged() {
+  const kind = +$('#edColKind').value;
+  $('#edColKindHint').textContent = ED_KIND_HINTS[kind];
+  $('#edColGridField').classList.toggle('hidden', kind !== EDK.IMAGE);
+  edGridHint();
+}
+function edOpenColumn(index) {
+  ED.col = index;
+  const c = index == null ? null : ED.meta.columns[index];
+  $('#edColTitle').textContent = c ? `Column: ${c.name}` : 'New column';
+  $('#edColName').value = c ? c.name : '';
+  $('#edColKind').innerHTML = ED.meta.kinds.map((k, i) => `<option value="${i}">${esc(k)}</option>`).join('');
+  $('#edColKind').value = c ? c.kind : EDK.FLOAT;
+  $('#edColGridR').value = c && c.grid ? c.grid[0] : 1; $('#edColGridC').value = c && c.grid ? c.grid[1] : 1;
+  ['#edColDelete', '#edColLeft', '#edColRight'].forEach(id => $(id).classList.toggle('hidden', !c));
+  edKindChanged();
+  $('#edColModal').classList.add('open');
+  if (!c) setTimeout(() => $('#edColName').focus(), 50);
+}
+const edCloseColumn = () => $('#edColModal').classList.remove('open');
+$('#edColKind').onchange = edKindChanged;
+$('#edColGridR').oninput = $('#edColGridC').oninput = edGridHint;
+$('#edColCancel').onclick = edCloseColumn;
+$('#edColModal').addEventListener('click', e => { if (e.target.id === 'edColModal') edCloseColumn(); });
+async function edColumnOp(body, close = true) {
+  try {
+    const j = await edCall({...body, start: ED.start, count: Math.max(ED_PAGE, ED.rows.length)});
+    edRender();
+    if (j.dropped) toast(`${j.dropped} value${j.dropped === 1 ? '' : 's'} did not fit the new type and were cleared`, true);
+    if (close) edCloseColumn();
+    return j;
+  } catch (e) { toast(e.message, true); }
+}
+$('#edColSave').onclick = () => {
+  const kind = +$('#edColKind').value, grid = [+$('#edColGridR').value || 1, +$('#edColGridC').value || 1], name = $('#edColName').value.trim();
+  if (ED.col == null) return edColumnOp({op: 'add_column', name, kind, grid});
+  const c = ED.meta.columns[ED.col];
+  if (c.kind !== kind && ED.meta.total && !confirm(`Change ${c.name} from ${ED.meta.kinds[c.kind]} to ${ED.meta.kinds[kind]}? Values that do not fit the new type are cleared.`)) return;
+  edColumnOp({op: 'update_column', index: ED.col, name, kind, grid});
+};
+$('#edColName').addEventListener('keydown', e => { if (e.key === 'Enter') $('#edColSave').click(); });
+$('#edColDelete').onclick = () => { if (confirm(`Delete column ${ED.meta.columns[ED.col].name} and all its values?`)) edColumnOp({op: 'delete_column', index: ED.col}); };
+$('#edColLeft').onclick = async () => { if (ED.col > 0 && await edColumnOp({op: 'move_column', index: ED.col, delta: -1}, false)) ED.col--; };
+$('#edColRight').onclick = async () => { if (ED.col < ED.meta.columns.length - 1 && await edColumnOp({op: 'move_column', index: ED.col, delta: 1}, false)) ED.col++; };
+$('#edAddCol').onclick = () => edOpenColumn(null);
+async function edGoto(row, focus = false) {
+  try {
+    await edLoad(Math.max(0, Math.min(row, ED.meta.total) - 3));
+    const tr = $(`#edTable tr[data-row="${Math.min(row, ED.meta.total)}"]`);
+    if (tr) { tr.scrollIntoView({block: 'center'}); if (focus) { const c = tr.querySelector('[data-col]'); c && c.focus(); } }
+  } catch (e) { toast(e.message, true); }
+}
+$('#edAddRow').onclick = () => { if (!ED.meta.columns.length) return toast('Add a column first', true); edGoto(ED.meta.total, true); };
+$('#edGoto').onchange = e => { if (e.target.value) edGoto(+e.target.value - 1); };
+$('#edDelRows').onclick = async () => {
+  if (!ED.sel.size || !confirm(`Delete ${ED.sel.size} row${ED.sel.size === 1 ? '' : 's'}?`)) return;
+  try { const rows = [...ED.sel]; ED.sel = new Set(); await edLoad(Math.min(ED.start, Math.max(0, ED.meta.total - rows.length - 1)), {op: 'delete_rows', rows}); }
+  catch (e) { toast(e.message, true); }
+};
+$('#edNew').onclick = async () => {
+  if (ED.meta && ED.meta.dirty && !confirm('Discard the unsaved changes and start an empty table?')) return;
+  try { ED.sel = new Set(); await edLoad(0, {op: 'new'}); $('#edName').value = ''; } catch (e) { toast(e.message, true); }
+};
+function edNameOf(path) { return path && ED.meta.home && path.startsWith(ED.meta.home + '/') && !path.slice(ED.meta.home.length + 1).includes('/') ? path.split('/').pop() : (path || ''); }
+async function edSave() {
+  const name = $('#edName').value.trim();
+  if (!name) { $('#edName').focus(); throw new Error('Give the file a name first'); }
+  let j;
+  try { j = await edCall({op: 'save', name}); }
+  catch (e) {
+    if (!/already exists/.test(e.message)) throw e;
+    if (!confirm(`${name} already exists. Overwrite it?`)) return null;
+    j = await edCall({op: 'save', name, overwrite: true});
+  }
+  $('#edName').value = edNameOf(j.saved);
+  toast('Saved ' + j.saved);
+  return j.saved;
+}
+$('#edSave').onclick = () => edSave().catch(e => toast(e.message, true));
+$('#edUse').onclick = async () => {
+  try {
+    const saved = await edSave();
+    if (!saved) return;
+    pathInputs.dataset.value = saved; $('#delimiter').value = ','; $('#delimiter').dispatchEvent(new Event('change'));
+    await inspect();
+    $('#columnsCard').scrollIntoView({behavior: 'smooth', block: 'start'});
+  } catch (e) { toast(e.message, true); }
+};
+async function setDataSource(source, loadPath = null) {
+  const manual = source === 'manual';
+  $$('#dataSource button').forEach(b => b.classList.toggle('active', b.dataset.source === source));
+  $('#editorCard').classList.toggle('hidden', !manual);
+  $('#sourceCsvField').classList.toggle('hidden', manual);
+  $('#sourceManualHint').classList.toggle('hidden', !manual);
+  store.set('dataSource', source);
+  if (!manual) return;
+  try {
+    ED.sel = new Set();
+    await edLoad(0, loadPath ? {op: 'load', path: loadPath, delimiter: delimiterValue()} : {});
+    if (loadPath || !$('#edName').value) $('#edName').value = edNameOf(ED.meta.path);
+  } catch (e) { toast(e.message, true); }
+}
+$$('#dataSource button').forEach(b => b.onclick = () => setDataSource(b.dataset.source));
+$('#editCsvBtn').onclick = async () => {
+  const path = pathInputs.dataset.value.trim();
+  if (!path) return toast('Choose a CSV file first', true);
+  try {
+    const current = await api('/api/editor', {op: 'view'});
+    if (current.dirty && current.path !== path && !confirm('The CSV Editor holds unsaved changes. Discard them and open this file?')) return;
+  } catch (e) { return toast(e.message, true); }
+  await setDataSource('manual', path);
+  $('#editorCard').scrollIntoView({behavior: 'smooth', block: 'start'});
+};
+if (store.get('dataSource', 'csv') === 'manual') setDataSource('manual');
 const COLUMN_PICKS = {
   all: () => usableColumns(), none: () => [],
   numeric: () => usableColumns().filter(c => c.numeric), text: () => usableColumns().filter(c => !c.numeric),
@@ -2122,15 +2464,35 @@ function typicalFrozen() {
 }
 function renderPredictFields() {
   const box = $('#predictFields');
-  box.innerHTML = M.summary.inputs.map(i => i.kind === 'numeric'
+  // Text and image columns of a CSV Editor dataset get one field each in place of their encoded numbers.
+  const groups = M.summary.editor || [], encoded = new Set(groups.flatMap(g => g.columns));
+  box.innerHTML = groups.map((g, n) => g.kind === 6
+    ? `<div class="field"><label>${esc(g.name)} <span class="hint">image${g.columns.length > 3 ? `, ${g.grid[0]}×${g.grid[1]} grid` : ''}</span></label><div class="row"><button class="btn" type="button" data-predimg="${n}">Upload image…</button><span class="hint" data-predimgname="${n}">blank = typical values</span></div><input type="file" class="hidden" accept="image/*" data-predimgfile="${n}"><input type="hidden" data-in="${esc(g.name)}"></div>`
+    : `<div class="field"><label>${esc(g.name)} <span class="hint">${g.kind === 4 ? 'text' : `text, up to ${g.length} characters`}</span></label><input type="text" data-in="${esc(g.name)}" spellcheck="false" ${g.kind === 4 ? `list="predStrings${n}"` : `maxlength="${g.length}"`}>${g.kind === 4 ? `<datalist id="predStrings${n}">${g.strings.map(t => `<option value="${esc(t)}">`).join('')}</datalist>` : ''}</div>`).join('')
+    + M.summary.inputs.filter(i => !encoded.has(i.name)).map(i => i.kind === 'numeric'
     ? `<div class="field"><label>${esc(i.name)} ${i.range ? `<span class="hint">${fmt(i.range[0])} … ${fmt(i.range[1])}</span>` : ''}</label><input type="number" step="any" data-in="${esc(i.name)}" placeholder="${esc(fmt(i.typical, 6))}"></div>`
     : `<div class="field"><label>${esc(i.name)}</label><select data-in="${esc(i.name)}"><option value="">(most common)</option>${i.classes.map(c => `<option>${esc(c)}</option>`).join('')}</select></div>`).join('');
   $('#predictOut').innerHTML = '';
+  $$('#predictFields [data-predimg]').forEach(button => {
+    const n = button.dataset.predimg, file = $(`#predictFields [data-predimgfile="${n}"]`), label = $(`#predictFields [data-predimgname="${n}"]`);
+    button.onclick = () => file.click();
+    file.onchange = async () => {
+      if (!file.files[0]) return;
+      label.textContent = 'Encoding…';
+      try {
+        const r = await fetch('/api/editor/image?name=' + encodeURIComponent(file.files[0].name), {method: 'POST', body: file.files[0]});
+        const j = await r.json();
+        if (!r.ok) throw new Error(j.error || r.statusText);
+        file.parentElement.querySelector('[data-in]').value = j.image.path; label.textContent = file.files[0].name;
+      } catch (e) { label.textContent = 'blank = typical values'; toast(e.message, true); }
+    };
+  });
 }
 $('#typicalBtn').onclick = () => { $$('#predictFields [data-in]').forEach(e => e.value = ''); $('#predictBtn').click(); };
 $('#randomBtn').onclick = () => {
   for (const i of M.summary.inputs) {
     const e = $(`#predictFields [data-in="${CSS.escape(i.name)}"]`);
+    if (!e || e.type !== 'number' && e.tagName !== 'SELECT') continue;      // text and image fields keep what was entered
     if (i.kind === 'numeric' && i.range) e.value = +(i.range[0] + Math.random() * (i.range[1] - i.range[0])).toPrecision(5);
     else if (i.kind === 'categorical' && i.classes.length) e.value = i.classes[Math.floor(Math.random() * i.classes.length)];
   }
@@ -2144,7 +2506,7 @@ $('#predictBtn').onclick = async () => {
     const r = await api('/api/models/predict', {index: M.index, row});
     const outs = Object.entries(r.outputs);
     $('#predictOut').innerHTML = `<table><tbody>${outs.map(([k, v]) => `<tr><td>${esc(k)}</td><td class="${typeof v === 'number' ? 'num' : ''}"><strong>${typeof v === 'object' && v !== null ? esc(Object.entries(v).map(([c, p]) => `${c}: ${(100 * p).toFixed(1)}%`).join(' · ')) : esc(typeof v === 'number' ? fmt(v, 8) : v)}</strong></td></tr>`).join('')}</tbody></table>
-      <div class="hint" style="margin-top:4px">Blank inputs used their typical training value: ${esc(Object.entries(r.inputs).filter(([k]) => !(k in row)).map(([k, v]) => `${k}=${typeof v === 'number' ? fmt(v, 5) : v}`).join(', ') || 'none')}</div>`;
+      <div class="hint" style="margin-top:4px">Blank inputs used their typical training value: ${esc(Object.entries(r.inputs).filter(([k]) => !(k in row) && !(M.summary.editor || []).some(g => g.name in row && g.columns.includes(k))).map(([k, v]) => `${k}=${typeof v === 'number' ? fmt(v, 5) : v}`).join(', ') || 'none')}</div>`;
   } catch (e) { toast(e.message, true); }
 };
 $('#batchBtn').onclick = async () => {

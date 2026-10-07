@@ -64,6 +64,7 @@ import pandas as pd
 from afpo_lib.checkpoint_format import from_json_value as _from_json_checkpoint_value
 from afpo_lib.checkpoint_format import to_json_value as _json_checkpoint_value
 from afpo_lib.constraints import ConstraintEvaluator
+from afpo_lib import editor_format
 
 EPS, CLIP = 1e-12, 1e12
 rng = random.Random()
@@ -773,27 +774,35 @@ def _sum_parts(t, sign, parts):
     coefficient,term=_product_key(t)
     if term is None: parts[0]+=sign*coefficient; return
     parts[1][term]=parts[1].get(term,0.)+sign*coefficient
-def _product_parts(t, parts):
-    """Accumulate t into parts = [coefficient, [factor keys]]."""
+def _key_power(value, count):
+    """value**count for a coefficient met count times; overflow saturates like the repeated product did."""
+    if count==1: return value
+    try: return value**count
+    except OverflowError: return math.copysign(float("inf"),value if count%2 else 1.)
+def _product_parts(t, parts, count=1):
+    """Accumulate t**count into parts = [coefficient, {factor key: multiplicity}]."""
     op=t[0]
-    if op=="c": parts[0]*=float(t[1]); return
-    if op=="*" and len(t)==3: _product_parts(t[1],parts); _product_parts(t[2],parts); return
-    if op=="neg" and len(t)==2: parts[0]=-parts[0]; _product_parts(t[1],parts); return
-    if op in _POWER_FACTORS and len(t)==2:
-        for _ in range(_POWER_FACTORS[op]): _product_parts(t[1],parts)
-        return
+    if op=="c": parts[0]*=_key_power(float(t[1]),count); return
+    if op=="*" and len(t)==3: _product_parts(t[1],parts,count); _product_parts(t[2],parts,count); return
+    if op=="neg" and len(t)==2:
+        if count%2: parts[0]=-parts[0]
+        _product_parts(t[1],parts,count); return
+    # A power multiplies the multiplicity.  Walking the child once per factor
+    # tripled the work and the key at every nested cube: a 15-deep cube chain
+    # (16 nodes) took 18 s and 2 GB.
+    if op in _POWER_FACTORS and len(t)==2: _product_parts(t[1],parts,count*_POWER_FACTORS[op]); return
     key=_equivalence_key(t)
     if key[0]=="sum" and not key[1] and len(key[2])==1:
         # A single scaled term, e.g. neg(x) or 2*x reached through a sum.
-        coefficient,term=key[2][0]; parts[0]*=coefficient; parts[1].append(term); return
-    if key[0]=="const": parts[0]*=key[1]; return
-    parts[1].append(key)
+        coefficient,term=key[2][0]; parts[0]*=_key_power(coefficient,count); parts[1][term]=parts[1].get(term,0)+count; return
+    if key[0]=="const": parts[0]*=_key_power(key[1],count); return
+    parts[1][key]=parts[1].get(key,0)+count
 def _product_key(t):
     """(coefficient, factor-multiset key or None for a pure constant)."""
-    parts=[1.,[]]; _product_parts(t,parts)
+    parts=[1.,{}]; _product_parts(t,parts)
     if parts[0]==0 or not parts[1]: return parts[0],None
-    factors=tuple(sorted(parts[1],key=repr))
-    return parts[0],(factors[0] if len(factors)==1 else ("prod",factors))
+    factors=tuple(sorted(parts[1].items(),key=repr))
+    return parts[0],(factors[0][0] if len(factors)==1 and factors[0][1]==1 else ("prod",factors))
 def _equivalence_key(t):
     op=t[0]
     if op=="c": return ("const",_key_number(t[1]))
@@ -839,6 +848,11 @@ def node_depth(t): return 0 if t[0] in ("x","c","arg") or len(t)==1 else 1+max(n
 SEQUENCE_LAYOUT = None
 SEQUENCE_GROUP_REQUEST = ()
 SEQUENCE_LAYOUT_KEY = "__afpo_sequence_layout__"
+# Text and image columns of a CSV Editor file (see afpo_lib/editor_format.py):
+# set per run from the dataset, carried in maps[EDITOR_SCHEMA_KEY] so the
+# checkpoint and best_model.py can rebuild the encoded columns and show
+# predicted text.
+EDITOR_SCHEMA = None
 def build_sequence_layout(names, groups):
     """groups: [(name, [column names in order]), ...] over numeric feature names."""
     if not groups: return None
@@ -5548,7 +5562,7 @@ def column_types(df):
           "type to this column and the next count-1 columns, skipping their prompts.")
     print("Classification: choose 6 for class labels (text or integer codes such as 0/1/2); "
           "3+ classes then get one score equation per class. Type 5 fits a single regression equation.")
-    usable=[i for i,c in enumerate(df.columns) if df[c].dropna().nunique() > 1]
+    usable=[i for i,c in enumerate(df.columns) if df[c].dropna().nunique() > 1 and not editor_format.editor_reserved(c)]
     suggested_output=usable[-1] if usable else -1
     def class_like(values):
         """Few distinct integer codes usually mean class labels, not a quantity."""
@@ -5561,6 +5575,11 @@ def column_types(df):
         values=df[col].dropna()
         unique=int(values.nunique())
         examples=", ".join(repr(v) for v in values.iloc[:3].tolist()) or "(all missing)"
+        if editor_format.editor_reserved(col):
+            print(f"[{i}] {col!r}: CSV Editor data — automatically ignored.")
+            types[i]=0
+            i += 1
+            continue
         if unique <= 1:
             print(f"[{i}] {col!r}: examples {examples}; {unique} unique value — automatically ignored.")
             types[i]=0
@@ -5580,7 +5599,9 @@ def column_types(df):
             if typ in (0,1,2,5,6) and count >= 1:
                 end=min(len(df.columns),i+count)
                 for j in range(i,end):
-                    if df.iloc[:,j].dropna().nunique() <= 1:
+                    if editor_format.editor_reserved(df.columns[j]):
+                        types[j]=0
+                    elif df.iloc[:,j].dropna().nunique() <= 1:
                         types[j]=0
                         print(f"[{j}] {df.columns[j]!r} is constant and remains ignored.")
                     else:
@@ -5643,6 +5664,8 @@ def encode(df, types, fitted_maps=None):
                 outputs.append(pd.Index(classes).get_indexer(vals).astype(float)); categorical.append(classes)
             output_names.append(col)
     maps["__afpo_numeric_fills__"]=numeric_fills
+    editor_schema=(fitted_maps or {}).get(editor_format.EDITOR_SCHEMA_KEY) or EDITOR_SCHEMA
+    if editor_schema: maps[editor_format.EDITOR_SCHEMA_KEY]=editor_schema
     if not names: raise ValueError("need at least one array to concatenate")
     X=np.empty((len(df),len(names))); offset=0
     for item in plan:
@@ -6797,6 +6820,8 @@ def export_model(m, feature_names, output_names, cats, maps, source_columns, typ
     # used during search, rather than importing this training script.
     operator_source=inspect.getsource(op_eval).replace("def op_eval", "def op", 1)
     sequence_source=inspect.getsource(sequence_value)+inspect.getsource(sequence_augment)
+    # Text and image columns: the editor's encoders travel with the model.
+    editor_source=Path(editor_format.__file__).read_text(encoding="utf-8") if maps.get(editor_format.EDITOR_SCHEMA_KEY) else ""
     code=f'''#!/usr/bin/env python3
 """Exported AFPO symbolic model.  Run directly for sampling, plots, CSV generation, or CSV evaluation."""
 import argparse, math, json, shutil, sys
@@ -6805,6 +6830,8 @@ import numpy as np
 import pandas as pd
 MODEL = {payload}
 CONTRACT = MODEL['contract']
+EDITOR_SCHEMA = MODEL['maps'].get('{editor_format.EDITOR_SCHEMA_KEY}')
+{editor_source}
 EPS={EPS!r}; CLIP={CLIP!r}
 def clean(x): return np.clip(np.nan_to_num(x,nan=0.,posinf=CLIP,neginf=-CLIP),-CLIP,CLIP)
 {operator_source}
@@ -6841,6 +6868,7 @@ def transform(df):
         offset+=width
     return X if SEQUENCE_LAYOUT is None else sequence_augment(X,SEQUENCE_LAYOUT)
 def predict_frame(df):
+    if EDITOR_SCHEMA: df=editor_prepare_frame(df,EDITOR_SCHEMA)
     X=transform(df); raw=np.column_stack([clean(a*ev(t,X)+b) for t,(a,b) in zip(MODEL['trees'],MODEL['scales'])]); out=pd.DataFrame(index=df.index); head=0
     for i,n in enumerate(MODEL['outputs']):
         labels=MODEL['cats'][i]; count=len(labels) if labels is not None and len(labels)>2 else 1
@@ -6850,7 +6878,7 @@ def predict_frame(df):
             out[n]=[labels[int(np.clip(round(v),0,len(labels)-1))] for v in raw[:,head]]
         else: out[n]=raw[:,head]
         head+=count
-    return out
+    return editor_decode_frame(out,EDITOR_SCHEMA) if EDITOR_SCHEMA else out
 def write_new_csv(rows, destination='new_formula_predictions.csv'):
     """Save model inputs and their learned-formula predictions."""
     inputs=pd.DataFrame(rows).reindex(columns=CONTRACT['input_columns'])
@@ -6883,7 +6911,7 @@ def verify_fixture(directory=None):
     frame=pd.read_csv(fixture)
     missing=[column for column in CONTRACT['input_columns'] if column not in frame]
     if missing: raise ValueError('Fixture misses required input columns: '+', '.join(missing))
-    actual=predict_frame(frame); reference=pd.read_csv(expected)
+    actual=predict_frame(frame)[MODEL['outputs']]; reference=pd.read_csv(expected)
     if list(actual.columns)!=list(reference.columns): raise AssertionError('Output-column contract mismatch')
     for column in actual:
         if MODEL['cats'][MODEL['outputs'].index(column)] is None:
@@ -9291,6 +9319,12 @@ def train_from_setup(args, setup, choose_model=None):
     # Dropped from the setup so the frame can be freed once encoded (see below).
     df=setup.pop("df")
     path,types,delimiter,ops=(setup[key] for key in ("path","types","delimiter","ops"))
+    # A CSV Editor file: its reserved columns are never read, and image codes are inputs only.
+    global EDITOR_SCHEMA
+    if len(types)==len(df.columns): types=setup["types"]=[0 if editor_format.editor_reserved(column) else kind for column,kind in zip(df.columns,types)]
+    if not setup.get("_subrun"): EDITOR_SCHEMA=editor_format.editor_schema_from_frame(df,Path(path).resolve().parent)
+    image_outputs=[str(column) for column,kind in zip(df.columns,types) if kind in (5,6) and str(column) in editor_format.editor_input_only_columns(EDITOR_SCHEMA)]
+    if image_outputs: raise ValueError(f"Image columns can only be inputs: {', '.join(image_outputs)}")
     max_rows=getattr(args,"max_rows",0); sample_seed=row_sample_seed(args)
     affine_on,coev,dynamic_pressure_on,adf_enabled,nodes,depth=(setup[key] for key in ("affine_on","coev","dynamic_pressure_on","adf_enabled","nodes","depth"))
     island_count,migration_interval,migrants_per_island,val_path=(setup[key] for key in ("island_count","migration_interval","migrants_per_island","val_path"))

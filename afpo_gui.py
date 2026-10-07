@@ -29,6 +29,8 @@ from pathlib import Path
 # only works before numpy starts.  Imported the other way round, every training
 # run and its workers got a 16-thread pool and ran ~40x slower.
 import afpo
+from afpo_lib import editor_format
+from afpo_lib.csv_editor import CsvEditor
 
 import numpy as np
 import pandas as pd
@@ -36,6 +38,7 @@ import pandas as pd
 HTML = Path(__file__).with_name("afpo_gui.html")
 GUI_RUNS = Path("afpo_gui_runs")
 DEFAULT_PORT = 8778
+MAX_IMAGE_BYTES = 64 << 20   # one uploaded image
 SNAPSHOT_INTERVAL = 1.0      # seconds between live frontier snapshots
 MAX_POPULATION_POINTS = 800
 MAX_ARCHIVE_POINTS = 400
@@ -155,8 +158,12 @@ def inspect_dataset(path, delimiter=","):
     if not len(df.columns):
         raise ValueError("The file has no columns")
     sample = df.attrs.get("afpo_row_sample")
-    usable = [i for i, c in enumerate(df.columns) if df[c].dropna().nunique() > 1]
-    suggested_output = usable[-1] if usable else -1
+    # CSV Editor files: reserved columns are locked to "ignore", image codes cannot be outputs.
+    schema = editor_format.editor_schema_from_frame(df)
+    input_only = editor_format.editor_input_only_columns(schema)
+    usable = [i for i, c in enumerate(df.columns) if df[c].dropna().nunique() > 1 and not editor_format.editor_reserved(c)]
+    outputs = [i for i in usable if str(df.columns[i]) not in input_only]
+    suggested_output = outputs[-1] if outputs else -1
     columns = []
     for i, col in enumerate(df.columns):
         values = df[col].dropna()
@@ -164,14 +171,16 @@ def inspect_dataset(path, delimiter=","):
         numeric = bool(pd.api.types.is_numeric_dtype(df[col]))
         class_like = bool(numeric and unique <= 10 and len(values) and
                           np.all(np.isclose(values.to_numpy(float), np.round(values.to_numpy(float)))))
-        if unique <= 1:
+        reserved = editor_format.editor_reserved(col)
+        if unique <= 1 or reserved:
             suggested = 0
         elif i == suggested_output:
             suggested = 5 if numeric else 6
         else:
             suggested = 1 if numeric else 2
         info = {"index": i, "name": str(col), "numeric": numeric, "unique": unique, "missing": int(df[col].isna().sum()),
-                "constant": unique <= 1, "class_like": class_like, "suggested": suggested,
+                "constant": unique <= 1 or reserved, "reserved": reserved, "input_only": str(col) in input_only,
+                "class_like": class_like, "suggested": suggested,
                 "examples": [str(v) for v in values.iloc[:3].tolist()]}
         if numeric:
             z = pd.to_numeric(df[col], errors="coerce").to_numpy(float)
@@ -186,6 +195,7 @@ def inspect_dataset(path, delimiter=","):
     preview = df.head(12).astype(object).where(df.head(12).notna(), None).values.tolist()
     return {"path": str(resolve_path(path)), "rows": int(sample["source_rows"] if sample else len(df)),
             "sampled_rows": int(len(df)) if sample else None, "columns": columns,
+            "editor": bool(schema),
             "preview": [[None if v is None else str(v) for v in row] for row in preview]}
 
 
@@ -327,6 +337,12 @@ def check_form(form):
     rows, columns = afpo.csv_shape(resolve_path(setup["path"]), setup["delimiter"])
     if len(setup["types"]) != len(columns):
         raise ValueError(f"The column types list has {len(setup['types'])} entries but the file has {len(columns)} columns; inspect the dataset again")
+    # Image codes of a CSV Editor file are inputs only (afpo.py enforces it too; this says so before a run starts).
+    images = {name for header in columns for column in editor_format.editor_parse_header(header) or [] if column["kind"] == editor_format.EDITOR_IMAGE
+              for name in editor_format.editor_image_columns(column["name"], column.get("grid"))}
+    outputs = [str(column) for column, kind in zip(columns, setup["types"]) if kind in (5, 6) and str(column) in images]
+    if outputs:
+        raise ValueError(f"Image columns can only be inputs: {', '.join(outputs)}")
     return {"ok": True, "argv": argv, "operators": len(setup["ops"]), "rows": int(rows),
             "training_rows": int(min(rows, args.max_rows)) if args.max_rows else int(rows)}
 
@@ -837,11 +853,33 @@ class ModelExplorer:
                 inputs.append({"name": column, "kind": "categorical", "classes": state["maps"].get(column, []),
                                "typical": typical.get(column)})
         return {"path": str(self.path), "generation": self.generation, "source": "validation" if state.get("Xv") is not None else "training",
-                "outputs": state["out_names"], "cats": state["cats"], "inputs": inputs, "models": out,
+                "outputs": state["out_names"], "cats": state["cats"], "inputs": inputs, "models": out, "editor": self._editor_inputs(inputs),
                 "dataset": state.get("dataset_path"), "seed": state.get("run_seed"),
                 "train_rows": len(state["Xt"]), "validation_rows": 0 if state.get("Xv") is None else len(state["Xv"]),
                 "test_rows": 0 if state.get("Xtest") is None else len(state["Xtest"]),
                 "saved_selection": (saved or {}).get("selected_choice"), "manifest": state.get("manifest")}
+
+    def _schema(self):
+        return (self.state or {}).get("maps", {}).get(editor_format.EDITOR_SCHEMA_KEY)
+
+    def _editor_inputs(self, inputs):
+        """Text and image columns among the inputs: one field each instead of their encoded numbers."""
+        names = {item["name"] for item in inputs}
+        groups = []
+        for column in (self._schema() or {}).get("columns", ()):
+            used = [name for name in column.get("columns") or [] if name in names]
+            if used and column["kind"] in (editor_format.EDITOR_TEXT, editor_format.EDITOR_CHARS, editor_format.EDITOR_IMAGE):
+                groups.append({"name": column["name"], "kind": column["kind"], "columns": used, "length": column.get("length"),
+                               "grid": column.get("grid"), "strings": sorted(column.get("codes") or {})[:500]})
+        return groups
+
+    def _editor_row(self, row):
+        """A prediction row with its text and image fields turned into the encoded numbers."""
+        schema = self._schema()
+        if not schema or not row:
+            return row
+        frame = editor_format.editor_prepare_frame(pd.DataFrame([row]).astype(object), schema)
+        return {key: value for key, value in frame.iloc[0].to_dict().items() if not (isinstance(value, float) and math.isnan(value))}
 
     def _model(self, index):
         self._require()
@@ -1034,8 +1072,11 @@ class ModelExplorer:
     def predict(self, index, row):
         with self.lock:
             model = self._model(index)
-            full = {**self._typical_row(), **{k: v for k, v in (row or {}).items() if v not in (None, "")}}
-            return {"inputs": full, "outputs": self._decode(model, self._encode([full]))[0]}
+            given = {k: v for k, v in (row or {}).items() if v not in (None, "")}
+            full = {**self._typical_row(), **self._editor_row(given)}
+            outputs = self._decode(model, self._encode([full]))[0]
+            outputs.update(editor_format.editor_decode_row(outputs, self._schema()))
+            return {"inputs": {**full, **given}, "outputs": outputs}
 
     def _axis(self, column, lo=None, hi=None, points=120):
         """Values one explored input takes: an even numeric range, or every category."""
@@ -1139,7 +1180,7 @@ class ModelExplorer:
     def predict_csv(self, index, path, delimiter=","):
         with self.lock:
             model, state = self._model(index), self.state
-            frame = read_frame(path, delimiter)
+            frame = editor_format.editor_prepare_frame(read_frame(path, delimiter), self._schema())
             missing = [c for c, k in zip(state["source_columns"], state["types"]) if k in (1, 2) and c not in frame.columns]
             if missing:
                 raise ValueError(f"The CSV lacks input column(s): {', '.join(missing)}")
@@ -1149,6 +1190,9 @@ class ModelExplorer:
             result = frame.copy()
             for name in state["out_names"]:
                 result[f"predicted_{name}"] = [row.get(name) for row in decoded]
+            texts = [editor_format.editor_decode_row(row, self._schema()) for row in decoded]
+            for name in dict.fromkeys(key for row in texts for key in row):
+                result[f"predicted_{name}"] = [row.get(name) for row in texts]
             destination = Path(os.getcwd()) / f"afpo_predictions_{Path(path).stem}.csv"
             result.to_csv(destination, index=False)
             self.files[str(destination.resolve())] = True
@@ -1448,10 +1492,13 @@ def run_gui(host="127.0.0.1", port=DEFAULT_PORT, open_browser=True):
     from urllib.parse import parse_qs, urlparse
 
     session, explorer = TrainingSession(), ModelExplorer()
+    # New CSVs and uploaded images are kept next to the scripts.
+    editor = CsvEditor(Path(__file__).resolve().parent)
     routes = {
         "/api/options": lambda b: options(),
         "/api/fs": lambda b: list_dir(b.get("path")),
         "/api/dataset/inspect": lambda b: inspect_dataset(b["path"], b.get("delimiter") or ","),
+        "/api/editor": lambda b: editor.handle(b),
         "/api/train/check": lambda b: check_form(b),
         "/api/train/start": lambda b: session.start(b),
         "/api/train/stop": lambda b: session.stop(),
@@ -1504,11 +1551,13 @@ def run_gui(host="127.0.0.1", port=DEFAULT_PORT, open_browser=True):
                 return self._send(200, Path(target).read_bytes(), "text/csv",
                                   {"Content-Disposition": f'attachment; filename="{Path(target).name}"'})
             try:
+                if path == "/api/editor/thumb":
+                    return self._send(200, editor.thumbnail(body.get("path", "")), "image/png")
                 if path not in routes:
                     return self._send(404, {"error": f"unknown route {path}"})
                 self._send(200, routes[path](body))
             except Exception as exc:
-                if not isinstance(exc, (ValueError, KeyError, FileNotFoundError, RuntimeError)):
+                if not isinstance(exc, (ValueError, KeyError, FileNotFoundError, FileExistsError, RuntimeError)):
                     traceback.print_exc()
                 self._send(400, {"error": f"{type(exc).__name__}: {exc}"})
 
@@ -1522,6 +1571,15 @@ def run_gui(host="127.0.0.1", port=DEFAULT_PORT, open_browser=True):
                 try:
                     name = parse_qs(url.query).get("name", ["upload.csv"])[0]
                     return self._send(200, save_upload(name, self.rfile, n))
+                except Exception as exc:
+                    return self._send(400, {"error": f"{type(exc).__name__}: {exc}"})
+            if url.path == "/api/editor/image":
+                # An image for a table cell (row, col) or, without them, for a prediction field.
+                try:
+                    query = {k: v[0] for k, v in parse_qs(url.query).items()}
+                    if n > MAX_IMAGE_BYTES:
+                        raise ValueError(f"The image is larger than {MAX_IMAGE_BYTES >> 20} MB")
+                    return self._send(200, editor.save_image(query.get("name"), self.rfile.read(n), query.get("row"), query.get("col")))
                 except Exception as exc:
                     return self._send(400, {"error": f"{type(exc).__name__}: {exc}"})
             try:
