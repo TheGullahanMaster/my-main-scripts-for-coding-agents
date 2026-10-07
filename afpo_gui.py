@@ -845,11 +845,13 @@ class ModelExplorer:
                         "age": int(model.age), "origin": model.origin})
         inputs = []
         typical = self._typical_row()
+        booleans = editor_format.editor_kind_columns(self._schema(), editor_format.EDITOR_BOOL)
         for column, kind in zip(state["source_columns"], state["types"]):
             if kind == 1:
                 values = state["Xt"][:, state["names"].index(column)] if column in state["names"] else np.empty(0)
                 inputs.append({"name": column, "kind": "numeric", "range": (state.get("input_ranges") or {}).get(column),
                                "typical": state["maps"].get("__afpo_numeric_fills__", {}).get(column),
+                               "boolean": column in booleans,    # a CSV Editor Bool input: a True/False choice in the predict form
                                "integer": bool(len(values) and np.all(np.isclose(values, np.round(values))))})
             elif kind == 2:
                 inputs.append({"name": column, "kind": "categorical", "classes": state["maps"].get(column, []),
@@ -870,7 +872,7 @@ class ModelExplorer:
         groups = []
         for column in (self._schema() or {}).get("columns", ()):
             used = [name for name in column.get("columns") or [] if name in names]
-            if used and column["kind"] in (editor_format.EDITOR_TEXT, editor_format.EDITOR_CHARS, editor_format.EDITOR_IMAGE):
+            if used and column["kind"] in (editor_format.EDITOR_TEXT, editor_format.EDITOR_LABEL, editor_format.EDITOR_CHARS, editor_format.EDITOR_IMAGE):
                 groups.append({"name": column["name"], "kind": column["kind"], "columns": used, "length": column.get("length"),
                                "grid": column.get("grid"), "strings": sorted(column.get("codes") or {})[:500]})
         return groups
@@ -1081,7 +1083,9 @@ class ModelExplorer:
             full = {**self._typical_row(), **self._editor_row(given)}
             outputs = self._decode(model, self._encode([full]))[0]
             outputs.update(editor_format.editor_decode_row(outputs, self._schema()))
-            return {"inputs": {**full, **given}, "outputs": outputs}
+            schema = self._schema()     # Bool and Integer inputs are shown as the model read them (1/0, rounded)
+            coerced = editor_format.editor_kind_columns(schema, editor_format.EDITOR_BOOL) | editor_format.editor_kind_columns(schema, editor_format.EDITOR_INT)
+            return {"inputs": {**full, **{key: value for key, value in given.items() if key not in coerced or key not in full}}, "outputs": outputs}
 
     def _axis(self, column, lo=None, hi=None, points=120):
         """Values one explored input takes: an even numeric range, or every category."""

@@ -317,8 +317,8 @@ class CsvEditor:
             name, kind = entry["name"], entry["kind"]
             source = fmt.editor_source_column(name)
             column = self._new_column(name, kind, entry.get("grid"))
-            if kind in (fmt.EDITOR_TEXT, fmt.EDITOR_CHARS, fmt.EDITOR_IMAGE):
-                encoded = ([name] if kind == fmt.EDITOR_TEXT else
+            if kind in (fmt.EDITOR_TEXT, fmt.EDITOR_LABEL, fmt.EDITOR_CHARS, fmt.EDITOR_IMAGE):
+                encoded = ([name] if kind in fmt.EDITOR_STRING_CODES else
                            [item for item in names if item.startswith(name + "[") and item.endswith("]") and item[len(name) + 1:-1].isdigit()] if kind == fmt.EDITOR_CHARS
                            else fmt.editor_image_columns(name, column["grid"]))
                 if source not in names:
@@ -386,8 +386,11 @@ class CsvEditor:
         for index, column in enumerate(self.columns):
             name, kind = column["name"], column["kind"]
             values = [row[index] for row in self.rows]
-            if kind == fmt.EDITOR_TEXT:
-                fmt.editor_assign_codes(values, column["codes"])
+            if kind in fmt.EDITOR_STRING_CODES:
+                if kind == fmt.EDITOR_TEXT:
+                    fmt.editor_assign_codes(values, column["codes"])      # kept for good once given
+                else:
+                    column["codes"] = fmt.editor_label_codes(values)      # the sorted vocabulary, renumbered on every save
                 header.append(name); blocks.append([["" if value is None else _plain(column["codes"][value])] for value in values])
                 sources.append((name, [_plain(value) for value in values]))
             elif kind == fmt.EDITOR_CHARS:

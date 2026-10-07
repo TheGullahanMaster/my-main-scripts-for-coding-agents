@@ -761,6 +761,12 @@ EQUIVALENCE_COLLAPSE = True
 _EQUIVALENCE_CACHE = {}
 EQUIVALENCE_STATS = {"children_redrawn":0}
 _POWER_FACTORS = {"square":2,"cube":3}
+# Inputs that only hold 0 or 1 (see configure_input_kinds).  Every power, root
+# and rounding of such an input is the input itself, so x*x, cube(x), sqrt(x)
+# and abs(x) all share the key of x.
+BOOL_FEATURES = frozenset()
+BOOL_FIXED_OPS = frozenset(("sqrt","abs","round","floor","ceil","int","sign","relu","leaky_relu","perceptronReLU1",
+                            *(f"pow{n}" for n in range(4,11)),*(f"root{n}" for n in range(3,11))))
 def _key_number(value):
     value=float(value)
     return 0. if value==0 else float(f"{value:.12g}")
@@ -801,6 +807,9 @@ def _product_key(t):
     """(coefficient, factor-multiset key or None for a pure constant)."""
     parts=[1.,{}]; _product_parts(t,parts)
     if parts[0]==0 or not parts[1]: return parts[0],None
+    if BOOL_FEATURES:
+        for key in parts[1]:
+            if key[0]=="x" and key[1] in BOOL_FEATURES: parts[1][key]=1
     factors=tuple(sorted(parts[1].items(),key=repr))
     return parts[0],(factors[0][0] if len(factors)==1 and factors[0][1]==1 else ("prod",factors))
 def _equivalence_key(t):
@@ -815,6 +824,7 @@ def _equivalence_key(t):
         if constant==0 and len(terms)==1 and terms[0][0]==1.: return terms[0][1]
         return ("sum",constant,terms)
     children=[_equivalence_key(child) for child in t[1:]]
+    if BOOL_FEATURES and op in BOOL_FIXED_OPS and len(children)==1 and children[0][0]=="x" and children[0][1] in BOOL_FEATURES: return children[0]
     if op in COMMUTATIVE_OPS: children.sort(key=repr)
     return (op,*children)
 def equivalence_key(tree):
@@ -2931,9 +2941,77 @@ def relation_violation(tree, opaque=frozenset()):
     if not RELATION_OF_FEATURE or tree[0] in ("x","c","arg"): return ""
     return _relation_summary(tree,opaque)[1]
 
+# Input kinds of a CSV Editor file (afpo_lib/editor_format.py).  The file
+# records each column's kind, so the search knows which inputs only hold 0/1
+# (BOOL_FEATURES, used by the equivalence key) and which only hold whole
+# numbers.  --integer-operators typed (default) then reserves the operators
+# that truncate their arguments (mod, gcd, lcm, bitwise, shifts, digits) for
+# whole-number expressions: whole inputs, constants, and whatever rounding,
+# comparisons and whole-number arithmetic make of them, so mod(round(x),2) is
+# allowed on a Float input but mod(x,2) is not.  Trees that break the rule are
+# infeasible, and such offspring are redrawn.  A plain CSV records no kinds:
+# nothing is known, and nothing changes.
+WHOLE_FEATURES = None          # None: no rule; else the feature indices that only hold whole numbers
+INTEGER_OPERATORS = "typed"
+WHOLE_NUMBER_OPS = frozenset(("mod","gcd","lcm","bitwise_and","bitwise_or","bitwise_xor","bitwise_not","lshift","rshift","cat","x_at_pos_y"))
+_WHOLE_RESULT_OPS = frozenset(("round","floor","ceil","int","sign","signbit","oom","floordiv","gt","lt","gte","lte","eq","ne",
+                               "gcd","lcm","bitwise_and","bitwise_or","bitwise_xor","bitwise_not","lshift","rshift","cat","x_at_pos_y"))
+_WHOLE_CLOSED_OPS = frozenset(("+","-","*","delta","max","min","neg","abs","mod","copysign","square","cube",
+                               *(f"pow{n}" for n in range(4,11)),"if_in_range","if_out_of_range"))
+
+def configure_input_kinds(schema, feature_names, source_columns=(), types=(), X=None, mode="typed"):
+    """Set BOOL_FEATURES and WHOLE_FEATURES from a CSV Editor schema; returns (0/1 names, whole-number names).
+
+    A numeric input takes its column's kind (Float is the only kind that is
+    not whole); every one-hot feature of a categorical input is 0/1.  X, the
+    training matrix, has the last word: a column with a filled-in missing
+    value or a stray fraction is neither."""
+    global BOOL_FEATURES,WHOLE_FEATURES,INTEGER_OPERATORS
+    before=BOOL_FEATURES; INTEGER_OPERATORS=mode; BOOL_FEATURES=frozenset(); WHOLE_FEATURES=None
+    bools,whole=[],[]
+    if schema:
+        kinds={encoded:column["kind"] for column in schema.get("columns",()) for encoded in column.get("columns") or ()}
+        roles=dict(zip(source_columns,types)); categorical=[column for column,role in roles.items() if role==2]
+        for position,name in enumerate(feature_names):
+            if roles.get(name)==1: kind=kinds.get(name)
+            elif any(name.startswith(f"{column}=") for column in categorical): kind=editor_format.EDITOR_BOOL
+            else: kind=None
+            if kind is None or kind==editor_format.EDITOR_FLOAT: continue
+            values=None if X is None or position>=X.shape[1] else np.asarray(X[:,position],float)
+            if values is not None and not (np.isfinite(values).all() and (values==np.rint(values)).all()): continue
+            whole.append(position)
+            if kind==editor_format.EDITOR_BOOL and (values is None or ((values==0)|(values==1)).all()): bools.append(position)
+        BOOL_FEATURES=frozenset(bools)
+        if mode=="typed": WHOLE_FEATURES=frozenset(whole)
+    if BOOL_FEATURES!=before: _EQUIVALENCE_CACHE.clear()
+    return [feature_names[position] for position in bools],[feature_names[position] for position in whole]
+
+def _whole_summary(tree, opaque=frozenset()):
+    """(the subtree is whole-number valued, violation); constants and ADF arguments are wildcards.  An
+    opaque subtree stands for the staged feature it replaced: a predicted value, not looked into."""
+    op=tree[0]
+    if opaque and tree in opaque: return False,""
+    if op=="x": return tree[1] in WHOLE_FEATURES,""
+    if op in ("c","arg"): return True,""
+    whole=[]
+    for child in tree[1:]:
+        value,violation=_whole_summary(child,opaque)
+        if violation: return False,violation
+        whole.append(value)
+    if op in WHOLE_NUMBER_OPS and not all(whole): return False,f"{op} of a non-whole argument"
+    if op in _WHOLE_RESULT_OPS: return True,""
+    if op=="if_else": return all(whole[1:]),""
+    return op in _WHOLE_CLOSED_OPS and all(whole),""
+
+def whole_number_violation(tree, opaque=frozenset()):
+    if WHOLE_FEATURES is None or tree[0] in ("x","c","arg"): return ""
+    return _whole_summary(tree,opaque)[1]
+
+def structural_rules(): return bool(NESTING_RULES or UNIT_FEATURES or RELATION_OF_FEATURE or WHOLE_FEATURES is not None)
+
 def structural_violation(tree, opaque=frozenset()):
-    """The first --forbid-nesting, --units or --input-relations violation of a tree, or ''."""
-    return nesting_violation(tree,opaque=opaque) or unit_violation(tree,opaque) or relation_violation(tree,opaque)
+    """The first --forbid-nesting, --units, --input-relations or --integer-operators violation of a tree, or ''."""
+    return nesting_violation(tree,opaque=opaque) or unit_violation(tree,opaque) or relation_violation(tree,opaque) or whole_number_violation(tree,opaque)
 
 # --custom-op "name = expression": operators the user already knows part of.
 # The expression uses AFPO's own operators only (+ - * / ** %, //, unary -,
@@ -5794,8 +5872,9 @@ def assess(m, X, Y, affine_on, cats, fit_affine=True, constraints=None, output_n
         return ""
     reason=""; opaque=frozenset(m.opaque)
     for tree in m.trees:
-        violation=structural_violation(tree,opaque) if NESTING_RULES or UNIT_FEATURES or RELATION_OF_FEATURE else ""
-        kind="nesting" if NESTING_RULES and nesting_violation(tree,opaque=opaque) else "units" if UNIT_FEATURES and unit_violation(tree,opaque) else "relations"
+        violation=structural_violation(tree,opaque) if structural_rules() else ""
+        kind=("nesting" if NESTING_RULES and nesting_violation(tree,opaque=opaque) else "units" if UNIT_FEATURES and unit_violation(tree,opaque)
+              else "relations" if RELATION_OF_FEATURE and relation_violation(tree,opaque) else "input_kinds")
         reason=valid(tree) or (f"{kind}:{violation}" if violation else "")
         if reason: break
     if reason:
@@ -7926,7 +8005,7 @@ def semantic_simplify_tree(tree, X):
 # 15 processes left a third wave of two); the count is fixed, never derived
 # from --workers, because it shapes the random streams.
 CREATION_BATCHES=128
-_CREATION_SETTINGS=("SEMANTIC_SIMPLIFICATION","READOUT_MODE","GENE_CROSSOVER_RATE","BACKPROP_MUTATION_WEIGHT","RESIDUAL_TERM_WEIGHT","BACKPROP_INVERSE","SEMANTIC_MAX_DELTA","EQUIVALENCE_COLLAPSE","NESTING_RULES")
+_CREATION_SETTINGS=("SEMANTIC_SIMPLIFICATION","READOUT_MODE","GENE_CROSSOVER_RATE","BACKPROP_MUTATION_WEIGHT","RESIDUAL_TERM_WEIGHT","BACKPROP_INVERSE","SEMANTIC_MAX_DELTA","EQUIVALENCE_COLLAPSE","NESTING_RULES","BOOL_FEATURES","WHOLE_FEATURES")
 def creation_batch_sizes(count):
     size=max(1,math.ceil(count/CREATION_BATCHES))
     return [min(size,count-start) for start in range(0,count,size)]
@@ -7953,7 +8032,7 @@ def _create_children(count, c):
     seen=set(c.seen)
     def duplicate(trees):
         nonlocal unchanged,redrawn
-        if (NESTING_RULES or UNIT_FEATURES or RELATION_OF_FEATURE) and unchanged<unchanged_limit and any(structural_violation(tree) for tree in trees):
+        if structural_rules() and unchanged<unchanged_limit and any(structural_violation(tree) for tree in trees):
             unchanged+=1; return True
         key=model_equivalence_key(trees)
         if EQUIVALENCE_COLLAPSE and key in seen and unchanged<unchanged_limit:
@@ -8037,7 +8116,7 @@ def _worker_create_batch(token, payload, count, seed):
     """Scoring process: create one batch and score it as assess(tune=True) would."""
     if _WORKER_CREATION[0]!=token:
         c=pickle.loads(payload)
-        if c.settings["EQUIVALENCE_COLLAPSE"]!=EQUIVALENCE_COLLAPSE: _EQUIVALENCE_CACHE.clear()
+        if c.settings["EQUIVALENCE_COLLAPSE"]!=EQUIVALENCE_COLLAPSE or c.settings["BOOL_FEATURES"]!=BOOL_FEATURES: _EQUIVALENCE_CACHE.clear()
         globals().update(c.settings)
         c.parents=[Model(list(trees),list(scales),age,lineage_id=lineage_id,adfs=adfs,founder_ids=founder_ids) for trees,scales,age,lineage_id,founder_ids,adfs in c.parents]
         # Archives probing the same rows share one array, so each tree is evaluated on them once.
@@ -8528,6 +8607,8 @@ def resume_main(args):
     LOSS_MODE=state.get("loss","huber"); ROBUST_LOSS_DELTA=float(state.get("huber_delta",1.5))
     configure_units(state.get("units",""),list(names))
     configure_input_relations(state.get("input_relations",""),list(names),state.get("source_columns",()),state.get("types",()))
+    # A checkpoint from before --integer-operators searched without the rule.
+    configure_input_kinds(maps.get(editor_format.EDITOR_SCHEMA_KEY),list(names),state.get("source_columns",()),state.get("types",()),Xt,state.get("integer_operators","any"))
     base=state.get("custom_feature_base")
     configure_custom_ops(state.get("custom_ops",()),list(names) if base is None else list(names)[:base],state.get("source_columns",()),state.get("types",()))
     RESIDUAL_TERM_WEIGHT=float(state.get("residual_term_weight",0.)); NESTING_RULES=parse_nesting_rules(state.get("forbid_nesting",""))
@@ -8753,6 +8834,7 @@ def build_arg_parser():
     ap.add_argument("--backprop-inverse",choices=("exact","generic"),default="generic",help="exact inverts only + - * / neg exp log tanh sigmoid; generic also solves every other operator numerically per row, on the branch the subtree is already on (default: generic)")
     ap.add_argument("--residual-term-weight",type=float,default=1.,help="Initial portfolio weight of the residual-term mutation, which adds the small expression that best matches what the parent still misses (boosting-style); 0 disables it (default: 1)")
     ap.add_argument("--forbid-nesting",default="",metavar="OUTER>INNER,...",help="Operator pairs that may not nest, e.g. exp>exp,log>exp,sin>sin: INNER may not appear anywhere below OUTER (default: none)")
+    ap.add_argument("--integer-operators",choices=("typed","any"),default="typed",help="For CSV Editor files, which record each column's kind: typed lets mod, gcd, lcm, the bitwise operators, shifts and digit operators read only whole-number values (Integer, Bool, category and text/image code inputs, constants, and rounded or compared expressions), so they are not tried on Float inputs; any lifts the rule, e.g. for mod on a periodic Float input. Plain CSVs are never restricted (default: typed)")
     ap.add_argument("--symbolic-export",choices=("on","off"),default="on",help="Also write the chosen model to best_model_symbolic.txt when sympy is installed: an exact form with afpo's protected operators and a readable raw form without them, each with LaTeX (default: on)")
     ap.add_argument("--loss",choices=("huber","squared","relative"),default="huber",help="Regression loss: huber (MAD-scaled, robust to outliers), squared (plain least squares) or relative (Huber on the error relative to |y|, for targets spanning orders of magnitude) (default: huber)")
     ap.add_argument("--huber-delta",type=float,default=1.5,help="Huber threshold in robust target-scale units for --loss huber and relative (default: 1.5)")
@@ -9157,6 +9239,7 @@ def train_separate_outputs(args, setup, df, frames, run_seed, metadata, choose_m
     # space; only the inlined earlier equations are opaque (Model.opaque).
     configure_units(getattr(args,"units",""),list(names))
     configure_input_relations(getattr(args,"input_relations",None) or (),list(names),columns,types)
+    configure_input_kinds(maps.get(editor_format.EDITOR_SCHEMA_KEY),list(names),columns,types,Xt,getattr(args,"integer_operators","typed"))
     assess(merged,Xt,Yt,setup["affine_on"],cats,fit_affine=False,constraints=constraints,output_names=out_names_all)
     if not merged.feasible: print(f"WARNING: the merged model is infeasible ({merged.invalid_reason})")
     # The inlined model must predict exactly what the searches chose.
@@ -9408,6 +9491,12 @@ def train_from_setup(args, setup, choose_model=None):
     if UNIT_FEATURES: print(f"Dimensional analysis on {len(UNIT_FEATURES)} column(s) over base units {', '.join(UNIT_BASES)}.")
     configure_input_relations(getattr(args,"input_relations",None) or (),list(names),source_columns,types)
     if INPUT_RELATIONS: print(f"Input relations: {'; '.join('('+', '.join(columns)+')' for columns in INPUT_RELATIONS)}; their columns combine with outside inputs only as complete subexpressions.")
+    bool_inputs,whole_inputs=configure_input_kinds(maps.get(editor_format.EDITOR_SCHEMA_KEY),list(names),source_columns,types,Xt,getattr(args,"integer_operators","typed"))
+    if maps.get(editor_format.EDITOR_SCHEMA_KEY):
+        reserved=[op for op in ops if op in WHOLE_NUMBER_OPS]
+        print(f"Input kinds (CSV Editor): {len(bool_inputs)} input(s) hold only 0/1 (their powers, roots and roundings count as the input itself); "
+              +(f"{', '.join(reserved)} read only whole-number values ({len(whole_inputs)} of {len(names)} inputs are whole numbers)." if reserved and WHOLE_FEATURES is not None
+                else "no whole-number operator is enabled." if not reserved else "whole-number operators read any input (--integer-operators any)."))
     hypotheses=discover_hypotheses(Xt,Yt,names,out_names)
     interaction_discovery=discover_interaction_fragments(Xt,Yt,names,out_names,ops,Xv,Yv)
     if interaction_discovery["status"]=="ok":
@@ -9429,7 +9518,7 @@ def train_from_setup(args, setup, choose_model=None):
         "islands":{"count":island_count,"population_total":args.population,"migration_interval":migration_interval,"migrants_per_island":migrants_per_island,"topology":"ring","state":"independent population, Bayesian banks, archive, QD, fragment library, pressure, ADF, and budget",
                    "stages":{key:stages[key] for key in ("mode","count","interval","age_gap","schedule","threshold_quantile")},
                    "roles":{key:roles[key] for key in ("enabled","interval","mix","retire_after","assignments")}},
-        "equivalence_collapse":EQUIVALENCE_COLLAPSE,"residual_archive":RESIDUAL_ARCHIVE,"qd_parent_choice":QD_PARENT_CHOICE,"scale_balanced_selection":SCALE_BALANCED_SELECTION,"class_balance":CLASS_BALANCE,"output_balance":OUTPUT_BALANCE,"output_balance_bins":OUTPUT_BALANCE_BINS,
+        "integer_operators":INTEGER_OPERATORS,"equivalence_collapse":EQUIVALENCE_COLLAPSE,"residual_archive":RESIDUAL_ARCHIVE,"qd_parent_choice":QD_PARENT_CHOICE,"scale_balanced_selection":SCALE_BALANCED_SELECTION,"class_balance":CLASS_BALANCE,"output_balance":OUTPUT_BALANCE,"output_balance_bins":OUTPUT_BALANCE_BINS,
         "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"selection_probe_filter":SELECTION_PROBE_FILTER,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"final_simplification":FINAL_SIMPLIFICATION,"dynamic_size_limit":DYNAMIC_SIZE_LIMIT,"semantic_simplification":SEMANTIC_SIMPLIFICATION,"adaptive_parsimony":ADAPTIVE_PARSIMONY,"prune_mutation_weight":PRUNE_MUTATION_WEIGHT,"neutral_shrink":NEUTRAL_SHRINK,"simplifier_lane":LANE_SURVIVOR_SHARE,"simplifier_lane_parents":LANE_PARENT_SHARE,"simplifier_lane_band":LANE_BAND,"fit_iterations":CONSTANT_FIT_ITERATIONS,"semantic_max_delta":SEMANTIC_MAX_DELTA,"constant_snapping":CONSTANT_SNAPPING,"snap_tolerance":SNAP_TOLERANCE,"readout":READOUT_MODE,"max_terms":MAX_TERMS,"gene_crossover_rate":GENE_CROSSOVER_RATE,"backprop_mutation_weight":BACKPROP_MUTATION_WEIGHT,"backprop_inverse":BACKPROP_INVERSE,"residual_term_weight":RESIDUAL_TERM_WEIGHT,"loss":LOSS_MODE,"huber_delta":ROBUST_LOSS_DELTA,"forbid_nesting":",".join(sorted(f"{o}>{i}" for o,i in NESTING_RULES)),"units":UNIT_SPEC,"input_relations":RELATION_SPEC,"custom_ops":list(CUSTOM_OP_SPECS),"custom_feature_base":CUSTOM_FEATURE_BASE,"clip":CLIP,"eps":EPS,"sparse_seeding":SPARSE_SEEDING,"sparse_basis_size":SPARSE_BASIS_SIZE,"squash_swap_weight":SQUASH_SWAP_WEIGHT,"smooth_swap_weight":SMOOTH_SWAP_WEIGHT,"gate_mutation_weight":GATE_MUTATION_WEIGHT,"loss_noise_floor":LOSS_NOISE_FLOOR,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age",
         "test_csv":str(Path(args.test_csv).resolve()) if args.test_csv else None,
         "row_sample":row_sample,
@@ -9446,7 +9535,7 @@ def train_from_setup(args, setup, choose_model=None):
         "nsga_normalization":args.nsga_normalization,"parsimony_quality_tolerance":args.parsimony_quality_tolerance,"dynamic_pressure_enabled":dynamic_pressure_on,"adf_registry":ADFRegistry(adf_enabled,allow_nested=args.adf_mode=="nested").snapshot(),
         "profile":args.profile,"constraint_metadata":metadata,"constraints":constraints.describe(),"bayesian_particles":args.bayesian_particles,"interaction_discovery":interaction_discovery,
         "island_config":{"count":island_count,"migration_interval":migration_interval,"migrants_per_island":migrants_per_island,"topology":"ring","migration_events":0,"stages":stages,"roles":roles},
-        "equivalence_collapse":EQUIVALENCE_COLLAPSE,"residual_archive":RESIDUAL_ARCHIVE,"qd_parent_choice":QD_PARENT_CHOICE,"scale_balanced_selection":SCALE_BALANCED_SELECTION,"class_balance":CLASS_BALANCE,"output_balance":OUTPUT_BALANCE,"output_balance_bins":OUTPUT_BALANCE_BINS,
+        "integer_operators":INTEGER_OPERATORS,"equivalence_collapse":EQUIVALENCE_COLLAPSE,"residual_archive":RESIDUAL_ARCHIVE,"qd_parent_choice":QD_PARENT_CHOICE,"scale_balanced_selection":SCALE_BALANCED_SELECTION,"class_balance":CLASS_BALANCE,"output_balance":OUTPUT_BALANCE,"output_balance_bins":OUTPUT_BALANCE_BINS,
         "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"selection_probe_filter":SELECTION_PROBE_FILTER,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"final_simplification":FINAL_SIMPLIFICATION,"dynamic_size_limit":DYNAMIC_SIZE_LIMIT,"semantic_simplification":SEMANTIC_SIMPLIFICATION,"adaptive_parsimony":ADAPTIVE_PARSIMONY,"prune_mutation_weight":PRUNE_MUTATION_WEIGHT,"neutral_shrink":NEUTRAL_SHRINK,"simplifier_lane":LANE_SURVIVOR_SHARE,"simplifier_lane_parents":LANE_PARENT_SHARE,"simplifier_lane_band":LANE_BAND,"fit_iterations":CONSTANT_FIT_ITERATIONS,"semantic_max_delta":SEMANTIC_MAX_DELTA,"constant_snapping":CONSTANT_SNAPPING,"snap_tolerance":SNAP_TOLERANCE,"readout":READOUT_MODE,"max_terms":MAX_TERMS,"gene_crossover_rate":GENE_CROSSOVER_RATE,"backprop_mutation_weight":BACKPROP_MUTATION_WEIGHT,"backprop_inverse":BACKPROP_INVERSE,"residual_term_weight":RESIDUAL_TERM_WEIGHT,"loss":LOSS_MODE,"huber_delta":ROBUST_LOSS_DELTA,"forbid_nesting":",".join(sorted(f"{o}>{i}" for o,i in NESTING_RULES)),"units":UNIT_SPEC,"input_relations":RELATION_SPEC,"custom_ops":list(CUSTOM_OP_SPECS),"custom_feature_base":CUSTOM_FEATURE_BASE,"clip":CLIP,"eps":EPS,"sparse_seeding":SPARSE_SEEDING,"sparse_basis_size":SPARSE_BASIS_SIZE,"squash_swap_weight":SQUASH_SWAP_WEIGHT,"smooth_swap_weight":SMOOTH_SWAP_WEIGHT,"gate_mutation_weight":GATE_MUTATION_WEIGHT,"loss_noise_floor":LOSS_NOISE_FLOOR,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age"}
     head_count=sum(len(heads) for heads in classification_layout(cats)[0])
     population_sizes=cell_population_sizes(args.population,cell_count)

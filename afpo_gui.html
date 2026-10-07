@@ -1303,7 +1303,8 @@ function renderColumns() {
     const select = c.constant ? `<span class="hint">ignored (${c.reserved ? 'CSV Editor data' : 'constant'})</span>`
       : `<select data-col="${c.index}">${TYPE_LABELS.filter(([v]) => !(c.input_only && v >= 5)).map(([v, l]) => `<option value="${v}" ${v === c.type ? 'selected' : ''}>${l}</option>`).join('')}</select>` +
         (c.boolean && c.type === 5 ? '<div class="hint">Bool column: Categorical output keeps every prediction at 0 or 1</div>'
-          : c.class_like && c.type === 5 ? '<div class="hint">few integer codes: pick Categorical output if these are classes</div>' : '');
+          : c.class_like && c.type === 5 ? '<div class="hint">few integer codes: pick Categorical output if these are classes</div>'
+          : c.class_like && !c.boolean && c.unique > 2 && c.type === 1 ? '<div class="hint">few integer codes: pick Categorical input if these are labels, not amounts</div>' : '');
     const tick = c.constant ? '' : `<input type="checkbox" data-colpick="${c.index}" ${COL_SEL.has(c.index) ? 'checked' : ''}>`;
     tr.innerHTML = `<td>${tick}</td><td class="num">${c.index}</td><td><strong>${esc(c.name)}</strong><div class="hint">${c.numeric ? 'numeric' : 'text'}</div></td><td>${values}</td><td class="hist">${c.hist ? '<canvas></canvas>' : ''}</td><td>${select}</td>`;
     tb.appendChild(tr);
@@ -1346,7 +1347,7 @@ $('#inspectBtn').onclick = inspect;
 // ED.start … ED.start + ED.rows.length, and trades pages with the server as the box is scrolled.
 const ED = {meta: null, start: 0, rows: [], sel: new Set(), busy: false, col: null};
 const ED_PAGE = 100, ED_KEEP = 400;
-const EDK = {BOOL: 0, INT: 1, FLOAT: 2, CAT: 3, TEXT: 4, CHARS: 5, IMAGE: 6};
+const EDK = {BOOL: 0, INT: 1, FLOAT: 2, CAT: 3, TEXT: 4, CHARS: 5, IMAGE: 6, LABEL: 7};
 const ED_KIND_HINTS = [
   'True or False; saved as 1 and 0.',
   'Whole numbers: anything entered is rounded to the nearest integer.',
@@ -1355,6 +1356,7 @@ const ED_KIND_HINTS = [
   'Each distinct string is saved as one number. As an output, a prediction shows the nearest stored string, with ~ marks for how far off it is (none, ~, ~~, ~~~).',
   'Saved as one column per character position, up to the longest entry of the column.',
   'Upload a picture per row; it is saved as three numbers (per grid cell). Images can only be inputs.',
+  'Each distinct string is saved as its place in the column\'s sorted list: 1, 2, 3, … Small, evenly spaced numbers, renumbered on every save, so adding a string shifts the ones sorted after it. Predictions show the nearest string with ~ marks, as for Text (encoded).',
 ];
 function edApply(j) {
   ED.meta = {columns: j.columns, total: j.total, path: j.path, dirty: j.dirty, kinds: j.kinds, home: j.home, max_grid: j.max_grid, warnings: j.warnings || []};
@@ -2467,10 +2469,13 @@ function renderPredictFields() {
   const box = $('#predictFields');
   // Text and image columns of a CSV Editor dataset get one field each in place of their encoded numbers.
   const groups = M.summary.editor || [], encoded = new Set(groups.flatMap(g => g.columns));
+  const stringCode = g => g.kind === EDK.TEXT || g.kind === EDK.LABEL;
   box.innerHTML = groups.map((g, n) => g.kind === 6
     ? `<div class="field"><label>${esc(g.name)} <span class="hint">image${g.columns.length > 3 ? `, ${g.grid[0]}×${g.grid[1]} grid` : ''}</span></label><div class="row"><button class="btn" type="button" data-predimg="${n}">Upload image…</button><span class="hint" data-predimgname="${n}">blank = typical values</span></div><input type="file" class="hidden" accept="image/*" data-predimgfile="${n}"><input type="hidden" data-in="${esc(g.name)}"></div>`
-    : `<div class="field"><label>${esc(g.name)} <span class="hint">${g.kind === 4 ? 'text' : `text, up to ${g.length} characters`}</span></label><input type="text" data-in="${esc(g.name)}" spellcheck="false" ${g.kind === 4 ? `list="predStrings${n}"` : `maxlength="${g.length}"`}>${g.kind === 4 ? `<datalist id="predStrings${n}">${g.strings.map(t => `<option value="${esc(t)}">`).join('')}</datalist>` : ''}</div>`).join('')
-    + M.summary.inputs.filter(i => !encoded.has(i.name)).map(i => i.kind === 'numeric'
+    : `<div class="field"><label>${esc(g.name)} <span class="hint">${stringCode(g) ? 'text' : `text, up to ${g.length} characters`}</span></label><input type="text" data-in="${esc(g.name)}" spellcheck="false" ${stringCode(g) ? `list="predStrings${n}"` : `maxlength="${g.length}"`}>${stringCode(g) ? `<datalist id="predStrings${n}">${g.strings.map(t => `<option value="${esc(t)}">`).join('')}</datalist>` : ''}</div>`).join('')
+    + M.summary.inputs.filter(i => !encoded.has(i.name)).map(i => i.boolean
+    ? `<div class="field"><label>${esc(i.name)}</label><select data-in="${esc(i.name)}"><option value="">(typical)</option><option value="1">True</option><option value="0">False</option></select></div>`
+    : i.kind === 'numeric'
     ? `<div class="field"><label>${esc(i.name)} ${i.range ? `<span class="hint">${fmt(i.range[0])} … ${fmt(i.range[1])}</span>` : ''}</label><input type="number" step="any" data-in="${esc(i.name)}" placeholder="${esc(fmt(i.typical, 6))}"></div>`
     : `<div class="field"><label>${esc(i.name)}</label><select data-in="${esc(i.name)}"><option value="">(most common)</option>${i.classes.map(c => `<option>${esc(c)}</option>`).join('')}</select></div>`).join('');
   $('#predictOut').innerHTML = '';
@@ -2494,7 +2499,8 @@ $('#randomBtn').onclick = () => {
   for (const i of M.summary.inputs) {
     const e = $(`#predictFields [data-in="${CSS.escape(i.name)}"]`);
     if (!e || e.type !== 'number' && e.tagName !== 'SELECT') continue;      // text and image fields keep what was entered
-    if (i.kind === 'numeric' && i.range) e.value = +(i.range[0] + Math.random() * (i.range[1] - i.range[0])).toPrecision(5);
+    if (i.boolean) e.value = Math.random() < .5 ? '1' : '0';
+    else if (i.kind === 'numeric' && i.range) e.value = +(i.range[0] + Math.random() * (i.range[1] - i.range[0])).toPrecision(5);
     else if (i.kind === 'categorical' && i.classes.length) e.value = i.classes[Math.floor(Math.random() * i.classes.length)];
   }
   $('#predictBtn').click();

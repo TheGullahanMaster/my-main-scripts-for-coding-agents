@@ -9,11 +9,14 @@ numeric/category columns it holds reserved columns, all starting with
   #afpo:schema:<spec>  one empty column whose *name* lists every editor
                        column and its kind (0 bool, 1 integer, 2 float,
                        3 category, 4 text encoded, 5 text char level,
-                       6 image), so the kinds survive a save
+                       6 image, 7 text label code), so the kinds survive
+                       a save
 
 and the encoded columns training reads:
 
   text (encoded)   <name>            one number per string (EasyNN-plus rule)
+  text (label)     <name>            the string's place in the column's sorted
+                                     vocabulary: 1, 2, 3, … (mlpRes6 rule)
   text (chars)     <name>[1..L]      one character code per position, 0 = none
   image            <name>.PC/.EC/.BC three codes per image, or
                    <name>[r1c1].PC … three per grid cell
@@ -34,9 +37,10 @@ EDITOR_PREFIX = "#afpo:"
 EDITOR_SCHEMA_PREFIX = "#afpo:schema:"
 EDITOR_SOURCE_PREFIX = "#afpo:src:"
 EDITOR_SCHEMA_KEY = "__afpo_editor_schema__"
-EDITOR_KINDS = ("bool", "int", "float", "category", "text", "chars", "image")
-EDITOR_KIND_LABELS = ("Bool", "Integer", "Float", "Category", "Text (encoded)", "Text (char level)", "Image")
-EDITOR_BOOL, EDITOR_INT, EDITOR_FLOAT, EDITOR_CATEGORY, EDITOR_TEXT, EDITOR_CHARS, EDITOR_IMAGE = range(7)
+EDITOR_KINDS = ("bool", "int", "float", "category", "text", "chars", "image", "label")
+EDITOR_KIND_LABELS = ("Bool", "Integer", "Float", "Category", "Text (encoded)", "Text (char level)", "Image", "Text (label code)")
+EDITOR_BOOL, EDITOR_INT, EDITOR_FLOAT, EDITOR_CATEGORY, EDITOR_TEXT, EDITOR_CHARS, EDITOR_IMAGE, EDITOR_LABEL = range(8)
+EDITOR_STRING_CODES = (EDITOR_TEXT, EDITOR_LABEL)     # kinds saved as one number per distinct string
 EDITOR_IMAGE_SIZE = 100       # every image is stretched to this square before encoding
 EDITOR_MAX_GRID = 10
 EDITOR_IMAGE_CODES = ("PC", "EC", "BC")
@@ -153,7 +157,33 @@ def editor_lookup_code(value, codes):
     return float(editor_text_code(text, sorted(codes.values())))
 
 
-def editor_decode_text(value, codes):
+def editor_label_codes(strings):
+    """{string: id} of a label-code column: its distinct strings in sorted order, numbered from 1.
+
+    The mlpRes6 rule (``sorted()`` of the vocabulary, then 1, 2, 3, …): unlike
+    the EasyNN-plus codes these are evenly spaced and small, and they are
+    worked out afresh from the whole column, so a new string shifts the ids
+    of the strings sorted after it."""
+    return {text: index + 1 for index, text in enumerate(sorted({text for text in strings if text is not None and text != ""}))}
+
+
+def editor_label_lookup(value, codes):
+    """Id for one cell of a label-code column: a known string, a number (already an id), or 0 for an unknown string."""
+    if value is None:
+        return float("nan")
+    if isinstance(value, (int, float, np.integer, np.floating)) and not isinstance(value, bool):
+        return float(value)
+    text = str(value)
+    if text in codes:
+        return float(codes[text])
+    try:
+        return float(text)
+    except ValueError:
+        pass
+    return 0. if text.strip() else float("nan")
+
+
+def editor_decode_text(value, codes, lone=EDITOR_TEXT_STEP / 2):
     """Nearest stored string, prefixed with 0-3 '~' by how far the value is from it.
 
     The distance is measured against the point where the answer would flip to
@@ -173,9 +203,9 @@ def editor_decode_text(value, codes):
         half = abs(numbers[toward] - code) / 2
     else:
         # Beyond the outermost string there is nothing to flip to: reuse its
-        # one neighbour's spacing, or the minimum spacing for a lone string.
+        # one neighbour's spacing, or half the minimum spacing (lone) for a lone string.
         other = nearest - (1 if value > code else -1)
-        half = abs(numbers[other] - code) / 2 if 0 <= other < len(ordered) else EDITOR_TEXT_STEP / 2
+        half = abs(numbers[other] - code) / 2 if 0 <= other < len(ordered) else lone
     share = abs(value - code) / half if half > 0 else 0.
     return "~" * (0 if share < .25 else 1 if share < .5 else 2 if share < .75 else 3) + text
 
@@ -358,7 +388,7 @@ def editor_schema_from_frame(frame, base=None):
     for column in parsed:
         name, kind = column["name"], column["kind"]
         entry = {"name": name, "kind": kind}
-        if kind == EDITOR_TEXT:
+        if kind in EDITOR_STRING_CODES:
             entry["columns"] = [name] if name in present else []
             codes, source = {}, editor_source_column(name)
             if name in present and source in present:
@@ -385,24 +415,63 @@ def editor_input_only_columns(schema):
     return {name for column in (schema or {}).get("columns", ()) if column["kind"] == EDITOR_IMAGE for name in column["columns"]}
 
 
-def editor_prepare_frame(frame, schema):
-    """Add the encoded columns a model reads when the frame holds the raw text or image paths instead.
+EDITOR_TRUE_WORDS = frozenset(("true", "t", "yes", "y", "on"))
+EDITOR_FALSE_WORDS = frozenset(("false", "f", "no", "n", "off"))
 
-    A text column may hold strings (looked up, or given a new code by the
-    same rule), a char-level or image column may be given under its own name
-    or its ``#afpo:src:`` name.  Encoded columns already present are kept."""
+
+def editor_coerce_value(kind, value):
+    """A Bool or Integer value as its column stores it (1/0, a whole number); anything unreadable is returned as given."""
+    if _editor_missing(value) or isinstance(value, str) and not value.strip():
+        return value
+    if kind == EDITOR_BOOL and isinstance(value, str) and value.strip().lower() in EDITOR_TRUE_WORDS | EDITOR_FALSE_WORDS:
+        return int(value.strip().lower() in EDITOR_TRUE_WORDS)
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return value
+    if not math.isfinite(number):
+        return value
+    return int(number != 0) if kind == EDITOR_BOOL else int(editor_round(number))
+
+
+def editor_coerce_column(kind, values):
+    """A Bool or Integer column as the editor stores it; numbers stay numbers, text is read value by value."""
+    if pd.api.types.is_bool_dtype(values):
+        return values.astype(int)
+    if pd.api.types.is_integer_dtype(values):
+        return values if kind == EDITOR_INT else (values != 0).astype(int)
+    if pd.api.types.is_float_dtype(values):     # stays float: a missing value has no whole-number form
+        numbers = values.to_numpy(float)
+        kept = ~np.isfinite(numbers)
+        return pd.Series(np.where(kept, numbers, (numbers != 0).astype(float) if kind == EDITOR_BOOL else editor_round(numbers)), index=values.index)
+    return pd.Series([editor_coerce_value(kind, value) for value in values], index=values.index, dtype=object)
+
+
+def editor_prepare_frame(frame, schema):
+    """Make a frame of raw values the one a model reads.
+
+    A Bool column is snapped to 1/0 (true/false words included) and an
+    Integer column rounded, as the editor stores them.  A text column may
+    hold strings (looked up, or given a new code by the same rule), a
+    char-level or image column may be given under its own name or its
+    ``#afpo:src:`` name.  Encoded columns already present are kept."""
     if not schema:
         return frame
     frame = frame.copy()
     for column in schema.get("columns", ()):
         name, kind, encoded = column["name"], column["kind"], column.get("columns") or []
+        if kind in (EDITOR_BOOL, EDITOR_INT):
+            if name in frame.columns:
+                frame[name] = editor_coerce_column(kind, frame[name])
+            continue
         source = name if name in frame.columns else editor_source_column(name) if editor_source_column(name) in frame.columns else None
-        if kind == EDITOR_TEXT:
+        if kind in EDITOR_STRING_CODES:
+            lookup = editor_lookup_code if kind == EDITOR_TEXT else editor_label_lookup
             if name in frame.columns:
                 if not pd.api.types.is_numeric_dtype(frame[name]):
-                    frame[name] = [editor_lookup_code(None if _editor_missing(value) else value, column.get("codes") or {}) for value in frame[name]]
+                    frame[name] = [lookup(None if _editor_missing(value) else value, column.get("codes") or {}) for value in frame[name]]
             elif source is not None:
-                frame[name] = [editor_lookup_code(None if _editor_missing(value) else value, column.get("codes") or {}) for value in frame[source]]
+                frame[name] = [lookup(None if _editor_missing(value) else value, column.get("codes") or {}) for value in frame[source]]
         elif kind == EDITOR_CHARS:
             if source is not None and not all(item in frame.columns for item in encoded):
                 codes = [editor_char_codes(None if _editor_missing(value) else value, len(encoded)) for value in frame[source]]
@@ -447,8 +516,8 @@ def editor_decode_row(outputs, schema):
         if kind == EDITOR_INT and isinstance(outputs.get(name), (int, float)) and not isinstance(outputs.get(name), bool):
             if math.isfinite(outputs[name]):
                 decoded[name] = int(editor_round(outputs[name]))
-        elif kind == EDITOR_TEXT and isinstance(outputs.get(name), (int, float)) and not isinstance(outputs.get(name), bool):
-            decoded[f"{name} (text)"] = editor_decode_text(outputs[name], column.get("codes") or {})
+        elif kind in EDITOR_STRING_CODES and isinstance(outputs.get(name), (int, float)) and not isinstance(outputs.get(name), bool):
+            decoded[f"{name} (text)"] = editor_decode_text(outputs[name], column.get("codes") or {}, *((.5,) if kind == EDITOR_LABEL else ()))
         elif kind == EDITOR_CHARS:
             encoded = column.get("columns") or []
             if encoded and all(isinstance(outputs.get(item), (int, float)) for item in encoded):
@@ -467,8 +536,9 @@ def editor_decode_frame(frame, schema):
         if kind == EDITOR_INT and name in frame.columns and pd.api.types.is_numeric_dtype(frame[name]):
             rounded = editor_round(frame[name])
             frame[name] = rounded.astype(np.int64) if np.isfinite(rounded).all() else rounded
-        elif kind == EDITOR_TEXT and name in frame.columns and pd.api.types.is_numeric_dtype(frame[name]):
-            frame[f"{name} (text)"] = [editor_decode_text(value, column.get("codes") or {}) for value in frame[name]]
+        elif kind in EDITOR_STRING_CODES and name in frame.columns and pd.api.types.is_numeric_dtype(frame[name]):
+            lone = (.5,) if kind == EDITOR_LABEL else ()
+            frame[f"{name} (text)"] = [editor_decode_text(value, column.get("codes") or {}, *lone) for value in frame[name]]
         elif kind == EDITOR_CHARS:
             encoded = column.get("columns") or []
             if encoded and all(item in frame.columns for item in encoded):
