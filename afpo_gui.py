@@ -863,6 +863,7 @@ class ModelExplorer:
                                "typical": typical.get(column)})
         return {"path": str(self.path), "generation": self.generation, "source": "validation" if state.get("Xv") is not None else "training",
                 "outputs": state["out_names"], "cats": state["cats"], "inputs": inputs, "models": out, "editor": self._editor_inputs(inputs),
+                "text_columns": self._text_columns(),
                 "dataset": state.get("dataset_path"), "seed": state.get("run_seed"),
                 "train_rows": len(state["Xt"]), "validation_rows": 0 if state.get("Xv") is None else len(state["Xv"]),
                 "test_rows": 0 if state.get("Xtest") is None else len(state["Xtest"]),
@@ -870,6 +871,19 @@ class ModelExplorer:
 
     def _schema(self):
         return (self.state or {}).get("maps", {}).get(editor_format.EDITOR_SCHEMA_KEY)
+
+    def _text_columns(self):
+        """How the page turns an encoded number back into text, per encoded column (inputs and outputs):
+        {"codes": [[code, string], …] in code order, "lone": spacing of a lone string} for the two
+        string-code kinds (see editor_decode_text), {"chars": True} for each character position."""
+        columns = {}
+        for column in (self._schema() or {}).get("columns", ()):
+            if column["kind"] in editor_format.EDITOR_STRING_CODES and column.get("codes"):
+                columns[column["name"]] = {"codes": sorted([float(code), str(text)] for text, code in column["codes"].items()),
+                                           "lone": .5 if column["kind"] == editor_format.EDITOR_LABEL else editor_format.EDITOR_TEXT_STEP / 2}
+            elif column["kind"] == editor_format.EDITOR_CHARS:
+                columns.update({name: {"chars": True} for name in column.get("columns") or []})
+        return columns
 
     def _editor_inputs(self, inputs):
         """Text and image columns among the inputs: one field each instead of their encoded numbers."""

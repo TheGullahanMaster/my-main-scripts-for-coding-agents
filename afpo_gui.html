@@ -253,7 +253,8 @@ table.ed .imgcell img { width: 36px; height: 36px; object-fit: cover; border-rad
     </div>
     <div id="edWarn"></div>
     <div class="ed-wrap" id="edWrap"><table class="ed" id="edTable"><thead></thead><tbody></tbody></table></div>
-    <div class="hint" id="edHint" style="margin-top:6px">Tap a column name to rename it, change its type or delete it. Typing in the last, faded row adds a row. More rows load as you scroll.</div>
+    <div class="hint" id="edHint" style="margin-top:6px">Tap a column name to rename it, change its type or delete it. Typing in the last, faded row adds a row. More rows load as you scroll.
+      <br>Keys: arrows, Enter and Shift+Enter move between cells · Home / End first and last column · Page Up / Page Down 15 rows · Ctrl+Home / Ctrl+End first and last row · Ctrl+Enter new row · F2 or typing edits a cell (then Left / Right move in the text and Esc undoes) · Delete removes the row, or the ticked rows · Shift+Space ticks the row · Ctrl+S saves.</div>
   </div>
   <div class="grid2">
     <div>
@@ -668,6 +669,31 @@ function fmt(v, digits = 4) {
   const a = Math.abs(v);
   if (a >= 1e5 || a < 1e-3) return v.toExponential(Math.max(1, digits - 2));
   return String(+v.toPrecision(digits));
+}
+// The text behind an encoded number of a CSV Editor text column (M.summary.text_columns), or null.
+// Same rules as editor_format.editor_decode_text (nearest stored string, 0-3 '~' by how far
+// the value is towards the next one) and editor_decode_chars (one character position).
+function textOf(name, v) {
+  const c = typeof M !== 'undefined' && M.summary && M.summary.text_columns ? M.summary.text_columns[name] : null;
+  if (!c || typeof v !== 'number' || !isFinite(v)) return null;
+  if (c.chars) {
+    const down = Math.floor(v), code = v - down === .5 ? down + (down % 2 ? 1 : 0) : Math.round(v);   // Python rounds halves to even
+    return code <= 0 ? '' : code >= 0xD800 && code <= 0xDFFF ? '?' : String.fromCodePoint(Math.min(code, 0x10FFFF));
+  }
+  const codes = c.codes, n = codes.length;
+  if (!n) return null;
+  let at = 0;
+  while (at < n && codes[at][0] < v) at++;
+  const nearest = at === 0 ? 0 : at === n ? n - 1 : Math.abs(codes[at][0] - v) < Math.abs(codes[at - 1][0] - v) ? at : at - 1;
+  const code = codes[nearest][0], step = v > code ? 1 : -1, toward = nearest + step, other = nearest - step;
+  const half = toward >= 0 && toward < n ? Math.abs(codes[toward][0] - code) / 2 : other >= 0 && other < n ? Math.abs(codes[other][0] - code) / 2 : c.lone;
+  const share = half > 0 ? Math.abs(v - code) / half : 0;
+  return '~'.repeat(share < .25 ? 0 : share < .5 ? 1 : share < .75 ? 2 : 3) + codes[nearest][1];
+}
+// fmt(v), followed by the text it stands for in parentheses when the column holds encoded text.
+function fmtText(name, v, digits = 4) {
+  const text = textOf(name, v);
+  return fmt(v, digits) + (text ? ` (${text})` : '');
 }
 function fmtTime(s) {
   if (s == null) return '—';
@@ -1359,7 +1385,7 @@ $('#inspectBtn').onclick = inspect;
 // ───────────── CSV Editor ─────────────
 // The table lives in the server (afpo_lib/csv_editor.py); the page holds only the rows it shows,
 // ED.start … ED.start + ED.rows.length, and trades pages with the server as the box is scrolled.
-const ED = {meta: null, start: 0, rows: [], sel: new Set(), busy: false, col: null};
+const ED = {meta: null, start: 0, rows: [], sel: new Set(), busy: false, col: null, edit: false, mouse: false, pending: Promise.resolve()};
 const ED_PAGE = 100, ED_KEEP = 400;
 const EDK = {BOOL: 0, INT: 1, FLOAT: 2, CAT: 3, TEXT: 4, CHARS: 5, IMAGE: 6, LABEL: 7};
 const ED_KIND_HINTS = [
@@ -1519,7 +1545,7 @@ $('#edTable').addEventListener('change', async ev => {
     value = (prompt(`New category for ${column.name}`) || '').trim();
     if (!value) { t.value = ''; return; }
   }
-  edSetCell(tr, ci, value === '' ? null : value);
+  ED.pending = edSetCell(tr, ci, value === '' ? null : value);
 });
 $('#edTable').addEventListener('click', ev => {
   const t = ev.target.closest('[data-imgbtn],[data-imgclear],[data-colbtn]');
@@ -1588,11 +1614,94 @@ async function edGoto(row, focus = false) {
 }
 $('#edAddRow').onclick = () => { if (!ED.meta.columns.length) return toast('Add a column first', true); edGoto(ED.meta.total, true); };
 $('#edGoto').onchange = e => { if (e.target.value) edGoto(+e.target.value - 1); };
-$('#edDelRows').onclick = async () => {
-  if (!ED.sel.size || !confirm(`Delete ${ED.sel.size} row${ED.sel.size === 1 ? '' : 's'}?`)) return;
-  try { const rows = [...ED.sel]; ED.sel = new Set(); await edLoad(Math.min(ED.start, Math.max(0, ED.meta.total - rows.length - 1)), {op: 'delete_rows', rows}); }
-  catch (e) { toast(e.message, true); }
-};
+async function edDeleteRows(rows, focus) {
+  if (!rows.length || !confirm(`Delete ${rows.length} row${rows.length === 1 ? '' : 's'}?`)) return;
+  try {
+    ED.sel = new Set(); await ED.pending;
+    await edLoad(Math.min(ED.start, Math.max(0, ED.meta.total - rows.length - 1)), {op: 'delete_rows', rows});
+    if (focus) edFocus(...focus);
+  } catch (e) { toast(e.message, true); }
+}
+$('#edDelRows').onclick = () => edDeleteRows([...ED.sel]);
+// Keyboard.  A cell reached with the keyboard is selected, not being typed in:
+// all four arrows, Home and End move, and Delete removes the row.  Typing,
+// F2 or a click starts editing, where Left/Right/Home/End/Delete belong to the
+// text and Escape puts the stored value back.  Up, Down, Enter and the page
+// keys always move.  Table cell 0 is the row's tick box, cell 1 the first column.
+const edTyping = t => t.matches('input[type=text],input[type=number]');
+const edControl = (tr, cell) => tr.cells[cell] && tr.cells[cell].querySelector('[data-col],[data-imgbtn],[data-pick]');
+async function edFocus(row, cell) {
+  row = Math.max(0, Math.min(row, ED.meta.total)); cell = Math.max(0, Math.min(cell, ED.meta.columns.length));
+  const find = () => $(`#edTable tr[data-row="${row}"]`);
+  let tr = find();
+  if (!tr) {
+    // Outside the rows on screen: let a cell still being stored finish, then show that part of the table.
+    try { await ED.pending; await edLoad(Math.max(0, row - 20)); } catch (e) { return toast(e.message, true); }
+    tr = find();
+  }
+  const control = tr && (edControl(tr, cell) || edControl(tr, 1));
+  if (!control) return;
+  control.focus(); ED.edit = ED.mouse = false;
+  if (edTyping(control)) control.select();
+  tr.scrollIntoView({block: 'nearest'});
+}
+$('#edTable').addEventListener('mousedown', () => { ED.edit = ED.mouse = true; });
+$('#edTable').addEventListener('mouseup', () => { ED.mouse = false; });
+$('#edTable').addEventListener('focusin', () => { if (!ED.mouse) ED.edit = false; ED.mouse = false; });
+$('#edTable').addEventListener('input', () => { ED.edit = true; });
+$('#edTable').addEventListener('keydown', ev => {
+  const t = ev.target, td = t.closest('td'), tr = t.closest('tr[data-row]'), k = ev.key;
+  if (!td || !tr || ev.altKey || ev.metaKey || ev.isComposing) return;
+  const row = +tr.dataset.row, cell = td.cellIndex, typing = ED.edit && edTyping(t);
+  const go = (r, c) => { ev.preventDefault(); edFocus(r, c); };
+  if (ev.ctrlKey) {
+    if (k === 'Home') go(0, cell);
+    else if (k === 'End') go(ED.meta.total, cell);
+    else if (k === 'Enter') go(ED.meta.total, 1);
+    return;
+  }
+  if (k === 'Enter') { if (t.matches('[data-col]')) go(row + (ev.shiftKey ? -1 : 1), cell); return; }
+  if (ev.shiftKey) {
+    // Shift+Space ticks the row (while typing it is an ordinary space).
+    const pick = tr.querySelector('[data-pick]');
+    if (k === ' ' && !typing && pick) { ev.preventDefault(); pick.click(); }
+    return;
+  }
+  if (k === 'ArrowUp') return go(row - 1, cell);
+  if (k === 'ArrowDown') return go(row + 1, cell);
+  if (k === 'PageUp') return go(row - 15, cell);
+  if (k === 'PageDown') return go(row + 15, cell);
+  if (typing) {
+    if (k === 'Escape') {
+      const stored = row >= ED.start && row < ED.start + ED.rows.length ? ED.rows[row - ED.start][cell - 1] : null;
+      ev.preventDefault(); t.value = stored ?? ''; t.select(); ED.edit = false;
+    }
+    return;
+  }
+  if (k === 'ArrowLeft') return go(row, cell - 1);
+  if (k === 'ArrowRight') return go(row, cell + 1);
+  if (k === 'Home') return go(row, 1);
+  if (k === 'End') return go(row, ED.meta.columns.length);
+  if (k === 'F2') {
+    ev.preventDefault();
+    if (edTyping(t)) { ED.edit = true; const v = t.value; t.value = ''; t.value = v; }   // caret to the end, nothing selected
+    else if (t.matches('select') && t.showPicker) t.showPicker();
+    return;
+  }
+  if (k === 'Delete') {
+    ev.preventDefault();
+    const rows = ED.sel.size ? [...ED.sel] : row < ED.meta.total ? [row] : [];
+    edDeleteRows(rows, [row, cell]);
+  }
+});
+// Ctrl+S anywhere in the editor saves, after the cell being typed in is stored.
+$('#editorCard').addEventListener('keydown', async ev => {
+  if (!(ev.ctrlKey || ev.metaKey) || ev.altKey || ev.key.toLowerCase() !== 's') return;
+  ev.preventDefault();
+  const active = document.activeElement;
+  if (active && active.closest('#edTable')) { active.blur(); await ED.pending; active.focus(); }
+  $('#edSave').click();
+});
 $('#edNew').onclick = async () => {
   if (ED.meta && ED.meta.dirty && !confirm('Discard the unsaved changes and start an empty table?')) return;
   try { ED.sel = new Set(); await edLoad(0, {op: 'new'}); $('#edName').value = ''; } catch (e) { toast(e.message, true); }
@@ -2145,7 +2254,7 @@ async function loadFit() {
   c1.set({x: {title: 'Actual ' + o.name}, y: {title: 'Predicted'}, layers: [
     {type: 'line', data: [{x: lo, y: lo}, {x: hi, y: hi}], color: '--muted', width: 1.5, dash: [5, 4]},
     {type: 'points', data: pts, color: '--s1', alpha: .7, r: 2.5}],
-    tooltip: d => `actual ${fmt(d.x, 6)}<br>predicted ${fmt(d.y, 6)}<br><span class="hint">error ${fmt(d.y - d.x)}</span>`});
+    tooltip: d => `actual ${esc(fmtText(o.name, d.x, 6))}<br>predicted ${esc(fmtText(o.name, d.y, 6))}<br><span class="hint">error ${fmt(d.y - d.x)}</span>`});
   const h = o.residual_hist;
   if (h) {
     const bw = (h.hi - h.lo) / h.counts.length || 1;
@@ -2217,17 +2326,26 @@ function renderFrozen() {
     if (i.kind !== 'numeric')
       return `<div class="field"><label>${n} ${tag}</label><select data-frozen="${n}">${i.classes.map(c => `<option ${String(c) === String(v) ? 'selected' : ''}>${esc(c)}</option>`).join('')}</select></div>`;
     const r = i.range || [0, 1];
-    return `<div class="field"><label>${n} ${tag}</label><div class="frow">
+    return `<div class="field"><label>${n} ${tag} <span class="unused" data-frozen-text="${n}"></span></label><div class="frow">
         <input type="number" step="any" data-frozen="${n}" value="${esc(v)}" placeholder="${esc(fmt(i.typical, 6))}">
         <button class="play ${a && a.playing ? 'on' : ''}" data-play="${n}" title="Animate ${n} over a range in a loop">${a && a.playing ? '❚❚' : '▶'}</button></div>
       ${a ? `<div class="anim"><input type="number" step="any" data-anim="${n}" data-k="lo" value="${esc(a.lo)}" placeholder="from ${esc(fmt(r[0]))}" title="From">
         <input type="number" step="any" data-anim="${n}" data-k="hi" value="${esc(a.hi)}" placeholder="to ${esc(fmt(r[1]))}" title="To">
         <input type="number" step="1" min="2" data-anim="${n}" data-k="steps" value="${esc(a.steps)}" title="Steps per loop"></div>` : ''}</div>`;
   }).join('');
-  $$('[data-frozen]', box).forEach(el => el.addEventListener('input', () => { EX.frozen[el.dataset.frozen] = el.value; animInvalidate(); scheduleExplore(); }));
+  $$('[data-frozen]', box).forEach(el => el.addEventListener('input', () => { EX.frozen[el.dataset.frozen] = el.value; showFrozenText(); animInvalidate(); scheduleExplore(); }));
+  showFrozenText();
   $$('[data-play]', box).forEach(b => b.onclick = () => toggleAnim(b.dataset.play));
   $$('[data-anim]', box).forEach(el => el.addEventListener('input', () => { EX.anim[el.dataset.anim][el.dataset.k] = el.value; animInvalidate(); }));
   syncAnimBar();
+}
+// Beside a frozen text-encoded input: the string its number (or, left blank, its typical value) stands for.
+function showFrozenText() {
+  $$('#exFrozen [data-frozen-text]').forEach(span => {
+    const name = span.dataset.frozenText, el = $(`#exFrozen [data-frozen="${CSS.escape(name)}"]`), input = M.summary.inputs.find(i => i.name === name);
+    const text = textOf(name, el && el.value !== '' ? +el.value : input ? input.typical : null);
+    span.textContent = text ? `(${text})` : '';
+  });
 }
 function scheduleExplore() { clearTimeout(EX.timer); EX.timer = setTimeout(() => loadExplore().catch(e => toast(e.message, true)), 220); }
 function exPick(item, key) {
@@ -2301,6 +2419,7 @@ function renderExplore(r, p) {
   const {mode, key, outName, isProb, outLabel, xName, yName} = p;
   $('#exWrap2d').classList.toggle('hidden', mode === '3d'); $('#exWrap3d').classList.toggle('hidden', mode !== '3d');
   const sets = exSets(r, key);
+  const outText = (v, digits = 6) => isProb ? fmt(v, digits) : fmtText(outName, v, digits);   // a class probability is never text
   EX.view = {mode, categorical: false};
   if (mode === '1d') {
     const ys = exPick(r.outputs[outName], key), cat = r.kind === 'categorical';
@@ -2316,7 +2435,7 @@ function renderExplore(r, p) {
     exChart.set({
       x: {title: xName, labels: cat ? r.x.map(String) : null, domain: [lo, hi]},
       y: {title: outLabel, domain: isProb ? [-.02, 1.02] : null}, layers, crosshair: !cat,
-      tooltip: d => d.data ? `${esc(d.data.toLowerCase().replace(/s$/, ''))}<br>${esc(xName)} = ${esc(cat ? r.x[d.raw] : fmt(d.x, 6))}<br>${esc(outLabel)} = ${fmt(d.y, 6)}` : `${esc(xName)} = ${esc(cat ? d.label : fmt(d.label, 6))}<br>${esc(outLabel)} = <strong>${fmt(d.y, 6)}</strong>`,
+      tooltip: d => d.data ? `${esc(d.data.toLowerCase().replace(/s$/, ''))}<br>${esc(xName)} = ${esc(cat ? r.x[d.raw] : fmtText(xName, d.x, 6))}<br>${esc(outLabel)} = ${esc(outText(d.y))}` : `${esc(xName)} = ${esc(cat ? d.label : fmtText(xName, d.label, 6))}<br>${esc(outLabel)} = <strong>${esc(outText(d.y))}</strong>`,
     });
     $('#exHint').textContent = 'The curve varies one input; every other input stays at the values on the left.';
     return;
@@ -2329,8 +2448,8 @@ function renderExplore(r, p) {
   const xs = xc ? r.x.values.map((_, i) => i) : r.x.values, ys = yc ? r.y.values.map((_, i) => i) : r.y.values;
   const ramp = rampStops().map((c, i, a) => `rgb(${c.join(',')}) ${Math.round(100 * i / (a.length - 1))}%`).join(', ');
   $('#exColorbar').classList.remove('hidden');
-  $('#exColorbar').innerHTML = `<span class="title">${esc(outLabel)}${isProb ? '' : ' (colour scale spans this view)'}</span><span>${fmt(lo)}</span><div class="ramp" style="background:linear-gradient(90deg, ${ramp})"></div><span>${fmt(hi)}</span>`;
-  const valueTip = d => `${esc(xName)} = ${esc(xc ? r.x.values[d.x] : fmt(d.x, 6))}<br>${esc(yName)} = ${esc(yc ? r.y.values[d.y] : fmt(d.y, 6))}<br>${esc(outLabel)} = <strong>${fmt(d.z, 6)}</strong>`;
+  $('#exColorbar').innerHTML = `<span class="title">${esc(outLabel)}${isProb ? '' : ' (colour scale spans this view)'}</span><span>${esc(outText(lo, 4))}</span><div class="ramp" style="background:linear-gradient(90deg, ${ramp})"></div><span>${esc(outText(hi, 4))}</span>`;
+  const valueTip = d => `${esc(xName)} = ${esc(xc ? r.x.values[d.x] : fmtText(xName, d.x, 6))}<br>${esc(yName)} = ${esc(yc ? r.y.values[d.y] : fmtText(yName, d.y, 6))}<br>${esc(outLabel)} = <strong>${esc(outText(d.z))}</strong>`;
   EX.view = {mode, xCat: xc, yCat: yc};
   if (mode === '2d') {
     const ex = cellEdges(xs), ey = cellEdges(ys), inside = d => d.x >= ex[0] && d.x <= ex[ex.length - 1] && d.y >= ey[0] && d.y <= ey[ey.length - 1];
@@ -2341,7 +2460,7 @@ function renderExplore(r, p) {
     exChart.set({
       x: {title: xName, labels: xc ? r.x.values.map(String) : null, domain: [ex[0], ex[ex.length - 1]]},
       y: {title: yName, labels: yc ? r.y.values.map(String) : null, domain: [ey[0], ey[ey.length - 1]]}, layers,
-      tooltip: d => d.data ? `${esc(d.data.toLowerCase().replace(/s$/, ''))}<br>${esc(xName)} = ${esc(xc ? r.x.values[d.rx] : fmt(d.rx, 6))}<br>${esc(yName)} = ${esc(yc ? r.y.values[d.ry] : fmt(d.ry, 6))}<br>actual ${esc(outLabel)} = ${fmt(d.z, 6)}` : valueTip(d),
+      tooltip: d => d.data ? `${esc(d.data.toLowerCase().replace(/s$/, ''))}<br>${esc(xName)} = ${esc(xc ? r.x.values[d.rx] : fmtText(xName, d.rx, 6))}<br>${esc(yName)} = ${esc(yc ? r.y.values[d.ry] : fmtText(yName, d.ry, 6))}<br>actual ${esc(outLabel)} = ${esc(outText(d.z))}` : valueTip(d),
     });
     $('#exHint').textContent = 'Colour is the model output over two inputs; the rest stay at the values on the left. Areas far from the data rows are extrapolation.';
     return;
@@ -2504,6 +2623,7 @@ function animShowValues(frozen) {
     const el = $(`#exFrozen [data-frozen="${CSS.escape(name)}"]`);
     if (el) el.value = +(+frozen[name]).toPrecision(6);
   }
+  showFrozenText();
 }
 $('#exAnimStop').onclick = () => animStop();
 $('#exPregen').onchange = () => { if (animPlaying().length) { animInvalidate(); animStart(); } };
@@ -2578,7 +2698,7 @@ $('#predictBtn').onclick = async () => {
     const r = await api('/api/models/predict', {index: M.index, row});
     const outs = Object.entries(r.outputs);
     $('#predictOut').innerHTML = `<table><tbody>${outs.map(([k, v]) => `<tr><td>${esc(k)}</td><td class="${typeof v === 'number' ? 'num' : ''}"><strong>${typeof v === 'object' && v !== null ? esc(Object.entries(v).map(([c, p]) => `${c}: ${(100 * p).toFixed(1)}%`).join(' · ')) : esc(typeof v === 'number' ? fmt(v, 8) : v)}</strong></td></tr>`).join('')}</tbody></table>
-      <div class="hint" style="margin-top:4px">Blank inputs used their typical training value: ${esc(Object.entries(r.inputs).filter(([k]) => !(k in row) && !(M.summary.editor || []).some(g => g.name in row && g.columns.includes(k))).map(([k, v]) => `${k}=${typeof v === 'number' ? fmt(v, 5) : v}`).join(', ') || 'none')}</div>`;
+      <div class="hint" style="margin-top:4px">Blank inputs used their typical training value: ${esc(Object.entries(r.inputs).filter(([k]) => !(k in row) && !(M.summary.editor || []).some(g => g.name in row && g.columns.includes(k))).map(([k, v]) => `${k}=${typeof v === 'number' ? fmtText(k, v, 5) : v}`).join(', ') || 'none')}</div>`;
   } catch (e) { toast(e.message, true); }
 };
 $('#batchBtn').onclick = async () => {
