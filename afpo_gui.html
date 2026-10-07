@@ -365,6 +365,20 @@ table.ed .imgcell img { width: 36px; height: 36px; object-fit: cover; border-rad
       </div>
 
       <div class="card">
+        <h2>Saved configurations</h2>
+        <div class="row">
+          <div class="field grow"><label>Load <span class="hint">replaces every setting on this tab</span></label><select id="configList"></select></div>
+          <button class="btn" id="configLoad">Load</button>
+          <button class="btn" id="configDelete">Delete</button>
+        </div>
+        <div class="row">
+          <div class="field grow"><label>Save current setup as</label><input type="text" id="configName" placeholder="name" spellcheck="false" maxlength="80"></div>
+          <button class="btn" id="configSave">Save</button>
+        </div>
+        <div class="hint" id="configHint"></div>
+      </div>
+
+      <div class="card">
         <h2>Start</h2>
         <div id="checkMsg"></div>
         <div class="row">
@@ -1669,6 +1683,57 @@ function collectForm() {
     advanced: advancedValues(),
   };
 }
+// Saved configurations: the whole Setup tab (dataset paths, column types,
+// operators, search, run and advanced options) as a named JSON file kept by
+// the server, so it survives the browser's storage and can be copied around.
+const CONFIG_PATHS = ['dataset', 'validation', 'test', 'metadata'];
+function currentConfig() {
+  saveForm();
+  const paths = {};
+  CONFIG_PATHS.forEach(k => paths[k] = pathInputs[k].value.trim());
+  return {form: store.get('form', {}), ops: operatorForm(), advanced: advancedValues(), islandRoles: islandRoleValues(), paths,
+    types: INSPECT ? {key: INSPECT.path + '|' + delimiterValue(), types: INSPECT.columns.map(c => c.type)} : null};
+}
+function applyConfig(c) {
+  CONFIG_PATHS.forEach(k => { if (c.paths && c.paths[k] !== undefined) { pathInputs[k].value = c.paths[k]; store.set('path.' + k, c.paths[k]); } });
+  if (c.islandRoles) store.set('islandRoles', c.islandRoles);
+  if (c.types) store.set('types', c.types);
+  if (c.form) { store.set('form', c.form); restoreForm(); }
+  if (c.ops) { store.set('ops', c.ops); renderOperators(); }
+  // Options this version no longer has are skipped; ones the file lacks keep their value.
+  $$('[data-adv]').forEach(el => {
+    const v = (c.advanced || {})[el.dataset.adv];
+    if (v === undefined) return;
+    if (el.type === 'checkbox') el.checked = !!v; else el.value = v;
+  });
+  saveForm();
+  if (pathInputs.dataset.value) inspect();
+}
+function showConfigs(j, selected) {
+  const list = $('#configList');
+  list.innerHTML = j.configs.length ? j.configs.map(c => `<option value="${esc(c.name)}">${esc(c.name)} — ${esc(new Date(c.modified * 1000).toLocaleString())}</option>`).join('') : '<option value="">(none saved yet)</option>';
+  if (selected && j.configs.some(c => c.name === selected)) list.value = selected;
+  $('#configLoad').disabled = $('#configDelete').disabled = !j.configs.length;
+  $('#configHint').textContent = 'Stored as JSON files in ' + j.folder;
+}
+async function refreshConfigs() { try { showConfigs(await api('/api/configs')); } catch (e) { toast(e.message, true); } }
+$('#configSave').onclick = async () => {
+  const name = $('#configName').value.trim() || $('#configList').value;
+  if (!name) return toast('Type a name for the configuration', true);
+  if ($$('#configList option').some(o => o.value === name) && !confirm(`Overwrite the saved configuration "${name}"?`)) return;
+  try { showConfigs(await api('/api/configs/save', {name, config: currentConfig()}), name); $('#configName').value = ''; toast('Saved configuration: ' + name); }
+  catch (e) { toast(e.message, true); }
+};
+$('#configLoad').onclick = async () => {
+  const name = $('#configList').value; if (!name) return;
+  try { applyConfig((await api('/api/configs/load', {name})).config); toast('Loaded configuration: ' + name); }
+  catch (e) { toast(e.message, true); }
+};
+$('#configDelete').onclick = async () => {
+  const name = $('#configList').value; if (!name || !confirm(`Delete the saved configuration "${name}"?`)) return;
+  try { showConfigs(await api('/api/configs/delete', {name})); toast('Deleted configuration: ' + name); }
+  catch (e) { toast(e.message, true); }
+};
 function showCheck(msg, err) { $('#checkMsg').innerHTML = msg ? `<div class="notice ${err ? 'err' : ''}">${esc(msg)}</div>` : ''; }
 $('#checkBtn').onclick = async () => {
   try { const j = await api('/api/train/check', collectForm()); showCheck(`Looks good: ${j.rows.toLocaleString()} rows${j.training_rows < j.rows ? ` (training on a ${j.training_rows.toLocaleString()}-row sample)` : ''}, ${j.operators} operators. Command-line equivalent options: ${j.argv.join(' ')}`); }
@@ -2679,7 +2744,7 @@ $('#genBtn').onclick = () => startGenerate(false);
     renderOperators(); renderAdvanced();
   } catch (e) { toast('Could not load options: ' + e.message, true); }
   showTab(store.get('tab', 'setup'));
-  refreshRuns();
+  refreshRuns(); refreshConfigs();
   if (pathInputs.dataset.value) inspect();
   poll();
 })();

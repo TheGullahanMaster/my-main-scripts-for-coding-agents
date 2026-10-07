@@ -4692,12 +4692,14 @@ class DynamicPressureController:
         for bank in banks: bank.pressure_exploration=self.exploration_boost()
         qd_controller.uniform_rate=self.uniform_rate()
     size_limit=None    # --dynamic-size-limit: this population's current per-tree node limit (None until first used)
-    def snapshot(self): return {key:getattr(self,key) for key in ("enabled","base_parsimony","base_uniform","window","level","last_quality_generation","last_check_generation","last_qd_activity","size_limit")}
+    anchor_loss=None   # --description-length-anchor: best loss this population's lane anchor has had (None until first used)
+    def snapshot(self): return {key:getattr(self,key) for key in ("enabled","base_parsimony","base_uniform","window","level","last_quality_generation","last_check_generation","last_qd_activity","size_limit","anchor_loss")}
     @classmethod
     def from_snapshot(cls, data):
         result=cls(data.get("enabled",False),data.get("base_parsimony",.01),data.get("base_uniform",.25),data.get("window",100))
         for key in ("level","last_quality_generation","last_check_generation"): setattr(result,key,int(data.get(key,0)))
         if data.get("size_limit") is not None: result.size_limit=int(data["size_limit"])
+        if data.get("anchor_loss") is not None: result.anchor_loss=float(data["anchor_loss"])
         result.last_qd_activity=tuple(tuple(item) for item in data.get("last_qd_activity",((0,0),(0,0)))); return result
     def stats(self):
         return f"Dynamic pressure={'on' if self.enabled else 'off'}; level={self.level}; parsimony={self.effective_parsimony():.0%}; Bayesian boost={self.exploration_boost():.0%}; QD uniform={self.uniform_rate():.0%}; novelty={self.novelty_rate():.0%}"
@@ -7573,6 +7575,22 @@ REFINER_MAX_DELTA = 1.          # refiner's semantic step cap (target standard d
 LANE_SURVIVOR_SHARE = 0.
 LANE_PARENT_SHARE = 0.
 LANE_BAND = SIMPLIFIER_BAND
+# --description-length-anchor W (off by default): a better-fitting model
+# becomes the lane's anchor only when its loss gain pays for its bits.  With a
+# lowest-loss anchor the band shrinks with the loss and the lane fills with
+# near-copies of the largest model.  Each population keeps a loss ceiling (the
+# best loss an anchor of its has had); the anchor is the model of lowest total
+# description length
+#     MDL bits + W * (rows/2) * log2(loss)   per output, loss floored at the noise floor,
+# among those within the band of that ceiling, so it never moves to a worse
+# fit: taking the lowest total length of the whole population anchored the
+# lane on a constant and stalled the search.  Selection-only: the Pareto
+# survivors outside the lane and every score are unchanged.
+DESCRIPTION_LENGTH_ANCHOR = 0.
+DESCRIPTION_LENGTH_ROWS = 0
+def total_description_bits(bits, loss, outputs=1):
+    """Model bits plus the weighted bits of coding the residuals of `outputs` targets."""
+    return bits+DESCRIPTION_LENGTH_ANCHOR*.5*DESCRIPTION_LENGTH_ROWS*outputs*math.log2(max(loss,LOSS_NOISE_FLOOR,1e-300))
 def preset_role_parameters(role, crossover_rate, bayesian_proposal_rate, nodes, ops):
     """Search settings of a fixed (non-auto) island role."""
     if role=="generalist": return {}
@@ -7602,30 +7620,43 @@ def assign_role_parameters(cells, island_count, crossover_rate, bayesian_proposa
             cell.role={"params":role_parameters(t,crossover_rate,bayesian_proposal_rate,nodes),"stale":0}
         else:
             cell.role={"kind":role,"params":preset_role_parameters(role,crossover_rate,bayesian_proposal_rate,nodes,ops)}
-def anchored_band(models, band):
+def anchored_band(models, band, ceiling=None):
     """(anchor, loss limit, in-band models) of the anchored simplifier.
 
-    The anchor is the lowest-loss feasible model (ties: the shorter); the
+    The anchor is the lowest-loss feasible model (ties: the shorter), or with
+    --description-length-anchor the one of lowest total description length
+    within the band of `ceiling` (None or unreachable: of the lowest loss); the
     limit adds max(band*|anchor loss|, LOSS_NOISE_FLOOR), so an exact anchor
     (loss ~0) still leaves room for models that differ only by round-off."""
     feasible=[m for m in models if m.feasible and np.isfinite(aggregate_loss(m))]
     if not feasible: return None,None,[]
-    anchor=min(feasible,key=secondary_key); best=aggregate_loss(anchor)
+    anchor=min(feasible,key=secondary_key)
+    if DESCRIPTION_LENGTH_ANCHOR>0 and DESCRIPTION_LENGTH_ROWS>0:
+        reach=aggregate_loss(anchor) if ceiling is None else max(ceiling,aggregate_loss(anchor))
+        reach+=max(band*abs(reach),LOSS_NOISE_FLOOR)
+        anchor=min((m for m in feasible if aggregate_loss(m)<=reach),key=lambda m:(total_description_bits(model_complexity(m),aggregate_loss(m),len(m.trees)),*secondary_key(m)))
+    best=aggregate_loss(anchor)
     limit=best+max(band*abs(best),LOSS_NOISE_FLOOR)
     return anchor,limit,[m for m in feasible if aggregate_loss(m)<=limit]
 def tree_size_cap(model):
     """Largest single tree of a model: the per-tree node cap of its simplification lane."""
     return max(3,max(node_size(tree) for tree in model.trees))
-def anchored_lane(models, band=SIMPLIFIER_BAND):
+def lane_ceiling(pressure, models, band):
+    """This population's anchor loss ceiling, lowered to its current anchor's loss (None unless --description-length-anchor)."""
+    if not DESCRIPTION_LENGTH_ANCHOR>0: return None
+    anchor,_,_=anchored_band(models,band,pressure.anchor_loss)
+    if anchor is not None: pressure.anchor_loss=aggregate_loss(anchor) if pressure.anchor_loss is None else min(pressure.anchor_loss,aggregate_loss(anchor))
+    return pressure.anchor_loss
+def anchored_lane(models, band=SIMPLIFIER_BAND, ceiling=None):
     """(lane models shortest first, per-tree node cap): in-band models no bigger than the anchor."""
-    anchor,_,inside=anchored_band(models,band)
+    anchor,_,inside=anchored_band(models,band,ceiling)
     if anchor is None: return [],None
     cap=tree_size_cap(anchor)
     lane=[m for m in inside if tree_size_cap(m)<=cap]
     return sorted(lane,key=lambda m:(model_complexity(m),aggregate_loss(m),trees_text(m.trees))),cap
-def anchored_survivors(pool, count, normalization, tolerance, share=SIMPLIFIER_LANE_SHARE, band=SIMPLIFIER_BAND):
+def anchored_survivors(pool, count, normalization, tolerance, share=SIMPLIFIER_LANE_SHARE, band=SIMPLIFIER_BAND, ceiling=None):
     """`share` of the slots to the shortest lane models, the rest by NSGA."""
-    lane,_=anchored_lane(pool,band)
+    lane,_=anchored_lane(pool,band,ceiling)
     kept=lane[:int(count*share)]
     kept_ids={id(m) for m in kept}
     rest=[m for m in pool if id(m) not in kept_ids]
@@ -8315,7 +8346,7 @@ def evolve_generation(pop, generation, *, X, Xt, Yt, Xv, Yv, cats, constraints, 
     anchored=bool(role_settings.get("anchored"))
     lane_parent_share,lane_survivor_share,lane_band=(SIMPLIFIER_PARENT_SHARE,SIMPLIFIER_LANE_SHARE,SIMPLIFIER_BAND) if anchored else (LANE_PARENT_SHARE,LANE_SURVIVOR_SHARE,LANE_BAND)
     if lane_parent_share>0:
-        lane,cap=anchored_lane(pop,lane_band)
+        lane,cap=anchored_lane(pop,lane_band,lane_ceiling(pressure,pop,lane_band))
         if lane:
             lane_count=min(len(parents),int(round(len(parents)*lane_parent_share)))
             lane_parents=[ParentChoice(min(rng.choice(lane),rng.choice(lane),key=lambda m:(model_complexity(m),aggregate_loss(m)))) for _ in range(lane_count)]
@@ -8415,7 +8446,7 @@ def evolve_generation(pop, generation, *, X, Xt, Yt, Xv, Yv, cats, constraints, 
         evaluator.assess(batch,"train",None if isinstance(sample,slice) else sample,tune=True)
         for model in batch: history_born(model,generation,place)
         survivor_pool=novelty_pool([*survivor_pool,*batch],Xs); attempts+=len(batch)
-    survivors=(anchored_survivors(survivor_pool,min(population_size,len(survivor_pool)),nsga_normalization,effective_tolerance,lane_survivor_share,lane_band)
+    survivors=(anchored_survivors(survivor_pool,min(population_size,len(survivor_pool)),nsga_normalization,effective_tolerance,lane_survivor_share,lane_band,lane_ceiling(pressure,survivor_pool,lane_band))
                if lane_survivor_share>0 else
                select_nsga(survivor_pool,min(population_size,len(survivor_pool)),nsga_normalization,effective_tolerance))
     # Some datasets admit fewer distinct behaviors than population slots.
@@ -8615,6 +8646,8 @@ def resume_main(args):
     DYNAMIC_SIZE_LIMIT=int(state.get("dynamic_size_limit",0)); SEMANTIC_SIMPLIFICATION=bool(state.get("semantic_simplification",False)); ADAPTIVE_PARSIMONY=float(state.get("adaptive_parsimony",0.))
     global LANE_SURVIVOR_SHARE,LANE_PARENT_SHARE,LANE_BAND
     LANE_SURVIVOR_SHARE=float(state.get("simplifier_lane",0.)); LANE_PARENT_SHARE=float(state.get("simplifier_lane_parents",0.)); LANE_BAND=float(state.get("simplifier_lane_band",SIMPLIFIER_BAND))
+    global DESCRIPTION_LENGTH_ANCHOR,DESCRIPTION_LENGTH_ROWS
+    DESCRIPTION_LENGTH_ANCHOR=float(state.get("description_length_anchor",0.)); DESCRIPTION_LENGTH_ROWS=int(state.get("description_length_rows",0))
     global CONSTANT_FIT_ITERATIONS,SEMANTIC_MAX_DELTA,CONSTANT_SNAPPING,SNAP_TOLERANCE
     CONSTANT_FIT_ITERATIONS=int(state.get("fit_iterations",12)); SEMANTIC_MAX_DELTA=float(state.get("semantic_max_delta",5.))
     CONSTANT_SNAPPING=state.get("constant_snapping","off"); SNAP_TOLERANCE=float(state.get("snap_tolerance",1e-6))
@@ -8878,6 +8911,7 @@ def build_arg_parser():
     ap.add_argument("--simplifier-lane",type=float,default=0.,help="Share of survivor slots (0..0.5) given to the shortest models within --simplifier-lane-band of the population's best loss, in populations that are not a simplifier island: keeps slightly worse but shorter equations alive so they can be refined; 0 disables it (default: 0)")
     ap.add_argument("--simplifier-lane-parents",type=float,default=0.,help="Share of parents (0..0.9) drawn from that lane, whose children may not outgrow the best model; 0 disables it (default: 0)")
     ap.add_argument("--simplifier-lane-band",type=float,default=.05,help="Relative loss band of the simplifier lane (default: 0.05)")
+    ap.add_argument("--description-length-anchor",type=float,default=0.,metavar="WEIGHT",help="Let a better-fitting model become the simplifier lane's anchor only when its loss gain pays for its bits: the anchor is the model of lowest total description length, MDL bits + WEIGHT x (rows/2) x log2(loss), among those fitting as well as the best anchor so far (within the lane band), instead of the lowest-loss model; needs --simplifier-lane or a simplifier island; 1 is the textbook two-part code, 0 disables it (default: 0)")
     ap.add_argument("--neutral-shrink",choices=("on","off"),default="off",help="Accept a mutation that leaves the tree's output unchanged when the tree got smaller (an exact simplification) instead of redrawing it as a no-op; simplifier islands always do (default: off)")
     ap.add_argument("--jump-mutation-weight",type=float,default=1.,help="Initial portfolio weight of the jump mutation, which wraps a subtree in mod(s,c), floordiv(s,c) or if_else(gt(x,c),s,s') as one move; adapted like the other mutation kinds; 0 disables it (default: 1)")
     ap.add_argument("--loss-noise-floor",default="auto",help="Loss differences below this count as ties (the shorter model wins). 'auto' derives it from the targets' written precision: about 3e-12 for 7-digit CSV values, down to 1e-18 for full doubles, never above the old fixed 1e-9 (default: auto)")
@@ -8919,6 +8953,7 @@ def parse_cli(argv=None):
     if not 0 <= args.simplifier_lane <= .5: ap.error("--simplifier-lane must be between 0 and 0.5")
     if not 0 <= args.simplifier_lane_parents <= .9: ap.error("--simplifier-lane-parents must be between 0 and 0.9")
     if not args.simplifier_lane_band >= 0: ap.error("--simplifier-lane-band must be non-negative")
+    if not args.description_length_anchor >= 0: ap.error("--description-length-anchor must be non-negative")
     if args.backprop_mutation_weight < 0: ap.error("--backprop-mutation-weight must be non-negative")
     if args.sparse_basis_size < 1: ap.error("--sparse-basis-size must be positive")
     if args.max_terms < 2: ap.error("--max-terms must be at least 2")
@@ -9396,6 +9431,8 @@ def train_from_setup(args, setup, choose_model=None):
     DYNAMIC_SIZE_LIMIT=int(getattr(args,"dynamic_size_limit",0)); SEMANTIC_SIMPLIFICATION=getattr(args,"semantic_simplification","off")=="on"; ADAPTIVE_PARSIMONY=float(getattr(args,"adaptive_parsimony",0.))
     global LANE_SURVIVOR_SHARE,LANE_PARENT_SHARE,LANE_BAND
     LANE_SURVIVOR_SHARE=float(getattr(args,"simplifier_lane",0.)); LANE_PARENT_SHARE=float(getattr(args,"simplifier_lane_parents",0.)); LANE_BAND=float(getattr(args,"simplifier_lane_band",SIMPLIFIER_BAND))
+    global DESCRIPTION_LENGTH_ANCHOR,DESCRIPTION_LENGTH_ROWS
+    DESCRIPTION_LENGTH_ANCHOR=float(getattr(args,"description_length_anchor",0.))
     global CONSTANT_FIT_ITERATIONS,SEMANTIC_MAX_DELTA,CONSTANT_SNAPPING,SNAP_TOLERANCE
     CONSTANT_FIT_ITERATIONS=int(getattr(args,"fit_iterations",12)); SEMANTIC_MAX_DELTA=float(getattr(args,"semantic_max_delta",5.))
     CONSTANT_SNAPPING=getattr(args,"constant_snapping","final"); SNAP_TOLERANCE=float(getattr(args,"snap_tolerance",1e-6))
@@ -9496,6 +9533,8 @@ def train_from_setup(args, setup, choose_model=None):
     floor_setting=getattr(args,"loss_noise_floor","auto")
     LOSS_NOISE_FLOOR=estimate_loss_noise_floor(Yt,cats,Yv) if floor_setting=="auto" else float(floor_setting)
     print(f"Loss noise floor: {LOSS_NOISE_FLOOR:.3g} ({'from the precision of the targets' if floor_setting=='auto' else 'set'})")
+    DESCRIPTION_LENGTH_ROWS=len(Xt)
+    if DESCRIPTION_LENGTH_ANCHOR>0: print(f"Lane anchor: lowest total description length among models fitting as well as the best anchor so far (MDL bits + {DESCRIPTION_LENGTH_ANCHOR:g} x {DESCRIPTION_LENGTH_ROWS}/2 x log2 loss)")
     Xtest=Ytest=None
     test_df=setup.get("_test_frame")
     if test_df is None and args.test_csv:
@@ -9541,7 +9580,7 @@ def train_from_setup(args, setup, choose_model=None):
                    "stages":{key:stages[key] for key in ("mode","count","interval","age_gap","schedule","threshold_quantile")},
                    "roles":{key:roles[key] for key in ("enabled","interval","mix","retire_after","assignments")}},
         "integer_operators":INTEGER_OPERATORS,"equivalence_collapse":EQUIVALENCE_COLLAPSE,"residual_archive":RESIDUAL_ARCHIVE,"qd_parent_choice":QD_PARENT_CHOICE,"scale_balanced_selection":SCALE_BALANCED_SELECTION,"class_balance":CLASS_BALANCE,"output_balance":OUTPUT_BALANCE,"output_balance_bins":OUTPUT_BALANCE_BINS,
-        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"selection_probe_filter":SELECTION_PROBE_FILTER,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"final_simplification":FINAL_SIMPLIFICATION,"dynamic_size_limit":DYNAMIC_SIZE_LIMIT,"semantic_simplification":SEMANTIC_SIMPLIFICATION,"adaptive_parsimony":ADAPTIVE_PARSIMONY,"prune_mutation_weight":PRUNE_MUTATION_WEIGHT,"neutral_shrink":NEUTRAL_SHRINK,"simplifier_lane":LANE_SURVIVOR_SHARE,"simplifier_lane_parents":LANE_PARENT_SHARE,"simplifier_lane_band":LANE_BAND,"fit_iterations":CONSTANT_FIT_ITERATIONS,"semantic_max_delta":SEMANTIC_MAX_DELTA,"constant_snapping":CONSTANT_SNAPPING,"snap_tolerance":SNAP_TOLERANCE,"readout":READOUT_MODE,"max_terms":MAX_TERMS,"gene_crossover_rate":GENE_CROSSOVER_RATE,"backprop_mutation_weight":BACKPROP_MUTATION_WEIGHT,"backprop_inverse":BACKPROP_INVERSE,"residual_term_weight":RESIDUAL_TERM_WEIGHT,"loss":LOSS_MODE,"huber_delta":ROBUST_LOSS_DELTA,"forbid_nesting":",".join(sorted(f"{o}>{i}" for o,i in NESTING_RULES)),"units":UNIT_SPEC,"input_relations":RELATION_SPEC,"custom_ops":list(CUSTOM_OP_SPECS),"custom_feature_base":CUSTOM_FEATURE_BASE,"clip":CLIP,"eps":EPS,"sparse_seeding":SPARSE_SEEDING,"sparse_basis_size":SPARSE_BASIS_SIZE,"squash_swap_weight":SQUASH_SWAP_WEIGHT,"smooth_swap_weight":SMOOTH_SWAP_WEIGHT,"gate_mutation_weight":GATE_MUTATION_WEIGHT,"loss_noise_floor":LOSS_NOISE_FLOOR,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age",
+        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"selection_probe_filter":SELECTION_PROBE_FILTER,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"final_simplification":FINAL_SIMPLIFICATION,"dynamic_size_limit":DYNAMIC_SIZE_LIMIT,"semantic_simplification":SEMANTIC_SIMPLIFICATION,"adaptive_parsimony":ADAPTIVE_PARSIMONY,"prune_mutation_weight":PRUNE_MUTATION_WEIGHT,"neutral_shrink":NEUTRAL_SHRINK,"simplifier_lane":LANE_SURVIVOR_SHARE,"simplifier_lane_parents":LANE_PARENT_SHARE,"simplifier_lane_band":LANE_BAND,"description_length_anchor":DESCRIPTION_LENGTH_ANCHOR,"description_length_rows":DESCRIPTION_LENGTH_ROWS,"fit_iterations":CONSTANT_FIT_ITERATIONS,"semantic_max_delta":SEMANTIC_MAX_DELTA,"constant_snapping":CONSTANT_SNAPPING,"snap_tolerance":SNAP_TOLERANCE,"readout":READOUT_MODE,"max_terms":MAX_TERMS,"gene_crossover_rate":GENE_CROSSOVER_RATE,"backprop_mutation_weight":BACKPROP_MUTATION_WEIGHT,"backprop_inverse":BACKPROP_INVERSE,"residual_term_weight":RESIDUAL_TERM_WEIGHT,"loss":LOSS_MODE,"huber_delta":ROBUST_LOSS_DELTA,"forbid_nesting":",".join(sorted(f"{o}>{i}" for o,i in NESTING_RULES)),"units":UNIT_SPEC,"input_relations":RELATION_SPEC,"custom_ops":list(CUSTOM_OP_SPECS),"custom_feature_base":CUSTOM_FEATURE_BASE,"clip":CLIP,"eps":EPS,"sparse_seeding":SPARSE_SEEDING,"sparse_basis_size":SPARSE_BASIS_SIZE,"squash_swap_weight":SQUASH_SWAP_WEIGHT,"smooth_swap_weight":SMOOTH_SWAP_WEIGHT,"gate_mutation_weight":GATE_MUTATION_WEIGHT,"loss_noise_floor":LOSS_NOISE_FLOOR,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age",
         "test_csv":str(Path(args.test_csv).resolve()) if args.test_csv else None,
         "row_sample":row_sample,
     },(source_rows,source_columns),train_indices,validation_indices,external_validation)
@@ -9558,7 +9597,7 @@ def train_from_setup(args, setup, choose_model=None):
         "profile":args.profile,"constraint_metadata":metadata,"constraints":constraints.describe(),"bayesian_particles":args.bayesian_particles,"interaction_discovery":interaction_discovery,
         "island_config":{"count":island_count,"migration_interval":migration_interval,"migrants_per_island":migrants_per_island,"topology":"ring","migration_events":0,"stages":stages,"roles":roles},
         "integer_operators":INTEGER_OPERATORS,"equivalence_collapse":EQUIVALENCE_COLLAPSE,"residual_archive":RESIDUAL_ARCHIVE,"qd_parent_choice":QD_PARENT_CHOICE,"scale_balanced_selection":SCALE_BALANCED_SELECTION,"class_balance":CLASS_BALANCE,"output_balance":OUTPUT_BALANCE,"output_balance_bins":OUTPUT_BALANCE_BINS,
-        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"selection_probe_filter":SELECTION_PROBE_FILTER,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"final_simplification":FINAL_SIMPLIFICATION,"dynamic_size_limit":DYNAMIC_SIZE_LIMIT,"semantic_simplification":SEMANTIC_SIMPLIFICATION,"adaptive_parsimony":ADAPTIVE_PARSIMONY,"prune_mutation_weight":PRUNE_MUTATION_WEIGHT,"neutral_shrink":NEUTRAL_SHRINK,"simplifier_lane":LANE_SURVIVOR_SHARE,"simplifier_lane_parents":LANE_PARENT_SHARE,"simplifier_lane_band":LANE_BAND,"fit_iterations":CONSTANT_FIT_ITERATIONS,"semantic_max_delta":SEMANTIC_MAX_DELTA,"constant_snapping":CONSTANT_SNAPPING,"snap_tolerance":SNAP_TOLERANCE,"readout":READOUT_MODE,"max_terms":MAX_TERMS,"gene_crossover_rate":GENE_CROSSOVER_RATE,"backprop_mutation_weight":BACKPROP_MUTATION_WEIGHT,"backprop_inverse":BACKPROP_INVERSE,"residual_term_weight":RESIDUAL_TERM_WEIGHT,"loss":LOSS_MODE,"huber_delta":ROBUST_LOSS_DELTA,"forbid_nesting":",".join(sorted(f"{o}>{i}" for o,i in NESTING_RULES)),"units":UNIT_SPEC,"input_relations":RELATION_SPEC,"custom_ops":list(CUSTOM_OP_SPECS),"custom_feature_base":CUSTOM_FEATURE_BASE,"clip":CLIP,"eps":EPS,"sparse_seeding":SPARSE_SEEDING,"sparse_basis_size":SPARSE_BASIS_SIZE,"squash_swap_weight":SQUASH_SWAP_WEIGHT,"smooth_swap_weight":SMOOTH_SWAP_WEIGHT,"gate_mutation_weight":GATE_MUTATION_WEIGHT,"loss_noise_floor":LOSS_NOISE_FLOOR,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age"}
+        "numeric_guard_check":GUARD_EXPLOIT_CHECK,"interpolation_check":INTERPOLATION_CHECK,"jump_constant_scan":JUMP_CONSTANT_SCAN,"selection_probe_filter":SELECTION_PROBE_FILTER,"jump_mutation_weight":JUMP_MUTATION_WEIGHT,"final_simplification":FINAL_SIMPLIFICATION,"dynamic_size_limit":DYNAMIC_SIZE_LIMIT,"semantic_simplification":SEMANTIC_SIMPLIFICATION,"adaptive_parsimony":ADAPTIVE_PARSIMONY,"prune_mutation_weight":PRUNE_MUTATION_WEIGHT,"neutral_shrink":NEUTRAL_SHRINK,"simplifier_lane":LANE_SURVIVOR_SHARE,"simplifier_lane_parents":LANE_PARENT_SHARE,"simplifier_lane_band":LANE_BAND,"description_length_anchor":DESCRIPTION_LENGTH_ANCHOR,"description_length_rows":DESCRIPTION_LENGTH_ROWS,"fit_iterations":CONSTANT_FIT_ITERATIONS,"semantic_max_delta":SEMANTIC_MAX_DELTA,"constant_snapping":CONSTANT_SNAPPING,"snap_tolerance":SNAP_TOLERANCE,"readout":READOUT_MODE,"max_terms":MAX_TERMS,"gene_crossover_rate":GENE_CROSSOVER_RATE,"backprop_mutation_weight":BACKPROP_MUTATION_WEIGHT,"backprop_inverse":BACKPROP_INVERSE,"residual_term_weight":RESIDUAL_TERM_WEIGHT,"loss":LOSS_MODE,"huber_delta":ROBUST_LOSS_DELTA,"forbid_nesting":",".join(sorted(f"{o}>{i}" for o,i in NESTING_RULES)),"units":UNIT_SPEC,"input_relations":RELATION_SPEC,"custom_ops":list(CUSTOM_OP_SPECS),"custom_feature_base":CUSTOM_FEATURE_BASE,"clip":CLIP,"eps":EPS,"sparse_seeding":SPARSE_SEEDING,"sparse_basis_size":SPARSE_BASIS_SIZE,"squash_swap_weight":SQUASH_SWAP_WEIGHT,"smooth_swap_weight":SMOOTH_SWAP_WEIGHT,"gate_mutation_weight":GATE_MUTATION_WEIGHT,"loss_noise_floor":LOSS_NOISE_FLOOR,"fit_backend":FIT_BACKEND,"mdl_policy":MDL_POLICY,"objective_schema":"per_output_loss_shape[,per_output_constraint_violation],mdl_bits,age"}
     head_count=sum(len(heads) for heads in classification_layout(cats)[0])
     population_sizes=cell_population_sizes(args.population,cell_count)
     islands=[new_island_runtime(size,X=X,Xt=Xt,cats=cats,ops=ops,nodes=nodes,depth=depth,head_count=head_count,

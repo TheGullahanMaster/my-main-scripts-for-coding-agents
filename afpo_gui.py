@@ -37,6 +37,7 @@ import pandas as pd
 
 HTML = Path(__file__).with_name("afpo_gui.html")
 GUI_RUNS = Path("afpo_gui_runs")
+GUI_CONFIGS = Path("afpo_gui_configs")   # named Setup-tab configurations, one JSON file each
 DEFAULT_PORT = 8778
 MAX_IMAGE_BYTES = 64 << 20   # one uploaded image
 SNAPSHOT_INTERVAL = 1.0      # seconds between live frontier snapshots
@@ -1498,6 +1499,50 @@ def recent_runs(limit=30):
     return {"runs": runs}
 
 
+def _config_file(name):
+    """afpo_gui_configs/<name>.json for a plain name (letters, digits, spaces, . _ -)."""
+    name = str(name or "").strip()
+    if not name or len(name) > 80 or name.startswith(".") or any(not (ch.isalnum() or ch in " ._-") for ch in name):
+        raise ValueError("A configuration name is 1-80 letters, digits, spaces, dots, dashes or underscores, and does not start with a dot")
+    return GUI_CONFIGS / f"{name}.json"
+
+
+def list_configs():
+    """Saved Setup configurations, newest first."""
+    files = sorted(GUI_CONFIGS.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True) if GUI_CONFIGS.is_dir() else []
+    return {"configs": [{"name": p.stem, "modified": p.stat().st_mtime} for p in files], "folder": str(GUI_CONFIGS.resolve())}
+
+
+def save_config(name, config):
+    """Write one configuration (the browser's Setup state, stored as given) and return the new list."""
+    if not isinstance(config, dict):
+        raise ValueError("A configuration is a JSON object")
+    target = _config_file(name)
+    GUI_CONFIGS.mkdir(exist_ok=True)
+    partial = target.with_name(target.name + ".tmp")
+    partial.write_text(json.dumps({"name": target.stem, "saved": time.time(), "config": clean(config)}, indent=1), encoding="utf-8")
+    os.replace(partial, target)
+    return list_configs()
+
+
+def load_config(name):
+    target = _config_file(name)
+    if not target.is_file():
+        raise ValueError(f"No saved configuration named {target.stem!r}")
+    config = json.loads(target.read_text(encoding="utf-8")).get("config")
+    if not isinstance(config, dict):
+        raise ValueError(f"{target} is not a saved configuration")
+    return {"name": target.stem, "config": config}
+
+
+def delete_config(name):
+    target = _config_file(name)
+    if not target.is_file():
+        raise ValueError(f"No saved configuration named {target.stem!r}")
+    target.unlink()
+    return list_configs()
+
+
 # ───────────────────────── HTTP server ─────────────────────────
 def run_gui(host="127.0.0.1", port=DEFAULT_PORT, open_browser=True):
     import webbrowser
@@ -1518,6 +1563,10 @@ def run_gui(host="127.0.0.1", port=DEFAULT_PORT, open_browser=True):
         "/api/train/choose": lambda b: session.pick(b["index"]),
         "/api/train/status": lambda b: session.status(b.get("since", 0), b.get("console_since", 0), b.get("snapshot_seq", 0)),
         "/api/runs": lambda b: recent_runs(),
+        "/api/configs": lambda b: list_configs(),
+        "/api/configs/save": lambda b: save_config(b.get("name"), b.get("config")),
+        "/api/configs/load": lambda b: load_config(b.get("name")),
+        "/api/configs/delete": lambda b: delete_config(b.get("name")),
         "/api/models/load": lambda b: explorer.load(b["path"]),
         "/api/models/detail": lambda b: explorer.detail(b["index"]),
         "/api/models/latex": lambda b: explorer.latex(b["index"]),

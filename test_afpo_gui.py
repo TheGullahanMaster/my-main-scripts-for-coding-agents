@@ -69,6 +69,24 @@ class GuiTests(unittest.TestCase):
             gui.check_form(bad)
         self.assertTrue(gui.check_form(form(self.csv))["ok"])
 
+    def test_saved_configurations_round_trip(self):
+        config = {"form": {"population": "64", "affine": True}, "ops": {"groups": ["1"], "excluded": ["/"]}, "advanced": {"fit_iterations": "32"},
+                  "islandRoles": ["auto"], "paths": {"dataset": str(self.csv)}, "types": {"key": f"{self.csv}|,", "types": [1, 1, 1, 5]}}
+        self.assertEqual(gui.list_configs()["configs"], [])
+        listed = gui.save_config("toy run 1", config)
+        self.assertEqual([c["name"] for c in listed["configs"]], ["toy run 1"])
+        self.assertTrue((Path(listed["folder"]) / "toy run 1.json").is_file())
+        self.assertEqual(gui.load_config("toy run 1"), {"name": "toy run 1", "config": config})
+        gui.save_config("toy run 1", {**config, "form": {"population": "8"}})   # same name overwrites
+        self.assertEqual(gui.load_config("toy run 1")["config"]["form"], {"population": "8"})
+        self.assertEqual(len(gui.list_configs()["configs"]), 1)
+        for bad in ("", "../escape", "a/b", ".hidden", "x" * 81):
+            with self.assertRaises(ValueError): gui.save_config(bad, config)
+        with self.assertRaises(ValueError): gui.save_config("fine", ["not", "an", "object"])
+        with self.assertRaises(ValueError): gui.load_config("missing")
+        self.assertEqual(gui.delete_config("toy run 1")["configs"], [])
+        with self.assertRaises(ValueError): gui.delete_config("toy run 1")
+
     def test_relation_fields_become_flags(self):
         related = form(self.csv)
         related["data"]["input_relations"] = "a,b\n"
