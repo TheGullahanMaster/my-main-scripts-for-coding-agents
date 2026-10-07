@@ -161,6 +161,7 @@ def inspect_dataset(path, delimiter=","):
     # CSV Editor files: reserved columns are locked to "ignore", image codes cannot be outputs.
     schema = editor_format.editor_schema_from_frame(df)
     input_only = editor_format.editor_input_only_columns(schema)
+    booleans = editor_format.editor_kind_columns(schema, editor_format.EDITOR_BOOL)
     usable = [i for i, c in enumerate(df.columns) if df[c].dropna().nunique() > 1 and not editor_format.editor_reserved(c)]
     outputs = [i for i in usable if str(df.columns[i]) not in input_only]
     suggested_output = outputs[-1] if outputs else -1
@@ -175,10 +176,11 @@ def inspect_dataset(path, delimiter=","):
         if unique <= 1 or reserved:
             suggested = 0
         elif i == suggested_output:
-            suggested = 5 if numeric else 6
+            suggested = 5 if numeric and str(col) not in booleans else 6    # an editor Bool output is a true/false class
         else:
             suggested = 1 if numeric else 2
         info = {"index": i, "name": str(col), "numeric": numeric, "unique": unique, "missing": int(df[col].isna().sum()),
+                "boolean": str(col) in booleans,
                 "constant": unique <= 1 or reserved, "reserved": reserved, "input_only": str(col) in input_only,
                 "class_like": class_like, "suggested": suggested,
                 "examples": [str(v) for v in values.iloc[:3].tolist()]}
@@ -1002,6 +1004,7 @@ class ModelExplorer:
             if len(rows) > MAX_FIT_POINTS:
                 rows = np.random.default_rng(0).choice(rows, MAX_FIT_POINTS, replace=False)
             outputs = []
+            integers = editor_format.editor_kind_columns(self._schema(), editor_format.EDITOR_INT)
             for j, (name, labels) in enumerate(zip(state["out_names"], state["cats"])):
                 if labels is None:
                     residual = prediction[:, j] - Y[:, j]
@@ -1009,6 +1012,8 @@ class ModelExplorer:
                                     "residual_hist": _histogram(residual, 30),
                                     "rmse": float(np.sqrt(np.mean(residual ** 2))), "mae": float(np.mean(np.abs(residual))),
                                     "r2": float(1 - np.sum(residual ** 2) / max(np.sum((Y[:, j] - Y[:, j].mean()) ** 2), afpo.EPS))})
+                    if name in integers:    # an editor Integer output is predicted rounded: how often that lands exactly
+                        outputs[-1]["exact"] = float(np.mean(editor_format.editor_round(prediction[:, j]) == editor_format.editor_round(Y[:, j])))
                 else:
                     k = len(labels)
                     matrix = np.zeros((k, k), dtype=int)

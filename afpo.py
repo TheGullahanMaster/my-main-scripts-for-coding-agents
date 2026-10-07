@@ -5568,6 +5568,7 @@ def column_types(df):
         """Few distinct integer codes usually mean class labels, not a quantity."""
         return (pd.api.types.is_numeric_dtype(values) and values.nunique()<=10
                 and bool(np.all(np.isclose(values.to_numpy(float),np.round(values.to_numpy(float))))))
+    booleans=editor_format.editor_kind_columns(editor_format.editor_schema_from_frame(df),editor_format.EDITOR_BOOL)
     types=[0]*len(df.columns)
     i=0
     while i < len(df.columns):
@@ -5586,8 +5587,9 @@ def column_types(df):
             i += 1
             continue
         numeric=pd.api.types.is_numeric_dtype(df[col])
-        default=(5 if numeric else 6) if i==suggested_output else (1 if numeric else 2)
-        if i==suggested_output and numeric and class_like(values):
+        boolean=str(col) in booleans    # a CSV Editor Bool output is a true/false class, not a quantity
+        default=(5 if numeric and not boolean else 6) if i==suggested_output else (1 if numeric else 2)
+        if i==suggested_output and numeric and not boolean and class_like(values):
             print(f"[{i}] {col!r} holds {unique} integer codes; if these are classes, choose 6 for per-class equations.")
         while True:
             answer=ask(f"[{i}] {col!r}: examples {examples}; {unique} unique — type or type*count", default)
@@ -7071,6 +7073,7 @@ if __name__=='__main__': main()
         decoded=predict_targets(m,X,cats); expected=pd.DataFrame(index=fixture.index)
         for index,name in enumerate(output_names):
             expected[name]=([cats[index][int(value)] for value in decoded[:,index]] if cats[index] else decoded[:,index])
+        expected=editor_format.editor_decode_frame(expected,maps.get(editor_format.EDITOR_SCHEMA_KEY))[list(output_names)]
         fixture.loc[:,input_columns].to_csv("best_model_fixture.csv",index=False)
         expected.to_csv("best_model_fixture_predictions.csv",index=False)
 

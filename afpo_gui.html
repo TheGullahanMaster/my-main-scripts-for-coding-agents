@@ -1302,7 +1302,8 @@ function renderColumns() {
       : `${esc((c.top || []).slice(0, 3).map(t => t[0]).join(', '))}<div class="hint">${c.unique} categories${c.missing ? ` · ${c.missing} missing` : ''}</div>`;
     const select = c.constant ? `<span class="hint">ignored (${c.reserved ? 'CSV Editor data' : 'constant'})</span>`
       : `<select data-col="${c.index}">${TYPE_LABELS.filter(([v]) => !(c.input_only && v >= 5)).map(([v, l]) => `<option value="${v}" ${v === c.type ? 'selected' : ''}>${l}</option>`).join('')}</select>` +
-        (c.class_like && c.type === 5 ? '<div class="hint">few integer codes: pick Categorical output if these are classes</div>' : '');
+        (c.boolean && c.type === 5 ? '<div class="hint">Bool column: Categorical output keeps every prediction at 0 or 1</div>'
+          : c.class_like && c.type === 5 ? '<div class="hint">few integer codes: pick Categorical output if these are classes</div>' : '');
     const tick = c.constant ? '' : `<input type="checkbox" data-colpick="${c.index}" ${COL_SEL.has(c.index) ? 'checked' : ''}>`;
     tr.innerHTML = `<td>${tick}</td><td class="num">${c.index}</td><td><strong>${esc(c.name)}</strong><div class="hint">${c.numeric ? 'numeric' : 'text'}</div></td><td>${values}</td><td class="hist">${c.hist ? '<canvas></canvas>' : ''}</td><td>${select}</td>`;
     tb.appendChild(tr);
@@ -2068,7 +2069,7 @@ async function loadFit() {
         const t = v / max; return `<td style="background:color-mix(in srgb, var(--s1) ${Math.round(8 + 72 * t)}%, var(--surface));color:${t > .55 ? '#fff' : 'var(--text)'}">${v}</td>`; }).join('')}</tr>`).join('')}</tbody></table></div>`;
     return;
   }
-  body.innerHTML = `<div class="hint" style="margin-bottom:4px">${f.split} rows: ${f.rows} · R² ${fmt(o.r2, 5)} · RMSE ${fmt(o.rmse)} · MAE ${fmt(o.mae)}</div>
+  body.innerHTML = `<div class="hint" style="margin-bottom:4px">${f.split} rows: ${f.rows} · R² ${fmt(o.r2, 5)} · RMSE ${fmt(o.rmse)} · MAE ${fmt(o.mae)}${o.exact == null ? '' : ` · exact after rounding ${(100 * o.exact).toFixed(1)}%`}</div>
     <div class="legend"><span><i class="sw" style="background:var(--s1)"></i>Rows</span><span><i class="sw line" style="background:var(--muted)"></i>Perfect prediction</span></div>
     <div class="chart h320"><canvas></canvas></div><div class="hint" style="margin:8px 0 2px">Residuals (predicted − actual)</div><div class="chart h200"><canvas></canvas></div>`;
   const [c1, c2] = $$('canvas', body).map(c => new Chart(c)); fitCharts = [c1, c2];

@@ -427,12 +427,27 @@ def _editor_missing(value):
     return value is None or (isinstance(value, float) and math.isnan(value))
 
 
+def editor_kind_columns(schema, kind):
+    """Names of the editor columns of one kind."""
+    return {column["name"] for column in (schema or {}).get("columns", ()) if column["kind"] == kind}
+
+
+def editor_round(values):
+    """Nearest whole numbers, halves away from zero (the editor's rule for Integer cells)."""
+    values = np.asarray(values, float)
+    return np.sign(values) * np.floor(np.abs(values) + .5)
+
+
 def editor_decode_row(outputs, schema):
-    """{"<name> (text)": decoded} for the text columns among predicted outputs ({name: number})."""
+    """What an editor file adds to predicted outputs ({name: number}): an Integer column's value
+    rounded to a whole number, and {"<name> (text)": decoded} for a text column."""
     decoded = {}
     for column in (schema or {}).get("columns", ()):
         name, kind = column["name"], column["kind"]
-        if kind == EDITOR_TEXT and isinstance(outputs.get(name), (int, float)) and not isinstance(outputs.get(name), bool):
+        if kind == EDITOR_INT and isinstance(outputs.get(name), (int, float)) and not isinstance(outputs.get(name), bool):
+            if math.isfinite(outputs[name]):
+                decoded[name] = int(editor_round(outputs[name]))
+        elif kind == EDITOR_TEXT and isinstance(outputs.get(name), (int, float)) and not isinstance(outputs.get(name), bool):
             decoded[f"{name} (text)"] = editor_decode_text(outputs[name], column.get("codes") or {})
         elif kind == EDITOR_CHARS:
             encoded = column.get("columns") or []
@@ -442,13 +457,17 @@ def editor_decode_row(outputs, schema):
 
 
 def editor_decode_frame(frame, schema):
-    """A copy of a predictions frame with a '<name> (text)' column per predicted text column."""
+    """A copy of a predictions frame with every predicted Integer column rounded to whole numbers
+    and a '<name> (text)' column per predicted text column."""
     if not schema:
         return frame
     frame = frame.copy()
     for column in schema.get("columns", ()):
         name, kind = column["name"], column["kind"]
-        if kind == EDITOR_TEXT and name in frame.columns and pd.api.types.is_numeric_dtype(frame[name]):
+        if kind == EDITOR_INT and name in frame.columns and pd.api.types.is_numeric_dtype(frame[name]):
+            rounded = editor_round(frame[name])
+            frame[name] = rounded.astype(np.int64) if np.isfinite(rounded).all() else rounded
+        elif kind == EDITOR_TEXT and name in frame.columns and pd.api.types.is_numeric_dtype(frame[name]):
             frame[f"{name} (text)"] = [editor_decode_text(value, column.get("codes") or {}) for value in frame[name]]
         elif kind == EDITOR_CHARS:
             encoded = column.get("columns") or []
