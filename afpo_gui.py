@@ -810,6 +810,10 @@ class ModelExplorer:
                 best = state.get("best_model", {}).get("model")
                 if best:
                     pool.append(afpo.Model(**best))
+            # The run's shortened and snapped final candidates (no island holds them), so its chosen model is offered here too.
+            final, final_simplifier = afpo.final_candidates_from_state(state)
+            pool += final
+            simplifier_keys |= final_simplifier
             constraints = afpo.compile_constraints(state.get("profile", "general"), state.get("constraint_metadata", {}))
             cats, names, out_names = state["cats"], state["names"], state["out_names"]
             Xt, Yt, Xv, Yv = state["Xt"], state["Yt"], state.get("Xv"), state.get("Yv")

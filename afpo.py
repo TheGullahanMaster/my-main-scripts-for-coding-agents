@@ -6512,6 +6512,26 @@ def report_simplification(summary):
     if summary["mode"]=="on" and summary["models_tried"]:
         print(f"Final simplification: {summary['nodes_removed']} node(s) removed from {summary['models_simplified']} of {summary['models_tried']} lowest-loss candidates (within {summary['tolerance']:.2%} of their loss).")
 
+# The shortened and snapped copies exist only in the final candidate list, not
+# in any island, so a checkpoint of the islands alone loses them (and with
+# them, usually, the model that was chosen).  They are saved next to the
+# islands so that whoever reloads the checkpoint is offered the same choices.
+def final_candidate_snapshot(models, islands, from_simplifier=()):
+    """Checkpoint data of the final candidates that no island holds.
+
+    from_simplifier flags ``models`` position by position (shorter is fine)."""
+    held={selection_identity(model) for island in islands for model in [*island.archive.items,*island.population,island.best_models.model] if model is not None}
+    kept={}
+    for index,model in enumerate(models):
+        if model is None or (key:=selection_identity(model)) in held: continue
+        entry=kept.setdefault(key,[model,False]); entry[1]=entry[1] or (index<len(from_simplifier) and bool(from_simplifier[index]))
+    return {"models":[PosteriorParticlePopulation._model_data(model) for model,_ in kept.values()],"simplifier":[flag for _,flag in kept.values()]}
+def final_candidates_from_state(state):
+    """(models, selection_identity keys of the simplifier islands' ones) saved by final_candidate_snapshot."""
+    saved=state.get("final_candidates") or {}
+    models=[Model(**item) for item in saved.get("models",())]
+    return models,{selection_identity(model) for model,flag in zip(models,saved.get("simplifier",())) if flag}
+
 def used_feature_indices(model):
     """Return encoded feature indices referenced by any output tree."""
     used=set(); seen=set()
@@ -8699,11 +8719,13 @@ def resume_main(args):
         refresh_persistent_scores(island.archive,island.best_models,island.semantic_qd,island.structural_qd,evaluator,island.residual_qd)
         evaluator.assess(island.population,"train"); island.best_models.update(island.population); island.archive.update(island.population,Xt)
     f=[model for island in islands for model in [*island.archive.items,*island.population,island.best_models.model] if model is not None]
+    from_simplifier=[role_kind(island)=="simplifier" for island in islands for model in [*island.archive.items,*island.population,island.best_models.model] if model is not None]
     f,simplification=simplify_final_candidates(f,Xt,Yt,Xv,Yv,affine_on,cats,loss_tolerance,constraints,out_names,evaluator=evaluator); report_simplification(simplification)
     f,snapping=snap_final_candidates(f,Xt,Yt,Xv,Yv,affine_on,cats,constraints,out_names); report_snapping(snapping)
     chosen,selection=select_best_model(f,Xv,Yv,cats,loss_tolerance,constraints,out_names) if Xv is not None else select_best_model(f,loss_tolerance=loss_tolerance)
     state["selection"]={**selection,"selected_choice":"default","default_selected":True,
                         "selected_metrics":selection["metrics"],"selected_objectives":selection["objectives"],"constant_snapping":snapping,"final_simplification":simplification}
+    state["final_candidates"]=final_candidate_snapshot(f,islands,from_simplifier)
     snapshot_islands(state,islands,island_config)
     save_checkpoint(checkpoint_path,generation,islands[0].population,islands[0].bayes,islands[0].archive,state)
     print(f"Resume complete at generation {generation}. {selection['source'].title()} loss-tolerance shortest-MDL model selected: {equations(chosen,names,out_names,cats)}")
@@ -9645,6 +9667,7 @@ def train_from_setup(args, setup, choose_model=None):
     selection={**selection,"constant_snapping":snapping,"final_simplification":simplification,"selected_choice":labels[selected_index],"default_selected":selected_index==0,
                "selected_metrics":selected_entry[2],"selected_objectives":tuple(selected_entry[1].objectives)}
     checkpoint_state["selection"]=selection
+    checkpoint_state["final_candidates"]=final_candidate_snapshot(f,islands,from_simplifier)
     if subrun: checkpoint_state["separate_output"]=dict(subrun)
     snapshot_islands(checkpoint_state,islands,checkpoint_state["island_config"])
     save_checkpoint(checkpoint_path,gen,islands[0].population,islands[0].bayes,islands[0].archive,checkpoint_state)
