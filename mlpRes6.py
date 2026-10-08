@@ -1644,6 +1644,8 @@ class CustomDataset(Dataset):
             # Coerce errors to NaN, then drop rows that became NaN
             # This handles cases where a number column contains "error" or garbage text
             # True / False (bool dtype, or the words in a text column) count as 1 / 0
+            if is_hashed(col, self.col_types, self.vocabularies):
+                self.df[col] = hash_encode_series(self.df[col], self.vocabularies[col])
             converted = numeric_series(self.df[col])
             bad = int(converted.isna().sum())
             if bad:
@@ -1695,7 +1697,7 @@ class CustomDataset(Dataset):
         for col in self.vocabularies:
             # If vocabulary was already built manually in 'ask_column_types', we might update it here 
             # or just rely on existing. If values are int (like 1,2,3), it's likely already built.
-            if isinstance(list(self.vocabularies[col].values())[0], int): 
+            if not self.vocabularies[col] or isinstance(list(self.vocabularies[col].values())[0], int): 
                 continue
                 
             # Otherwise, rebuild based on the CLEAN data
@@ -2523,6 +2525,67 @@ def _bool_as_number(v):
     if isinstance(v, (bool, np.bool_)): return int(v)
     if isinstance(v, str) and v.strip().lower() in ("true", "false"): return int(v.strip().lower() == "true")
     return v
+
+
+# ── Hashed text (inhash / outhash) ─────────────────────────────────────────────
+# Text that the network sees as a number, by the EasyNN-plus rule that AFPO's "Text (encoded)" kind also
+# uses: a string's code is the sum of each character code times its position counted from the end ('Dog'
+# = 68*3 + 111*2 + 103 = 529), moved up by 101 while it lies within 100 of an earlier string's code.
+# Inside the engine such a column is an ordinary numeric in / out column; the {string: code} codebook
+# lives in vocabularies[col], so a numeric column that has a vocabulary entry is a hashed-text column.
+# Outputs are shown as the nearest string, prefixed with "~" by how far the number is from it.
+try:
+    from afpo_lib import editor_format as _hashfmt
+except ImportError:  # the rule lives in afpo_lib; without it only the hashed-text type is unavailable
+    _hashfmt = None
+HASH_TYPES = {"inhash": "in", "outhash": "out"}
+
+
+def lower_hash_types(col_types):
+    """col_types with inhash / outhash replaced by the plain numeric in / out they are stored as."""
+    return {c: HASH_TYPES.get(t, t) for c, t in col_types.items()}
+
+
+def is_hashed(col, col_types, vocabularies):
+    return col_types.get(col) in ("in", "out") and isinstance(vocabularies.get(col), dict)
+
+
+def _hash_rule():
+    if _hashfmt is None: raise ImportError("Hashed text needs afpo_lib/editor_format.py next to mlpRes6.py")
+    return _hashfmt
+
+
+def _is_number_cell(v):
+    if isinstance(v, (bool, np.bool_)): return False
+    if isinstance(v, (int, float, np.integer, np.floating)): return True
+    try: float(str(v)); return True
+    except ValueError: return False
+
+
+def hash_codebook(values, codes=None):
+    """Codebook {string: code} for a column, strings numbered in order of first appearance (numbers are
+    already codes and blank cells have none). Extends `codes` in place when given."""
+    codes = {} if codes is None else codes
+    _hash_rule().editor_assign_codes([str(v) for v in pd.Series(values).dropna() if not _is_number_cell(v)], codes)
+    return codes
+
+
+def hash_encode_series(s, codes):
+    """Column of strings (and/or numeric codes) -> floats; unseen strings join the codebook."""
+    if pd.api.types.is_numeric_dtype(s) and not pd.api.types.is_bool_dtype(s): return s.astype(float)
+    hash_codebook(s, codes)
+    def one(v):
+        if v is None or (isinstance(v, float) and v != v): return float("nan")
+        t = str(v)
+        if t in codes: return float(codes[t])
+        try: return float(t)
+        except ValueError: return float("nan")
+    return s.map(one).astype(float)
+
+
+def hash_label(value, codes):
+    """Nearest string for a model output (display units), '~'-prefixed by distance."""
+    return _hash_rule().editor_decode_text(value, codes)
 
 
 class FastLoader:
@@ -4781,6 +4844,10 @@ def _setup_vocab_for_col(col, col_type, file_path, delimiter, vocabularies, imag
         df_temp = read_table(file_path, delimiter=delimiter)
         vocabularies[col] = seqm.build_vocab(df_temp[col].dropna().astype(str), tokenizer)
         print(f"  '{col}': {tokenizer} vocabulary of {seqm.vocab_size(vocabularies[col]) - len(seqm.SPECIALS)} tokens")
+    elif col_type in HASH_TYPES:
+        df_temp = read_table(file_path, delimiter=delimiter)
+        vocabularies[col] = hash_codebook(df_temp[col])
+        print(f"  '{col}': {len(vocabularies[col])} hashed strings")
     elif col_type in ["inlab", "outlab", "inlabcat", "outlabcat"]:
         df_temp = read_table(file_path, delimiter=delimiter)
         sorted_unique = sorted(df_temp[col].astype(str).unique())
@@ -4916,12 +4983,14 @@ def ask_column_types(columns, file_path, delimiter, allow_seq=False):
     print("  8=inlabcat (one-hot label input),  9=intexcat (one-hot text input),")
     print(" 10=outlabcat (categorical label output), 11=outexcat (categorical text output)")
     print(" 12=inenc (text read by a sequence encoder), 13=outdec (text written by a sequence decoder)")
+    print(" 14=inhash, 15=outhash (text as one number by the EasyNN-plus hash; outputs show the nearest string)")
     print("\n  TIP: Use N*M to apply type N to this column and the next M-1 columns.")
     
     type_map = {
         "0": "i", "1": "in", "2": "inlab", "3": "intex", "4": "inim",
         "5": "out", "6": "outlab", "7": "outex",
-        "8": "inlabcat", "9": "intexcat", "10": "outlabcat", "11": "outexcat", "12": "inenc", "13": "outdec"
+        "8": "inlabcat", "9": "intexcat", "10": "outlabcat", "11": "outexcat", "12": "inenc", "13": "outdec",
+        "14": "inhash", "15": "outhash"
     }
     valid_types = set(type_map.values())
     
@@ -4990,7 +5059,7 @@ def ask_column_types(columns, file_path, delimiter, allow_seq=False):
         if out_cols_str:
             out_col_names = [c.strip() for c in out_cols_str.split(',')]
             print("\nNow specify output type for each:")
-            print("  5=out, 6=outlab, 7=outex, 10=outlabcat, 11=outexcat, 13=outdec")
+            print("  5=out, 6=outlab, 7=outex, 10=outlabcat, 11=outexcat, 13=outdec, 15=outhash")
             for oc in out_col_names:
                 if oc not in columns:
                     print(f"  '{oc}' not found in columns, skipping.")
@@ -5006,9 +5075,9 @@ def ask_column_types(columns, file_path, delimiter, allow_seq=False):
                         _setup_vocab_for_col(oc, ot, file_path, delimiter, vocabularies, image_params,
                                              ASKED_SEQ_PARAMS.get(oc, {}).get("tokenizer", "char"))
                         break
-                    print("    Invalid. Use 5, 6, 7, 10, 11 or 13.")
+                    print("    Invalid. Use 5, 6, 7, 10, 11, 13 or 15.")
     
-    return col_types, vocabularies, image_params
+    return lower_hash_types(col_types), vocabularies, image_params
 
 def activation_config_of(cls):
     """The {"name", "params"} that save_config would store for an activation class / factory."""
@@ -5427,6 +5496,8 @@ def encode_sample_input(sample_input, col_types, vocabularies, scalings, image_p
                 pc, ec, bc = compute_patch_codes(patch); codes.extend([pc, ec, bc])
             processed_input.extend(codes)
         else:
+            if col_type == "in" and isinstance(vocabularies.get(col_name), dict) and not _is_number_cell(value):  # hashed text
+                value = _hash_rule().editor_lookup_code(value, vocabularies[col_name])
             if col_name in scalings and 'min' in scalings[col_name]:
                 value = to_model_units(float(_bool_as_number(value)), scalings[col_name])
             processed_input.append(float(_bool_as_number(value)))
@@ -8092,8 +8163,16 @@ class InteractiveSampler:
         vocab = self.vocabs.get(col, {})
         return sorted(vocab, key=lambda k: vocab[k])
 
+    def _hashed(self, col):
+        return is_hashed(col, self.col_types, self.vocabs)
+
+    def _hash_labels(self, col):
+        return sorted(self.vocabs[col], key=lambda k: self.vocabs[col][k])
+
     def _default_input(self, col):
         ct = self.col_types[col]
+        if ct == "in" and self._hashed(col):
+            labels = self._hash_labels(col); return labels[0] if labels else ""
         if ct in ("inlab", "inlabcat"): return self._labels(col)[0]
         if ct == "in" and self._scaled(col):
             df = self._get_dataset()
@@ -8166,7 +8245,9 @@ class InteractiveSampler:
             elif ct == "outlab":
                 code = round(sl[0].item()); item["value"] = inv.get(code, code); item["raw"] = sl[0].item()
             else:
-                item["value"] = _gui_float(self._to_display(col, sl[0].item()))
+                shown = _gui_float(self._to_display(col, sl[0].item()))
+                if self._hashed(col) and shown is not None: item["raw"] = shown; item["value"] = hash_label(shown, self.vocabs[col]) or shown
+                else: item["value"] = shown
             items.append(item)
         return items
 
@@ -8230,6 +8311,7 @@ class InteractiveSampler:
                 if self._scaled(c): spec["min"] = self.scalings[c]["min"]; spec["max"] = self.scalings[c]["max"]
                 if ct in ("intex", "intexcat", "inenc"): spec["max_len"] = self.scalings[c].get("max_len")
                 spec["sweepable"] = ct in ("in", "inlab", "inlabcat")
+                if self._hashed(c): spec.update(type="inhash", options=self._hash_labels(c), sweepable=False)
                 inputs.append(spec)
             outputs = []
             for e in self.output_layout:
@@ -8932,7 +9014,7 @@ class InteractiveSampler:
             return self._data_stats
 
 
-_GUI_COL_TYPES = ["i", "in", "inlab", "intex", "inim", "inlabcat", "intexcat", "inenc", "out", "outlab", "outex", "outlabcat", "outexcat", "outdec"]
+_GUI_COL_TYPES = ["i", "in", "inlab", "intex", "inim", "inlabcat", "intexcat", "inenc", "inhash", "out", "outlab", "outex", "outlabcat", "outexcat", "outdec", "outhash"]
 _GUI_OPTIMIZERS = ["Adam", "AdamHD", "SGD", "SGDHD", "Lamb", "Adagrad", "Adadelta", "AdamW", "RMSprop", "Rprop", "ASGD",
                    "Adamax", "NAdam", "SparseAdam", "RAdamScheduleFree", "AdEMAMix", "Adam3", "AdamDelta", "AutoAdam",
                    "NormAdam", "SWATS", "AdaBoundW", "CLion", "Signum", "SRprop", "IRprop", "Adan", "Prodigy",
@@ -8975,13 +9057,129 @@ def gui_list_dir(path=None):
         if name.startswith("."): continue
         full = os.path.join(path, name)
         if os.path.isdir(full): dirs.append(name)
-        elif name.lower().endswith((".csv", ".tsv", ".txt", ".dat")): files.append({"name": name, "size": os.path.getsize(full)})
+        elif name.lower().endswith((".csv", ".tsv", ".txt", ".dat", ".tvq")): files.append({"name": name, "size": os.path.getsize(full)})
     return {"path": path, "parent": os.path.dirname(path), "dirs": dirs, "files": files}
+
+
+# ───────────── EasyNN-plus / JustNN .tvq import ─────────────
+TVQ_DIR = "tvq_imports"
+
+
+def _tvq_load(path):
+    import hashlib, tvq_reader
+    source = os.path.abspath(os.path.expanduser(str(path).strip().strip('"').strip("'")))
+    if not os.path.isfile(source): raise FileNotFoundError(f"No such file: {source}")
+    try: t = tvq_reader.read_tvq(source)
+    except Exception as e: raise ValueError(f"{os.path.basename(source)} could not be read as a .tvq file: {e}") from e
+    tag = hashlib.sha1(source.encode()).hexdigest()[:6]
+    return source, t, os.path.join(TVQ_DIR, f"{os.path.splitext(os.path.basename(source))[0]}-{tag}")
+
+
+def gui_tvq_dataset(path):
+    """A .tvq file's training + validating rows as a CSV (text stays text). Returns (csv path, the type each
+    column's own role suggests, {source, notes, network report}); the trained network is imported separately."""
+    import tvq_reader
+    source, t, stem = _tvq_load(path)
+    ds = tvq_reader.dataset(t)
+    if not ds["columns"]: raise ValueError(f"{os.path.basename(source)} has no usable columns (image columns are not stored in the file)")
+    if not ds["rows"]: raise ValueError(f"{os.path.basename(source)} has no training or validating rows")
+    os.makedirs(TVQ_DIR, exist_ok=True)
+    csv_path = os.path.abspath(stem + ".csv")
+    tvq_reader.write_csv(ds, csv_path)
+    types = {}
+    for c in ds["columns"]:
+        hashed = c["mode"] == 3
+        types[c["name"]] = {0: "inhash" if hashed else "in", 1: "outhash" if hashed else "out"}.get(c["role"], "i")
+    return csv_path, types, {"source": source, "notes": ds["notes"], "network": tvq_reader.network_report(t)}
+
+
+def gui_tvq_network(path, activate=False, overwrite=False):
+    """Turn the trained network of a .tvq file into an mlpRes6 model (model.pt + config.json in tvq_imports/<name>-net/)
+    and check it against the original. With activate, it also becomes the current model of the working directory;
+    existing model files are only replaced when overwrite is set, and are kept as *.bak-<time>."""
+    import shutil, tvq_reader
+    source, t, stem = _tvq_load(path)
+    rep = tvq_reader.network_report(t)
+    if not rep["compatible"]: raise ValueError("This network cannot be imported: " + "; ".join(rep["reasons"]))
+    net = tvq_reader.network(t)
+    sizes = net["sizes"]; n_in, n_out = sizes[0], sizes[-1]
+    names, cols = tvq_reader.column_names(t), t["columns"]
+    used = sorted(net["input_cols"] + net["output_cols"])  # file order is mlpRes6's input / output order
+    col_types = {names[i]: ("in" if i in net["input_cols"] else "out") for i in used}
+    scalings = {names[i]: {"min": cols[i]["min"], "max": cols[i]["max"], "range": [0.0, 1.0]} for i in used}  # EasyNN scales to 0..1
+    vocabularies = {names[i]: tvq_reader.codebook(t, i) for i in used if cols[i]["mode"] == 3}
+    empty = [c for c, v in vocabularies.items() if not v]
+    if empty: raise ValueError("Text column without any stored strings: " + ", ".join(empty))
+    folder = os.path.abspath(stem + "-net"); os.makedirs(folder, exist_ok=True)
+    # EasyNN's training rows are the dataset and its validating rows the held-out set that Resume validates on, but only
+    # when they are really held out: EasyNN often repeats training rows as validating ones, and mlpRes6 keeps no input
+    # combination in both sets (it would drop those training rows), so then everything is training data.
+    train_only = tvq_reader.dataset(t, row_types=(0,), roles=(0, 1), label_column=False)
+    held = tvq_reader.dataset(t, row_types=(1,), roles=(0, 1), label_column=False)
+    at = [k for k, c in enumerate(train_only["columns"]) if col_types.get(c["name"]) == "in"]
+    seen = {tuple(r[k] for k in at) for r in train_only["rows"]}
+    split = len(train_only["rows"]) >= 2 and bool(held["rows"]) and not any(tuple(r[k] for k in at) in seen for r in held["rows"])
+    train_types = (0,) if split else (0, 1)
+    ds = train_only if split else tvq_reader.dataset(t, row_types=(0, 1), roles=(0, 1), label_column=False)
+    csv_path = os.path.join(folder, "data.csv"); tvq_reader.write_csv(ds, csv_path)
+    val_path = os.path.join(folder, VALIDATION_ROWS_FILE)
+    if split: tvq_reader.write_csv(held, val_path)
+    elif os.path.exists(val_path): os.remove(val_path)
+    split_note = ("" if split or not held["rows"] else
+                  "its validating rows repeat training rows, so all rows are training data and there is no held-out set")
+    config = {"file_path": csv_path, "col_types": col_types, "hidden_dims": sizes[1:-1], "vocabularies": vocabularies,
+              "scalings": scalings, "image_params": {}, "optimizer_choice": "Adam", "batch_size": 32,
+              "activation": {"name": "Sigmoid", "params": {}}, "activation_type": 0, "residual_type": "none",
+              "norm_type": "none", "groups": 1, "attention_type": "none", "num_heads": 1, "input_attention_type": "none",
+              "moe_mode": 1, "noise_mode": "none", "noise_params": {}, "mlp_mode": 0, "layer_routing": "none", "use_grn": False,
+              "output_activation": {"name": "Sigmoid", "params": {}},
+              "csv_format": csv_format(True, delimiter=",")}  # recorded, or Resume would have to guess it from the column names
+    model = build_model_from_config(config, n_in, n_out, torch.device("cpu"))
+    mats = list(zip(net["weights"], net["biases"]))
+    put = lambda dst, src: dst.copy_(torch.as_tensor(src, dtype=torch.float32))
+    with torch.no_grad():
+        for blk, (W, b) in zip(model.blocks, mats[:-1]): put(blk.linear1.weight, W); put(blk.linear1.bias, b)
+        W_out = mats[-1][0]
+        if isinstance(model.final_skip, nn.Linear): model.final_skip.weight.zero_()
+        else: W_out = W_out - np.eye(len(W_out))  # MLPO adds an identity skip when the last layer is as wide as the output: cancel it
+        put(model.final_linear.weight, W_out); put(model.final_linear.bias, mats[-1][1])
+    model.eval()
+    # Check the whole path: CSV cells -> mlpRes6 encoding -> model must equal EasyNN's stored scaling -> its own network.
+    rows = [e for e in t["examples"] if e["type"] in train_types]
+    frame = read_table(csv_path, delimiter=",")
+    keep = [k for k, e in enumerate(rows) if all(e["raw"][i] != tvq_reader.MISSING for i in used)][:200]
+    in_names = [names[i] for i in net["input_cols"]]
+    X = np.array([encode_sample_input(list(frame.iloc[k][in_names]), col_types, vocabularies, scalings, {}) for k in keep], dtype=np.float32)
+    Xt = np.array([[rows[k]["norm"][i] for i in net["input_cols"]] for k in keep], dtype=np.float32)
+    with torch.no_grad(): got = model(torch.as_tensor(X)).numpy()
+    want = tvq_reader.forward(net, Xt)
+    e_in, e_out = float(np.abs(X - Xt).max()), float(np.abs(got - want).max())
+    if not (e_in < 1e-4 and e_out < 1e-4):
+        raise RuntimeError(f"The imported model does not reproduce the original network (input scaling off by {e_in:.2g}, outputs by {e_out:.2g})")
+    torch.save(model.state_dict(), os.path.join(folder, "model.pt"))
+    with open(os.path.join(folder, "config.json"), "w") as f: json.dump(convert_to_serializable(config), f, indent=2)
+    result = {"source": source, "folder": folder, "sizes": sizes, "rows_checked": len(keep), "input_error": e_in, "output_error": e_out,
+              "quality": rep.get("quality"), "notes": rep["notes"], "weight_scale": rep.get("weight_scale"), "activated": False,
+              "validation_rows": len(held["rows"]) if split else 0, "validation_note": split_note}
+    if activate:
+        existing = [f for f in ("model.pt", "config.json", OPTIMIZER_STATE_FILE, VALIDATION_ROWS_FILE) if os.path.exists(f)]
+        if existing and not overwrite:
+            result.update(needs_overwrite=True, existing=existing); return result
+        stamp = time.strftime("%Y%m%d-%H%M%S"); result["backed_up"] = []
+        for f in existing: os.replace(f, f"{f}.bak-{stamp}"); result["backed_up"].append(f"{f}.bak-{stamp}")
+        shutil.copy(os.path.join(folder, "model.pt"), "model.pt"); shutil.copy(os.path.join(folder, "config.json"), "config.json")
+        if split: shutil.copy(val_path, VALIDATION_ROWS_FILE)
+        result["activated"] = True
+    return result
 
 
 def gui_preview_dataset(path, delimiter=None, rows=15, header=True):
     """Column statistics and a suggested type per column, for the training GUI. Names are the file's own
-    (or col1, col2, ... without a header row); renaming is applied by the form on top of them."""
+    (or col1, col2, ... without a header row); renaming is applied by the form on top of them.
+    A .tvq path is converted to a CSV first; its own input / output roles become the suggestions."""
+    tvq = None
+    if str(path).strip().lower().endswith(".tvq"):
+        path, tvq_types, tvq = gui_tvq_dataset(path); delimiter = ","; header = True
     path = os.path.abspath(os.path.expanduser(path))
     delim = delimiter or _gui_detect_delimiter(path)
     df = read_table(path, delimiter=delim, fmt={"header": header})
@@ -9003,12 +9201,17 @@ def gui_preview_dataset(path, delimiter=None, rows=15, header=True):
         else: sug = "intexcat" if info.get("max_len", 0) <= 32 else "intex"
         info["suggested"] = sug
         cols.append(info)
-    active = [c for c in cols if c["suggested"] not in ("i", "inim")]
+    if tvq:
+        for c in cols:
+            if c["suggested"] != "i": c["suggested"] = tvq_types.get(c["name"], "i")
+    active = [] if tvq else [c for c in cols if c["suggested"] not in ("i", "inim")]
     if active:  # last usable column is the usual target
         last = active[-1]; last["suggested"] = {"in": "out", "inlabcat": "outlabcat", "intex": "outex", "intexcat": "outexcat"}[last["suggested"]]
     head = df.head(rows)
-    return {"path": path, "delimiter": delim, "n_rows": int(len(df)), "columns": cols,
-            "head": [[("" if pd.isna(v) else str(v)) for v in r] for r in head.itertuples(index=False)]}
+    out = {"path": path, "delimiter": delim, "n_rows": int(len(df)), "columns": cols,
+           "head": [[("" if pd.isna(v) else str(v)) for v in r] for r in head.itertuples(index=False)]}
+    if tvq: out.update(converted_from=tvq["source"], import_notes=tvq["notes"], network=tvq["network"])
+    return out
 
 
 class TrainingSession:
@@ -9121,7 +9324,7 @@ class TrainingSession:
         out_act = None if is_linear_activation(spec.get("output_activation")) else act_cfg(spec["output_activation"])
         scale_ranges = {}
         for c, r in (spec.get("scale_ranges") or {}).items():
-            if col_types.get(new(c)) not in ("in", "out") or not r or [float(v) for v in r] == [-1.0, 1.0]: continue
+            if col_types.get(new(c)) not in ("in", "out", "inhash", "outhash") or not r or [float(v) for v in r] == [-1.0, 1.0]: continue
             lo, hi = map(float, r)
             if lo == hi: raise ValueError(f"{new(c)}: the scaling range needs two different numbers.")
             scale_ranges[new(c)] = [lo, hi]
@@ -9192,6 +9395,7 @@ class TrainingSession:
                 if t in ("i", "inim"): continue  # inim sizes come from the GUI instead of stdin
                 _setup_vocab_for_col(c, t, a["path"], a["delim"], vocabularies, image_params,
                                      a["kwargs"]["seq_params"].get(c, {}).get("tokenizer", "char"))
+            col_types = lower_hash_types(col_types)  # hashed text is numeric from here on; its codebook is in vocabularies
             bs = a["kwargs"]["batch_size"]; v = a["val"]; vpath = None
             if v["mode"] == "file":
                 vpath = os.path.abspath(os.path.expanduser(v["file"] or ""))
@@ -9412,6 +9616,7 @@ def run_gui(host="127.0.0.1", port=8765, open_browser=True, model_path="model.pt
         "/api/dataset_row": lambda b: sampler().dataset_row(b.get("index"), b.get("source", "training")),
         "/api/data_stats": lambda b: sampler().data_stats(),
         "/api/fs": lambda b: gui_list_dir(b.get("path")),
+        "/api/tvq/network": lambda b: gui_tvq_network(b["path"], bool(b.get("activate")), bool(b.get("overwrite"))),
         "/api/dataset/preview": lambda b: gui_preview_dataset(b["path"], b.get("delimiter"), header=b.get("header", True) is not False),
         "/api/train/options": lambda b: gui_train_options(),
         "/api/train/start": lambda b: session.start(b),

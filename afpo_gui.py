@@ -17,6 +17,8 @@ import io
 import json
 import math
 import os
+import csv
+import hashlib
 import signal
 import subprocess
 import sys
@@ -35,7 +37,10 @@ from afpo_lib.csv_editor import CsvEditor
 import numpy as np
 import pandas as pd
 
+import tvq_reader
+
 HTML = Path(__file__).with_name("afpo_gui.html")
+TVQ_IMPORTS = Path("tvq_imports")      # CSVs converted from EasyNN / JustNN .tvq files
 GUI_RUNS = Path("afpo_gui_runs")
 GUI_CONFIGS = Path("afpo_gui_configs")   # named Setup-tab configurations, one JSON file each
 DEFAULT_PORT = 8778
@@ -88,7 +93,7 @@ def list_dir(path=None):
                 dirs.append(entry.name)
                 continue
             suffix = entry.suffix.lower()
-            kind = "csv" if suffix in (".csv", ".tsv", ".txt", ".dat") else "json" if suffix == ".json" else "file"
+            kind = "csv" if suffix in (".csv", ".tsv", ".txt", ".dat") else "tvq" if suffix == ".tvq" else "json" if suffix == ".json" else "file"
             files.append({"name": entry.name, "kind": kind, "size": entry.stat().st_size, "mtime": entry.stat().st_mtime})
         except OSError:
             continue
@@ -133,6 +138,61 @@ def resolve_path(path, must_exist=True):
     return resolved.resolve()
 
 
+def is_tvq(path):
+    return str(path or "").strip().strip('"').strip("'").lower().endswith(".tvq")
+
+
+def import_tvq(path):
+    """Convert an EasyNN-plus / JustNN .tvq file to a CSV Editor file of its training + validating rows.
+
+    Real, integer and bool columns keep their kind; a text column becomes the editor's "Text (encoded)" kind
+    with the file's own EasyNN-plus codes (AFPO uses the same hash), plus the strings in a #afpo:src: column,
+    so predictions decode back to text.  Returns (csv_path, info); info maps each CSV column to the type the
+    file's roles imply and carries the importer's notes.  Querying and excluded rows, image columns and the
+    trained network are not part of the dataset."""
+    source = resolve_path(path)
+    try:
+        tvq = tvq_reader.read_tvq(source)
+    except Exception as exc:
+        raise ValueError(f"{source.name} could not be read as a .tvq file: {exc}") from exc
+    ds = tvq_reader.dataset(tvq, text="both")
+    if not ds["columns"]:
+        raise ValueError(f"{source.name} has no usable columns (image columns are not stored in the file)")
+    if not ds["rows"]:
+        raise ValueError(f"{source.name} has no training or validating rows")
+    kinds = {0: editor_format.EDITOR_FLOAT, 1: editor_format.EDITOR_INT, 2: editor_format.EDITOR_BOOL, 3: editor_format.EDITOR_TEXT}
+    editor_columns = [column for column in ds["columns"] if column["index"] >= 0]
+    folder = Path(os.getcwd()) / TVQ_IMPORTS
+    folder.mkdir(exist_ok=True)
+    tag = hashlib.sha1(str(source).encode()).hexdigest()[:6]
+    target = folder / f"{source.stem}-{tag}.csv"
+    schema = editor_format.editor_schema_header([{"name": c["name"], "kind": kinds[c["mode"]]} for c in editor_columns])
+    header = []
+    for column in ds["columns"]:
+        header.append(column["name"])
+        if column["mode"] == 3 and column["index"] >= 0:
+            header.append(editor_format.editor_source_column(column["name"]))
+    with open(target, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(header + [schema])
+        for number, row in enumerate(ds["rows"]):
+            cells = []
+            for column, value in zip(ds["columns"], row):
+                cells.append(value)
+                if column["mode"] == 3 and column["index"] >= 0:
+                    cells.append(ds["sources"][column["name"]][number])
+            writer.writerow(cells + [""])
+    types = {}
+    for column in ds["columns"]:
+        if column["role"] == 0:
+            types[column["name"]] = 1
+        elif column["role"] == 1:
+            types[column["name"]] = 5 if column["mode"] in (0, 1) else 6
+        else:
+            types[column["name"]] = 0
+    return target, {"source": str(source), "types": types, "notes": ds["notes"], "rows": len(ds["rows"])}
+
+
 def read_frame(path, delimiter, max_rows=0):
     return afpo.read_dataset(resolve_path(path), delimiter or ",", max_rows)
 
@@ -154,7 +214,23 @@ def _histogram(values, bins=24):
 
 
 def inspect_dataset(path, delimiter=","):
-    """Columns with the CLI's default type suggestions, a histogram each, and a preview."""
+    """Columns with the CLI's default type suggestions, a histogram each, and a preview.
+    A .tvq path is converted to a CSV first and its own input / output roles become the suggestions."""
+    tvq = None
+    if is_tvq(path):
+        path, tvq = import_tvq(path)
+        delimiter = ","
+    result = _inspect_csv(path, delimiter)
+    if tvq:
+        for column in result["columns"]:
+            if not column["constant"] and column["name"] in tvq["types"]:
+                suggested = tvq["types"][column["name"]]
+                column["suggested"] = 0 if suggested >= 5 and column["input_only"] else suggested
+        result.update(converted_from=tvq["source"], import_notes=tvq["notes"], delimiter=",")
+    return result
+
+
+def _inspect_csv(path, delimiter=","):
     df = read_frame(path, delimiter, INSPECT_ROWS)
     if not len(df.columns):
         raise ValueError("The file has no columns")
@@ -335,6 +411,8 @@ def check_form(form):
         return {"ok": True, "argv": argv}
     args = parse_argv(argv)
     setup = setup_answers(form)
+    if is_tvq(setup["path"]):
+        raise ValueError("A .tvq file is converted to a CSV when its columns are inspected; press Inspect columns first")
     if setup["island_count"] * setup["stages"]["count"] > args.population // 8:
         raise ValueError("Islands x stages need at least eight models each; raise the population or choose fewer islands/stages")
     rows, columns = afpo.csv_shape(resolve_path(setup["path"]), setup["delimiter"])

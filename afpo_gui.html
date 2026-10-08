@@ -263,8 +263,8 @@ table.ed .imgcell img { width: 36px; height: 36px; object-fit: cover; border-rad
         <div class="seg" id="dataSource" style="margin-bottom:10px"><button type="button" data-source="csv" class="active">Existing CSV</button><button type="button" data-source="manual">Manual entry</button></div>
         <div class="hint hidden" id="sourceManualHint" style="margin-bottom:10px">Build the table in the CSV Editor above, then press <strong>Save &amp; use for training</strong>: the saved file appears here and its columns below.</div>
         <div class="field" id="sourceCsvField">
-          <label>CSV file <span class="hint">paste a full path, browse this machine, or upload through your browser</span></label>
-          <div data-path="dataset" data-kind="csv"></div>
+          <label>CSV or .tvq file <span class="hint">paste a full path, browse this machine, or upload through your browser; an EasyNN-plus / JustNN .tvq is converted to a CSV when you inspect it</span></label>
+          <div data-path="dataset" data-kind="dataset"></div>
         </div>
         <div class="row">
           <div class="field grow">
@@ -1116,7 +1116,7 @@ function mountPathField(host) {
   host.classList.add('row');
   host.innerHTML = `<input type="text" class="grow mono" placeholder="/full/path/to/file" spellcheck="false">
     <button class="btn" type="button">Browse…</button><button class="btn" type="button">Upload…</button>
-    <input type="file" class="hidden" accept="${kind === 'json' ? '.json,application/json' : '.csv,.tsv,.txt,.dat,text/csv'}">`;
+    <input type="file" class="hidden" accept="${kind === 'json' ? '.json,application/json' : kind === 'dataset' ? '.csv,.tsv,.txt,.dat,.tvq,text/csv' : '.csv,.tsv,.txt,.dat,text/csv'}">`;
   const [input, browse, upload, file] = [host.querySelector('input[type=text]'), ...host.querySelectorAll('button'), host.querySelector('input[type=file]')];
   input.value = store.get('path.' + key, '');
   input.addEventListener('change', () => { store.set('path.' + key, input.value.trim()); host.dispatchEvent(new Event('pathchange')); });
@@ -1161,14 +1161,14 @@ async function browseTo(path) {
       it.onclick = () => browseTo(j.path.replace(/\/$/, '') + '/' + d); list.appendChild(it);
     }
     for (const f of j.files) {
-      const match = f.kind === browserKind;
+      const match = f.kind === browserKind || (browserKind === 'dataset' && (f.kind === 'csv' || f.kind === 'tvq'));
       const it = document.createElement('div'); it.className = 'item' + (match ? '' : ' dim');
       it.innerHTML = `<span>${esc(f.name)}</span><span class="hint">${(f.size / 1024).toFixed(f.size < 10240 ? 1 : 0)} KB · ${new Date(f.mtime * 1000).toLocaleString()}</span>`;
       it.onclick = () => { $('#browser').classList.remove('open'); browserPick && browserPick(j.path.replace(/\/$/, '') + '/' + f.name); };
       list.appendChild(it);
     }
     if (!j.dirs.length && !j.files.length) list.innerHTML = '<div class="hint" style="padding:8px">Empty folder</div>';
-    $('#browserHint').textContent = `Click a file to use it. ${browserKind === 'json' ? 'JSON' : 'CSV-like'} files are highlighted.`;
+    $('#browserHint').textContent = `Click a file to use it. ${browserKind === 'json' ? 'JSON' : browserKind === 'dataset' ? 'CSV-like and .tvq' : 'CSV-like'} files are highlighted.`;
   } catch (e) { toast(e.message, true); }
 }
 $('#browserClose').onclick = () => $('#browser').classList.remove('open');
@@ -1314,6 +1314,12 @@ async function inspect() {
   $('#inspectBtn').disabled = true; $('#datasetInfo').textContent = 'Reading…';
   try {
     INSPECT = await api('/api/dataset/inspect', {path, delimiter: delimiterValue()});
+    if (INSPECT.converted_from) {
+      // A .tvq was converted: from here on the dataset is the CSV written next to the working directory.
+      pathInputs.dataset.value = INSPECT.path; store.set('path.dataset', INSPECT.path);
+      $('#delimiter').value = ','; $('#delimiterCustom').classList.add('hidden');
+      toast('Converted ' + INSPECT.converted_from.split('/').pop() + ' to ' + INSPECT.path + (INSPECT.import_notes.length ? ' · ' + INSPECT.import_notes.join(' · ') : ''));
+    }
     const savedTypes = store.get('types', null);
     const key = INSPECT.path + '|' + delimiterValue();
     INSPECT.columns.forEach(c => c.type = c.suggested);

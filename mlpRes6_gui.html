@@ -1284,6 +1284,7 @@ async function initExplore(keepInputs = false) {
   if (S.page === "explore") showPage("explore");
   const eb = $("#exploreBtn"); if (eb) eb.disabled = false;
   await predict(); if (S.page === "explore") renderTab();
+  if (S.page === "train") renderTrain();   // the Resume button and its note depend on S.meta
 }
 async function refreshAfterReload() {
   const before = S.meta ? S.meta.inputs.map(i => i.col + ":" + i.type).join("|") : "";
@@ -1292,6 +1293,7 @@ async function refreshAfterReload() {
   if (before !== after) { await initExplore(); return; }  // a new training run changed the columns
   S.meta = meta; S.dataStats = null; renderMeta(); renderStatus(S.meta.status);
   await predict(); if (S.page === "explore") renderTab();
+  if (S.page === "train") renderTrain();
 }
 async function poll(force = false) {
   try {
@@ -1322,7 +1324,8 @@ function showPage(page) {
 const TYPE_LABELS = { i: "ignore", in: "input · numeric", inlab: "input · label code", intex: "input · text codes", inim: "input · image",
   inlabcat: "input · category (one-hot)", intexcat: "input · text (one-hot chars)", out: "output · numeric", outlab: "output · label code",
   outex: "output · text codes", outlabcat: "output · category (softmax)", outexcat: "output · text (softmax chars)",
-  inenc: "input · text → encoder", outdec: "output · text ← decoder" };
+  inenc: "input · text → encoder", outdec: "output · text ← decoder",
+  inhash: "input · hashed text (EasyNN code)", outhash: "output · hashed text (nearest string)" };
 const SEQ_TYPES = ["inenc", "outdec"];
 const DEFAULT_FORM = { path: "", delimiter: "", columns: {}, image_params: {}, hidden_dims: [64, 64], mlp_mode: 0, batch_size: 32,
   activation: { name: "ReLU", params: {} }, activation_type: 0, layer_routing: "none", optimizer: "Adam", lr: "", optim_params: {},
@@ -1392,7 +1395,7 @@ function datasetCard() {
         q ? null : el("div", { class: "item", onclick: () => go(d.parent) }, "⬑ ..", ""),
         ...dirs.map(n => el("div", { class: "item", onclick: () => go(d.path + "/" + n) }, "▸ " + n + "/", "")),
         ...files.map(f => el("div", { class: "item", onclick: () => pick(f.name) }, f.name, el("span", { class: "muted" }, (f.size / 1024).toFixed(0) + " KB"))),
-        dirs.length || files.length ? null : el("div", { class: "item muted" }, q ? "nothing matches" : "no .csv / .tsv / .txt files here"));
+        dirs.length || files.length ? null : el("div", { class: "item muted" }, q ? "nothing matches" : "no .csv / .tsv / .txt / .tvq files here"));
     };
     filter.addEventListener("input", () => { T.browseFilter = filter.value; draw(); });
     filter.addEventListener("keydown", e => {
@@ -1405,6 +1408,7 @@ function datasetCard() {
       .catch(e => box.replaceChildren(el("div", { class: "path" }, e.message)));
     if (matchMedia("(pointer: fine)").matches) requestAnimationFrame(() => { filter.focus(); filter.setSelectionRange(filter.value.length, filter.value.length); });
   }
+  if (T.preview && T.preview.converted_from) card.append(tvqPanel(T.preview));
   if (T.preview) {
     const d = { ",": "comma", "\t": "tab", ";": "semicolon", " ": "space" }[T.preview.delimiter] || T.preview.delimiter;
     card.append(el("p", { class: "note", style: "margin:8px 0 0" }, `${T.preview.n_rows.toLocaleString()} rows · ${T.preview.columns.length} columns · ${d}-separated`));
@@ -1412,6 +1416,37 @@ function datasetCard() {
     card.append(el("details", {}, el("summary", {}, "Preview first rows"), el("div", { class: "scroll" }, t)));
   }
   return card;
+}
+
+// A .tvq (EasyNN-plus / JustNN) file was converted to a CSV: say so, and offer its trained network.
+function tvqPanel(p) {
+  const box = el("div", { class: "note", style: "margin:8px 0 0" }), n = p.network, name = p.converted_from.split("/").pop();
+  box.append(el("div", {}, `Converted from ${name}: its training and validating rows are the dataset below and the roles are pre-set from the file.` +
+    (p.import_notes.length ? " " + p.import_notes.join(" · ") : "")));
+  if (!n || !n.has_network) return box;
+  if (!n.compatible) { box.append(el("div", { style: "margin-top:4px" }, "Its trained network cannot be imported: " + n.reasons.join("; "))); return box; }
+  const q = n.quality, res = T.tvqNet && T.tvqNet.source === p.converted_from ? T.tvqNet : null;
+  box.append(el("div", { style: "margin-top:4px" }, `Trained network in the file: ${n.sizes.join(" → ")} nodes, logistic activations` +
+    (q && q.ratio != null ? ` · error ${(q.ratio * 100).toFixed(0)}% of predicting the column means` : "") + (n.notes.length ? " · " + n.notes.join(" · ") : "")));
+  const run = async (activate, overwrite) => {
+    try {
+      let r = await api("/api/tvq/network", { path: p.converted_from, activate, overwrite });
+      if (r.needs_overwrite) {
+        if (!confirm(`This replaces the current model (${r.existing.join(", ")}) in the working directory. The old files are kept with a .bak-<time> suffix. Continue?`)) return;
+        r = await api("/api/tvq/network", { path: p.converted_from, activate: true, overwrite: true });
+      }
+      T.tvqNet = r; renderTrain();
+      if (r.activated) await poll(true);  // pick the new model up now, so Resume current model is enabled
+      toast(r.activated ? "Imported network is now the current model — press Resume current model to keep training it." : "Network imported and checked.");
+    } catch (e) { toast("Network import failed: " + e.message); }
+  };
+  box.append(el("div", { class: "row-flex", style: "margin-top:6px" },
+    el("button", { onclick: () => run(false, false) }, "Import network"),
+    res ? el("button", { class: "primary", onclick: () => run(true, false) }, "Use as current model") : null));
+  box.append(el("div", { class: "muted", style: "margin-top:4px" }, "To train the imported network further, make it the current model and press “Resume current model”. “Start training” builds a new network from the settings below and replaces the current one."));
+  if (res) box.append(el("div", { style: "margin-top:4px" }, `Imported and checked on ${res.rows_checked} rows (largest difference from the original: ${Math.max(res.input_error, res.output_error).toExponential(1)}). ` +
+    `Saved in ${res.folder}` + (res.validation_rows ? ` · ${res.validation_rows} validating rows are kept as its held-out validation set` : res.validation_note ? ` · ${res.validation_note}` : "") + (res.activated ? ` · now the current model${res.backed_up && res.backed_up.length ? ` (previous files kept: ${res.backed_up.join(", ")})` : ""}` : "")));
+  return box;
 }
 
 function applyPreview(p) {
