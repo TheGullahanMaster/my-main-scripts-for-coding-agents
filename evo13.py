@@ -1070,6 +1070,22 @@ ROBUST_LOSS_MULTISCALE_HI   = 2.5   # decades at/above which L_ms is fully ON
 # absolute std<1e-6 → +10 penalty which left R² reading a spurious ≈1.0.
 DEGENERATE_PRED_REL_TOL     = 1e-4  # |std(export_pred)| / std(y) below this ⇒ degenerate
 
+# ---- Domain-guard exploitation penalty ----
+# Protected operators rescue undefined inputs with epsilon guards
+# (log(|x| + 1e-30), guarded divisors, …).  Evolution can EXPLOIT those
+# guards as hidden constants: e.g. log_base((x < x), x) feeds an identically
+# zero argument into log so the guard epsilon supplies ln(1e-30) ≈ −69 — the
+# model fits, but the equation is mathematically degenerate ("log of zero",
+# SymPy renders it as zoo) and any faithful re-implementation NaNs.
+# `evaluate()` already scores each node's guard-region traffic into
+# `last_eval_domain_margin` (0 = clean … 1 = every row inside a guard); this
+# penalty folds that into `.loss` (so the HoF and the final report feel it)
+# once the margin passes the free threshold.  An honest reformulation of the
+# same fit (e.g. log_base(C, x) with a real constant C) carries no margin and
+# wins the tie.  Set the weight to 0 to disable.
+DOMAIN_GUARD_PENALTY_WEIGHT = 1.0    # loss units added at margin = 1.0
+DOMAIN_GUARD_PENALTY_START  = 0.25   # margin below this is penalty-free
+
 # ---- Sobolev Training ----
 # Adds a gradient-matching penalty to the regression loss.
 # Target gradients dy/dX are estimated once from the training data before
@@ -6291,6 +6307,29 @@ def simplify_cgp_tree(cgp_eq):
                             continue
                     except Exception:
                         pass
+
+                # ---- SELF-COMPARISON FOLDING ----
+                # Both operands are the SAME slot, so these hold per-row for
+                # any input, in both safe and unsafe op modes.  Folding them
+                # exposes degenerate constructs — e.g. log_base((x < x), x)
+                # becomes log_base(0, x), visibly "log of zero" instead of a
+                # disguised guard-epsilon constant.
+                if node.in1 == node.in2:
+                    if node.op in ('lt', 'gt'):        # x < x, x > x → 0
+                        node.op = 'const'; node.const_val = 0.0
+                        changed = True
+                        continue
+                    if node.op in ('lte', 'gte', 'eq'):  # x ≤ x, x ≥ x, x = x → 1
+                        node.op = 'const'; node.const_val = 1.0
+                        changed = True
+                        continue
+                    if node.op in ('-', 'delta'):      # x − x, |x − x| → 0
+                        node.op = 'const'; node.const_val = 0.0
+                        changed = True
+                        continue
+                    if node.op in ('min', 'max'):      # min/max(x, x) → x
+                        changed |= _redirect(idx, node.in1)
+                        continue
 
                 # ---- IDENTITY REDUCTION (fold-to-zero / fold-to-one) ----
                 # EXACT matches only.  The old ``abs(c) < 1e-9`` tolerance
@@ -16499,6 +16538,20 @@ class Individual:
             if getattr(self.tree, 'last_eval_clipped', False):
                 self.loss += 10.0
 
+            # ── Domain-guard exploitation penalty ─────────────────────────────
+            # See the DOMAIN_GUARD_PENALTY_* config block: models whose value
+            # rides on protected-op epsilon guards (log of an identically-zero
+            # argument, near-zero divisors on most rows, …) are pushed below
+            # honest reformulations of the same fit.  `last_eval_domain_margin`
+            # is already computed during every evaluate(), so this is free.
+            if DOMAIN_GUARD_PENALTY_WEIGHT > 0.0:
+                _dg_margin = float(getattr(self.tree,
+                                           'last_eval_domain_margin', 0.0))
+                if _dg_margin > DOMAIN_GUARD_PENALTY_START:
+                    self.loss += (DOMAIN_GUARD_PENALTY_WEIGHT
+                                  * (_dg_margin - DOMAIN_GUARD_PENALTY_START)
+                                  / (1.0 - DOMAIN_GUARD_PENALTY_START))
+
             # ── Constant magnitude penalty ────────────────────────────────────
             # Astronomically large constants (e.g. 6e16) are exploited by pow()
             # to create disguised exponentials: C^(x+k) = e^((x+k)·ln C).
@@ -18190,7 +18243,11 @@ def _sympy_expr_diverges(py_expr, tree, final_vars, X_sample):
     """
     try:
         import math as _math
-        t = tree.evaluate(X_sample)
+        # force_hard: the exported code paths (SymPy piecewise, inline
+        # np.where, hardened per-node) all use HARD branching, so hard
+        # evaluation is the export-semantics ground truth (matching the
+        # degenerate-output guard's definition of the exported model).
+        t = tree.evaluate(X_sample, force_hard=True)
         t = np.clip(np.nan_to_num(np.asarray(t, dtype=np.float64),
                                   nan=0.0, posinf=1e9, neginf=-1e9), -1e9, 1e9)
 
@@ -18203,6 +18260,11 @@ def _sympy_expr_diverges(py_expr, tree, final_vars, X_sample):
                 return getattr(_math, k)
 
         env = {'np': np, 'numpy': np, 'math': _MathShim()}
+        # Expressions from tree_to_python_expr may call the module-level
+        # operator helpers (_op_round2, _to_int, …) that the generated
+        # script defines; resolve them here so such models are validatable.
+        env.update({k: v for k, v in globals().items()
+                    if k.startswith('_op_') or k == '_to_int'})
         for j, name in enumerate(final_vars):
             env[name] = X_sample[:, j]
         p = eval(py_expr, env)  # our own generated code, not user input
@@ -18213,6 +18275,60 @@ def _sympy_expr_diverges(py_expr, tree, final_vars, X_sample):
         return frac_bad > 0.01
     except Exception:
         return True
+
+
+def _tree_to_hardened_fn_src(cgp_eq, feature_var_names, fn_name, safe=None):
+    """Emit a per-node NumPy function that mirrors ``CGPEquation.evaluate()``
+    faithfully — including the per-node NaN/Inf sanitisation and the final
+    ±1e9 output clip the training pipeline applies.
+
+    The compact inline expression from :func:`tree_to_python_expr` composes
+    the ops WITHOUT the per-node ``nan_to_num`` the evaluator runs, so a raw
+    intermediate overflow that training silently sanitised (±Inf → ±1e9)
+    poisons every downstream op in the exported script and surfaces as NaN
+    predictions.  ``generate_script`` uses this emitter whenever the inline
+    form fails the numeric fidelity check: uglier, but correct by
+    construction.  ``if_else`` is emitted HARD (matching export semantics).
+    """
+    if safe is None:
+        safe = SAFE_OPS_MODE
+    if not cgp_eq.active_nodes:
+        cgp_eq.update_active_nodes()
+    blocked = set(_normalise_blocked_features(
+        getattr(cgp_eq, 'blocked_features', ()), cgp_eq.n_features))
+
+    def _ref(i):
+        if i < cgp_eq.n_features:
+            return "0.0" if i in blocked else str(feature_var_names[i])
+        return f"_s{i}"
+
+    lines = [f"def {fn_name}({', '.join(feature_var_names)}):"]
+    lines.append("    _snt = lambda v: np.nan_to_num("
+                 "v, nan=0.0, posinf=1e9, neginf=-1e9)")
+    for idx in sorted(cgp_eq.active_nodes):
+        if idx < cgp_eq.n_features:
+            continue
+        node = cgp_eq.nodes[idx - cgp_eq.n_features]
+        if node.op == 'const':
+            lines.append(f"    _s{idx} = {repr(float(node.const_val))}")
+            continue
+        v1 = _ref(node.in1)
+        if node.op in cgp_eq.OPS_BINARY_SET:
+            expr = _binary_python_expr(node.op, v1, _ref(node.in2), safe)
+        elif node.op in cgp_eq.OPS_TERNARY_SET:
+            expr = _ternary_python_expr(node.op, v1, _ref(node.in2),
+                                        _ref(node.in3))
+        elif node.op in cgp_eq.OPS_UNARY_SET:
+            expr = _unary_python_expr(node.op, v1, safe)
+        else:
+            expr = "0.0"
+        lines.append(f"    _s{idx} = _snt({expr})")
+    # ``+ zeros_like(first input)`` broadcasts constant-only outputs to the
+    # row count; the clip mirrors calculate_fitness's final ±1e9 clamp.
+    lines.append(f"    return np.clip(_snt(({_ref(cgp_eq.out_idx)}) "
+                 f"+ np.zeros_like(np.asarray({feature_var_names[0]}, "
+                 f"dtype=np.float64))), -1e9, 1e9)")
+    return "\n".join(lines) + "\n"
 
 
 def generate_script(models, dp, filename="best_model.py", X_data=None):
@@ -18258,6 +18374,9 @@ def generate_script(models, dp, filename="best_model.py", X_data=None):
     eq_code = ""
 
     adf_helper_code = ""
+    # Per-node hardened model functions, emitted only for outputs whose
+    # inline expression fails the numeric fidelity check (see the loop below).
+    hardened_code = ""
     emitted_adfs = set()
 
     def _adf_node_data_to_numpy(d):
@@ -18379,6 +18498,28 @@ def generate_script(models, dp, filename="best_model.py", X_data=None):
             except Exception:
                 py_expr = fallback_expr
 
+        # Fidelity backstop: the winning inline form (SymPy or the direct
+        # emission) must reproduce the evaluator on real data.  The inline
+        # composition lacks the evaluator's PER-NODE NaN/Inf sanitisation,
+        # so a raw intermediate overflow that training silently clamped
+        # (±Inf → ±1e9) turns into NaN predictions in the exported script.
+        # When that happens, emit a per-node hardened function instead —
+        # uglier, but semantically identical to training by construction.
+        if X_data is not None and len(X_data) > 0:
+            _X_chk = np.asarray(X_data, dtype=np.float64)[:512]
+            if _sympy_expr_diverges(py_expr, ind.tree, final_vars, _X_chk):
+                _fn = f"_model_output_{i}"
+                hardened_code += "\n" + _tree_to_hardened_fn_src(
+                    ind.tree, final_vars, _fn, safe=SAFE_OPS_MODE)
+                py_expr = f"{_fn}({', '.join(final_vars)})"
+
+        # Mirror the training pipeline's output sanitisation (calculate_fitness
+        # clips the raw tree output to ±1e9 with NaN→0 BEFORE the affine).
+        # Without this, a raw Inf/NaN that training clamped flows into the
+        # affine unchecked and the exported script reports non-finite
+        # predictions the training metrics never saw.
+        py_expr = (f"np.clip(np.nan_to_num({py_expr}, nan=0.0, "
+                   f"posinf=1e9, neginf=-1e9), -1e9, 1e9)")
         if out_types[i] == 5:
             a = getattr(ind, 'affine_a', 1.0)
             b = getattr(ind, 'affine_b', 0.0)
@@ -18540,6 +18681,14 @@ def _op_perceptronCustom2(v1, v2):
 
 # ── ADF (Automatically Defined Functions) — frozen sub-graph operators ────────
 {adf_helper_code if adf_helper_code else "# (no ADF operators used in this model)"}
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Hardened per-node model functions ────────────────────────────────────────
+# Present only for outputs whose compact inline expression failed the numeric
+# fidelity check against the training evaluator; these mirror it node-by-node
+# (per-node NaN/Inf sanitisation + final ±1e9 clip) so predictions match
+# training exactly.
+{hardened_code if hardened_code else "# (all outputs use faithful inline expressions)"}
 # ─────────────────────────────────────────────────────────────────────────────
 
 USED_COLS = {repr(used_cols)}
@@ -37361,31 +37510,48 @@ def train_mode():
                         
                     simplified_sym = advanced_simplify_expr(raw_sym)
                     simplified_expr = str(simplified_sym)
-                    # Numeric sanity check: warn when the pretty "Simplified"
-                    # form no longer computes what the fitted model computes
-                    # (e.g. SymPy collapsed it to a constant) so the perfect
-                    # Loss/R² above are never attributed to a wrong equation.
-                    try:
-                        _Xc = np.asarray(X, dtype=np.float64)[:512]
-                        _f  = sympy.lambdify(sym_vars, simplified_sym,
-                                             modules='numpy')
-                        _p  = np.asarray(_f(*[_Xc[:, j]
-                                              for j in range(_Xc.shape[1])]),
-                                         dtype=np.float64)
-                        _t  = best.tree.evaluate(_Xc)
-                        _t  = np.clip(np.nan_to_num(_t, nan=0.0, posinf=1e9,
-                                                    neginf=-1e9), -1e9, 1e9)
-                        if not is_cls:
-                            _t = (getattr(best, 'affine_a', 1.0) * _t
-                                  + getattr(best, 'affine_b', 0.0))
-                        _p = np.broadcast_to(_p, _t.shape)
-                        _tol = 1e-6 * (float(np.max(np.abs(_t))) + 1e-30)
-                        if float(np.mean(np.abs(_p - _t) > _tol)) > 0.01:
-                            simplified_expr += ("   [WARNING: diverges "
-                                                "numerically from the fitted "
-                                                "model — use 'Expression']")
-                    except Exception:
-                        pass
+                    # Degenerate atoms (zoo/±oo/nan) mean SymPy hit an
+                    # undefined form the protected evaluator papered over
+                    # (e.g. log of an identically-zero subexpression) — the
+                    # printed equation is NOT evaluable as ordinary math.
+                    # Checked directly because lambdify can't compile these
+                    # and the numeric check below would silently pass.
+                    if (simplified_sym.has(sympy.zoo)
+                            or simplified_sym.has(sympy.oo)
+                            or simplified_sym.has(-sympy.oo)
+                            or simplified_sym.has(sympy.nan)):
+                        simplified_expr += ("   [WARNING: contains an "
+                                            "undefined form (zoo/oo/nan) — "
+                                            "not valid math; use "
+                                            "'Expression']")
+                    else:
+                        # Numeric sanity check: warn when the pretty
+                        # "Simplified" form no longer computes what the fitted
+                        # model computes (e.g. SymPy collapsed it to a
+                        # constant) so the perfect Loss/R² above are never
+                        # attributed to a wrong equation.
+                        try:
+                            _Xc = np.asarray(X, dtype=np.float64)[:512]
+                            _f  = sympy.lambdify(sym_vars, simplified_sym,
+                                                 modules='numpy')
+                            _p  = np.asarray(_f(*[_Xc[:, j]
+                                                  for j in range(_Xc.shape[1])]),
+                                             dtype=np.float64)
+                            _t  = best.tree.evaluate(_Xc)
+                            _t  = np.clip(np.nan_to_num(_t, nan=0.0, posinf=1e9,
+                                                        neginf=-1e9), -1e9, 1e9)
+                            if not is_cls:
+                                _t = (getattr(best, 'affine_a', 1.0) * _t
+                                      + getattr(best, 'affine_b', 0.0))
+                            _p = np.broadcast_to(_p, _t.shape)
+                            _tol = 1e-6 * (float(np.max(np.abs(_t))) + 1e-30)
+                            if float(np.mean(np.abs(_p - _t) > _tol)) > 0.01:
+                                simplified_expr += ("   [WARNING: diverges "
+                                                    "numerically from the "
+                                                    "fitted model — use "
+                                                    "'Expression']")
+                        except Exception:
+                            pass
                 except Exception:
                     pass
 
