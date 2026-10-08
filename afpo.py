@@ -6286,11 +6286,23 @@ def simplifier_choice(entries, simplifier_keys, band=None):
     best=min(e[2]["loss"] for e in entries); limit=best+max(band*abs(best),LOSS_NOISE_FLOOR)
     inside=[e for e in entries if e[2]["loss"]<=limit and selection_identity(e[0]) in simplifier_keys]
     return min(inside,key=lambda e:(e[2]["mdl_bits"],e[2]["loss"],e[2]["shape"]))[0] if inside else None
-def model_options(models, X=None, Y=None, cats=None, loss_tolerance=.01, constraints=None, output_names=(), best_so_far=None, evaluation=None, simplifier_keys=None):
+def compression_choice(evaluation, target=None, band=.05, output_names=()):
+    """(label, model) of a run that reached its compression stage, or None: the shortest
+    candidate meeting --stop-at-loss on the selection rows (--compress-ceiling target),
+    else the shortest within `band` of the best selection loss (anchor)."""
+    source,entries=evaluation
+    if target is None:
+        model=simplifier_choice(entries,{selection_identity(e[0]) for e in entries},band)
+        return None if model is None else (f"Shortest within {band:.0%} of the best {source} loss (compression stage)",model)
+    meeting=[e for e in entries if loss_target_note(model_losses(e[1]),e[2]["loss"],target,list(output_names)) is not None]
+    if not meeting: return None
+    return (f"Shortest meeting --stop-at-loss on {source} loss (compression stage)",min(meeting,key=lambda e:(e[2]["mdl_bits"],e[2]["loss"],e[2]["shape"]))[0])
+def model_options(models, X=None, Y=None, cats=None, loss_tolerance=.01, constraints=None, output_names=(), best_so_far=None, evaluation=None, simplifier_keys=None, compression=None):
     """Return the deduplicated candidates shown when the user saves a model.
 
     simplifier_keys (simplifier_identities) adds the simplifier island's
-    shortest model within SIMPLIFIER_BAND of the best loss as its own choice."""
+    shortest model within SIMPLIFIER_BAND of the best loss as its own choice;
+    compression (compression_choice) is offered second, after Best Score."""
     models=[*models]+([best_so_far] if best_so_far is not None else [])
     evaluation=evaluation or selection_evaluation(models,X,Y,cats,constraints,output_names)
     best,selection=_select_best(evaluation,loss_tolerance)
@@ -6299,6 +6311,7 @@ def model_options(models, X=None, Y=None, cats=None, loss_tolerance=.01, constra
     entries=evaluation[1]
     candidates=[
         (f"Best Score ({selection['source']} equivalent shortest MDL; ≤{selection['loss_tolerance']:.1%} loss tolerance)",best),
+        *((compression,) if compression is not None else ()),
         *(((("Best-so-far retained",best_so_far),) if best_so_far is not None and any(e[0] is best_so_far for e in entries) else ())),
         (f"Lowest {selection['source'].title()} Loss",lowest_loss),
         (("Pareto Knee (loss/MDL bits)" if knee_info['interior_knee'] else "Pareto Knee fallback (no interior bend; lowest loss)"),knee),
@@ -7203,6 +7216,9 @@ class IslandRuntime:
     # means the cell draws from the shared module streams (one-cell runs and
     # checkpoints made before cells could run in parallel).
     streams:Any=None
+    # Compression stage (anchor_compression): the cell's fixed loss ceiling,
+    # size cap and progress, or None while it still searches for loss.
+    compress:Any=None
     def __post_init__(self):
         if not self.population_size: self.population_size=len(self.population)
 
@@ -7225,6 +7241,7 @@ def island_snapshot(island):
             "evaluation_budget":island.budget.snapshot(),
         },
         **({"streams":island.streams} if island.streams is not None else {}),
+        **({"compress":dict(island.compress)} if island.compress else {}),
     }
 
 def island_from_snapshot(data, n_rows, parsimony_quality_tolerance):
@@ -7250,6 +7267,7 @@ def island_from_snapshot(data, n_rows, parsimony_quality_tolerance):
         int(data.get("island",0)),int(data.get("stage",0)),dict(data.get("role") or {}),
         residual_qd_from_snapshot(runtime["quality_diversity"]),
         data.get("streams"),
+        dict(data["compress"]) if data.get("compress") else None,
     )
 
 def snapshot_islands(state, islands, island_config):
@@ -7294,7 +7312,10 @@ def migrate_islands(islands, migrant_count, *, X, nsga_normalization, parsimony_
             evaluator.assess(island.population,"train")
         pool=[model for model in island.population if model.feasible]
         if not pool: pool=island.population
-        leaving=(anchored_emigrants(pool,min(migrant_count,len(pool)),nsga_normalization,parsimony_quality_tolerance)
+        # A compressing island sends its shortest in-band models first.
+        leaving=(anchored_survivors(pool,min(migrant_count,len(pool)),nsga_normalization,parsimony_quality_tolerance,1.,lane=compression_lane(pool,island.compress))
+                 if getattr(island,"compress",None) else
+                 anchored_emigrants(pool,min(migrant_count,len(pool)),nsga_normalization,parsimony_quality_tolerance)
                  if (island.role.get("params") or {}).get("anchored") else
                  select_nsga(pool,min(migrant_count,len(pool)),nsga_normalization,parsimony_quality_tolerance))
         outgoing.append([model.clone() for model in leaving])
@@ -7588,6 +7609,22 @@ LANE_BAND = SIMPLIFIER_BAND
 # survivors outside the lane and every score are unchanged.
 DESCRIPTION_LENGTH_ANCHOR = 0.
 DESCRIPTION_LENGTH_ROWS = 0
+# Two-stage search (--stop-at-loss-action compress).  Once enough islands'
+# best models reach --stop-at-loss (--stop-at-loss-fraction), the run stops
+# chasing loss: every island whose best model meets the target is anchored at
+# that model's training loss, and from then on solves
+#     min MDL  subject to  loss <= anchor + max(band*|anchor|, noise floor)
+# with a fixed ceiling (it never tightens, so a later better fit does not pull
+# the island back into loss search, and never loosens).  COMPRESS_SURVIVOR_SHARE
+# of survivors are the shortest in-band models no larger than the anchor,
+# COMPRESS_PARENT_SHARE of parents come from them (their children may not
+# outgrow the anchor), mutation is biased toward pruning like a simplifier
+# island, and the remaining survivors are ordinary Pareto survival, so a
+# model that loses accuracy simply drops out of the lane.  Islands that have
+# not met the target yet keep searching for loss until they do.  Selection-only:
+# every score and the final pick's metrics are unchanged.
+COMPRESS_SURVIVOR_SHARE = .75
+COMPRESS_PARENT_SHARE = .9
 def total_description_bits(bits, loss, outputs=1):
     """Model bits plus the weighted bits of coding the residuals of `outputs` targets."""
     return bits+DESCRIPTION_LENGTH_ANCHOR*.5*DESCRIPTION_LENGTH_ROWS*outputs*math.log2(max(loss,LOSS_NOISE_FLOOR,1e-300))
@@ -7654,9 +7691,42 @@ def anchored_lane(models, band=SIMPLIFIER_BAND, ceiling=None):
     cap=tree_size_cap(anchor)
     lane=[m for m in inside if tree_size_cap(m)<=cap]
     return sorted(lane,key=lambda m:(model_complexity(m),aggregate_loss(m),trees_text(m.trees))),cap
-def anchored_survivors(pool, count, normalization, tolerance, share=SIMPLIFIER_LANE_SHARE, band=SIMPLIFIER_BAND, ceiling=None):
-    """`share` of the slots to the shortest lane models, the rest by NSGA."""
-    lane,_=anchored_lane(pool,band,ceiling)
+def within_compression_ceiling(model, compress):
+    """Training loss within a compressing cell's ceiling: the mean loss, or each output's own limit."""
+    if compress.get("output_ceilings") is not None:
+        return all(loss<=limit for loss,limit in zip(model_losses(model),compress["output_ceilings"]))
+    return aggregate_loss(model)<=compress["ceiling"]
+def compression_lane(models, compress):
+    """In-band models of a compressing cell, shortest first: feasible, training loss
+    within its fixed ceiling, no tree bigger than its anchor's."""
+    lane=[m for m in models if m.feasible and np.isfinite(aggregate_loss(m)) and tree_size_cap(m)<=compress["cap"] and within_compression_ceiling(m,compress)]
+    return sorted(lane,key=lambda m:(model_complexity(m),aggregate_loss(m),trees_text(m.trees)))
+def anchor_compression(cell, band, generation, target=None, names=()):
+    """Start the compression stage on one cell, anchored at its best model; False when it has none.
+
+    The ceiling is the anchor's training loss plus max(band*|loss|, noise floor),
+    raised to --stop-at-loss when `target` is given (--compress-ceiling target):
+    a number caps the mean loss, NAME=LOSS limits cap those outputs (the others
+    keep the anchor's band)."""
+    anchor=cell.best_models.model
+    if anchor is None or not anchor.feasible or not np.isfinite(aggregate_loss(anchor)): return False
+    banded=lambda loss:loss+max(band*abs(loss),LOSS_NOISE_FLOOR)
+    loss=aggregate_loss(anchor); ceiling=banded(loss); output_ceilings=None
+    if isinstance(target,dict):
+        names=list(names)
+        output_ceilings=[max(banded(value),float(target[names[j]])) if j<len(names) and names[j] in target else banded(value) for j,value in enumerate(model_losses(anchor))]
+        ceiling=None
+    elif target is not None: ceiling=max(ceiling,float(target))
+    cell.compress={"anchor_loss":loss,"ceiling":ceiling,"output_ceilings":output_ceilings,"cap":tree_size_cap(anchor),"band":band,
+                   "since":int(generation),"anchor_bits":model_complexity(anchor),"shortest":model_complexity(anchor),"improved":int(generation)}
+    return True
+def describe_compression_ceiling(compress):
+    """'training loss <= 0.012' or 'training losses <= 0.01, 0.2' (one limit per output)."""
+    if compress.get("output_ceilings") is not None: return "training losses <= "+", ".join(f"{limit:.6g}" for limit in compress["output_ceilings"])
+    return f"training loss <= {compress['ceiling']:.6g}"
+def anchored_survivors(pool, count, normalization, tolerance, share=SIMPLIFIER_LANE_SHARE, band=SIMPLIFIER_BAND, ceiling=None, lane=None):
+    """`share` of the slots to the shortest lane models (anchored_lane unless given), the rest by NSGA."""
+    if lane is None: lane,_=anchored_lane(pool,band,ceiling)
     kept=lane[:int(count*share)]
     kept_ids={id(m) for m in kept}
     rest=[m for m in pool if id(m) not in kept_ids]
@@ -7680,12 +7750,18 @@ def cell_search_settings(cell, crossover_rate, bayesian_proposal_rate, nodes):
     """(crossover_rate, bayesian_proposal_rate, nodes, case_weights) for one cell's generation."""
     params=cell.role.get("params") or {}
     weights=cell.role.get("case_weights")
-    return (params.get("crossover_rate",crossover_rate),params.get("bayesian_proposal_rate",bayesian_proposal_rate),
+    # A compressing cell crosses and draws fresh proposals half as often, like a simplifier island.
+    rate=.5 if getattr(cell,"compress",None) else 1.
+    return (rate*params.get("crossover_rate",crossover_rate),rate*params.get("bayesian_proposal_rate",bayesian_proposal_rate),
             params.get("nodes",nodes),None if weights is None else np.asarray(weights,float))
 def cell_role_settings(cell):
-    """The preset-only settings evolve_generation takes as role_settings (None for defaults)."""
+    """The preset-only settings evolve_generation takes as role_settings (None for defaults),
+    plus "compress" (anchor_compression) once the cell is in the compression stage."""
     params=cell.role.get("params") or {}
     settings={key:params[key] for key in ("ops","parsimony","semantic_max_delta","novelty","neutral_shrink","mutation_bias","anchored") if key in params}
+    if getattr(cell,"compress",None):
+        settings.pop("novelty",None); settings.pop("anchored",None)
+        settings.update(compress=dict(cell.compress),neutral_shrink=True,mutation_bias=ROLE_MUTATION_BIAS["simplifier"])
     return settings or None
 def row_errors(model, X, Y, cats):
     """Scale-free per-row error (mean over outputs) used for responsibilities."""
@@ -8254,7 +8330,8 @@ def evolve_generation(pop, generation, *, X, Xt, Yt, Xv, Yv, cats, constraints, 
     role_settings: a fixed island role's preset (cell_role_settings): "ops"
     (operators that build new structure; the MDL grammar stays the run's),
     "parsimony" (near-tie band floor), "semantic_max_delta", "novelty" (fresh
-    random share of offspring), "neutral_shrink" and "mutation_bias"."""
+    random share of offspring), "neutral_shrink", "mutation_bias", and "compress"
+    (a compressing cell's fixed loss ceiling and size cap: compression_lane)."""
     role_settings=role_settings or {}; place=place or history_place()
     portfolio.bias=role_settings.get("mutation_bias")
     role_delta=role_settings.get("semantic_max_delta"); neutral_shrink=NEUTRAL_SHRINK or bool(role_settings.get("neutral_shrink"))
@@ -8343,10 +8420,11 @@ def evolve_generation(pop, generation, *, X, Xt, Yt, Xv, Yv, cats, constraints, 
         if pressure.size_limit is None: pressure.size_limit=DYNAMIC_SIZE_LIMIT
         size_limit=max(3,min(nodes,pressure.size_limit)); grow_nodes=min(nodes,size_limit+max(2,size_limit//4))
     lane_ids=set(); lane_cap=grow_nodes
-    anchored=bool(role_settings.get("anchored"))
-    lane_parent_share,lane_survivor_share,lane_band=(SIMPLIFIER_PARENT_SHARE,SIMPLIFIER_LANE_SHARE,SIMPLIFIER_BAND) if anchored else (LANE_PARENT_SHARE,LANE_SURVIVOR_SHARE,LANE_BAND)
+    anchored=bool(role_settings.get("anchored")); compress=role_settings.get("compress")
+    lane_parent_share,lane_survivor_share,lane_band=((COMPRESS_PARENT_SHARE,COMPRESS_SURVIVOR_SHARE,None) if compress else
+                                                     (SIMPLIFIER_PARENT_SHARE,SIMPLIFIER_LANE_SHARE,SIMPLIFIER_BAND) if anchored else (LANE_PARENT_SHARE,LANE_SURVIVOR_SHARE,LANE_BAND))
     if lane_parent_share>0:
-        lane,cap=anchored_lane(pop,lane_band,lane_ceiling(pressure,pop,lane_band))
+        lane,cap=(compression_lane(pop,compress),compress["cap"]) if compress else anchored_lane(pop,lane_band,lane_ceiling(pressure,pop,lane_band))
         if lane:
             lane_count=min(len(parents),int(round(len(parents)*lane_parent_share)))
             lane_parents=[ParentChoice(min(rng.choice(lane),rng.choice(lane),key=lambda m:(model_complexity(m),aggregate_loss(m)))) for _ in range(lane_count)]
@@ -8361,7 +8439,8 @@ def evolve_generation(pop, generation, *, X, Xt, Yt, Xv, Yv, cats, constraints, 
     creation=SimpleNamespace(
         parents=[choice.model for choice in parents],lane_start=len(parents)-len(lane_ids),lane_cap=lane_cap,bayes=bayes,library=library,portfolio=portfolio,
         definitions=definitions,active_ops=active_ops,variation_ops=variation_ops,nodes=grow_nodes,depth=depth,n_features=X.shape[1],head_count=len(pop[0].trees),
-        generation=generation,novelty_rate=max(pressure.novelty_rate(),float(role_settings.get("novelty",0.))),bayesian_mode=bayesian_mode,
+        # A compressing cell's loss stalls on purpose; dynamic pressure would read that as stagnation and inject random trees.
+        generation=generation,novelty_rate=0. if compress else max(pressure.novelty_rate(),float(role_settings.get("novelty",0.))),bayesian_mode=bayesian_mode,
         bayesian_proposal_rate=bayesian_proposal_rate,crossover_rate=crossover_rate,affine_on=affine_on,role_delta=role_delta,neutral_shrink=neutral_shrink,
         seen={model_equivalence_key(model) for model in pop},sample=None if isinstance(sample,slice) else sample,Xsb=Xsb,
         Ysb=Ysb if BACKPROP_MUTATION_WEIGHT>0 or RESIDUAL_TERM_WEIGHT>0 else None,head_outputs=head_outputs if BACKPROP_MUTATION_WEIGHT>0 or RESIDUAL_TERM_WEIGHT>0 else None,
@@ -8446,7 +8525,9 @@ def evolve_generation(pop, generation, *, X, Xt, Yt, Xv, Yv, cats, constraints, 
         evaluator.assess(batch,"train",None if isinstance(sample,slice) else sample,tune=True)
         for model in batch: history_born(model,generation,place)
         survivor_pool=novelty_pool([*survivor_pool,*batch],Xs); attempts+=len(batch)
-    survivors=(anchored_survivors(survivor_pool,min(population_size,len(survivor_pool)),nsga_normalization,effective_tolerance,lane_survivor_share,lane_band,lane_ceiling(pressure,survivor_pool,lane_band))
+    survivors=(anchored_survivors(survivor_pool,min(population_size,len(survivor_pool)),nsga_normalization,effective_tolerance,lane_survivor_share,lane=compression_lane(survivor_pool,compress))
+               if compress else
+               anchored_survivors(survivor_pool,min(population_size,len(survivor_pool)),nsga_normalization,effective_tolerance,lane_survivor_share,lane_band,lane_ceiling(pressure,survivor_pool,lane_band))
                if lane_survivor_share>0 else
                select_nsga(survivor_pool,min(population_size,len(survivor_pool)),nsga_normalization,effective_tolerance))
     # Some datasets admit fewer distinct behaviors than population slots.
@@ -8721,7 +8802,7 @@ def resume_main(args):
     started=time.time(); stop=GracefulStop().__enter__(); interrupted=False
     try:
         stop_validation={"X":Xv,"Y":Yv,"cats":cats,"constraints":constraints,"out_names":out_names}
-        while (not args.max_generations or generation < args.max_generations) and not stop.requested and not stop_rule_reached(args,started,islands,stop_validation):
+        while (not args.max_generations or generation < args.max_generations) and not stop.requested and not stop_rule_reached(args,started,islands,stop_validation,generation):
             def step(island):
                 def progress(gen,elite,sample):
                     if len(islands)>1 and gen%10==0: print(cell_label(island,island_config["count"],stage_count),flush=True)
@@ -8766,6 +8847,11 @@ def resume_main(args):
     if warning: print(f"WARNING: {warning}"); state["selection"]["warning"]=warning
     print(f"{selection['source'].title()} selection scores: mean loss={selection['metrics']['loss']:.6g}, mean shape={selection['metrics']['shape']:.6g}, MDL bits={selection['metrics']['mdl_bits']:.6g}")
     if chosen.history: print("History:\n  "+"\n  ".join(describe_history(chosen.history)))
+    compressed=[island.compress for island in islands if island.compress]
+    if compressed:
+        target=parse_stop_targets(getattr(args,"stop_at_loss",None)) if getattr(args,"compress_ceiling","target")=="target" else None
+        choice=compression_choice(selection_evaluation(f,Xv,Yv,cats,constraints,out_names),target,max(c["band"] for c in compressed),out_names)
+        if choice is not None: print(f"{choice[0]}: {equations(choice[1],names,out_names,cats)} (a resume exports the model selected above)")
     if part and part.get("reads"):
         # Its inputs include other outputs' predicted values, which no CSV holds.
         print(f"Not exporting best_model.py: {part['output']!r} reads predicted {', '.join(part['reads'])}; only the full separate-output run exports it.")
@@ -8799,21 +8885,17 @@ def parse_stop_targets(value):
     return targets
 
 _STOP_VALIDATION={}
-def stop_rule_reached(args, started, islands, validation=None):
-    """--max-time (seconds of search) and --stop-at-loss end the search like Ctrl-C.
+def loss_target_status(args, islands, validation=None):
+    """(kind, per-island notes) for --stop-at-loss, or None when there is no loss target.
 
-    The loss is the validation loss of the islands' best models when there is
-    validation data (validation = dict(X, Y, cats, constraints, out_names)),
-    else their training loss.  Per-output targets ('HH=0.01,MM=0.05') must all
-    be met; names that are not outputs of this search are ignored, so in a
-    separate-output run each output's search stops at its own limit."""
-    limit=getattr(args,"max_time",0.) or 0.
-    if limit and time.time()-started>=limit:
-        print(f"Stopping: --max-time {limit:g}s reached."); return True
+    A note says how an island's best model meets the target, or is None when
+    it does not (or the island has no model yet).  The loss is the validation
+    loss when there is validation data (validation = dict(X, Y, cats,
+    constraints, out_names)), else the training loss.  Per-output targets
+    ('HH=0.01,MM=0.05') must all be met; names that are not outputs of this
+    search are ignored, and when none is an output there is no loss target."""
     target=parse_stop_targets(getattr(args,"stop_at_loss",None))
-    if target is None: return False
-    models=[island.best_models.model for island in islands if island.best_models.model is not None]
-    if not models: return False
+    if target is None: return None
     names=list(validation["out_names"]) if validation else []
     held_out=bool(validation) and validation.get("X") is not None
     def losses(model):
@@ -8827,18 +8909,76 @@ def stop_rule_reached(args, started, islands, validation=None):
             except (ArithmeticError, IndexError, RecursionError, ValueError): _STOP_VALIDATION[key]=((float("inf"),)*len(names),float("inf"))
         return _STOP_VALIDATION[key]
     kind="validation" if held_out else "training"
-    scored=[losses(model) for model in models]
-    if isinstance(target,dict):
-        wanted={names.index(name):value for name,value in target.items() if name in names}
-        if not wanted: return False
-        for per_output,_ in scored:
-            if all(per_output[j]<=value for j,value in wanted.items()):
-                print(f"Stopping: best {kind} loss reached --stop-at-loss for "+", ".join(f"{names[j]} ({per_output[j]:.6g} <= {value:g})" for j,value in wanted.items())+"."); return True
-        return False
-    best=min(total for _,total in scored)
-    if best<=target:
-        print(f"Stopping: best {kind} loss {best:.6g} reached --stop-at-loss {target:g}."); return True
+    if isinstance(target,dict) and not any(name in names for name in target): return None
+    notes=[None if island.best_models.model is None else loss_target_note(*losses(island.best_models.model),target,names) for island in islands]
+    return kind,notes
+
+def loss_target_note(per_output, total, target, names):
+    """How losses meet --stop-at-loss ('0.01 <= 0.02', 'HH (0.01 <= 0.02)'), or None when they do not."""
+    if not isinstance(target,dict): return f"{total:.6g} <= {target:g}" if total<=target else None
+    wanted={j:target[name] for j,name in enumerate(names) if name in target}
+    if not wanted or not all(per_output[j]<=value for j,value in wanted.items()): return None
+    return ", ".join(f"{names[j]} ({per_output[j]:.6g} <= {value:g})" for j,value in wanted.items())
+
+def loss_target_count(args, island_count):
+    """Islands whose best model must meet --stop-at-loss: --stop-at-loss-fraction of them, at least one."""
+    fraction=float(getattr(args,"stop_at_loss_fraction",0.) or 0.)
+    return max(1,min(island_count,math.ceil(fraction*island_count-1e-9)))
+
+def compression_progress(islands, generation, patience=0):
+    """Track each compressing island's shortest in-band model; True once none has
+    found a shorter one for `patience` generations (0: never)."""
+    for island in islands:
+        compress=getattr(island,"compress",None)
+        if not compress: continue
+        lane=compression_lane([*island.population,*([island.best_models.model] if island.best_models.model is not None else [])],compress)
+        if lane and model_complexity(lane[0])<compress["shortest"]-1e-9:
+            compress["shortest"]=model_complexity(lane[0]); compress["improved"]=int(generation)
+            label=f"Island {island.island_index+1}"+(f" stage {island.stage+1}" if island.stage else "")+": " if len(islands)>1 else ""
+            print(f"Compression: {label}shortest in-band model {compress['shortest']:.1f} MDL bits (anchor {compress['anchor_bits']:.1f}; training loss {aggregate_loss(lane[0]):.6g}).",flush=True)
+    active=[island.compress for island in islands if getattr(island,"compress",None)]
+    if patience and active and all(generation-compress["improved"]>=patience for compress in active):
+        print(f"Stopping: no compressing island found a shorter in-band model for {patience} generations (--compress-patience).")
+        return True
     return False
+
+def stop_rule_reached(args, started, islands, validation=None, generation=0):
+    """--max-time (seconds of search) and --stop-at-loss end the search like Ctrl-C.
+
+    --stop-at-loss is met once --stop-at-loss-fraction of the islands' best
+    models reach it (0: any one, 1: all); see loss_target_status.  With
+    --stop-at-loss-action compress that starts the compression stage instead
+    (anchor_compression on each island that meets it, now or later), which
+    ends only by Ctrl-C, --max-time, --max-generations or --compress-patience."""
+    limit=getattr(args,"max_time",0.) or 0.
+    if limit and time.time()-started>=limit:
+        print(f"Stopping: --max-time {limit:g}s reached."); return True
+    compressing=getattr(args,"stop_at_loss_action","stop")=="compress"
+    cells=[island for island in islands if island.best_models.model is not None]
+    if compressing and cells and all(getattr(island,"compress",None) for island in cells):
+        return compression_progress(islands,generation,getattr(args,"compress_patience",0))
+    status=loss_target_status(args,islands,validation)
+    if status is None: return compressing and compression_progress(islands,generation,getattr(args,"compress_patience",0))
+    kind,notes=status; met=[note for note in notes if note is not None]
+    required=loss_target_count(args,len(islands))
+    if compressing:
+        started_before=any(getattr(island,"compress",None) for island in islands)
+        if started_before or len(met)>=required:
+            band=float(getattr(args,"compress_band",SIMPLIFIER_BAND))
+            target=parse_stop_targets(args.stop_at_loss) if getattr(args,"compress_ceiling","target")=="target" else None
+            names=list(validation["out_names"]) if validation else []
+            anchored=[island for island,note in zip(islands,notes)
+                      if note is not None and not getattr(island,"compress",None) and anchor_compression(island,band,generation,target,names)]
+            for island in anchored:
+                label=f"island {island.island_index+1}"+(f" stage {island.stage+1}" if island.stage else "") if len(islands)>1 else "the population"
+                print(f"Compression stage{' started' if not started_before else ''}: {label} reached --stop-at-loss ({kind} {notes[islands.index(island)]}); "
+                      f"now searching for shorter models with {describe_compression_ceiling(island.compress)} "
+                      f"(anchor loss {island.compress['anchor_loss']:.6g}, {island.compress['anchor_bits']:.1f} MDL bits); press Ctrl-C to choose and save a model.",flush=True)
+        return compression_progress(islands,generation,getattr(args,"compress_patience",0))
+    if len(met)<required: return False
+    if required==1: print(f"Stopping: best {kind} loss reached --stop-at-loss ({met[0]}).")
+    else: print(f"Stopping: {len(met)} of {len(islands)} islands' best {kind} loss reached --stop-at-loss (needed {required}): {'; '.join(met)}.")
+    return True
 
 def build_arg_parser():
     ap=argparse.ArgumentParser(); ap.add_argument("--max-generations",type=int,default=0); ap.add_argument("--population",type=int,default=160); ap.add_argument("--seed",type=int); ap.add_argument("--workers",type=int,default=0,help="Model-scoring processes; 0=auto, 1=serial.  Results are identical for any count (default: 0)"); ap.add_argument("--adf-mode",choices=("off","flat","nested"),default="nested",help="ADF experiment mode; nested is v2, flat is the v1-style ablation, off disables ADFs")
@@ -8902,6 +9042,11 @@ def build_arg_parser():
     ap.add_argument("--units",default="",metavar="COLUMN=UNIT,...",help="Units of input columns for dimensional analysis, e.g. x=m,t=s,F=kg*m/s^2 (exponents with ^, fractions in parentheses like m^(1/2)); trees that add, compare or exponentiate unlike units are rejected; constants and unlisted columns are unit-free wildcards (default: none)")
     ap.add_argument("--max-time",type=float,default=0.,help="Stop the search after this many seconds and go to the final choice; 0 = no limit (default: 0)")
     ap.add_argument("--stop-at-loss",default=None,metavar="LOSS|NAME=LOSS,...",help="Stop the search once the best model's loss is at or below this value: its validation loss when there is validation data, else its training loss. NAME=LOSS,... sets one limit per output instead (all must be met); in separate-output runs each output's search stops at its own limit and the next output starts (default: off)")
+    ap.add_argument("--stop-at-loss-fraction",type=float,default=0.,metavar="F",help="Share of islands (their best models) that must reach --stop-at-loss before it acts: 0 = any one island, 1 = all of them, in between a fraction (rounded up, at least one); a single population is one island (default: 0)")
+    ap.add_argument("--stop-at-loss-action",choices=("stop","compress"),default="stop",help="What reaching --stop-at-loss does: stop ends the search; compress starts a second stage that stops chasing loss and evolves for simplicity instead: each island whose best model meets the target is anchored at that model's training loss and searches for the shortest models whose loss stays within --compress-ceiling (models that lose more accuracy drop out); it runs until Ctrl-C, --max-time, --max-generations or --compress-patience (default: stop)")
+    ap.add_argument("--compress-ceiling",choices=("target","anchor"),default="target",help="Compression stage loss limit (on training loss): target lets models get as bad as --stop-at-loss itself (or --compress-band over the anchor, if that is looser); anchor keeps them within --compress-band of the anchor's loss (default: target)")
+    ap.add_argument("--compress-band",type=float,default=SIMPLIFIER_BAND,metavar="B",help="Compression stage: relative training-loss allowance over each island's anchor loss (0.05 = models may be up to 5%% worse than the anchor; never below the loss noise floor) (default: 0.05)")
+    ap.add_argument("--compress-patience",type=int,default=0,metavar="N",help="Compression stage: stop once no island has found a shorter in-band model for N generations; 0 runs until stopped (default: 0)")
     ap.add_argument("--sparse-seeding",choices=("on","off"),default="off",help="Seed the initial population with sparse linear fits over a modest basis (inputs, unary operators of inputs, pairwise products and ratios, hinges), found by orthogonal matching pursuit (default: off)")
     ap.add_argument("--sparse-basis-size",type=int,default=300,help="Most basis terms the sparse seeding searches (default: 300)")
     ap.add_argument("--prune-mutation-weight",type=float,default=0.,help="Initial portfolio weight of the prune mutation, which collapses one inner node anywhere in the tree into one of its children or a constant, so the tree gets smaller; adapted like the other mutation kinds; 0 leaves it to simplifier island roles (default: 0)")
@@ -8953,6 +9098,10 @@ def parse_cli(argv=None):
     if not 0 <= args.simplifier_lane <= .5: ap.error("--simplifier-lane must be between 0 and 0.5")
     if not 0 <= args.simplifier_lane_parents <= .9: ap.error("--simplifier-lane-parents must be between 0 and 0.9")
     if not args.simplifier_lane_band >= 0: ap.error("--simplifier-lane-band must be non-negative")
+    if not 0 <= args.stop_at_loss_fraction <= 1: ap.error("--stop-at-loss-fraction must be between 0 and 1")
+    if not args.compress_band >= 0: ap.error("--compress-band must be non-negative")
+    if args.compress_patience < 0: ap.error("--compress-patience must be non-negative")
+    if args.stop_at_loss_action=="compress" and args.stop_at_loss in (None,"") and not args.resume: ap.error("--stop-at-loss-action compress needs --stop-at-loss")
     if not args.description_length_anchor >= 0: ap.error("--description-length-anchor must be non-negative")
     if args.backprop_mutation_weight < 0: ap.error("--backprop-mutation-weight must be non-negative")
     if args.sparse_basis_size < 1: ap.error("--sparse-basis-size must be positive")
@@ -9627,7 +9776,7 @@ def train_from_setup(args, setup, choose_model=None):
     stop=GracefulStop().__enter__(); interrupted=False
     try:
         stop_validation={"X":Xv,"Y":Yv,"cats":cats,"constraints":constraints,"out_names":out_names}
-        while (not args.max_generations or gen<args.max_generations) and not stop.requested and not stop_rule_reached(args,start,islands,stop_validation):
+        while (not args.max_generations or gen<args.max_generations) and not stop.requested and not stop_rule_reached(args,start,islands,stop_validation,gen):
             def step(island):
                 def progress(generation,elite,sample):
                     if cell_count>1 and generation%10==0: print(cell_label(island,island_count,stages["count"]),flush=True)
@@ -9674,7 +9823,14 @@ def train_from_setup(args, setup, choose_model=None):
     # simplifier's candidates after it.
     simplifier_keys={selection_identity(model) for model,flag in zip(f,from_simplifier) if flag}
     evaluation=selection_evaluation(f,Xv,Yv,cats,constraints,out_names)
-    labels,choices,selection=model_options(f,cats=cats,loss_tolerance=args.selection_loss_tolerance,evaluation=evaluation,simplifier_keys=simplifier_keys)
+    compressed=[island.compress for island in islands if island.compress]
+    if compressed:
+        anchors=", ".join(f"{c['anchor_bits']:.1f}" for c in compressed)
+        print(f"Compression stage: {len(compressed)} of {len(islands)} cell(s) compressed; shortest in-band model "
+              f"{min(c['shortest'] for c in compressed):.1f} MDL bits (anchor model{'s' if len(compressed)>1 else ''} {anchors} bits).")
+    compression=(compression_choice(evaluation,parse_stop_targets(args.stop_at_loss) if getattr(args,"compress_ceiling","target")=="target" else None,max(c["band"] for c in compressed),out_names)
+                 if compressed else None)
+    labels,choices,selection=model_options(f,cats=cats,loss_tolerance=args.selection_loss_tolerance,evaluation=evaluation,simplifier_keys=simplifier_keys,compression=compression)
     print_frontier(f,names,out_names,cats,recommendations=(labels,choices),evaluation=evaluation)
     if selection.get("warning"): print(f"WARNING: {selection['warning']}")
     if len(islands)==1: print(islands[0].archive.stats())
